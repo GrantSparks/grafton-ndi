@@ -62,6 +62,7 @@ mod queued;
 mod receive;
 mod routing;
 mod send;
+mod send_slots;
 mod sync;
 
 pub use crate::receiver::{AvSyncAttached, PacketAttached};

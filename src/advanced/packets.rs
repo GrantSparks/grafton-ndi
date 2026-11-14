@@ -5,8 +5,9 @@ use std::ffi::c_char;
 
 use super::{aliasable::AliasableVec, descriptors, invalid_frame, sdk_quantity};
 use crate::{
-    frames::FrameMetadata, sys::bindings::*, Error, FourCc, FrameRate, Rejected, Result, ScanType,
-    SdkTimestamp, StreamTier, Timecode,
+    frames::{check_picture_aspect_ratio, FrameMetadata, VideoHeader},
+    sys::bindings::*,
+    Error, FourCc, FrameRate, Rejected, Result, ScanType, SdkTimestamp, StreamTier, Timecode,
 };
 
 /// Maximum compressed frame size, in bytes, that this module sends or accepts.
@@ -477,17 +478,6 @@ impl<'a> PacketEnvelope<'a> {
     }
 }
 
-/// A picture aspect ratio this module accepts: finite and not negative.
-fn checked_aspect_ratio(ratio: f32) -> std::result::Result<f32, String> {
-    if ratio.is_finite() && ratio >= 0.0 {
-        Ok(ratio)
-    } else {
-        Err(format!(
-            "Picture aspect ratio {ratio} must be finite and not negative; zero selects square pixels"
-        ))
-    }
-}
-
 /// The codec, geometry and timing of compressed video, independent of any
 /// one frame's bytes.
 ///
@@ -559,14 +549,13 @@ impl VideoPacketFormat {
             .ok_or_else(|| invalid_frame("Unknown compressed video FourCC"))?;
         let format =
             Self::checked(codec, raw.xres.into(), raw.yres.into()).map_err(Error::InvalidFrame)?;
+        let header = VideoHeader::from_sdk(raw)?;
         Ok(Self {
             tier,
             protected,
-            frame_rate: FrameRate::from_sdk(raw.frame_rate_N, raw.frame_rate_D)?,
-            picture_aspect_ratio: checked_aspect_ratio(raw.picture_aspect_ratio)
-                .map_err(Error::InvalidFrame)?,
-            scan_type: ScanType::from_sdk(raw.frame_format_type)
-                .ok_or_else(|| invalid_frame("Unknown packet scan type"))?,
+            frame_rate: header.frame_rate,
+            picture_aspect_ratio: header.picture_aspect_ratio,
+            scan_type: header.scan_type,
             ..format
         })
     }
@@ -586,9 +575,10 @@ impl VideoPacketFormat {
     ///
     /// [`Error::InvalidInput`] when the value is negative or not finite.
     pub fn with_picture_aspect_ratio(self, ratio: f32) -> Result<Self> {
-        let picture_aspect_ratio = checked_aspect_ratio(ratio).map_err(Error::InvalidInput)?;
+        check_picture_aspect_ratio(ratio)
+            .map_err(|reason| Error::InvalidInput(reason.to_string()))?;
         Ok(Self {
-            picture_aspect_ratio,
+            picture_aspect_ratio: ratio,
             ..self
         })
     }
@@ -1662,6 +1652,74 @@ mod tests {
         match result {
             Err(Error::InvalidFrame(reason)) => reason,
             other => panic!("expected an invalid frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn received_packet_and_uncompressed_headers_report_the_same_invalid_fields() {
+        let valid = NDIlib_video_frame_v2_t {
+            FourCC: VideoCodec::H264.outer(StreamTier::Program, false),
+            xres: 16,
+            yres: 16,
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            frame_format_type: ScanType::Progressive.to_sdk(),
+            ..Default::default()
+        };
+        let invalid = [
+            NDIlib_video_frame_v2_t {
+                frame_rate_N: 0,
+                ..valid
+            },
+            NDIlib_video_frame_v2_t {
+                frame_rate_N: -1,
+                ..valid
+            },
+            NDIlib_video_frame_v2_t {
+                frame_rate_D: 0,
+                ..valid
+            },
+            NDIlib_video_frame_v2_t {
+                frame_rate_D: -1,
+                ..valid
+            },
+            NDIlib_video_frame_v2_t {
+                picture_aspect_ratio: -1.0,
+                ..valid
+            },
+            NDIlib_video_frame_v2_t {
+                picture_aspect_ratio: f32::NAN,
+                ..valid
+            },
+            NDIlib_video_frame_v2_t {
+                picture_aspect_ratio: f32::INFINITY,
+                ..valid
+            },
+            NDIlib_video_frame_v2_t {
+                frame_format_type: u32::MAX,
+                ..valid
+            },
+        ];
+        for raw in invalid {
+            assert_eq!(
+                reason(VideoPacketFormat::from_sdk(&raw).map(drop)),
+                reason(VideoHeader::from_sdk(&raw).map(drop)),
+            );
+        }
+        assert!(reason(VideoHeader::from_sdk(&invalid[7]).map(drop)).contains("0xFFFFFFFF"));
+        for ratio in [-1.0, f32::NAN, f32::INFINITY] {
+            let Err(Error::InvalidInput(packet)) = h264_format().with_picture_aspect_ratio(ratio)
+            else {
+                panic!("packet setter must retain InvalidInput")
+            };
+            let mut frame = crate::VideoFrame::builder()
+                .resolution(2, 1)
+                .build()
+                .unwrap();
+            let Err(Error::InvalidFrame(frame)) = frame.set_picture_aspect_ratio(ratio) else {
+                panic!("frame setter must retain InvalidFrame")
+            };
+            assert_eq!(packet, frame);
         }
     }
 

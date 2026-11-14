@@ -108,6 +108,8 @@ pub(super) enum Closing {
     AtStop,
     /// This long after the stop returns, as its documentation allows.
     After(std::time::Duration),
+    /// Stop recording before returning, but report the file closed later.
+    StoppedBeforeClose(std::time::Duration),
     /// After the stop returns, once the test calls [`Recorder::close`]:
     /// `After` with the delay in the test's hands, so that it can look at the
     /// stopping session first however slowly its threads run.
@@ -410,6 +412,10 @@ unsafe extern "C" fn recorder_stop(handle: NDIlib_file_recorder_instance_t) {
     match recorder.closing {
         Closing::AtStop => recorder.close(),
         Closing::After(delay) => recorder.close_after(delay),
+        Closing::StoppedBeforeClose(delay) => {
+            recorder.recording.store(false, Ordering::Release);
+            recorder.close_after(delay);
+        }
         Closing::WhenTold => {}
         Closing::WhenWaitedFor => recorder.close_owed_to_a_wait.store(true, Ordering::Release),
         Closing::DuringSlowStop(delay) => {

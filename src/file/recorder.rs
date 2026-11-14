@@ -9,7 +9,7 @@ use std::{
 };
 
 use super::{
-    out_param::OutParam,
+    out_param,
     types::{track_flags, NamePattern},
     EventText, FileApi, RecorderEvent, RecorderEventKind, RecorderOptions, RecorderStats,
     RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec, StateError,
@@ -31,7 +31,7 @@ const SETTLE_POLL: Duration = Duration::from_millis(1);
 /// How many stale events [`FileRecorder::start`] discards before giving up on
 /// finding the queue empty, and how many queued events a wait takes after its
 /// deadline before it reports a timeout.
-const STALE_EVENT_LIMIT: usize = 256;
+pub(super) const STALE_EVENT_LIMIT: usize = 256;
 
 /// Where a recorder is in its session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -232,6 +232,27 @@ struct OpenFile {
     has_media: bool,
 }
 
+/// The one budget for stopping and destroying this native recorder.
+/// A finish's deadline belongs to its caller and never changes this budget.
+#[derive(Clone, Copy)]
+enum CleanupBudget {
+    Skip,
+    For(Duration),
+    Until(Deadline),
+}
+
+impl CleanupBudget {
+    fn begin(&mut self, requested: Instant) -> Option<Deadline> {
+        if let Self::For(wait) = *self {
+            *self = Deadline::starting(requested, wait).map_or(Self::Skip, Self::Until);
+        }
+        match *self {
+            Self::Until(deadline) => Some(deadline),
+            Self::Skip | Self::For(_) => None,
+        }
+    }
+}
+
 /// The record of one session, built from the recorder's events.
 struct Ledger {
     /// The session's report, whose phase is where the session is.
@@ -321,9 +342,24 @@ impl Ledger {
         )
     }
 
+    /// A final report can still leave known files awaiting cleanup.
+    fn cleanup_pending(&self) -> bool {
+        self.session_open() || !self.open_files.is_empty()
+    }
+
     /// Whether every file reported open has been reported closed.
     fn all_closed(&self) -> bool {
         self.open_files.is_empty() && self.report.closed_files > 0
+    }
+
+    /// Settle a wait once the session is final, or its final drain is done.
+    fn settle(&self, expired: bool, drained: bool) -> Option<FinishStatus> {
+        match self.state() {
+            RecorderState::Closed => Some(FinishStatus::Closed(self.report.clone())),
+            RecorderState::Indeterminate => Some(FinishStatus::Indeterminate(self.report.clone())),
+            _ if expired && drained => Some(FinishStatus::TimedOut(self.report.clone())),
+            _ => None,
+        }
     }
 
     /// Record that a stop is under way, announced by the SDK after an
@@ -361,12 +397,19 @@ impl Ledger {
 
     /// Record one event of the open session.
     fn observe(&mut self, kind: RecorderEventKind, path: EventText) {
-        if !self.session_open() {
-            return;
-        }
         // A path that is cut short cannot be matched with a later event.
         let exact =
             !path.as_bytes().is_empty() && path.is_terminated() && !path.is_possibly_truncated();
+        if !self.session_open() {
+            // Keep cleanup evidence after an indeterminate verdict without
+            // changing the report already returned to the caller.
+            if kind == RecorderEventKind::FileClosed && exact {
+                if let Some(index) = self.open_files.iter().position(|open| open.path == path) {
+                    self.open_files.remove(index);
+                }
+            }
+            return;
+        }
         match kind {
             RecorderEventKind::Started | RecorderEventKind::Rollover => {
                 let first = kind == RecorderEventKind::Started;
@@ -472,9 +515,11 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 /// The SDK finalizes a file only between the stop request and its file-closed
 /// event. [`finish`](Self::finish) performs both and reports the outcome;
 /// treat a recording as complete only when it returns
-/// [`FinishStatus::Closed`]. Dropping a recorder with a session still open
-/// does the same, waiting up to [`RecorderOptions::drop_wait`], but cannot
-/// report whether it succeeded; [`abandon`](Self::abandon) skips the wait.
+/// [`FinishStatus::Closed`]. Dropping a recorder waits up to
+/// [`RecorderOptions::drop_wait`] while the session is open or a file it
+/// reported open has not been reported closed, including after an
+/// indeterminate outcome. Drop cannot report whether cleanup succeeded;
+/// [`abandon`](Self::abandon) skips the wait.
 ///
 /// # What a closed file means
 ///
@@ -514,9 +559,7 @@ pub struct FileRecorder {
     /// needs to be, even when it ended that session itself: until then it
     /// refuses to start another.
     native_stop_owed: bool,
-    drop_wait: Duration,
-    /// An async shutdown's existing budget, shared with a running finish.
-    drop_deadline: Option<Deadline>,
+    cleanup: CleanupBudget,
     // Keeps the NDI runtime initialized.
     _api: FileApi,
     // Neither the NDI File Format API documentation nor
@@ -565,8 +608,7 @@ impl FileRecorder {
             handle,
             records_media: options.tracks.contains(MediaTypes::VIDEO)
                 || options.tracks.contains(MediaTypes::AUDIO),
-            drop_wait: options.drop_wait,
-            drop_deadline: None,
+            cleanup: CleanupBudget::For(options.drop_wait),
             accepted_source: Some(options.source.clone()),
             naming: resolved.naming,
             ledger: Ledger::idle(),
@@ -612,8 +654,9 @@ impl FileRecorder {
     /// # Errors
     ///
     /// * [`Error::InvalidState`] with [`StateError::PreviousSessionOpen`]
-    ///   while an earlier session is recording or stopping;
-    ///   [`finish`](Self::finish) it first. With
+    ///   while an earlier session is recording, stopping, or still has a
+    ///   known file awaiting its closure event after an indeterminate outcome;
+    ///   finish or poll it first, or [`reset`](Self::reset) it. With
     ///   [`StateError::EarlierSessionEvents`] when the SDK keeps reporting
     ///   events of an earlier session.
     /// * [`Error::Io`] when the directory of the file the pattern names
@@ -627,7 +670,7 @@ impl FileRecorder {
     ///   that event, counted in no session's report. Retrying `start` discards
     ///   queued events before asking the SDK to start again.
     pub fn start(&mut self, target: &RecordingTarget, timecode: RecordingTimecode) -> Result<u64> {
-        if self.ledger.session_open() {
+        if self.ledger.cleanup_pending() {
             return Err(Error::InvalidState(StateError::PreviousSessionOpen));
         }
         self.naming.check(target)?;
@@ -757,26 +800,22 @@ impl FileRecorder {
     /// Take the next native event, or `None` when the queue stays empty for
     /// `wait_ms` milliseconds.
     fn capture(&mut self, wait_ms: u32) -> Result<Option<NDIlib_file_recorder_event_t>> {
-        let mut event = OutParam::<NDIlib_file_recorder_event_t>::new();
-        // SAFETY: the recorder is live and `event` is writable storage for the
-        // structure the SDK fills in.
-        let kind = unsafe {
-            self.recording.NDIlib_file_recorder_capture_event(
-                self.handle.as_ptr(),
-                event.as_mut_ptr(),
-                wait_ms,
-            )
-        };
-        let event = event.read()?;
-        if kind == NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_none {
-            return Ok(None);
-        }
-        if kind != event.type_ {
-            return Err(Error::UnexpectedSdkResult(
-                "the recorder returned one event type and stored another".into(),
-            ));
-        }
-        Ok(Some(event))
+        out_param::capture_event(
+            |event| {
+                // SAFETY: the recorder is live and the helper keeps guarded
+                // event storage writable through the call.
+                unsafe {
+                    self.recording.NDIlib_file_recorder_capture_event(
+                        self.handle.as_ptr(),
+                        event,
+                        wait_ms,
+                    )
+                }
+            },
+            |event| event.type_,
+            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_none,
+            "the recorder returned one event type and stored another",
+        )
     }
 
     /// Stop the session and wait up to `timeout` for its last file to be
@@ -850,92 +889,81 @@ impl FileRecorder {
         deadline: Deadline,
         each: impl FnMut(Result<Option<RecorderEvent>>) -> bool,
     ) -> Result<FinishStatus> {
-        self.wait_finished_with(deadline, |_, deadline| deadline, each)
-    }
-
-    /// The same wait, with a budget the async shutdown path can narrow before
-    /// each poll. Cancellation stays separate from shutdown and ends the wait
-    /// after the current poll, whose event is still delivered by `each`.
-    pub(super) fn wait_finished_with(
-        &mut self,
-        mut deadline: Deadline,
-        mut budget: impl FnMut(&mut Self, Deadline) -> Deadline,
-        mut each: impl FnMut(Result<Option<RecorderEvent>>) -> bool,
-    ) -> Result<FinishStatus> {
-        if matches!(self.state(), RecorderState::Idle | RecorderState::Recording) {
-            return Err(Error::InvalidState(StateError::StopNotRequested));
-        }
+        self.check_wait()?;
+        let mut each = each;
         let mut interrupted = false;
         let mut late_polls = 0;
         loop {
-            deadline = budget(self, deadline);
-            match self.state() {
-                RecorderState::Closed => return Ok(FinishStatus::Closed(self.report())),
-                RecorderState::Indeterminate => {
-                    return Ok(FinishStatus::Indeterminate(self.report()))
-                }
-                _ => {}
+            if let Some(outcome) = self.settle_wait(false, false) {
+                return Ok(outcome);
             }
-            if interrupted {
-                return Ok(FinishStatus::TimedOut(self.report()));
+            if interrupted || late_polls == STALE_EVENT_LIMIT {
+                return Ok(self
+                    .settle_wait(true, true)
+                    .expect("a completed drain settles"));
             }
-            // Read once, so that this poll and the check after it agree on
-            // whether it was a late one.
+            // Read once, so the poll and its settlement agree whether this
+            // is part of the final, bounded nonblocking drain.
             let expired = deadline.is_expired();
             if expired {
-                if late_polls == STALE_EVENT_LIMIT {
-                    return Ok(FinishStatus::TimedOut(self.report()));
-                }
                 late_polls += 1;
             }
-            // With every file closed, one empty poll settles the outcome.
             let step = if self.ledger.all_closed() {
                 SETTLE_POLL
             } else {
                 FINISH_POLL
             };
-            // A failed poll is an event that was taken but could not be
-            // decoded, or could not be read at all. Either way its effect is
-            // already in the ledger, which the loop goes on to settle.
             let polled =
                 self.poll_event_ms(deadline.within_at(Instant::now(), step).remaining_ms());
             let drained = matches!(polled, Ok(None));
             interrupted = each(polled);
-            if expired && drained {
-                // The queue was empty and its state recorded: what it shows
-                // now is the outcome.
-                return Ok(match self.state() {
-                    RecorderState::Closed => FinishStatus::Closed(self.report()),
-                    RecorderState::Indeterminate => FinishStatus::Indeterminate(self.report()),
-                    _ => FinishStatus::TimedOut(self.report()),
-                });
+            if let Some(outcome) = self.settle_wait(expired, drained) {
+                return Ok(outcome);
             }
         }
     }
 
-    /// Reuse the close's deadline for both an active finish and destruction.
-    pub(super) fn limit_shutdown_wait(
-        &mut self,
-        deadline: Deadline,
-        requested: Instant,
-    ) -> Deadline {
-        let deadline = deadline.within_at(requested, self.drop_wait);
-        self.drop_deadline = Some(deadline);
-        deadline
-    }
-
-    pub(super) fn bound_shutdown_wait(&mut self, requested: Instant) {
-        if self.drop_deadline.is_none() {
-            self.drop_deadline = Deadline::starting(requested, self.drop_wait).ok();
-            if self.drop_deadline.is_none() {
-                // An unrepresentable deadline cannot provide a bounded wait.
-                self.drop_wait = Duration::ZERO;
-            }
+    pub(super) fn check_wait(&self) -> Result<()> {
+        if matches!(self.state(), RecorderState::Idle | RecorderState::Recording) {
+            Err(Error::InvalidState(StateError::StopNotRequested))
+        } else {
+            Ok(())
         }
     }
 
-    pub(super) fn shutdown_wait_spent(&mut self) {
-        self.drop_wait = Duration::ZERO;
+    pub(super) fn settle_wait(&self, expired: bool, drained: bool) -> Option<FinishStatus> {
+        self.ledger.settle(expired, drained)
+    }
+
+    /// Start cleanup once, retaining an async close's original submission time.
+    pub(super) fn begin_cleanup(&mut self, requested: Instant) -> Option<Deadline> {
+        self.cleanup.begin(requested)
+    }
+
+    pub(super) fn cleanup_pending(&self) -> bool {
+        self.ledger.cleanup_pending()
+    }
+
+    /// Keep taking closure evidence even when the session's report is final.
+    fn wait_cleanup(&mut self, deadline: Deadline) {
+        let mut late_polls = 0;
+        while self.ledger.cleanup_pending() {
+            let expired = deadline.is_expired();
+            if expired {
+                if late_polls == STALE_EVENT_LIMIT {
+                    break;
+                }
+                late_polls += 1;
+            }
+            let polled = self.poll_event_ms(
+                deadline
+                    .within_at(Instant::now(), FINISH_POLL)
+                    .remaining_ms(),
+            );
+            if expired && matches!(polled, Ok(None)) {
+                break;
+            }
+        }
     }
 
     /// Stop and destroy the recorder at once, without waiting for the SDK to
@@ -943,7 +971,7 @@ impl FileRecorder {
     ///
     /// The file of a session that had not ended may be left truncated.
     pub fn abandon(mut self) -> RecordingReport {
-        self.drop_wait = Duration::ZERO;
+        self.cleanup = CleanupBudget::Skip;
         self.report()
     }
 
@@ -1158,15 +1186,15 @@ impl FileRecorder {
     /// [`Error::UnexpectedSdkResult`] when the SDK's structure does not match this
     /// crate's layout.
     pub fn stats(&self) -> Result<Option<RecorderStats>> {
-        let mut stats = OutParam::<NDIlib_file_recorder_stats_t>::new();
-        // SAFETY: the recorder is live and `stats` is writable storage for the
-        // structure the SDK fills in.
-        let available = unsafe {
-            self.recording
-                .NDIlib_file_recorder_get_stats(self.handle.as_ptr(), stats.as_mut_ptr())
-        };
-        let stats = stats.read()?;
-        Ok(available.then(|| RecorderStats::from_sdk(&stats)))
+        out_param::checked_fill(|stats| {
+            // SAFETY: the recorder is live and the helper keeps guarded stats
+            // storage writable through the call.
+            unsafe {
+                self.recording
+                    .NDIlib_file_recorder_get_stats(self.handle.as_ptr(), stats)
+            }
+        })
+        .map(|stats| stats.map(|stats| RecorderStats::from_sdk(&stats)))
     }
 
     /// The format of the source, once the recorder has seen audio or video.
@@ -1175,15 +1203,16 @@ impl FileRecorder {
     ///
     /// [`Error::UnexpectedSdkResult`] when the SDK's structure is malformed.
     pub fn source_format(&self) -> Result<Option<SourceFormat>> {
-        let mut format = OutParam::<NDIlib_file_source_format_t>::new();
-        // SAFETY: the recorder is live and `format` is writable storage for
-        // the structure the SDK fills in.
-        let known = unsafe {
-            self.recording
-                .NDIlib_file_recorder_get_source_format(self.handle.as_ptr(), format.as_mut_ptr())
-        };
-        let format = format.read()?;
-        known.then(|| SourceFormat::from_sdk(&format)).transpose()
+        out_param::checked_fill(|format| {
+            // SAFETY: the recorder is live and the helper keeps guarded
+            // format storage writable through the call.
+            unsafe {
+                self.recording
+                    .NDIlib_file_recorder_get_source_format(self.handle.as_ptr(), format)
+            }
+        })?
+        .map(|format| SourceFormat::from_sdk(&format))
+        .transpose()
     }
 }
 
@@ -1191,18 +1220,10 @@ impl Drop for FileRecorder {
     fn drop(&mut self) {
         // The SDK finalizes a file between the stop request and the
         // file-closed event; destroying sooner may truncate it.
-        if self.ledger.session_open() {
+        if self.ledger.cleanup_pending() {
             self.request_stop();
-            if !self.drop_wait.is_zero() {
-                // The outcome cannot be reported from here. The wait itself
-                // cannot fail: the session is stopping and `drop_wait` was
-                // checked when the recorder was created, and a malformed
-                // event does not end it.
-                if let Some(deadline) = self.drop_deadline {
-                    let _ = self.wait_finished_from(deadline, |_| false);
-                } else {
-                    let _ = self.wait_finished(self.drop_wait);
-                }
+            if let Some(deadline) = self.cleanup.begin(Instant::now()) {
+                self.wait_cleanup(deadline);
             }
         }
         // SAFETY: the recorder is live and is destroyed exactly once, on the
@@ -1269,6 +1290,42 @@ mod tests {
         ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
         assert_eq!(ledger.report.dropped_events, 1);
+    }
+
+    #[test]
+    fn an_indeterminate_report_keeps_its_pending_cleanup_without_changing_the_report() {
+        let mut ledger = session();
+        ledger.observe(Started, path("take.mkv"));
+        ledger.dropped(1);
+        ledger.drained(false);
+        assert_eq!(ledger.state(), RecorderState::Indeterminate);
+        assert!(ledger.cleanup_pending());
+        let report = ledger.report.clone();
+        ledger.observe(FileClosed, path("other.mkv"));
+        assert!(ledger.cleanup_pending());
+        ledger.observe(FileClosed, path("take.mkv"));
+        assert!(!ledger.cleanup_pending());
+        assert_eq!(ledger.report, report);
+    }
+
+    #[test]
+    fn a_wait_settles_only_on_a_final_report_or_an_expired_completed_drain() {
+        let mut ledger = session();
+        ledger.observe(Started, path("take.mkv"));
+        ledger.stop_requested(true);
+        assert_eq!(ledger.settle(false, false), None);
+        assert_eq!(ledger.settle(false, true), None);
+        assert_eq!(ledger.settle(true, false), None);
+        assert!(matches!(
+            ledger.settle(true, true),
+            Some(FinishStatus::TimedOut(_))
+        ));
+        ledger.observe(FileClosed, path("take.mkv"));
+        ledger.drained(false);
+        assert!(matches!(
+            ledger.settle(false, false),
+            Some(FinishStatus::Closed(_))
+        ));
     }
 
     #[test]

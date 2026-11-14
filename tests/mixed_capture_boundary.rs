@@ -160,6 +160,24 @@ fn exercise(library: std::path::PathBuf) {
         "returned events must not be retained again"
     );
 
+    // The no-slot kernel reports unknown native values, and combined capture
+    // reports the same value once through its own event constructor.
+    script(90, "unknown");
+    assert_eq!(
+        receiver.poll_event(Duration::ZERO).unwrap(),
+        Some(ReceiverEvent::Unknown(987))
+    );
+    assert!(log().lines().last().unwrap().ends_with(":000:0"));
+    assert!(receiver.capture_any_ref(Duration::ZERO).unwrap().is_none());
+    script(91, "unknown");
+    assert!(matches!(
+        receiver.capture_any_ref(Duration::ZERO).unwrap(),
+        Some(ReceiverItemRef::Event(ReceiverEvent::Unknown(987)))
+    ));
+    assert!(log().lines().last().unwrap().ends_with(":111:0"));
+    assert!(receiver.poll_event(Duration::ZERO).unwrap().is_none());
+    assert!(receiver.capture_any_ref(Duration::ZERO).unwrap().is_none());
+
     // Typed capture retains an invalidation and combined capture consumes it
     // without making another native call, including for a zero timeout.
     script(2, "status");

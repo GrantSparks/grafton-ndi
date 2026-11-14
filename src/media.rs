@@ -161,6 +161,15 @@ impl From<PixelFormat> for FourCc {
     }
 }
 
+impl PixelFormat {
+    /// Decode an uncompressed format without allocating for an unknown FourCC.
+    pub(crate) fn from_fourcc(fourcc: FourCc) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|&format| FourCc::from(format) == fourcc)
+    }
+}
+
 impl TryFrom<FourCc> for PixelFormat {
     type Error = Error;
 
@@ -171,12 +180,9 @@ impl TryFrom<FourCc> for PixelFormat {
     /// [`Error::InvalidFrame`] when it names no uncompressed pixel format
     /// this crate supports.
     fn try_from(fourcc: FourCc) -> Result<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|&format| FourCc::from(format) == fourcc)
-            .ok_or_else(|| {
-                Error::InvalidFrame(format!("Unknown pixel format FourCC: 0x{:08X}", fourcc.0))
-            })
+        Self::from_fourcc(fourcc).ok_or_else(|| {
+            Error::InvalidFrame(format!("Unknown pixel format FourCC: 0x{:08X}", fourcc.0))
+        })
     }
 }
 

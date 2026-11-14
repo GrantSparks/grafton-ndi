@@ -78,8 +78,8 @@ use std::{fmt, num::NonZeroU32};
 use crate::{
     capture::{FrameSyncAudioFree, FrameSyncVideoFree, Guard},
     frames::{
-        validate_audio_sample_rate, validate_packed_audio_dimensions, validate_returned_audio,
-        AudioFrame, AudioRef, ReturnedAudio, ScanType, VideoFrame, VideoRef,
+        validate_returned_audio, AudioFrame, AudioRef, ReturnedAudio, ScanType,
+        ValidatedAudioLayout, VideoFrame, VideoRef,
     },
     receiver::{FrameSyncAttached, Receiver},
     sys::bindings::*,
@@ -182,29 +182,26 @@ impl AudioInputFormat {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrameSyncAudioRequest {
-    // The SDK's signed arguments, all checked positive.
-    sample_rate: i32,
-    num_channels: i32,
-    num_samples: i32,
+    layout: ValidatedAudioLayout,
 }
 
 impl FrameSyncAudioRequest {
     /// Requested output sample rate in Hz.
     #[must_use]
     pub fn sample_rate(&self) -> u32 {
-        self.sample_rate as u32
+        self.layout.sample_rate()
     }
 
     /// Requested number of output channels.
     #[must_use]
     pub fn num_channels(&self) -> u32 {
-        self.num_channels as u32
+        self.layout.num_channels()
     }
 
     /// Requested number of output samples per channel.
     #[must_use]
     pub fn num_samples(&self) -> u32 {
-        self.num_samples as u32
+        self.layout.num_samples()
     }
 
     /// Capture samples resampled to `sample_rate` Hz, converted to
@@ -221,14 +218,14 @@ impl FrameSyncAudioRequest {
     /// stride, arithmetic overflow, or a sample payload exceeding 64 MiB.
     /// Validation does not allocate sample storage.
     pub fn capture_at(sample_rate: u32, num_channels: u32, num_samples: u32) -> Result<Self> {
-        let sample_rate = validate_audio_sample_rate(sample_rate.into())?;
-        validate_packed_audio_dimensions(num_channels, num_samples)?;
-        // Lossless: the rate and the packed dimensions were checked to fit
-        // the SDK's signed arguments.
         Ok(Self {
-            sample_rate: sample_rate as i32,
-            num_channels: num_channels as i32,
-            num_samples: num_samples as i32,
+            layout: ValidatedAudioLayout::new_uncompressed(
+                crate::AudioFormat::Fltp,
+                sample_rate,
+                num_channels,
+                num_samples,
+                None,
+            )?,
         })
     }
 
@@ -338,6 +335,11 @@ pub struct FrameSync {
     resource: FrameSyncResource,
     receiver: Receiver<FrameSyncAttached>,
 }
+
+const _: () = {
+    const fn send_and_sync<T: Send + Sync>() {}
+    send_and_sync::<FrameSync>();
+};
 
 struct FrameSyncResource {
     instance: NDIlib_framesync_instance_t,
@@ -483,9 +485,9 @@ impl FrameSyncResource {
     fn capture_audio(&self, call: AudioCall) -> Guard<'_, FrameSyncAudioFree> {
         let (sample_rate, num_channels, num_samples) = match call {
             AudioCall::Samples(request) => (
-                request.sample_rate,
-                request.num_channels,
-                request.num_samples,
+                request.layout.sdk_sample_rate(),
+                request.layout.sdk_num_channels(),
+                request.layout.sdk_num_samples(),
             ),
             AudioCall::InputFormat => (0, 0, 0),
         };
@@ -980,7 +982,7 @@ impl FrameSync {
 /// it. It retains the SDK runtime directly. Borrowed frame guards cannot be moved
 /// between threads and keep this owner borrowed until their buffers are
 /// freed; destruction requires exclusive ownership.
-unsafe impl Send for FrameSync {}
+unsafe impl Send for FrameSyncResource {}
 
 /// # Safety
 ///
@@ -1005,10 +1007,11 @@ unsafe impl Send for FrameSync {}
 ///
 /// `one_framesync_serves_captures_from_several_threads_at_once` in
 /// tests/framesync_capture_boundary.rs repeats the last check briefly with
-/// every runtime the tests run against. Receiver attachment disables raw
-/// video and audio capture until the synchronizer is destroyed, including
-/// when the receiver is accessed through [`FrameSync::receiver`].
-unsafe impl Sync for FrameSync {}
+/// every runtime the tests run against. The enclosing FrameSync's
+/// Receiver<FrameSyncAttached> contributes its own auto traits; attachment
+/// disables raw video and audio capture until this resource is destroyed,
+/// including when the receiver is accessed through [`FrameSync::receiver`].
+unsafe impl Sync for FrameSyncResource {}
 
 impl fmt::Debug for FrameSync {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

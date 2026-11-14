@@ -106,6 +106,7 @@ fn native_resource_ownership() {
             "queue_scatter_protocol",
             "queue_scatter_unavailable",
             "queue_destroy",
+            "queue_close",
             "queue_registered_sender",
         ]);
     }
@@ -598,7 +599,12 @@ fn child(case: &str) {
                 assert!(!log().contains("sender-scatter-submit"));
             } else if case == "queue_scatter_protocol" {
                 std::env::set_var("GRAFTON_FAKE_SCATTER_KEY", "altered");
-                queue.try_submit(packet()).unwrap();
+                let frame = packet();
+                let original = frame
+                    .blocks()
+                    .map(|block| block.as_ptr())
+                    .collect::<Vec<_>>();
+                let id = queue.try_submit(frame).unwrap();
                 assert!(queue.completion_protocol_failed());
                 assert_eq!(queue.retained_frames(), 1);
                 assert!(queue.try_take_completed().is_none());
@@ -606,6 +612,25 @@ fn child(case: &str) {
                     queue.try_submit(packet()).unwrap_err().error(),
                     Error::UnexpectedSdkResult(_)
                 ));
+                assert!(matches!(
+                    queue.wait_completed(Duration::ZERO),
+                    Err(Error::UnexpectedSdkResult(_))
+                ));
+                let mut reclaimed = queue.close();
+                assert_eq!(reclaimed.len(), 1);
+                let completed = reclaimed.pop().unwrap();
+                assert_eq!(completed.id(), id);
+                let QueuedVideoFrame::Scatter(frame) = completed.into_frame() else {
+                    panic!("the frame changed type")
+                };
+                assert_eq!(
+                    frame
+                        .blocks()
+                        .map(|block| block.as_ptr())
+                        .collect::<Vec<_>>(),
+                    original
+                );
+                assert_eq!(log().matches("sender-destroy\n").count(), 1);
             } else {
                 let mut submitted = Vec::new();
                 for _ in 0..3 {
@@ -756,19 +781,36 @@ fn child(case: &str) {
             assert_eq!(log().matches("sender-submit-return\n").count(), 128);
         }
         #[cfg(feature = "advanced")]
-        "queue_destroy" => {
-            use grafton_ndi::advanced::{QueueOptions, QueuedSender};
+        "queue_destroy" | "queue_close" => {
+            use grafton_ndi::advanced::{QueueOptions, QueuedSender, QueuedVideoFrame};
             let mut queue =
                 QueuedSender::new(&ndi, &SenderOptions::new("queue"), QueueOptions::default())
                     .unwrap();
-            queue.try_submit(frame()).unwrap();
-            queue.try_submit(frame()).unwrap();
+            let original = [frame(), frame()].map(|frame| {
+                let pointer = frame.data().as_ptr();
+                (queue.try_submit(frame).unwrap(), pointer)
+            });
             assert!(queue
                 .wait_completed(Duration::from_millis(1))
                 .unwrap()
                 .is_none());
             assert_eq!(queue.retained_frames(), 2);
-            drop(queue);
+            if case == "queue_close" {
+                let reclaimed = queue.close();
+                assert_eq!(reclaimed.len(), original.len());
+                // This fixture completes pending frames most recent first.
+                for (completed, (id, pointer)) in
+                    reclaimed.into_iter().zip(original.into_iter().rev())
+                {
+                    assert_eq!(completed.id(), id);
+                    let QueuedVideoFrame::Pixels(frame) = completed.into_frame() else {
+                        panic!("the frame changed type")
+                    };
+                    assert_eq!(frame.data().as_ptr(), pointer);
+                }
+            } else {
+                drop(queue);
+            }
             let events = log();
             assert!(
                 events.find("sender-destroy-begin\n").unwrap()
@@ -779,6 +821,7 @@ fn child(case: &str) {
                     < events.find("sender-destroy\n").unwrap()
             );
             assert_eq!(events.matches("sender-completion\n").count(), 2);
+            assert_eq!(events.matches("sender-destroy\n").count(), 1);
         }
         #[cfg(feature = "advanced")]
         "queue_registered_sender" => {

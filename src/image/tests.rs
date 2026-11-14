@@ -1668,6 +1668,70 @@ fn unreadable_color_metadata_is_refused_unless_the_caller_overrides() {
     }
 }
 
+#[test]
+fn withheld_color_metadata_is_refused_by_every_encoder_before_output() {
+    for format in [PixelFormat::Uyvy, PixelFormat::Rgba] {
+        let frame = VideoFrame::builder()
+            .resolution(2, 2)
+            .pixel_format(format)
+            .build()
+            .unwrap();
+        for status in [
+            crate::FrameMetadataStatus::NotUtf8,
+            crate::FrameMetadataStatus::Unterminated,
+        ] {
+            let source = || {
+                let mut source = Source::new(&frame);
+                source.metadata = crate::color_info::Metadata::new(status, None);
+                source
+            };
+            for output_format in [
+                ImageFormat::Png,
+                ImageFormat::Jpeg(85),
+                ImageFormat::WebpLossless,
+                ImageFormat::WebpLossy(75),
+            ] {
+                let sdk = options(output_format);
+                let mut out = Recorder {
+                    written: 0,
+                    fail_after: None,
+                };
+                let message = invalid_frame(super::encode_to(source(), &sdk, &mut out));
+                assert!(message.contains(&format!("{status:?}")), "{message}");
+                assert!(message.contains("ColorPolicy::Override"), "{message}");
+                assert_eq!(out.written, 0);
+                invalid_frame(super::encode(source(), &sdk));
+                invalid_frame(super::encode_data_url(source(), &sdk));
+                let mut workspace = crate::ImageWorkspace::new();
+                invalid_frame(workspace.encode_source(source(), &sdk));
+                assert_eq!(workspace.retained_bytes(), 0);
+
+                let overridden = sdk.color(ColorPolicy::Override {
+                    matrix: YuvMatrix::Bt709,
+                    range: YuvRange::Limited,
+                });
+                let expected = frame.encode_image(&overridden).unwrap();
+                let actual = super::encode(source(), &overridden).unwrap();
+                assert_eq!(actual, expected);
+                let mut output = Vec::new();
+                super::encode_to(source(), &overridden, &mut output).unwrap();
+                assert_eq!(output, expected);
+                assert_eq!(
+                    super::encode_data_url(source(), &overridden).unwrap(),
+                    frame.encode_image_data_url(&overridden).unwrap()
+                );
+                assert_eq!(
+                    workspace.encode_source(source(), &overridden).unwrap(),
+                    expected
+                );
+                if output_format == ImageFormat::Png {
+                    assert!(png_chunks(&actual).iter().all(|(kind, _)| kind != b"cICP"));
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Option checks, sizes and writers
 // ---------------------------------------------------------------------------

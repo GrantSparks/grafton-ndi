@@ -40,7 +40,7 @@ pub(crate) struct Source<'a> {
     height: usize,
     format: PixelFormat,
     planes: VideoPlanes<'a>,
-    metadata: Option<&'a str>,
+    metadata: color_info::Metadata<'a>,
 }
 
 impl<'a> Source<'a> {
@@ -51,7 +51,7 @@ impl<'a> Source<'a> {
             height: layout.height() as usize,
             format: layout.pixel_format(),
             planes: frame.plane_views(),
-            metadata: frame.metadata_text().map(|text| text.as_str()),
+            metadata: frame.color_metadata(),
         }
     }
 }
@@ -320,8 +320,8 @@ impl Plan {
         // The caller who overrides the conversion takes responsibility for
         // the frame's color: unreadable metadata then counts as none.
         let color = match options.color {
-            ColorPolicy::Sdk => color_info::parse(source.metadata)?,
-            ColorPolicy::Override { .. } => color_info::parse(source.metadata).ok().flatten(),
+            ColorPolicy::Sdk => source.metadata.read()?,
+            ColorPolicy::Override { .. } => source.metadata.read().ok().flatten(),
         };
         if let Some(transfer) = color.and_then(|color| hdr_transfer(&color)) {
             match options.hdr {

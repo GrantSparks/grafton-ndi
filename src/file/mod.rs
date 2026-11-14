@@ -174,11 +174,8 @@ pub use types::*;
 
 use std::path::{Path, PathBuf};
 
-use crate::{
-    capabilities::CapabilityStatus,
-    sys::{self, bindings::NDIlib_file_player_file_info_t},
-    Error, Ndi, Result,
-};
+use crate::{capabilities::CapabilityStatus, sys, Error, Ndi, Result};
+#[cfg(test)]
 use out_param::OutParam;
 
 /// A family of the NDI File library's entry points, which a library provides
@@ -346,17 +343,14 @@ impl FileApi {
     pub fn probe(&self, path: impl AsRef<Path>) -> Result<FileInfo> {
         let playback = self.table::<sys::FilePlayback>()?;
         let path = types::path_string(path.as_ref())?;
-        let mut info = OutParam::<NDIlib_file_player_file_info_t>::new();
-        // SAFETY: `path` is a NUL-terminated string that outlives the call and
-        // `info` is writable storage for the structure the SDK fills in.
-        let probed =
-            unsafe { playback.NDIlib_file_player_probe_file(path.as_ptr(), info.as_mut_ptr()) };
-        let info = info.read()?;
-        if !probed {
-            return Err(Error::NativeOperationFailed {
-                operation: "file probe",
-            });
-        }
+        let info = out_param::checked_fill(|info| {
+            // SAFETY: `path` is a NUL-terminated string that outlives the
+            // call; the helper keeps guarded info storage writable through it.
+            unsafe { playback.NDIlib_file_player_probe_file(path.as_ptr(), info) }
+        })?
+        .ok_or(Error::NativeOperationFailed {
+            operation: "file probe",
+        })?;
         FileInfo::from_sdk(&info)
     }
 

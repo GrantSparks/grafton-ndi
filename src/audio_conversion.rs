@@ -6,7 +6,7 @@
 //! descriptors, which have no metadata or timestamp fields.
 
 use crate::{
-    frames::{validate_packed_audio_dimensions, AudioSource},
+    frames::{AudioSource, ValidatedAudioLayout},
     sender::AudioSendMode,
     sys::{self, bindings::*},
     AudioFrame, Error, Ndi, Result, Sender, Timecode,
@@ -38,25 +38,19 @@ impl AudioReferenceLevel {
 
 /// Checked FLTP dimensions shared by interleaved inputs and planar frames.
 #[derive(Debug, Clone, Copy)]
-struct AudioShape {
-    sample_rate: u32,
-    num_channels: u32,
-    num_samples: u32,
-    count: usize,
-}
+struct AudioShape(ValidatedAudioLayout);
 
 impl AudioShape {
     fn new(sample_rate: u32, num_channels: u32, num_samples: u32) -> Result<Self> {
-        let sample_rate = crate::frames::validate_audio_sample_rate(sample_rate.into())?;
         // Share FLTP's checked stride and 64 MiB payload ceiling. This also
         // bounds conversion destinations for 16-bit source data.
-        let count = validate_packed_audio_dimensions(num_channels, num_samples)?.sample_count();
-        Ok(Self {
+        Ok(Self(ValidatedAudioLayout::new_uncompressed(
+            crate::AudioFormat::Fltp,
             sample_rate,
             num_channels,
             num_samples,
-            count,
-        })
+            None,
+        )?))
     }
 
     /// The shape of `len` interleaved samples in `num_channels` channels.
@@ -80,20 +74,14 @@ impl AudioShape {
     /// within the shared payload limit, and exactly `channels * samples`
     /// samples. Nothing is checked again.
     fn from_planar(frame: &(impl AudioSource + ?Sized)) -> Self {
-        let layout = frame.layout();
-        Self {
-            sample_rate: layout.sample_rate(),
-            num_channels: layout.no_channels() as u32,
-            num_samples: layout.no_samples() as u32,
-            count: layout.no_channels() * layout.no_samples(),
-        }
+        Self(frame.layout().packed())
     }
 
     fn check_output(self, length: usize) -> Result<()> {
-        if length < self.count {
+        if length < self.0.sample_count() {
             return Err(Error::InvalidFrame(format!(
                 "audio destination has {length} samples, requires {}",
-                self.count
+                self.0.sample_count()
             )));
         }
         Ok(())
@@ -102,9 +90,9 @@ impl AudioShape {
     /// Require a destination frame of exactly this shape, so that the native
     /// conversion writes every sample of it and nothing beyond.
     fn check_planar(self, frame: &AudioFrame) -> Result<()> {
-        if frame.sample_rate() != self.sample_rate
-            || frame.num_channels() != self.num_channels
-            || frame.num_samples() != self.num_samples
+        if frame.sample_rate() != self.0.sample_rate()
+            || frame.num_channels() != self.0.num_channels()
+            || frame.num_samples() != self.0.num_samples()
         {
             return Err(Error::InvalidFrame(
                 "planar destination rate, channels and samples must match the interleaved source"
@@ -116,9 +104,9 @@ impl AudioShape {
 
     fn allocate(self, timecode: Timecode) -> Result<AudioFrame> {
         AudioFrame::builder()
-            .sample_rate(self.sample_rate)
-            .num_channels(self.num_channels)
-            .num_samples(self.num_samples)
+            .sample_rate(self.0.sample_rate())
+            .num_channels(self.0.num_channels())
+            .num_samples(self.0.num_samples())
             .timecode(timecode)
             .build()
             .map_err(crate::Rejected::into_error)
@@ -126,12 +114,10 @@ impl AudioShape {
 
     /// The SDK's `sample_rate`, `no_channels` and `no_samples`.
     fn to_sdk(self) -> (i32, i32, i32) {
-        // Lossless: `new`, or the validated layout of the frame `from_planar`
-        // read, checked each against the SDK's signed range.
         (
-            self.sample_rate as i32,
-            self.num_channels as i32,
-            self.num_samples as i32,
+            self.0.sdk_sample_rate(),
+            self.0.sdk_num_channels(),
+            self.0.sdk_num_samples(),
         )
     }
 }
@@ -172,11 +158,11 @@ macro_rules! interleaved_input {
             #[must_use]
             pub fn with_timecode(mut self, timecode: Timecode) -> Self { self.timecode = timecode; self }
             /// Sample rate in Hz.
-            pub fn sample_rate(&self) -> u32 { self.shape.sample_rate }
+            pub fn sample_rate(&self) -> u32 { self.shape.0.sample_rate() }
             /// Number of interleaved channels.
-            pub fn num_channels(&self) -> u32 { self.shape.num_channels }
+            pub fn num_channels(&self) -> u32 { self.shape.0.num_channels() }
             /// Number of samples per channel.
-            pub fn num_samples(&self) -> u32 { self.shape.num_samples }
+            pub fn num_samples(&self) -> u32 { self.shape.0.num_samples() }
             /// The timecode.
             pub fn timecode(&self) -> Timecode { self.timecode }
             /// Complete initialized interleaved samples.
@@ -248,7 +234,7 @@ macro_rules! conversions {
             if !unsafe { self.audio.$to(&source, &mut destination) } {
                 return Err(Error::NativeOperationFailed { operation: stringify!($to_method) });
             }
-            Ok(shape.count)
+            Ok(shape.0.sample_count())
         }
 
         /// Allocate a tightly packed FLTP frame with the source timecode.
@@ -434,7 +420,8 @@ mod tests {
                 32
             );
             assert_eq!(
-                shape.count, 6,
+                shape.0.sample_count(),
+                6,
                 "padding is not an interleaved destination sample"
             );
             assert!(shape.check_output(5).is_err());

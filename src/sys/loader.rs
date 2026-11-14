@@ -420,6 +420,8 @@ mod shared {
                 beside: None,
                 names: &names,
                 anchor: CORE_ANCHOR,
+                #[cfg(all(unix, not(target_vendor = "apple")))]
+                selected_core: None,
                 description: &description,
             }
             .open(|module| Runtime::describe(module, requested))
@@ -464,6 +466,9 @@ mod shared {
         pub(in crate::sys) names: &'a [&'a str],
         /// A symbol the library must define; it identifies the opened module.
         pub(in crate::sys) anchor: &'a CStr,
+        /// The selected core's anchor when this search loads its File library.
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        pub(in crate::sys) selected_core: Option<*const c_void>,
         /// What is being looked for, as the error names it.
         pub(in crate::sys) description: &'a str,
     }
@@ -474,6 +479,8 @@ mod shared {
         /// # Errors
         ///
         /// [`Error::InvalidInput`] for a relative explicit path;
+        /// [`Error::RuntimeConflict`] for an explicit runtime or a File search
+        /// that would bind to another globally visible runtime;
         /// otherwise [`Error::RuntimeLoadFailed`] naming every location tried
         /// and the reason each was rejected.
         pub(in crate::sys) fn open<T>(
@@ -494,7 +501,7 @@ mod shared {
             );
             let mut failures = Vec::with_capacity(plan.len());
             for candidate in plan {
-                let refusal = match candidate.open(self.anchor) {
+                let refusal = match candidate.open(self) {
                     Ok(module) => {
                         // `accept` consumes the module, so its identity is taken first.
                         let loaded = Loaded {
@@ -511,6 +518,14 @@ mod shared {
                     }
                     Err(refusal) => refusal,
                 };
+                if let LoadRefusal::ForeignRuntimeInScope { .. } = &refusal.reason {
+                    if self.explicit.is_some() || self.kind == LibraryKind::File {
+                        return Err(Error::RuntimeConflict {
+                            kind: SelectionConflict::ForeignRuntimeInScope,
+                            detail: format!("{candidate}: {}", refusal.reason),
+                        });
+                    }
+                }
                 failures.push(candidate.describe(refusal));
             }
             Err(Error::RuntimeLoadFailed(LoadFailure::searched(
@@ -518,6 +533,27 @@ mod shared {
                 self.description,
                 failures,
             )))
+        }
+
+        /// ELF global definitions take precedence over a module's own imports,
+        /// even when that module is opened locally. Check before opening it:
+        /// constructors and PLT self-calls could otherwise reach another core.
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        fn check_global_scope(&self, location: &OsStr) -> std::result::Result<(), LoadRefusal> {
+            let Some(global) = global_definition(CORE_ANCHOR)? else {
+                return Ok(());
+            };
+            let same_module = match self.selected_core {
+                Some(selected) => global.address == selected,
+                None => same_loaded_module(location, global.path.as_os_str()),
+            };
+            if same_module {
+                Ok(())
+            } else {
+                Err(LoadRefusal::ForeignRuntimeInScope {
+                    module: global.path,
+                })
+            }
         }
     }
 
@@ -545,7 +581,7 @@ mod shared {
     }
 
     impl Candidate {
-        fn open(&self, anchor: &CStr) -> std::result::Result<Module, Refusal> {
+        fn open(&self, search: &Search<'_>) -> std::result::Result<Module, Refusal> {
             // A relative environment directory is a refused location, never
             // a request to load code relative to the working directory.
             if self.origin == Origin::RuntimeDirectory && !self.location.is_absolute() {
@@ -560,7 +596,11 @@ mod shared {
             {
                 return Err(Refusal::unloaded(LoadRefusal::Absent));
             }
-            Module::open(self.location.as_os_str(), anchor)
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            search
+                .check_global_scope(self.location.as_os_str())
+                .map_err(Refusal::unloaded)?;
+            Module::open(self.location.as_os_str(), search.anchor)
         }
 
         /// Why this candidate cannot be used.
@@ -693,9 +733,66 @@ mod shared {
     }
 
     fn same_path(a: &Path, b: &Path) -> bool {
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let (Ok(a), Ok(b)) = (a.metadata(), b.metadata()) {
+                return a.dev() == b.dev() && a.ino() == b.ino();
+            }
+        }
         match (a.canonicalize(), b.canonicalize()) {
             (Ok(a), Ok(b)) => a == b,
             _ => a == b,
+        }
+    }
+
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    struct GlobalDefinition {
+        address: *const c_void,
+        path: PathBuf,
+    }
+
+    /// Identify the global definition through the same module lookup used by
+    /// opened libraries, keeping all `dladdr` access in `containing_module`.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    fn global_definition(
+        name: &CStr,
+    ) -> std::result::Result<Option<GlobalDefinition>, LoadRefusal> {
+        // SAFETY: a lookup of a NUL-terminated name in the default scope. The
+        // address is inspected, never called through this pointer.
+        let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        if address.is_null() {
+            return Ok(None);
+        }
+        let (_, path) =
+            containing_module(address).map_err(|detail| LoadRefusal::NotIdentifiable { detail })?;
+        Ok(Some(GlobalDefinition {
+            address,
+            path: path.canonicalize().unwrap_or(path),
+        }))
+    }
+
+    /// Compare loader handles without loading either name. In particular, a
+    /// bare name may resolve to a preloaded module through its SONAME, and
+    /// aliases may name that module without sharing its original path spelling.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    fn same_loaded_module(a: &OsStr, b: &OsStr) -> bool {
+        use libloading::os::unix::Library;
+        let probe = |location: &OsStr| {
+            // SAFETY: RTLD_NOLOAD only acquires a reference to an existing
+            // module; it cannot load code or run constructors. RTLD_LAZY does
+            // not promote existing lazy relocations to eager binding.
+            let library =
+                unsafe { Library::open(Some(location), libc::RTLD_NOLOAD | libc::RTLD_LAZY) }
+                    .ok()?;
+            let handle = library.into_raw();
+            // SAFETY: this is the reference `into_raw` just released. Its drop
+            // balances only the no-load probe, leaving the original load intact.
+            Some((unsafe { Library::from_raw(handle) }, handle))
+        };
+        match (probe(a), probe(b)) {
+            (Some((_, a)), Some((_, b))) => a == b,
+            _ => false,
         }
     }
 
@@ -901,7 +998,17 @@ mod shared {
             assert!(!plan
                 .iter()
                 .any(|candidate| candidate.location.parent() == Some(Path::new("relative"))));
-            let refusal = match refused.open(CORE_ANCHOR) {
+            let search = Search {
+                kind: LibraryKind::Runtime,
+                explicit: None,
+                beside: None,
+                names: &["libndi.so.6"],
+                anchor: CORE_ANCHOR,
+                #[cfg(all(unix, not(target_vendor = "apple")))]
+                selected_core: None,
+                description: "NDI runtime",
+            };
+            let refusal = match refused.open(&search) {
                 Ok(_) => panic!("relative runtime directory was opened"),
                 Err(refusal) => refusal,
             };

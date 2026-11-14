@@ -26,6 +26,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Runtime and File library selection require absolute explicit paths on every
   target. Relative `NDI_RUNTIME_DIR_V6` directories are refused and skipped,
   with the reason retained in load-failure diagnostics.
+- On dynamically loaded non-Apple ELF targets, a runtime already linked or
+  preloaded into the global symbol scope must be the selected module. Other
+  candidates are refused before loading; diagnostics name the runtime in scope.
 - `send_video_async_copy` returns `Result<()>` and reuses released video and
   metadata storage instead of returning the displaced frame. After warm-up,
   repeated copies of one layout allocate nothing; `finish_video_async` returns
@@ -36,7 +39,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   `RefUnwindSafe`.
 - Received video and audio survive unreadable optional per-frame metadata.
   `metadata_status()` reports why text was withheld; forwarding and owned
-  copies omit it. Standalone metadata capture remains strict.
+  copies omit it. Owned copies preserve the withheld status. Default image
+  encoding and `color_info()` refuse withheld video metadata; an explicit
+  color-policy override permits encoding. Standalone metadata capture remains
+  strict.
 - FrameSync- and AvSync-attached receivers, including KVM views, no longer expose
   event polling because native synchronization can consume status notifications.
   `EventMode` separates this capability from typed metadata capture; query
@@ -111,6 +117,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Added
 
+- `QueuedSender::close` returns every retained frame with its submission id,
+  including frames left after a native completion-protocol failure. Explicit
+  and implicit teardown release storage only after native destruction.
 - `QueuedVideoFrame::Scatter` queues separate encoder blocks without joining
   them and returns their original allocations after native completion.
 - Packet receivers, allocator-backed packet receivers and packet KVM sessions
@@ -164,6 +173,24 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Performance and correctness
 
+- Queued sending reserves stable frame and scatter descriptors at construction.
+  Accepted submissions allocate nothing; `QueueFull` refusals allocate only
+  their returned `Rejected` value. Completion and collection remain allocation
+  free.
+- Recorder cleanup keeps waiting for every known open file within one shutdown
+  budget, even after an indeterminate report. A short finish wait no longer
+  shortens another clone's close budget. Starting another session waits for
+  known prior files to close, or requires explicit reset.
+- Async recorder finish waits use the event pump, allowing status and other
+  commands to run while finalization is pending. Concurrent finish waiters
+  observe the same session without serializing their waits. Successful reset
+  closes pending finish waits for the displaced recorder.
+- Custom receive allocation declines audio requests above the 64 MiB capture
+  limit before calling application policy. Unrepresentable video and audio
+  requests are declined without allocating on SDK threads.
+- Discovery Server connection requests inspect only receiver identifiers and
+  the matched receiver's commands. Unrelated malformed fields or snapshot-copy
+  limits no longer prevent an otherwise valid request.
 - Runtime-authorized layouts now guard caller video descriptors, including
   owned AV-sync input. Older runtimes reject planar 4:4:4 video consistently
   before native calls; receiver settings carry the same structural checks.

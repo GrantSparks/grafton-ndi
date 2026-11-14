@@ -52,6 +52,14 @@ return `Error::InvalidInput`. `RuntimeLoadFailed` lists attempted paths and erro
 failed selection can be retried. A successful selection lasts for the process.
 A different path or incompatible edition then returns `RuntimeConflict`.
 
+On dynamically loaded non-Apple ELF targets, including Linux and Android, a
+runtime already linked or preloaded into the process's global symbol scope must
+also be the selected runtime. Other runtime candidates are refused before they
+are opened; an explicit different file returns
+`SelectionConflict::ForeignRuntimeInScope`. The diagnostic names the runtime
+already in scope. Select that file, or stop linking or preloading the other
+runtime. The same check protects the separate File library's runtime binding.
+
 Rejected libraries that loaded also stay resident. A platform search may resolve
 to the rejected module again; remove or fix that library, or select an exact path.
 

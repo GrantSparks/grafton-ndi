@@ -40,13 +40,37 @@ impl Fixtures {
             "empty",
             "mislabelled",
             "unloadable",
+            "preloaded",
+            "global-named",
         ] {
             fs::create_dir_all(root.join(directory)).unwrap();
         }
         let fixtures = Self {
             root: root.to_owned(),
         };
-        FakeRuntime::default().build(&fixtures.complete());
+        FakeRuntime {
+            cfgs: vec!["fake_constructor"],
+            ..Default::default()
+        }
+        .build(&fixtures.complete());
+        FakeRuntime {
+            cfgs: vec!["fake_advanced"],
+            ..Default::default()
+        }
+        .build(&fixtures.preloaded());
+        FakeRuntime {
+            soname: Some(STANDARD_NAME),
+            ..Default::default()
+        }
+        .build(&fixtures.named_global());
+        std::os::unix::fs::symlink(fixtures.preloaded(), fixtures.alias("symlink")).unwrap();
+        fs::hard_link(fixtures.preloaded(), fixtures.alias("hardlink")).unwrap();
+        #[cfg(target_arch = "x86_64")]
+        FakeRuntime {
+            cfgs: vec!["fake_plt_runtime"],
+            ..Default::default()
+        }
+        .build(&fixtures.plt());
         FakeRuntime {
             cfgs: vec!["fake_omit_required"],
             ..Default::default()
@@ -91,16 +115,19 @@ impl Fixtures {
         }
         .build(&fixtures.long_version());
         FakeRuntime {
+            cfgs: vec!["fake_constructor"],
             version: Some(BESIDE_EXECUTABLE),
             ..Default::default()
         }
         .build(&fixtures.bundle().join(STANDARD_NAME));
         FakeRuntime {
+            cfgs: vec!["fake_constructor"],
             version: Some(IN_RUNTIME_DIRECTORY),
             ..Default::default()
         }
         .build(&fixtures.runtime().join(STANDARD_NAME));
         FakeRuntime {
+            cfgs: vec!["fake_constructor"],
             version: Some(ON_LOADER_PATH),
             ..Default::default()
         }
@@ -124,6 +151,19 @@ impl Fixtures {
 
     fn complete(&self) -> PathBuf {
         self.root.join("libndi_complete.so")
+    }
+    fn preloaded(&self) -> PathBuf {
+        self.root.join("preloaded/libndi_preloaded.so")
+    }
+    fn named_global(&self) -> PathBuf {
+        self.root.join("global-named").join(STANDARD_NAME)
+    }
+    fn alias(&self, kind: &str) -> PathBuf {
+        self.root.join(format!("libndi_preloaded_{kind}.so"))
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn plt(&self) -> PathBuf {
+        self.root.join("libndi_plt.so")
     }
     fn missing(&self) -> PathBuf {
         self.root.join("libndi_missing.so")
@@ -182,6 +222,8 @@ struct Scenario {
     runtime_directory: Option<&'static str>,
     /// Directory for `LD_LIBRARY_PATH`, relative to the fixture root.
     loader_directory: Option<&'static str>,
+    /// A fixture placed in the global symbol scope before the child starts.
+    preloaded: Option<&'static str>,
 }
 
 const fn scenario(name: &'static str) -> Scenario {
@@ -190,6 +232,7 @@ const fn scenario(name: &'static str) -> Scenario {
         bundled_executable: false,
         runtime_directory: None,
         loader_directory: None,
+        preloaded: None,
     }
 }
 
@@ -238,6 +281,41 @@ const SCENARIOS: &[Scenario] = &[
         ..scenario("selecting_and_starting_are_separate_steps")
     },
     scenario("a_failed_start_is_classified_and_can_be_retried"),
+    Scenario {
+        bundled_executable: true,
+        preloaded: Some("preloaded/libndi_preloaded.so"),
+        ..scenario("foreign_preload_refuses_default_search_before_constructors")
+    },
+    Scenario {
+        runtime_directory: Some("runtime"),
+        loader_directory: Some("loader"),
+        preloaded: Some("preloaded/libndi_preloaded.so"),
+        ..scenario("foreign_preload_refuses_runtime_directory_before_constructors")
+    },
+    Scenario {
+        preloaded: Some("preloaded/libndi_preloaded.so"),
+        ..scenario("foreign_preload_refuses_explicit_path_before_constructors")
+    },
+    Scenario {
+        preloaded: Some("preloaded/libndi_preloaded.so"),
+        ..scenario("the_preloaded_module_and_its_aliases_are_accepted")
+    },
+    Scenario {
+        preloaded: Some("preloaded/libndi_preloaded.so"),
+        ..scenario("the_preloaded_module_may_be_selected_through_a_hardlink")
+    },
+    Scenario {
+        // Despite a different file on the loader path, the bare name resolves
+        // to the already loaded module carrying that SONAME.
+        loader_directory: Some("loader"),
+        preloaded: Some("global-named/libndi.so.6"),
+        ..scenario("a_bare_name_may_select_the_preloaded_module")
+    },
+    #[cfg(target_arch = "x86_64")]
+    Scenario {
+        preloaded: Some("libndi_plt.so"),
+        ..scenario("a_global_runtime_captures_another_modules_plt_self_call")
+    },
 ];
 
 #[test]
@@ -269,7 +347,15 @@ fn selected_runtime_loader_contract() {
                 root.join(format!("{}.log", scenario.name)),
             )
             .env_remove("NDI_RUNTIME_DIR_V6")
-            .env_remove("LD_LIBRARY_PATH");
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD")
+            .env(
+                "GRAFTON_REJECTED_CONSTRUCTOR_MARKER",
+                root.join(format!("{}.constructor", scenario.name)),
+            );
+        if let Some(preloaded) = scenario.preloaded {
+            command.env("LD_PRELOAD", root.join(preloaded));
+        }
         if let Some(directory) = scenario.runtime_directory {
             command.env("NDI_RUNTIME_DIR_V6", root.join(directory));
         }
@@ -312,7 +398,7 @@ fn is_loaded(library: &Path) -> bool {
         .contains(library.to_str().unwrap())
 }
 
-fn load_failure(result: Result<Ndi, Error>) -> LoadFailure {
+fn load_failure(result: Result<impl std::fmt::Debug, Error>) -> LoadFailure {
     match result {
         Err(Error::RuntimeLoadFailed(reason)) => {
             assert_eq!(reason.library(), LibraryKind::Runtime);
@@ -328,6 +414,120 @@ fn child(name: &str, fixtures: &Fixtures) {
     let complete = fixtures.complete();
     let options = explicit(complete.clone());
     match name {
+        "foreign_preload_refuses_default_search_before_constructors"
+        | "foreign_preload_refuses_runtime_directory_before_constructors" => {
+            for reason in [
+                load_failure(Ndi::new()),
+                load_failure(Runtime::select(&RuntimeOptions::default())),
+            ] {
+                assert!(!reason.loaded_any());
+                let origin = if name.contains("default_search") {
+                    LoadOrigin::Executable
+                } else {
+                    LoadOrigin::RuntimeDirectory
+                };
+                let attempt = reason
+                    .attempts()
+                    .iter()
+                    .find(|attempt| {
+                        attempt.origin() == origin
+                            && attempt.location().file_name().unwrap() == STANDARD_NAME
+                    })
+                    .unwrap();
+                assert_eq!(
+                    attempt.refusal(),
+                    &LoadRefusal::ForeignRuntimeInScope {
+                        module: fixtures.preloaded()
+                    }
+                );
+                assert!(!attempt.loaded());
+                assert!(!is_loaded(attempt.location()));
+            }
+            assert!(!PathBuf::from(
+                std::env::var_os("GRAFTON_REJECTED_CONSTRUCTOR_MARKER").unwrap()
+            )
+            .exists());
+            assert!(!Ndi::is_running());
+        }
+        "foreign_preload_refuses_explicit_path_before_constructors" => {
+            for error in [
+                Ndi::with_options(&options).unwrap_err(),
+                Runtime::select(&options).unwrap_err(),
+            ] {
+                match error {
+                    Error::RuntimeConflict { kind, detail } => {
+                        assert_eq!(kind, SelectionConflict::ForeignRuntimeInScope);
+                        assert!(detail.contains(complete.to_str().unwrap()));
+                        assert!(detail.contains(fixtures.preloaded().to_str().unwrap()));
+                    }
+                    other => panic!("expected a global-scope conflict, got {other}"),
+                }
+            }
+            assert!(!is_loaded(&complete));
+            assert!(!PathBuf::from(
+                std::env::var_os("GRAFTON_REJECTED_CONSTRUCTOR_MARKER").unwrap()
+            )
+            .exists());
+            // Refusal leaves selection open for the global runtime itself.
+            drop(Ndi::with_options(&explicit(fixtures.preloaded())).unwrap());
+        }
+        "the_preloaded_module_and_its_aliases_are_accepted"
+        | "the_preloaded_module_may_be_selected_through_a_hardlink" => {
+            let alias = if name.contains("hardlink") {
+                "hardlink"
+            } else {
+                "symlink"
+            };
+            for path in [
+                fixtures.alias(alias),
+                fixtures.alias("hardlink"),
+                fixtures.preloaded(),
+            ] {
+                let runtime = Runtime::select(&explicit(path)).unwrap();
+                assert_eq!(
+                    runtime.info().library_path(),
+                    Some(fixtures.preloaded().as_path())
+                );
+                drop(runtime.initialize().unwrap());
+            }
+        }
+        "a_bare_name_may_select_the_preloaded_module" => {
+            let runtime = Runtime::select(&standard()).unwrap();
+            assert_eq!(
+                runtime.info().library_path(),
+                Some(fixtures.named_global().as_path())
+            );
+            assert!(!is_loaded(&fixtures.loader().join(STANDARD_NAME)));
+            drop(runtime.initialize().unwrap());
+        }
+        #[cfg(target_arch = "x86_64")]
+        "a_global_runtime_captures_another_modules_plt_self_call" => {
+            // Bypass selection only in this binding probe. Opening a second
+            // copy demonstrates why the production loader must refuse it.
+            type Create = unsafe extern "C" fn(*const std::ffi::c_void) -> *mut std::ffi::c_void;
+            type CreateV4 = unsafe extern "C" fn(
+                *const std::ffi::c_void,
+                *const std::ffi::c_void,
+            ) -> *mut std::ffi::c_void;
+            // A copy has its own instance marker and relocation slots.
+            let other = fixtures.root.join("libndi_plt_other.so");
+            fs::copy(fixtures.plt(), &other).unwrap();
+            // SAFETY: these test-owned modules implement the signatures above;
+            // their returned markers are compared only, never dereferenced.
+            unsafe {
+                let global = libloading::Library::new(fixtures.plt()).unwrap();
+                let candidate = libloading::Library::new(&other).unwrap();
+                let global_v4 = global.get::<CreateV4>(b"NDIlib_recv_create_v4\0").unwrap();
+                let own_v4 = candidate
+                    .get::<CreateV4>(b"NDIlib_recv_create_v4\0")
+                    .unwrap();
+                let trampoline = candidate.get::<Create>(b"NDIlib_recv_create_v3\0").unwrap();
+                let global_instance = global_v4(std::ptr::null(), std::ptr::null());
+                let own_instance = own_v4(std::ptr::null(), std::ptr::null());
+                assert_ne!(global_instance, own_instance);
+                assert_eq!(trampoline(std::ptr::null()), global_instance);
+            }
+        }
         "relative_path_selects_nothing" => {
             let relative = RuntimeOptions::new().library_path("libndi.so.6");
             assert!(matches!(

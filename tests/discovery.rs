@@ -83,6 +83,7 @@ const VARIANTS: &[Variant] = &[
             "null_event_batch_with_a_count_is_refused",
             "nested_snapshot_arrays_include_owned_storage",
             "malformed_membership_entries_are_omitted",
+            "connection_requests_ignore_unrelated_snapshot_copy_limits",
             "malformed_events_are_omitted",
             "null_snapshot_arrays_are_refused",
             "owners_move_between_threads",
@@ -671,17 +672,33 @@ fn child(scenario: &str) {
                 requested += 2;
                 assert_eq!(log().matches("recv-listener-connect ").count(), requested);
                 let omitted = ReceiverId::new("receiver-fixed").unwrap();
-                for refused in [
-                    listener.request_connect(&omitted, "STUDIO (Camera 2)"),
-                    listener.request_disconnect(&omitted),
-                ] {
-                    assert!(
-                        matches!(
-                            refused,
-                            Err(Error::ReceiverRequestNotAccepted { advertised: false })
-                        ),
-                        "{malformed}: {refused:?}"
-                    );
+                match malformed {
+                    "receiver-id" | "commands-null" => {
+                        for refused in [
+                            listener.request_connect(&omitted, "STUDIO (Camera 2)"),
+                            listener.request_disconnect(&omitted),
+                        ] {
+                            let Err(Error::ReceiverRequestNotAccepted { advertised }) = refused
+                            else {
+                                panic!("{malformed}: expected a refused request, got {refused:?}")
+                            };
+                            assert_eq!(advertised, malformed == "commands-null", "{malformed}");
+                        }
+                    }
+                    _ => {
+                        // This variant explicitly advertises Connect. Its bad
+                        // unrelated field still omits it from snapshots, but
+                        // cannot prevent a request to its exact identifier.
+                        listener
+                            .request_connect(&omitted, "STUDIO (Camera 2)")
+                            .unwrap();
+                        listener.request_disconnect(&omitted).unwrap();
+                        requested += 2;
+                        assert!(log().contains(&format!(
+                            "recv-listener-connect {} null\n",
+                            hex(b"receiver-fixed")
+                        )));
+                    }
                 }
                 assert_eq!(log().matches("recv-listener-connect ").count(), requested);
             }
@@ -689,6 +706,33 @@ fn child(scenario: &str) {
                 "recv-listener-connect {} {}\n",
                 hex(RECEIVER_ID),
                 hex(b"STUDIO (Camera 2)")
+            )));
+            std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
+        }
+        "connection_requests_ignore_unrelated_snapshot_copy_limits" => {
+            std::env::set_var("GRAFTON_FAKE_DISCOVERY_MALFORMED", "receiver-copy-budget");
+            let mut listener = RecvListener::new(&ndi, &listeners).unwrap();
+            assert!(matches!(
+                listener.snapshot(),
+                Err(Error::ResourceLimit {
+                    resource: ResourceKind::DiscoveryServerCopyBytes,
+                    limit: 16_777_216,
+                })
+            ));
+            let target = ReceiverId::new(RECEIVER_ID).unwrap();
+            listener
+                .request_connect(&target, "STUDIO (Camera 2)")
+                .unwrap();
+            listener.request_disconnect(&target).unwrap();
+            assert_eq!(log().matches("recv-listener-connect ").count(), 2);
+            assert!(log().contains(&format!(
+                "recv-listener-connect {} {}\n",
+                hex(RECEIVER_ID),
+                hex(b"STUDIO (Camera 2)")
+            )));
+            assert!(log().contains(&format!(
+                "recv-listener-connect {} null\n",
+                hex(RECEIVER_ID)
             )));
             std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
         }
@@ -743,6 +787,16 @@ fn child(scenario: &str) {
                 receivers.snapshot(),
                 Err(Error::UnexpectedSdkResult(_))
             ));
+            let target = ReceiverId::new(RECEIVER_ID).unwrap();
+            assert!(matches!(
+                receivers.request_connect(&target, "STUDIO (Camera 2)"),
+                Err(Error::UnexpectedSdkResult(_))
+            ));
+            assert!(matches!(
+                receivers.request_disconnect(&target),
+                Err(Error::UnexpectedSdkResult(_))
+            ));
+            assert_eq!(log().matches("recv-listener-connect ").count(), 0);
             std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
             assert_eq!(senders.snapshot().unwrap().len(), 2);
             assert_eq!(receivers.snapshot().unwrap().len(), 2);

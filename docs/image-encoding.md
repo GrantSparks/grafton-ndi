@@ -81,9 +81,13 @@ encoded directly. For an untagged source with another matrix or range, specify
 ### `ndi_color_info`
 
 Every frame's `color_info()` exposes this metadata without `image-encoding`.
-Malformed or conflicting descriptions produce `InvalidFrame`. The default
-encoding policy refuses them; an explicit override ignores unreadable color
-metadata and treats it as SDR with unknown primaries. Readable metadata still
+Malformed or conflicting descriptions produce `InvalidFrame`, as does received
+metadata withheld with `FrameMetadataStatus::NotUtf8` or `Unterminated`. Owned
+copies and clones preserve that status without retaining the unreadable text,
+so encoding on a blocking thread has the same behavior as encoding a capture.
+The default encoding policy refuses these frames before writing output; an
+explicit `ColorPolicy::Override` ignores unreadable color metadata and treats
+it as SDR with unknown primaries. Readable metadata still
 controls the HDR check and PNG tagging. See
 [`ColorInfo`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/struct.ColorInfo.html)
 for accepted metadata values.

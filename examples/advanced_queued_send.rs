@@ -5,6 +5,7 @@
 //! - Reusing each frame once the SDK has finished sending it
 //! - Getting a frame back when the queue is full
 //! - Sending audio on a separate scoped thread while video waits for completions
+//! - Recovering every retained frame and submission id when the sender closes
 //!
 //! Needs the NDI Advanced SDK at build time and an Advanced runtime.
 //!
@@ -43,7 +44,7 @@ fn main() -> Result<(), Error> {
         QueueOptions::default().max_frames(4),
     )?;
 
-    {
+    let send_result = {
         let (mut video, audio) = sender.split();
         thread::scope(|scope| -> Result<(), Error> {
             let worker = scope.spawn(move || -> Result<(), Error> {
@@ -61,10 +62,17 @@ fn main() -> Result<(), Error> {
             let video_result = send_video(&mut video);
             worker.join().expect("audio worker panicked")?;
             video_result
-        })?;
+        })
+    };
+    // Close waits without a timeout for native destruction, including any
+    // remaining completions. Use a blocking thread with an async executor.
+    // It recovers retained frames even when sending reported a protocol error.
+    for done in sender.close() {
+        println!("Recovered submission {} at shutdown", done.id().get());
+        // Return this frame to an application pool, or release it explicitly.
+        drop(done.into_frame());
     }
-    // Drop waits for native completion before freeing any retained frame.
-    drop(sender);
+    send_result?;
     Ok(())
 }
 
@@ -100,6 +108,5 @@ fn send_video(sender: &mut QueuedVideo<'_>) -> Result<(), Error> {
         // Do not burst through missed ticks after queue backpressure.
         next_tick = next_tick.max(Instant::now());
     }
-    println!("{} frames still queued at exit", sender.retained_frames());
     Ok(())
 }

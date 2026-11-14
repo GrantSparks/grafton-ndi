@@ -19,11 +19,13 @@ use std::{
     },
 };
 
-#[cfg(any(test, ndi_has_advanced_receive_allocators))]
-use super::{invalid_frame, sdk_quantity, AudioCodec, VideoCodec};
 use super::{invalid_input, PacketItem, PacketItemRef, PacketReceiver, ReceiverControls};
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+use super::{AudioCodec, VideoCodec};
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use crate::sys::bindings::*;
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
+use crate::{frames::ValidatedAudioLayout, AudioFormat};
 use crate::{
     frames::ValidatedVideoLayout, receiver::PacketAttached, runtime::ProcessLifetimeRuntime,
     sys::advanced::ReceiveAllocators, Error, FourCc, PixelFormat, RawCapture, Receiver,
@@ -460,6 +462,8 @@ impl AllocationBuffer {
 /// one allocation fail; the SDK then drops the frame. Inspect
 /// [`AllocatorService::usage`] for process-wide [`AllocationDecline`] counts,
 /// including distinct policy-error and contained-panic counts.
+/// Invalid media layouts are declined before calling the policy, including
+/// planar audio requests above capture's 64 MiB frame limit.
 pub trait ReceiveAllocator: Send + Sync + 'static {
     /// Supply memory for one frame.
     ///
@@ -637,12 +641,12 @@ impl Registry {
     fn allocate_request(
         &self,
         token: usize,
-        request: Result<AllocationRequest>,
+        request: std::result::Result<AllocationRequest, AllocationDecline>,
     ) -> Option<(NonNull<u8>, i32)> {
         match request {
             Ok(request) => self.allocate(token, request),
-            Err(_) => {
-                self.decline(AllocationDecline::RequestNotRepresentable);
+            Err(reason) => {
+                self.decline(reason);
                 None
             }
         }
@@ -875,6 +879,8 @@ pub struct AllocatorService {
 #[non_exhaustive]
 pub enum AllocationDecline {
     /// The SDK's format, dimensions or requested extent cannot be represented.
+    /// Includes planar audio above capture's 64 MiB frame limit; the policy
+    /// is not called and recording this decline allocates nothing.
     RequestNotRepresentable,
     /// The policy generation is unknown, replaced, closing or retired.
     GenerationUnavailable,
@@ -1362,23 +1368,24 @@ impl<M: ReceiverMode> Drop for Allocation<M> {
 
 /// A compressed frame's size, which the SDK passes in the stride union.
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-fn compressed_size(size: i32) -> Result<usize> {
+fn compressed_size(size: i32) -> std::result::Result<usize, AllocationDecline> {
     usize::try_from(size)
         .ok()
         .filter(|size| (1..=MAX_ALLOCATION).contains(size))
-        .ok_or_else(|| invalid_frame("Invalid compressed allocation size"))
+        .ok_or(AllocationDecline::RequestNotRepresentable)
 }
 
 /// A dimension of a compressed frame the SDK is about to receive.
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-fn compressed_dimension(value: i32) -> Result<u32> {
-    u32::try_from(value)
-        .map_err(|_| invalid_frame(format!("Negative compressed allocation dimension {value}")))
+fn compressed_dimension(value: i32) -> std::result::Result<u32, AllocationDecline> {
+    u32::try_from(value).map_err(|_| AllocationDecline::RequestNotRepresentable)
 }
 
 /// The request for the video frame the SDK is about to receive.
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-fn video_request(frame: &NDIlib_video_frame_v2_t) -> Result<AllocationRequest> {
+fn video_request(
+    frame: &NDIlib_video_frame_v2_t,
+) -> std::result::Result<AllocationRequest, AllocationDecline> {
     let fourcc = FourCc::from_raw(frame.FourCC);
     if VideoCodec::from_outer(frame.FourCC).is_some() {
         // SAFETY: for a compressed frame the union holds the data size.
@@ -1392,9 +1399,10 @@ fn video_request(frame: &NDIlib_video_frame_v2_t) -> Result<AllocationRequest> {
             capacity_limit: MAX_ALLOCATION,
         });
     }
-    let pixel = PixelFormat::try_from(fourcc)
-        .map_err(|_| invalid_frame("Unknown allocator video format"))?;
-    let layout = ValidatedVideoLayout::from_sdk(pixel, frame.xres, frame.yres, 0)?;
+    let pixel =
+        PixelFormat::from_fourcc(fourcc).ok_or(AllocationDecline::RequestNotRepresentable)?;
+    let layout = ValidatedVideoLayout::from_sdk_checked(pixel, frame.xres, frame.yres, 0)
+        .map_err(|_| AllocationDecline::RequestNotRepresentable)?;
     Ok(AllocationRequest {
         bytes: layout.data_len_bytes(),
         stride: layout.line_stride_bytes(),
@@ -1407,10 +1415,12 @@ fn video_request(frame: &NDIlib_video_frame_v2_t) -> Result<AllocationRequest> {
 
 /// The request for the audio frame the SDK is about to receive.
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-fn audio_request(frame: &NDIlib_audio_frame_v3_t) -> Result<AllocationRequest> {
+fn audio_request(
+    frame: &NDIlib_audio_frame_v3_t,
+) -> std::result::Result<AllocationRequest, AllocationDecline> {
     if frame.FourCC != NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP {
         if AudioCodec::from_outer(frame.FourCC).is_none() {
-            return Err(invalid_frame("Unknown allocator audio format"));
+            return Err(AllocationDecline::RequestNotRepresentable);
         }
         // SAFETY: for a compressed frame the union holds the data size.
         let size = compressed_size(unsafe { frame.__bindgen_anon_1.data_size_in_bytes })?;
@@ -1423,26 +1433,22 @@ fn audio_request(frame: &NDIlib_audio_frame_v3_t) -> Result<AllocationRequest> {
             capacity_limit: MAX_ALLOCATION,
         });
     }
-    let (Some(samples), Some(channels), Some(_)) = (
-        sdk_quantity(frame.no_samples),
-        sdk_quantity(frame.no_channels),
-        sdk_quantity(frame.sample_rate),
-    ) else {
-        return Err(invalid_frame("Invalid audio allocation dimensions"));
-    };
-    let stride = (samples as usize)
-        .checked_mul(size_of::<f32>())
-        .ok_or_else(|| invalid_frame("Audio allocator stride overflow"))?;
-    let bytes = stride
-        .checked_mul(channels as usize)
-        .filter(|n| *n <= MAX_ALLOCATION)
-        .ok_or_else(|| invalid_frame("Audio allocator extent overflow"))?;
+    // The callback chooses a packed stride. The incoming data pointer and
+    // stride do not name allocated storage yet and must not be read as media.
+    let layout = ValidatedAudioLayout::from_sdk_checked(
+        AudioFormat::Fltp,
+        frame.sample_rate,
+        frame.no_channels,
+        frame.no_samples,
+        None,
+    )
+    .map_err(|_| AllocationDecline::RequestNotRepresentable)?;
     Ok(AllocationRequest {
-        bytes,
-        stride,
+        bytes: layout.sample_count() * size_of::<f32>(),
+        stride: layout.channel_stride_bytes(),
         format: AllocationFormat::AudioPlanarF32,
-        width: samples,
-        height: channels,
+        width: layout.num_samples(),
+        height: layout.num_channels(),
         capacity_limit: MAX_ALLOCATION,
     })
 }
@@ -1558,7 +1564,10 @@ mod tests {
             (16, 16, 64)
         );
         video.xres = -16;
-        assert!(matches!(video_request(&video), Err(Error::InvalidFrame(_))));
+        assert!(matches!(
+            video_request(&video),
+            Err(AllocationDecline::RequestNotRepresentable)
+        ));
         video.xres = 16;
         video.__bindgen_anon_1.data_size_in_bytes = 0;
         assert!(video_request(&video).is_err());
@@ -1646,6 +1655,145 @@ mod tests {
         let (pointer, _) = registry.allocate(token, request()).unwrap();
         assert_eq!(registry.usage().declined_allocations(), 2);
         assert!(registry.free(token, pointer.as_ptr()));
+    }
+
+    #[test]
+    fn unrepresentable_requests_decline_without_allocating_or_calling_the_policy() {
+        let registry = Registry::new(limits());
+        let policy_calls = Arc::new(AtomicUsize::new(0));
+        let calls = policy_calls.clone();
+        let token = registry
+            .register(move |_: AllocationRequest| -> Result<AllocationBuffer> {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Err(Error::InvalidInput(String::new()))
+            })
+            .unwrap();
+        let video = NDIlib_video_frame_v2_t {
+            FourCC: FourCc::from(PixelFormat::Bgra).raw(),
+            xres: 16,
+            yres: 16,
+            ..Default::default()
+        };
+        let videos = [
+            NDIlib_video_frame_v2_t {
+                FourCC: u32::MAX,
+                ..video
+            },
+            NDIlib_video_frame_v2_t { xres: -1, ..video },
+            NDIlib_video_frame_v2_t { xres: 3, ..video },
+            NDIlib_video_frame_v2_t { yres: 0, ..video },
+            NDIlib_video_frame_v2_t {
+                FourCC: FourCc::from(PixelFormat::I420).raw(),
+                yres: 3,
+                ..video
+            },
+            NDIlib_video_frame_v2_t {
+                FourCC: FourCc::from(PixelFormat::Nv12).raw(),
+                yres: 3,
+                ..video
+            },
+            NDIlib_video_frame_v2_t {
+                xres: i32::MAX - 1,
+                yres: i32::MAX,
+                ..video
+            },
+            NDIlib_video_frame_v2_t {
+                FourCC: VideoCodec::H264.outer(StreamTier::Program, false),
+                ..video
+            },
+        ];
+        // FLTP extents are multiples of four: the first representable excess
+        // over the 64 MiB capture cap is four bytes, not one byte.
+        let audio = NDIlib_audio_frame_v3_t {
+            FourCC: AudioFormat::Fltp.to_sdk(),
+            sample_rate: 48_000,
+            no_channels: 1,
+            no_samples: (crate::frames::MAX_AUDIO_BYTES / size_of::<f32>()) as i32 + 1,
+            ..Default::default()
+        };
+        let audios = [
+            audio,
+            NDIlib_audio_frame_v3_t {
+                FourCC: u32::MAX,
+                ..audio
+            },
+            NDIlib_audio_frame_v3_t {
+                sample_rate: 0,
+                ..audio
+            },
+            NDIlib_audio_frame_v3_t {
+                no_channels: 0,
+                ..audio
+            },
+            NDIlib_audio_frame_v3_t {
+                no_samples: 0,
+                ..audio
+            },
+            NDIlib_audio_frame_v3_t {
+                no_samples: i32::MAX,
+                ..audio
+            },
+            NDIlib_audio_frame_v3_t {
+                FourCC: AudioCodec::Aac.outer(false),
+                no_channels: -1,
+                __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                    data_size_in_bytes: 64,
+                },
+                ..audio
+            },
+        ];
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            for frame in &videos {
+                assert!(registry
+                    .allocate_request(token, video_request(frame))
+                    .is_none());
+            }
+            for frame in &audios {
+                assert!(registry
+                    .allocate_request(token, audio_request(frame))
+                    .is_none());
+            }
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(policy_calls.load(Ordering::Relaxed), 0);
+        let usage = registry.usage();
+        assert_eq!(
+            usage.declined(AllocationDecline::RequestNotRepresentable),
+            (videos.len() + audios.len()) as u64
+        );
+        assert_eq!(usage.in_progress_allocations(), 0);
+        assert_eq!(usage.retained_allocations(), 0);
+    }
+
+    #[test]
+    fn audio_request_at_capture_limit_uses_the_shared_packed_layout() {
+        let frame = NDIlib_audio_frame_v3_t {
+            FourCC: AudioFormat::Fltp.to_sdk(),
+            sample_rate: 48_000,
+            no_channels: 1,
+            no_samples: (crate::frames::MAX_AUDIO_BYTES / size_of::<f32>()) as i32,
+            // Allocator input is geometry, not existing media. The callback
+            // chooses the packed stride without requiring a data pointer.
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: -1,
+            },
+            ..Default::default()
+        };
+        let (request, allocations) = crate::test_alloc::allocation_count(|| audio_request(&frame));
+        let request = request.unwrap();
+        assert_eq!(allocations, 0);
+        let layout = ValidatedAudioLayout::from_sdk_checked(
+            AudioFormat::Fltp,
+            frame.sample_rate,
+            frame.no_channels,
+            frame.no_samples,
+            None,
+        )
+        .unwrap();
+        assert_eq!(request.minimum_bytes(), crate::frames::MAX_AUDIO_BYTES);
+        assert_eq!(request.stride_bytes(), layout.channel_stride_bytes());
+        assert_eq!(request.width(), layout.num_samples());
+        assert_eq!(request.height(), layout.num_channels());
     }
 
     #[test]

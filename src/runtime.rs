@@ -95,6 +95,14 @@
 //! the operating system's own. [`Error::RuntimeConflict`] carries a
 //! [`crate::SelectionConflict`] beside its diagnostic context.
 //!
+//! On dynamically loaded, non-Apple ELF targets, a runtime already linked or
+//! preloaded into the process's global symbol scope must also be the selected
+//! runtime. Other candidates are refused before opening them, because that
+//! global runtime would capture their native calls. Search failures record
+//! [`crate::LoadRefusal::ForeignRuntimeInScope`]; an explicit different file
+//! returns [`crate::SelectionConflict::ForeignRuntimeInScope`]. Select the
+//! module named in the diagnostic, or stop linking or preloading it.
+//!
 //! One limit applies to a library that loads but is rejected: it stays loaded,
 //! because a native library can never be unloaded safely. If the platform
 //! loader's own search then matches the library name to that module, it
@@ -119,6 +127,9 @@ use crate::{
 /// The default options search for the runtime library of either edition in
 /// the [documented order](crate::runtime#where-the-runtime-is-loaded-from)
 /// and accept whichever is found first.
+/// On dynamically loaded, non-Apple ELF targets, any runtime already in the
+/// process's global symbol scope must be the selected module; see
+/// [`crate::LoadRefusal::ForeignRuntimeInScope`].
 ///
 /// # Examples
 ///
@@ -180,6 +191,10 @@ impl RuntimeOptions {
     /// load and rejects an absolute path with [`Error::RuntimeConflict`].
     /// A relative path returns [`Error::InvalidInput`] on every target,
     /// before an implementation is selected.
+    /// On dynamically loaded, non-Apple ELF targets, a different runtime
+    /// already linked or preloaded into the global symbol scope causes
+    /// [`crate::SelectionConflict::ForeignRuntimeInScope`] before this file
+    /// is opened. Aliases identifying the same loaded module are accepted.
     #[must_use]
     pub fn library_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.library_path = Some(path.into());
@@ -265,6 +280,8 @@ impl Runtime {
     ///   ask for the Advanced SDK when the selected implementation is not one.
     ///   Also returned for an explicit path on a linked target, or when native
     ///   loading re-enters selection on the same thread before selection finishes.
+    ///   On dynamically loaded, non-Apple ELF targets, an explicit file is also
+    ///   refused before opening when another runtime is in the global symbol scope.
     ///   [`crate::SelectionConflict`] identifies the cause.
     /// * [`Error::InvalidInput`] when `options` name a relative
     ///   library path.

@@ -20,9 +20,11 @@
 //!   borrowed frame into an owned one. The capture itself is made only through
 //!   a [`CaptureLock`], the proof that the receiver's shared capture guard is
 //!   held, so no receiver capture can overlap a reconnect. [`capture_raw`]
-//!   (one kind) and `capture_any` (every kind) both turn what that capture
-//!   delivered into a guard through `Captured::take`, the one place a
-//!   receiver guard is made.
+//!   (one kind) and `capture_any` (a sealed set of all media slots or none)
+//!   both go through `Captured`. A delivered frame becomes a guard through
+//!   `Captured::take`, the one place a receiver guard is made. Mixed and
+//!   notification-only capture share a receiver kernel that handles every
+//!   notification before the caller can convert media.
 //!
 //! # Example
 //!
@@ -55,6 +57,8 @@ mod sealed {
     impl Sealed for super::MetadataKind {}
     impl Sealed for super::FrameSyncVideoFree {}
     impl Sealed for super::FrameSyncAudioFree {}
+    impl Sealed for super::AllSlots {}
+    impl Sealed for super::NoSlots {}
 }
 
 /// The *free strategy* for one captured-frame family: the SDK instance handle
@@ -503,14 +507,19 @@ pub(crate) struct Slots {
 }
 
 impl Slots {
-    /// The slot of kind `K` alone, so that the SDK can deliver no frame of
-    /// another kind, which nothing would take and free.
-    fn only<K: CaptureStrategy>() -> Self {
-        let mut slots = Self {
+    /// No media slots, so the SDK can deliver notifications alone.
+    fn none() -> Self {
+        Self {
             video: None,
             audio: None,
             metadata: None,
-        };
+        }
+    }
+
+    /// The slot of kind `K` alone, so that the SDK can deliver no frame of
+    /// another kind, which nothing would take and free.
+    fn only<K: CaptureStrategy>() -> Self {
+        let mut slots = Self::none();
         *K::slot(&mut slots) = Some(K::RawFrame::default());
         slots
     }
@@ -602,40 +611,81 @@ pub(crate) fn capture_raw<'rx, K: CaptureKind>(
     }
 }
 
-/// What one capture with all three media slots delivered: a frame of any
-/// kind, or what the SDK reported in its place.
-pub(crate) enum Delivered<'rx> {
+/// A media frame delivered by a capture with all three media slots. A
+/// consumer of this type cannot receive or discard a native notification.
+pub(crate) enum Media<'rx> {
     /// A video frame.
     Video(Guard<'rx, VideoKind>),
     /// An audio frame.
     Audio(Guard<'rx, AudioKind>),
     /// A metadata frame.
     Metadata(Guard<'rx, MetadataKind>),
-    /// No frame; see [`Notification`].
+}
+
+/// A sealed set of media slots, paired with exactly the media it can deliver.
+/// Only [`AllSlots`] and [`NoSlots`] implement it, so every descriptor given
+/// to the SDK is taken and guarded when the SDK reports its frame kind.
+pub(crate) trait SlotSet: sealed::Sealed + Sized {
+    type Media<'rx>;
+
+    fn capture<'rx>(lock: &CaptureLock<'rx>) -> Result<Delivered<'rx, Self>>;
+}
+
+/// Capture video, audio, metadata and notifications.
+pub(crate) enum AllSlots {}
+
+impl SlotSet for AllSlots {
+    type Media<'rx> = Media<'rx>;
+
+    fn capture<'rx>(lock: &CaptureLock<'rx>) -> Result<Delivered<'rx, Self>> {
+        let mut captured = Captured::capture(lock, Slots::all());
+        Ok(if let Some(frame) = captured.take::<VideoKind>() {
+            Delivered::Media(Media::Video(frame))
+        } else if let Some(frame) = captured.take::<AudioKind>() {
+            Delivered::Media(Media::Audio(frame))
+        } else if let Some(frame) = captured.take::<MetadataKind>() {
+            Delivered::Media(Media::Metadata(frame))
+        } else {
+            Delivered::Notification(captured.notification()?)
+        })
+    }
+}
+
+/// Capture notifications alone, without requesting any media buffers.
+pub(crate) enum NoSlots {}
+
+/// A no-slot capture cannot deliver a media frame. Its converter is an
+/// exhaustive empty match, without unreachable media or free paths.
+pub(crate) enum NoMedia {}
+
+impl SlotSet for NoSlots {
+    type Media<'rx> = NoMedia;
+
+    fn capture<'rx>(lock: &CaptureLock<'rx>) -> Result<Delivered<'rx, Self>> {
+        let captured = Captured::capture(lock, Slots::none());
+        Ok(Delivered::Notification(captured.notification()?))
+    }
+}
+
+/// What one capture with slot set `S` delivered: media for that set, or what
+/// the SDK reported in its place. For [`NoSlots`], the media is uninhabited.
+pub(crate) enum Delivered<'rx, S: SlotSet> {
+    Media(S::Media<'rx>),
     Notification(Notification),
 }
 
-/// Capture a frame of whichever kind arrives first from the receiver `lock`
-/// holds the capture guard of, within what is left of the lock's attempt.
+/// Capture with slot set `S` from the receiver `lock` holds the capture
+/// guard of, within what is left of the lock's attempt.
 ///
-/// Gives `NDIlib_recv_capture_v3` all three media slots and wraps the
-/// frame it delivered in the guard of its kind, as [`capture_raw`] does for
-/// one kind; any other result is classified by [`Notification::classify`].
+/// Any delivered media is wrapped in the guard of its kind, as
+/// [`capture_raw`] does for one kind; any other result is classified by
+/// [`Notification::classify`]. Every slot set goes through [`Captured`].
 ///
 /// # Errors
 ///
 /// As for [`Notification::classify`].
-pub(crate) fn capture_any<'rx>(lock: &CaptureLock<'rx>) -> Result<Delivered<'rx>> {
-    let mut captured = Captured::capture(lock, Slots::all());
-    Ok(if let Some(frame) = captured.take::<VideoKind>() {
-        Delivered::Video(frame)
-    } else if let Some(frame) = captured.take::<AudioKind>() {
-        Delivered::Audio(frame)
-    } else if let Some(frame) = captured.take::<MetadataKind>() {
-        Delivered::Metadata(frame)
-    } else {
-        Delivered::Notification(captured.notification()?)
-    })
+pub(crate) fn capture_any<'rx, S: SlotSet>(lock: &CaptureLock<'rx>) -> Result<Delivered<'rx, S>> {
+    S::capture(lock)
 }
 
 // Convenience aliases for the receiver guard kinds that have a kind-specific

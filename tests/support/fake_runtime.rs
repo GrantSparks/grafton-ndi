@@ -39,6 +39,10 @@
 //! * `fake_receiver_v4` — also export only `NDIlib_recv_create_v4`, as a newer
 //!   Standard runtime might;
 //! * `fake_omit_required` — omit one required function;
+//! * `fake_constructor` — write `GRAFTON_REJECTED_CONSTRUCTOR_MARKER` when
+//!   the library is loaded, to distinguish refusal from opening and rejecting;
+//! * `fake_plt_runtime` — on x86-64, make receiver creation jump through its
+//!   PLT to an exported v4 function, matching the Advanced runtime's self-call;
 //! * `fake_configured_creation` — also export the Advanced entry points that
 //!   create a router, advertisers and listeners with a configuration. Each
 //!   logs `<entry point>` and creates nothing. Without `fake_objects` and
@@ -96,6 +100,17 @@ fn log(operation: &str) {
         let _ = writeln!(file, "{operation}");
     }
 }
+
+#[cfg(fake_constructor)]
+extern "C" fn mark_load() {
+    if let Some(path) = std::env::var_os("GRAFTON_REJECTED_CONSTRUCTOR_MARKER") {
+        std::fs::write(path, b"native constructor ran\n").unwrap();
+    }
+}
+#[cfg(fake_constructor)]
+#[used]
+#[link_section = ".init_array"]
+static INITIALIZE: extern "C" fn() = mark_load;
 
 /// A string argument as the bytes it holds, or `null`.
 #[cfg(any(fake_objects, fake_discovery))]
@@ -295,8 +310,24 @@ stub! {
 }
 
 #[cfg(not(fake_objects))]
+#[cfg(not(fake_plt_runtime))]
 stub! {
     fn NDIlib_recv_create_v3(p_create_settings: *const NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t;
+}
+
+// An explicit PLT jump keeps this fixture interposable even when rustc would
+// otherwise bind a call to an exported Rust function within this module.
+#[cfg(fake_plt_runtime)]
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_recv_create_v3(
+    _p_create_settings: *const NDIlib_recv_create_v3_t,
+) -> NDIlib_recv_instance_t {
+    core::arch::naked_asm!("xor esi, esi", "jmp NDIlib_recv_create_v4@PLT");
+}
+
+#[cfg(not(fake_objects))]
+stub! {
     fn NDIlib_recv_destroy(p_instance: NDIlib_recv_instance_t);
     fn NDIlib_send_create(p_create_settings: *const NDIlib_send_create_t) -> NDIlib_send_instance_t;
     fn NDIlib_send_destroy(p_instance: NDIlib_send_instance_t);
@@ -806,7 +837,16 @@ mod discovery {
                     events_subscribed: false,
                 },
             ];
-            match malformed().as_str() {
+            let malformed = malformed();
+            // The baseline fixed receiver refuses control. These variants
+            // explicitly grant Connect so an unrelated bad field is the only
+            // reason the old snapshot-based request would have refused it.
+            if matches!(malformed.as_str(), "receiver-name" | "receiver-input-id"
+                | "receiver-input-name" | "receiver-address" | "streams-null") {
+                receivers[1].p_commands = commands.as_mut_ptr();
+                receivers[1].num_commands = 1;
+            }
+            match malformed.as_str() {
                 "receiver-id" => receivers[1].p_uuid = oversized_text(),
                 "receiver-name" => receivers[1].p_name = oversized_text(),
                 "receiver-input-id" => receivers[1].p_input_uuid = oversized_text(),
@@ -814,6 +854,16 @@ mod discovery {
                 "receiver-address" => receivers[1].p_address = oversized_text(),
                 "streams-null" => receivers[1].num_streams = 1,
                 "commands-null" => receivers[1].num_commands = 1,
+                "receiver-copy-budget" => {
+                    // Shift the oversized allocation by one byte so its NUL
+                    // falls just inside the 4 MiB string bound. These valid
+                    // fields together exceed the 16 MiB snapshot copy budget.
+                    let text = unsafe { oversized_text().add(1) };
+                    receivers[1].p_name = text;
+                    receivers[1].p_input_uuid = text;
+                    receivers[1].p_input_name = text;
+                    receivers[1].p_address = text;
+                }
                 _ => {}
             }
             Box::into_raw(Box::new(RecvListener { receivers, _streams: streams, _commands: commands, batch: Batch::new() })).cast()
@@ -877,13 +927,23 @@ use objects::NDIlib_recv_create_v3;
 #[cfg(all(fake_objects, fake_advanced))]
 use objects::NDIlib_send_create;
 
-#[cfg(any(fake_advanced, fake_receiver_v4))]
+#[cfg(all(any(fake_advanced, fake_receiver_v4), not(fake_plt_runtime)))]
 #[no_mangle]
 pub unsafe extern "C" fn NDIlib_recv_create_v4(
     p_create_settings: *const NDIlib_recv_create_v3_t,
     _p_config_data: *const c_char,
 ) -> NDIlib_recv_instance_t {
     unsafe { NDIlib_recv_create_v3(p_create_settings) }
+}
+
+#[cfg(fake_plt_runtime)]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_recv_create_v4(
+    _p_create_settings: *const NDIlib_recv_create_v3_t,
+    _p_config_data: *const c_char,
+) -> NDIlib_recv_instance_t {
+    static INSTANCE: u8 = 0;
+    std::ptr::addr_of!(INSTANCE).cast_mut().cast()
 }
 
 #[cfg(fake_advanced)]

@@ -6,7 +6,7 @@ pub(crate) use budget::SnapshotBudget;
 
 use std::{
     collections::{HashMap, HashSet},
-    ffi::CString,
+    ffi::{c_char, CString},
     fmt::{self, Display, Formatter},
     net::IpAddr,
     ptr,
@@ -199,25 +199,55 @@ pub(crate) unsafe fn snapshot_entry(
     source: &NDIlib_source_t,
     budget: &mut SnapshotBudget,
 ) -> Result<Option<Source>> {
+    let (name, address) = source_pointers(source);
+    // SAFETY: the caller keeps both strings readable through their terminator
+    // or the SDK string bound. This policy skips malformed strings while
+    // retaining their scan charges in the snapshot's shared budget.
+    unsafe { decode_source(name, address, |pointer| budget.text(pointer)) }
+}
+
+/// The descriptor's address is one pointer, whether the SDK calls it an IP
+/// address or a URL. Decoding classifies the copied text by its scheme.
+fn source_pointers(source: &NDIlib_source_t) -> (*const c_char, *const c_char) {
     // SAFETY: both union fields are pointers of the same type.
     let address = unsafe { source.__bindgen_anon_1.p_url_address };
-    if source.p_ndi_name.is_null() && address.is_null() {
+    (source.p_ndi_name, address)
+}
+
+/// Decode a source's two strings with the caller's copy policy. A null name
+/// is allowed when an address is present; both null pointers name no source.
+/// `copy` is called only for non-null pointers, and `None` omits the source.
+///
+/// # Safety
+///
+/// Each non-null pointer must stay readable through its first NUL or
+/// [`crate::frames::MAX_SDK_STRING_BYTES`] bytes, whichever comes first,
+/// until its copy finishes. The copy policy must preserve those lifetimes.
+pub(crate) unsafe fn decode_source(
+    name: *const c_char,
+    address: *const c_char,
+    mut copy: impl FnMut(*const c_char) -> Result<Option<String>>,
+) -> Result<Option<Source>> {
+    if name.is_null() && address.is_null() {
         return Ok(None);
     }
-    // SAFETY: the caller keeps every non-null string live while copying.
-    let name = unsafe { budget.text(source.p_ndi_name)? };
-    if !source.p_ndi_name.is_null() && name.is_none() {
-        return Ok(None);
-    }
-    // SAFETY: as for the name above.
-    let copied_address = unsafe { budget.text(address)? };
-    if !address.is_null() && copied_address.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(Source {
-        name: name.unwrap_or_default(),
-        address: copied_address.map(SourceAddress::from_sdk_text),
-    }))
+    let name = if name.is_null() {
+        String::new()
+    } else {
+        let Some(name) = copy(name)? else {
+            return Ok(None);
+        };
+        name
+    };
+    let address = if address.is_null() {
+        None
+    } else {
+        let Some(address) = copy(address)? else {
+            return Ok(None);
+        };
+        Some(SourceAddress::from_sdk_text(address))
+    };
+    Ok(Some(Source { name, address }))
 }
 
 impl Finder {
@@ -1157,31 +1187,16 @@ impl Source {
 
         // SAFETY: the caller guarantees a non-null descriptor is live.
         let ndi_source = unsafe { &*source_ptr };
-        // The two address fields share one pointer; a URL is told apart from
-        // an IP address by its scheme.
-        // SAFETY: both union fields are pointers of the same type.
-        let address = unsafe { ndi_source.__bindgen_anon_1.p_url_address };
-
-        let name = if ndi_source.p_ndi_name.is_null() {
-            // The SDK accepts an address-only descriptor with a null name.
-            if address.is_null() {
-                return Err(failed());
-            }
-            String::new()
-        } else {
-            // SAFETY: the caller keeps the name readable through its terminator.
-            unsafe { copy_sdk_string(ndi_source.p_ndi_name, operation) }?
-        };
-
-        let address = if address.is_null() {
-            None
-        } else {
-            // SAFETY: the caller keeps the address readable through its terminator.
-            let address = unsafe { copy_sdk_string(address, operation) }?;
-            Some(SourceAddress::from_sdk_text(address))
-        };
-
-        Ok(Source { name, address })
+        let (name, address) = source_pointers(ndi_source);
+        // SAFETY: the caller keeps both strings readable through their
+        // terminator or the SDK string bound. The decoder passes only non-null
+        // pointers to this strict policy, which reports malformed SDK text.
+        unsafe {
+            decode_source(name, address, |pointer| {
+                copy_sdk_string(pointer, operation).map(Some)
+            })
+        }?
+        .ok_or_else(failed)
     }
 
     /// Copy the source's strings into owned C strings and build the native
@@ -2073,6 +2088,130 @@ mod tests {
                 operation: "NDIlib_send_get_source_name"
             })
         ));
+    }
+
+    #[test]
+    fn source_copy_policies_decode_the_same_descriptors() {
+        enum Expected {
+            Source(Source),
+            Missing,
+            Malformed,
+        }
+
+        let name = c"Camera".as_ptr();
+        let ip = c"192.0.2.1:5960".as_ptr();
+        let url = c"ndi://camera.local:5960".as_ptr();
+        let empty = c"".as_ptr();
+        let unterminated = vec![b'x'; crate::frames::MAX_SDK_STRING_BYTES];
+        let malformed = unterminated.as_ptr().cast();
+        let cases = [
+            (
+                "name and IP",
+                name,
+                ip,
+                Expected::Source(
+                    Source::new("Camera").with_address(SourceAddress::Ip("192.0.2.1:5960".into())),
+                ),
+            ),
+            (
+                "name and URL",
+                name,
+                url,
+                Expected::Source(
+                    Source::new("Camera")
+                        .with_address(SourceAddress::Url("ndi://camera.local:5960".into())),
+                ),
+            ),
+            (
+                "address only",
+                ptr::null(),
+                ip,
+                Expected::Source(
+                    Source::new("").with_address(SourceAddress::Ip("192.0.2.1:5960".into())),
+                ),
+            ),
+            (
+                "neither pointer",
+                ptr::null(),
+                ptr::null(),
+                Expected::Missing,
+            ),
+            (
+                "lossy name",
+                c"Cam\xff".as_ptr(),
+                ptr::null(),
+                Expected::Source(Source::new("Cam\u{fffd}")),
+            ),
+            ("unterminated name", malformed, ip, Expected::Malformed),
+            (
+                "name only",
+                name,
+                ptr::null(),
+                Expected::Source(Source::new("Camera")),
+            ),
+            (
+                "empty name",
+                empty,
+                ptr::null(),
+                Expected::Source(Source::new("")),
+            ),
+            (
+                "empty address only",
+                ptr::null(),
+                empty,
+                Expected::Source(Source::new("").with_address(SourceAddress::Ip("".into()))),
+            ),
+            (
+                "empty address",
+                name,
+                empty,
+                Expected::Source(Source::new("Camera").with_address(SourceAddress::Ip("".into()))),
+            ),
+            ("unterminated address", name, malformed, Expected::Malformed),
+        ];
+
+        for (label, name, address, expected) in cases {
+            let raw = NDIlib_source_t {
+                p_ndi_name: name,
+                __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                    p_url_address: address,
+                },
+            };
+            // SAFETY: pointers are null, live C string literals, or the live
+            // buffer readable for the complete SDK string bound. Both copies
+            // finish before any backing storage is dropped.
+            let (snapshot, single) = unsafe {
+                (
+                    snapshot_entry(&raw, &mut SnapshotBudget::new()),
+                    Source::try_from_raw(&raw, "test source query"),
+                )
+            };
+            match expected {
+                Expected::Source(expected) => {
+                    assert_eq!(snapshot.unwrap().as_ref(), Some(&expected), "{label}");
+                    assert_eq!(single.unwrap(), expected, "{label}");
+                }
+                Expected::Missing => {
+                    assert_eq!(snapshot.unwrap(), None, "{label}");
+                    assert!(
+                        matches!(
+                            &single,
+                            Err(Error::NativeOperationFailed {
+                                operation: "test source query"
+                            })
+                        ),
+                        "{label}: {single:?}"
+                    );
+                }
+                Expected::Malformed => {
+                    assert_eq!(snapshot.unwrap(), None, "{label}");
+                    assert!(
+                        matches!(&single, Err(Error::UnexpectedSdkResult(_))),
+                        "{label}: {single:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -466,7 +466,7 @@ pub(super) enum PendingVideo {
         frame: ScatterVideoFrame,
         // The scatter list given to the SDK, kept only so that its address
         // stays valid. Its arrays belong to the frame.
-        list: AliasableBox<FrameScatter>,
+        list: super::send_slots::ScatterLease,
         table: &'static ScatterSend,
     },
 }
@@ -485,12 +485,36 @@ unsafe impl Send for PendingVideo {}
 unsafe impl Sync for PendingVideo {}
 
 impl PendingVideo {
-    /// The entry for a scatter frame, sent through `table`, with a scatter
-    /// list that stays where it is for as long as the entry exists.
+    /// The frame owns a strong lease of its caller's already reserved list
+    /// storage, which stays valid independently of any moving queue entry.
     #[cfg(ndi_has_advanced_scatter_send)]
-    pub(super) fn scatter(mut frame: ScatterVideoFrame, table: &'static ScatterSend) -> Self {
-        let list = AliasableBox::new(Box::new(frame.storage.descriptor(table)));
+    pub(super) fn scatter_in(
+        mut frame: ScatterVideoFrame,
+        table: &'static ScatterSend,
+        slot: &mut super::send_slots::DescriptorLease,
+    ) -> Self {
+        let list = slot.scatter(frame.storage.descriptor(table));
         Self::Scatter { frame, list, table }
+    }
+
+    /// Lend a queue entry using the original first block as completion key.
+    /// Supported runtimes ignore these fields for scatter input and report
+    /// them unchanged in completion callbacks, including destruction callbacks.
+    pub(super) fn lend_for_queue(&mut self) -> Lent {
+        let lent = self.lend(());
+        #[cfg(ndi_has_advanced_scatter_send)]
+        {
+            let mut lent = lent;
+            if let Self::Scatter { frame, .. } = self {
+                let first = &mut frame.storage.blocks[0];
+                let descriptor = lent.descriptor_mut();
+                descriptor.p_data = first.as_mut_ptr();
+                descriptor.__bindgen_anon_1.data_size_in_bytes = first.len() as i32;
+            }
+            lent
+        }
+        #[cfg(not(ndi_has_advanced_scatter_send))]
+        lent
     }
 
     /// The stream the frame is sent on.
@@ -512,7 +536,8 @@ impl PendingVideo {
 }
 
 // SAFETY: Each variant owns the initialized payload and terminated metadata;
-// Scatter additionally owns its list in stable storage. Moving PendingVideo
+// Scatter additionally owns its stable list's allocation through a strong
+// pool lease. Moving PendingVideo
 // moves none of those allocations. InFlight prevents access until release.
 unsafe impl Lend for PendingVideo {
     type Authorization = ();
@@ -537,13 +562,72 @@ unsafe impl Lend for PendingVideo {
 /// per stream until the replacement on that same stream returns, or the native
 /// sender is destroyed. A synchronizing send on another stream can end the
 /// native loan earlier without releasing this retained storage to the caller.
-#[derive(Default)]
 struct PendingStreams {
     program: InFlight<PendingVideo>,
     preview: InFlight<PendingVideo>,
+    #[cfg(ndi_has_advanced_scatter_send)]
+    scatter_slots: std::sync::Arc<super::send_slots::DescriptorSlots>,
+    #[cfg(ndi_has_advanced_scatter_send)]
+    next_scatter: [usize; 2],
 }
 
 impl PendingStreams {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            program: InFlight::default(),
+            preview: InFlight::default(),
+            // Each stream needs old and replacement lists to coexist until
+            // native submission has returned and released the displaced loan.
+            #[cfg(ndi_has_advanced_scatter_send)]
+            scatter_slots: super::send_slots::DescriptorSlots::new(4)?,
+            #[cfg(ndi_has_advanced_scatter_send)]
+            next_scatter: [0, 2],
+        })
+    }
+
+    #[cfg(ndi_has_advanced_scatter_send)]
+    fn submit_scatter(
+        &mut self,
+        sender: SendHandle,
+        frame: ScatterVideoFrame,
+        table: &'static ScatterSend,
+    ) -> Option<SubmittedVideo> {
+        let stream = match frame.format().tier() {
+            StreamTier::Program => 0,
+            StreamTier::Preview => 1,
+        };
+        let index = self.next_scatter[stream];
+        // SAFETY: a stream alternates between its own two slots. Any older
+        // loan of this index was displaced and released before the previous
+        // same-stream submission returned. The other stream has disjoint slots.
+        let mut slot = unsafe { self.scatter_slots.claim(index) };
+        let pending = PendingVideo::scatter_in(frame, table, &mut slot);
+        #[cfg(test)]
+        {
+            let previous = if stream == 0 {
+                self.program.frame()
+            } else {
+                self.preview.frame()
+            };
+            if let (
+                Some(PendingVideo::Scatter { list: old, .. }),
+                PendingVideo::Scatter { list: next, .. },
+            ) = (previous, &pending)
+            {
+                // Pin the coexistence invariant at the actual boundary before
+                // submit makes its synchronizing native call.
+                assert_ne!(old.as_ptr(), next.as_ptr());
+            }
+        }
+        let returned = self.submit(sender, pending);
+        self.next_scatter[stream] = if index.is_multiple_of(2) {
+            index + 1
+        } else {
+            index - 1
+        };
+        returned
+    }
+
     /// Hand `next` to the SDK through `sender`, then take back the frame it
     /// replaces on the same stream.
     fn submit(&mut self, sender: SendHandle, next: PendingVideo) -> Option<SubmittedVideo> {
@@ -671,12 +755,14 @@ impl CompressedSender {
     ///
     /// As for [`Sender::new`], and
     /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
-    /// without an Advanced runtime (or in a build without the Advanced SDK).
+    /// without an Advanced runtime (or in a build without the Advanced SDK),
+    /// and [`Error::InvalidInput`](crate::Error::InvalidInput) when stable
+    /// descriptor storage cannot be reserved.
     pub fn new(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
         let config = AdvancedConfig::or_empty(options.config.as_ref());
         Ok(Self {
             sender: Sender::new_configured(ndi, options, &config)?,
-            pending: PendingStreams::default(),
+            pending: PendingStreams::new()?,
         })
     }
 
@@ -896,7 +982,7 @@ impl CompressedVideo<'_> {
             Err(error) => return Err(Rejected::new(error, frame)),
         };
         native!(ScatterSend, table => {
-            Ok(self.pending.submit(self.sender.handle(), PendingVideo::scatter(frame, table)))
+            Ok(self.pending.submit_scatter(self.sender.handle(), frame, table))
         })
     }
 }
@@ -1252,11 +1338,13 @@ mod tests {
         let frame = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
         let pointers = frame.storage.pointers.as_ptr().cast::<*const u8>();
         let sizes = frame.storage.sizes.as_ptr().cast::<i32>();
-        let (mut pending, allocations) =
-            crate::test_alloc::allocation_count(|| PendingVideo::scatter(frame, table));
-        // The scatter list is the only new allocation: its arrays belong to
-        // the frame.
-        assert_eq!(allocations, 1);
+        let slots = super::super::send_slots::DescriptorSlots::new(1).unwrap();
+        // SAFETY: this is the pool's first and only claim.
+        let mut slot = unsafe { slots.claim(0) };
+        let (mut pending, allocations) = crate::test_alloc::allocation_count(|| {
+            PendingVideo::scatter_in(frame, table, &mut slot)
+        });
+        assert_eq!(allocations, 0, "the list uses reserved production storage");
         let Lent::Scatter { scatter, .. } = pending.lend(()) else {
             panic!("a scatter frame is lent with its scatter list");
         };
@@ -1273,6 +1361,76 @@ mod tests {
             assert_eq!(list.p_data_blocks.cast::<*const u8>(), pointers);
             assert_eq!(list.p_data_blocks_size.cast::<i32>(), sizes);
         });
+    }
+
+    #[cfg(ndi_has_advanced_scatter_send)]
+    #[test]
+    fn compressed_scatter_streams_double_buffer_lists_without_allocating() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let (format, bytes) = h264();
+        let make =
+            |tier| ScatterVideoFrame::new(format.with_tier(tier), split(&bytes, &[44])).unwrap();
+        let mut sender = CompressedSender::new(
+            &ndi,
+            &SenderOptions::new(crate::test_support::unique_name("scatter-double-buffer"))
+                .clock_video(false),
+        )
+        .unwrap();
+        let list = |stream: &InFlight<PendingVideo>| match stream.frame().unwrap() {
+            PendingVideo::Scatter { list, .. } => list.as_ptr(),
+            _ => panic!("scatter stream"),
+        };
+        let first = make(StreamTier::Program);
+        let original = first.blocks().next().unwrap().as_ptr();
+        sender.send_scatter_video_async(first).unwrap();
+        let program = list(&sender.pending.program);
+        sender
+            .send_scatter_video_async(make(StreamTier::Preview))
+            .unwrap();
+        let preview = list(&sender.pending.preview);
+        assert_ne!(program, preview);
+        let replacement = make(StreamTier::Program);
+        let (returned, allocations) =
+            crate::test_alloc::allocation_count(|| sender.send_scatter_video_async(replacement));
+        assert_eq!(allocations, 0);
+        let SubmittedVideo::Scatter(returned) = returned.unwrap().unwrap() else {
+            panic!("scatter")
+        };
+        assert_eq!(returned.blocks().next().unwrap().as_ptr(), original);
+        let next_program = list(&sender.pending.program);
+        assert_ne!(next_program, program);
+        assert_ne!(next_program, preview);
+        assert_eq!(list(&sender.pending.preview), preview);
+        let replacement = make(StreamTier::Preview);
+        let (returned, allocations) =
+            crate::test_alloc::allocation_count(|| sender.send_scatter_video_async(replacement));
+        returned.unwrap();
+        assert_eq!(allocations, 0);
+        let next_preview = list(&sender.pending.preview);
+        assert_ne!(next_preview, preview);
+        assert_ne!(next_preview, next_program);
+        sender
+            .send_scatter_video_async(make(StreamTier::Program))
+            .unwrap();
+        assert_eq!(list(&sender.pending.program), program);
+        assert_eq!(list(&sender.pending.preview), next_preview);
+        // A contiguous replacement also ends the previous scatter loan; the
+        // next scatter send can use the stream's reserved alternate index.
+        sender
+            .send_video_async(
+                CompressedVideoFrame::new(format.with_tier(StreamTier::Preview), bytes.clone())
+                    .unwrap(),
+            )
+            .unwrap();
+        sender
+            .send_scatter_video_async(make(StreamTier::Preview))
+            .unwrap();
+        assert_eq!(list(&sender.pending.preview), preview);
+        let reclaimed = sender.close();
+        assert!(reclaimed.program.is_some());
+        assert!(reclaimed.preview.is_some());
     }
 
     /// Each stream keeps its own frame in flight: a submission hands back the

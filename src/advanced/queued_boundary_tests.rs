@@ -3,30 +3,11 @@ use super::*;
 fn retain(state: &CallbackState, id: u64) -> usize {
     let pixels = VideoFrame::builder().resolution(2, 2).build().unwrap();
     let bytes = pixels.retained_bytes();
-    let authorized = QueuedAuthorization::Pixels(SendableVideoLayout::for_test(*pixels.layout()));
-    let mut frame = QueuedStorage::new(pixels.into(), authorized);
-    let lent = frame.lend(authorized);
-    #[cfg(ndi_has_advanced_scatter_send)]
-    let Lent::Frame(raw) = lent
-    else {
-        unreachable!()
-    };
-    #[cfg(not(ndi_has_advanced_scatter_send))]
-    let Lent::Frame(raw) = lent;
-    let header = AliasableBox::new(Box::new(raw));
-    let key = header.p_data as usize;
+    let frame = QueuedVideoFrame::from(pixels).authorize_for_test(None);
     let mut locked = state.state.lock().unwrap();
-    locked.bytes += bytes;
-    locked.in_flight.insert(
-        key,
-        Entry {
-            id: SubmissionId(id),
-            _header: header,
-            frame,
-            bytes,
-        },
-    );
-    key
+    let admitted = locked.admit(frame, bytes).unwrap();
+    assert_eq!(admitted.id.get(), id);
+    admitted.lent.descriptor().p_data as usize
 }
 
 #[test]
@@ -120,38 +101,30 @@ fn scatter_keys_and_concurrent_completions_preserve_allocations() {
             .map(|block| block.as_ptr() as usize)
             .collect::<Vec<_>>();
         let bytes = frame.retained_bytes();
-        let (mut frame, allocations) = crate::test_alloc::allocation_count(|| {
-            QueuedStorage::new(frame.into(), QueuedAuthorization::Scatter(table))
+        let (frame, allocations) = crate::test_alloc::allocation_count(|| {
+            QueuedVideoFrame::from(frame).authorize_for_test(Some(table))
         });
-        assert_eq!(allocations, 1, "only the stable scatter-list descriptor");
-        let (lent, allocations) =
-            crate::test_alloc::allocation_count(|| frame.lend(QueuedAuthorization::Scatter(table)));
-        assert_eq!(allocations, 0);
-        let Lent::Scatter { frame: raw, .. } = lent else {
-            panic!("scatter storage")
-        };
-        assert_eq!(raw.p_data as usize, pointers[0]);
-        let (header, allocations) =
-            crate::test_alloc::allocation_count(|| AliasableBox::new(Box::new(raw)));
-        assert_eq!(allocations, 1, "only the native frame descriptor");
-        let key = header.p_data as usize;
+        assert_eq!(
+            allocations, 0,
+            "authorization retains capabilities without allocating"
+        );
+        let mut locked = state.state.lock().unwrap();
+        let (admitted, allocations) =
+            crate::test_alloc::allocation_count(|| locked.admit(frame, bytes));
+        let admitted = admitted.unwrap();
+        assert_eq!(
+            allocations, 0,
+            "frame and scatter descriptors use reserved slots"
+        );
+        assert_eq!(admitted.lent.descriptor().p_data as usize, pointers[0]);
+        assert_eq!(admitted.id.get(), number);
+        let key = admitted.lent.descriptor().p_data as usize;
         assert!(
             !keys.contains(&key),
             "keys are distinct across all variants"
         );
         keys.push(key);
         original.push((number, pointers));
-        let mut locked = state.state.lock().unwrap();
-        locked.bytes += bytes;
-        locked.in_flight.insert(
-            key,
-            Entry {
-                id: SubmissionId(number),
-                _header: header,
-                frame,
-                bytes,
-            },
-        );
     }
     std::thread::scope(|scope| {
         for key in keys.into_iter().rev() {
