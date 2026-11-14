@@ -24,6 +24,14 @@ For `RuntimeConflict`, inspect the selected path and edition. A successful
 selection lasts for the process, so configure it before another component
 initializes NDI. Restart after changing the selected library.
 
+`SelectionConflict::ForeignRuntimeInScope` or
+`LoadRefusal::ForeignRuntimeInScope` means a runtime already linked or preloaded
+into the process's global symbol scope would intercept another runtime's native
+calls. On non-Apple ELF targets, select the file named by the diagnostic, or
+remove the other runtime's direct link or preload. Matching its version or
+edition does not make two different runtime modules interchangeable. A Standard
+runtime in scope also prevents selecting a separate Advanced runtime.
+
 For `UnsupportedCapability`, inspect its feature and reason, then check
 [runtime capabilities](setup.md#runtime-capabilities). A Cargo feature, SDK
 edition or exported entry point alone does not establish hardware support or

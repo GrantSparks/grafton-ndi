@@ -145,9 +145,12 @@ the encoder supplies separate header, payload and parameter-set blocks; it
 returns as `QueuedVideoFrame::Scatter`, and `into_blocks()` recovers the original
 allocations. This requires scatter-send support as well as completion support.
 The byte budget counts block capacities, the owned block collection, both
-scatter arrays and metadata. Submitting allocates a native frame descriptor
-and, for scatter, one stable list descriptor. The SDK completion callback runs
-no application code.
+scatter arrays and metadata. Queue construction reserves stable native frame
+descriptors and, where supported, scatter-list descriptors for `max_frames`,
+plus bookkeeping scratch for allocation-free index rebuilds.
+Accepted submissions, completion callbacks and completion collection allocate
+nothing. A `QueueFull` refusal allocates only the returned `Rejected` value.
+The SDK completion callback runs no application code.
 
 `from_sender` drains an ordinary sender's async pipeline and returns any held
 frame; it refuses advertised senders. The queue lends audio, metadata and
@@ -155,9 +158,14 @@ shared controls through `sender()`, but reserves video sends. `QueuedSender` is
 `Send + Sync`; submission/collection require mutable access. `split()` lends
 an exclusive `QueuedVideo` view alongside the shared sender, so audio can run
 on its own scoped thread while video waits for completions. Neither split
-adds a lock or allocation to a send. **Drop waits
-without a timeout** for the SDK to finish with queued frames. Keep this blocking
-shutdown off an async executor. See
+adds a lock or allocation to a send. `close()` consumes the queue and returns
+every retained frame with its submission id: completed frames awaiting
+collection in completion order, followed by unmatched frames in submission
+order. Use it to
+recover buffers at shutdown or after `completion_protocol_failed()` reports an
+unmatched native callback. Native destruction ends the SDK's access before any
+frame is returned. **Close and drop wait without a timeout** for native
+destruction. Keep this blocking shutdown off an async executor. See
 [`advanced_queued_send`](../examples/advanced_queued_send.rs).
 
 ## Custom receive allocation
@@ -181,6 +189,11 @@ unavailable generations, policy errors/panics and refused buffers. Counters
 never reset, include retired policies and saturate at `u64::MAX`. Each declined
 request increments one reason. Updates add no allocation, callback or logging
 on SDK threads.
+
+Audio requests above the 64 MiB capture limit are declined as
+`AllocationDecline::RequestNotRepresentable` before calling the allocation
+policy. Unrepresentable video and audio requests are declined without allocating
+on the SDK thread.
 
 `AllocatorService::attach_packets` gives packet capture the same application
 buffers. Use `AllocatedPacketReceiver::capture_ref` to inspect those buffers

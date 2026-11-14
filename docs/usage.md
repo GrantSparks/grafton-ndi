@@ -136,9 +136,12 @@ Optional per-frame metadata does not prevent reception of valid video or
 samples. `metadata()` returns `None` when that text is not UTF-8 or has no
 terminator within the 4 MiB cap; `metadata_status()` distinguishes these
 conditions from absent text. The borrowed frame keeps this status without
-allocation. Forwarding omits unreadable text, and owned copies retain only
-valid metadata, so their status becomes `Absent`. Standalone metadata frames
-remain strict because their text is the entire payload.
+allocation. Forwarding omits unreadable text. Owned copies also omit the text
+but preserve its withheld status, including copies made for async processing.
+Default image encoding and `color_info()` refuse withheld video metadata;
+`ColorPolicy::Override` permits encoding when the application supplies the
+matrix and range. Standalone metadata frames remain strict because their text
+is the entire payload.
 
 ## Use FrameSync
 
