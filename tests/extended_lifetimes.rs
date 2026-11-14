@@ -423,13 +423,12 @@ fn child(case: &str) {
             let mut metadata = String::with_capacity(1024);
             metadata.push_str("<pooled/>");
             let metadata_pointer = metadata.as_ptr();
-            let packet = CompressedVideoFrame::new(
+            let mut packet = CompressedVideoFrame::new(
                 VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16).unwrap(),
                 vec![0; 4],
             )
-            .unwrap()
-            .with_metadata(metadata)
             .unwrap();
+            packet.set_metadata(metadata).unwrap();
             let mut bounded = QueuedSender::new(
                 &ndi,
                 &SenderOptions::new("queue metadata capacity"),

@@ -256,6 +256,11 @@ shows scoped inspection with either async runtime; see
 Create a `Sender` to publish a source. Use its tally, connection count and
 metadata methods to monitor receivers and exchange control messages.
 
+Owned and borrowed video construction defaults to 60 frames per second, as do
+compressed video formats. Set a `FrameRate` explicitly when the source uses
+another rate. Owned frames use `set_metadata` and `clear_metadata` to replace
+or remove per-frame metadata; a rejected replacement preserves the old value.
+
 ```rust
 use grafton_ndi::{FrameRate, PixelFormat, Sender, SenderOptions, VideoFrame};
 use std::time::Duration;

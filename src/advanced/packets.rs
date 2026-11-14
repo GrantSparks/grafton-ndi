@@ -520,7 +520,7 @@ pub struct VideoPacketFormat {
 }
 
 impl VideoPacketFormat {
-    /// A progressive program-tier format at 30 frames per second with square
+    /// A progressive program-tier format at 60 frames per second with square
     /// pixels. Adjust it with the `with_*` methods.
     ///
     /// # Errors
@@ -541,7 +541,7 @@ impl VideoPacketFormat {
                 protected: false,
                 width,
                 height,
-                frame_rate: const { FrameRate::per_second(30) },
+                frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
                 picture_aspect_ratio: 0.0,
                 scan_type: ScanType::Progressive,
             }),
@@ -762,6 +762,19 @@ impl FrameExtras {
         self.metadata.as_ref().map(FrameMetadata::as_str)
     }
 
+    pub(crate) fn set_timecode(&mut self, timecode: Timecode) {
+        self.timecode = timecode;
+    }
+
+    pub(crate) fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<()> {
+        self.metadata = Some(FrameMetadata::new(metadata)?);
+        Ok(())
+    }
+
+    pub(crate) fn clear_metadata(&mut self) {
+        self.metadata = None;
+    }
+
     /// Bytes the metadata keeps allocated, including terminator and spare capacity.
     pub(crate) fn retained_bytes(&self) -> usize {
         self.metadata
@@ -783,30 +796,45 @@ impl FrameExtras {
     }
 }
 
-/// A frame that carries [`FrameExtras`].
-pub(crate) trait HasExtras: Sized {
-    fn extras_mut(&mut self) -> &mut FrameExtras;
-}
-
-/// Set a frame's timecode.
-pub(crate) fn attach_timecode<T: HasExtras>(mut frame: T, timecode: Timecode) -> T {
-    frame.extras_mut().timecode = timecode;
-    frame
-}
-
-/// Attach checked metadata, returning the frame unchanged when it is refused.
-pub(crate) fn attach_metadata<T: HasExtras>(
-    mut frame: T,
-    value: String,
-) -> std::result::Result<T, Rejected<T>> {
-    match FrameMetadata::new(value) {
-        Ok(metadata) => {
-            frame.extras_mut().metadata = Some(metadata);
-            Ok(frame)
+/// Accessors and editing operations shared by owned compressed and scatter frames.
+macro_rules! frame_extras_accessors {
+    () => {
+        /// The timecode: [`crate::Timecode::SYNTHESIZE`] on a frame built for
+        /// sending without an explicit timecode.
+        pub fn timecode(&self) -> $crate::Timecode {
+            self.extras.timecode()
         }
-        Err(error) => Err(Rejected::new(error, frame)),
-    }
+
+        /// Replace the frame's timecode.
+        pub fn set_timecode(&mut self, timecode: $crate::Timecode) {
+            self.extras.set_timecode(timecode);
+        }
+
+        /// The per-frame metadata, if any.
+        pub fn metadata(&self) -> Option<&str> {
+            self.extras.metadata()
+        }
+
+        /// Replace frame metadata. Use [`Self::clear_metadata`] to remove it.
+        ///
+        /// Invalid replacement text leaves the existing metadata unchanged.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::Error::InvalidCString`] for an interior NUL, or
+        /// [`crate::Error::InvalidFrame`] when the emitted C string would
+        /// exceed the metadata size cap.
+        pub fn set_metadata(&mut self, metadata: impl Into<String>) -> $crate::Result<()> {
+            self.extras.set_metadata(metadata)
+        }
+
+        /// Remove the frame metadata.
+        pub fn clear_metadata(&mut self) {
+            self.extras.clear_metadata();
+        }
+    };
 }
+pub(crate) use frame_extras_accessors;
 
 /// One owned compressed video frame: a [`VideoPacketFormat`] and the codec
 /// bytes, with optional metadata.
@@ -825,17 +853,13 @@ pub struct CompressedVideoFrame {
     pub(crate) extras: FrameExtras,
 }
 
-impl HasExtras for CompressedVideoFrame {
-    fn extras_mut(&mut self) -> &mut FrameExtras {
-        &mut self.extras
-    }
-}
-
 impl CompressedVideoFrame {
+    frame_extras_accessors!();
+
     /// Take ownership of one frame's bytes: a packet envelope for H.264 and
     /// HEVC (see [`PacketEnvelope::encode`]), a SpeedHQ frame otherwise. The
     /// timecode is synthesized by the SDK unless
-    /// [`with_timecode`](Self::with_timecode) sets one.
+    /// [`set_timecode`](Self::set_timecode) sets one.
     ///
     /// # Errors
     ///
@@ -858,24 +882,6 @@ impl CompressedVideoFrame {
         }
     }
 
-    /// The same frame with per-frame metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns the frame unchanged when the text is too long or contains a NUL.
-    pub fn with_metadata(
-        self,
-        metadata: impl Into<String>,
-    ) -> std::result::Result<Self, Rejected<Self>> {
-        attach_metadata(self, metadata.into())
-    }
-
-    /// The same frame with `timecode`.
-    #[must_use]
-    pub fn with_timecode(self, timecode: Timecode) -> Self {
-        attach_timecode(self, timecode)
-    }
-
     /// The codec bytes.
     pub fn data(&self) -> &[u8] {
         &self.bytes
@@ -886,21 +892,10 @@ impl CompressedVideoFrame {
         self.format
     }
 
-    /// The timecode: [`Timecode::SYNTHESIZE`] on a frame built for sending
-    /// without one.
-    pub fn timecode(&self) -> Timecode {
-        self.extras.timecode()
-    }
-
     /// When the sender submitted a received frame, as the SDK recorded it;
     /// `None` on a frame built for sending.
     pub fn timestamp(&self) -> Option<SdkTimestamp> {
         self.extras.timestamp()
-    }
-
-    /// The per-frame metadata, if any.
-    pub fn metadata(&self) -> Option<&str> {
-        self.extras.metadata()
     }
 
     /// Take the codec bytes, retaining the original allocation and capacity.
@@ -1212,13 +1207,9 @@ pub struct CompressedAudioFrame {
     pub(crate) extras: FrameExtras,
 }
 
-impl HasExtras for CompressedAudioFrame {
-    fn extras_mut(&mut self) -> &mut FrameExtras {
-        &mut self.extras
-    }
-}
-
 impl CompressedAudioFrame {
+    frame_extras_accessors!();
+
     /// Take ownership of one audio frame's bytes: a packet envelope for AAC
     /// (see [`PacketEnvelope::encode`]), one bare packet for Opus.
     /// `num_samples` is the number of samples per channel the frame decodes
@@ -1254,28 +1245,9 @@ impl CompressedAudioFrame {
         }
     }
 
-    /// The same frame with `timecode`.
-    #[must_use]
-    pub fn with_timecode(self, timecode: Timecode) -> Self {
-        attach_timecode(self, timecode)
-    }
-
-    /// The same frame with per-frame metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns the frame unchanged when the text is too long or contains a NUL.
-    pub fn with_metadata(
-        self,
-        metadata: impl Into<String>,
-    ) -> std::result::Result<Self, Rejected<Self>> {
-        attach_metadata(self, metadata.into())
-    }
-
-    /// The same frame, marked as a protected stream or not.
-    #[must_use]
-    pub fn with_protected(self, protected: bool) -> Self {
-        Self { protected, ..self }
+    /// Set whether the frame belongs to a protected stream.
+    pub fn set_protected(&mut self, protected: bool) {
+        self.protected = protected;
     }
 
     /// The codec bytes.
@@ -1308,21 +1280,10 @@ impl CompressedAudioFrame {
         self.parameters.num_samples
     }
 
-    /// The timecode: [`Timecode::SYNTHESIZE`] on a frame built for sending
-    /// without one.
-    pub fn timecode(&self) -> Timecode {
-        self.extras.timecode()
-    }
-
     /// When the sender submitted a received frame, as the SDK recorded it;
     /// `None` on a frame built for sending.
     pub fn timestamp(&self) -> Option<SdkTimestamp> {
         self.extras.timestamp()
-    }
-
-    /// The per-frame metadata, if any.
-    pub fn metadata(&self) -> Option<&str> {
-        self.extras.metadata()
     }
 
     /// Take the codec bytes, retaining the original allocation and capacity.
@@ -1793,7 +1754,7 @@ mod tests {
         let format = h264_format()
             .with_frame_rate(rate)
             .with_scan_type(ScanType::Interlaced);
-        assert_eq!(h264_format().frame_rate(), FrameRate::new(30, 1).unwrap());
+        assert_eq!(h264_format().frame_rate(), FrameRate::new(60, 1).unwrap());
         assert_eq!(
             (format.frame_rate(), format.scan_type()),
             (rate, ScanType::Interlaced)
@@ -1861,47 +1822,45 @@ mod tests {
             assert_eq!(rejected.into_inner(), [1, 2]);
         }
 
-        let frame = CompressedVideoFrame::new(
+        let mut frame = CompressedVideoFrame::new(
             h264_format().with_tier(StreamTier::Preview),
             h264_packet(false, &[]),
         )
         .unwrap();
-        let frame = frame.with_metadata("nul\0inside").unwrap_err().into_inner();
+        assert!(matches!(
+            frame.set_metadata("nul\0inside"),
+            Err(Error::InvalidCString(_))
+        ));
         assert_eq!(frame.format().tier(), StreamTier::Preview);
         assert_eq!(frame.metadata(), None);
-        let frame = frame.with_metadata("<ok/>").unwrap();
+        frame.set_metadata("<ok/>").unwrap();
         assert_eq!(frame.metadata(), Some("<ok/>"));
     }
 
     #[test]
-    fn compressed_and_scatter_metadata_retain_owned_storage() {
-        use crate::advanced::{ScatterAudioFrame, ScatterVideoFrame};
-
-        fn check<F: HasExtras + std::fmt::Debug>(frame: F) {
+    fn frame_extras_retain_owned_metadata_storage_until_cleared() {
+        fn check(extras: &mut FrameExtras) {
             let mut text = String::with_capacity(1024);
             text.push_str("<metadata label='é'/>");
             let (pointer, capacity) = (text.as_ptr(), text.capacity());
-            let (mut frame, allocations) =
-                crate::test_alloc::allocation_count(|| attach_metadata(frame, text).unwrap());
+            let ((), allocations) =
+                crate::test_alloc::allocation_count(|| extras.set_metadata(text).unwrap());
             assert_eq!(allocations, 0);
-            let extras = frame.extras_mut();
             assert_eq!(extras.metadata().unwrap().as_ptr(), pointer);
             assert_eq!(extras.retained_bytes(), capacity);
             assert_eq!(extras.to_sdk().2.cast::<u8>(), pointer);
 
-            let mut frame = attach_metadata(frame, "bad\0metadata".into())
-                .unwrap_err()
-                .into_inner();
-            assert_eq!(frame.extras_mut().metadata(), Some("<metadata label='é'/>"));
-            assert_eq!(frame.extras_mut().metadata().unwrap().as_ptr(), pointer);
-            assert_eq!(frame.extras_mut().retained_bytes(), capacity);
+            assert!(extras.set_metadata("bad\0metadata").is_err());
+            assert_eq!(extras.metadata(), Some("<metadata label='é'/>"));
+            assert_eq!(extras.metadata().unwrap().as_ptr(), pointer);
+            assert_eq!(extras.retained_bytes(), capacity);
+            extras.clear_metadata();
+            assert_eq!(extras.metadata(), None);
+            assert_eq!(extras.retained_bytes(), 0);
+            assert!(extras.to_sdk().2.is_null());
         }
 
-        let format = VideoPacketFormat::new(VideoCodec::SpeedHq422, 18, 6).unwrap();
-        check(CompressedVideoFrame::new(format, vec![0; 4]).unwrap());
-        check(ScatterVideoFrame::new(format, vec![vec![0; 4]]).unwrap());
-        check(CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1]).unwrap());
-        check(ScatterAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![vec![1]]).unwrap());
+        check(&mut FrameExtras::default());
     }
 
     #[test]
@@ -1929,9 +1888,8 @@ mod tests {
     #[test]
     fn protected_aac_preserves_codec_high_bit() {
         let bytes = aac_packet(48_000, 2, &[1]);
-        let mut frame = CompressedAudioFrame::new(AudioCodec::Aac, 48_000, 2, 1024, bytes)
-            .unwrap()
-            .with_protected(true);
+        let mut frame = CompressedAudioFrame::new(AudioCodec::Aac, 48_000, 2, 1024, bytes).unwrap();
+        frame.set_protected(true);
         let raw = frame.raw();
         let copied = unsafe { copy_audio_packet(&raw) }.unwrap();
         assert_eq!(copied.codec(), AudioCodec::Aac);
@@ -2215,9 +2173,8 @@ mod tests {
     /// delivered.
     #[test]
     fn received_frames_keep_their_timecode_and_timestamp() {
-        let mut video = CompressedVideoFrame::new(h264_format(), h264_packet(false, &[]))
-            .unwrap()
-            .with_timecode(Timecode::from_ticks(17));
+        let mut video = CompressedVideoFrame::new(h264_format(), h264_packet(false, &[])).unwrap();
+        video.set_timecode(Timecode::from_ticks(17));
         assert_eq!(video.timestamp(), None);
         let raw = video.raw();
         assert_eq!(raw.timecode, 17);
@@ -2234,9 +2191,9 @@ mod tests {
         let received = unsafe { copy_video_packet(&raw) }.unwrap();
         assert_eq!(received.timestamp(), None);
 
-        let mut audio = CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8])
-            .unwrap()
-            .with_timecode(Timecode::from_ticks(-5));
+        let mut audio =
+            CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8]).unwrap();
+        audio.set_timecode(Timecode::from_ticks(-5));
         assert_eq!(audio.timecode(), Timecode::from_ticks(-5));
         let delivered = NDIlib_audio_frame_v3_t {
             timestamp: 99,
@@ -2251,10 +2208,8 @@ mod tests {
     /// never show in the other.
     #[test]
     fn a_cloned_frame_owns_a_copy_of_its_bytes() {
-        let frame = CompressedVideoFrame::new(h264_format(), h264_packet(true, &[2]))
-            .unwrap()
-            .with_metadata("<copy/>")
-            .unwrap();
+        let mut frame = CompressedVideoFrame::new(h264_format(), h264_packet(true, &[2])).unwrap();
+        frame.set_metadata("<copy/>").unwrap();
         let mut copy = frame.clone();
         assert_eq!(copy.data(), frame.data());
         assert_ne!(copy.data().as_ptr(), frame.data().as_ptr());
@@ -2266,9 +2221,9 @@ mod tests {
         assert_eq!(copy.data()[RESERVED_OFFSET], 7);
         assert_eq!(frame.data()[RESERVED_OFFSET], 0);
 
-        let audio = CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8])
-            .unwrap()
-            .with_protected(true);
+        let mut audio =
+            CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8]).unwrap();
+        audio.set_protected(true);
         let copy = audio.clone();
         assert_eq!(
             (copy.data(), copy.is_protected(), copy.num_samples()),

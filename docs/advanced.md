@@ -131,7 +131,7 @@ checks remain in the Advanced layer. See the
 `PacketReceiver` delivers a frame as the codec packet the source sent when the
 frame's format is one that its `PassthroughPreset` names, and as a decoded frame
 otherwise. One `capture` call returns whichever frame or event arrives first as
-a `PacketEvent`, and every result owns its data. It waits up to its timeout as
+a `PacketItem`, and every result owns its data. It waits up to its timeout as
 a `Receiver`'s capture does, capturing again when the SDK returns early with
 nothing, and returns `None` only once the whole timeout is spent. A
 `PacketReceiver` is `Send` and `Sync`, as a `Receiver` is: it can be created
@@ -153,8 +153,8 @@ exist in this mode, because `capture` takes every frame and event:
 ```rust
 use std::time::Duration;
 use grafton_ndi::{
-    advanced::{PacketEvent, PacketReceiver, PassthroughPreset},
-    Ndi, ReceiverOptions, Source, StreamTier, Tally,
+    advanced::{PacketItem, PacketReceiver, PassthroughPreset},
+    Ndi, ReceiverEvent, ReceiverOptions, Source, StreamTier, Tally,
 };
 
 fn relay(ndi: &Ndi, source: Source) -> grafton_ndi::Result<()> {
@@ -162,8 +162,10 @@ fn relay(ndi: &Ndi, source: Source) -> grafton_ndi::Result<()> {
         PacketReceiver::new(ndi, &ReceiverOptions::new(source), PassthroughPreset::Hevc)?;
     packets.receiver().set_tally(Tally::new(true, false));
     packets.controls().set_stream_tier(StreamTier::Program)?;
-    if let Some(PacketEvent::StatusChanged) = packets.capture(Duration::from_secs(1))? {
-        println!("connections: {}", packets.receiver().connection_stats().connections());
+    if let Some(PacketItem::Event(ReceiverEvent::StatusChanged(status))) =
+        packets.capture(Duration::from_secs(1))?
+    {
+        println!("connections: {}", status.connections());
     }
     Ok(())
 }
@@ -180,6 +182,14 @@ samples per channel. Every frame carries a `Timecode`, which the SDK
 synthesizes unless one is set, and a received frame also carries the
 `SdkTimestamp` of its sending.
 
+Video construction defaults to 60 frames per second across owned, borrowed and
+compressed frames. Set the `FrameRate` explicitly to match encoded media.
+Owned raw, compressed and scatter frames use `set_timecode`, `set_metadata` and
+`clear_metadata` for editing. Invalid metadata leaves the prior value intact;
+clearing removes it, while setting `""` retains present but empty metadata.
+Compressed and scatter audio use `set_protected`; the reusable
+`VideoPacketFormat` uses `with_protected` along with its other fluent settings.
+
 H.264, HEVC and AAC payloads travel inside a packet envelope: a 44-byte header
 followed by the payload and the codec configuration. `PacketEnvelope::encode`
 builds one and `PacketEnvelope::parse` reads one. Opus and SpeedHQ frames have
@@ -190,7 +200,7 @@ there is one, the envelope. It does not decode or validate the codec bitstream;
 supplying a correct bitstream, and the codec configuration that keyframes and
 AAC packets need, is the application's job. A frame that fails is refused with
 `Error::InvalidFrame`; a `VideoPacketFormat` value out of range is refused with
-`Error::InvalidInput` when the format is made. The `with_protected` setting
+`Error::InvalidInput` when the format is made. The protected-stream setting
 describes an SDK packet convention. It does not encrypt anything.
 
 The SDK accepts any compressed frame and silently discards those it will not
@@ -433,7 +443,9 @@ different number of samples to follow the audio that belongs to the frame, and
 then reports the count as adjusted. The outcome is the audio, or says why there
 is none: no samples for this frame, a changed audio format (with the source's
 sample rate and channel count), no audio stream, no samples matching the
-frame's time, or an SDK error. Nothing is retried or converted.
+frame's time. An SDK internal error returns `Error::NativeOperationFailed`;
+an unknown status returns `Error::UnexpectedSdkResult`, preserving its code in
+the diagnostic. Both propagate through `?`. Nothing is retried or converted.
 `into_receiver` stops synchronizing and returns the receiver, with its own
 audio capture again.
 

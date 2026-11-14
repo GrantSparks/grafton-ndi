@@ -6,7 +6,7 @@ use std::ptr;
 use super::{
     aliasable::AliasableVec,
     invalid_frame,
-    packets::{attach_metadata, attach_timecode, AudioParameters, FrameExtras, HasExtras},
+    packets::{frame_extras_accessors, AudioParameters, FrameExtras},
     AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, VideoPacketFormat,
     MAX_PACKET_BYTES,
 };
@@ -19,7 +19,7 @@ use crate::{
         advanced::{native, ScatterSend},
         bindings::*,
     },
-    CompressedAttached, Ndi, Rejected, Result, Sender, SenderOptions, StreamTier, Timecode,
+    CompressedAttached, Ndi, Rejected, Result, Sender, SenderOptions, StreamTier,
 };
 
 #[cfg(any(test, ndi_has_advanced_scatter_send))]
@@ -195,13 +195,9 @@ pub struct ScatterVideoFrame {
     extras: FrameExtras,
 }
 
-impl HasExtras for ScatterVideoFrame {
-    fn extras_mut(&mut self) -> &mut FrameExtras {
-        &mut self.extras
-    }
-}
-
 impl ScatterVideoFrame {
+    frame_extras_accessors!();
+
     /// Take ownership of one frame's blocks, in order.
     ///
     /// # Errors
@@ -253,35 +249,6 @@ impl ScatterVideoFrame {
         self.storage.total
     }
 
-    /// The timecode: [`Timecode::SYNTHESIZE`] unless
-    /// [`with_timecode`](Self::with_timecode) set one.
-    pub fn timecode(&self) -> Timecode {
-        self.extras.timecode()
-    }
-
-    /// The per-frame metadata, if any.
-    pub fn metadata(&self) -> Option<&str> {
-        self.extras.metadata()
-    }
-
-    /// The same frame with `timecode`.
-    #[must_use]
-    pub fn with_timecode(self, timecode: Timecode) -> Self {
-        attach_timecode(self, timecode)
-    }
-
-    /// The same frame with per-frame metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns the frame unchanged when the text is too long or contains a NUL.
-    pub fn with_metadata(
-        self,
-        metadata: impl Into<String>,
-    ) -> std::result::Result<Self, Rejected<Self>> {
-        attach_metadata(self, metadata.into())
-    }
-
     /// Join the blocks into one newly allocated contiguous frame.
     pub fn into_contiguous_copy(self) -> CompressedVideoFrame {
         CompressedVideoFrame {
@@ -312,13 +279,9 @@ pub struct ScatterAudioFrame {
     extras: FrameExtras,
 }
 
-impl HasExtras for ScatterAudioFrame {
-    fn extras_mut(&mut self) -> &mut FrameExtras {
-        &mut self.extras
-    }
-}
-
 impl ScatterAudioFrame {
+    frame_extras_accessors!();
+
     /// Take ownership of one frame's blocks, in order. `num_samples` is the
     /// number of samples per channel the frame decodes to.
     ///
@@ -382,17 +345,6 @@ impl ScatterAudioFrame {
         self.parameters.num_samples
     }
 
-    /// The timecode: [`Timecode::SYNTHESIZE`] unless
-    /// [`with_timecode`](Self::with_timecode) set one.
-    pub fn timecode(&self) -> Timecode {
-        self.extras.timecode()
-    }
-
-    /// The per-frame metadata, if any.
-    pub fn metadata(&self) -> Option<&str> {
-        self.extras.metadata()
-    }
-
     /// The blocks, in order.
     pub fn blocks(&self) -> impl ExactSizeIterator<Item = &[u8]> {
         self.storage.blocks()
@@ -411,28 +363,9 @@ impl ScatterAudioFrame {
         self.storage.total
     }
 
-    /// The same frame with `timecode`.
-    #[must_use]
-    pub fn with_timecode(self, timecode: Timecode) -> Self {
-        attach_timecode(self, timecode)
-    }
-
-    /// The same frame with per-frame metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns the frame unchanged when the text is too long or contains a NUL.
-    pub fn with_metadata(
-        self,
-        metadata: impl Into<String>,
-    ) -> std::result::Result<Self, Rejected<Self>> {
-        attach_metadata(self, metadata.into())
-    }
-
-    /// The same frame, marked as a protected stream or not.
-    #[must_use]
-    pub fn with_protected(self, protected: bool) -> Self {
-        Self { protected, ..self }
+    /// Set whether the frame belongs to a protected stream.
+    pub fn set_protected(&mut self, protected: bool) {
+        self.protected = protected;
     }
 
     /// Join the blocks into one newly allocated contiguous frame.
@@ -883,6 +816,7 @@ mod tests {
         packets::testing::{aac_config, aac_packet},
         EnvelopeCodec, PacketEnvelope, VideoCodec,
     };
+    use crate::Timecode;
 
     fn h264() -> (VideoPacketFormat, Vec<u8>) {
         (
@@ -999,11 +933,9 @@ mod tests {
     #[test]
     fn a_cloned_scatter_frame_describes_its_own_blocks() {
         let (format, bytes) = h264();
-        let frame = ScatterVideoFrame::new(format, split(&bytes, &[44, 47]))
-            .unwrap()
-            .with_timecode(Timecode::from_ticks(3))
-            .with_metadata("<scatter/>")
-            .unwrap();
+        let mut frame = ScatterVideoFrame::new(format, split(&bytes, &[44, 47])).unwrap();
+        frame.set_timecode(Timecode::from_ticks(3));
+        frame.set_metadata("<scatter/>").unwrap();
         let copy = frame.clone();
         assert_eq!(
             (copy.timecode(), copy.metadata()),
@@ -1018,9 +950,9 @@ mod tests {
         assert_eq!(&*copy.storage.sizes, &*frame.storage.sizes);
         assert!(copy.storage.pointers[3].is_null());
 
-        let audio = scatter_audio(AudioCodec::Opus, 48_000, 2, 960, vec![vec![1], vec![2]])
-            .unwrap()
-            .with_protected(true);
+        let mut audio =
+            scatter_audio(AudioCodec::Opus, 48_000, 2, 960, vec![vec![1], vec![2]]).unwrap();
+        audio.set_protected(true);
         let copy = audio.clone();
         assert!(copy.is_protected());
         assert_eq!(

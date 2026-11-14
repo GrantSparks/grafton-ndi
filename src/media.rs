@@ -33,6 +33,9 @@ pub struct FrameRate {
     denominator: u32,
 }
 
+/// The shared default for owned, borrowed and compressed video construction.
+pub(crate) const DEFAULT_VIDEO_FRAME_RATE: FrameRate = FrameRate::per_second(60);
+
 impl PartialEq for FrameRate {
     fn eq(&self, other: &Self) -> bool {
         // Each component is at most i32::MAX, so either product fits in u64.

@@ -13,6 +13,20 @@ API, see the [README](README.md) and the migration guides for
 
 ### Breaking Changes
 
+- Video construction uses a shared 60 fps default for owned frames, borrowed
+  frames and compressed video formats. Set an explicit `FrameRate` for other
+  timing.
+- Packet capture returns `PacketItem`, with `Event(ReceiverEvent)` carrying the
+  same notifications and connection snapshot as raw receiver capture.
+- AV synchronization reports SDK internal failures through
+  `Error::NativeOperationFailed` and unknown statuses through
+  `Error::UnexpectedSdkResult`; these are no longer successful outcomes.
+- Owned compressed and scatter frames use `set_metadata`, `clear_metadata`
+  and `set_timecode` rather than consuming `with_*` methods. Their audio
+  variants use `set_protected`.
+- File statistics use named media properties and
+  `PlayerStats::video_frames(StreamTier)` instead of positional arrays. See the
+  [migration notes](docs/migration/unreleased.md).
 - `SourceCache` owns its configured `Finder` and has no lifetime parameter.
   Move it with `SourceCache::new(finder)` and use `cache.finder()` for uncached
   queries. This permits direct storage in server state without extra ownership
@@ -20,6 +34,8 @@ API, see the [README](README.md) and the migration guides for
 
 ### Fixed
 
+- Async recorder metadata injection accepts every `MetadataSource`, including
+  captured metadata, and copies its text and timecode once when called.
 - Contain consumer waker panics in async File API command, event and shutdown
   notifications, preserving recording/playback and completing other waiters.
 

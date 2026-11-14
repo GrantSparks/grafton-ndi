@@ -13,7 +13,7 @@ use super::{
     RecorderState, RecorderStats, RecordingReport, RecordingTarget, RecordingTimecode,
     SourceFormat, SourceSpec, StateError, StopRequest,
 };
-use crate::{timeout::Deadline, Error, MetadataFrame, QueueLimit, Result, Source, Timecode};
+use crate::{timeout::Deadline, Error, MetadataSource, QueueLimit, Result, Source, Timecode};
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
@@ -1595,12 +1595,12 @@ impl AsyncFileRecorder {
     /// Write a metadata frame into the recording at its current position;
     /// see [`FileRecorder::inject_metadata`].
     ///
-    /// Copies the owned frame's text when this method is called, retaining it
-    /// until the deferred worker command runs or is discarded. Unlike the
-    /// synchronous recorder method, this cannot borrow a capture through the
-    /// command's lifetime; convert captured metadata with `to_owned()` first.
-    pub fn inject_metadata(&self, metadata: &MetadataFrame) -> FileOperation<()> {
-        let metadata = metadata.clone();
+    /// Copies the source's text and timecode when this method is called,
+    /// retaining the copy until the deferred worker command runs or is
+    /// discarded. Accepts owned and captured metadata without retaining a
+    /// native frame or borrowing the source through the command's lifetime.
+    pub fn inject_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> FileOperation<()> {
+        let metadata = MetadataSource::to_owned(metadata);
         self.worker.call(move |r| r.inject_metadata(&metadata))
     }
     /// The recorder's running counters.
@@ -2248,6 +2248,71 @@ mod tests {
         ))
         .unwrap();
         (device, recorder)
+    }
+
+    #[test]
+    fn metadata_commands_snapshot_owned_and_captured_sources_before_submission() {
+        use crate::{
+            capture::{Guard, MetadataKind},
+            sys::bindings::{NDIlib_metadata_frame_t, NDIlib_recv_instance_t},
+            MetadataFrame, MetadataFrameRef,
+        };
+        use std::ffi::CString;
+
+        unsafe fn release(instance: NDIlib_recv_instance_t, _: &mut NDIlib_metadata_frame_t) {
+            // SAFETY: the test's counter outlives its synthetic capture guard.
+            unsafe { &*instance.cast::<AtomicUsize>() }.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let (device, recorder) = mock_recorder(Closing::AtStop);
+        let mut owned = MetadataFrame::new("<owned/>")
+            .unwrap()
+            .with_timecode(Timecode::from_ticks(123));
+        let owned_command = recorder.inject_metadata(&owned);
+        owned.set_data("<changed/>").unwrap();
+        owned.set_timecode(Timecode::from_ticks(999));
+        drop(owned);
+
+        let releases = AtomicUsize::new(0);
+        let text = CString::new("<captured label='é'/>").unwrap();
+        let original_address = text.as_ptr() as usize;
+        let raw = NDIlib_metadata_frame_t {
+            length: text.as_bytes_with_nul().len() as i32,
+            timecode: -456,
+            p_data: text.as_ptr().cast_mut(),
+        };
+        // SAFETY: the text and release counter both outlive the capture guard.
+        // The callback counts releases without freeing the borrowed text.
+        let captured = unsafe {
+            MetadataFrameRef::new(Guard::<MetadataKind>::with_test_free(
+                std::ptr::from_ref(&releases).cast_mut().cast(),
+                raw,
+                release,
+            ))
+            .unwrap()
+        };
+        let source: &dyn MetadataSource = &captured;
+        let captured_command = recorder.inject_metadata(source);
+        drop(captured);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        drop(text);
+        assert!(
+            lock(&device.injected).is_empty(),
+            "commands are still deferred"
+        );
+
+        block_on(owned_command).unwrap();
+        block_on(captured_command).unwrap();
+        let frames = lock(&device.injected);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].bytes, b"<owned/>\0");
+        assert_eq!(frames[0].timecode, 123);
+        assert_eq!(frames[1].bytes, "<captured label='é'/>\0".as_bytes());
+        assert_eq!(frames[1].timecode, -456);
+        assert_ne!(frames[1].address, original_address);
+        assert_eq!(frames[1].length as usize, frames[1].bytes.len());
+        drop(frames);
+        block_on(recorder.close()).unwrap();
     }
 
     #[test]

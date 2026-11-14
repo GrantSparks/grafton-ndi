@@ -1283,16 +1283,20 @@ impl RecorderEvent {
 /// Owned playback counters for the current or most recent file session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct PlayerStats {
-    pub(super) video_frames: [u64; 2],
+    pub(super) program_video_frames: u64,
+    pub(super) preview_video_frames: u64,
     pub(super) audio_frames: u64,
     pub(super) metadata_frames: u64,
     pub(super) wallclock: FilePosition,
 }
 
 impl PlayerStats {
-    /// Sent frames for HQ and proxy respectively.
-    pub fn video_frames(&self) -> [u64; 2] {
-        self.video_frames
+    /// Sent video frames for the program or preview stream.
+    pub fn video_frames(&self, tier: StreamTier) -> u64 {
+        match tier {
+            StreamTier::Program => self.program_video_frames,
+            StreamTier::Preview => self.preview_video_frames,
+        }
     }
     /// Sent audio packet count.
     pub fn audio_frames(&self) -> u64 {
@@ -1315,12 +1319,18 @@ pub struct RecorderStats {
     pub(super) video_frames: u64,
     pub(super) audio_frames: u64,
     pub(super) metadata_frames: u64,
-    pub(super) receiver_dropped: [u64; 3],
-    pub(super) pipeline_dropped: [u64; 3],
+    pub(super) video_frames_dropped_by_receiver: u64,
+    pub(super) audio_frames_dropped_by_receiver: u64,
+    pub(super) metadata_frames_dropped_by_receiver: u64,
+    pub(super) video_frames_dropped_by_pipeline: u64,
+    pub(super) audio_frames_dropped_by_pipeline: u64,
+    pub(super) metadata_frames_dropped_by_pipeline: u64,
     pub(super) writer_dropped: u64,
     pub(super) rollover_count: u64,
     pub(super) recording_time: FilePosition,
-    pub(super) last_pts: [FilePosition; 3],
+    pub(super) last_video_pts: FilePosition,
+    pub(super) last_audio_pts: FilePosition,
+    pub(super) last_metadata_pts: FilePosition,
 }
 
 impl RecorderStats {
@@ -1340,13 +1350,29 @@ impl RecorderStats {
     pub fn metadata_frames(&self) -> u64 {
         self.metadata_frames
     }
-    /// Receiver drops in video/audio/metadata order.
-    pub fn receiver_dropped(&self) -> [u64; 3] {
-        self.receiver_dropped
+    /// Video packets dropped by the receiver.
+    pub fn video_frames_dropped_by_receiver(&self) -> u64 {
+        self.video_frames_dropped_by_receiver
     }
-    /// Pipeline drops in video/audio/metadata order.
-    pub fn pipeline_dropped(&self) -> [u64; 3] {
-        self.pipeline_dropped
+    /// Audio packets dropped by the receiver.
+    pub fn audio_frames_dropped_by_receiver(&self) -> u64 {
+        self.audio_frames_dropped_by_receiver
+    }
+    /// Metadata packets dropped by the receiver.
+    pub fn metadata_frames_dropped_by_receiver(&self) -> u64 {
+        self.metadata_frames_dropped_by_receiver
+    }
+    /// Video packets dropped by the pipeline.
+    pub fn video_frames_dropped_by_pipeline(&self) -> u64 {
+        self.video_frames_dropped_by_pipeline
+    }
+    /// Audio packets dropped by the pipeline.
+    pub fn audio_frames_dropped_by_pipeline(&self) -> u64 {
+        self.audio_frames_dropped_by_pipeline
+    }
+    /// Metadata packets dropped by the pipeline.
+    pub fn metadata_frames_dropped_by_pipeline(&self) -> u64 {
+        self.metadata_frames_dropped_by_pipeline
     }
     /// Writer-stage drops across all tracks.
     pub fn writer_dropped(&self) -> u64 {
@@ -1360,9 +1386,17 @@ impl RecorderStats {
     pub fn recording_time(&self) -> FilePosition {
         self.recording_time
     }
-    /// Last muxed timestamps in video/audio/metadata order.
-    pub fn last_pts(&self) -> [FilePosition; 3] {
-        self.last_pts
+    /// Last muxed video timestamp.
+    pub fn last_video_pts(&self) -> FilePosition {
+        self.last_video_pts
+    }
+    /// Last muxed audio timestamp.
+    pub fn last_audio_pts(&self) -> FilePosition {
+        self.last_audio_pts
+    }
+    /// Last muxed metadata timestamp.
+    pub fn last_metadata_pts(&self) -> FilePosition {
+        self.last_metadata_pts
     }
 }
 
@@ -1535,7 +1569,8 @@ impl PlayerStats {
     /// The statistics the SDK's `raw` reports.
     pub(super) fn from_sdk(raw: &NDIlib_file_player_stats_t) -> Self {
         Self {
-            video_frames: raw.video_frames_sent,
+            program_video_frames: raw.video_frames_sent[0],
+            preview_video_frames: raw.video_frames_sent[1],
             audio_frames: raw.audio_frames_sent,
             metadata_frames: raw.metadata_frames_sent,
             wallclock: FilePosition::from_ticks(raw.playback_wallclock_100ns),
@@ -1551,24 +1586,18 @@ impl RecorderStats {
             video_frames: raw.video_frames,
             audio_frames: raw.audio_frames,
             metadata_frames: raw.metadata_frames,
-            receiver_dropped: [
-                raw.receiver_dropped_video_frames,
-                raw.receiver_dropped_audio_frames,
-                raw.receiver_dropped_metadata_frames,
-            ],
-            pipeline_dropped: [
-                raw.pipeline_dropped_video_frames,
-                raw.pipeline_dropped_audio_frames,
-                raw.pipeline_dropped_metadata_frames,
-            ],
+            video_frames_dropped_by_receiver: raw.receiver_dropped_video_frames,
+            audio_frames_dropped_by_receiver: raw.receiver_dropped_audio_frames,
+            metadata_frames_dropped_by_receiver: raw.receiver_dropped_metadata_frames,
+            video_frames_dropped_by_pipeline: raw.pipeline_dropped_video_frames,
+            audio_frames_dropped_by_pipeline: raw.pipeline_dropped_audio_frames,
+            metadata_frames_dropped_by_pipeline: raw.pipeline_dropped_metadata_frames,
             writer_dropped: raw.writer_dropped_frames,
             rollover_count: raw.rollover_count,
             recording_time: FilePosition::from_ticks(raw.recording_time_100ns),
-            last_pts: [
-                FilePosition::from_ticks(raw.last_video_pts_100ns),
-                FilePosition::from_ticks(raw.last_audio_pts_100ns),
-                FilePosition::from_ticks(raw.last_metadata_pts_100ns),
-            ],
+            last_video_pts: FilePosition::from_ticks(raw.last_video_pts_100ns),
+            last_audio_pts: FilePosition::from_ticks(raw.last_audio_pts_100ns),
+            last_metadata_pts: FilePosition::from_ticks(raw.last_metadata_pts_100ns),
         }
     }
 }
@@ -1576,6 +1605,56 @@ impl RecorderStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_statistics_preserve_each_native_media_and_stream_counter() {
+        let playback = PlayerStats::from_sdk(&NDIlib_file_player_stats_t {
+            video_frames_sent: [11, 22],
+            audio_frames_sent: 33,
+            metadata_frames_sent: u64::MAX,
+            playback_wallclock_100ns: 55,
+        });
+        assert_eq!(playback.video_frames(StreamTier::Program), 11);
+        assert_eq!(playback.video_frames(StreamTier::Preview), 22);
+        assert_eq!(playback.audio_frames(), 33);
+        assert_eq!(playback.metadata_frames(), u64::MAX);
+        assert_eq!(playback.wallclock().ticks(), 55);
+
+        let recording = RecorderStats::from_sdk(&NDIlib_file_recorder_stats_t {
+            bytes_written: u64::MAX,
+            video_frames: 1,
+            audio_frames: 2,
+            metadata_frames: 3,
+            receiver_dropped_video_frames: 4,
+            receiver_dropped_audio_frames: 5,
+            receiver_dropped_metadata_frames: 6,
+            pipeline_dropped_video_frames: 7,
+            pipeline_dropped_audio_frames: 8,
+            pipeline_dropped_metadata_frames: 9,
+            writer_dropped_frames: 10,
+            rollover_count: 11,
+            recording_time_100ns: 12,
+            last_video_pts_100ns: 13,
+            last_audio_pts_100ns: 14,
+            last_metadata_pts_100ns: 15,
+        });
+        assert_eq!(recording.bytes_written(), u64::MAX);
+        assert_eq!(recording.video_frames(), 1);
+        assert_eq!(recording.audio_frames(), 2);
+        assert_eq!(recording.metadata_frames(), 3);
+        assert_eq!(recording.video_frames_dropped_by_receiver(), 4);
+        assert_eq!(recording.audio_frames_dropped_by_receiver(), 5);
+        assert_eq!(recording.metadata_frames_dropped_by_receiver(), 6);
+        assert_eq!(recording.video_frames_dropped_by_pipeline(), 7);
+        assert_eq!(recording.audio_frames_dropped_by_pipeline(), 8);
+        assert_eq!(recording.metadata_frames_dropped_by_pipeline(), 9);
+        assert_eq!(recording.writer_dropped(), 10);
+        assert_eq!(recording.rollover_count(), 11);
+        assert_eq!(recording.recording_time().ticks(), 12);
+        assert_eq!(recording.last_video_pts().ticks(), 13);
+        assert_eq!(recording.last_audio_pts().ticks(), 14);
+        assert_eq!(recording.last_metadata_pts().ticks(), 15);
+    }
 
     fn invalid_text<T: std::fmt::Debug>(result: Result<T>) -> String {
         match result {

@@ -1606,19 +1606,33 @@ impl ReceiverCore {
         &self,
         deadline: Deadline,
     ) -> Result<Option<ReceiverItemRef<'_>>> {
+        self.capture_any_until_with(deadline, ReceiverItemRef::Event, |delivered| {
+            self.combined_result(delivered)
+        })
+    }
+
+    /// The mixed-capture wait, shared by raw and packet receivers. A pending
+    /// invalidation is consumed before waiting for native media; delivered
+    /// frames keep their guards through the caller's validation and copy.
+    pub(crate) fn capture_any_until_with<'rx, T>(
+        &'rx self,
+        deadline: Deadline,
+        mut event: impl FnMut(ReceiverEvent) -> T,
+        mut convert: impl FnMut(Delivered<'rx>) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
         capture_within(deadline, |attempt| {
-            if let Some(event) = self.take_pending_event() {
-                return Ok(Some(ReceiverItemRef::Event(event)));
+            if let Some(pending) = self.take_pending_event() {
+                return Ok(Some(event(pending)));
             }
             let Some(lock) = self.capture_lock(attempt) else {
-                return Ok(self.take_pending_event().map(ReceiverItemRef::Event));
+                return Ok(self.take_pending_event().map(&mut event));
             };
-            if let Some(event) = self.take_pending_event() {
-                return Ok(Some(ReceiverItemRef::Event(event)));
+            if let Some(pending) = self.take_pending_event() {
+                return Ok(Some(event(pending)));
             }
             let delivered = capture_any(&lock)?;
             drop(lock);
-            self.combined_result(delivered)
+            convert(delivered)
         })
     }
 
@@ -1660,7 +1674,7 @@ impl ReceiverCore {
     /// typed capture retained during this wait, then consume one. A pending
     /// event returned before the native wait never comes through this path
     /// and is never published again.
-    fn event(&self, notification: Notification) -> Option<ReceiverEvent> {
+    pub(crate) fn event(&self, notification: Notification) -> Option<ReceiverEvent> {
         self.retain(notification);
         self.take_pending_event()
     }
@@ -2535,6 +2549,37 @@ mod tests {
     use super::*;
 
     use std::cell::Cell;
+
+    #[cfg(feature = "advanced")]
+    #[test]
+    fn packet_capture_consumes_the_same_pending_events_as_raw_capture() {
+        use crate::advanced::{PacketItem, PacketReceiver};
+
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap().into_mode();
+        // Model notifications retained before a mode transition. Packet capture
+        // must consume them once without spending its timeout in native capture.
+        receiver.core.retain(Notification::StatusChanged);
+        receiver.core.retain(Notification::SourceChanged);
+        receiver.core.retain(Notification::Unknown(987));
+        native_capture_calls::take();
+        for expected in [
+            ReceiverEvent::StatusChanged(ReceiverStatus { connections: 0 }),
+            ReceiverEvent::SourceChanged,
+            ReceiverEvent::Unknown(987),
+        ] {
+            let Some(PacketItem::Event(actual)) =
+                PacketReceiver::capture_from(&receiver, Duration::from_secs(1)).unwrap()
+            else {
+                panic!("expected receiver event {expected:?}");
+            };
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(native_capture_calls::take(), 0);
+        assert_eq!(receiver.core.take_pending_event(), None);
+    }
 
     #[test]
     fn receive_delay_rounds_up_and_rejects_out_of_range_values() {

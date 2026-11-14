@@ -20,7 +20,7 @@ use std::{env, time::Duration};
 
 use grafton_ndi::{
     advanced::{
-        CompressedSender, PacketEvent, PacketReceiver, PassthroughPreset, ReceivedAudio,
+        CompressedSender, PacketItem, PacketReceiver, PassthroughPreset, ReceivedAudio,
         ReceivedVideo,
     },
     Error, Ndi, ReceiverOptions, SenderOptions, Tally,
@@ -79,28 +79,28 @@ fn main() -> Result<(), Error> {
         match receiver.capture(Duration::from_secs(1))? {
             // A packet the sender cannot pass on is refused with the reason,
             // and stays with the caller.
-            Some(PacketEvent::Video(ReceivedVideo::Compressed(mut packet))) => {
+            Some(PacketItem::Video(ReceivedVideo::Compressed(mut packet))) => {
                 match sender.send_video(&mut packet) {
                     Ok(()) => video += 1,
                     Err(error) => println!("Video packet not relayed: {error}"),
                 }
             }
-            Some(PacketEvent::Audio(ReceivedAudio::Compressed(mut packet))) => {
+            Some(PacketItem::Audio(ReceivedAudio::Compressed(mut packet))) => {
                 match sender.send_audio(&mut packet) {
                     Ok(()) => audio += 1,
                     Err(error) => println!("Audio packet not relayed: {error}"),
                 }
             }
-            Some(PacketEvent::Video(ReceivedVideo::Decoded(frame))) => println!(
+            Some(PacketItem::Video(ReceivedVideo::Decoded(frame))) => println!(
                 "The source sent {}x{} video in a format this preset decodes",
                 frame.width(),
                 frame.height()
             ),
-            Some(PacketEvent::Audio(ReceivedAudio::Decoded(frame))) => println!(
+            Some(PacketItem::Audio(ReceivedAudio::Decoded(frame))) => println!(
                 "The source sent {} audio samples in a format this preset decodes",
                 frame.num_samples()
             ),
-            Some(PacketEvent::Metadata(metadata)) => sender.sender().send_metadata(&metadata),
+            Some(PacketItem::Metadata(metadata)) => sender.sender().send_metadata(&metadata),
             None => println!("Waiting for frames..."),
             Some(_) => {}
         }

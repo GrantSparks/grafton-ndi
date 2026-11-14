@@ -941,7 +941,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// `data` includes extra room. Direct sending requires an explicit
     /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`] opt-in.
     ///
-    /// Its defaults are the packed line stride, 30/1 frames per second,
+    /// Its defaults are the packed line stride, 60/1 frames per second,
     /// square pixels (picture aspect ratio `0.0`), progressive scan, [`Timecode::SYNTHESIZE`]
     /// and no metadata. All validation occurs in
     /// [`BorrowedVideoFrameBuilder::build`].
@@ -971,7 +971,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
             height,
             pixel_format,
             line_stride: None,
-            frame_rate: const { FrameRate::per_second(30) },
+            frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
             picture_aspect_ratio: VideoHeader::SQUARE_PIXELS,
             scan_type: ScanType::Progressive,
             timecode: Timecode::SYNTHESIZE,
@@ -3324,7 +3324,7 @@ mod tests {
         }
     }
 
-    /// Build a borrowed frame of `format` over `buffer` at 30 frames per second.
+    /// Build a borrowed frame of `format` over `buffer` at 60 frames per second.
     fn borrowed(
         buffer: &[u8],
         width: u32,
@@ -3428,7 +3428,7 @@ mod tests {
             borrowed(&buffer, 1920, 1080, PixelFormat::Bgra)
                 .unwrap()
                 .frame_rate(),
-            FrameRate::new(30, 1).unwrap()
+            FrameRate::new(60, 1).unwrap()
         );
     }
 

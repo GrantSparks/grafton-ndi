@@ -109,7 +109,8 @@ pub enum Error {
     /// from an operation that reports success, or null from one that creates
     /// an object (a finder, receiver, sender, router, FrameSync, AV sync or
     /// genlock instance, or a File player or recorder) or returns a source
-    /// descriptor. A source descriptor with neither a name nor an address is
+    /// descriptor; or an internal-error status from AV synchronization.
+    /// A source descriptor with neither a name nor an address is
     /// reported the same way. `operation` names the SDK function or the File
     /// API operation. A Discovery Server advertiser or listener the SDK does
     /// not create is reported as [`Error::InvalidInput`] instead, because the
@@ -234,8 +235,9 @@ pub enum Error {
     /// a Discovery Server snapshot or event batch that is malformed, a
     /// send-completion callback for a frame the SDK
     /// was not handed or had already returned, negative encoder guidance, an
-    /// AV sync format change to a sample rate or channel count that is not
-    /// positive, or a File SDK result that cannot be represented. Malformed
+    /// unknown AV sync status, an AV sync format change to a sample rate or
+    /// channel count that is not positive, or a File SDK result that cannot
+    /// be represented. Malformed
     /// frames are reported as [`Error::InvalidFrame`], and text that is not
     /// UTF-8 as [`Error::InvalidUtf8`]. Ordinary resource-budget ceilings are
     /// [`Error::ResourceLimit`] instead.

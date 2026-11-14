@@ -256,6 +256,16 @@ files: `rollover` starts a new file, `set_source` changes the source, and the
 SDK starts a new file by itself when the options ask for it, for example at a
 size limit. `RecorderOptions` also selects the tracks to record and how files
 are named. `inject_metadata` writes a metadata frame into the recording.
+Both recorder variants accept any `MetadataSource`, including captured metadata
+and `&dyn MetadataSource`. The synchronous recorder borrows its validated text
+for the native call; the async recorder snapshots its text and timecode when
+the method is called, so the capture can be released before the command runs.
+
+Statistics use named media properties. `RecorderStats` exposes, for example,
+`video_frames_dropped_by_receiver`, `video_frames_dropped_by_pipeline` and
+`last_video_pts`, with equivalent audio and metadata properties.
+`PlayerStats::video_frames(StreamTier::Program)` and
+`video_frames(StreamTier::Preview)` select playback video counters by stream.
 
 Before they call the SDK, `start` and `rollover` work out the file that the
 filename pattern names for the target. Its directory must exist and, on Unix,

@@ -21,7 +21,7 @@ use std::{
 
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use super::{invalid_frame, sdk_quantity, AudioCodec, VideoCodec};
-use super::{invalid_input, PacketEvent, PacketReceiver, ReceiverControls};
+use super::{invalid_input, PacketItem, PacketReceiver, ReceiverControls};
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use crate::sys::bindings::*;
 use crate::{
@@ -954,7 +954,7 @@ impl AllocatedPacketReceiver {
     /// # Errors
     ///
     /// As for [`PacketReceiver::capture`].
-    pub fn capture(&mut self, timeout: std::time::Duration) -> Result<Option<PacketEvent>> {
+    pub fn capture(&mut self, timeout: std::time::Duration) -> Result<Option<PacketItem>> {
         PacketReceiver::capture_from(self.inner.receiver(), timeout)
     }
 

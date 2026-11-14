@@ -109,6 +109,9 @@ impl AvSyncRequest {
 }
 
 /// The result of one [`AvSync::synchronize`] call.
+///
+/// These are successful audio or expected no-audio states. Native failures
+/// and unknown statuses are returned through [`crate::Error`].
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum AvSyncOutcome {
@@ -138,11 +141,6 @@ pub enum AvSyncOutcome {
     NoAudioStream,
     /// The source sends audio, but none of it matches the video frame's time.
     NoMatchingSamples,
-    /// The SDK reported an internal error.
-    InternalError,
-    /// A result this crate does not know, with its native value, which can
-    /// be negative as the SDK's failure codes are.
-    Unknown(i32),
 }
 
 /// How the SDK classified one synchronization.
@@ -367,8 +365,10 @@ impl AvSync {
     /// # Errors
     ///
     /// [`Error::InvalidFrame`] when the audio the SDK returned fails
-    /// validation, and [`Error::UnexpectedSdkResult`] when it reports a
-    /// format change to a sample rate or channel count that is not positive.
+    /// validation, [`Error::NativeOperationFailed`] when the SDK reports an
+    /// internal error, and [`Error::UnexpectedSdkResult`] for an unknown
+    /// status or a format change to a sample rate or channel count that is
+    /// not positive.
     pub fn synchronize(
         &self,
         video: Option<&dyn AvSyncVideo>,
@@ -542,8 +542,16 @@ unsafe fn outcome(status: Synchronized, audio: &NDIlib_audio_frame_v3_t) -> Resu
                 }
             }
         }
-        Synchronized::InternalError => AvSyncOutcome::InternalError,
-        Synchronized::Unknown(code) => AvSyncOutcome::Unknown(code),
+        Synchronized::InternalError => {
+            return Err(Error::NativeOperationFailed {
+                operation: "NDIlib_avsync_synchronize",
+            });
+        }
+        Synchronized::Unknown(code) => {
+            return Err(Error::UnexpectedSdkResult(format!(
+                "NDIlib_avsync_synchronize returned unknown status {code}"
+            )));
+        }
     })
 }
 
@@ -914,14 +922,20 @@ mod tests {
             classify(Synchronized::NoMatchingSamples),
             AvSyncOutcome::NoMatchingSamples
         ));
+        // SAFETY: failure statuses never read the descriptor's buffers.
         assert!(matches!(
-            classify(Synchronized::InternalError),
-            AvSyncOutcome::InternalError
+            unsafe { outcome(Synchronized::InternalError, &audio) },
+            Err(Error::NativeOperationFailed {
+                operation: "NDIlib_avsync_synchronize"
+            })
         ));
-        assert!(matches!(
-            classify(Synchronized::Unknown(99)),
-            AvSyncOutcome::Unknown(99)
-        ));
+        for code in [-99, 99] {
+            // SAFETY: an unknown status never reads a buffer.
+            assert!(matches!(
+                unsafe { outcome(Synchronized::Unknown(code), &audio) },
+                Err(Error::UnexpectedSdkResult(message)) if message.contains(&code.to_string())
+            ));
+        }
 
         let empty = NDIlib_audio_frame_v3_t {
             p_data: ptr::null_mut(),
@@ -1053,7 +1067,7 @@ mod tests {
             let audio = returned(descriptor());
             // SAFETY: validation rejects the descriptor before any buffer is read.
             let result = unsafe { outcome(status, &audio.audio) };
-            assert_eq!(result.is_err(), status == Synchronized::Matched);
+            assert_eq!(result.is_ok(), status == Synchronized::FormatChanged);
             drop(audio);
             assert_eq!(released.get(), before + 1);
         }

@@ -281,7 +281,7 @@ fn advanced_types_keep_their_auto_traits() {
         MouseButton: Send, Sync, UnwindSafe, RefUnwindSafe;
         PacketAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
         PacketEnvelope<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
-        PacketEvent: Send, Sync, UnwindSafe, RefUnwindSafe;
+        PacketItem: Send, Sync, UnwindSafe, RefUnwindSafe;
         PacketReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         PassthroughPreset: Send, Sync, UnwindSafe, RefUnwindSafe;
         QualityPlan: Send, Sync, UnwindSafe, RefUnwindSafe;

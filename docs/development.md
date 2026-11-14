@@ -39,6 +39,17 @@ separate receive, send, and FrameSync calculations.
 SDK routing and free strategies are private. New generic APIs should not expose
 raw handles or SDK structures merely to reuse an internal implementation.
 
+Keep equivalent public operations predictable across feature families. Video
+constructors share `media::DEFAULT_VIDEO_FRAME_RATE`; owned raw, compressed and
+scatter frames expose metadata replacement and clearing with the same failure
+semantics. The packet frame accessors share `FrameExtras` and its accessor
+macro. Mixed captures wrap the common `ReceiverEvent`, including its status
+snapshot, in their `Event` variant. Native failures use `Error` rather than a
+successful outcome variant. Statistics name each media quantity, or select an
+existing typed stream value, instead of exposing positional native arrays.
+Async media inputs may borrow a source for an immediate copy, but their
+deferred work must own everything it needs.
+
 Long-lived adapters own their configured dependencies, as `SourceCache` owns
 its finder and `FrameSync` owns its receiver. They must be storable in service
 state without borrowing another field. Borrowed frame, capture, clock and

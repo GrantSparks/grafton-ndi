@@ -7,17 +7,14 @@ use super::{
     ReceiverControls, VideoCodec,
 };
 use crate::{
-    capture::{
-        capture_any, AudioKind, CaptureKind, Delivered, Guard, MetadataKind, Notification,
-        VideoKind,
-    },
-    receiver::{capture_within, Attempt, PacketAttached},
+    capture::{AudioKind, CaptureKind, Delivered, Guard, MetadataKind, VideoKind},
+    receiver::PacketAttached,
     sys::{
         advanced::{native, ReceiverConfiguration},
         bindings::*,
     },
     timeout::Deadline,
-    AudioFrame, MetadataFrame, Ndi, Receiver, ReceiverOptions, Result, VideoFrame,
+    AudioFrame, MetadataFrame, Ndi, Receiver, ReceiverEvent, ReceiverOptions, Result, VideoFrame,
 };
 
 /// Which compressed formats a [`PacketReceiver`] passes through.
@@ -90,25 +87,22 @@ pub enum ReceivedAudio {
 /// What one [`PacketReceiver::capture`] call produced.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub enum PacketEvent {
+pub enum PacketItem {
     /// A video frame.
     Video(ReceivedVideo),
     /// An audio frame.
     Audio(ReceivedAudio),
     /// A metadata frame.
     Metadata(MetadataFrame),
-    /// The connection or the source's properties changed.
-    StatusChanged,
-    /// The receiver is now connected to a different source.
-    SourceChanged,
-    /// A frame type this crate does not know, with its native value.
-    Unknown(u32),
+    /// A receiver invalidation, with the same status snapshot and semantics
+    /// as [`crate::ReceiverItem::Event`].
+    Event(ReceiverEvent),
 }
 
 /// A receiver that delivers compressed packets where it can.
 ///
 /// One capture call returns whichever frame or event arrives first, as a
-/// [`PacketEvent`]; every result owns its data. It cannot feed a
+/// [`PacketItem`]; every result owns its data. It cannot feed a
 /// [`FrameSync`](crate::framesync::FrameSync), which needs decoded frames.
 ///
 /// [`receiver`](Self::receiver) and [`controls`](Self::controls) reach
@@ -130,7 +124,7 @@ pub enum PacketEvent {
 /// ```no_run
 /// use std::time::Duration;
 /// use grafton_ndi::{
-///     advanced::{PacketEvent, PacketReceiver, PassthroughPreset, ReceivedVideo},
+///     advanced::{PacketItem, PacketReceiver, PassthroughPreset, ReceivedVideo},
 ///     ReceiverOptions, Source, Ndi, Tally,
 /// };
 ///
@@ -140,7 +134,7 @@ pub enum PacketEvent {
 /// let mut receiver =
 ///     PacketReceiver::new(&ndi, &ReceiverOptions::new(source), PassthroughPreset::Hevc)?;
 /// receiver.receiver().set_tally(Tally::new(true, false));
-/// if let Some(PacketEvent::Video(ReceivedVideo::Compressed(packet))) =
+/// if let Some(PacketItem::Video(ReceivedVideo::Compressed(packet))) =
 ///     receiver.capture(Duration::from_secs(1))?
 /// {
 ///     println!("{:?}: {} bytes", packet.format().codec(), packet.data().len());
@@ -224,6 +218,9 @@ impl PacketReceiver {
     /// establish disconnection. Use the attached receiver's per-media
     /// counters as described in the
     /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
+    /// Notifications are coalesced [`ReceiverEvent`] invalidations, consumed
+    /// once. Status changes include the current connection count, as in raw
+    /// mixed capture; pending notifications are delivered before waiting.
     ///
     /// The timeout is spent as [`Capture::capture`](crate::Capture::capture)
     /// spends it. The SDK returns early, with neither a frame nor an event,
@@ -244,7 +241,7 @@ impl PacketReceiver {
     /// [`Error::InvalidInput`]: crate::Error::InvalidInput
     /// [`Error::CaptureFailed`]: crate::Error::CaptureFailed
     /// [`Error::InvalidFrame`]: crate::Error::InvalidFrame
-    pub fn capture(&mut self, timeout: Duration) -> Result<Option<PacketEvent>> {
+    pub fn capture(&mut self, timeout: Duration) -> Result<Option<PacketItem>> {
         Self::capture_from(&self.receiver, timeout)
     }
 
@@ -253,37 +250,32 @@ impl PacketReceiver {
     pub(crate) fn capture_from(
         receiver: &Receiver<PacketAttached>,
         timeout: Duration,
-    ) -> Result<Option<PacketEvent>> {
-        capture_within(Deadline::after(timeout)?, |attempt| {
-            Self::poll(receiver, attempt)
-        })
+    ) -> Result<Option<PacketItem>> {
+        receiver.core.capture_any_until_with(
+            Deadline::after(timeout)?,
+            PacketItem::Event,
+            |delivered| Self::capture_result(receiver, delivered),
+        )
     }
 
-    /// One SDK capture on `receiver` within `attempt`, under the capture
-    /// lock the receiver's own capture verbs hold. `None` when the lock was
-    /// not free in time, or the SDK returned neither a frame nor an event.
-    fn poll(receiver: &Receiver<PacketAttached>, attempt: Attempt) -> Result<Option<PacketEvent>> {
-        // A connect or reconnect holds this lock exclusively. Waiting for it
-        // spends the attempt; a zero timeout does not wait, and when the lock
-        // is not available in time no capture is attempted.
-        let Some(lock) = receiver.core.capture_lock(attempt) else {
-            return Ok(None);
-        };
-        let delivered = capture_any(&lock)?;
-        drop(lock);
+    /// Interpret one guarded native result through the same receiver event
+    /// model as raw mixed capture.
+    fn capture_result(
+        receiver: &Receiver<PacketAttached>,
+        delivered: Delivered<'_>,
+    ) -> Result<Option<PacketItem>> {
         // Each guard borrows the receiver and frees its frame exactly once
         // through the matching NDIlib_recv_free_* function, whether or not
         // the copy succeeds.
-        let event = match delivered {
+        let item = match delivered {
             Delivered::Video(frame) => video_event(frame)?,
             Delivered::Audio(frame) => audio_event(frame)?,
             Delivered::Metadata(frame) => metadata_event(frame)?,
-            Delivered::Notification(Notification::None) => return Ok(None),
-            Delivered::Notification(Notification::StatusChanged) => PacketEvent::StatusChanged,
-            Delivered::Notification(Notification::SourceChanged) => PacketEvent::SourceChanged,
-            Delivered::Notification(Notification::Unknown(value)) => PacketEvent::Unknown(value),
+            Delivered::Notification(notification) => {
+                return Ok(receiver.core.event(notification).map(PacketItem::Event));
+            }
         };
-        Ok(Some(event))
+        Ok(Some(item))
     }
 }
 
@@ -310,7 +302,7 @@ fn creation_options(
 
 /// Copy a delivered video frame: a codec packet as it is, any other frame as
 /// the receiver's owned video capture copies it.
-fn video_event(frame: Guard<'_, VideoKind>) -> Result<PacketEvent> {
+fn video_event(frame: Guard<'_, VideoKind>) -> Result<PacketItem> {
     let video = if VideoCodec::from_outer(frame.frame().FourCC).is_some() {
         // SAFETY: the FourCC marks a compressed frame, whose descriptor holds
         // the size of its data. The guard keeps the frame's buffers allocated
@@ -319,23 +311,23 @@ fn video_event(frame: Guard<'_, VideoKind>) -> Result<PacketEvent> {
     } else {
         ReceivedVideo::Decoded(decoded(frame)?)
     };
-    Ok(PacketEvent::Video(video))
+    Ok(PacketItem::Video(video))
 }
 
 /// Copy a delivered audio frame; see [`video_event`].
-fn audio_event(frame: Guard<'_, AudioKind>) -> Result<PacketEvent> {
+fn audio_event(frame: Guard<'_, AudioKind>) -> Result<PacketItem> {
     let audio = if AudioCodec::from_outer(frame.frame().FourCC).is_some() {
         // SAFETY: as for video.
         ReceivedAudio::Compressed(unsafe { packets::copy_audio_packet(frame.frame())? })
     } else {
         ReceivedAudio::Decoded(decoded(frame)?)
     };
-    Ok(PacketEvent::Audio(audio))
+    Ok(PacketItem::Audio(audio))
 }
 
 /// Copy a delivered metadata frame.
-fn metadata_event(frame: Guard<'_, MetadataKind>) -> Result<PacketEvent> {
-    decoded(frame).map(PacketEvent::Metadata)
+fn metadata_event(frame: Guard<'_, MetadataKind>) -> Result<PacketItem> {
+    decoded(frame).map(PacketItem::Metadata)
 }
 
 /// Copy an uncompressed frame through the receiver's validated borrowed view
@@ -358,10 +350,52 @@ mod tests {
     use super::*;
     use crate::{
         advanced::{EnvelopeCodec, PacketEnvelope, VideoPacketFormat},
+        capture::Notification,
         frames::PixelFormat,
         receiver::native_capture_calls,
         Error, Timecode,
     };
+
+    #[test]
+    fn packet_notifications_use_the_shared_receiver_event_payloads() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("")))
+            .unwrap()
+            .into_mode();
+        let Some(PacketItem::Event(ReceiverEvent::StatusChanged(status))) =
+            PacketReceiver::capture_result(
+                &receiver,
+                Delivered::Notification(Notification::StatusChanged),
+            )
+            .unwrap()
+        else {
+            panic!("status changes include a receiver status snapshot");
+        };
+        assert_eq!(
+            status.connections(),
+            receiver.connection_stats().connections()
+        );
+        for (notification, expected) in [
+            (Notification::SourceChanged, ReceiverEvent::SourceChanged),
+            (Notification::Unknown(987), ReceiverEvent::Unknown(987)),
+        ] {
+            let Some(PacketItem::Event(event)) =
+                PacketReceiver::capture_result(&receiver, Delivered::Notification(notification))
+                    .unwrap()
+            else {
+                panic!("expected receiver event {expected:?}");
+            };
+            assert_eq!(event, expected);
+        }
+        assert!(PacketReceiver::capture_result(
+            &receiver,
+            Delivered::Notification(Notification::None),
+        )
+        .unwrap()
+        .is_none());
+    }
 
     unsafe fn count_release<T>(instance: NDIlib_recv_instance_t, _frame: &mut T) {
         // SAFETY: `deliver` keeps the counter alive through every guard.
@@ -372,8 +406,8 @@ mod tests {
     /// often the frame is released.
     fn deliver<K: CaptureKind>(
         raw: K::RawFrame,
-        event: fn(Guard<'_, K>) -> Result<PacketEvent>,
-    ) -> (Result<PacketEvent>, usize) {
+        event: fn(Guard<'_, K>) -> Result<PacketItem>,
+    ) -> (Result<PacketItem>, usize) {
         let releases = AtomicUsize::new(0);
         let instance = (&releases as *const AtomicUsize).cast_mut().cast();
         // SAFETY: every caller's descriptor refers to buffers it keeps alive
@@ -399,7 +433,7 @@ mod tests {
         }
         let (event, releases) = deliver::<VideoKind>(source.to_raw(), video_event);
         assert_eq!(releases, 1);
-        let PacketEvent::Video(ReceivedVideo::Decoded(frame)) = event.unwrap() else {
+        let PacketItem::Video(ReceivedVideo::Decoded(frame)) = event.unwrap() else {
             panic!("an uncompressed frame is decoded");
         };
         assert_eq!(frame.data(), source.data());
@@ -428,7 +462,7 @@ mod tests {
         let mut sent = CompressedVideoFrame::new(format, packet.clone()).unwrap();
         let (event, releases) = deliver::<VideoKind>(sent.raw(), video_event);
         assert_eq!(releases, 1);
-        let PacketEvent::Video(ReceivedVideo::Compressed(copied)) = event.unwrap() else {
+        let PacketItem::Video(ReceivedVideo::Compressed(copied)) = event.unwrap() else {
             panic!("a codec packet is passed through");
         };
         assert_eq!(copied.data(), packet);
@@ -455,7 +489,7 @@ mod tests {
         }
         let (event, releases) = deliver::<AudioKind>(source.to_raw(), audio_event);
         assert_eq!(releases, 1);
-        let PacketEvent::Audio(ReceivedAudio::Decoded(frame)) = event.unwrap() else {
+        let PacketItem::Audio(ReceivedAudio::Decoded(frame)) = event.unwrap() else {
             panic!("uncompressed audio is decoded");
         };
         assert_eq!(frame.data(), source.data());
@@ -480,7 +514,7 @@ mod tests {
             CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8]).unwrap();
         let (event, releases) = deliver::<AudioKind>(sent.raw(), audio_event);
         assert_eq!(releases, 1);
-        let PacketEvent::Audio(ReceivedAudio::Compressed(copied)) = event.unwrap() else {
+        let PacketItem::Audio(ReceivedAudio::Compressed(copied)) = event.unwrap() else {
             panic!("a codec packet is passed through");
         };
         assert_eq!(copied.data(), &[1; 8]);
@@ -500,7 +534,7 @@ mod tests {
             .with_timecode(Timecode::from_ticks(31));
         let (event, releases) = deliver::<MetadataKind>(source.to_raw(), metadata_event);
         assert_eq!(releases, 1);
-        let PacketEvent::Metadata(frame) = event.unwrap() else {
+        let PacketItem::Metadata(frame) = event.unwrap() else {
             panic!("metadata is copied");
         };
         assert_eq!(

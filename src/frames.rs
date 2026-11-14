@@ -1431,7 +1431,7 @@ impl VideoFrame {
             width: 1920,
             height: 1080,
             pixel_format: PixelFormat::Bgra,
-            frame_rate: const { FrameRate::per_second(60) },
+            frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
             picture_aspect_ratio: VideoHeader::SQUARE_PIXELS,
             scan_type: ScanType::Progressive,
             timecode: Timecode::SYNTHESIZE,
@@ -2952,13 +2952,15 @@ pub(crate) trait MetadataParts {
     }
 }
 
-/// A validated metadata input for synchronous sending and connection metadata.
+/// A validated metadata input for sending, connection metadata and recording.
 ///
 /// Implemented by [`MetadataFrame`] and [`MetadataFrameRef`]. Both can be sent
 /// directly, including through `&dyn MetadataSource`, without a wrapper string
-/// allocation or copy. The SDK copies the text during the call, so a captured
-/// frame can be released as soon as the operation returns, even when registering
-/// metadata for future connections. The source's timecode is preserved.
+/// allocation or copy in synchronous operations. The SDK copies the text during
+/// the call, so a captured frame can be released as soon as the operation
+/// returns, even when registering metadata for future connections. Async
+/// recording copies the text immediately into its deferred command. The
+/// source's timecode is preserved in every operation.
 ///
 /// This trait is sealed: applications cannot supply unchecked native pointers.
 #[allow(private_bounds)]

@@ -4,7 +4,7 @@
 use std::ffi::CString;
 use std::{collections::BTreeSet, time::Duration};
 
-use super::{invalid_input, PacketAttached, PacketEvent, PacketReceiver};
+use super::{invalid_input, PacketAttached, PacketItem, PacketReceiver};
 #[cfg(ndi_has_advanced_kvm)]
 use crate::sys::bindings::NDIlib_recv_instance_t;
 #[cfg(any(doc, test, ndi_has_advanced_kvm))]
@@ -377,7 +377,7 @@ impl KvmSession<'_, PacketAttached> {
     /// # Errors
     ///
     /// As for [`PacketReceiver::capture`].
-    pub fn capture(&mut self, timeout: Duration) -> Result<Option<PacketEvent>> {
+    pub fn capture(&mut self, timeout: Duration) -> Result<Option<PacketItem>> {
         PacketReceiver::capture_from(self.receiver, timeout)
     }
 }

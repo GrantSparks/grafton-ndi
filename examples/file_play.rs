@@ -64,7 +64,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if let Some(stats) = player.stats()? {
-        println!("Sent {} video frame(s).", stats.video_frames()[0]);
+        println!(
+            "Sent {} video frame(s).",
+            stats.video_frames(grafton_ndi::StreamTier::Program)
+        );
     }
     Ok(())
 }

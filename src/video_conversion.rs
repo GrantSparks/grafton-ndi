@@ -10,7 +10,7 @@ use std::ptr;
 use crate::{
     frames::{sdk_video_frame, ValidatedVideoLayout, VideoHeader, MAX_VIDEO_BYTES},
     sys::{self, bindings::NDIlib_video_frame_v2_t},
-    Error, FrameRate, Ndi, PixelFormat, Result, ScanType, Timecode, VideoFrame, VideoSource,
+    Error, Ndi, PixelFormat, Result, ScanType, Timecode, VideoFrame, VideoSource,
 };
 
 /// Validated V210 storage geometry, including optional initialized row padding.
@@ -159,7 +159,7 @@ impl V210Layout {
         }
         // The utilities convert samples; the header only has to be valid.
         let header = VideoHeader {
-            frame_rate: const { FrameRate::per_second(30) },
+            frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
             picture_aspect_ratio: 0.0,
             scan_type: ScanType::Progressive,
             timecode: Timecode::SYNTHESIZE,
