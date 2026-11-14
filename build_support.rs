@@ -1,4 +1,5 @@
-//! SDK discovery and static-archive selection, shared by the build script and its tests.
+//! SDK discovery, header licensing and static-archive selection, shared by the
+//! build script, bindings generator and tests.
 //!
 //! Dynamically loaded targets need none of this to build: an SDK found here
 //! only supplies the Advanced-only headers, with the `advanced` feature.
@@ -10,15 +11,62 @@ use std::{
 };
 
 /// The header only an Advanced SDK installation contains.
-#[cfg(feature = "advanced")]
 const ADVANCED_HEADER: &str = "Processing.NDI.Advanced.h";
 
 /// The umbrella header every SDK installation contains.
 const UMBRELLA_HEADER: &str = "Processing.NDI.Lib.h";
 
 /// The licence grant carried by every header that may be redistributed.
-#[cfg(feature = "advanced")]
-const MIT_GRANT: &str = "Permission is hereby granted, free of charge";
+pub const MIT_GRANT: &str = "Permission is hereby granted, free of charge";
+
+/// Header file names classified by whether their declarations may be redistributed.
+pub struct Headers {
+    pub licensed: Vec<String>,
+    pub restricted: Vec<String>,
+}
+
+/// Classify every `.h` file in `include_dir` by the shared redistribution rule.
+/// Both sets are sorted so generated declarations do not depend on directory order.
+pub fn classify_headers(include_dir: &Path) -> Result<Headers, String> {
+    let read_error = |error| format!("Cannot read {}: {error}", include_dir.display());
+    let mut headers = Headers {
+        licensed: Vec::new(),
+        restricted: Vec::new(),
+    };
+    for entry in std::fs::read_dir(include_dir).map_err(read_error)? {
+        let path = entry.map_err(read_error)?.path();
+        if path.extension().is_none_or(|extension| extension != "h") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("Unsupported SDK header name {}", path.display()))?;
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
+        let set = if text.contains(MIT_GRANT) {
+            &mut headers.licensed
+        } else {
+            &mut headers.restricted
+        };
+        set.push(name.to_owned());
+    }
+    headers.licensed.sort();
+    headers.restricted.sort();
+    Ok(headers)
+}
+
+/// A regular expression matching `header` in any directory.
+pub fn header_pattern(header: &str) -> String {
+    let mut pattern = String::from(r".*[/\\]");
+    for character in header.chars() {
+        if !character.is_ascii_alphanumeric() && character != '_' {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern
+}
 
 /// The edition of a static archive, which the statically linked runtime reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,36 +181,8 @@ impl Sdk {
     }
 
     /// Whether this is an Advanced SDK installation.
-    #[cfg(feature = "advanced")]
     pub fn is_advanced(&self) -> bool {
         self.include_dir.join(ADVANCED_HEADER).is_file()
-    }
-
-    /// File names of the headers without the MIT grant. They and the
-    /// declarations generated from them stay on the build machine; only the
-    /// signatures of the functions the crate calls are checked in, in
-    /// `src/sys/advanced_tables.rs`.
-    #[cfg(feature = "advanced")]
-    pub fn restricted_headers(&self) -> Result<Vec<String>, String> {
-        let read_error = |error| format!("Cannot read {}: {error}", self.include_dir.display());
-        let mut headers = Vec::new();
-        for entry in std::fs::read_dir(&self.include_dir).map_err(read_error)? {
-            let path = entry.map_err(read_error)?.path();
-            if path.extension().is_none_or(|extension| extension != "h") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path)
-                .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
-            if !text.contains(MIT_GRANT) {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .ok_or_else(|| format!("Unsupported SDK header name {}", path.display()))?;
-                headers.push(name.to_owned());
-            }
-        }
-        headers.sort();
-        Ok(headers)
     }
 }
 

@@ -18,6 +18,9 @@ use std::{
 
 mod build_advanced;
 mod build_apple;
+// The bindings generator uses the licensed set and SDK probes that this
+// consumer needs only with Advanced declarations or static linking.
+#[allow(dead_code)]
 mod build_support;
 
 use build_support::{Edition, Sdk};
@@ -233,18 +236,12 @@ fn generate_advanced_bindings(sdk: &Sdk, target: &str, out: &Path) -> String {
         .derive_default(true)
         .allowlist_recursively(false)
         .formatter(bindgen::Formatter::Prettyplease);
-    let restricted = sdk
-        .restricted_headers()
-        .unwrap_or_else(|error| panic!("{error}"));
-    for header in &restricted {
-        let escaped: String = header
-            .chars()
-            .flat_map(|character| {
-                let literal = character.is_ascii_alphanumeric() || character == '_';
-                (!literal).then_some('\\').into_iter().chain([character])
-            })
-            .collect();
-        builder = builder.allowlist_file(format!(r".*[/\\]{escaped}"));
+    // Restricted declarations stay on the build machine; only the Standard
+    // generator may emit declarations from the licensed set into the repository.
+    let headers =
+        build_support::classify_headers(&sdk.include_dir).unwrap_or_else(|error| panic!("{error}"));
+    for header in &headers.restricted {
+        builder = builder.allowlist_file(build_support::header_pattern(header));
     }
     let generate = |codegen: bindgen::CodegenConfig, file: &str| {
         let bindings = builder

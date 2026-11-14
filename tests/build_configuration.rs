@@ -127,7 +127,6 @@ fn a_static_edition_is_embedded_in_the_spelling_the_loader_reads() {
     assert_eq!(Edition::Advanced.as_str(), "advanced");
 }
 
-#[cfg(feature = "advanced")]
 #[test]
 fn an_installation_is_advanced_when_it_has_the_advanced_header() {
     let sdk = Sdk::new("edition");
@@ -136,13 +135,12 @@ fn an_installation_is_advanced_when_it_has_the_advanced_header() {
     assert!(sdk.located().is_advanced());
 }
 
-#[cfg(feature = "advanced")]
 #[test]
 fn only_headers_without_the_mit_grant_are_generated_locally() {
     let sdk = Sdk::new("restricted");
     fs::write(
         sdk.root().join("Include/Processing.NDI.Lib.h"),
-        "// Permission is hereby granted, free of charge, to any person\n",
+        format!("// {}, to any person\n", build_support::MIT_GRANT),
     )
     .unwrap();
     fs::write(
@@ -150,10 +148,29 @@ fn only_headers_without_the_mit_grant_are_generated_locally() {
         "// This file is part of the NDI Advanced SDK and may not be distributed.\n",
     )
     .unwrap();
+    fs::write(
+        sdk.root().join("Include/Processing.NDI.Send.h"),
+        format!("// {}, to any person\n", build_support::MIT_GRANT),
+    )
+    .unwrap();
+    sdk.artifact("Include/Processing.NDI.Private.h");
     sdk.artifact("Include/notes.txt");
+    let headers = build_support::classify_headers(&sdk.located().include_dir).unwrap();
     assert_eq!(
-        sdk.located().restricted_headers().unwrap(),
-        ["Processing.NDI.Advanced.h"]
+        headers.licensed,
+        ["Processing.NDI.Lib.h", "Processing.NDI.Send.h"]
+    );
+    assert_eq!(
+        headers.restricted,
+        ["Processing.NDI.Advanced.h", "Processing.NDI.Private.h"]
+    );
+}
+
+#[test]
+fn header_patterns_escape_every_separator() {
+    assert_eq!(
+        build_support::header_pattern("Processing.NDI.Lib.h"),
+        r".*[/\\]Processing\.NDI\.Lib\.h"
     );
 }
 

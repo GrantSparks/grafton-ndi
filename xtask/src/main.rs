@@ -12,11 +12,15 @@ use std::{
     process::{Command, ExitCode},
 };
 
+// Static-archive selection and build-time SDK probes are used by build.rs,
+// while this consumer shares its directory, licensing and pattern rules.
+#[allow(dead_code)]
+#[path = "../../build_support.rs"]
+mod build_support;
+use build_support::{classify_headers, directory, header_pattern, MIT_GRANT};
+
 /// Umbrella headers whose declarations are vendored.
 const UMBRELLA_HEADERS: [&str; 2] = ["Processing.NDI.Lib.h", "Processing.NDI.Lib.File.h"];
-
-/// Text every header must carry before its declarations may be redistributed.
-const MIT_GRANT: &str = "Permission is hereby granted, free of charge";
 
 /// Target the vendored file is generated for.
 const PRIMARY_TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -157,35 +161,11 @@ struct Sdk {
 
 impl Sdk {
     fn open(root: &Path) -> Result<Self, String> {
-        let include = ["include", "Include"]
-            .into_iter()
-            .map(|name| root.join(name))
-            .find(|path| path.is_dir())
-            .ok_or_else(|| format!("{} has no include directory", root.display()))?;
-        let mut licensed = Vec::new();
-        let mut unlicensed = Vec::new();
-        let entries = fs::read_dir(&include)
-            .map_err(|error| format!("cannot read {}: {error}", include.display()))?;
-        for entry in entries {
-            let path = entry.map_err(|error| error.to_string())?.path();
-            if path.extension().is_none_or(|extension| extension != "h") {
-                continue;
-            }
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| format!("unsupported header name {}", path.display()))?
-                .to_owned();
-            let text = fs::read_to_string(&path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            if text.contains(MIT_GRANT) {
-                licensed.push(name);
-            } else {
-                unlicensed.push(name);
-            }
-        }
-        licensed.sort();
-        unlicensed.sort();
+        let include = directory(root, "include", "Include")?;
+        let build_support::Headers {
+            licensed,
+            restricted: unlicensed,
+        } = classify_headers(&include)?;
         for umbrella in UMBRELLA_HEADERS {
             if !licensed.iter().any(|name| name == umbrella) {
                 return Err(format!(
@@ -331,18 +311,6 @@ fn locked_version<'a>(lockfile: &'a str, package: &str) -> Option<&'a str> {
         .strip_suffix('"')
 }
 
-/// A regular expression matching `header` in any directory.
-fn header_pattern(header: &str) -> String {
-    let mut pattern = String::from(r".*[/\\]");
-    for character in header.chars() {
-        if !character.is_ascii_alphanumeric() && character != '_' {
-            pattern.push('\\');
-        }
-        pattern.push(character);
-    }
-    pattern
-}
-
 /// The copyright line and MIT permission text of a header, as Rust line comments.
 fn license_notice(header: &str) -> Result<String, String> {
     let lines: Vec<&str> = header
@@ -430,17 +398,9 @@ mod tests {
     }
 
     #[test]
-    fn header_patterns_escape_every_separator() {
-        assert_eq!(
-            header_pattern("Processing.NDI.Lib.h"),
-            r".*[/\\]Processing\.NDI\.Lib\.h"
-        );
-    }
-
-    #[test]
     fn notice_keeps_copyright_and_permission_text() {
-        let header = "#pragma once\n// NOTE\n//\n//****\n//\n// Copyright (C) 2023 X.\n//\n// Permission is hereby granted, free of charge, to all.\n// OTHER DEALINGS IN THE SOFTWARE.\n//\n//****\nint x;\n";
-        let notice = license_notice(header).unwrap();
+        let header = format!("#pragma once\n// NOTE\n//\n//****\n//\n// Copyright (C) 2023 X.\n//\n// {MIT_GRANT}, to all.\n// OTHER DEALINGS IN THE SOFTWARE.\n//\n//****\nint x;\n");
+        let notice = license_notice(&header).unwrap();
         assert!(notice.starts_with("// Copyright (C) 2023 X."));
         assert!(notice.ends_with("DEALINGS IN THE SOFTWARE."));
         assert!(license_notice("// Copyright (C) 2023 X.\nint x;").is_err());
