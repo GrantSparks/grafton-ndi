@@ -58,10 +58,49 @@ impl<T: Copy + Default> OutParam<T> {
     }
 }
 
+/// Fill guarded storage, then honor the native call's availability result.
+///
+/// The closure receives a writable structure for the duration of the call;
+/// its other native arguments must remain valid through that call. Check the
+/// guard even on `false`: a library with a different layout cannot be trusted
+/// merely because it reported no result.
+pub(super) fn checked_fill<T: Copy + Default>(
+    call: impl FnOnce(*mut T) -> bool,
+) -> Result<Option<T>> {
+    let mut out = OutParam::<T>::new();
+    let available = call(out.as_mut_ptr());
+    let value = out.read()?;
+    Ok(available.then_some(value))
+}
+
+/// Capture a raw event without decoding its payload. Recorder callers must
+/// observe it in the session ledger before any fallible payload conversion.
+///
+/// As for `checked_fill`, the closure receives guarded writable storage for
+/// the call. A `none` return takes precedence over its stored event type, but
+/// never over a damaged guard.
+pub(super) fn capture_event<T: Copy + Default, K: PartialEq>(
+    call: impl FnOnce(*mut T) -> K,
+    event_type: impl FnOnce(&T) -> K,
+    none: K,
+    mismatch: &'static str,
+) -> Result<Option<T>> {
+    let mut out = OutParam::<T>::new();
+    let kind = call(out.as_mut_ptr());
+    let event = out.read()?;
+    if kind == none {
+        return Ok(None);
+    }
+    if kind != event_type(&event) {
+        return Err(Error::UnexpectedSdkResult(mismatch.into()));
+    }
+    Ok(Some(event))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sys::bindings::NDIlib_file_recorder_event_t;
+    use crate::sys::{self, bindings::*};
 
     #[test]
     fn a_write_within_the_layout_is_returned() {
@@ -90,5 +129,160 @@ mod tests {
             out.guard.as_ptr() as usize - start,
             size_of::<NDIlib_file_recorder_event_t>()
         );
+    }
+
+    #[test]
+    fn checked_fill_returns_available_storage_without_allocating() {
+        let (result, allocations) = crate::test_alloc::allocation_count(|| {
+            checked_fill(|out: *mut u64| {
+                // SAFETY: the helper provides initialized, writable storage.
+                unsafe { out.write(7) };
+                true
+            })
+        });
+        assert_eq!(result.unwrap(), Some(7));
+        assert_eq!(allocations, 0);
+        assert_eq!(checked_fill(|_: *mut u64| false).unwrap(), None);
+    }
+
+    /// Damage the first guard byte while staying within the helper's storage.
+    ///
+    /// # Safety
+    ///
+    /// `out` must point into an `OutParam<T>` supplied by a helper.
+    unsafe fn damage_guard<T>(out: *mut T) {
+        // SAFETY: the whole guarded allocation supplies the pointer's
+        // provenance, and the first guard byte follows the T it contains.
+        unsafe { out.cast::<u8>().add(size_of::<T>()).write(0) };
+    }
+
+    fn assert_guard_damage<T: std::fmt::Debug>(result: Result<T>) {
+        assert!(
+            matches!(result, Err(Error::UnexpectedSdkResult(message)) if message.contains("wrote past")),
+            "a damaged guard must be checked before the native result"
+        );
+    }
+
+    #[test]
+    fn checked_fill_checks_the_guard_even_when_the_native_result_is_false() {
+        for available in [false, true] {
+            assert_guard_damage(checked_fill(|out: *mut u64| {
+                // SAFETY: this pointer comes from the guarded fill helper.
+                unsafe { damage_guard(out) };
+                available
+            }));
+        }
+    }
+
+    #[test]
+    fn capture_checks_the_guard_before_none_or_a_stored_type_mismatch() {
+        fn check<T: Copy + Default + std::fmt::Debug>() {
+            for kind in [0, 1] {
+                assert_guard_damage(capture_event(
+                    |out: *mut T| {
+                        // SAFETY: this pointer comes from the guarded capture helper.
+                        unsafe { damage_guard(out) };
+                        kind
+                    },
+                    |_| panic!("a damaged event cannot be inspected"),
+                    0,
+                    "mismatched event types",
+                ));
+            }
+        }
+        check::<NDIlib_file_player_event_t>();
+        check::<NDIlib_file_recorder_event_t>();
+    }
+
+    #[test]
+    fn a_none_event_does_not_inspect_the_stored_event_type() {
+        let result = capture_event(
+            |out: *mut u32| {
+                // SAFETY: the helper provides initialized, writable storage.
+                unsafe { out.write(3) };
+                0
+            },
+            |_| panic!("a none result does not expose an event"),
+            0,
+            "mismatched event types",
+        );
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn event_type_mismatch_is_diagnosed_for_both_native_handles() {
+        use crate::file::{mock, FileApi, PlayerOptions, RecorderOptions, SourceSpec};
+
+        unsafe extern "C" fn player_create(
+            _: *const NDIlib_file_player_create_t,
+        ) -> NDIlib_file_player_instance_t {
+            std::ptr::NonNull::dangling().as_ptr()
+        }
+        unsafe extern "C" fn recorder_create(
+            _: *const NDIlib_file_recorder_create_t,
+        ) -> NDIlib_file_recorder_instance_t {
+            std::ptr::NonNull::dangling().as_ptr()
+        }
+        unsafe extern "C" fn player_mismatch(
+            _: NDIlib_file_player_instance_t,
+            event: *mut NDIlib_file_player_event_t,
+            _: u32,
+        ) -> NDIlib_file_player_event_type_e {
+            // SAFETY: the capture helper provides writable player-event storage.
+            unsafe {
+                event.write(NDIlib_file_player_event_t {
+                    type_: NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_ended,
+                    ..Default::default()
+                })
+            };
+            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_file_opened
+        }
+        unsafe extern "C" fn recorder_mismatch(
+            _: NDIlib_file_recorder_instance_t,
+            event: *mut NDIlib_file_recorder_event_t,
+            _: u32,
+        ) -> NDIlib_file_recorder_event_type_e {
+            // SAFETY: the capture helper provides writable recorder-event storage.
+            unsafe { event.write(mock::recorder_event(mock::STARTED, "take.mkv")) };
+            mock::FILE_CLOSED
+        }
+        let api = FileApi::with_tables(
+            sys::FilePlayback {
+                NDIlib_file_player_create: player_create,
+                NDIlib_file_player_capture_event: player_mismatch,
+                ..mock::playback()
+            },
+            sys::FileRecording {
+                NDIlib_file_recorder_create: recorder_create,
+                NDIlib_file_recorder_capture_event: recorder_mismatch,
+                ..mock::recording()
+            },
+        );
+        let mut player = api
+            .create_player(&PlayerOptions::new("mock player"))
+            .unwrap();
+        let mut recorder = api
+            .create_recorder(&RecorderOptions::new(
+                SourceSpec::new("mock source").unwrap(),
+            ))
+            .unwrap();
+        for (result, owner) in [
+            (
+                player.poll_event(std::time::Duration::ZERO).map(|_| ()),
+                "player",
+            ),
+            (
+                recorder.poll_event(std::time::Duration::ZERO).map(|_| ()),
+                "recorder",
+            ),
+        ] {
+            let Err(Error::UnexpectedSdkResult(message)) = result else {
+                panic!("the {owner} must refuse mismatched event types: {result:?}");
+            };
+            assert_eq!(
+                message,
+                format!("the {owner} returned one event type and stored another")
+            );
+        }
     }
 }

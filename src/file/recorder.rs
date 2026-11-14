@@ -9,7 +9,7 @@ use std::{
 };
 
 use super::{
-    out_param::OutParam,
+    out_param,
     types::{track_flags, NamePattern},
     EventText, FileApi, RecorderEvent, RecorderEventKind, RecorderOptions, RecorderStats,
     RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec, StateError,
@@ -800,26 +800,22 @@ impl FileRecorder {
     /// Take the next native event, or `None` when the queue stays empty for
     /// `wait_ms` milliseconds.
     fn capture(&mut self, wait_ms: u32) -> Result<Option<NDIlib_file_recorder_event_t>> {
-        let mut event = OutParam::<NDIlib_file_recorder_event_t>::new();
-        // SAFETY: the recorder is live and `event` is writable storage for the
-        // structure the SDK fills in.
-        let kind = unsafe {
-            self.recording.NDIlib_file_recorder_capture_event(
-                self.handle.as_ptr(),
-                event.as_mut_ptr(),
-                wait_ms,
-            )
-        };
-        let event = event.read()?;
-        if kind == NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_none {
-            return Ok(None);
-        }
-        if kind != event.type_ {
-            return Err(Error::UnexpectedSdkResult(
-                "the recorder returned one event type and stored another".into(),
-            ));
-        }
-        Ok(Some(event))
+        out_param::capture_event(
+            |event| {
+                // SAFETY: the recorder is live and the helper keeps guarded
+                // event storage writable through the call.
+                unsafe {
+                    self.recording.NDIlib_file_recorder_capture_event(
+                        self.handle.as_ptr(),
+                        event,
+                        wait_ms,
+                    )
+                }
+            },
+            |event| event.type_,
+            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_none,
+            "the recorder returned one event type and stored another",
+        )
     }
 
     /// Stop the session and wait up to `timeout` for its last file to be
@@ -1190,15 +1186,15 @@ impl FileRecorder {
     /// [`Error::UnexpectedSdkResult`] when the SDK's structure does not match this
     /// crate's layout.
     pub fn stats(&self) -> Result<Option<RecorderStats>> {
-        let mut stats = OutParam::<NDIlib_file_recorder_stats_t>::new();
-        // SAFETY: the recorder is live and `stats` is writable storage for the
-        // structure the SDK fills in.
-        let available = unsafe {
-            self.recording
-                .NDIlib_file_recorder_get_stats(self.handle.as_ptr(), stats.as_mut_ptr())
-        };
-        let stats = stats.read()?;
-        Ok(available.then(|| RecorderStats::from_sdk(&stats)))
+        out_param::checked_fill(|stats| {
+            // SAFETY: the recorder is live and the helper keeps guarded stats
+            // storage writable through the call.
+            unsafe {
+                self.recording
+                    .NDIlib_file_recorder_get_stats(self.handle.as_ptr(), stats)
+            }
+        })
+        .map(|stats| stats.map(|stats| RecorderStats::from_sdk(&stats)))
     }
 
     /// The format of the source, once the recorder has seen audio or video.
@@ -1207,15 +1203,16 @@ impl FileRecorder {
     ///
     /// [`Error::UnexpectedSdkResult`] when the SDK's structure is malformed.
     pub fn source_format(&self) -> Result<Option<SourceFormat>> {
-        let mut format = OutParam::<NDIlib_file_source_format_t>::new();
-        // SAFETY: the recorder is live and `format` is writable storage for
-        // the structure the SDK fills in.
-        let known = unsafe {
-            self.recording
-                .NDIlib_file_recorder_get_source_format(self.handle.as_ptr(), format.as_mut_ptr())
-        };
-        let format = format.read()?;
-        known.then(|| SourceFormat::from_sdk(&format)).transpose()
+        out_param::checked_fill(|format| {
+            // SAFETY: the recorder is live and the helper keeps guarded
+            // format storage writable through the call.
+            unsafe {
+                self.recording
+                    .NDIlib_file_recorder_get_source_format(self.handle.as_ptr(), format)
+            }
+        })?
+        .map(|format| SourceFormat::from_sdk(&format))
+        .transpose()
     }
 }
 

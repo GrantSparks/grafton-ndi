@@ -3,8 +3,8 @@
 use std::{marker::PhantomData, path::Path, ptr::NonNull, rc::Rc, time::Duration};
 
 use super::{
-    out_param::OutParam, types, FileApi, FileDuration, FilePosition, PlayerEvent, PlayerOptions,
-    PlayerStats, SourceFormat,
+    out_param, types, FileApi, FileDuration, FilePosition, PlayerEvent, PlayerOptions, PlayerStats,
+    SourceFormat,
 };
 use crate::{
     sys::{self, bindings::*},
@@ -133,26 +133,24 @@ impl FilePlayer {
     /// and [`Error::UnexpectedSdkResult`] when the SDK's event is malformed.
     pub fn poll_event(&mut self, timeout: Duration) -> Result<Option<PlayerEvent>> {
         let timeout = crate::to_ms_checked(timeout)?;
-        let mut event = OutParam::<NDIlib_file_player_event_t>::new();
-        // SAFETY: the player is live and `event` is writable storage for the
-        // structure the SDK fills in.
-        let kind = unsafe {
-            self.playback.NDIlib_file_player_capture_event(
-                self.handle.as_ptr(),
-                event.as_mut_ptr(),
-                timeout,
-            )
-        };
-        let event = event.read()?;
-        if kind == NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_none {
-            return Ok(None);
-        }
-        if kind != event.type_ {
-            return Err(Error::UnexpectedSdkResult(
-                "the player returned one event type and stored another".into(),
-            ));
-        }
-        Ok(Some(PlayerEvent::from_sdk(&event)?))
+        out_param::capture_event(
+            |event| {
+                // SAFETY: the player is live and the helper keeps guarded
+                // event storage writable through the call.
+                unsafe {
+                    self.playback.NDIlib_file_player_capture_event(
+                        self.handle.as_ptr(),
+                        event,
+                        timeout,
+                    )
+                }
+            },
+            |event| event.type_,
+            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_none,
+            "the player returned one event type and stored another",
+        )?
+        .map(|event| PlayerEvent::from_sdk(&event))
+        .transpose()
     }
 
     /// How many events the SDK has discarded since the player was created
@@ -174,15 +172,15 @@ impl FilePlayer {
     /// [`Error::UnexpectedSdkResult`] when the SDK's structure does not match this
     /// crate's layout.
     pub fn stats(&self) -> Result<Option<PlayerStats>> {
-        let mut stats = OutParam::<NDIlib_file_player_stats_t>::new();
-        // SAFETY: the player is live and `stats` is writable storage for the
-        // structure the SDK fills in.
-        let available = unsafe {
-            self.playback
-                .NDIlib_file_player_get_stats(self.handle.as_ptr(), stats.as_mut_ptr())
-        };
-        let stats = stats.read()?;
-        Ok(available.then(|| PlayerStats::from_sdk(&stats)))
+        out_param::checked_fill(|stats| {
+            // SAFETY: the player is live and the helper keeps guarded stats
+            // storage writable through the call.
+            unsafe {
+                self.playback
+                    .NDIlib_file_player_get_stats(self.handle.as_ptr(), stats)
+            }
+        })
+        .map(|stats| stats.map(|stats| PlayerStats::from_sdk(&stats)))
     }
 
     /// Seek to a position on the file's timeline, where zero is its first frame.
@@ -323,15 +321,16 @@ impl FilePlayer {
     ///
     /// [`Error::UnexpectedSdkResult`] when the SDK's structure is malformed.
     pub fn source_format(&self) -> Result<Option<SourceFormat>> {
-        let mut format = OutParam::<NDIlib_file_source_format_t>::new();
-        // SAFETY: the player is live and `format` is writable storage for the
-        // structure the SDK fills in.
-        let known = unsafe {
-            self.playback
-                .NDIlib_file_player_get_source_format(self.handle.as_ptr(), format.as_mut_ptr())
-        };
-        let format = format.read()?;
-        known.then(|| SourceFormat::from_sdk(&format)).transpose()
+        out_param::checked_fill(|format| {
+            // SAFETY: the player is live and the helper keeps guarded format
+            // storage writable through the call.
+            unsafe {
+                self.playback
+                    .NDIlib_file_player_get_source_format(self.handle.as_ptr(), format)
+            }
+        })?
+        .map(|format| SourceFormat::from_sdk(&format))
+        .transpose()
     }
 
     /// The NDI source this player advertises, for example to connect a
