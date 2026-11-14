@@ -90,6 +90,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Added
 
+- `QueuedSender::split` and `CompressedSender::split` lend video and audio
+  operations to separate scoped threads without an external lock.
 - `Runtime::select`, runtime information and capability queries. Optional
   operations report availability by entry points, runtime edition, version
   and build declarations instead of assuming support from a version number.

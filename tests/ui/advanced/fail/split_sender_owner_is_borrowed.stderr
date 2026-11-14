@@ -1,0 +1,21 @@
+error[E0499]: cannot borrow `*owner` as mutable more than once at a time
+ --> tests/ui/advanced/fail/split_sender_owner_is_borrowed.rs:5:13
+  |
+4 |     let (mut video, _) = owner.split();
+  |                          ----- first mutable borrow occurs here
+5 |     let _ = owner.try_take_completed();
+  |             ^^^^^ second mutable borrow occurs here
+6 |     let _ = video.try_take_completed();
+  |             ----- first borrow later used here
+
+error[E0505]: cannot move out of `owner` because it is borrowed
+  --> tests/ui/advanced/fail/split_sender_owner_is_borrowed.rs:12:13
+   |
+10 |     let mut owner = owner;
+   |         --------- binding `owner` declared here
+11 |     let (video, _) = owner.split();
+   |                      ----- borrow of `owner` occurs here
+12 |     let _ = owner.close();
+   |             ^^^^^ move out of `owner` occurs here
+13 |     drop(video);
+   |          ----- borrow later used here

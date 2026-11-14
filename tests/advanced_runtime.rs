@@ -1677,6 +1677,118 @@ fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {
     assert!(!queue.completion_protocol_failed());
 }
 
+/// Split Advanced senders carry audio and video on independent native threads.
+#[test]
+fn advanced_senders_lend_audio_and_video_to_separate_threads() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    fn await_both(receiver: &mut PacketReceiver) {
+        let deadline = Instant::now() + PATIENCE;
+        let (mut video, mut audio) = (false, false);
+        while !(video && audio) {
+            match receiver.capture(SLICE).unwrap() {
+                Some(PacketItem::Video(_)) => video = true,
+                Some(PacketItem::Audio(_)) => audio = true,
+                _ => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "split media missing: video={video}, audio={audio}"
+            );
+        }
+    }
+    let _turn = sockets();
+    let mut queue = QueuedSender::new(
+        &ndi,
+        &options("split-queue").clock_video(true).clock_audio(true),
+        QueueOptions::default(),
+    )
+    .unwrap();
+    let mut receiver = packet_receiver(
+        &ndi,
+        &queue.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
+    connect(&mut receiver, "split queue", |timecode| {
+        queue
+            .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
+            .unwrap();
+        queue.wait_completed(PATIENCE).unwrap().unwrap();
+    });
+    let audio = AudioFrame::builder()
+        .num_channels(2)
+        .num_samples(480)
+        .sample_rate(48_000)
+        .build()
+        .unwrap();
+    {
+        let (mut video, sender) = queue.split();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                for number in 0..6 {
+                    video
+                        .try_submit(keyframe(
+                            VideoCodec::H264,
+                            StreamTier::Program,
+                            FIRST_TIMECODE + number,
+                        ))
+                        .unwrap();
+                    video.wait_completed(PATIENCE).unwrap().unwrap();
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..6 {
+                    sender.send_audio(&audio);
+                }
+            });
+        });
+    }
+    await_both(&mut receiver);
+    assert_eq!(queue.retained_frames(), 0);
+
+    let mut sender = CompressedSender::new(
+        &ndi,
+        &options("split-compressed")
+            .clock_video(true)
+            .clock_audio(true),
+    )
+    .unwrap();
+    let mut receiver = packet_receiver(
+        &ndi,
+        &sender.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
+    connect(&mut receiver, "split compressed", |timecode| {
+        let mut frame = keyframe(VideoCodec::H264, StreamTier::Program, timecode);
+        sender.send_video(&mut frame).unwrap();
+    });
+    {
+        let (mut video, mut audio) = sender.split();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                for number in 0..6 {
+                    let mut frame = keyframe(
+                        VideoCodec::H264,
+                        StreamTier::Program,
+                        FIRST_TIMECODE + number,
+                    );
+                    video.send_video(&mut frame).unwrap();
+                }
+            });
+            scope.spawn(move || {
+                for _ in 0..6 {
+                    let mut frame =
+                        CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64])
+                            .unwrap();
+                    audio.send_audio(&mut frame).unwrap();
+                }
+            });
+        });
+    }
+    await_both(&mut receiver);
+}
+
 /// A queue works on threads other than the one that created it: it submits
 /// and collects completions after a move, is read through a shared reference
 /// from a third thread, and is destroyed on a fourth, where destruction waits

@@ -4,6 +4,7 @@
 //! - Queuing frames with a [`QueuedSender`]
 //! - Reusing each frame once the SDK has finished sending it
 //! - Getting a frame back when the queue is full
+//! - Sending audio on a separate scoped thread while video waits for completions
 //!
 //! Needs the NDI Advanced SDK at build time and an Advanced runtime.
 //!
@@ -15,8 +16,8 @@ use std::{
 };
 
 use grafton_ndi::{
-    advanced::{QueueOptions, QueuedSender, QueuedVideoFrame},
-    Error, Ndi, RuntimeOptions, SdkEdition, SenderOptions, VideoFrame,
+    advanced::{QueueOptions, QueuedSender, QueuedVideo, QueuedVideoFrame},
+    AudioFrame, Error, Ndi, RuntimeOptions, SdkEdition, SenderOptions, VideoFrame,
 };
 
 fn main() -> Result<(), Error> {
@@ -28,6 +29,32 @@ fn main() -> Result<(), Error> {
         QueueOptions::default().max_frames(4),
     )?;
 
+    {
+        let (mut video, audio) = sender.split();
+        thread::scope(|scope| -> Result<(), Error> {
+            let worker = scope.spawn(move || -> Result<(), Error> {
+                let frame = AudioFrame::builder()
+                    .sample_rate(48_000)
+                    .num_channels(2)
+                    .num_samples(480)
+                    .build()?;
+                // Audio's native clock paces these 10 ms blocks independently.
+                for _ in 0..500 {
+                    audio.send_audio(&frame);
+                }
+                Ok(())
+            });
+            let video_result = send_video(&mut video);
+            worker.join().expect("audio worker panicked")?;
+            video_result
+        })?;
+    }
+    // Drop waits for native completion before freeing any retained frame.
+    drop(sender);
+    Ok(())
+}
+
+fn send_video(sender: &mut QueuedVideo<'_>) -> Result<(), Error> {
     // Frames the SDK has finished with, ready to be filled and sent again.
     let mut spare: Vec<QueuedVideoFrame> = Vec::new();
     let mut next_tick = Instant::now();
@@ -60,7 +87,5 @@ fn main() -> Result<(), Error> {
         next_tick = next_tick.max(Instant::now());
     }
     println!("{} frames still queued at exit", sender.retained_frames());
-    // Drop waits for native completion before freeing any retained frame.
-    drop(sender);
     Ok(())
 }

@@ -91,6 +91,7 @@ fn native_resource_ownership() {
         scenarios.extend([
             "queue_immediate",
             "queue_backlog",
+            "queue_split",
             "queue_destroy",
             "queue_registered_sender",
         ]);
@@ -490,6 +491,52 @@ fn child(case: &str) {
             );
             exact.try_submit(rejected.into_inner()).unwrap();
             assert_eq!(log().matches("sender-submit-return\n").count(), 4);
+        }
+        #[cfg(feature = "advanced")]
+        "queue_split" => {
+            use grafton_ndi::{
+                advanced::{QueueOptions, QueuedSender},
+                AudioFrame,
+            };
+            use std::sync::{
+                atomic::{AtomicBool, Ordering},
+                Barrier,
+            };
+            let mut queue = QueuedSender::new(
+                &ndi,
+                &SenderOptions::new("split queue"),
+                QueueOptions::default(),
+            )
+            .unwrap();
+            queue.try_submit(frame()).unwrap();
+            let audio = AudioFrame::builder()
+                .num_samples(480)
+                .num_channels(2)
+                .build()
+                .unwrap();
+            let started = Barrier::new(2);
+            let finished = AtomicBool::new(false);
+            let (mut video, sender) = queue.split();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    started.wait();
+                    assert!(video
+                        .wait_completed(Duration::from_millis(250))
+                        .unwrap()
+                        .is_none());
+                    finished.store(true, Ordering::Release);
+                });
+                scope.spawn(|| {
+                    started.wait();
+                    sender.send_audio(&audio);
+                    assert!(!finished.load(Ordering::Acquire));
+                    assert_eq!(log().matches("sender-audio\n").count(), 1);
+                });
+            });
+            drop(queue);
+            let events = log();
+            assert!(position(&events, "sender-audio") < position(&events, "sender-destroy-begin"));
+            assert_eq!(events.matches("sender-completion\n").count(), 1);
         }
         #[cfg(feature = "advanced")]
         "queue_backlog" => {

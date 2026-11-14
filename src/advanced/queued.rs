@@ -279,6 +279,17 @@ impl CallbackState {
         Ok(state)
     }
 
+    fn retained_frames(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retained()
+    }
+
+    fn completion_protocol_failed(&self) -> bool {
+        self.protocol_error.load(Ordering::Acquire)
+    }
+
     fn validate_frame_size(&self, bytes: usize) -> Result<()> {
         if bytes > self.max_bytes {
             return Err(Error::InvalidInput(format!(
@@ -505,11 +516,28 @@ impl QueuedSender {
     /// connection metadata, failover, and the Advanced controls.
     ///
     /// Its mode has none of the video sends, which would bypass the queue, and
-    /// it cannot be registered with an advertiser. It is `Sync`, but it
-    /// borrows this queue, so it is used between submissions rather than
-    /// during one.
+    /// it cannot be registered with an advertiser. Use [`split`](Self::split)
+    /// to send audio or metadata through it while another thread submits video.
     pub fn sender(&self) -> &Sender<QueueAttached> {
         &self.sender
+    }
+
+    /// Lend video submission and completion collection separately from audio,
+    /// metadata and controls. The halves can be moved to separate scoped
+    /// threads; dropping them restores access to this owner.
+    ///
+    /// Only the video half submits video, and it is neither `Sync` nor `Clone`.
+    pub fn split(&mut self) -> (QueuedVideo<'_>, &Sender<QueueAttached>) {
+        let video = QueuedVideo {
+            sender: &self.sender,
+            callback: &self.callback,
+            _not_sync: std::marker::PhantomData,
+        };
+        (video, &self.sender)
+    }
+
+    fn video(&mut self) -> QueuedVideo<'_> {
+        self.split().0
     }
 
     /// Queue a frame without waiting for an earlier submission to complete.
@@ -537,9 +565,67 @@ impl QueuedSender {
         &mut self,
         frame: impl Into<QueuedVideoFrame>,
     ) -> std::result::Result<SubmissionId, Rejected<QueuedVideoFrame>> {
+        self.video().try_submit(frame)
+    }
+
+    /// Take one completed frame, if there is one.
+    pub fn try_take_completed(&mut self) -> Option<CompletedVideo> {
+        self.video().try_take_completed()
+    }
+
+    /// Wait up to `timeout` for a completed frame. `None` means none completed
+    /// in time; the queue is unchanged and can still be used.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
+    /// and [`Error::UnexpectedSdkResult`] when the queue has failed (see
+    /// [`completion_protocol_failed`](Self::completion_protocol_failed)).
+    pub fn wait_completed(&mut self, timeout: Duration) -> Result<Option<CompletedVideo>> {
+        self.video().wait_completed(timeout)
+    }
+
+    /// The number of frames held: those still being sent and those completed
+    /// but not yet collected.
+    pub fn retained_frames(&self) -> usize {
+        self.callback.retained_frames()
+    }
+
+    /// Whether the SDK has reported a completion that matches no queued frame,
+    /// or the same one twice.
+    ///
+    /// The queue then no longer knows which frames the SDK still reads, so it
+    /// accepts no more submissions; frames already completed can still be
+    /// collected, and dropping the sender releases the rest safely.
+    pub fn completion_protocol_failed(&self) -> bool {
+        self.callback.completion_protocol_failed()
+    }
+}
+
+/// Exclusive video operations borrowed from a [`QueuedSender`].
+///
+/// Move this half to a scoped video thread while the other half sends audio,
+/// metadata or controls. It is `Send`, but neither `Sync` nor `Clone`, and
+/// cannot outlive its owner. Dropping it leaves pending frames with the owner.
+pub struct QueuedVideo<'a> {
+    sender: &'a Sender<QueueAttached>,
+    callback: &'a CallbackState,
+    _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
+}
+
+impl QueuedVideo<'_> {
+    /// See [`QueuedSender::try_submit`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`QueuedSender::try_submit`].
+    pub fn try_submit(
+        &mut self,
+        frame: impl Into<QueuedVideoFrame>,
+    ) -> std::result::Result<SubmissionId, Rejected<QueuedVideoFrame>> {
         let mut frame = frame.into();
         let failure = Rejected::new;
-        let authorized = match frame.validate(&self.sender) {
+        let authorized = match frame.validate(self.sender) {
             Ok(proof) => proof,
             Err(error) => return Err(failure(error, frame)),
         };
@@ -612,7 +698,7 @@ impl QueuedSender {
         Ok(id)
     }
 
-    /// Take one completed frame, if there is one.
+    /// See [`QueuedSender::try_take_completed`].
     pub fn try_take_completed(&mut self) -> Option<CompletedVideo> {
         let mut state = self
             .callback
@@ -622,14 +708,11 @@ impl QueuedSender {
         take_completed(&mut state)
     }
 
-    /// Wait up to `timeout` for a completed frame. `None` means none completed
-    /// in time; the queue is unchanged and can still be used.
+    /// See [`QueuedSender::wait_completed`].
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
-    /// and [`Error::UnexpectedSdkResult`] when the queue has failed (see
-    /// [`completion_protocol_failed`](Self::completion_protocol_failed)).
+    /// As for [`QueuedSender::wait_completed`].
     pub fn wait_completed(&mut self, timeout: Duration) -> Result<Option<CompletedVideo>> {
         let deadline = Deadline::after(timeout)?;
         let mut state = self
@@ -659,24 +742,14 @@ impl QueuedSender {
         }
     }
 
-    /// The number of frames held: those still being sent and those completed
-    /// but not yet collected.
+    /// See [`QueuedSender::retained_frames`].
     pub fn retained_frames(&self) -> usize {
-        self.callback
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retained()
+        self.callback.retained_frames()
     }
 
-    /// Whether the SDK has reported a completion that matches no queued frame,
-    /// or the same one twice.
-    ///
-    /// The queue then no longer knows which frames the SDK still reads, so it
-    /// accepts no more submissions; frames already completed can still be
-    /// collected, and dropping the sender releases the rest safely.
+    /// See [`QueuedSender::completion_protocol_failed`].
     pub fn completion_protocol_failed(&self) -> bool {
-        self.callback.protocol_error.load(Ordering::Acquire)
+        self.callback.completion_protocol_failed()
     }
 }
 
@@ -692,6 +765,27 @@ fn take_completed(state: &mut State) -> Option<CompletedVideo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_submission_keeps_the_single_descriptor_allocation() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let mut queue = QueuedSender::new(
+            &ndi,
+            &SenderOptions::new(crate::test_support::unique_name("split-allocation"))
+                .clock_video(false),
+            QueueOptions::default(),
+        )
+        .unwrap();
+        let frame = VideoFrame::builder().resolution(16, 16).build().unwrap();
+        let ((mut video, _audio), allocations) =
+            crate::test_alloc::allocation_count(|| queue.split());
+        assert_eq!(allocations, 0);
+        let (result, allocations) = crate::test_alloc::allocation_count(|| video.try_submit(frame));
+        result.unwrap();
+        assert_eq!(allocations, 1);
+    }
 
     #[test]
     fn permanent_admission_check_needs_no_lock_or_descriptor() {

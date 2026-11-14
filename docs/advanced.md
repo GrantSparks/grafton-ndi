@@ -117,6 +117,9 @@ the SDK can still copy internally.
 The attached sender retains metadata, tally, connection and encoder controls,
 but offers no uncompressed sends and cannot be registered with a
 `SendAdvertiser`. This keeps the native sender from outliving pending storage.
+`CompressedSender::split()` lends video and audio views to separate scoped
+threads. Each view is `Send` and neither is `Sync` or `Clone`; the audio view's
+`sender()` provides metadata and controls while video is being submitted.
 
 ## Queued sending
 
@@ -137,7 +140,10 @@ descriptor. The queue's SDK completion callback runs no application code.
 `from_sender` drains an ordinary sender's async pipeline and returns any held
 frame; it refuses advertised senders. The queue lends audio, metadata and
 shared controls through `sender()`, but reserves video sends. `QueuedSender` is
-`Send + Sync`; submission/collection require mutable access. **Drop waits
+`Send + Sync`; submission/collection require mutable access. `split()` lends
+an exclusive `QueuedVideo` view alongside the shared sender, so audio can run
+on its own scoped thread while video waits for completions. Neither split
+adds a lock or allocation to a send. **Drop waits
 without a timeout** for the SDK to finish with queued frames. Keep this blocking
 shutdown off an async executor. See
 [`advanced_queued_send`](../examples/advanced_queued_send.rs).

@@ -237,7 +237,6 @@ stub! {
     fn NDIlib_recv_ptz_exposure_manual(p_instance: NDIlib_recv_instance_t, exposure_level: f32) -> bool;
     fn NDIlib_recv_ptz_exposure_manual_v2(p_instance: NDIlib_recv_instance_t, iris: f32, gain: f32, shutter_speed: f32) -> bool;
     fn NDIlib_send_send_video_v2(p_instance: NDIlib_send_instance_t, p_video_data: *const NDIlib_video_frame_v2_t);
-    fn NDIlib_send_send_audio_v3(p_instance: NDIlib_send_instance_t, p_audio_data: *const NDIlib_audio_frame_v3_t);
     fn NDIlib_send_send_metadata(p_instance: NDIlib_send_instance_t, p_metadata: *const NDIlib_metadata_frame_t);
     fn NDIlib_send_get_tally(p_instance: NDIlib_send_instance_t, p_tally: *mut NDIlib_tally_t, timeout_in_ms: u32) -> bool;
     fn NDIlib_send_get_no_connections(p_instance: NDIlib_send_instance_t, timeout_in_ms: u32) -> ::std::os::raw::c_int;
@@ -245,6 +244,12 @@ stub! {
     fn NDIlib_send_add_connection_metadata(p_instance: NDIlib_send_instance_t, p_metadata: *const NDIlib_metadata_frame_t);
     fn NDIlib_send_get_source_name(p_instance: NDIlib_send_instance_t) -> *const NDIlib_source_t;
 
+}
+
+export! {
+    fn NDIlib_send_send_audio_v3(_p_instance: NDIlib_send_instance_t, _p_audio_data: *const NDIlib_audio_frame_v3_t) {
+        log("sender-audio");
+    }
 }
 
 #[cfg(not(fake_receiver_controls))]

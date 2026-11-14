@@ -567,6 +567,12 @@ impl PendingStreams {
 /// and which cannot be registered with a
 /// [`SendAdvertiser`](crate::discovery::SendAdvertiser).
 ///
+/// # Threading
+///
+/// [`split`](Self::split) lends independent video and audio views to scoped
+/// threads without an external lock. Each view is `Send` but not `Sync`, so
+/// video submissions remain serialized and audio need not wait for them.
+///
 /// # Sending lends the frame
 ///
 /// The SDK writes to the frames it sends: it stamps the reserved field of
@@ -665,14 +671,28 @@ impl CompressedSender {
     /// [`set_external_tally`](Sender::set_external_tally).
     ///
     /// Its mode has none of the uncompressed sends, and it cannot be
-    /// registered with an advertiser. It is `Sync`, but it borrows this value,
-    /// so it is used between sends rather than during one.
+    /// registered with an advertiser. Use [`split`](Self::split) to reach
+    /// these controls through the audio half while video is being sent.
     pub fn sender(&self) -> &Sender<CompressedAttached> {
         &self.sender
     }
 
-    fn instance(&self) -> NDIlib_send_instance_t {
-        self.sender.native_instance()
+    /// Lend video and audio operations to separate scoped threads.
+    ///
+    /// Video keeps exclusive access to the pending streams. Each half is
+    /// `Send`, but neither `Sync` nor `Clone`, and neither outlives this owner.
+    pub fn split(&mut self) -> (CompressedVideo<'_>, CompressedAudio<'_>) {
+        (
+            CompressedVideo {
+                sender: &self.sender,
+                pending: &mut self.pending,
+                _not_sync: std::marker::PhantomData,
+            },
+            CompressedAudio {
+                sender: &self.sender,
+                _not_sync: std::marker::PhantomData,
+            },
+        )
     }
 
     /// Send a video frame and return when the SDK has finished with it.
@@ -684,16 +704,7 @@ impl CompressedSender {
     /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the frame is
     /// not sendable; see [`CompressedVideoFrame::validate_for_send`].
     pub fn send_video(&mut self, frame: &mut CompressedVideoFrame) -> Result<()> {
-        frame.validate_for_send()?;
-        let descriptor = frame.raw();
-        // SAFETY: the sender is live, and the descriptor lends `frame`, which
-        // is borrowed exclusively for longer than this synchronous call.
-        unsafe {
-            self.sender
-                .core()
-                .NDIlib_send_send_video_v2(self.instance(), &descriptor)
-        };
-        Ok(())
+        self.split().0.send_video(frame)
     }
 
     /// Submit a video frame without waiting for it to be sent.
@@ -710,12 +721,7 @@ impl CompressedSender {
         &mut self,
         frame: CompressedVideoFrame,
     ) -> std::result::Result<Option<SubmittedVideo>, Rejected<CompressedVideoFrame>> {
-        if let Err(error) = frame.validate_for_send() {
-            return Err(Rejected::new(error, frame));
-        }
-        Ok(self
-            .pending
-            .submit(self.sender.handle(), PendingVideo::Contiguous(frame)))
+        self.split().0.send_video_async(frame)
     }
 
     /// Send an audio frame and return when the SDK has finished with it.
@@ -727,16 +733,7 @@ impl CompressedSender {
     /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the frame is
     /// not sendable; see [`CompressedAudioFrame::validate_for_send`].
     pub fn send_audio(&mut self, frame: &mut CompressedAudioFrame) -> Result<()> {
-        frame.validate_for_send()?;
-        let descriptor = frame.raw();
-        // SAFETY: the sender is live, and the descriptor lends `frame`, which
-        // is borrowed exclusively for longer than this synchronous call.
-        unsafe {
-            self.sender
-                .core()
-                .NDIlib_send_send_audio_v3(self.instance(), &descriptor)
-        };
-        Ok(())
+        self.split().1.send_audio(frame)
     }
 
     /// Send a video frame held in several blocks and return when the SDK has
@@ -748,6 +745,110 @@ impl CompressedSender {
     ///
     /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
     /// when the runtime has no scatter sending.
+    pub fn send_scatter_video(&mut self, _frame: &mut ScatterVideoFrame) -> Result<()> {
+        self.split().0.send_scatter_video(_frame)
+    }
+
+    /// Submit a video frame held in several blocks without waiting for it to
+    /// be sent; see [`send_video_async`](Self::send_video_async).
+    ///
+    /// # Errors
+    ///
+    /// Returns the frame when the runtime has no scatter sending.
+    pub fn send_scatter_video_async(
+        &mut self,
+        frame: ScatterVideoFrame,
+    ) -> std::result::Result<Option<SubmittedVideo>, Rejected<ScatterVideoFrame>> {
+        self.split().0.send_scatter_video_async(frame)
+    }
+
+    /// Send an audio frame held in several blocks and return when the SDK has
+    /// finished with it.
+    ///
+    /// The frame is borrowed exclusively because the SDK writes to its blocks.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+    /// when the runtime has no scatter sending.
+    pub fn send_scatter_audio(&mut self, _frame: &mut ScatterAudioFrame) -> Result<()> {
+        self.split().1.send_scatter_audio(_frame)
+    }
+
+    /// Destroy the sender and take back the frames it still held.
+    ///
+    /// Destroying the native sender waits for the SDK to finish with every
+    /// pending frame, without a timeout.
+    pub fn close(self) -> ReclaimedVideo {
+        let Self { sender, pending } = self;
+        pending.into_reclaimed(&in_flight::destroy(sender))
+    }
+}
+
+/// Exclusive video operations borrowed from a [`CompressedSender`].
+///
+/// It is `Send`, but neither `Sync` nor `Clone`. Pending frames stay with the
+/// owner when the view is dropped; closing or dropping the owner drains them.
+pub struct CompressedVideo<'a> {
+    sender: &'a Sender<CompressedAttached>,
+    pending: &'a mut PendingStreams,
+    _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
+}
+
+/// Audio operations and shared controls borrowed from a [`CompressedSender`].
+///
+/// It is `Send`, but neither `Sync` nor `Clone`, and may run on a scoped thread
+/// separately from the video half.
+pub struct CompressedAudio<'a> {
+    sender: &'a Sender<CompressedAttached>,
+    _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
+}
+
+impl CompressedVideo<'_> {
+    fn instance(&self) -> NDIlib_send_instance_t {
+        self.sender.native_instance()
+    }
+
+    /// See [`CompressedSender::send_video`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`CompressedSender::send_video`].
+    pub fn send_video(&mut self, frame: &mut CompressedVideoFrame) -> Result<()> {
+        frame.validate_for_send()?;
+        let descriptor = frame.raw();
+        // SAFETY: the sender is live, and the descriptor lends `frame`, which
+        // is borrowed exclusively for longer than this synchronous call.
+        unsafe {
+            self.sender
+                .core()
+                .NDIlib_send_send_video_v2(self.instance(), &descriptor)
+        };
+        Ok(())
+    }
+
+    /// See [`CompressedSender::send_video_async`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`CompressedSender::send_video_async`].
+    pub fn send_video_async(
+        &mut self,
+        frame: CompressedVideoFrame,
+    ) -> std::result::Result<Option<SubmittedVideo>, Rejected<CompressedVideoFrame>> {
+        if let Err(error) = frame.validate_for_send() {
+            return Err(Rejected::new(error, frame));
+        }
+        Ok(self
+            .pending
+            .submit(self.sender.handle(), PendingVideo::Contiguous(frame)))
+    }
+
+    /// See [`CompressedSender::send_scatter_video`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`CompressedSender::send_scatter_video`].
     pub fn send_scatter_video(&mut self, _frame: &mut ScatterVideoFrame) -> Result<()> {
         let table = self.sender.runtime().table::<ScatterSend>()?;
         native!(ScatterSend, table => {
@@ -762,12 +863,11 @@ impl CompressedSender {
         })
     }
 
-    /// Submit a video frame held in several blocks without waiting for it to
-    /// be sent; see [`send_video_async`](Self::send_video_async).
+    /// See [`CompressedSender::send_scatter_video_async`].
     ///
     /// # Errors
     ///
-    /// Returns the frame when the runtime has no scatter sending.
+    /// As for [`CompressedSender::send_scatter_video_async`].
     pub fn send_scatter_video_async(
         &mut self,
         frame: ScatterVideoFrame,
@@ -780,16 +880,41 @@ impl CompressedSender {
             Ok(self.pending.submit(self.sender.handle(), PendingVideo::scatter(frame, table)))
         })
     }
+}
 
-    /// Send an audio frame held in several blocks and return when the SDK has
-    /// finished with it.
-    ///
-    /// The frame is borrowed exclusively because the SDK writes to its blocks.
+impl CompressedAudio<'_> {
+    fn instance(&self) -> NDIlib_send_instance_t {
+        self.sender.native_instance()
+    }
+
+    /// The shared metadata, source, tally, connection and encoder controls.
+    pub fn sender(&self) -> &Sender<CompressedAttached> {
+        self.sender
+    }
+
+    /// See [`CompressedSender::send_audio`].
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
-    /// when the runtime has no scatter sending.
+    /// As for [`CompressedSender::send_audio`].
+    pub fn send_audio(&mut self, frame: &mut CompressedAudioFrame) -> Result<()> {
+        frame.validate_for_send()?;
+        let descriptor = frame.raw();
+        // SAFETY: the sender is live, and the descriptor lends `frame`, which
+        // is borrowed exclusively for longer than this synchronous call.
+        unsafe {
+            self.sender
+                .core()
+                .NDIlib_send_send_audio_v3(self.instance(), &descriptor)
+        };
+        Ok(())
+    }
+
+    /// See [`CompressedSender::send_scatter_audio`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`CompressedSender::send_scatter_audio`].
     pub fn send_scatter_audio(&mut self, _frame: &mut ScatterAudioFrame) -> Result<()> {
         let table = self.sender.runtime().table::<ScatterSend>()?;
         native!(ScatterSend, table => {
@@ -803,15 +928,6 @@ impl CompressedSender {
             Ok(())
         })
     }
-
-    /// Destroy the sender and take back the frames it still held.
-    ///
-    /// Destroying the native sender waits for the SDK to finish with every
-    /// pending frame, without a timeout.
-    pub fn close(self) -> ReclaimedVideo {
-        let Self { sender, pending } = self;
-        pending.into_reclaimed(&in_flight::destroy(sender))
-    }
 }
 
 #[cfg(test)]
@@ -822,6 +938,28 @@ mod tests {
         EnvelopeCodec, PacketEnvelope, VideoCodec,
     };
     use crate::Timecode;
+
+    #[test]
+    fn split_audio_adds_no_allocation_to_a_send() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let mut sender = CompressedSender::new(
+            &ndi,
+            &SenderOptions::new(crate::test_support::unique_name("split-audio-allocation"))
+                .clock_audio(false),
+        )
+        .unwrap();
+        let mut frame =
+            CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64]).unwrap();
+        let ((_video, mut audio), allocations) =
+            crate::test_alloc::allocation_count(|| sender.split());
+        assert_eq!(allocations, 0);
+        let (result, allocations) =
+            crate::test_alloc::allocation_count(|| audio.send_audio(&mut frame));
+        result.unwrap();
+        assert_eq!(allocations, 0);
+    }
 
     fn h264() -> (VideoPacketFormat, Vec<u8>) {
         (
