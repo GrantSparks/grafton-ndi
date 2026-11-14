@@ -90,6 +90,55 @@ fn video(frame: &impl VideoSource, status: FrameMetadataStatus) {
         .flat_map(|plane| plane.rows())
         .flatten()
         .all(|&byte| byte == 37));
+    assert!(matches!(
+        frame.color_info(),
+        Err(grafton_ndi::Error::InvalidFrame(_))
+    ));
+    let mut owned = VideoSource::to_owned(frame);
+    assert_eq!(owned.metadata_status(), status);
+    assert_eq!(owned.clone().metadata_status(), status);
+    for _ in 0..3 {
+        frame.copy_into(&mut owned);
+        assert_eq!(owned.metadata_status(), status);
+    }
+    #[cfg(feature = "image-encoding")]
+    {
+        use grafton_ndi::{
+            ColorPolicy, ImageFormat, ImageOptions, ImageWorkspace, YuvMatrix, YuvRange,
+        };
+        let defaults = ImageOptions::new(ImageFormat::Png);
+        let mut workspace = ImageWorkspace::new();
+        let mut output = Vec::new();
+        assert!(matches!(
+            workspace.encode(frame, &defaults),
+            Err(grafton_ndi::Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            workspace.encode_to(frame, &defaults, &mut output),
+            Err(grafton_ndi::Error::InvalidFrame(_))
+        ));
+        assert!(output.is_empty());
+        assert!(matches!(
+            owned.encode_png(),
+            Err(grafton_ndi::Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            owned.encode_image(&defaults),
+            Err(grafton_ndi::Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            owned.encode_image_data_url(&defaults),
+            Err(grafton_ndi::Error::InvalidFrame(_))
+        ));
+        let options = defaults.color(ColorPolicy::Override {
+            matrix: YuvMatrix::Bt709,
+            range: YuvRange::Limited,
+        });
+        assert_eq!(
+            workspace.encode(frame, &options).unwrap(),
+            owned.encode_image(&options).unwrap()
+        );
+    }
 }
 
 fn audio(frame: &impl AudioSource, status: FrameMetadataStatus) {
@@ -98,6 +147,13 @@ fn audio(frame: &impl AudioSource, status: FrameMetadataStatus) {
     assert_eq!(frame.sample_rate(), 48_000);
     assert_eq!(frame.channel_data(0), Some([0.25, 0.5].as_slice()));
     assert_eq!(frame.channel_data(1), Some([-0.25, -0.5].as_slice()));
+    let mut owned = AudioSource::to_owned(frame);
+    assert_eq!(owned.metadata_status(), status);
+    assert_eq!(owned.clone().metadata_status(), status);
+    for _ in 0..3 {
+        frame.copy_into(&mut owned);
+        assert_eq!(owned.metadata_status(), status);
+    }
 }
 
 fn synchronous(receiver: &Receiver) {
@@ -110,7 +166,7 @@ fn synchronous(receiver: &Receiver) {
                 .unwrap()
                 .unwrap();
             video(&frame, status);
-            video(&frame.to_owned(), FrameMetadataStatus::Absent);
+            video(&frame.to_owned(), status);
         } else {
             let frame = receiver
                 .audio()
@@ -118,7 +174,7 @@ fn synchronous(receiver: &Receiver) {
                 .unwrap()
                 .unwrap();
             audio(&frame, status);
-            audio(&frame.to_owned(), FrameMetadataStatus::Absent);
+            audio(&frame.to_owned(), status);
         }
         script(index * 4 + 1, kind);
         match receiver.capture_any_ref(Duration::ZERO).unwrap().unwrap() {
@@ -130,18 +186,18 @@ fn synchronous(receiver: &Receiver) {
         if kind.starts_with("video") {
             video(
                 &receiver.video().capture(Duration::ZERO).unwrap().unwrap(),
-                FrameMetadataStatus::Absent,
+                status,
             );
         } else {
             audio(
                 &receiver.audio().capture(Duration::ZERO).unwrap().unwrap(),
-                FrameMetadataStatus::Absent,
+                status,
             );
         }
         script(index * 4 + 3, kind);
         match receiver.capture_any(Duration::ZERO).unwrap().unwrap() {
-            ReceiverItem::Video(frame) => video(&frame, FrameMetadataStatus::Absent),
-            ReceiverItem::Audio(frame) => audio(&frame, FrameMetadataStatus::Absent),
+            ReceiverItem::Video(frame) => video(&frame, status),
+            ReceiverItem::Audio(frame) => audio(&frame, status),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -194,7 +250,7 @@ async fn asynchronous<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
                     .await
                     .unwrap()
                     .unwrap(),
-                FrameMetadataStatus::Absent,
+                status,
             );
         } else {
             audio(
@@ -204,13 +260,13 @@ async fn asynchronous<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
                     .await
                     .unwrap()
                     .unwrap(),
-                FrameMetadataStatus::Absent,
+                status,
             );
         }
         script(serial + index * 4 + 3, kind);
         match receiver.capture_any(Duration::ZERO).await.unwrap().unwrap() {
-            ReceiverItem::Video(frame) => video(&frame, FrameMetadataStatus::Absent),
-            ReceiverItem::Audio(frame) => audio(&frame, FrameMetadataStatus::Absent),
+            ReceiverItem::Video(frame) => video(&frame, status),
+            ReceiverItem::Audio(frame) => audio(&frame, status),
             other => panic!("unexpected {other:?}"),
         }
     }

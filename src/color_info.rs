@@ -17,7 +17,9 @@ use crate::{Error, Result};
 /// how image encoding reads them; missing `primaries` are unknown.
 ///
 /// Every video frame's `color_info` method reads it, for example
-/// [`VideoFrame::color_info`](crate::VideoFrame::color_info). Measured with the
+/// [`VideoFrame::color_info`](crate::VideoFrame::color_info). That read refuses
+/// received metadata withheld as non-UTF-8 or unterminated text, including
+/// when its status was preserved on an owned copy. Measured with the
 /// 6.4 SDK, the SDK passes the element through unchanged to receivers in
 /// every color format, YUV and RGB, but does not apply it: it converts
 /// between YUV and RGB with BT.709 coefficients whatever the element says.
@@ -115,6 +117,33 @@ pub enum YuvMatrix {
 
 /// The element's name, which every scanned start tag is compared with.
 const ELEMENT: &[u8] = b"ndi_color_info";
+
+/// The optional text and its cached receive status. Retaining both lets an
+/// encoder choose its color policy before trying to read the description.
+pub(crate) struct Metadata<'a> {
+    status: crate::FrameMetadataStatus,
+    text: Option<&'a str>,
+}
+
+impl<'a> Metadata<'a> {
+    pub(crate) fn new(status: crate::FrameMetadataStatus, text: Option<&'a str>) -> Self {
+        Self { status, text }
+    }
+
+    /// Read color only from metadata that was not withheld. Absent metadata
+    /// has no element; withheld text cannot establish that it has no element.
+    pub(crate) fn read(&self) -> Result<Option<ColorInfo>> {
+        match self.status {
+            crate::FrameMetadataStatus::Absent => Ok(None),
+            crate::FrameMetadataStatus::Text => parse(self.text),
+            status @ (crate::FrameMetadataStatus::NotUtf8
+            | crate::FrameMetadataStatus::Unterminated) => Err(Error::InvalidFrame(format!(
+                "The frame's color description cannot be read because its metadata was withheld \
+                 ({status:?}); ColorPolicy::Override explicitly supplies its color conversion"
+            ))),
+        }
+    }
+}
 
 /// The most of an unreadable value an error message quotes.
 const QUOTED_LIMIT: usize = 40;

@@ -367,7 +367,8 @@ pub enum ColorPolicy {
     /// An untagged source with different color encoding needs
     /// [`ColorPolicy::Override`].
     ///
-    /// A frame whose `ndi_color_info` cannot be read is refused with
+    /// A frame whose `ndi_color_info` cannot be read, including received
+    /// metadata withheld as non-UTF-8 or unterminated text, is refused with
     /// [`Error::InvalidFrame`](crate::Error::InvalidFrame), so the encoder
     /// never guesses at a frame that says something it cannot read.
     #[default]
@@ -375,7 +376,8 @@ pub enum ColorPolicy {
     /// Convert with this matrix and range, whatever the frame says.
     ///
     /// The caller takes responsibility for the frame's color: unreadable
-    /// `ndi_color_info` is ignored, and the frame then counts as SDR with
+    /// `ndi_color_info` and withheld received metadata are ignored, and the
+    /// frame then counts as SDR with
     /// unknown primaries. Readable metadata still decides the HDR check and
     /// a PNG's color tag.
     Override {

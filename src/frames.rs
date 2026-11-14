@@ -671,6 +671,14 @@ pub(crate) unsafe trait VideoParts {
         }
     }
 
+    /// Keep the metadata's status beside its text for a lazy color read.
+    fn color_metadata(&self) -> crate::color_info::Metadata<'_> {
+        crate::color_info::Metadata::new(
+            self.metadata_state(),
+            self.metadata_text().map(MetadataText::as_str),
+        )
+    }
+
     /// The time the sender submitted the frame, when it is known.
     fn sdk_timestamp(&self) -> Option<SdkTimestamp>;
 
@@ -866,9 +874,10 @@ pub trait VideoSource: VideoParts {
     /// # Errors
     ///
     /// [`Error::InvalidFrame`] for malformed, truncated or conflicting color
-    /// metadata, with the same semantics as [`VideoFrame::color_info`].
+    /// metadata or withheld received text, with the same semantics as
+    /// [`VideoFrame::color_info`].
     fn color_info(&self) -> Result<Option<crate::ColorInfo>> {
-        crate::color_info::parse(self.metadata())
+        self.color_metadata().read()
     }
 
     /// One plane's initialized active rows, excluding row padding.
@@ -887,8 +896,9 @@ pub trait VideoSource: VideoParts {
         self.active_data()
     }
 
-    /// Copy active pixels and metadata into a new, tightly packed owned frame.
-    /// Allocates pixel storage and, when present, metadata storage.
+    /// Copy active pixels and readable metadata into a new, tightly packed
+    /// owned frame. Withheld metadata keeps its status without its text.
+    /// Allocates pixel storage and, when present, readable metadata storage.
     fn to_owned(&self) -> VideoFrame {
         self.owned_copy()
     }
@@ -932,6 +942,7 @@ fn packed_video<P: VideoParts + ?Sized>(
         header: *source.header(),
         data,
         metadata,
+        metadata_status: source.metadata_state(),
         timestamp: source.sdk_timestamp(),
     }
 }
@@ -1109,7 +1120,10 @@ macro_rules! video_accessors {
             /// [`Error::InvalidFrame`](crate::Error::InvalidFrame), naming the
             /// attribute and its value, when the element is malformed or
             /// truncated, gives a value outside the SDK's list, or appears more
-            /// than once with different values.
+            /// than once with different values. Also returned when received
+            /// metadata was withheld as [`FrameMetadataStatus::NotUtf8`](crate::FrameMetadataStatus::NotUtf8)
+            /// or [`FrameMetadataStatus::Unterminated`](crate::FrameMetadataStatus::Unterminated),
+            /// including on an owned copy of that frame.
             ///
             /// # Example
             ///
@@ -1123,7 +1137,7 @@ macro_rules! video_accessors {
             /// # Ok::<(), Box<dyn std::error::Error>>(())
             /// ```
             pub fn color_info(&self) -> $crate::Result<Option<$crate::ColorInfo>> {
-                $crate::color_info::parse(self.metadata())
+                $crate::frames::VideoParts::color_metadata(self).read()
             }
 
             /// Get one plane in SDK memory order, or `None` for an invalid index.
@@ -1170,7 +1184,8 @@ macro_rules! video_accessors {
             /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) for a frame
             /// the options cannot encode: a PQ or HLG frame under
             /// [`HdrPolicy::Refuse`](crate::HdrPolicy::Refuse), unreadable
-            /// `ndi_color_info` under [`ColorPolicy::Sdk`](crate::ColorPolicy::Sdk),
+            /// `ndi_color_info` or withheld received metadata under
+            /// [`ColorPolicy::Sdk`](crate::ColorPolicy::Sdk),
             /// or an image larger than its codec allows; and when the codec
             /// fails.
             ///
@@ -1363,7 +1378,8 @@ pub(crate) use video_accessors;
 ///
 /// Owned frames contain tightly packed active pixels: copies of borrowed or
 /// received frames omit their row padding. Use [`Self::builder`] to create
-/// one for sending. Cloning copies the pixels and metadata.
+/// one for sending. Cloning copies the pixels, readable metadata and metadata
+/// status, including when received text was withheld.
 ///
 /// The allocation that holds the pixels also holds the
 /// [room](PixelFormat::send_tail_room) the SDK needs after a frame of this
@@ -1377,6 +1393,7 @@ pub struct VideoFrame {
     /// The pixels, followed by the room required by the layout and scan type.
     data: Pixels,
     metadata: FrameMetadata,
+    metadata_status: FrameMetadataStatus,
     timestamp: Option<SdkTimestamp>,
 }
 
@@ -1399,6 +1416,10 @@ unsafe impl VideoParts for VideoFrame {
     #[inline]
     fn metadata_text(&self) -> Option<MetadataText<'_>> {
         self.metadata.optional_text()
+    }
+    #[inline]
+    fn metadata_state(&self) -> FrameMetadataStatus {
+        self.metadata_status
     }
     #[inline]
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
@@ -1438,7 +1459,8 @@ video_accessors! {
 }
 
 impl VideoFrame {
-    /// Copy this frame and its metadata into independent owned storage.
+    /// Copy this frame, its readable metadata and its metadata status into
+    /// independent owned storage.
     #[must_use]
     pub fn to_owned(&self) -> Self {
         self.clone()
@@ -1589,7 +1611,9 @@ impl VideoFrame {
 
     /// Replace frame metadata. Use [`Self::clear_metadata`] to remove it.
     ///
-    /// Invalid replacement text leaves the existing metadata unchanged.
+    /// Valid replacement text sets [`FrameMetadataStatus::Text`], including
+    /// an empty string. Invalid replacement text leaves the existing metadata
+    /// and its status unchanged.
     ///
     /// # Errors
     ///
@@ -1598,12 +1622,15 @@ impl VideoFrame {
     /// the metadata size cap.
     pub fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<()> {
         self.metadata = FrameMetadata::new(metadata)?;
+        self.metadata_status = FrameMetadataStatus::Text;
         Ok(())
     }
 
-    /// Remove frame metadata, retaining its allocation for later copies.
+    /// Remove frame metadata, setting [`FrameMetadataStatus::Absent`] and
+    /// retaining its allocation for later copies.
     pub fn clear_metadata(&mut self) {
         self.metadata.clear();
+        self.metadata_status = FrameMetadataStatus::Absent;
     }
 
     /// # Safety
@@ -1650,6 +1677,11 @@ impl VideoFrame {
             metadata: metadata
                 .map(|text| FrameMetadata::new(text).unwrap())
                 .unwrap_or_default(),
+            metadata_status: if metadata.is_some() {
+                FrameMetadataStatus::Text
+            } else {
+                FrameMetadataStatus::Absent
+            },
             timestamp: None,
         }
     }
@@ -1838,6 +1870,7 @@ impl VideoFrameBuilder {
                 timecode: self.timecode,
             },
             data,
+            metadata_status: FrameMetadataState::from_text(metadata.optional_text()).status(),
             metadata,
             timestamp: None,
         })
@@ -2046,8 +2079,9 @@ pub trait AudioSource: AudioParts {
         self.contiguous_samples()
     }
 
-    /// Copy samples and metadata into a new owned, tightly packed planar frame.
-    /// Allocates sample storage and, when present, metadata storage.
+    /// Copy samples and readable metadata into a new owned, tightly packed
+    /// planar frame. Withheld metadata keeps its status without its text.
+    /// Allocates sample storage and, when present, readable metadata storage.
     fn to_owned(&self) -> AudioFrame {
         self.owned_copy()
     }
@@ -2285,6 +2319,7 @@ fn packed_audio<P: AudioParts + ?Sized>(
         timecode: source.audio_timecode(),
         data,
         metadata,
+        metadata_status: source.metadata_state(),
         timestamp: source.sdk_timestamp(),
     }
 }
@@ -2436,13 +2471,15 @@ audio_accessors! {
 ///
 /// Channel samples are contiguous, with channels stored one after another.
 /// Conversion from borrowed SDK audio omits inter-channel padding. Cloning
-/// copies the samples and metadata.
+/// copies the samples, readable metadata and metadata status, including when
+/// received text was withheld.
 #[derive(Clone)]
 pub struct AudioFrame {
     layout: ValidatedAudioLayout,
     timecode: Timecode,
     data: Vec<f32>,
     metadata: FrameMetadata,
+    metadata_status: FrameMetadataStatus,
     timestamp: Option<SdkTimestamp>,
 }
 
@@ -2470,6 +2507,10 @@ unsafe impl AudioParts for AudioFrame {
     fn metadata_text(&self) -> Option<MetadataText<'_>> {
         self.metadata.optional_text()
     }
+    #[inline]
+    fn metadata_state(&self) -> FrameMetadataStatus {
+        self.metadata_status
+    }
 }
 
 impl AudioSource for AudioFrame {}
@@ -2496,7 +2537,8 @@ audio_accessors! {
 }
 
 impl AudioFrame {
-    /// Copy this frame and its metadata into independent owned storage.
+    /// Copy this frame, its readable metadata and its metadata status into
+    /// independent owned storage.
     #[must_use]
     pub fn to_owned(&self) -> Self {
         self.clone()
@@ -2583,7 +2625,9 @@ impl AudioFrame {
 
     /// Replace frame metadata. Use [`Self::clear_metadata`] to remove it.
     ///
-    /// Invalid replacement text leaves the existing metadata unchanged.
+    /// Valid replacement text sets [`FrameMetadataStatus::Text`], including
+    /// an empty string. Invalid replacement text leaves the existing metadata
+    /// and its status unchanged.
     ///
     /// # Errors
     ///
@@ -2592,12 +2636,15 @@ impl AudioFrame {
     /// the metadata size cap.
     pub fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<()> {
         self.metadata = FrameMetadata::new(metadata)?;
+        self.metadata_status = FrameMetadataStatus::Text;
         Ok(())
     }
 
-    /// Remove frame metadata, retaining its allocation for later copies.
+    /// Remove frame metadata, setting [`FrameMetadataStatus::Absent`] and
+    /// retaining its allocation for later copies.
     pub fn clear_metadata(&mut self) {
         self.metadata.clear();
+        self.metadata_status = FrameMetadataStatus::Absent;
     }
 
     /// Get mutable samples for one channel without allocating.
@@ -2795,6 +2842,7 @@ impl AudioFrameBuilder {
             layout: audio_layout,
             timecode: self.timecode,
             data,
+            metadata_status: FrameMetadataState::from_text(metadata.optional_text()).status(),
             metadata,
             timestamp: None,
         })
@@ -3279,8 +3327,11 @@ fn metadata_len_to_i32(len_with_nul: usize) -> Result<i32> {
 ///
 /// Unreadable metadata does not discard otherwise valid media. Its text is
 /// withheld from [`VideoSource::metadata`] and [`AudioSource::metadata`], from
-/// forwarding descriptors, and from owned copies. Owned frames contain only
-/// valid text, so a copy of unreadable metadata has [`Self::Absent`] status.
+/// forwarding descriptors, and from owned copies. Owned copies and clones
+/// preserve the status without retaining unreadable text. Video color queries
+/// and default image encoding refuse withheld metadata, including on a copy.
+/// Replacing metadata with valid text sets [`Self::Text`]; explicitly clearing
+/// it sets [`Self::Absent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum FrameMetadataStatus {
@@ -5124,6 +5175,7 @@ macro_rules! borrowed_video_methods {
             /// Copies only active rows into one tightly packed pixel allocation and
             /// copies metadata separately. The owned stride can be smaller than the
             /// SDK stride. Preserves format, timing, aspect ratio, and scan type.
+            /// Withheld metadata keeps its status without retaining its text.
             /// [`Self::copy_into`] makes the same copy into an existing frame,
             /// reusing its allocations.
             ///
@@ -5285,6 +5337,7 @@ macro_rules! borrowed_audio_methods {
             /// Copies channel samples into tightly packed planar storage and copies
             /// metadata, allowing the frame to outlive the SDK buffer. Padding is omitted.
             /// Allocates one sample buffer, and one metadata string when present.
+            /// Withheld metadata keeps its status without retaining its text.
             /// [`Self::copy_into`] makes the same copy into an existing frame,
             /// reusing its allocations.
             ///

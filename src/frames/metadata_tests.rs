@@ -48,6 +48,12 @@ where
     let ((), allocations) = crate::test_alloc::allocation_count(|| {
         assert_eq!(VideoParts::metadata_state(&frame), status);
         assert_eq!(VideoSource::metadata_status(&frame), status);
+        if matches!(
+            status,
+            FrameMetadataStatus::Absent | FrameMetadataStatus::Text
+        ) {
+            assert_eq!(VideoSource::color_info(&frame).unwrap(), None);
+        }
         assert_eq!(VideoSource::data(&frame), Some(pixels.as_slice()));
         assert_eq!(
             frame
@@ -59,20 +65,54 @@ where
         );
     });
     assert_eq!(allocations, 0);
-    let mut owned = frame.owned_copy();
-    let owned_status = if status == FrameMetadataStatus::Text {
-        FrameMetadataStatus::Text
-    } else {
-        FrameMetadataStatus::Absent
-    };
-    assert_eq!(owned.metadata_status(), owned_status);
+    let (mut owned, allocations) = crate::test_alloc::allocation_count(|| frame.owned_copy());
+    assert_eq!(
+        allocations,
+        1 + usize::from(status == FrameMetadataStatus::Text)
+    );
+    assert_eq!(owned.metadata_status(), status);
+    let (cloned, allocations) = crate::test_alloc::allocation_count(|| owned.clone());
+    assert_eq!(
+        allocations,
+        1 + usize::from(status == FrameMetadataStatus::Text)
+    );
+    assert_eq!(cloned.metadata_status(), status);
+    let copy = VideoSource::to_owned(&owned);
+    assert_eq!(copy.metadata_status(), status);
     assert_eq!(owned.data(), pixels);
-    frame.copy_into_owned(&mut owned);
-    assert_eq!(owned.metadata_status(), owned_status);
+    let ((), allocations) = crate::test_alloc::allocation_count(|| {
+        for _ in 0..3 {
+            frame.copy_into_owned(&mut owned);
+            assert_eq!(owned.metadata_status(), status);
+            copy.copy_into_owned(&mut owned);
+            assert_eq!(owned.metadata_status(), status);
+        }
+    });
+    assert_eq!(allocations, 0);
     assert_eq!(
         owned.as_test_raw().p_metadata.is_null(),
         status != FrameMetadataStatus::Text
     );
+    owned
+        .set_metadata("replacement metadata with capacity to reuse")
+        .unwrap();
+    let metadata_capacity = owned.metadata.inner.capacity();
+    let ((), allocations) = crate::test_alloc::allocation_count(|| {
+        frame.copy_into_owned(&mut owned);
+        assert_eq!(owned.metadata_status(), status);
+        assert_eq!(owned.metadata.inner.capacity(), metadata_capacity);
+    });
+    assert_eq!(allocations, 0);
+    assert!(owned.set_metadata("bad\0text").is_err());
+    assert_eq!(owned.metadata_status(), status);
+    owned.set_metadata("").unwrap();
+    assert_eq!(owned.metadata_status(), FrameMetadataStatus::Text);
+    assert_eq!(owned.metadata(), Some(""));
+    owned.clear_metadata();
+    assert_eq!(owned.metadata_status(), FrameMetadataStatus::Absent);
+    assert_eq!(owned.metadata(), None);
+    frame.copy_into_owned(&mut owned);
+    assert_eq!(owned.metadata_status(), status);
     assert_eq!(FREES.with(Cell::get), 0);
     drop(frame);
     assert_eq!(FREES.with(Cell::get), 1);
@@ -136,20 +176,54 @@ where
         );
     });
     assert_eq!(allocations, 0);
-    let mut owned = frame.owned_copy();
-    let owned_status = if status == FrameMetadataStatus::Text {
-        FrameMetadataStatus::Text
-    } else {
-        FrameMetadataStatus::Absent
-    };
-    assert_eq!(owned.metadata_status(), owned_status);
+    let (mut owned, allocations) = crate::test_alloc::allocation_count(|| frame.owned_copy());
+    assert_eq!(
+        allocations,
+        1 + usize::from(status == FrameMetadataStatus::Text)
+    );
+    assert_eq!(owned.metadata_status(), status);
+    let (cloned, allocations) = crate::test_alloc::allocation_count(|| owned.clone());
+    assert_eq!(
+        allocations,
+        1 + usize::from(status == FrameMetadataStatus::Text)
+    );
+    assert_eq!(cloned.metadata_status(), status);
+    let copy = AudioSource::to_owned(&owned);
+    assert_eq!(copy.metadata_status(), status);
     assert_eq!(owned.data(), samples);
-    frame.copy_into_owned(&mut owned);
-    assert_eq!(owned.metadata_status(), owned_status);
+    let ((), allocations) = crate::test_alloc::allocation_count(|| {
+        for _ in 0..3 {
+            frame.copy_into_owned(&mut owned);
+            assert_eq!(owned.metadata_status(), status);
+            copy.copy_into_owned(&mut owned);
+            assert_eq!(owned.metadata_status(), status);
+        }
+    });
+    assert_eq!(allocations, 0);
     assert_eq!(
         owned.to_raw().p_metadata.is_null(),
         status != FrameMetadataStatus::Text
     );
+    owned
+        .set_metadata("replacement metadata with capacity to reuse")
+        .unwrap();
+    let metadata_capacity = owned.metadata.inner.capacity();
+    let ((), allocations) = crate::test_alloc::allocation_count(|| {
+        frame.copy_into_owned(&mut owned);
+        assert_eq!(owned.metadata_status(), status);
+        assert_eq!(owned.metadata.inner.capacity(), metadata_capacity);
+    });
+    assert_eq!(allocations, 0);
+    assert!(owned.set_metadata("bad\0text").is_err());
+    assert_eq!(owned.metadata_status(), status);
+    owned.set_metadata("").unwrap();
+    assert_eq!(owned.metadata_status(), FrameMetadataStatus::Text);
+    assert_eq!(owned.metadata(), Some(""));
+    owned.clear_metadata();
+    assert_eq!(owned.metadata_status(), FrameMetadataStatus::Absent);
+    assert_eq!(owned.metadata(), None);
+    frame.copy_into_owned(&mut owned);
+    assert_eq!(owned.metadata_status(), status);
     assert_eq!(FREES.with(Cell::get), 0);
     drop(frame);
     assert_eq!(FREES.with(Cell::get), 1);
@@ -206,6 +280,106 @@ fn all_received_media_keep_their_payload_and_cache_metadata_status_without_alloc
         video::<FrameSyncVideoFree>(metadata, status);
         audio::<AudioKind>(metadata, status);
         audio::<FrameSyncAudioFree>(metadata, status);
+    }
+}
+
+#[test]
+fn withheld_video_color_is_refused_on_receiver_framesync_and_owned_frames() {
+    let pq = b"<ndi_color_info transfer=\"bt_2100_pq\" matrix=\"bt_2020\"/>";
+    let mut unterminated = vec![b'x'; MAX_METADATA_BYTES];
+    unterminated[..pq.len()].copy_from_slice(pq);
+    let mut pixels = [37; 32];
+    for (metadata, status) in [
+        (
+            c"<ndi_color_info transfer=\"bt_2100_pq\" matrix=\"bt_2020\"/>\xff".as_ptr(),
+            FrameMetadataStatus::NotUtf8,
+        ),
+        (
+            unterminated.as_ptr().cast(),
+            FrameMetadataStatus::Unterminated,
+        ),
+    ] {
+        let raw = NDIlib_video_frame_v2_t {
+            xres: 4,
+            yres: 2,
+            FourCC: FourCc::from(PixelFormat::Bgra).raw(),
+            frame_rate_N: 30,
+            frame_rate_D: 1,
+            p_data: pixels.as_mut_ptr(),
+            p_metadata: metadata,
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: 16,
+            },
+            ..Default::default()
+        };
+        macro_rules! check {
+            ($kind:ty) => {{
+                // SAFETY: the pixels and bounded metadata buffers remain live
+                // and unchanged until the guard drops; release only counts.
+                let frame = unsafe {
+                    VideoRef::<$kind>::new(Guard::with_test_free(ptr::null_mut(), raw, count_free))
+                        .unwrap()
+                };
+                let mut owned = frame.to_owned();
+                for source in [&frame as &dyn VideoSource, &owned] {
+                    assert_eq!(source.metadata(), None);
+                    assert_eq!(source.metadata_status(), status);
+                    let Error::InvalidFrame(message) = source.color_info().unwrap_err() else {
+                        panic!("expected an invalid color description")
+                    };
+                    assert!(message.contains(&format!("{status:?}")), "{message}");
+                    assert!(message.contains("ColorPolicy::Override"), "{message}");
+                }
+                assert!(matches!(frame.color_info(), Err(Error::InvalidFrame(_))));
+                assert!(matches!(owned.color_info(), Err(Error::InvalidFrame(_))));
+                #[cfg(feature = "image-encoding")]
+                {
+                    assert!(matches!(frame.encode_png(), Err(Error::InvalidFrame(_))));
+                    assert!(matches!(owned.encode_png(), Err(Error::InvalidFrame(_))));
+                    let options = crate::ImageOptions::new(crate::ImageFormat::Png).color(
+                        crate::ColorPolicy::Override {
+                            matrix: crate::YuvMatrix::Bt709,
+                            range: crate::YuvRange::Limited,
+                        },
+                    );
+                    assert_eq!(
+                        frame.encode_image(&options).unwrap(),
+                        owned.encode_image(&options).unwrap()
+                    );
+                    let mut workspace = crate::ImageWorkspace::new();
+                    let mut output = Vec::new();
+                    for source in [&frame as &dyn VideoSource, &owned] {
+                        assert!(matches!(
+                            workspace.encode_to(
+                                source,
+                                &crate::ImageOptions::new(crate::ImageFormat::Png),
+                                &mut output,
+                            ),
+                            Err(Error::InvalidFrame(_))
+                        ));
+                        assert!(output.is_empty());
+                        assert_eq!(workspace.retained_bytes(), 0);
+                        workspace.encode(source, &options).unwrap();
+                        workspace.release();
+                    }
+                }
+                owned.clear_metadata();
+                assert_eq!(owned.color_info().unwrap(), None);
+                frame.copy_into(&mut owned);
+                assert_eq!(owned.metadata_status(), status);
+                assert!(matches!(owned.color_info(), Err(Error::InvalidFrame(_))));
+                owned
+                    .set_metadata("<ndi_color_info matrix='bt_601'/>")
+                    .unwrap();
+                assert_eq!(owned.metadata_status(), FrameMetadataStatus::Text);
+                assert_eq!(
+                    owned.color_info().unwrap().unwrap().matrix(),
+                    Some(crate::YuvMatrix::Bt601)
+                );
+            }};
+        }
+        check!(VideoKind);
+        check!(FrameSyncVideoFree);
     }
 }
 
