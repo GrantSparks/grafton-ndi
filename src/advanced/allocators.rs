@@ -655,15 +655,19 @@ impl Registry {
             Ok(token) => token,
             Err(error) => return Err(Rejected::new(error, policy)),
         };
-        lock(&self.state).active.insert(
-            token,
-            Arc::new(Generation {
-                #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-                phase: Mutex::new(Phase::Active),
-                policy: ManuallyDrop::new(Arc::new(policy)),
-                count: self.generations.clone(),
-            }),
-        );
+        let generation = Arc::new(Generation {
+            #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+            phase: Mutex::new(Phase::Active),
+            policy: ManuallyDrop::new(Arc::new(policy)),
+            count: self.generations.clone(),
+        });
+        // Some platforms, including macOS, allocate a mutex's native state on
+        // its first lock. Initialize it on this registering thread, before the
+        // generation is published, so the first SDK callback allocates nothing
+        // when checking the phase or recording a policy decline.
+        #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+        drop(lock(&generation.phase));
+        lock(&self.state).active.insert(token, generation);
         Ok(token)
     }
 
