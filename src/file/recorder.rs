@@ -232,6 +232,27 @@ struct OpenFile {
     has_media: bool,
 }
 
+/// The one budget for stopping and destroying this native recorder.
+/// A finish's deadline belongs to its caller and never changes this budget.
+#[derive(Clone, Copy)]
+enum CleanupBudget {
+    Skip,
+    For(Duration),
+    Until(Deadline),
+}
+
+impl CleanupBudget {
+    fn begin(&mut self, requested: Instant) -> Option<Deadline> {
+        if let Self::For(wait) = *self {
+            *self = Deadline::starting(requested, wait).map_or(Self::Skip, Self::Until);
+        }
+        match *self {
+            Self::Until(deadline) => Some(deadline),
+            Self::Skip | Self::For(_) => None,
+        }
+    }
+}
+
 /// The record of one session, built from the recorder's events.
 struct Ledger {
     /// The session's report, whose phase is where the session is.
@@ -321,6 +342,11 @@ impl Ledger {
         )
     }
 
+    /// A final report can still leave known files awaiting cleanup.
+    fn cleanup_pending(&self) -> bool {
+        self.session_open() || !self.open_files.is_empty()
+    }
+
     /// Whether every file reported open has been reported closed.
     fn all_closed(&self) -> bool {
         self.open_files.is_empty() && self.report.closed_files > 0
@@ -361,12 +387,19 @@ impl Ledger {
 
     /// Record one event of the open session.
     fn observe(&mut self, kind: RecorderEventKind, path: EventText) {
-        if !self.session_open() {
-            return;
-        }
         // A path that is cut short cannot be matched with a later event.
         let exact =
             !path.as_bytes().is_empty() && path.is_terminated() && !path.is_possibly_truncated();
+        if !self.session_open() {
+            // Keep cleanup evidence after an indeterminate verdict without
+            // changing the report already returned to the caller.
+            if kind == RecorderEventKind::FileClosed && exact {
+                if let Some(index) = self.open_files.iter().position(|open| open.path == path) {
+                    self.open_files.remove(index);
+                }
+            }
+            return;
+        }
         match kind {
             RecorderEventKind::Started | RecorderEventKind::Rollover => {
                 let first = kind == RecorderEventKind::Started;
@@ -472,9 +505,11 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 /// The SDK finalizes a file only between the stop request and its file-closed
 /// event. [`finish`](Self::finish) performs both and reports the outcome;
 /// treat a recording as complete only when it returns
-/// [`FinishStatus::Closed`]. Dropping a recorder with a session still open
-/// does the same, waiting up to [`RecorderOptions::drop_wait`], but cannot
-/// report whether it succeeded; [`abandon`](Self::abandon) skips the wait.
+/// [`FinishStatus::Closed`]. Dropping a recorder waits up to
+/// [`RecorderOptions::drop_wait`] while the session is open or a file it
+/// reported open has not been reported closed, including after an
+/// indeterminate outcome. Drop cannot report whether cleanup succeeded;
+/// [`abandon`](Self::abandon) skips the wait.
 ///
 /// # What a closed file means
 ///
@@ -514,9 +549,7 @@ pub struct FileRecorder {
     /// needs to be, even when it ended that session itself: until then it
     /// refuses to start another.
     native_stop_owed: bool,
-    drop_wait: Duration,
-    /// An async shutdown's existing budget, shared with a running finish.
-    drop_deadline: Option<Deadline>,
+    cleanup: CleanupBudget,
     // Keeps the NDI runtime initialized.
     _api: FileApi,
     // Neither the NDI File Format API documentation nor
@@ -565,8 +598,7 @@ impl FileRecorder {
             handle,
             records_media: options.tracks.contains(MediaTypes::VIDEO)
                 || options.tracks.contains(MediaTypes::AUDIO),
-            drop_wait: options.drop_wait,
-            drop_deadline: None,
+            cleanup: CleanupBudget::For(options.drop_wait),
             accepted_source: Some(options.source.clone()),
             naming: resolved.naming,
             ledger: Ledger::idle(),
@@ -612,8 +644,9 @@ impl FileRecorder {
     /// # Errors
     ///
     /// * [`Error::InvalidState`] with [`StateError::PreviousSessionOpen`]
-    ///   while an earlier session is recording or stopping;
-    ///   [`finish`](Self::finish) it first. With
+    ///   while an earlier session is recording, stopping, or still has a
+    ///   known file awaiting its closure event after an indeterminate outcome;
+    ///   finish or poll it first, or [`reset`](Self::reset) it. With
     ///   [`StateError::EarlierSessionEvents`] when the SDK keeps reporting
     ///   events of an earlier session.
     /// * [`Error::Io`] when the directory of the file the pattern names
@@ -627,7 +660,7 @@ impl FileRecorder {
     ///   that event, counted in no session's report. Retrying `start` discards
     ///   queued events before asking the SDK to start again.
     pub fn start(&mut self, target: &RecordingTarget, timecode: RecordingTimecode) -> Result<u64> {
-        if self.ledger.session_open() {
+        if self.ledger.cleanup_pending() {
             return Err(Error::InvalidState(StateError::PreviousSessionOpen));
         }
         self.naming.check(target)?;
@@ -919,23 +952,37 @@ impl FileRecorder {
         deadline: Deadline,
         requested: Instant,
     ) -> Deadline {
-        let deadline = deadline.within_at(requested, self.drop_wait);
-        self.drop_deadline = Some(deadline);
-        deadline
-    }
-
-    pub(super) fn bound_shutdown_wait(&mut self, requested: Instant) {
-        if self.drop_deadline.is_none() {
-            self.drop_deadline = Deadline::starting(requested, self.drop_wait).ok();
-            if self.drop_deadline.is_none() {
-                // An unrepresentable deadline cannot provide a bounded wait.
-                self.drop_wait = Duration::ZERO;
-            }
+        match self.cleanup.begin(requested) {
+            Some(cleanup) if cleanup.end() < deadline.end() => cleanup,
+            Some(_) => deadline,
+            None => deadline.within_at(Instant::now(), Duration::ZERO),
         }
     }
 
-    pub(super) fn shutdown_wait_spent(&mut self) {
-        self.drop_wait = Duration::ZERO;
+    pub(super) fn bound_shutdown_wait(&mut self, requested: Instant) {
+        self.cleanup.begin(requested);
+    }
+
+    /// Keep taking closure evidence even when the session's report is final.
+    fn wait_cleanup(&mut self, deadline: Deadline) {
+        let mut late_polls = 0;
+        while self.ledger.cleanup_pending() {
+            let expired = deadline.is_expired();
+            if expired {
+                if late_polls == STALE_EVENT_LIMIT {
+                    break;
+                }
+                late_polls += 1;
+            }
+            let polled = self.poll_event_ms(
+                deadline
+                    .within_at(Instant::now(), FINISH_POLL)
+                    .remaining_ms(),
+            );
+            if expired && matches!(polled, Ok(None)) {
+                break;
+            }
+        }
     }
 
     /// Stop and destroy the recorder at once, without waiting for the SDK to
@@ -943,7 +990,7 @@ impl FileRecorder {
     ///
     /// The file of a session that had not ended may be left truncated.
     pub fn abandon(mut self) -> RecordingReport {
-        self.drop_wait = Duration::ZERO;
+        self.cleanup = CleanupBudget::Skip;
         self.report()
     }
 
@@ -1191,18 +1238,10 @@ impl Drop for FileRecorder {
     fn drop(&mut self) {
         // The SDK finalizes a file between the stop request and the
         // file-closed event; destroying sooner may truncate it.
-        if self.ledger.session_open() {
+        if self.ledger.cleanup_pending() {
             self.request_stop();
-            if !self.drop_wait.is_zero() {
-                // The outcome cannot be reported from here. The wait itself
-                // cannot fail: the session is stopping and `drop_wait` was
-                // checked when the recorder was created, and a malformed
-                // event does not end it.
-                if let Some(deadline) = self.drop_deadline {
-                    let _ = self.wait_finished_from(deadline, |_| false);
-                } else {
-                    let _ = self.wait_finished(self.drop_wait);
-                }
+            if let Some(deadline) = self.cleanup.begin(Instant::now()) {
+                self.wait_cleanup(deadline);
             }
         }
         // SAFETY: the recorder is live and is destroyed exactly once, on the
@@ -1269,6 +1308,22 @@ mod tests {
         ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
         assert_eq!(ledger.report.dropped_events, 1);
+    }
+
+    #[test]
+    fn an_indeterminate_report_keeps_its_pending_cleanup_without_changing_the_report() {
+        let mut ledger = session();
+        ledger.observe(Started, path("take.mkv"));
+        ledger.dropped(1);
+        ledger.drained(false);
+        assert_eq!(ledger.state(), RecorderState::Indeterminate);
+        assert!(ledger.cleanup_pending());
+        let report = ledger.report.clone();
+        ledger.observe(FileClosed, path("other.mkv"));
+        assert!(ledger.cleanup_pending());
+        ledger.observe(FileClosed, path("take.mkv"));
+        assert!(!ledger.cleanup_pending());
+        assert_eq!(ledger.report, report);
     }
 
     #[test]

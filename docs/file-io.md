@@ -108,16 +108,20 @@ recorder and returns the old session's report; `abandon` destroys it without
 waiting. Either can leave an unfinished file.
 
 Drop requests a stop and waits for closure events up to `drop_wait` (five
-seconds by default), but cannot report the outcome. Use explicit finishing when
-the result matters. See [`FileRecorder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorder.html)
+seconds by default), including known pending files after an indeterminate
+outcome, but cannot report the outcome. Until those files close, a new start
+returns `PreviousSessionOpen`; poll for closure or use `reset` to abandon them.
+Use explicit finishing when the result matters. See
+[`FileRecorder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorder.html)
 for state transitions, error conditions and recovery.
 
 If another async clone calls `close` while `finish` or `wait_finished` runs,
 the wait uses the earlier of its own deadline and `drop_wait` measured from
 the close's submission. It reports `Closed` or `Indeterminate` if the session
 settles, or `InvalidState(Closed)` if that budget ends first. `TimedOut` would
-suggest another wait, which a closed handle cannot perform. Destruction does
-not start a second finalization wait after the running wait spends its budget.
+suggest another wait, which a closed handle cannot perform. Destruction
+uses only the remainder of the close's budget after an earlier finish deadline;
+the finish never shortens the time available to close.
 
 ## Limits of the NDI 6.4 File library
 
