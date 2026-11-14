@@ -67,8 +67,7 @@ fn copied_send_survives_released_source() -> Result<(), grafton_ndi::Error> {
 }
 
 #[test]
-fn mixed_owned_and_copy_send_completes_each_frame_once() -> Result<(), grafton_ndi::Error> {
-    use std::sync::{Arc, Mutex};
+fn mixed_owned_and_copy_send_recovers_the_released_frames() -> Result<(), grafton_ndi::Error> {
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
@@ -76,64 +75,44 @@ fn mixed_owned_and_copy_send_completes_each_frame_once() -> Result<(), grafton_n
         .clock_video(false)
         .clock_audio(false);
     let mut sender = Sender::new(&ndi, &options)?;
-    let completed = Arc::new(Mutex::new(Vec::new()));
-    let recorded = completed.clone();
-    sender.on_async_video_done(move |len| recorded.lock().unwrap().push(len));
-    sender.send_video_async(frame(3))?;
+    let owned = frame(3);
+    let pixels = owned.data().as_ptr();
+    sender.send_video_async(owned)?;
     let source = vec![4; 16 * 16 * 4];
     let borrowed = BorrowedVideoFrame::builder(&source, 16, 16, PixelFormat::Bgra).build()?;
     let recovered = sender.send_video_async_copy(&borrowed)?.unwrap();
+    assert_eq!(recovered.data().as_ptr(), pixels);
     assert_eq!(recovered.data()[0], 3);
     sender.flush_async_blocking();
-    assert_eq!(completed.lock().unwrap().as_slice(), &[1024, 1024]);
     assert_eq!(sender.finish_video_async().unwrap().data()[0], 4);
+    assert!(sender.finish_video_async().is_none());
     sender.send_video_async(frame(5))?;
     drop(sender);
-    assert_eq!(completed.lock().unwrap().as_slice(), &[1024, 1024, 1024]);
     Ok(())
 }
 
 #[test]
-fn concurrent_sync_and_reentrant_flush_preserve_owned_frame() -> Result<(), grafton_ndi::Error> {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
+fn concurrent_sync_and_flush_preserve_owned_frame() -> Result<(), grafton_ndi::Error> {
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let options = SenderOptions::new(common::unique_name("sync and reentrant flush regression"))
+    let options = SenderOptions::new(common::unique_name("sync and flush regression"))
         .clock_video(false)
         .clock_audio(false);
     let mut sender = Sender::new(&ndi, &options)?;
     let submitted = frame(6);
     let original_ptr = submitted.data().as_ptr();
     sender.send_video_async(submitted)?;
-    let reference = Arc::new(std::sync::Mutex::new(std::sync::Weak::<Sender>::new()));
-    let weak_reference = reference.clone();
-    let completions = Arc::new(AtomicUsize::new(0));
-    let counted = completions.clone();
-    sender.on_async_video_done(move |_| {
-        counted.fetch_add(1, Ordering::SeqCst);
-        weak_reference
-            .lock()
-            .unwrap()
-            .upgrade()
-            .unwrap()
-            .flush_async_blocking();
-    });
     let shared = Arc::new(sender);
-    *reference.lock().unwrap() = Arc::downgrade(&shared);
     std::thread::scope(|scope| {
         scope.spawn(|| shared.flush_async_blocking());
         scope.spawn(|| shared.send_video(&frame(7)).unwrap());
     });
-    assert_eq!(completions.load(Ordering::SeqCst), 1);
     let mut sender = Arc::try_unwrap(shared).ok().unwrap();
     let returned = sender.finish_video_async().unwrap();
     assert_eq!(returned.data().as_ptr(), original_ptr);
     assert_eq!(returned.metadata(), Some("<frame value=\"6\"/>"));
-    assert_eq!(completions.load(Ordering::SeqCst), 1);
+    assert!(sender.finish_video_async().is_none());
     Ok(())
 }
 
@@ -182,40 +161,6 @@ fn senders_on_separate_threads_flush_independently() -> Result<(), grafton_ndi::
             .expect("a sender's flush did not return")?;
         assert_eq!(recovered, Some(FLUSH_ROUNDS));
     }
-    Ok(())
-}
-
-#[test]
-fn panicking_completion_keeps_new_owned_frame_pending() -> Result<(), grafton_ndi::Error> {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
-    let Some(ndi) = common::ndi() else {
-        return Ok(());
-    };
-    let options = SenderOptions::new(common::unique_name("panicking completion regression"))
-        .clock_video(false)
-        .clock_audio(false);
-    let mut sender = Sender::new(&ndi, &options)?;
-    let callbacks = Arc::new(AtomicUsize::new(0));
-    let recorded = callbacks.clone();
-    sender.on_async_video_done(move |_| {
-        if recorded.fetch_add(1, Ordering::SeqCst) == 0 {
-            panic!("intentional completion panic");
-        }
-    });
-    sender.send_video_async(frame(1))?;
-    let next = frame(2);
-    let next_ptr = next.data().as_ptr();
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = sender.send_video_async(next);
-    }));
-    assert!(panic.is_err());
-    let recovered = sender.finish_video_async().unwrap();
-    assert_eq!(recovered.data().as_ptr(), next_ptr);
-    assert_eq!(recovered.metadata(), Some("<frame value=\"2\"/>"));
-    assert_eq!(callbacks.load(Ordering::SeqCst), 2);
     Ok(())
 }
 

@@ -90,9 +90,7 @@ struct Inner {
 // A panic cannot leave this half-changed: its one lock guards `()`, and no
 // application code runs while it is held. The `parking_lot` lock does not
 // poison and so does not declare this itself, which would otherwise leave
-// even the Advanced senders, which hold no application callback, short of
-// `RefUnwindSafe`. An ordinary sender's completion handler still decides
-// that sender's unwind traits.
+// senders short of `RefUnwindSafe`.
 impl std::panic::RefUnwindSafe for Inner {}
 
 mod ownership {
@@ -159,9 +157,7 @@ mod ownership {
 
     impl fmt::Debug for Shared {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("Shared")
-                .field("video_callback_set", &self.video.callback.is_some())
-                .finish_non_exhaustive()
+            f.debug_struct("Shared").finish_non_exhaustive()
         }
     }
 
@@ -275,8 +271,8 @@ impl AudioSendMode for QueueAttached {}
 /// itself, and it cannot be registered with an advertiser.
 ///
 /// A sender is `Send` and `Sync`. Its operations take `&self` and may run on
-/// several threads at once, except the asynchronous video submissions and the
-/// completion handler setters, which take `&mut self`.
+/// several threads at once, except the asynchronous video submissions, which
+/// take `&mut self`.
 #[derive(Debug)]
 pub struct Sender<M: SenderMode = RawSend> {
     inner: Inner,
@@ -287,19 +283,15 @@ pub struct Sender<M: SenderMode = RawSend> {
     _mode: PhantomData<M>,
 }
 
-type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
-
 /// The video pipeline of a sender that sends uncompressed video: the frame
 /// the SDK may still be reading, or the one it last released, the copy a
-/// synchronous send makes of a frame it cannot send in place, and the
-/// completion handler.
+/// synchronous send makes of a frame it cannot send in place.
 ///
 /// [`Shared`] owns it beside the native sender and drops it first, so the
 /// pipeline drains the SDK while `sender` is still live.
 struct VideoPipeline {
     sender: SendHandle,
     state: Mutex<VideoState>,
-    callback: Option<AsyncCallback>,
 }
 
 /// What a sender's video operations share, behind one lock.
@@ -319,35 +311,13 @@ impl VideoPipeline {
         Self {
             sender,
             state: Mutex::new(VideoState::default()),
-            callback: None,
         }
     }
 
-    fn notify(&self, len: Option<usize>) {
-        if let (Some(len), Some(callback)) = (len, self.callback.as_ref()) {
-            callback(len);
-        }
-    }
-
-    /// Lock the video state, make one synchronizing SDK call through `call`,
-    /// which returns its result and the pixel-buffer length of the frame it
-    /// completed, then unlock and notify the completion handler.
-    ///
-    /// Every video operation follows this order, so the handler runs once the
-    /// state is consistent and outside the lock: it may panic or reenter the
-    /// sender without freeing a frame in flight or being notified twice.
-    /// Destruction follows it too, without the lock, in `Drop for
-    /// VideoPipeline`.
-    fn synchronize<R>(
-        &self,
-        call: impl FnOnce(&mut VideoState, SendHandle) -> (R, Option<usize>),
-    ) -> R {
-        let (result, completed) = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            call(&mut state, self.sender)
-        };
-        self.notify(completed);
-        result
+    /// Lock the video state and make one synchronizing SDK call through `call`.
+    fn synchronize<R>(&self, call: impl FnOnce(&mut VideoState, SendHandle) -> R) -> R {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        call(&mut state, self.sender)
     }
 
     /// Send `frame` synchronously, which also releases the frame in flight.
@@ -358,14 +328,11 @@ impl VideoPipeline {
             // A synchronous video send also releases the previous async frame,
             // which completes once the send has returned.
             let synchronized = state.in_flight.send(sender, frame);
-            ((), completed(&mut state.in_flight, synchronized))
+            state.in_flight.completed(synchronized);
         });
     }
 
     /// Hand a checked frame to the SDK and return the previous one, if any.
-    ///
-    /// If the handler panics, the synchronized previous frame is dropped and
-    /// the pipeline retains the new frame.
     fn submit(&self, frame: VideoFrame) -> Option<VideoFrame> {
         self.synchronize(|state, sender| {
             // The pipeline owns the new frame before the SDK sees it. The
@@ -373,60 +340,42 @@ impl VideoPipeline {
             // which synchronizes the SDK's access to it, has returned; only
             // the proof of that return completes it.
             let (mut displaced, synchronized) = state.in_flight.submit(sender, frame);
-            let len = completed(&mut displaced, synchronized);
-            (displaced.take_retained(), len)
+            displaced.completed(synchronized);
+            displaced.take_retained()
         })
     }
 
     /// Wait for the SDK to release the frame in flight, which stays retained.
     fn flush(&self) {
-        self.synchronize(|state, sender| ((), drain(&mut state.in_flight, sender)));
+        self.synchronize(|state, sender| drain(&mut state.in_flight, sender));
     }
 
     /// Drain the SDK and take the retained frame.
     fn finish(&self) -> Option<VideoFrame> {
         self.synchronize(|state, sender| {
-            let len = drain(&mut state.in_flight, sender);
-            (state.in_flight.take_retained(), len)
+            drain(&mut state.in_flight, sender);
+            state.in_flight.take_retained()
         })
     }
 
-    /// End the pipeline without calling its completion handler: drain the
-    /// SDK, take the retained frame, and drop the handler.
-    ///
-    /// A frame that was still in flight is returned rather than notified, so
-    /// a handler that would panic cannot unwind out of the conversion and
-    /// lose what its caller is converting. Nothing is left in flight once
-    /// this returns.
+    /// End the pipeline: drain the SDK and take the retained frame.
     #[cfg(all(feature = "advanced", ndi_has_advanced_send_completion))]
     fn retire(mut self) -> Option<VideoFrame> {
-        self.callback = None;
         let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        // The notification `drain` claims has no handler left to run.
-        let _ = drain(&mut state.in_flight, self.sender);
+        drain(&mut state.in_flight, self.sender);
         state.in_flight.take_retained()
-        // Dropping the idle pipeline makes no SDK call and notifies nothing.
+        // Dropping the idle pipeline makes no SDK call.
     }
 }
 
 impl Drop for VideoPipeline {
-    /// The destruction variant of [`VideoPipeline::synchronize`]: dropping
-    /// holds the state exclusively, so it takes no lock, and it contains a
-    /// handler panic while the thread is already unwinding.
+    /// Drain the SDK while destruction holds the state exclusively.
     fn drop(&mut self) {
         // The native sender may outlive this pipeline when an advertiser
         // registration shares it, so the pipeline drains the SDK itself
         // rather than relying on the sender's destruction.
         let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        let len = drain(&mut state.in_flight, self.sender);
-        // A handler that panics here unwinds through the rest of the drop:
-        // `Shared` still releases the native sender, and the retained frame
-        // is freed after the SDK has released it.
-        if std::thread::panicking() {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.notify(len)));
-        } else {
-            self.notify(len);
-        }
+        drain(&mut state.in_flight, self.sender);
     }
 }
 
@@ -439,27 +388,15 @@ unsafe impl in_flight::Lend for VideoFrame {
     }
 }
 
-/// Mark `state`'s frame in flight as released, with the proof that the SDK
-/// has synchronized it, and claim its notification: the pixel-buffer length
-/// to report.
-///
-/// The notification is claimed before any user code runs, so a handler that
-/// panics or reenters cannot be notified twice.
-fn completed(state: &mut InFlight<VideoFrame>, synchronized: Synchronized) -> Option<usize> {
-    state
-        .completed(synchronized)
-        .map(|frame| frame.data().len())
-}
-
 /// Synchronize the SDK if it may still read `state`'s frame, then complete
 /// it: the release a flush, a finish and the pipeline's destruction share.
-fn drain(state: &mut InFlight<VideoFrame>, sender: SendHandle) -> Option<usize> {
+fn drain(state: &mut InFlight<VideoFrame>, sender: SendHandle) {
     if !state.is_in_flight() {
         // A retained frame was completed when the SDK released it.
-        return None;
+        return;
     }
     let synchronized = state.flush(sender);
-    completed(state, synchronized)
+    state.completed(synchronized);
 }
 
 /// Frames an asynchronous video send lends to the SDK, and the SDK calls that
@@ -475,7 +412,7 @@ fn drain(state: &mut InFlight<VideoFrame>, sender: SendHandle) -> Option<usize> 
 /// send on that stream.
 ///
 /// [`InFlight`] holds one stream's lent frame. It hands the frame back only in
-/// exchange for [`Synchronized`], the proof that the SDK has returned from a
+/// exchange for [`in_flight::Synchronized`], the proof that the SDK has returned from a
 /// synchronizing call made after the frame was submitted, or [`Destroyed`],
 /// the proof that its native sender no longer exists. Both proofs have
 /// private fields, so the rest of the crate obtains one only from the
@@ -800,7 +737,7 @@ pub(crate) mod in_flight {
     }
 }
 
-use in_flight::{InFlight, Synchronized};
+use in_flight::InFlight;
 
 impl fmt::Debug for Inner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1523,8 +1460,6 @@ impl Sender {
     /// Synchronous sends and explicit flushes complete the operation but retain
     /// the owned frame for recovery by the next async send or finish call.
     /// No SDK completion callback is registered, including with Advanced SDK.
-    /// If a Rust completion handler panics, the new frame remains retained and
-    /// the synchronized previous frame is dropped rather than returned.
     ///
     /// # Errors
     ///
@@ -1546,9 +1481,7 @@ impl Sender {
     /// Drain the SDK and return the final owned frame, if any.
     ///
     /// Frames submitted through either owned or copied sending are returned.
-    /// Repeated calls return `None` and do not repeat completion notifications.
-    /// If the completion handler panics, the completed frame is dropped instead
-    /// of returned.
+    /// Repeated calls return `None`.
     pub fn finish_video_async(&mut self) -> Option<VideoFrame> {
         self.native.video.finish()
     }
@@ -1572,34 +1505,6 @@ impl Sender {
         self.require_video_format(frame.layout().pixel_format())?;
         let owned = frame.owned_copy();
         Ok(self.native.video.submit(owned))
-    }
-
-    /// Replace the completion handler receiving the submitted pixel-buffer length.
-    ///
-    /// It runs on the calling thread after SDK synchronization, outside internal
-    /// locks, at most once per submitted frame. Completion is observed by the
-    /// next video send, flush, finish, or sender destruction. Owned and copied sends share
-    /// this handler. State is updated before invocation, so panic or reentry cannot
-    /// repeat a notification. If sender destruction runs during unwinding, a
-    /// handler panic is suppressed to avoid a second panic.
-    ///
-    /// Replaces the previous handler. The current handler observes completion of
-    /// a frame still in flight, including one submitted before registration.
-    /// Frames completed before registration are not notified retroactively.
-    ///
-    /// Converting the sender with the Advanced `QueuedSender::from_sender`
-    /// drops the handler without calling it: that conversion returns the
-    /// frame still in flight instead of notifying it.
-    pub fn on_async_video_done<F>(&mut self, handler: F)
-    where
-        F: Fn(usize) + Send + Sync + 'static,
-    {
-        self.native.video.callback = Some(Box::new(handler));
-    }
-
-    /// Remove the completion handler. Pending frame ownership is unchanged.
-    pub fn clear_async_video_done(&mut self) {
-        self.native.video.callback = None;
     }
 
     /// Flush pending async video operations synchronously.
@@ -2146,7 +2051,6 @@ impl SenderOptions {
 mod tests {
     use super::*;
     use crate::RuntimeFeature;
-    use std::sync::Arc;
 
     #[test]
     fn captured_video_sending_uses_initialized_active_rows_and_preserves_descriptors() {
@@ -2781,25 +2685,16 @@ mod tests {
     }
 
     #[test]
-    fn mixed_sync_flush_and_copy_sends_notify_once_and_preserve_recovery() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let count = Arc::new(AtomicUsize::new(0));
-        let observed = count.clone();
+    fn mixed_sync_flush_and_copy_sends_preserve_recovery() {
         let Some(mut sender) = test_sender() else {
             return;
         };
-        sender.on_async_video_done(move |len| {
-            assert_eq!(len, 1024);
-            observed.fetch_add(1, Ordering::SeqCst);
-        });
         let frame = test_owned_frame(1);
         let pixels = frame.data().as_ptr();
         sender.send_video_async(frame).unwrap();
         sender.send_video(&test_owned_frame(9)).unwrap();
         sender.flush_async_blocking();
-        assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(sender.finish_video_async().unwrap().data().as_ptr(), pixels);
-        assert_eq!(count.load(Ordering::SeqCst), 1);
 
         // A copied send recovers the previous owned frame after synchronization.
         sender.send_video_async(test_owned_frame(2)).unwrap();
@@ -2846,21 +2741,13 @@ mod tests {
         assert_eq!(copied.metadata(), Some("<copy/>"));
         sender.finish_video_async().unwrap();
         sender.flush_async_blocking();
-        assert_eq!(count.load(Ordering::SeqCst), 4);
     }
 
     #[test]
     fn every_synchronizing_call_completes_a_frame_once_and_recovery_keeps_its_identity() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let count = Arc::new(AtomicUsize::new(0));
-        let observed = count.clone();
         let Some(mut sender) = test_sender() else {
             return;
         };
-        sender.on_async_video_done(move |_| {
-            observed.fetch_add(1, Ordering::SeqCst);
-        });
-        let notified = || count.load(Ordering::SeqCst);
         let in_flight = |sender: &Sender| {
             sender
                 .native
@@ -2878,154 +2765,42 @@ mod tests {
         };
 
         // A synchronous send completes the frame in flight; the next
-        // submission returns that allocation without notifying it again.
+        // submission returns that original allocation.
         let (a, a_pixels) = frame(1);
         assert!(sender.send_video_async(a).unwrap().is_none());
         assert!(in_flight(&sender));
-        assert_eq!(notified(), 0);
         sender.send_video(&test_owned_frame(9)).unwrap();
         assert!(!in_flight(&sender));
-        assert_eq!(notified(), 1);
         let (b, b_pixels) = frame(2);
         let previous = sender.send_video_async(b).unwrap().unwrap();
         assert_eq!(previous.data().as_ptr(), a_pixels);
-        assert_eq!(notified(), 1);
 
         // A flush does the same, and a second flush finds nothing in flight.
         sender.flush_async_blocking();
         assert!(!in_flight(&sender));
         sender.flush_async_blocking();
-        assert_eq!(notified(), 2);
         let (c, c_pixels) = frame(3);
         let previous = sender.send_video_async(c).unwrap().unwrap();
         assert_eq!(previous.data().as_ptr(), b_pixels);
-        assert_eq!(notified(), 2);
 
         // A submission completes the in-flight frame it displaces.
         let (d, d_pixels) = frame(4);
         let previous = sender.send_video_async(d).unwrap().unwrap();
         assert_eq!(previous.data().as_ptr(), c_pixels);
         assert!(in_flight(&sender));
-        assert_eq!(notified(), 3);
 
-        // Finishing recovers a frame a synchronous send already completed
-        // without notifying it again.
+        // Finishing recovers a frame a synchronous send already completed.
         sender.send_video(&test_owned_frame(9)).unwrap();
-        assert_eq!(notified(), 4);
         assert_eq!(
             sender.finish_video_async().unwrap().data().as_ptr(),
             d_pixels
         );
         assert!(sender.finish_video_async().is_none());
-        assert_eq!(notified(), 4);
 
-        // Destroying a sender whose retained frame was already completed
-        // notifies nothing more.
+        // A sender can also be dropped after an explicit flush.
         sender.send_video_async(frame(5).0).unwrap();
         sender.flush_async_blocking();
-        assert_eq!(notified(), 5);
         drop(sender);
-        assert_eq!(notified(), 5);
-    }
-
-    #[test]
-    fn callback_panic_after_submission_keeps_new_owned_frame_recoverable() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let count = Arc::new(AtomicUsize::new(0));
-        let observed = count.clone();
-        let Some(mut sender) = test_sender() else {
-            return;
-        };
-        sender.on_async_video_done(move |_| {
-            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("intentional completion panic");
-            }
-        });
-        sender.send_video_async(test_owned_frame(1)).unwrap();
-        let second = test_owned_frame(2);
-        let pixels = second.data().as_ptr();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = sender.send_video_async(second);
-        }));
-        assert!(result.is_err());
-        assert_eq!(sender.finish_video_async().unwrap().data().as_ptr(), pixels);
-        assert_eq!(count.load(Ordering::SeqCst), 2);
-        assert!(sender.finish_video_async().is_none());
-    }
-
-    #[test]
-    fn completion_callback_can_reenter_shared_flush_without_deadlock() {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Weak,
-        };
-        let reference = Arc::new(Mutex::new(Weak::<Sender>::new()));
-        let callback_reference = reference.clone();
-        let count = Arc::new(AtomicUsize::new(0));
-        let observed = count.clone();
-        let Some(mut sender) = test_sender() else {
-            return;
-        };
-        sender.on_async_video_done(move |_| {
-            observed.fetch_add(1, Ordering::SeqCst);
-            let sender = callback_reference.lock().unwrap().upgrade().unwrap();
-            sender.flush_async_blocking();
-            sender.send_video(&test_owned_frame(7)).unwrap();
-        });
-        sender.send_video_async(test_owned_frame(5)).unwrap();
-        let sender = Arc::new(sender);
-        *reference.lock().unwrap() = Arc::downgrade(&sender);
-        std::thread::scope(|scope| {
-            for _ in 0..4 {
-                scope.spawn(|| sender.flush_async_blocking());
-            }
-        });
-        assert_eq!(count.load(Ordering::SeqCst), 1);
-        let mut sender = Arc::try_unwrap(sender).unwrap();
-        assert_eq!(sender.finish_video_async().unwrap().data()[0], 5);
-    }
-
-    #[test]
-    fn sender_drop_notifies_once_for_copy() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let count = Arc::new(AtomicUsize::new(0));
-        let observed = count.clone();
-        let Some(mut sender) = test_sender() else {
-            return;
-        };
-        sender.on_async_video_done(move |_| {
-            observed.fetch_add(1, Ordering::SeqCst);
-        });
-        let data = vec![0; 1024];
-        {
-            let frame = BorrowedVideoFrame::builder(&data, 16, 16, PixelFormat::Bgra)
-                .build()
-                .unwrap();
-            assert!(sender.send_video_async_copy(&frame).unwrap().is_none());
-        }
-        drop(data);
-        drop(sender);
-        assert_eq!(count.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn completion_handler_can_be_replaced_and_cleared() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let count = Arc::new(AtomicUsize::new(0));
-        let Some(mut sender) = test_sender() else {
-            return;
-        };
-        sender.on_async_video_done(|_| panic!("replaced handler must not run"));
-        let observed = count.clone();
-        sender.on_async_video_done(move |_| {
-            observed.fetch_add(1, Ordering::SeqCst);
-        });
-        sender.send_video_async(test_owned_frame(1)).unwrap();
-        sender.finish_video_async();
-        sender.clear_async_video_done();
-        sender.send_video_async(test_owned_frame(2)).unwrap();
-        sender.finish_video_async();
-        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

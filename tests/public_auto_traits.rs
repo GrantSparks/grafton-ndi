@@ -7,7 +7,7 @@
 //! A trait a type lacks is its documented design, stated beside the type:
 //! the File objects and FrameSync's frame references stay on their thread,
 //! the Discovery Server owners, a `Router`, `AvSync`, `Genlock` and its clocks
-//! are `Send` but not `Sync`, and `Error`, `Rejected` and an ordinary `Sender`
+//! are `Send` but not `Sync`, and `Error` and `Rejected`
 //! may hold application values that are not unwind safe. Gaining a trait is
 //! not a breaking change; list it here when a type gains one, and list a new
 //! public type with the traits it is meant to have.
@@ -125,7 +125,7 @@ fn crate_root_types_keep_their_auto_traits() {
         RuntimeOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
         ScanType: Send, Sync, UnwindSafe, RefUnwindSafe;
         SdkTimestamp: Send, Sync, UnwindSafe, RefUnwindSafe;
-        Sender<RawSend>: Send, Sync;
+        Sender<RawSend>: Send, Sync, UnwindSafe, RefUnwindSafe;
         SenderOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
         SettingChange: Send, Sync, UnwindSafe, RefUnwindSafe;
         Source: Send, Sync, UnwindSafe, RefUnwindSafe;

@@ -77,6 +77,7 @@ fn native_resource_ownership() {
     let standard = fixture(&directory, false);
     let advanced = fixture(&directory, true);
     let mut scenarios = vec![
+        "sender_unregistered",
         "sender_registration",
         "dropped_sender_advertiser",
         "receiver_registration",
@@ -169,6 +170,15 @@ fn child(case: &str) {
         }
     }
     match case {
+        "sender_unregistered" => {
+            let mut sender = sender(&ndi);
+            sender.send_video_async(frame()).unwrap();
+            drop(sender);
+            let events = log();
+            assert_eq!(events.matches("sender-flush\n").count(), 1);
+            assert!(position(&events, "sender-flush") < position(&events, "sender-destroy-begin"));
+            assert_eq!(events.matches("sender-destroy\n").count(), 1);
+        }
         "sender_registration" => {
             let mut sender = sender(&ndi);
             let mut advertiser = SendAdvertiser::new(&ndi, &server()).unwrap();

@@ -20,6 +20,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Runtime and File library selection require absolute explicit paths on every
   target. Relative `NDI_RUNTIME_DIR_V6` directories are refused and skipped,
   with the reason retained in load-failure diagnostics.
+- Remove `Sender::on_async_video_done` and `clear_async_video_done`. Observe
+  asynchronous video completion through frames returned by `send_video_async`
+  and `finish_video_async`. Ordinary senders now implement `UnwindSafe` and
+  `RefUnwindSafe`.
 
 - `KvmSession::receiver()` returns a restricted `KvmReceiver<'_, M>` instead
   of `&Receiver<M>`. Compatible capture and shared controls remain available;
