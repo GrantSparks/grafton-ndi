@@ -9,7 +9,7 @@ use super::{
     CompressedVideoRef, ReceiverControls, VideoCodec,
 };
 use crate::{
-    capture::{AudioKind, CaptureStrategy, Delivered, Guard, MetadataKind, VideoKind},
+    capture::{AllSlots, AudioKind, CaptureStrategy, Guard, Media, MetadataKind, VideoKind},
     receiver::PacketAttached,
     sys::{
         advanced::{native, ReceiverConfiguration},
@@ -343,35 +343,31 @@ impl PacketReceiver {
         receiver: &Receiver<PacketAttached>,
         timeout: Duration,
     ) -> Result<Option<PacketItemRef<'_>>> {
-        receiver.core.capture_any_until_with(
+        receiver.core.capture_any_until_with::<AllSlots, _>(
             Deadline::after(timeout)?,
             crate::receiver::NeverStop,
             PacketItemRef::Event,
-            |delivered| Self::capture_result_ref(receiver, delivered),
+            Self::capture_result_ref,
         )
     }
 
-    fn capture_result_ref<'rx>(
-        receiver: &'rx Receiver<PacketAttached>,
-        delivered: Delivered<'rx>,
-    ) -> Result<Option<PacketItemRef<'rx>>> {
-        let item = match delivered {
-            Delivered::Video(frame) => video_ref_event(frame)?,
-            Delivered::Audio(frame) => audio_ref_event(frame)?,
-            Delivered::Metadata(frame) => metadata_ref_event(frame)?,
-            Delivered::Notification(notification) => {
-                return Ok(receiver.core.event(notification).map(PacketItemRef::Event));
-            }
-        };
-        Ok(Some(item))
+    fn capture_result_ref(media: Media<'_>) -> Result<PacketItemRef<'_>> {
+        match media {
+            Media::Video(frame) => video_ref_event(frame),
+            Media::Audio(frame) => audio_ref_event(frame),
+            Media::Metadata(frame) => metadata_ref_event(frame),
+        }
     }
 
     #[cfg(test)]
-    fn capture_result(
-        receiver: &Receiver<PacketAttached>,
-        delivered: Delivered<'_>,
+    fn capture_result<'rx>(
+        receiver: &'rx Receiver<PacketAttached>,
+        delivered: crate::capture::Delivered<'rx, AllSlots>,
     ) -> Result<Option<PacketItem>> {
-        Ok(Self::capture_result_ref(receiver, delivered)?.map(|item| item.to_owned()))
+        Ok(receiver
+            .core
+            .capture_any_result_with(delivered, PacketItemRef::Event, Self::capture_result_ref)?
+            .map(|item| item.to_owned()))
     }
 }
 
@@ -445,7 +441,7 @@ mod tests {
     use super::*;
     use crate::{
         advanced::{EnvelopeCodec, PacketEnvelope, VideoPacketFormat},
-        capture::Notification,
+        capture::{Delivered, Notification},
         frames::PixelFormat,
         receiver::native_capture_calls,
         Error, Timecode,

@@ -45,8 +45,8 @@ use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::{
     capabilities::RuntimeFeature,
     capture::{
-        capture_any, capture_raw, AudioKind, CaptureKind, CaptureResult, CaptureStrategy,
-        Delivered, MetadataKind, Notification, VideoKind,
+        capture_any, capture_raw, AllSlots, AudioKind, CaptureKind, CaptureResult, CaptureStrategy,
+        Delivered, Media, MetadataKind, NoSlots, Notification, SlotSet, VideoKind,
     },
     finder::{RawSource, Source},
     sys::{self, bindings::*},
@@ -1741,20 +1741,27 @@ impl ReceiverCore {
         deadline: Deadline,
         stop: impl Stop,
     ) -> Result<Option<ReceiverItemRef<'_>>> {
-        self.capture_any_until_with(deadline, stop, ReceiverItemRef::Event, |delivered| {
-            self.combined_result(delivered)
-        })
+        self.capture_any_until_with::<AllSlots, _>(
+            deadline,
+            stop,
+            ReceiverItemRef::Event,
+            Self::combined_result,
+        )
     }
 
-    /// The mixed-capture wait, shared by raw and packet receivers. A pending
-    /// invalidation is consumed before waiting for native media; delivered
-    /// frames keep their guards through the caller's validation and copy.
-    pub(crate) fn capture_any_until_with<'rx, T>(
+    /// The mixed-capture kernel, shared by raw and packet receivers and
+    /// notification-only polling. A pending event is taken before waiting for
+    /// the guard, so it is returned even while a reconnect holds the guard,
+    /// and again once the guard is held, so one a capture retained meanwhile
+    /// spares the native wait. A failed lock attempt also checks for events
+    /// retained during that attempt. Only media reaches `convert`, retaining
+    /// its guards through the caller's validation and copy.
+    pub(crate) fn capture_any_until_with<'rx, S: SlotSet, T>(
         &'rx self,
         deadline: Deadline,
         stop: impl Stop,
         mut event: impl FnMut(ReceiverEvent) -> T,
-        mut convert: impl FnMut(Delivered<'rx>) -> Result<Option<T>>,
+        mut convert: impl FnMut(S::Media<'rx>) -> Result<T>,
     ) -> Result<Option<T>> {
         capture_within(deadline, stop, |attempt| {
             if let Some(pending) = self.take_pending_event() {
@@ -1766,36 +1773,38 @@ impl ReceiverCore {
             if let Some(pending) = self.take_pending_event() {
                 return Ok(Some(event(pending)));
             }
-            let delivered = capture_any(&lock)?;
+            let delivered = capture_any::<S>(&lock)?;
             drop(lock);
-            convert(delivered)
+            self.capture_any_result_with(delivered, &mut event, &mut convert)
         })
     }
 
-    fn combined_result<'rx>(
+    /// The kernel's delivery boundary. Notifications always coalesce through
+    /// `event`, including a native miss when a typed capture retained an event
+    /// during the wait. A caller can convert only media from its slot set.
+    pub(crate) fn capture_any_result_with<'rx, S: SlotSet, T>(
         &'rx self,
-        delivered: Delivered<'rx>,
-    ) -> Result<Option<ReceiverItemRef<'rx>>> {
-        Ok(Some(match delivered {
+        delivered: Delivered<'rx, S>,
+        event: impl FnOnce(ReceiverEvent) -> T,
+        convert: impl FnOnce(S::Media<'rx>) -> Result<T>,
+    ) -> Result<Option<T>> {
+        match delivered {
+            Delivered::Media(media) => convert(media).map(Some),
+            Delivered::Notification(notification) => Ok(self.event(notification).map(event)),
+        }
+    }
+
+    fn combined_result(media: Media<'_>) -> Result<ReceiverItemRef<'_>> {
+        Ok(match media {
             // SAFETY: all-slot dispatch guards each delivered descriptor
             // with its matching capture kind and free operation. Construction
             // validates the active layout without reading native padding.
-            Delivered::Video(guard) => {
-                ReceiverItemRef::Video(unsafe { VideoKind::make_ref(guard)? })
-            }
-            Delivered::Audio(guard) => {
-                ReceiverItemRef::Audio(unsafe { AudioKind::make_ref(guard)? })
-            }
-            Delivered::Metadata(guard) => {
+            Media::Video(guard) => ReceiverItemRef::Video(unsafe { VideoKind::make_ref(guard)? }),
+            Media::Audio(guard) => ReceiverItemRef::Audio(unsafe { AudioKind::make_ref(guard)? }),
+            Media::Metadata(guard) => {
                 ReceiverItemRef::Metadata(unsafe { MetadataKind::make_ref(guard)? })
             }
-            Delivered::Notification(notification) => {
-                let Some(event) = self.event(notification) else {
-                    return Ok(None);
-                };
-                ReceiverItemRef::Event(event)
-            }
-        }))
+        })
     }
 
     /// Combined capture copied while its native guards are still local.
@@ -1810,7 +1819,7 @@ impl ReceiverCore {
     /// typed capture retained during this wait, then consume one. A pending
     /// event returned before the native wait never comes through this path
     /// and is never published again.
-    pub(crate) fn event(&self, notification: Notification) -> Option<ReceiverEvent> {
+    fn event(&self, notification: Notification) -> Option<ReceiverEvent> {
         self.retain(notification);
         self.take_pending_event()
     }
@@ -1868,7 +1877,12 @@ impl ReceiverCore {
         deadline: Deadline,
         stop: impl Stop,
     ) -> Result<Option<ReceiverEvent>> {
-        capture_within(deadline, stop, |attempt| self.poll_event_once(attempt))
+        self.capture_any_until_with::<NoSlots, _>(
+            deadline,
+            stop,
+            |event| event,
+            |media| match media {},
+        )
     }
 
     /// The one implementation of [`Receiver::poll_source_name_change`], also
@@ -1924,28 +1938,6 @@ impl ReceiverCore {
                 None => SourceNameChange::Disconnected,
             }))
         })
-    }
-
-    /// One attempt of [`Self::poll_event_until`]: a pending event, or what one SDK
-    /// capture without media slots reports within `attempt`.
-    ///
-    /// A pending event is taken before waiting for the guard, so that it is
-    /// returned even while a reconnect holds the guard, and again once the
-    /// guard is held, so that one a capture kept meanwhile spares the wait.
-    fn poll_event_once(&self, attempt: Attempt) -> Result<Option<ReceiverEvent>> {
-        if let Some(event) = self.take_pending_event() {
-            return Ok(Some(event));
-        }
-        let Some(lock) = self.capture_lock(attempt) else {
-            return Ok(self.take_pending_event());
-        };
-        if let Some(event) = self.take_pending_event() {
-            return Ok(Some(event));
-        }
-        // Null media slots request notifications only; no frame allocation escapes.
-        let frame_type = lock.capture(None, None, None);
-        drop(lock);
-        Ok(self.event(Notification::classify(frame_type)?))
     }
 }
 
@@ -3351,12 +3343,16 @@ mod tests {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        let deliver = |notification| {
+            receiver.core.capture_any_result_with::<AllSlots, _>(
+                Delivered::Notification(notification),
+                ReceiverItemRef::Event,
+                ReceiverCore::combined_result,
+            )
+        };
         receiver.core.retain(Notification::SourceChanged);
         assert!(matches!(
-            receiver
-                .core
-                .combined_result(Delivered::Notification(Notification::SourceChanged))
-                .unwrap(),
+            deliver(Notification::SourceChanged).unwrap(),
             Some(ReceiverItemRef::Event(ReceiverEvent::SourceChanged))
         ));
         assert!(
@@ -3365,13 +3361,66 @@ mod tests {
         );
         receiver.core.retain(Notification::Unknown(987));
         assert!(matches!(
-            receiver
-                .core
-                .combined_result(Delivered::Notification(Notification::None))
-                .unwrap(),
+            deliver(Notification::None).unwrap(),
             Some(ReceiverItemRef::Event(ReceiverEvent::Unknown(987)))
         ));
         assert!(receiver.core.take_pending_event().is_none());
+    }
+
+    #[test]
+    fn mixed_native_misses_deliver_concurrently_retained_events_once_without_allocating() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+
+        fn check<S: SlotSet>(core: &ReceiverCore) {
+            let deliver = |notification| {
+                core.capture_any_result_with::<S, _>(
+                    Delivered::Notification(notification),
+                    |event| event,
+                    |_| panic!("a notification must never reach the media converter"),
+                )
+                .unwrap()
+            };
+            assert_eq!(deliver(Notification::None), None);
+            assert_eq!(
+                deliver(Notification::Unknown(987)),
+                Some(ReceiverEvent::Unknown(987))
+            );
+            assert_eq!(deliver(Notification::None), None);
+
+            // Model a typed capture retaining events after the kernel's last
+            // pending check but before its native wait returns without media.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        core.retain(Notification::SourceChanged);
+                        core.retain(Notification::Unknown(988));
+                    })
+                    .join()
+                    .unwrap();
+            });
+            let (events, allocations) = crate::test_alloc::allocation_count(|| {
+                [
+                    deliver(Notification::None),
+                    deliver(Notification::None),
+                    deliver(Notification::None),
+                ]
+            });
+            assert_eq!(allocations, 0);
+            assert_eq!(
+                events,
+                [
+                    Some(ReceiverEvent::SourceChanged),
+                    Some(ReceiverEvent::Unknown(988)),
+                    None,
+                ]
+            );
+        }
+
+        check::<AllSlots>(&receiver.core);
+        check::<NoSlots>(&receiver.core);
     }
 
     #[test]
