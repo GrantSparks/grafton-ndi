@@ -5,7 +5,7 @@
 //! - Capturing video through it, in place in the SDK's buffer
 //! - Asking for the audio matching each frame's timestamp, without copying
 //!   the frame
-//! - Polling the receiver's events and publishing tally while it is attached
+//! - Querying connection state and publishing tally while it is attached
 //!
 //! Needs the NDI Advanced SDK at build time and an Advanced runtime.
 //!
@@ -18,7 +18,7 @@ use std::{env, time::Duration};
 
 use grafton_ndi::{
     advanced::{AvSync, AvSyncOutcome, AvSyncRequest, AvSyncVideo},
-    Error, Ndi, Receiver, ReceiverEvent, ReceiverOptions, RuntimeOptions, SdkEdition, Tally,
+    Error, Ndi, Receiver, ReceiverOptions, RuntimeOptions, SdkEdition, Tally,
 };
 
 #[path = "common/finder.rs"]
@@ -48,11 +48,13 @@ fn main() -> Result<(), Error> {
     // Every receiver control stays available while the receiver is attached.
     sync.receiver().set_tally(Tally::new(true, false));
 
+    let mut previous_connections = None;
     for _ in 0..120 {
-        if let Some(ReceiverEvent::StatusChanged(status)) =
-            sync.receiver().poll_event(Duration::ZERO)?
-        {
-            println!("{} connections", status.connections());
+        // Native synchronization consumes notifications; query current state.
+        let connections = sync.receiver().connection_stats().connections();
+        if previous_connections != Some(connections) {
+            println!("{connections} connections");
+            previous_connections = Some(connections);
         }
         // The frame borrows the SDK's buffer, and the synchronizer reads it
         // there: no pixels are copied.

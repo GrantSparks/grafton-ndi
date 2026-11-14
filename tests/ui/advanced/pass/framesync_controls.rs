@@ -33,6 +33,7 @@ fn avsync(sync: &mut AvSync) -> Result<()> {
     let (capture, controls) = sync.split();
     let mut session = controls.kvm()?;
     session.mouse_down(MouseButton::Left)?;
+    let metadata = session.receiver().metadata().capture_ref(std::time::Duration::ZERO)?;
     let video = session
         .receiver()
         .video()
@@ -43,7 +44,7 @@ fn avsync(sync: &mut AvSync) -> Result<()> {
         }
     }
     session.release_all()?;
-    drop(video);
+    drop((video, metadata));
     drop(session);
     sync.receiver().reconnect();
     let _ = sync.controls().kvm()?;

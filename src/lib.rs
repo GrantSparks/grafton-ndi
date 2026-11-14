@@ -116,8 +116,8 @@ pub use {
         FrameSyncVideoRef,
     },
     receiver::{
-        Capture, CaptureMode, ConnectionStats, FrameSyncAttached, MetadataMode, Ptz, RawCapture,
-        Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverEvent, ReceiverItem,
+        Capture, CaptureMode, ConnectionStats, EventMode, FrameSyncAttached, MetadataMode, Ptz,
+        RawCapture, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverEvent, ReceiverItem,
         ReceiverItemRef, ReceiverMode, ReceiverOptions, ReceiverStatus, SettingChange,
         SourceNameChange, Tally, VideoMode,
     },

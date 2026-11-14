@@ -597,9 +597,13 @@ impl FrameSync {
     /// Access the underlying receiver.
     ///
     /// Use this to access receiver functionality like tally, PTZ, status
-    /// queries, metadata capture or event polling while the FrameSync is
-    /// active. Tally control publishes state upstream; it does not query
-    /// incoming tally.
+    /// queries and metadata capture while FrameSync is active. Native
+    /// synchronization can consume status notifications, so this receiver has
+    /// no event polling. Query capabilities with `ptz().is_supported()`,
+    /// `web_control_url()` and Advanced KVM's `is_supported()`; observe the
+    /// source with `poll_source_name_change()` and connection state with
+    /// `is_connected()` or `connection_stats()`.
+    /// Tally control publishes state upstream; it does not query incoming tally.
     ///
     /// This receiver mode has no raw video or audio capture, because the
     /// synchronizer takes the receiver's video and audio: raw audio capture

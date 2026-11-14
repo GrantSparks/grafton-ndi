@@ -1,0 +1,27 @@
+error[E0599]: the method `poll_event` exists for struct `KvmReceiver<'_, FrameSyncAttached>`, but its trait bounds were not satisfied
+ --> tests/ui/advanced/fail/kvm_attached_receivers_have_no_event_polling.rs:6:32
+  |
+6 |     let _ = session.receiver().poll_event(Duration::ZERO);
+  |                                ^^^^^^^^^^ method cannot be called on `KvmReceiver<'_, FrameSyncAttached>` due to unsatisfied trait bounds
+  |
+ ::: src/receiver.rs
+  |
+  | pub enum FrameSyncAttached {}
+  | -------------------------- doesn't satisfy `FrameSyncAttached: EventMode`
+  |
+  = note: the following trait bounds were not satisfied:
+          `FrameSyncAttached: EventMode`
+
+error[E0599]: the method `poll_event` exists for struct `KvmReceiver<'_, AvSyncAttached>`, but its trait bounds were not satisfied
+  --> tests/ui/advanced/fail/kvm_attached_receivers_have_no_event_polling.rs:11:32
+   |
+11 |     let _ = session.receiver().poll_event(Duration::ZERO);
+   |                                ^^^^^^^^^^ method cannot be called on `KvmReceiver<'_, AvSyncAttached>` due to unsatisfied trait bounds
+   |
+  ::: src/receiver.rs
+   |
+   | pub enum AvSyncAttached {}
+   | ----------------------- doesn't satisfy `AvSyncAttached: EventMode`
+   |
+   = note: the following trait bounds were not satisfied:
+           `AvSyncAttached: EventMode`

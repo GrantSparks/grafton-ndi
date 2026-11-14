@@ -123,10 +123,10 @@ error[E0599]: the method `poll_event` exists for struct `KvmReceiver<'_, PacketA
   ::: src/receiver.rs
    |
    | pub enum PacketAttached {}
-   | ----------------------- doesn't satisfy `PacketAttached: MetadataMode`
+   | ----------------------- doesn't satisfy `PacketAttached: EventMode`
    |
    = note: the following trait bounds were not satisfied:
-           `PacketAttached: MetadataMode`
+           `PacketAttached: EventMode`
 
 error[E0599]: no method named `capture_any_ref` found for struct `KvmReceiver<'_, PacketAttached>` in the current scope
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:31:18

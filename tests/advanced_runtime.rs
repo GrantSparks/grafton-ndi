@@ -232,8 +232,8 @@ fn advanced_native_constructors_controls_and_queue() {
         RuntimeFeature::ReceiverDiscovery,
         RecvListener::new(&ndi, &listeners),
     );
-    // An attached receiver keeps every control, its events and its video and
-    // metadata capture.
+    // An attached receiver keeps every control and its video and metadata
+    // capture, while the synchronizer consumes its audio and notifications.
     let mut av = AvSync::new(receiver).unwrap();
     {
         let receiver = av.receiver();
@@ -241,7 +241,6 @@ fn advanced_native_constructors_controls_and_queue() {
         let _ = receiver.connection_stats();
         let _ = receiver.ptz().is_supported();
         receiver.request_keyframe().unwrap();
-        let _ = receiver.poll_event(Duration::ZERO).unwrap();
         let _ = receiver.metadata().capture(Duration::ZERO).unwrap();
         let _ = receiver.video().capture_ref(Duration::ZERO).unwrap();
         receiver.reconnect();
@@ -2309,8 +2308,8 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
                 sender.send_metadata(&MetadataFrame::new("<avsync/>").unwrap());
             }
         });
-        // The lent receiver captures metadata and polls events on another
-        // thread while this one synchronizes.
+        // The lent receiver captures metadata on another thread while this
+        // one synchronizes.
         let (receiver, stopped) = (sync.receiver(), &stop);
         let metadata = scope.spawn(move || {
             let mut captured = 0;
@@ -2318,7 +2317,6 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
                 if receiver.metadata().capture_ref(SLICE).unwrap().is_some() {
                     captured += 1;
                 }
-                let _ = receiver.poll_event(Duration::ZERO).unwrap();
             }
             captured
         });

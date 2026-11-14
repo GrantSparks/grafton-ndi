@@ -788,6 +788,7 @@ impl ValidatedReceiveOptions<'_> {
 mod mode_sealed {
     pub trait Sealed {}
     pub trait MetadataSealed {}
+    pub trait EventSealed {}
     pub trait CaptureSealed {}
     pub trait VideoSealed {}
 }
@@ -797,22 +798,28 @@ mod mode_sealed {
 ///
 /// The common controls work in every mode: tally, PTZ, upstream metadata,
 /// connection statistics, delays, source-name changes, connecting and
-/// reconnecting. A [`MetadataMode`] adds the receiver's own metadata capture
-/// and event polling, a [`CaptureMode`] adds audio capture to those, and a
-/// [`VideoMode`] adds video capture. Only [`RawCapture`] is all three, and
-/// only it is a [`CaptureMode`].
+/// reconnecting. [`MetadataMode`] adds typed metadata capture, [`EventMode`]
+/// adds event polling, [`CaptureMode`] adds audio capture, and [`VideoMode`]
+/// adds video capture. Only [`RawCapture`] permits every capture kind and
+/// event polling.
 pub trait ReceiverMode: mode_sealed::Sealed + Send + Sync {}
 
-/// Sealed receiver mode in which the receiver's own metadata capture and
-/// event polling are available: [`RawCapture`], [`FrameSyncAttached`] and,
-/// with the `advanced` feature, the `AvSyncAttached` mode of an Advanced
-/// `AvSync`'s receiver.
+/// Sealed receiver mode permitting typed metadata capture: [`RawCapture`],
+/// [`FrameSyncAttached`] and, with `advanced`, `AvSyncAttached`.
 ///
-/// A mode without it hands every frame and event to the object that holds
-/// the receiver, which captures them itself.
+/// Metadata capture retains any notifications it encounters for a later raw
+/// receiver, but does not grant event polling; see [`EventMode`].
 pub trait MetadataMode: ReceiverMode + mode_sealed::MetadataSealed {}
 
-/// Sealed receiver mode in which the receiver's own audio, metadata and event
+/// Sealed receiver mode permitting event polling: [`RawCapture`].
+///
+/// Native FrameSync and AV sync can consume status notifications before an
+/// attached receiver observes them. Attached receivers therefore use capability
+/// getters, [`Receiver::poll_source_name_change`], [`Receiver::is_connected`]
+/// and [`Receiver::connection_stats`] rather than event polling.
+pub trait EventMode: ReceiverMode + mode_sealed::EventSealed {}
+
+/// Sealed receiver mode in which the receiver's own audio and metadata
 /// capture are available: [`RawCapture`].
 ///
 /// A [`MetadataMode`] without it hands the receiver's audio to the object
@@ -835,9 +842,13 @@ pub enum RawCapture {}
 /// Receiver mode held exclusively by [`crate::FrameSync`], whose synchronizer
 /// takes the receiver's video and audio.
 ///
-/// The receiver's own metadata capture and event polling are available in
-/// this mode, as are the common controls. Its video and audio capture are
-/// not: the FrameSync returns them clock-corrected through
+/// The receiver's own metadata capture and common controls are available.
+/// Event polling is unavailable because native synchronization can consume
+/// status notifications. Query capabilities with [`Ptz::is_supported`] and
+/// [`Receiver::web_control_url`] (or Advanced KVM's `is_supported`), source
+/// names with [`Receiver::poll_source_name_change`], and connection state with
+/// [`Receiver::is_connected`] and [`Receiver::connection_stats`].
+/// Its video and audio capture are unavailable: FrameSync returns them through
 /// [`FrameSync::capture_video`](crate::FrameSync::capture_video) and
 /// [`FrameSync::capture_audio`](crate::FrameSync::capture_audio).
 ///
@@ -864,22 +875,29 @@ pub enum PacketAttached {}
 /// Receiver mode held by [`AvSync`](crate::advanced::AvSync), whose
 /// synchronizer takes the receiver's audio.
 ///
-/// The receiver's own video and metadata capture and its event polling are
-/// available in this mode, as are the common controls. Its audio capture is
-/// not: the synchronizer consumes the audio and returns it matched to video
-/// through [`AvSync::synchronize`](crate::advanced::AvSync::synchronize).
+/// The receiver's own video and metadata capture and common controls remain
+/// available. Its audio capture is unavailable: the synchronizer consumes the
+/// audio and returns it matched to video through
+/// [`AvSync::synchronize`](crate::advanced::AvSync::synchronize).
+/// Event polling is unavailable for the same reason as [`FrameSyncAttached`].
+/// Use [`Ptz::is_supported`], [`Receiver::web_control_url`] and Advanced KVM's
+/// `is_supported` to query capabilities, [`Receiver::poll_source_name_change`]
+/// for source names, and [`Receiver::is_connected`] or
+/// [`Receiver::connection_stats`] for connection state.
 #[cfg(feature = "advanced")]
 #[derive(Debug)]
 pub enum AvSyncAttached {}
 impl mode_sealed::Sealed for RawCapture {}
 impl mode_sealed::Sealed for FrameSyncAttached {}
 impl mode_sealed::MetadataSealed for RawCapture {}
+impl mode_sealed::EventSealed for RawCapture {}
 impl mode_sealed::MetadataSealed for FrameSyncAttached {}
 impl mode_sealed::CaptureSealed for RawCapture {}
 impl mode_sealed::VideoSealed for RawCapture {}
 impl ReceiverMode for RawCapture {}
 impl ReceiverMode for FrameSyncAttached {}
 impl MetadataMode for RawCapture {}
+impl EventMode for RawCapture {}
 impl MetadataMode for FrameSyncAttached {}
 impl CaptureMode for RawCapture {}
 impl VideoMode for RawCapture {}
@@ -1501,9 +1519,8 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 }
 
-/// The receiver's own event polling, metadata capture and, in a
-/// [`CaptureMode`], audio capture.
-impl<M: MetadataMode> Receiver<M> {
+/// Event polling is available only before a synchronizer takes the receiver.
+impl<M: EventMode> Receiver<M> {
     /// Wait up to `timeout` for a status or source change, or return `None`
     /// when none came.
     ///
@@ -1531,7 +1548,10 @@ impl<M: MetadataMode> Receiver<M> {
         self.core
             .poll_event_until(Deadline::after(timeout)?, NeverStop)
     }
+}
 
+/// The receiver's typed metadata capture and, in a [`CaptureMode`], audio.
+impl<M: MetadataMode> Receiver<M> {
     /// Capture **audio** frames from this receiver.
     ///
     /// Returns a [`Capture`] view; see [`Receiver::video`] for its two verbs,
@@ -3381,14 +3401,8 @@ mod tests {
         let original_core = Arc::as_ptr(&receiver.core);
         receiver.core.pending_status.store(true, Ordering::Release);
         let fs = crate::FrameSync::new(receiver).unwrap();
-        assert!(matches!(
-            fs.receiver().poll_event(Duration::ZERO).unwrap(),
-            Some(ReceiverEvent::StatusChanged(_))
-        ));
-        fs.receiver()
-            .core
-            .pending_status
-            .store(true, Ordering::Release);
+        assert!(fs.receiver().core.pending_status.load(Ordering::Acquire));
+        assert_eq!(Arc::as_ptr(&fs.receiver().core), original_core);
         let receiver = fs.into_receiver();
         assert!(matches!(
             receiver.poll_event(Duration::ZERO).unwrap(),

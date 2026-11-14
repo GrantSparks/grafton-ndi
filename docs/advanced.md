@@ -222,11 +222,13 @@ owners expose these controls through `controls()`; see the
 
 `Receiver::kvm()` creates an exclusive `KvmSession`; attached owners use
 `controls().kvm()`. A source must offer remote control. `session.receiver()`
-returns a restricted `KvmReceiver<'_, M>` for mode-permitted capture, events,
+returns a restricted `KvmReceiver<'_, M>` for mode-permitted capture, event polling,
 diagnostics, tally, PTZ, metadata and other shared controls while input stays
 held. Borrowed frames can coexist with mutable input calls. Use `split()`
 for simultaneous FrameSync/AVSync output and a session; packet sessions provide
-`capture()` directly.
+`capture()` directly. FrameSync and AvSync views retain metadata capture but
+have no event polling; use capability getters, source-name polling and connection
+queries.
 
 The session sends pointer, button, wheel, key, touch and explicit clipboard
 text; it never reads the local clipboard. Pointer/touch coordinates are

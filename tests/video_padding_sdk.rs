@@ -252,7 +252,6 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             .metadata()
             .capture(Duration::ZERO)
             .unwrap();
-        let _ = framesync.receiver().poll_event(Duration::ZERO).unwrap();
         let receiver = framesync.into_receiver();
         verify_owned(
             &receiver

@@ -145,7 +145,11 @@ remain strict because their text is the entire payload.
 Use `FrameSync` when output follows an application clock such as a playback
 callback or render loop. `FrameSync::new(receiver)` takes ownership, returning
 the receiver in `Rejected` on failure. It reserves raw video and audio capture;
-`receiver()` still provides metadata, events and shared controls.
+`receiver()` still provides metadata and shared controls. Native synchronization
+can consume status notifications, so attached receivers have no event polling.
+Query `ptz().is_supported()`, `web_control_url()` or KVM support for capabilities,
+`poll_source_name_change()` for the source, and `is_connected()` or
+`connection_stats()` for connection state.
 `into_receiver()` restores ordinary capture.
 
 At each output tick, use `capture_video_ref(scan_type)` or
@@ -181,8 +185,8 @@ rustdoc:
 | Owner | Media path | Receiver capture retained |
 | --- | --- | --- |
 | `Receiver` | Typed or combined capture | Video, audio, metadata and events |
-| `FrameSync` | Clocked video/audio | Metadata and events |
-| `advanced::AvSync` | Video-timestamp-matched audio | Video, metadata and events |
+| `FrameSync` | Clocked video/audio | Metadata |
+| `advanced::AvSync` | Video-timestamp-matched audio | Video and metadata |
 | `advanced::PacketReceiver` | Owned packets, decoded media and events | None |
 | `advanced::AllocatedReceiver` | Typed or combined capture | Video, audio, metadata and events |
 | `advanced::AllocatedPacketReceiver` | Owned packets, decoded media and events | None |

@@ -16,7 +16,7 @@ use std::{
 // synchronizer takes the receiver's audio
 // (tests/ui/fail/framesync_receiver_has_no_audio_capture.rs).
 #[test]
-fn attached_receiver_permits_controls_metadata_and_events_and_recovery_restores_raw_capture(
+fn attached_receiver_permits_controls_metadata_and_recovery_restores_raw_capture(
 ) -> Result<(), Error> {
     let Some(ndi) = common::ndi() else {
         return Ok(());
@@ -33,7 +33,6 @@ fn attached_receiver_permits_controls_metadata_and_events_and_recovery_restores_
         framesync.receiver().set_tally(Tally::new(false, true));
         assert!(!framesync.receiver().ptz().is_supported());
         let _ = framesync.receiver().metadata().capture(Duration::ZERO)?;
-        let _ = framesync.receiver().poll_event(Duration::ZERO)?;
         receiver = framesync.into_receiver();
         assert!(receiver.video().capture(Duration::ZERO)?.is_none());
         assert!(receiver.audio().capture_ref(Duration::ZERO)?.is_none());

@@ -36,6 +36,11 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Received video and audio survive unreadable optional per-frame metadata.
   `metadata_status()` reports why text was withheld; forwarding and owned
   copies omit it. Standalone metadata capture remains strict.
+- FrameSync- and AvSync-attached receivers, including KVM views, no longer expose
+  event polling because native synchronization can consume status notifications.
+  `EventMode` separates this capability from typed metadata capture; query
+  capabilities, source names and connection state on attached receivers.
+
 - Synchronous `Receiver::reconnect()` returns `()` and reuses its validated
   native target without allocating. Async reconnect remains fallible for task
   submission; `connection_target()` still returns the latest requested source.

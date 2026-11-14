@@ -1,5 +1,5 @@
 // The Receiver an AvSync lends, in the AvSyncAttached mode, keeps its video
-// and metadata capture, its events and every common control, and a frame
+// and metadata capture and every common control, and a frame
 // captured through it is synchronized in place, without a copy, once it is
 // known to carry its sender's timestamp.
 use grafton_ndi::{
@@ -10,16 +10,15 @@ use grafton_ndi::{
 use std::time::Duration;
 
 fn common<M: ReceiverMode>(_: &Receiver<M>) {}
-fn metadata_and_events<M: MetadataMode>(receiver: &Receiver<M>) {
+fn metadata<M: MetadataMode>(receiver: &Receiver<M>) {
     let _ = receiver.metadata().capture_ref(Duration::ZERO);
-    let _ = receiver.poll_event(Duration::ZERO);
 }
 fn video<M: VideoMode>(receiver: &Receiver<M>) {
     let _ = receiver.video().capture(Duration::ZERO);
 }
 fn controls(receiver: &Receiver<AvSyncAttached>) {
     common(receiver);
-    metadata_and_events(receiver);
+    metadata(receiver);
     video(receiver);
     receiver.set_tally(Tally::new(true, false));
     let _ = receiver.connection_stats();

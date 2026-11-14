@@ -3,14 +3,15 @@
 use std::time::Duration;
 
 use crate::{
-    AudioKind, Capture, CaptureMode, ConnectionStats, MetadataKind, MetadataMode, MetadataSource,
-    Ptz, RawCapture, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef, ReceiverMode, Result,
-    SettingChange, Source, SourceNameChange, Tally, VideoKind, VideoMode,
+    AudioKind, Capture, CaptureMode, ConnectionStats, EventMode, MetadataKind, MetadataMode,
+    MetadataSource, Ptz, RawCapture, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef,
+    ReceiverMode, Result, SettingChange, Source, SourceNameChange, Tally, VideoKind, VideoMode,
 };
 
 /// Restricted receiver access lent by [`super::KvmSession::receiver`].
 ///
-/// Capture follows the receiver's sealed mode bounds. Shared controls delegate
+/// Capture and event polling follow separate sealed mode bounds. FrameSync and
+/// AV sync views permit metadata capture but no event polling. Shared controls delegate
 /// to the same receiver, but this view cannot connect, disconnect, reconnect,
 /// or recover unrestricted receiver access. To switch sources, successfully
 /// release all input, end the session, change the owner's connection and start
@@ -167,7 +168,9 @@ impl<'a, M: MetadataMode> KvmReceiver<'a, M> {
     pub fn metadata(&self) -> Capture<'a, MetadataKind> {
         self.receiver.metadata()
     }
+}
 
+impl<'a, M: EventMode> KvmReceiver<'a, M> {
     /// Poll receiver events; see [`Receiver::poll_event`].
     ///
     /// # Errors

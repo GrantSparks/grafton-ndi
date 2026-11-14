@@ -1,4 +1,4 @@
-use grafton_ndi::{CaptureMode, FrameSync, MetadataMode, Receiver, ReceiverMode, Tally, VideoMode};
+use grafton_ndi::{CaptureMode, EventMode, FrameSync, MetadataMode, Receiver, ReceiverMode, Tally, VideoMode};
 use std::time::Duration;
 fn common<M: ReceiverMode>(receiver: &Receiver<M>) {
     receiver.set_tally(Tally::new(false, true));
@@ -7,13 +7,15 @@ fn common<M: ReceiverMode>(receiver: &Receiver<M>) {
     let _ = receiver.connection_target();
     receiver.reconnect();
 }
-fn metadata_and_events<M: MetadataMode>(receiver: &Receiver<M>) {
+fn metadata<M: MetadataMode>(receiver: &Receiver<M>) {
     common(receiver);
     let _ = receiver.metadata().capture(Duration::ZERO);
+}
+fn events<M: EventMode>(receiver: &Receiver<M>) {
     let _ = receiver.poll_event(Duration::ZERO);
 }
 fn capturing<M: CaptureMode>(receiver: &Receiver<M>) {
-    metadata_and_events(receiver);
+    metadata(receiver);
     let _ = receiver.audio().capture_ref(Duration::ZERO);
 }
 fn video<M: VideoMode>(receiver: &Receiver<M>) {
@@ -22,11 +24,13 @@ fn video<M: VideoMode>(receiver: &Receiver<M>) {
 }
 fn workflow(receiver: Receiver) {
     capturing(&receiver);
+    events(&receiver);
     video(&receiver);
     let fs = FrameSync::new(receiver).unwrap();
-    metadata_and_events(fs.receiver());
+    metadata(fs.receiver());
     let receiver = fs.into_receiver();
     capturing(&receiver);
+    events(&receiver);
     let _ = receiver.video().capture(Duration::ZERO);
 }
 fn assert_send_sync<T: Send + Sync>() {}

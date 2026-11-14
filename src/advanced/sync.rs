@@ -198,8 +198,9 @@ impl Drop for AvResource {
 /// [`into_receiver`](Self::into_receiver) returns the receiver.
 ///
 /// The receiver is lent in the [`AvSyncAttached`] mode, with its video and
-/// metadata capture, its events and every receiver control, but no audio
-/// capture of its own.
+/// metadata capture and every receiver control. Its audio capture and event
+/// polling are unavailable; use the capability, source-name and connection
+/// queries described on [`AvSyncAttached`].
 /// [`AvSyncOutcome`] distinguishes no audio stream, no samples matching a
 /// video's time, a changed format and successful output. These outcomes do
 /// not replace monitoring progress of the media the application expects;
@@ -211,7 +212,7 @@ impl Drop for AvResource {
 /// and synchronize and be dropped on another, but it synchronizes one call at
 /// a time: the SDK does not document two synchronizations of one
 /// synchronizer running at once. The receiver it lends is `Sync`, so scoped
-/// threads can capture video or metadata, poll events or reconnect through it
+/// threads can capture video or metadata or reconnect through it
 /// while the thread that holds the `AvSync` synchronizes.
 ///
 /// # Examples
@@ -297,9 +298,15 @@ impl AvSync {
     }
 
     /// The receiver this holds, in the [`AvSyncAttached`] mode: its video and
-    /// metadata capture, its events, and the controls every receiver has:
+    /// metadata capture and the controls every receiver has:
     /// tally, PTZ, statistics, upstream metadata, keyframe requests, delays,
     /// connecting, reconnecting and source-name changes.
+    ///
+    /// Event polling is unavailable because native synchronization can consume
+    /// status notifications. Query `ptz().is_supported()`, `web_control_url()`
+    /// or Advanced KVM's `is_supported()` for capabilities, use
+    /// `poll_source_name_change()` for the connected source, and
+    /// `is_connected()` or `connection_stats()` for connection state.
     ///
     /// A video frame captured through it can be handed to
     /// [`synchronize`](Self::synchronize) as it is, through [`AvSyncVideo`].
@@ -369,7 +376,7 @@ impl AvSync {
     ///
     /// One call synchronizes at a time, on the thread that holds this
     /// `AvSync`, which is not `Sync`. Other threads may meanwhile capture
-    /// video or metadata, poll events or use the controls through the
+    /// video or metadata or use the controls through the
     /// receiver it lends. This does not take the receiver's capture guard, as
     /// [`FrameSync`](crate::FrameSync) captures do not, so a
     /// [`reconnect`](Receiver::reconnect) neither waits for it nor holds it
