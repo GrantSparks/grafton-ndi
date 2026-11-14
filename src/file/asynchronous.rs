@@ -1167,6 +1167,54 @@ impl Owner for RecorderOwner {
     }
 }
 
+/// The native operations common to the two documented async handles. Keep
+/// these separate from Owner's event-pump contract so inert test owners need
+/// implement only the lifecycle they exercise.
+trait HandleOwner: Owner {
+    type Options: Clone + Send + 'static;
+    const THREAD_NAME: &'static str;
+
+    fn create(api: FileApi, options: &Self::Options) -> Result<Self>
+    where
+        Self: Sized;
+    fn dropped_event_count(&self) -> u64;
+    fn source_format(&self) -> Result<Option<SourceFormat>>;
+}
+
+impl HandleOwner for FilePlayer {
+    type Options = PlayerOptions;
+    const THREAD_NAME: &'static str = "ndi-file-player";
+
+    fn create(api: FileApi, options: &Self::Options) -> Result<Self> {
+        api.create_player(options)
+    }
+
+    fn dropped_event_count(&self) -> u64 {
+        FilePlayer::dropped_event_count(self)
+    }
+
+    fn source_format(&self) -> Result<Option<SourceFormat>> {
+        FilePlayer::source_format(self)
+    }
+}
+
+impl HandleOwner for RecorderOwner {
+    type Options = RecorderOptions;
+    const THREAD_NAME: &'static str = "ndi-file-recorder";
+
+    fn create(api: FileApi, options: &Self::Options) -> Result<Self> {
+        api.create_recorder(options).map(Self::new)
+    }
+
+    fn dropped_event_count(&self) -> u64 {
+        self.recorder.dropped_event_count()
+    }
+
+    fn source_format(&self) -> Result<Option<SourceFormat>> {
+        self.recorder.source_format()
+    }
+}
+
 type Job<H> = Box<dyn FnOnce(&mut H) + Send + 'static>;
 
 /// Admission to an owner thread's command queue: how many commands wait, and
@@ -1383,6 +1431,54 @@ impl<H: Owner> Worker<H> {
         work: impl FnOnce(&mut H) -> Result<T> + Send + 'static,
     ) -> FileOperation<T> {
         self.submit(false, move |owner, _| work(owner))
+    }
+}
+
+/// The shared async-handle implementation lives on the existing worker:
+/// public handles remain documented forwarding methods over one Arc, with
+/// no additional allocation or change to their lifetime behavior.
+impl<H: HandleOwner> Worker<H> {
+    fn create<T: Send + 'static>(
+        api: &FileApi,
+        options: &H::Options,
+        wrap: impl FnOnce(Arc<Self>) -> T + Send + 'static,
+    ) -> FileOperation<T> {
+        Self::create_with_options(api, options, AsyncFileOptions::new(), wrap)
+    }
+
+    fn create_with_options<T: Send + 'static>(
+        api: &FileApi,
+        options: &H::Options,
+        asynchronous: AsyncFileOptions,
+        wrap: impl FnOnce(Arc<Self>) -> T + Send + 'static,
+    ) -> FileOperation<T> {
+        let (api, options) = (api.clone(), options.clone());
+        spawn_owner(
+            H::THREAD_NAME,
+            move || H::create(api, &options),
+            asynchronous,
+            wrap,
+        )
+    }
+
+    fn next_event(&self, timeout: Duration) -> FileEventFuture<H::Event> {
+        self.events.wait(timeout)
+    }
+
+    fn dropped_event_count(&self) -> FileOperation<u64> {
+        self.call(|owner| Ok(owner.dropped_event_count()))
+    }
+
+    fn notification_dropped_count(&self) -> u64 {
+        lock(&self.events.0).dropped
+    }
+
+    fn source_format(&self) -> FileOperation<Option<SourceFormat>> {
+        self.call(|owner| owner.source_format())
+    }
+
+    fn close(&self) -> FileOperation<()> {
+        self.control.request_close()
     }
 }
 
@@ -1645,7 +1741,7 @@ impl AsyncFilePlayer {
     /// The future fails as [`FileApi::create_player`] does. The options are
     /// only read, so they stay with the caller whatever the outcome.
     pub fn create(api: &FileApi, options: &PlayerOptions) -> FileOperation<Self> {
-        Self::create_with_options(api, options, AsyncFileOptions::new())
+        Worker::<FilePlayer>::create(api, options, |worker| Self { worker })
     }
 
     /// Create a player and advertise its source, with the given queue sizes.
@@ -1657,13 +1753,9 @@ impl AsyncFilePlayer {
         options: &PlayerOptions,
         asynchronous: AsyncFileOptions,
     ) -> FileOperation<Self> {
-        let (api, options) = (api.clone(), options.clone());
-        spawn_owner(
-            "ndi-file-player",
-            move || api.create_player(&options),
-            asynchronous,
-            |worker| Self { worker },
-        )
+        Worker::<FilePlayer>::create_with_options(api, options, asynchronous, |worker| Self {
+            worker,
+        })
     }
 
     /// Read a recording's duration and track layout; see [`FileApi::probe`].
@@ -1713,16 +1805,16 @@ impl AsyncFilePlayer {
     }
     /// Wait up to `timeout` for the player's next event.
     pub fn next_event(&self, timeout: Duration) -> FileEventFuture<PlayerEvent> {
-        self.worker.events.wait(timeout)
+        self.worker.next_event(timeout)
     }
     /// How many events the SDK discarded before the player's thread took them.
     pub fn dropped_event_count(&self) -> FileOperation<u64> {
-        self.worker.call(|p| Ok(p.dropped_event_count()))
+        self.worker.dropped_event_count()
     }
     /// How many events this handle's own queue discarded because
     /// [`next_event`](Self::next_event) did not keep up.
     pub fn notification_dropped_count(&self) -> u64 {
-        lock(&self.worker.events.0).dropped
+        self.worker.notification_dropped_count()
     }
     /// Counters for the current or most recent file.
     pub fn stats(&self) -> FileOperation<Option<PlayerStats>> {
@@ -1774,7 +1866,7 @@ impl AsyncFilePlayer {
     }
     /// The track layout of the current file.
     pub fn source_format(&self) -> FileOperation<Option<SourceFormat>> {
-        self.worker.call(|p| p.source_format())
+        self.worker.source_format()
     }
     /// The NDI source this player advertises.
     pub fn advertised_source(&self) -> FileOperation<Source> {
@@ -1797,7 +1889,7 @@ impl AsyncFilePlayer {
     /// [`Error::InvalidState`] with [`StateError::OwnerFailed`] when the
     /// object's thread failed.
     pub fn close(&self) -> FileOperation<()> {
-        self.worker.control.request_close()
+        self.worker.close()
     }
 }
 
@@ -1838,7 +1930,7 @@ impl AsyncFileRecorder {
     /// [`Error::InvalidInput`] for options that conflict. The options are
     /// only read, so they stay with the caller whatever the outcome.
     pub fn create(api: &FileApi, options: &RecorderOptions) -> FileOperation<Self> {
-        Self::create_with_options(api, options, AsyncFileOptions::new())
+        Worker::<RecorderOwner>::create(api, options, |worker| Self { worker })
     }
     /// Create a recorder with the given queue sizes.
     ///
@@ -1849,13 +1941,9 @@ impl AsyncFileRecorder {
         options: &RecorderOptions,
         asynchronous: AsyncFileOptions,
     ) -> FileOperation<Self> {
-        let (api, options) = (api.clone(), options.clone());
-        spawn_owner(
-            "ndi-file-recorder",
-            move || api.create_recorder(&options).map(RecorderOwner::new),
-            asynchronous,
-            |worker| Self { worker },
-        )
+        Worker::<RecorderOwner>::create_with_options(api, options, asynchronous, |worker| Self {
+            worker,
+        })
     }
     /// Start a session; see [`FileRecorder::start`]. Generated starts carry a
     /// [`SessionTimecode`](super::SessionTimecode), validated before queuing.
@@ -1947,16 +2035,16 @@ impl AsyncFileRecorder {
     /// Wait up to `timeout` for the recorder's next event. Dropping the
     /// future does not affect the recording.
     pub fn next_event(&self, timeout: Duration) -> FileEventFuture<RecorderEvent> {
-        self.worker.events.wait(timeout)
+        self.worker.next_event(timeout)
     }
     /// How many events the SDK discarded before the recorder's thread took them.
     pub fn dropped_event_count(&self) -> FileOperation<u64> {
-        self.worker.call(|r| Ok(r.dropped_event_count()))
+        self.worker.dropped_event_count()
     }
     /// How many events this handle's own queue discarded because
     /// [`next_event`](Self::next_event) did not keep up.
     pub fn notification_dropped_count(&self) -> u64 {
-        lock(&self.worker.events.0).dropped
+        self.worker.notification_dropped_count()
     }
     /// Where the recorder is in its session.
     pub fn state(&self) -> FileOperation<RecorderState> {
@@ -2007,7 +2095,7 @@ impl AsyncFileRecorder {
     }
     /// The format of the source, once the recorder has seen audio or video.
     pub fn source_format(&self) -> FileOperation<Option<SourceFormat>> {
-        self.worker.call(|r| r.source_format())
+        self.worker.source_format()
     }
     /// Stop an open session, destroy the recorder and end its thread, for
     /// every clone of this handle.
@@ -2033,7 +2121,7 @@ impl AsyncFileRecorder {
     /// [`Error::InvalidState`] with [`StateError::OwnerFailed`] when the
     /// object's thread failed.
     pub fn close(&self) -> FileOperation<()> {
-        self.worker.control.request_close()
+        self.worker.close()
     }
 }
 
