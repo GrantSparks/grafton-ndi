@@ -8,6 +8,8 @@ Rust fences are compiled (never run) against the current crate and locked
 versions of its dependencies. Use a linked runnable example for code fragments.
 With --rustdoc, GitHub Pages API URLs and current-version docs.rs URLs are
 checked against generated HTML.
+Documented dependency features and the README feature table are checked against
+Cargo.toml so removed or renamed features cannot remain in install instructions.
 """
 import argparse
 from collections import Counter
@@ -141,6 +143,47 @@ def version(root):
     return tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
 
 
+def dependency_feature_violations(label, code, manifest):
+    """Check feature selections in a TOML dependency example, including renames."""
+    try:
+        example = tomllib.loads(code)
+    except tomllib.TOMLDecodeError as error:
+        return [f'{label}: invalid TOML example: {error}']
+    name = manifest['package']['name']
+    available = set(manifest.get('features', {}))
+    found = []
+    for section in ('dependencies', 'dev-dependencies', 'build-dependencies'):
+        for alias, dependency in example.get(section, {}).items():
+            if not isinstance(dependency, dict) or dependency.get('package', alias) != name:
+                continue
+            for feature in dependency.get('features', []):
+                if feature not in available:
+                    found.append(f'{label}: unknown {name} dependency feature: {feature}')
+    return found
+
+
+def readme_feature_violations(root, manifest):
+    """Keep the public feature table in sync with the package's feature names."""
+    table, documented, found = False, set(), []
+    available = set(manifest.get('features', {})) - {'default'}
+    lines = (root / 'README.md').read_text(encoding='utf-8').splitlines()
+    for line, text in enumerate(lines, 1):
+        cells = [cell.strip() for cell in text.strip().strip('|').split('|')]
+        if text.startswith('|') and cells[0] == 'Feature':
+            table = True
+        elif table and text.startswith('|'):
+            for feature in re.findall(r'`([^`]+)`', cells[0]):
+                documented.add(feature)
+                if feature not in available:
+                    found.append(f'README.md:{line}: unknown public feature: {feature}')
+        elif table:
+            break
+    if table:
+        for feature in sorted(available - documented):
+            found.append(f'README.md: feature table is missing: {feature}')
+    return found
+
+
 def doc_comment_text(text):
     """Extract line doc comments as Markdown without changing line numbers."""
     lines = []
@@ -266,8 +309,9 @@ def link_violations(root, source, text, release, repository_only=False):
 def check(root):
     """Return (violations, standalone Rust snippets) for the current docs."""
     root = root.resolve()
-    release = version(root)
-    found, snippets = [], []
+    manifest = tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))
+    release = manifest['package']['version']
+    found, snippets = readme_feature_violations(root, manifest), []
     for path in documents(root):
         text = path.read_text(encoding='utf-8')
         found.extend(link_violations(root, path, text, release))
@@ -280,6 +324,8 @@ def check(root):
             if last is None:
                 found.append(f'{label}: unclosed code fence')
             tags = [tag.strip() for tag in info.split(',')]
+            if tags[0] == 'toml':
+                found.extend(dependency_feature_violations(label, code, manifest))
             if not tags or tags[0] != 'rust':
                 continue
             if re.search(r'^\s*#(?:\s|$)', code, re.MULTILINE):

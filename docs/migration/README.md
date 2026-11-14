@@ -1,8 +1,7 @@
 # Upgrade grafton-ndi
 
 Use [Migrate from 2.x to 3.0](2.0-to-3.0.md) for the current release. It covers
-API edits, silent behavior changes and deployment. Applications tracking 3.0
-development should also read its [pre-release notes](2.0-to-3.0.md#adapting-pre-release-30-applications).
+API edits, silent behavior changes and deployment from released 2.x versions.
 
 Older guides are preserved at an immutable historical revision. They describe
 their named versions; they are not instructions for the current API. For an

@@ -75,6 +75,31 @@ class Documentation(unittest.TestCase):
                    '![image](https://img.shields.io/crates/v/grafton-ndi.svg) [section](#install)')
         self.assertEqual(docs.readme_link_violations(self.root), [])
 
+    def test_dependency_examples_reject_removed_features_including_renamed_dependencies(self):
+        self.write('Cargo.toml', '[package]\nname = "grafton-ndi"\nversion = "3.0.0"\n'
+                   '[features]\ndefault = []\nadvanced = []\nimage-encoding = []\n')
+        for dependency in ('grafton-ndi = { features = ["removed-feature"] }',
+                           'ndi = { package = "grafton-ndi", features = ["removed-feature"] }'):
+            with self.subTest(dependency=dependency):
+                errors, _ = self.check(f'```toml\n[dependencies]\n{dependency}\n```')
+                self.assertEqual(len(errors), 1)
+                self.assertIn('unknown grafton-ndi dependency feature: removed-feature', errors[0])
+        valid = ('```toml\n[dependencies]\n'
+                 'grafton-ndi = { version = "3.0", features = ["advanced", "image-encoding"] }\n'
+                 'other = { version = "1", features = ["unrelated-feature"] }\n```')
+        self.assertEqual(self.check(valid)[0], [])
+        self.assertIn('invalid TOML example', self.check('```toml\n[dependencies\n```')[0][0])
+
+    def test_readme_feature_table_rejects_removed_names_and_missing_features(self):
+        self.write('Cargo.toml', '[package]\nname = "grafton-ndi"\nversion = "3.0.0"\n'
+                   '[features]\ndefault = []\nadvanced = []\ntokio = []\nsmol = []\n')
+        table = '| Feature | Adds |\n| --- | --- |\n| `advanced` | SDK |\n| `tokio`, `smol` | Async |\n'
+        self.assertEqual(self.check(table)[0], [])
+        errors, _ = self.check(table.replace('`advanced`', '`removed-feature`'))
+        self.assertEqual(len(errors), 2)
+        self.assertIn('unknown public feature: removed-feature', errors[0])
+        self.assertIn('feature table is missing: advanced', errors[1])
+
     def test_historical_commit_links_use_historical_content(self):
         self.write('docs/old.md', '# Historical')
         subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
