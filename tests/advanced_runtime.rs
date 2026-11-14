@@ -2864,10 +2864,28 @@ fn concurrent_keyframe_waiters_observe_the_same_request() {
         [None, Some(format)],
     ] {
         for _ in 0..3 {
-            // Sending a keyframe clears demand. Consume earlier update reports
-            // before the concurrent waits, so only the explicit request wakes them.
-            sender.send_video(&mut frame).unwrap();
-            assert!(!sender.sender().keyframe_required(None).unwrap());
+            // The SDK can clear or reassert demand asynchronously while the
+            // receiver processes earlier frames. Establish actual readiness
+            // before starting the waiters instead of assuming send cleared it.
+            let ready_by = Instant::now() + PATIENCE;
+            loop {
+                sender.send_video(&mut frame).unwrap();
+                let received =
+                    matches!(receiver.capture(SLICE).unwrap(), Some(PacketItem::Video(_)));
+                let required = sender.sender().keyframe_required(None).unwrap();
+                if received && !required {
+                    break;
+                }
+                assert!(
+                    Instant::now() < ready_by,
+                    "keyframe preparation did not deliver video and clear demand for \
+                     {selectors:?} (demand={required}); {}; {}",
+                    link(receiver.receiver()),
+                    served(sender.sender()),
+                );
+            }
+            // Consume earlier update reports so only the explicit request
+            // should wake the concurrent waiters.
             for selector in [None, Some(format)] {
                 while sender
                     .sender()
