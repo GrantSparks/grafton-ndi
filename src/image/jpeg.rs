@@ -15,6 +15,10 @@ pub(super) const MAX_DIMENSION: usize = u16::MAX as usize;
 /// Encode `pixels` as a JPEG of `quality` into `out`. The plan checked the
 /// quality and the dimensions.
 pub(super) fn encode(pixels: &mut Pixels<'_, u8>, quality: u8, out: &mut dyn Write) -> Result<()> {
+    encode_rows(pixels, quality, out)
+}
+
+fn encode_rows(pixels: &mut Pixels<'_, u8>, quality: u8, out: &mut dyn Write) -> Result<()> {
     let image = Rows {
         width: to_u16(pixels.width()),
         height: to_u16(pixels.height()),
@@ -22,10 +26,14 @@ pub(super) fn encode(pixels: &mut Pixels<'_, u8>, quality: u8, out: &mut dyn Wri
     };
     jpeg_encoder::Encoder::new(out, quality)
         .encode_image(image)
-        .map_err(|error| match error {
-            jpeg_encoder::EncodingError::IoError(error) => Error::Io(error),
-            error => Error::InvalidFrame(format!("JPEG encoding failed: {error}")),
-        })
+        .map_err(encoding_error)
+}
+
+fn encoding_error(error: jpeg_encoder::EncodingError) -> Error {
+    match error {
+        jpeg_encoder::EncodingError::IoError(error) => Error::Io(error),
+        error => Error::InvalidFrame(format!("JPEG encoding failed: {error}")),
+    }
 }
 
 fn to_u16(length: usize) -> u16 {
@@ -79,6 +87,84 @@ impl Sink<u8> for Components<'_> {
         }
         for (buffer, values) in self.0.iter_mut().zip(&components) {
             buffer.extend_from_slice(&values[..pixels.len()]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        image::{Plan, Source},
+        ImageFormat, ImageOptions, PixelFormat, VideoFrame,
+    };
+
+    fn decode(bytes: &[u8], size: (u16, u16)) -> Vec<u8> {
+        let mut decoder = jpeg_decoder::Decoder::new(bytes);
+        let decoded = decoder.decode().unwrap();
+        let info = decoder.info().unwrap();
+        assert_eq!((info.width, info.height), size);
+        assert_eq!(info.pixel_format, jpeg_decoder::PixelFormat::RGB24);
+        decoded
+    }
+
+    #[test]
+    fn packed_rgb_preserves_channels_discards_alpha_and_matches_rows() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        eprintln!("JPEG AVX2={}", std::is_x86_feature_detected!("avx2"));
+        // Widths straddle the backend's eight-pixel AVX2 input batches. NDI
+        // uncompressed frame widths are even, so use their nearest neighbors.
+        for width in [2u16, 6, 8, 10, 14, 16, 18, 30, 32, 34, 66] {
+            for format in [
+                PixelFormat::Rgba,
+                PixelFormat::Rgbx,
+                PixelFormat::Bgra,
+                PixelFormat::Bgrx,
+            ] {
+                for quality in [50, 85, 89, 90, 91, 100] {
+                    let mut data = Vec::new();
+                    let rgb = matches!(format, PixelFormat::Rgba | PixelFormat::Rgbx);
+                    for i in 0..usize::from(width) * 3 {
+                        let (r, g, b) = (190 + (i % 30) as u8, 60, 20);
+                        data.extend_from_slice(&if rgb {
+                            [r, g, b, i as u8]
+                        } else {
+                            [b, g, r, i as u8]
+                        });
+                    }
+                    let frame = VideoFrame::builder()
+                        .resolution(width.into(), 3)
+                        .pixel_format(format)
+                        .data(data)
+                        .build()
+                        .unwrap();
+                    let options = ImageOptions::new(ImageFormat::Jpeg(quality));
+                    let direct = frame.encode_image(&options).unwrap();
+                    let source = Source::new(&frame);
+                    let plan = Plan::new(&source, &options).unwrap();
+                    let mut rows = Vec::new();
+                    encode_rows(&mut plan.pixels::<u8>(&source), quality, &mut rows).unwrap();
+                    let direct = decode(&direct, (width, 3));
+                    let rows = decode(&rows, (width, 3));
+                    // Runtime SIMD rounding is permitted: mean <= 1 code and
+                    // maximum <= 16 codes against the component-row path.
+                    let delta: Vec<_> = direct
+                        .iter()
+                        .zip(&rows)
+                        .map(|(&a, &b)| a.abs_diff(b) as usize)
+                        .collect();
+                    assert!(delta.iter().sum::<usize>() <= delta.len());
+                    assert!(delta.iter().all(|&d| d <= 16));
+                    for pixel in direct.as_chunks::<3>().0 {
+                        assert!(
+                            pixel[0] > 160
+                                && pixel[1].abs_diff(60) <= 15
+                                && pixel[2].abs_diff(20) <= 15,
+                            "{format:?} q={quality}: {pixel:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
