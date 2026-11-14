@@ -1602,3 +1602,6 @@ mod receiver_tests {
 
 #[cfg(test)]
 mod scoped_tests;
+
+#[cfg(test)]
+mod source_name_cancellation_sdk_tests;

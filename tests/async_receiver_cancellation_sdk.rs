@@ -1,4 +1,4 @@
-//! Native loopback cancellation, worker completion and subsequent media/source queries.
+//! Native loopback cancellation, worker completion and subsequent media capture.
 #![cfg(any(feature = "tokio", feature = "smol"))]
 
 #[macro_use]
@@ -8,8 +8,8 @@ common_helpers!(runtime, name, loopback);
 
 use grafton_ndi::{
     asynchronous::{AsyncReceiver, AsyncRuntime},
-    Error, Ndi, PixelFormat, Receiver, ReceiverOptions, RuntimeFeature, Sender, SenderOptions,
-    Source, SourceNameChange, Timecode, VideoFrame,
+    Error, Ndi, PixelFormat, Receiver, ReceiverOptions, Sender, SenderOptions, Timecode,
+    VideoFrame,
 };
 use std::{
     future::Future,
@@ -45,8 +45,7 @@ async fn later_items<R: AsyncRuntime>(ndi: &Ndi, runtime: &str) -> Result<(), Er
             .clock_audio(false),
     )?;
     let source = common::loopback_source(ndi, &sender)?;
-    let receiver =
-        AsyncReceiver::<R>::new(Receiver::new(ndi, &ReceiverOptions::new(source.clone()))?);
+    let receiver = AsyncReceiver::<R>::new(Receiver::new(ndi, &ReceiverOptions::new(source))?);
     let deadline = Instant::now() + Duration::from_secs(10);
     while !receiver.is_connected() {
         assert!(Instant::now() < deadline, "receiver did not connect");
@@ -89,31 +88,6 @@ async fn later_items<R: AsyncRuntime>(ndi: &Ndi, runtime: &str) -> Result<(), Er
                 "{runtime} did not receive live video for round {round} after its worker ended"
             );
         }
-    }
-    if ndi
-        .require_feature(RuntimeFeature::ConnectedSourceName)
-        .is_ok()
-    {
-        let receiver =
-            AsyncReceiver::<R>::new(Receiver::new(ndi, &ReceiverOptions::new(Source::new("")))?);
-        while receiver
-            .poll_source_name_change(Duration::ZERO)
-            .await?
-            .is_some()
-        {}
-        abandon(receiver.poll_source_name_change(Duration::from_secs(4)));
-        // The scripted boundary checks exact source-query attempt termination.
-        // This native query checks subsequent usability after a settling pause;
-        // the pause is not evidence that native scheduling met an exact bound.
-        std::thread::sleep(Duration::from_millis(150));
-        receiver.connect_to(&source).await?;
-        let change = receiver
-            .poll_source_name_change(Duration::from_secs(3))
-            .await?;
-        assert_eq!(
-            change,
-            Some(SourceNameChange::Connected(source.name().to_owned()))
-        );
     }
     Ok(())
 }
