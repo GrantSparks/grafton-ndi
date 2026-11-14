@@ -14,6 +14,11 @@ unsafe fn state(instance: NDIlib_framesync_instance_t) -> &'static SyncState {
 }
 
 export! {
+    fn NDIlib_recv_set_tally(receiver: NDIlib_recv_instance_t, tally: *const NDIlib_tally_t) -> bool {
+        let tally = unsafe { &*tally };
+        log(&format!("tally:{receiver:p}:{}:{}", tally.on_program, tally.on_preview));
+        true
+    }
     fn NDIlib_framesync_create(receiver: NDIlib_recv_instance_t) -> NDIlib_framesync_instance_t {
         let instance = Box::into_raw(Box::new(SyncState { receiver })).cast();
         log(&format!("fs-create:{receiver:p}:{instance:p}"));

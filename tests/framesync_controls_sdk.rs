@@ -99,6 +99,10 @@ fn stream_changes_leave_clocked_capture_and_recovery_usable() {
             let (capture, controls) = sync.split();
             let mut session = controls.kvm().unwrap();
             let _ = session.is_supported();
+            let receiving = session.receiver();
+            assert_eq!(receiving.connection_target(), source);
+            receiving.set_tally(grafton_ndi::Tally::new(false, true));
+            let metadata = receiving.metadata().capture_ref(Duration::ZERO).unwrap();
             let video = capture
                 .capture_video_ref(ScanType::Progressive)
                 .unwrap()
@@ -109,6 +113,7 @@ fn stream_changes_leave_clocked_capture_and_recovery_usable() {
             assert!(video.width() > 0 && video.height() > 0);
             assert_eq!((audio.num_channels(), audio.num_samples()), (2, 480));
             session.release_all().unwrap();
+            drop(metadata);
         }
         assert_eq!(sync.receiver().connection_target(), source);
         assert!(sync.capture_video(ScanType::Progressive).unwrap().is_some());

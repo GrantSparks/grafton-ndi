@@ -178,6 +178,8 @@ export! {
             }
         };
         log(&format!("receiver-connect:{name}"));
+        #[cfg(fake_receiver_controls)]
+        log(&format!("connect-instance:{_p_instance:p}"));
     }
 }
 
@@ -195,7 +197,6 @@ mod capture;
 
 stub! {
     fn NDIlib_recv_send_metadata(p_instance: NDIlib_recv_instance_t, p_metadata: *const NDIlib_metadata_frame_t) -> bool;
-    fn NDIlib_recv_set_tally(p_instance: NDIlib_recv_instance_t, p_tally: *const NDIlib_tally_t) -> bool;
     fn NDIlib_recv_get_performance(p_instance: NDIlib_recv_instance_t, p_total: *mut NDIlib_recv_performance_t, p_dropped: *mut NDIlib_recv_performance_t);
     fn NDIlib_recv_get_queue(p_instance: NDIlib_recv_instance_t, p_total: *mut NDIlib_recv_queue_t);
     fn NDIlib_recv_get_no_connections(p_instance: NDIlib_recv_instance_t) -> ::std::os::raw::c_int;
@@ -226,6 +227,11 @@ stub! {
     fn NDIlib_send_add_connection_metadata(p_instance: NDIlib_send_instance_t, p_metadata: *const NDIlib_metadata_frame_t);
     fn NDIlib_send_get_source_name(p_instance: NDIlib_send_instance_t) -> *const NDIlib_source_t;
 
+}
+
+#[cfg(not(fake_receiver_controls))]
+stub! {
+    fn NDIlib_recv_set_tally(p_instance: NDIlib_recv_instance_t, p_tally: *const NDIlib_tally_t) -> bool;
 }
 
 #[cfg(not(fake_receiver_controls))]

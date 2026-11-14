@@ -631,7 +631,8 @@ impl FrameSync {
     /// The synchronizer and receiver keep their original instances; creating
     /// the views allocates nothing and makes no SDK call. Drop held frames
     /// and both views before recovering the receiver. A source change must be
-    /// preceded by [`KvmSession::release_all`](crate::advanced::KvmSession::release_all).
+    /// preceded by successful [`KvmSession::release_all`](crate::advanced::KvmSession::release_all)
+    /// and session termination.
     ///
     /// ```no_run
     /// # use grafton_ndi::{FrameSync, ScanType, Result};

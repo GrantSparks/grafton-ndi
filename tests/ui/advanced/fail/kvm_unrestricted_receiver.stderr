@@ -1,0 +1,49 @@
+error[E0308]: mismatched types
+ --> tests/ui/advanced/fail/kvm_unrestricted_receiver.rs:4:27
+  |
+4 |     let _: &Receiver<M> = session.receiver();
+  |            ------------   ^^^^^^^^^^^^^^^^^^ expected `&Receiver<M>`, found `KvmReceiver<'_, M>`
+  |            |
+  |            expected due to this
+  |
+  = note: expected reference `&grafton_ndi::Receiver<M>`
+                found struct `KvmReceiver<'_, M>`
+
+error[E0308]: mismatched types
+ --> tests/ui/advanced/fail/kvm_unrestricted_receiver.rs:5:27
+  |
+5 |     let _: &Receiver<M> = &session.receiver();
+  |            ------------   ^^^^^^^^^^^^^^^^^^^ expected `&Receiver<M>`, found `&KvmReceiver<'_, M>`
+  |            |
+  |            expected due to this
+  |
+  = note: expected reference `&grafton_ndi::Receiver<M>`
+             found reference `&KvmReceiver<'_, M>`
+
+error[E0614]: type `KvmReceiver<'_, M>` cannot be dereferenced
+ --> tests/ui/advanced/fail/kvm_unrestricted_receiver.rs:6:28
+  |
+6 |     let _: &Receiver<M> = &*session.receiver();
+  |                            ^^^^^^^^^^^^^^^^^^^ can't be dereferenced
+
+error[E0277]: the trait bound `&grafton_ndi::Receiver<M>: From<KvmReceiver<'_, M>>` is not satisfied
+ --> tests/ui/advanced/fail/kvm_unrestricted_receiver.rs:7:46
+  |
+7 |     let _: &Receiver<M> = session.receiver().into();
+  |                                              ^^^^ the trait `From<KvmReceiver<'_, M>>` is not implemented for `&grafton_ndi::Receiver<M>`
+  |
+  = note: required for `KvmReceiver<'_, M>` to implement `Into<&grafton_ndi::Receiver<M>>`
+
+error[E0599]: no method named `receiver` found for struct `KvmReceiver<'a, M>` in the current scope
+ --> tests/ui/advanced/fail/kvm_unrestricted_receiver.rs:8:32
+  |
+8 |     let _ = session.receiver().receiver();
+  |             -------            ^^^^^^^^ private field, not a method
+  |             |
+  |             method `receiver` is available on `&KvmSession<'_, M>`
+
+error[E0599]: no method named `as_ref` found for struct `KvmReceiver<'a, M>` in the current scope
+ --> tests/ui/advanced/fail/kvm_unrestricted_receiver.rs:9:32
+  |
+9 |     let _ = session.receiver().as_ref();
+  |                                ^^^^^^ method not found in `KvmReceiver<'_, M>`

@@ -1,0 +1,21 @@
+error[E0502]: cannot borrow `*receiver` as immutable because it is also borrowed as mutable
+ --> tests/ui/advanced/fail/kvm_view_keeps_owner_borrowed.rs:7:5
+  |
+4 |     let session = receiver.kvm().unwrap();
+  |                   -------- mutable borrow occurs here
+...
+7 |     receiver.connect_to(next).unwrap();
+  |     ^^^^^^^^ immutable borrow occurs here
+8 |     let _ = view.is_connected();
+  |             ---- mutable borrow later used here
+
+error[E0502]: cannot borrow `*receiver` as immutable because it is also borrowed as mutable
+  --> tests/ui/advanced/fail/kvm_view_keeps_owner_borrowed.rs:15:5
+   |
+12 |     let session = receiver.kvm().unwrap();
+   |                   -------- mutable borrow occurs here
+...
+15 |     receiver.disconnect();
+   |     ^^^^^^^^ immutable borrow occurs here
+16 |     let _ = capture.capture_ref(std::time::Duration::ZERO);
+   |             ------- mutable borrow later used here

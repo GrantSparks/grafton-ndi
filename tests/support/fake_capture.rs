@@ -26,6 +26,8 @@ fn next() -> String {
 export! {
     fn NDIlib_recv_capture_v3(_p_instance: NDIlib_recv_instance_t, p_video_data: *mut NDIlib_video_frame_v2_t, p_audio_data: *mut NDIlib_audio_frame_v3_t, p_metadata: *mut NDIlib_metadata_frame_t, timeout_in_ms: u32) -> NDIlib_frame_type_e {
         let kind = next();
+        #[cfg(fake_receiver_controls)]
+        log(&format!("capture-instance:{_p_instance:p}"));
         log(&format!("capture:{kind}:{}{}{}:{timeout_in_ms}",
             u8::from(!p_video_data.is_null()), u8::from(!p_audio_data.is_null()), u8::from(!p_metadata.is_null())));
         if let Ok(delay) = std::env::var("GRAFTON_FAKE_CAPTURE_DELAY_MS").unwrap_or_default().parse::<u64>() {

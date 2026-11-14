@@ -278,6 +278,10 @@ fn advanced_types_keep_their_auto_traits() {
         ExtendedSource: Send, Sync, UnwindSafe, RefUnwindSafe;
         Genlock: Send, UnwindSafe, RefUnwindSafe;
         KvmSession<'static, RawCapture>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        KvmReceiver<'static, RawCapture>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        KvmReceiver<'static, grafton_ndi::FrameSyncAttached>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        KvmReceiver<'static, AvSyncAttached>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        KvmReceiver<'static, PacketAttached>: Send, Sync, UnwindSafe, RefUnwindSafe;
         MouseButton: Send, Sync, UnwindSafe, RefUnwindSafe;
         PacketAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
         PacketEnvelope<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;

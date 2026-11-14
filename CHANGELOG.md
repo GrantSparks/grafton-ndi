@@ -17,6 +17,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- `KvmSession::receiver()` returns a restricted `KvmReceiver<'_, M>` instead
+  of `&Receiver<M>`. Compatible capture and shared controls remain available;
+  connection changes require successful input release and session termination.
+  The unrestricted accessor is removed across raw and attached KVM entry paths.
 - `NDI` becomes `Ndi`. Pixel formats, color formats and other enum variants use
   Rust casing. Options have private fields, chainable setters and `new`
   constructors in place of separate options builders.

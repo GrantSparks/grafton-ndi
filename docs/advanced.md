@@ -210,8 +210,10 @@ owners expose these controls through `controls()`; see the
 ## KVM
 
 `Receiver::kvm()` creates an exclusive `KvmSession`; attached owners use
-`controls().kvm()`. A source must offer remote control. The session lends shared
-receiver access for compatible capture while input stays held. Use `split()`
+`controls().kvm()`. A source must offer remote control. `session.receiver()`
+returns a restricted `KvmReceiver<'_, M>` for mode-permitted capture, events,
+diagnostics, tally, PTZ, metadata and other shared controls while input stays
+held. Borrowed frames can coexist with mutable input calls. Use `split()`
 for simultaneous FrameSync/AVSync output and a session; packet sessions provide
 `capture()` directly.
 
@@ -219,8 +221,16 @@ The session sends pointer, button, wheel, key, touch and explicit clipboard
 text; it never reads the local clipboard. Pointer/touch coordinates are
 fractions in `0.0..=1.0`, and keys use X11 key symbols. A native send failure
 returns `Error::NativeOperationFailed`; success does not confirm the source
-acted on the message. **Call `release_all()` before changing source.** Drop
-attempts release only on a best-effort basis; explicit release reports failure.
+acted on the message. The view excludes `connect_to`, `disconnect` and
+`reconnect`, and cannot recover an unrestricted receiver. To switch sources,
+successfully `release_all()`, end the session, change the connection through its
+owner, then create a new session. This applies throughout the session, even
+when no inputs are held or the view moves to a scoped thread.
+
+Drop attempts release only on a best-effort basis; explicit release reports
+failure and retains failed inputs for retry. Native disconnection, Discovery
+Server remote control and failed release delivery can still leave remote input
+unresolved. The session cannot release input on a source it has lost.
 See [`advanced_kvm`](../examples/advanced_kvm.rs).
 
 ## Validation

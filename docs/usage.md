@@ -155,8 +155,12 @@ output therefore does not establish recent reception.
 With `advanced`, `controls()` reaches exclusive stream/tier controls and KVM.
 `split()` separates clocked capture from those controls so held remote input
 can span captures. Split views stay on their borrowing thread; FrameSync frame
-guards stay on their capture thread. Release held inputs before changing the
-source and drop outstanding borrows before recovering the receiver. See
+guards stay on their capture thread. `session.receiver()` lends a restricted
+`KvmReceiver` with compatible capture and shared controls. To change source,
+successfully release held inputs, end the session, change the owner's
+connection, then start a new session. Drop outstanding borrows before
+recovering the receiver. Source loss, remote Discovery Server changes and
+failed release delivery remain best-effort limitations. See
 [`advanced_kvm`](../examples/advanced_kvm.rs).
 
 Receiver ownership determines available capture; exact contracts remain in

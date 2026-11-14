@@ -1,0 +1,23 @@
+error[E0599]: no method named `connect_to` found for struct `KvmReceiver<'a, M>` in the current scope
+ --> tests/ui/advanced/fail/kvm_scoped_retarget.rs:7:30
+  |
+7 |             let _ = receiver.connect_to(next);
+  |                              ^^^^^^^^^^ method not found in `KvmReceiver<'_, M>`
+
+error[E0599]: no method named `disconnect` found for struct `KvmReceiver<'a, M>` in the current scope
+ --> tests/ui/advanced/fail/kvm_scoped_retarget.rs:8:22
+  |
+8 |             receiver.disconnect();
+  |                      ^^^^^^^^^^
+  |
+help: there is a method `is_connected` with a similar name
+  |
+8 -             receiver.disconnect();
+8 +             receiver.is_connected();
+  |
+
+error[E0599]: no method named `reconnect` found for struct `KvmReceiver<'a, M>` in the current scope
+ --> tests/ui/advanced/fail/kvm_scoped_retarget.rs:9:22
+  |
+9 |             receiver.reconnect()
+  |                      ^^^^^^^^^ method not found in `KvmReceiver<'_, M>`

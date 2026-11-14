@@ -83,8 +83,9 @@ impl<'a, M: ReceiverMode> ReceiverControls<'a, M> {
     ///
     /// This consumes the view, so a temporary `owner.controls()` can create
     /// a session lasting until it is dropped. Session creation allocates
-    /// nothing; holding inputs can allocate for tracking. Release all inputs
-    /// before changing source through the session's lent receiver.
+    /// nothing; holding inputs can allocate for tracking. To change source,
+    /// successfully release all inputs and end the session first. Its
+    /// restricted receiver view cannot change the connection.
     ///
     /// # Errors
     ///

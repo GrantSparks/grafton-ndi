@@ -50,6 +50,10 @@ fn main() -> Result<(), Error> {
 
     let (capture, controls) = sync.split();
     let mut session = controls.kvm()?;
+    // The restricted receiver view keeps shared controls and metadata capture
+    // available while the session holds the connection's exclusive borrow.
+    let receiving = session.receiver();
+    println!("KVM target: {}", receiving.connection_target());
     if !session.is_supported() {
         println!("This source does not offer remote control");
         return Ok(());
@@ -67,6 +71,7 @@ fn main() -> Result<(), Error> {
         // The frame stays borrowed from the receiver while input is sent.
         let frame = capture.capture_video_ref(ScanType::Progressive)?;
         let audio = capture.capture_audio_ref(audio_request)?;
+        let _event = receiving.poll_event(Duration::ZERO)?;
         if let Some(frame) = &frame {
             println!("Frame {}x{} while dragging", frame.width(), frame.height());
         }
@@ -79,6 +84,8 @@ fn main() -> Result<(), Error> {
     session.mouse_up(MouseButton::Left)?;
 
     session.release_all()?;
+    // To change source, end this session and outstanding split/frame borrows
+    // first, connect through sync.receiver(), then start a new session.
     println!("Dragged, and nothing is left pressed");
     Ok(())
 }

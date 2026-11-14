@@ -4,7 +4,7 @@
 use std::ffi::CString;
 use std::{collections::BTreeSet, time::Duration};
 
-use super::{invalid_input, PacketAttached, PacketItem, PacketReceiver};
+use super::{invalid_input, KvmReceiver, PacketAttached, PacketItem, PacketReceiver};
 #[cfg(ndi_has_advanced_kvm)]
 use crate::sys::bindings::NDIlib_recv_instance_t;
 #[cfg(any(doc, test, ndi_has_advanced_kvm))]
@@ -38,18 +38,19 @@ pub enum WheelAxis {
 ///
 /// Created by [`Receiver::kvm`], which borrows the receiver mutably, so a
 /// receiver has at most one session at a time. The session lends the receiver
-/// back as a shared reference through [`receiver`](Self::receiver), so frames
-/// can be captured, and held, while keys, buttons and touches stay pressed
-/// across them. The lent receiver offers what any `&Receiver` offers: capture,
-/// tally, PTZ, statistics, metadata and reconnecting. For a
+/// back as a restricted [`KvmReceiver`] through [`receiver`](Self::receiver),
+/// so frames can be captured, and held, while keys, buttons and touches stay pressed
+/// across them. The view offers mode-permitted capture, tally, PTZ, statistics
+/// and metadata, without allowing application connection changes. For a
 /// [`PacketReceiver`](super::PacketReceiver), which has no frame capture of its
 /// own, [`KvmSession::capture`] on a session from `packets.controls().kvm()`
 /// delivers its packets and events.
 ///
-/// A source change through the lent receiver (`connect_to`, `reconnect` or
-/// `disconnect`) leaves whatever the session holds pressed on the previous
-/// source, and the session cannot tell it to let go once the receiver has moved
-/// on. Call [`release_all`](Self::release_all) before changing source.
+/// To change source, successfully [`release_all`](Self::release_all), end the
+/// session, change the connection through its owner, then start a new session.
+/// Native disconnection, Discovery Server remote control and failed release
+/// delivery can still leave input pressed on the previous source: release is
+/// best effort and the session cannot address a source it has lost.
 ///
 /// The session never reads the local clipboard: it sends only the text it is
 /// given. It is `Send` and `Sync`, as the receiver is; its input methods take
@@ -135,14 +136,15 @@ fn validate_position(x: f32, y: f32) -> Result<()> {
 }
 
 impl<'a, M: ReceiverMode> KvmSession<'a, M> {
-    /// The receiver, lent for the session's whole lifetime.
+    /// Restricted receiver access for the session's original receiver lifetime.
     ///
     /// A frame captured through it can be held while the session's input
     /// methods run, which is how a key, button or touch stays down across
-    /// captured frames. Changing the source through it is covered in the
-    /// [type documentation](KvmSession).
-    pub fn receiver(&self) -> &'a Receiver<M> {
-        self.receiver
+    /// captured frames. The view cannot change the connection or recover an
+    /// unrestricted receiver, even when moved to a scoped thread. Creating it
+    /// allocates nothing and makes no SDK call or lock acquisition.
+    pub fn receiver(&self) -> KvmReceiver<'a, M> {
+        KvmReceiver::new(self.receiver)
     }
 
     #[cfg(ndi_has_advanced_kvm)]

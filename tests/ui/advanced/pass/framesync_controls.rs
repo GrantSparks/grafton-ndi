@@ -9,6 +9,11 @@ fn framesync(sync: &mut FrameSync) -> Result<()> {
     let (capture, controls) = sync.split();
     controls.receiver().set_tally(Tally::new(false, true));
     let mut session = controls.kvm()?;
+    session.receiver().set_tally(Tally::new(true, false));
+    let metadata = session
+        .receiver()
+        .metadata()
+        .capture_ref(std::time::Duration::ZERO)?;
     session.mouse_down(MouseButton::Left)?;
     let video = capture.capture_video_ref(ScanType::Progressive)?;
     let audio = capture.capture_audio_ref(FrameSyncAudioRequest::capture_at(48_000, 2, 480)?)?;
@@ -17,7 +22,10 @@ fn framesync(sync: &mut FrameSync) -> Result<()> {
     let _ = capture.audio_input_format()?;
     let _ = capture.audio_queue_depth();
     session.release_all()?;
-    drop((video, audio));
+    drop((video, audio, metadata));
+    drop(session);
+    sync.receiver().reconnect()?;
+    let _ = sync.controls().kvm()?;
     Ok(())
 }
 
@@ -33,6 +41,10 @@ fn avsync(sync: &mut AvSync) -> Result<()> {
         let _ = capture.synchronize(Some(video), AvSyncRequest::automatic())?;
     }
     session.release_all()?;
+    drop(video);
+    drop(session);
+    sync.receiver().reconnect()?;
+    let _ = sync.controls().kvm()?;
     Ok(())
 }
 
@@ -41,10 +53,15 @@ fn allocated(receiver: &mut AllocatedReceiver) -> Result<()> {
     receiver.controls().set_streams(MediaTypes::ALL)?;
     let mut session = receiver.controls().kvm()?;
     session.key_down(0xffe1)?;
-    let _ = session
+    let frame = session
         .receiver()
         .capture_any_ref(std::time::Duration::ZERO)?;
-    session.release_all()
+    session.release_all()?;
+    drop(frame);
+    drop(session);
+    receiver.receiver().reconnect()?;
+    let _ = receiver.controls().kvm()?;
+    Ok(())
 }
 
 fn main() {
