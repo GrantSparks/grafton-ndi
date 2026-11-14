@@ -31,7 +31,7 @@ const SETTLE_POLL: Duration = Duration::from_millis(1);
 /// How many stale events [`FileRecorder::start`] discards before giving up on
 /// finding the queue empty, and how many queued events a wait takes after its
 /// deadline before it reports a timeout.
-const STALE_EVENT_LIMIT: usize = 256;
+pub(super) const STALE_EVENT_LIMIT: usize = 256;
 
 /// Where a recorder is in its session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -350,6 +350,16 @@ impl Ledger {
     /// Whether every file reported open has been reported closed.
     fn all_closed(&self) -> bool {
         self.open_files.is_empty() && self.report.closed_files > 0
+    }
+
+    /// Settle a wait once the session is final, or its final drain is done.
+    fn settle(&self, expired: bool, drained: bool) -> Option<FinishStatus> {
+        match self.state() {
+            RecorderState::Closed => Some(FinishStatus::Closed(self.report.clone())),
+            RecorderState::Indeterminate => Some(FinishStatus::Indeterminate(self.report.clone())),
+            _ if expired && drained => Some(FinishStatus::TimedOut(self.report.clone())),
+            _ => None,
+        }
     }
 
     /// Record that a stop is under way, announced by the SDK after an
@@ -883,84 +893,59 @@ impl FileRecorder {
         deadline: Deadline,
         each: impl FnMut(Result<Option<RecorderEvent>>) -> bool,
     ) -> Result<FinishStatus> {
-        self.wait_finished_with(deadline, |_, deadline| deadline, each)
-    }
-
-    /// The same wait, with a budget the async shutdown path can narrow before
-    /// each poll. Cancellation stays separate from shutdown and ends the wait
-    /// after the current poll, whose event is still delivered by `each`.
-    pub(super) fn wait_finished_with(
-        &mut self,
-        mut deadline: Deadline,
-        mut budget: impl FnMut(&mut Self, Deadline) -> Deadline,
-        mut each: impl FnMut(Result<Option<RecorderEvent>>) -> bool,
-    ) -> Result<FinishStatus> {
-        if matches!(self.state(), RecorderState::Idle | RecorderState::Recording) {
-            return Err(Error::InvalidState(StateError::StopNotRequested));
-        }
+        self.check_wait()?;
+        let mut each = each;
         let mut interrupted = false;
         let mut late_polls = 0;
         loop {
-            deadline = budget(self, deadline);
-            match self.state() {
-                RecorderState::Closed => return Ok(FinishStatus::Closed(self.report())),
-                RecorderState::Indeterminate => {
-                    return Ok(FinishStatus::Indeterminate(self.report()))
-                }
-                _ => {}
+            if let Some(outcome) = self.settle_wait(false, false) {
+                return Ok(outcome);
             }
-            if interrupted {
-                return Ok(FinishStatus::TimedOut(self.report()));
+            if interrupted || late_polls == STALE_EVENT_LIMIT {
+                return Ok(self
+                    .settle_wait(true, true)
+                    .expect("a completed drain settles"));
             }
-            // Read once, so that this poll and the check after it agree on
-            // whether it was a late one.
+            // Read once, so the poll and its settlement agree whether this
+            // is part of the final, bounded nonblocking drain.
             let expired = deadline.is_expired();
             if expired {
-                if late_polls == STALE_EVENT_LIMIT {
-                    return Ok(FinishStatus::TimedOut(self.report()));
-                }
                 late_polls += 1;
             }
-            // With every file closed, one empty poll settles the outcome.
             let step = if self.ledger.all_closed() {
                 SETTLE_POLL
             } else {
                 FINISH_POLL
             };
-            // A failed poll is an event that was taken but could not be
-            // decoded, or could not be read at all. Either way its effect is
-            // already in the ledger, which the loop goes on to settle.
             let polled =
                 self.poll_event_ms(deadline.within_at(Instant::now(), step).remaining_ms());
             let drained = matches!(polled, Ok(None));
             interrupted = each(polled);
-            if expired && drained {
-                // The queue was empty and its state recorded: what it shows
-                // now is the outcome.
-                return Ok(match self.state() {
-                    RecorderState::Closed => FinishStatus::Closed(self.report()),
-                    RecorderState::Indeterminate => FinishStatus::Indeterminate(self.report()),
-                    _ => FinishStatus::TimedOut(self.report()),
-                });
+            if let Some(outcome) = self.settle_wait(expired, drained) {
+                return Ok(outcome);
             }
         }
     }
 
-    /// Reuse the close's deadline for both an active finish and destruction.
-    pub(super) fn limit_shutdown_wait(
-        &mut self,
-        deadline: Deadline,
-        requested: Instant,
-    ) -> Deadline {
-        match self.cleanup.begin(requested) {
-            Some(cleanup) if cleanup.end() < deadline.end() => cleanup,
-            Some(_) => deadline,
-            None => deadline.within_at(Instant::now(), Duration::ZERO),
+    pub(super) fn check_wait(&self) -> Result<()> {
+        if matches!(self.state(), RecorderState::Idle | RecorderState::Recording) {
+            Err(Error::InvalidState(StateError::StopNotRequested))
+        } else {
+            Ok(())
         }
     }
 
-    pub(super) fn bound_shutdown_wait(&mut self, requested: Instant) {
-        self.cleanup.begin(requested);
+    pub(super) fn settle_wait(&self, expired: bool, drained: bool) -> Option<FinishStatus> {
+        self.ledger.settle(expired, drained)
+    }
+
+    /// Start cleanup once, retaining an async close's original submission time.
+    pub(super) fn begin_cleanup(&mut self, requested: Instant) -> Option<Deadline> {
+        self.cleanup.begin(requested)
+    }
+
+    pub(super) fn cleanup_pending(&self) -> bool {
+        self.ledger.cleanup_pending()
     }
 
     /// Keep taking closure evidence even when the session's report is final.
@@ -1324,6 +1309,26 @@ mod tests {
         ledger.observe(FileClosed, path("take.mkv"));
         assert!(!ledger.cleanup_pending());
         assert_eq!(ledger.report, report);
+    }
+
+    #[test]
+    fn a_wait_settles_only_on_a_final_report_or_an_expired_completed_drain() {
+        let mut ledger = session();
+        ledger.observe(Started, path("take.mkv"));
+        ledger.stop_requested(true);
+        assert_eq!(ledger.settle(false, false), None);
+        assert_eq!(ledger.settle(false, true), None);
+        assert_eq!(ledger.settle(true, false), None);
+        assert!(matches!(
+            ledger.settle(true, true),
+            Some(FinishStatus::TimedOut(_))
+        ));
+        ledger.observe(FileClosed, path("take.mkv"));
+        ledger.drained(false);
+        assert!(matches!(
+            ledger.settle(false, false),
+            Some(FinishStatus::Closed(_))
+        ));
     }
 
     #[test]

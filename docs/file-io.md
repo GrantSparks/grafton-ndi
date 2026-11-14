@@ -155,6 +155,13 @@ bounded application notifications; dropped notifications do not alter its
 recording report. Configure queue limits with `AsyncFileOptions` and handle
 `QueueFull` when submitting commands.
 
+While `finish` or `wait_finished` waits for closure, the owner runs commands
+from every clone between event bursts. Status queries remain available, and
+several waits can observe the same session with independent deadlines. Native
+calls, including the initial stop, can still block the owner. A successful
+`reset` abandons the old native recorder and ends its pending finish waits with
+`InvalidState(Closed)`; a failed reset preserves those waits.
+
 Await `finish`, inspect its report, then await `close` to shut down all clones
 without blocking the executor. **Dropping the last clone blocks** until its
 worker exits; `drop_wait` does not bound native stop or destruction calls.
