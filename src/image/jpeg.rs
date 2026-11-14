@@ -15,6 +15,24 @@ pub(super) const MAX_DIMENSION: usize = u16::MAX as usize;
 /// Encode `pixels` as a JPEG of `quality` into `out`. The plan checked the
 /// quality and the dimensions.
 pub(super) fn encode(pixels: &mut Pixels<'_, u8>, quality: u8, out: &mut dyn Write) -> Result<()> {
+    // Plan validation precedes this function, including metadata/HDR checks.
+    // VideoPlane::data exposes only initialized contiguous active pixels;
+    // padded native rows must stay on the row path. Both color types ignore
+    // the fourth byte, including RGBX/BGRX's unspecified alpha.
+    if pixels.downscaler.is_none() {
+        if let Some((plane, rgb)) = pixels.reader.rgb_rows() {
+            if let Some(data) = plane.data() {
+                let color = if rgb {
+                    jpeg_encoder::ColorType::Rgba
+                } else {
+                    jpeg_encoder::ColorType::Bgra
+                };
+                return jpeg_encoder::Encoder::new(out, quality)
+                    .encode(data, to_u16(pixels.width()), to_u16(pixels.height()), color)
+                    .map_err(encoding_error);
+            }
+        }
+    }
     encode_rows(pixels, quality, out)
 }
 

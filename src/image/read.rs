@@ -219,6 +219,14 @@ impl<'a, P: Sample> Reader<'a, P> {
         }
     }
 
+    /// Four-byte RGB rows in their native channel order, before alpha policy.
+    pub(super) fn rgb_rows(&self) -> Option<(VideoPlane<'a>, bool)> {
+        match self.layout {
+            Layout::Rgb { plane, red, .. } if P::BYTES == 1 => Some((plane, red == 0)),
+            _ => None,
+        }
+    }
+
     /// Convert row `y` into `sink`.
     pub(super) fn row(&self, y: usize, sink: &mut impl Sink<P>) {
         let width = self.width;
