@@ -12,9 +12,14 @@ use std::{fs, path::PathBuf, process::Command};
 
 #[test]
 fn relative_environment_directories_never_run_constructors() {
+    let trusted_name = if cfg!(any(feature = "advanced", feature = "file-io")) {
+        "libndi_advanced.so.6"
+    } else {
+        "libndi.so.6"
+    };
     if let Ok(scenario) = std::env::var("GRAFTON_RELATIVE_TRUST_SCENARIO") {
         let root = PathBuf::from(std::env::var_os("GRAFTON_TRUST_ROOT").unwrap());
-        let trusted = root.join("trusted/libndi_advanced.so.6");
+        let trusted = root.join("trusted").join(trusted_name);
         let ndi = if scenario == "runtime" {
             Ndi::new().unwrap()
         } else {
@@ -42,11 +47,15 @@ fn relative_environment_directories_never_run_constructors() {
         for name in ["trusted", "executable", "relative", "loader"] {
             fs::create_dir(root.join(name)).unwrap();
         }
-        let trusted = root.join("trusted/libndi_advanced.so.6");
+        let trusted = root.join("trusted").join(trusted_name);
         FakeRuntime {
-            cfgs: vec!["fake_advanced"],
+            cfgs: if cfg!(any(feature = "advanced", feature = "file-io")) {
+                vec!["fake_advanced"]
+            } else {
+                Vec::new()
+            },
             version: Some("6.4.0.2"),
-            soname: Some("libndi_advanced.so.6"),
+            soname: Some(trusted_name),
             ..Default::default()
         }
         .build(&trusted);
