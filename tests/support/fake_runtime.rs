@@ -25,6 +25,8 @@
 //! * `fake_advanced` — also export the Advanced SDK entry points;
 //! * `fake_finder` — return the bounded-resource Finder fixtures in
 //!   `fake_finder.rs`, selected by `GRAFTON_FAKE_FINDER_CASE`;
+//! * `fake_changes` — consumable Finder and Advanced keyframe changes, with
+//!   explicit source announcements and one native wake per change;
 //! * `fake_capture` — script native media/notification delivery with
 //!   `GRAFTON_FAKE_CAPTURE_SCRIPT`; only active rows/channels are initialized;
 //! * `fake_receiver_controls` — clocked capture, stream controls and KVM log
@@ -894,3 +896,7 @@ stub! {
 #[cfg(fake_finder)]
 #[path = "fake_finder.rs"]
 mod finder;
+
+#[cfg(fake_changes)]
+#[path = "fake_changes.rs"]
+mod changes;

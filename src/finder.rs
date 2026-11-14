@@ -15,6 +15,7 @@ use std::{
 };
 
 use crate::{
+    change_feed::ChangeFeed,
     frames::copy_sdk_string,
     sys::{self, bindings::*},
     timeout::Deadline,
@@ -154,6 +155,8 @@ impl FinderOptions {
 ///
 /// `Finder` provides methods to discover and monitor NDI sources. It maintains
 /// a background thread that continuously updates the list of available sources.
+/// Concurrent lookups share native change reports: every waiting lookup is
+/// notified when the source list changes, then takes its own owned snapshot.
 ///
 /// # Examples
 ///
@@ -178,6 +181,7 @@ pub struct Finder {
     instance: NDIlib_find_instance_t,
     // SDK snapshots and their strings expire on the next snapshot call.
     sources_lock: Mutex<()>,
+    changes: ChangeFeed,
     _groups: Option<CString>,    // Hold ownership of CStrings
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
     #[cfg(feature = "advanced")]
@@ -286,6 +290,7 @@ impl Finder {
         Ok(Self {
             instance,
             sources_lock: Mutex::new(()),
+            changes: ChangeFeed::default(),
             _groups: groups,
             _extra_ips: extra_ips,
             #[cfg(feature = "advanced")]
@@ -352,6 +357,9 @@ impl Finder {
     ///
     /// This method blocks until the list of discovered sources changes or the
     /// timeout expires. Use this to efficiently monitor for source changes.
+    /// Concurrent waiters all observe a reported change. A zero timeout while
+    /// another thread waits only reads reports that thread has already
+    /// published; otherwise it makes one nonblocking native query.
     ///
     /// # Arguments
     ///
@@ -382,19 +390,20 @@ impl Finder {
     /// # }
     /// ```
     pub fn wait_for_sources(&self, timeout: Duration) -> Result<bool> {
-        Ok(self.wait_for_sources_ms(to_ms_checked(timeout)?))
+        let deadline = Deadline::after(timeout)?;
+        Ok(self.wait_for_sources_since(self.changes.generation(), deadline))
     }
 
-    /// [`Self::wait_for_sources`] with a timeout already in the SDK's
-    /// milliseconds.
-    fn wait_for_sources_ms(&self, timeout_ms: u32) -> bool {
+    /// Share one native report with every observer of the earlier generation.
+    fn wait_for_sources_since(&self, generation: u64, deadline: Deadline) -> bool {
         // SAFETY: the finder instance is live for this borrow.
-        unsafe {
-            self._ndi
-                .api()
-                .core
-                .NDIlib_find_wait_for_sources(self.instance, timeout_ms)
-        }
+        self.changes
+            .wait_since(generation, deadline, |timeout_ms| unsafe {
+                self._ndi
+                    .api()
+                    .core
+                    .NDIlib_find_wait_for_sources(self.instance, timeout_ms)
+            })
     }
 
     /// Returns the current list of discovered sources (snapshot).
@@ -508,6 +517,7 @@ impl Finder {
         // first snapshot already satisfies `accept`.
         let deadline = Deadline::after(timeout)?;
         loop {
+            let generation = self.changes.generation();
             let Some(sources) = self.current_sources_until(deadline)? else {
                 return Ok(None);
             };
@@ -520,7 +530,7 @@ impl Finder {
             // Block until the source list changes or the window ends; either
             // way the next iteration re-snapshots. The wait is rounded up, so
             // the last one lasts until the deadline rather than polling.
-            self.wait_for_sources_ms(deadline.remaining_ms());
+            self.wait_for_sources_since(generation, deadline);
         }
     }
 
@@ -663,7 +673,8 @@ unsafe impl std::marker::Send for Finder {}
 /// instance and invalidates its returned buffers on the next call. `sources_lock`
 /// serializes those calls through the complete deep copy into owned `Source`s.
 /// Waiting for source changes does not invalidate those buffers; destruction
-/// requires exclusive access through `Drop`.
+/// requires exclusive access through `Drop`. `changes` serializes native
+/// waits and broadcasts each report to concurrent Rust observers.
 unsafe impl std::marker::Sync for Finder {}
 
 fn accumulate_sources(
@@ -1256,6 +1267,8 @@ impl Display for Source {
 /// The cache is `Send + Sync`. Discovery runs outside its mutex so unrelated
 /// lookups and invalidation remain available; SDK snapshots retain their normal
 /// per-finder serialization. Returned vectors own copies of the descriptors.
+/// Concurrent discovery waits share change reports through that finder, so
+/// one lookup cannot consume another lookup's notification.
 /// Dropping the cache destroys its native finder and releases its runtime
 /// handle synchronously on the dropping thread.
 ///

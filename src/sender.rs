@@ -86,12 +86,14 @@ struct Inner {
     // The entry points of the runtime that created `instance`.
     core: &'static sys::Core,
     metadata_capture: parking_lot::Mutex<()>,
+    #[cfg(ndi_has_advanced_keyframe_demand)]
+    keyframe_changes: crate::change_feed::ChangeFeed,
 }
 
-// A panic cannot leave this half-changed: its one lock guards `()`, and no
-// application code runs while it is held. The `parking_lot` lock does not
+// A panic cannot leave metadata capture half-changed: its lock guards `()`,
+// and no application code runs while it is held. The `parking_lot` lock does not
 // poison and so does not declare this itself, which would otherwise leave
-// senders short of `RefUnwindSafe`.
+// senders short of `RefUnwindSafe`. The change feed uses unwind-safe standard locks.
 impl std::panic::RefUnwindSafe for Inner {}
 
 mod ownership {
@@ -1339,6 +1341,8 @@ impl<M: SenderMode> Sender<M> {
                 instance,
                 core,
                 metadata_capture: parking_lot::Mutex::new(()),
+                #[cfg(ndi_has_advanced_keyframe_demand)]
+                keyframe_changes: crate::change_feed::ChangeFeed::default(),
             },
             native: NativeOwner::new(SenderResource {
                 instance,
@@ -1603,6 +1607,14 @@ impl<M: AudioSendMode> Sender<M> {
 impl<M: SenderMode> Sender<M> {
     pub(crate) fn native_instance(&self) -> NDIlib_send_instance_t {
         self.inner.instance.0
+    }
+
+    /// All selectors consume the SDK's same one-shot report, including a
+    /// null selector beside a format-specific selector. Share the native wait
+    /// across them and filter the current demand at each caller.
+    #[cfg(ndi_has_advanced_keyframe_demand)]
+    pub(crate) fn keyframe_changes(&self) -> &crate::change_feed::ChangeFeed {
+        &self.inner.keyframe_changes
     }
 
     /// The handle the asynchronous video slots of this sender's owner send

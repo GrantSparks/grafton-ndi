@@ -2745,6 +2745,95 @@ fn h264_420_decodes_to_the_original_quadrants() {
     }
 }
 
+/// One request must reach every observer, including observers using a null
+/// stream selector beside observers naming the H.264 stream explicitly.
+#[test]
+fn concurrent_keyframe_waiters_observe_the_same_request() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("broadcast-keyframe")).unwrap();
+    let mut receiver = packet_receiver(
+        &ndi,
+        &sender.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
+    let format = VideoPacketFormat::new(VideoCodec::H264, 64, 64)
+        .unwrap()
+        .with_frame_rate(FrameRate::new(30, 1).unwrap());
+    let bitstream = include_bytes!("data/quadrants-420.h264");
+    let parameter_sets = parameter_sets(bitstream, |header| matches!(header & 0x1f, 1..=5));
+    let bytes =
+        PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, bitstream, parameter_sets).unwrap();
+    let mut frame = CompressedVideoFrame::new(format, bytes).unwrap();
+    connect(&mut receiver, "keyframe observer", |_| {
+        sender.send_video(&mut frame).unwrap();
+    });
+
+    for selectors in [
+        [None, None],
+        [Some(format), Some(format)],
+        [None, Some(format)],
+    ] {
+        for _ in 0..3 {
+            // Sending a keyframe clears demand. Consume earlier update reports
+            // before the concurrent waits, so only the explicit request wakes them.
+            sender.send_video(&mut frame).unwrap();
+            assert!(!sender.sender().keyframe_required(None).unwrap());
+            for selector in [None, Some(format)] {
+                while sender
+                    .sender()
+                    .wait_for_keyframe_change(Duration::ZERO, selector)
+                    .unwrap()
+                {}
+            }
+            let ready = std::sync::Barrier::new(3);
+            std::thread::scope(|scope| {
+                let sender = sender.sender();
+                let idle_stream = scope.spawn(|| {
+                    sender
+                        .wait_for_keyframe_change(
+                            Duration::from_millis(400),
+                            Some(format.with_tier(StreamTier::Preview)),
+                        )
+                        .unwrap()
+                });
+                let waits: Vec<_> = selectors
+                    .into_iter()
+                    .map(|selector| {
+                        let ready = &ready;
+                        scope.spawn(move || {
+                            ready.wait();
+                            sender
+                                .wait_for_keyframe_change(Duration::from_secs(2), selector)
+                                .unwrap()
+                        })
+                    })
+                    .collect();
+                ready.wait();
+                std::thread::sleep(Duration::from_millis(100));
+                let requested = Instant::now();
+                receiver.receiver().request_keyframe().unwrap();
+                for wait in waits {
+                    assert!(
+                        wait.join().unwrap(),
+                        "a keyframe waiter missed {selectors:?}"
+                    );
+                }
+                assert!(
+                    !idle_stream.join().unwrap(),
+                    "an idle preview stream observed program demand"
+                );
+                assert!(
+                    requested.elapsed() < Duration::from_secs(1),
+                    "a keyframe waiter returned late for {selectors:?}"
+                );
+            });
+        }
+    }
+}
+
 /// The Annex B units before the first slice of `bitstream`, start codes
 /// included: its parameter sets, which the SDK asks for both inline and in
 /// the envelope's extra data. `is_slice` tells a slice by its NAL header's

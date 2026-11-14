@@ -265,6 +265,13 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// Returns whether a change was signalled; call
     /// [`keyframe_required`](Self::keyframe_required) for the new state.
+    /// Concurrent waiters share one native update report. A format-specific
+    /// waiter reports the update when that stream currently needs a keyframe;
+    /// otherwise it keeps waiting within the same timeout. These reports are
+    /// coalesced invalidations, not a per-stream event history: pending demand
+    /// can be reported again, or a concurrent send can clear it before the
+    /// query. A zero timeout beside another native waiter only reads reports
+    /// that waiter has already published.
     ///
     /// # Errors
     ///
@@ -279,14 +286,32 @@ impl<M: SenderMode> Sender<M> {
     ) -> Result<bool> {
         let table = self.runtime().table::<KeyframeDemand>()?;
         native!(KeyframeDemand, table => {
-            let timeout = crate::to_ms_checked(_timeout)?;
+            let deadline = crate::timeout::Deadline::after(_timeout)?;
             let format = _format.map(VideoPacketFormat::raw);
-            // SAFETY: the sender instance is live for this borrow.
-            Ok(unsafe {
-                table.NDIlib_send_wait_for_keyframe_request(
-                    self.native_instance(), timeout, stream(format.as_ref()),
-                )
-            })
+            let changes = self.keyframe_changes();
+            let mut generation = changes.generation();
+            loop {
+                // SAFETY: the sender lives for this borrow. A null selector
+                // observes all updates; separate native waits for overlapping
+                // selectors can consume one another's report.
+                let changed = changes.wait_since(generation, deadline, |timeout| unsafe {
+                    table.NDIlib_send_wait_for_keyframe_request(
+                        self.native_instance(), timeout, std::ptr::null(),
+                    )
+                });
+                if !changed { return Ok(false); }
+                // Observe before filtering so a later report cannot fall into
+                // a gap between the demand query and the next wait.
+                generation = changes.generation();
+                // SAFETY: this query does not consume an update. The optional
+                // descriptor lives through the synchronous call.
+                if format.is_none() || unsafe {
+                    table.NDIlib_send_is_keyframe_required(self.native_instance(), stream(format.as_ref()))
+                } {
+                    return Ok(true);
+                }
+                if deadline.is_expired() { return Ok(false); }
+            }
         })
     }
 }

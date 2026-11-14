@@ -20,6 +20,8 @@ and extra IPs your application needs. Choose discovery by purpose:
   inspecting their addresses too.
 
 Selection and enumeration include snapshot-lock waits in their timeout budget.
+Concurrent waits on the same finder share each reported change, so every
+lookup can inspect the updated list promptly.
 A zero timeout makes one non-waiting attempt, which can miss a busy snapshot
 lock. Native snapshot work, copying and caller predicates can finish after the
 budget. `current_sources()` uses ordinary blocking serialization. Discovery

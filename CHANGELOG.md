@@ -156,6 +156,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   their receiver and blocking worker without waiting for the original timeout.
   Source-name polling now uses the same bounded attempts.
 
+- Concurrent Finder lookups and keyframe waiters share native change reports,
+  so one waiter cannot consume another waiter's notification. Native and
+  shared waits use the same deadline, including native waiter handoff.
 - [#140](https://github.com/GrantSparks/grafton-ndi/issues/140): enable runtime
   JPEG SIMD with scalar fallback and direct contiguous packed-RGB input;
   retry capture notifications immediately within bounded bursts; continue File

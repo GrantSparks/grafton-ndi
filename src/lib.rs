@@ -59,6 +59,7 @@
 )]
 
 mod capture;
+mod change_feed;
 mod color_info;
 mod error;
 mod media;
