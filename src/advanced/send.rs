@@ -466,7 +466,7 @@ pub(super) enum PendingVideo {
         frame: ScatterVideoFrame,
         // The scatter list given to the SDK, kept only so that its address
         // stays valid. Its arrays belong to the frame.
-        list: AliasableBox<FrameScatter>,
+        list: Option<AliasableBox<FrameScatter>>,
         table: &'static ScatterSend,
     },
 }
@@ -490,7 +490,42 @@ impl PendingVideo {
     #[cfg(ndi_has_advanced_scatter_send)]
     pub(super) fn scatter(mut frame: ScatterVideoFrame, table: &'static ScatterSend) -> Self {
         let list = AliasableBox::new(Box::new(frame.storage.descriptor(table)));
-        Self::Scatter { frame, list, table }
+        Self::Scatter {
+            frame,
+            list: Some(list),
+            table,
+        }
+    }
+
+    /// Structural queue authorization is allocation-free: permanent admission
+    /// failures happen before the first lend initializes its stable list.
+    #[cfg(ndi_has_advanced_scatter_send)]
+    pub(super) fn scatter_for_queue(frame: ScatterVideoFrame, table: &'static ScatterSend) -> Self {
+        Self::Scatter {
+            frame,
+            list: None,
+            table,
+        }
+    }
+
+    /// Lend a queue entry using the original first block as completion key.
+    /// Supported runtimes ignore these fields for scatter input and report
+    /// them unchanged in completion callbacks, including destruction callbacks.
+    pub(super) fn lend_for_queue(&mut self) -> Lent {
+        let lent = self.lend(());
+        #[cfg(ndi_has_advanced_scatter_send)]
+        {
+            let mut lent = lent;
+            if let Self::Scatter { frame, .. } = self {
+                let first = &mut frame.storage.blocks[0];
+                let descriptor = lent.descriptor_mut();
+                descriptor.p_data = first.as_mut_ptr();
+                descriptor.__bindgen_anon_1.data_size_in_bytes = first.len() as i32;
+            }
+            lent
+        }
+        #[cfg(not(ndi_has_advanced_scatter_send))]
+        lent
     }
 
     /// The stream the frame is sent on.
@@ -521,11 +556,16 @@ unsafe impl Lend for PendingVideo {
         match self {
             Self::Contiguous(frame) => Lent::Frame(frame.raw()),
             #[cfg(ndi_has_advanced_scatter_send)]
-            Self::Scatter { frame, list, table } => Lent::Scatter {
-                table,
-                frame: frame.descriptor(),
-                scatter: list.as_ptr(),
-            },
+            Self::Scatter { frame, list, table } => {
+                let list = list.get_or_insert_with(|| {
+                    AliasableBox::new(Box::new(frame.storage.descriptor(table)))
+                });
+                Lent::Scatter {
+                    table,
+                    frame: frame.descriptor(),
+                    scatter: list.as_ptr(),
+                }
+            }
         }
     }
 }

@@ -559,6 +559,62 @@ pub(crate) mod in_flight {
         },
     }
 
+    impl Lent {
+        pub(crate) fn descriptor(&self) -> &NDIlib_video_frame_v2_t {
+            match self {
+                Self::Frame(frame) => frame,
+                #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
+                Self::Scatter { frame, .. } => frame,
+            }
+        }
+
+        #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
+        pub(crate) fn descriptor_mut(&mut self) -> &mut NDIlib_video_frame_v2_t {
+            match self {
+                Self::Frame(frame) | Self::Scatter { frame, .. } => frame,
+            }
+        }
+
+        /// Submit through the one native dispatch used by ordinary and queued
+        /// asynchronous sending. Null-frame flushing is a distinct operation.
+        ///
+        /// # Safety
+        /// `sender` is live and owns the stream. `descriptor` describes this
+        /// loan and stays readable through the native call; with completion
+        /// callbacks it stays readable until completion. Every pointee,
+        /// including metadata, scatter list, arrays and payload, stays allocated
+        /// and inaccessible until native synchronization or completion ends
+        /// the loan. Any displaced loan stays live through this call's return.
+        pub(crate) unsafe fn submit(
+            &self,
+            sender: SendHandle,
+            descriptor: *const NDIlib_video_frame_v2_t,
+        ) {
+            match self {
+                Self::Frame(_) => {
+                    // SAFETY: the caller guarantees descriptor and loan lifetimes.
+                    unsafe {
+                        sender
+                            .core
+                            .NDIlib_send_send_video_async_v2(sender.instance.0, descriptor)
+                    };
+                }
+                #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
+                Self::Scatter { table, scatter, .. } => {
+                    // SAFETY: the same lifetime contract also covers the stable
+                    // scatter list and the arrays and payload it names.
+                    unsafe {
+                        table.NDIlib_send_send_video_scatter_async(
+                            sender.instance.0,
+                            descriptor,
+                            *scatter,
+                        )
+                    };
+                }
+            }
+        }
+    }
+
     /// One stream's asynchronously sent frame, and whether the SDK may still
     /// read it.
     ///
@@ -674,45 +730,11 @@ pub(crate) mod in_flight {
             // frame does not move what `lent` points to (the contract of
             // `Lend`).
             let displaced = Self(mem::replace(&mut self.0, State::InFlight(next)));
-            match lent {
-                // SAFETY: `sender` is the live sender whose stream this slot
-                // holds. The SDK reads the descriptor during the call, so it
-                // may be a stack value. It reads what the descriptor points
-                // to after the call returns, until the next synchronizing
-                // event on this stream: the frame in flight owns it, and
-                // leaves the slot only with a later call's proof or the
-                // sender's destruction, while the slot's owner ends the SDK's
-                // access before dropping it. Until this call returns the SDK
-                // may still read the displaced frame: `displaced` owns it
-                // across the call and is handed back only with the proof the
-                // call produces, so it cannot be dropped first.
-                Lent::Frame(frame) => unsafe {
-                    sender
-                        .core
-                        .NDIlib_send_send_video_async_v2(sender.instance.0, &frame)
-                },
-                #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
-                Lent::Scatter {
-                    table,
-                    frame,
-                    scatter,
-                } => {
-                    // SAFETY: as for a contiguous frame. The scatter
-                    // submission follows the rules of the asynchronous send
-                    // (`Processing.NDI.Advanced.h`), and what it reads after
-                    // the call, the frame's metadata, the scatter list at
-                    // `scatter`, the pointer and size arrays it refers to
-                    // and the blocks they name, all belong to the frame in
-                    // flight.
-                    unsafe {
-                        table.NDIlib_send_send_video_scatter_async(
-                            sender.instance.0,
-                            &frame,
-                            scatter,
-                        )
-                    }
-                }
-            }
+            // SAFETY: the slot owns the new payload and stable scatter list;
+            // this call-scoped header stays readable through submission. The
+            // displaced frame remains owned across this call and is returned
+            // only with the synchronization proof produced after it returns.
+            unsafe { lent.submit(sender, lent.descriptor()) };
             (displaced, Synchronized(()))
         }
     }

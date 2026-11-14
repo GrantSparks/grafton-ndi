@@ -84,15 +84,15 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             let length = frame.storage.blocks[0].len() as i32;
             frames.push(PendingVideo::scatter(frame, scatter));
             let Lent::Scatter {
-                mut frame,
+                frame,
                 scatter: list,
                 ..
-            } = frames.last_mut().unwrap().lend(())
+            } = frames.last_mut().unwrap().lend_for_queue()
             else {
                 unreachable!("a scatter frame was prepared");
             };
-            frame.p_data = key;
-            frame.__bindgen_anon_1.data_size_in_bytes = length;
+            assert_eq!(frame.p_data, key);
+            assert_eq!(unsafe { frame.__bindgen_anon_1.data_size_in_bytes }, length);
             expected.push((key as usize, number, length));
             // SAFETY: descriptor and scatter list describe the retained frame; no
             // payload is accessed again until sender destruction drains callbacks.
