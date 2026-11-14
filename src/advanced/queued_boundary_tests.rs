@@ -101,21 +101,22 @@ fn scatter_keys_and_concurrent_completions_preserve_allocations() {
             .map(|block| block.as_ptr() as usize)
             .collect::<Vec<_>>();
         let bytes = frame.retained_bytes();
-        let (mut frame, allocations) = crate::test_alloc::allocation_count(|| {
+        let (frame, allocations) = crate::test_alloc::allocation_count(|| {
             QueuedVideoFrame::from(frame).authorize_for_test(Some(table))
         });
         assert_eq!(
             allocations, 0,
             "authorization retains capabilities without allocating"
         );
-        let (lent, allocations) = crate::test_alloc::allocation_count(|| frame.lend(()));
-        assert_eq!(allocations, 1, "only the stable scatter-list descriptor");
-        assert_eq!(lent.descriptor().p_data as usize, pointers[0]);
         let mut locked = state.state.lock().unwrap();
         let (admitted, allocations) =
             crate::test_alloc::allocation_count(|| locked.admit(frame, bytes));
         let admitted = admitted.unwrap();
-        assert_eq!(allocations, 1, "only the native frame descriptor");
+        assert_eq!(
+            allocations, 0,
+            "frame and scatter descriptors use reserved slots"
+        );
+        assert_eq!(admitted.lent.descriptor().p_data as usize, pointers[0]);
         assert_eq!(admitted.id.get(), number);
         let key = admitted.lent.descriptor().p_data as usize;
         assert!(

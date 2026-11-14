@@ -13,7 +13,11 @@ use std::{
 #[cfg(any(test, ndi_has_advanced_send_completion))]
 use std::ffi::c_void;
 
-use super::{send::PendingVideo, CompressedVideoFrame, ScatterVideoFrame, SubmittedVideo};
+use super::{
+    send::PendingVideo,
+    send_slots::{DescriptorLease, DescriptorSlots},
+    CompressedVideoFrame, ScatterVideoFrame, SubmittedVideo,
+};
 use crate::{
     frames::{SendableVideoLayout, ValidatedVideoLayout, VideoParts},
     sender::in_flight::{self, Destroyed, Lend, Lent},
@@ -33,7 +37,9 @@ use super::aliasable::AliasableBox;
 /// frame the SDK has finished with but that has not been collected still uses
 /// its share. The byte budget includes retained payload capacity, even when a
 /// compressed frame uses only part of a pooled vector. The defaults are 8 frames
-/// and 512 MiB.
+/// and 512 MiB. Construction reserves one stable frame descriptor per frame
+/// and, when scatter sending is compiled in, one scatter-list descriptor.
+/// Completed frames retain their slots until collected.
 #[derive(Debug, Clone, Copy)]
 pub struct QueueOptions {
     frames: usize,
@@ -157,7 +163,7 @@ impl QueuedVideoFrame {
     fn authorize(
         self,
         sender: &Sender<QueueAttached>,
-    ) -> std::result::Result<QueuedStorage, Rejected<Self>> {
+    ) -> std::result::Result<AuthorizedVideo, Rejected<Self>> {
         self.authorize_with(
             |layout| sender.require_video_layout(layout),
             || sender.runtime().table::<ScatterSend>(),
@@ -170,14 +176,14 @@ impl QueuedVideoFrame {
         self,
         pixels: impl FnOnce(ValidatedVideoLayout) -> Result<SendableVideoLayout>,
         scatter: impl FnOnce() -> Result<&'static ScatterSend>,
-    ) -> std::result::Result<QueuedStorage, Rejected<Self>> {
+    ) -> std::result::Result<AuthorizedVideo, Rejected<Self>> {
         match self {
             Self::Pixels(frame) => match pixels(*frame.layout()) {
-                Ok(authorized) => Ok(QueuedStorage::Pixels { frame, authorized }),
+                Ok(authorized) => Ok(AuthorizedVideo::Pixels { frame, authorized }),
                 Err(error) => Err(Rejected::new(error, Self::Pixels(frame))),
             },
             Self::Compressed(frame) => match frame.validate_for_send() {
-                Ok(()) => Ok(QueuedStorage::Packet(PendingVideo::Contiguous(frame))),
+                Ok(()) => Ok(AuthorizedVideo::Compressed(frame)),
                 Err(error) => Err(Rejected::new(error, Self::Compressed(frame))),
             },
             Self::Scatter(frame) => {
@@ -186,19 +192,55 @@ impl QueuedVideoFrame {
                     Err(error) => return Err(Rejected::new(error, Self::Scatter(frame))),
                 };
                 native!(ScatterSend, table => {
-                    Ok(QueuedStorage::Packet(PendingVideo::scatter_for_queue(frame, table)))
+                    Ok(AuthorizedVideo::Scatter { frame, table })
                 })
             }
         }
     }
 
     #[cfg(test)]
-    fn authorize_for_test(self, scatter: Option<&'static ScatterSend>) -> QueuedStorage {
+    fn authorize_for_test(self, scatter: Option<&'static ScatterSend>) -> AuthorizedVideo {
         self.authorize_with(
             |layout| Ok(SendableVideoLayout::for_test(layout)),
             || scatter.ok_or_else(|| Error::InvalidInput("scatter table required by test".into())),
         )
         .unwrap()
+    }
+}
+
+/// Authorized payloads do not acquire descriptor storage until admitted.
+enum AuthorizedVideo {
+    Pixels {
+        frame: VideoFrame,
+        authorized: SendableVideoLayout,
+    },
+    Compressed(CompressedVideoFrame),
+    #[cfg(ndi_has_advanced_scatter_send)]
+    Scatter {
+        frame: ScatterVideoFrame,
+        table: &'static ScatterSend,
+    },
+}
+
+impl AuthorizedVideo {
+    fn into_frame(self) -> QueuedVideoFrame {
+        match self {
+            Self::Pixels { frame, .. } => frame.into(),
+            Self::Compressed(frame) => frame.into(),
+            #[cfg(ndi_has_advanced_scatter_send)]
+            Self::Scatter { frame, .. } => frame.into(),
+        }
+    }
+
+    fn retain(self, _slot: &mut DescriptorLease) -> QueuedStorage {
+        match self {
+            Self::Pixels { frame, authorized } => QueuedStorage::Pixels { frame, authorized },
+            Self::Compressed(frame) => QueuedStorage::Packet(PendingVideo::Contiguous(frame)),
+            #[cfg(ndi_has_advanced_scatter_send)]
+            Self::Scatter { frame, table } => {
+                QueuedStorage::Packet(PendingVideo::scatter_in(frame, table, _slot))
+            }
+        }
     }
 }
 
@@ -274,9 +316,8 @@ impl CompletedVideo {
 /// while the SDK may still write to them.
 struct Entry {
     id: SubmissionId,
-    // Kept so that the address given to the SDK stays valid. Its data
-    // pointer identifies the submission.
-    _header: AliasableBox<NDIlib_video_frame_v2_t>,
+    // Owns the fixed header slot until collection or proven destruction.
+    slot: DescriptorLease,
     frame: QueuedStorage,
     bytes: usize,
 }
@@ -314,6 +355,11 @@ struct State {
     bytes: usize,
     next: u64,
     options: QueueOptions,
+    slots: std::sync::Arc<DescriptorSlots>,
+    free: Vec<usize>,
+    // A fallibly reserved submission-thread workspace for rebuilding a map
+    // whose deletion tombstones have consumed its insertion capacity.
+    rehash: Vec<(usize, Entry)>,
 }
 
 impl State {
@@ -321,18 +367,13 @@ impl State {
     fn retained(&self) -> usize {
         self.in_flight.len() + self.ready.len()
     }
-    /// Prepare one stable descriptor, check bounds, assign its id and retain
-    /// ownership before any native call can produce a completion.
+    /// Check all admission bounds before acquiring descriptor storage. Then
+    /// initialize a free stable slot and record ownership before dispatch.
     fn admit(
         &mut self,
-        mut frame: QueuedStorage,
+        frame: AuthorizedVideo,
         bytes: usize,
     ) -> std::result::Result<Admitted, Rejected<QueuedVideoFrame>> {
-        // Lending checks pixel proof/storage agreement before any state change.
-        let lent = frame.lend(());
-        let header = AliasableBox::new(Box::new(*lent.descriptor()));
-        let key = header.p_data as usize;
-        let pointer = header.as_ptr();
         let Some(total) = self
             .bytes
             .checked_add(bytes)
@@ -355,6 +396,26 @@ impl State {
                 frame.into_frame(),
             ));
         };
+        debug_assert_eq!(self.free.len() + self.retained(), self.options.frames);
+        let index = *self
+            .free
+            .last()
+            .expect("admission leaves a descriptor slot free");
+        // SAFETY: free contains only unclaimed slots or slots returned after
+        // collection/destruction ended their old native loans. The state lock
+        // and exclusive video view serialize admission and reclamation.
+        let mut slot = unsafe { self.slots.claim(index) };
+        let mut frame = frame.retain(&mut slot);
+        // A mismatched pixel proof fails here, before free/bytes/next/maps
+        // change. An unused prepared slot has never been exposed to the SDK.
+        let lent = frame.lend(());
+        let pointer = slot.header(*lent.descriptor());
+        let key = lent.descriptor().p_data as usize;
+        if self.in_flight.capacity() == self.in_flight.len() {
+            self.rebuild_index();
+        }
+        let claimed = self.free.pop();
+        debug_assert_eq!(claimed, Some(index));
         let id = SubmissionId(self.next);
         self.next = next;
         self.bytes = total;
@@ -364,7 +425,7 @@ impl State {
             key,
             Entry {
                 id,
-                _header: header,
+                slot,
                 frame,
                 bytes,
             },
@@ -372,16 +433,39 @@ impl State {
         Ok(Admitted { id, lent, pointer })
     }
 
+    /// HashMap removal can consume insertion capacity without shrinking its
+    /// allocation. Draining resets the existing table, and both transfer
+    /// buffers were reserved for the maximum retained count at construction.
+    /// Entries move without moving any native pointee; the state lock excludes
+    /// completion callbacks throughout the rebuild.
+    fn rebuild_index(&mut self) {
+        debug_assert!(self.rehash.is_empty());
+        debug_assert!(self.rehash.capacity() >= self.in_flight.len());
+        for pair in self.in_flight.drain() {
+            self.rehash.push(pair);
+        }
+        debug_assert!(self.in_flight.capacity() > self.rehash.len());
+        for (key, entry) in self.rehash.drain(..) {
+            self.in_flight.insert(key, entry);
+        }
+        debug_assert!(self.in_flight.capacity() > self.in_flight.len());
+    }
+
     /// Release every retained entry only after native destruction. Both
     /// explicit close and implicit drop use this path, so even an unmatched
     /// completion cannot release a frame while the SDK might still use it.
     fn release_retained(&mut self, _destroyed: &Destroyed, mut release: impl FnMut(Entry)) {
         for entry in self.ready.drain(..) {
+            let index = entry.slot.index();
             release(entry);
+            self.free.push(index);
         }
         for (_, entry) in self.in_flight.drain() {
+            let index = entry.slot.index();
             release(entry);
+            self.free.push(index);
         }
+        debug_assert_eq!(self.free.len(), self.options.frames);
         self.bytes = 0;
     }
 
@@ -409,14 +493,22 @@ impl CallbackState {
     #[cfg(any(test, ndi_has_advanced_send_completion))]
     fn new(options: QueueOptions) -> Result<Box<Self>> {
         let options = options.validate()?;
-        let unavailable =
-            |_| Error::InvalidInput("unable to allocate bounded completion storage".into());
+        use super::send_slots::unavailable;
         let mut in_flight = HashMap::new();
         in_flight.try_reserve(options.frames).map_err(unavailable)?;
         let mut ready = VecDeque::new();
         ready
             .try_reserve_exact(options.frames)
             .map_err(unavailable)?;
+        let mut rehash = Vec::new();
+        rehash
+            .try_reserve_exact(options.frames)
+            .map_err(unavailable)?;
+        let slots = DescriptorSlots::new(options.frames)?;
+        let mut free = Vec::new();
+        free.try_reserve_exact(options.frames)
+            .map_err(unavailable)?;
+        free.extend((0..options.frames).rev());
         let state = Box::new(Self {
             max_bytes: options.bytes,
             state: Mutex::new(State {
@@ -425,6 +517,9 @@ impl CallbackState {
                 bytes: 0,
                 next: 1,
                 options,
+                slots,
+                free,
+                rehash,
             }),
             changed: Condvar::new(),
             protocol_error: AtomicBool::new(false),
@@ -738,9 +833,9 @@ impl QueuedSender {
     ///
     /// The queue owns the frame until it is collected: the SDK writes to a
     /// compressed frame's bytes while it sends them. A collected frame can be
-    /// submitted again. Submission does not scan previously submitted frames.
-    /// It allocates one retained native descriptor, and for scatter frames one
-    /// stable scatter-list descriptor. Pixels, blocks and metadata move without
+    /// submitted again.
+    /// Descriptor storage is reserved at construction, so accepted submission
+    /// allocates nothing. Pixels, blocks and metadata move without
     /// copies or growth; owned uncompressed frames already hold all SDK tail
     /// room their layout and scan type need.
     ///
@@ -929,7 +1024,10 @@ impl QueuedVideo<'_> {
 fn take_completed(state: &mut State) -> Option<CompletedVideo> {
     let entry = state.ready.pop_front()?;
     state.bytes -= entry.bytes;
-    Some(entry.into_completed())
+    let index = entry.slot.index();
+    let completed = entry.into_completed();
+    state.free.push(index);
+    Some(completed)
 }
 
 #[cfg(test)]
@@ -937,7 +1035,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_submission_keeps_the_single_descriptor_allocation() {
+    fn split_submission_reuses_reserved_descriptors() {
         let Some(ndi) = crate::test_support::advanced_ndi() else {
             return;
         };
@@ -954,7 +1052,232 @@ mod tests {
         assert_eq!(allocations, 0);
         let (result, allocations) = crate::test_alloc::allocation_count(|| video.try_submit(frame));
         result.unwrap();
-        assert_eq!(allocations, 1);
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn slots_are_retained_through_out_of_order_completion_and_reused_after_collection() {
+        let callback = CallbackState::new(QueueOptions::default().max_frames(3)).unwrap();
+        let mut admitted = Vec::new();
+        for _ in 0..3 {
+            let frame = VideoFrame::builder().resolution(2, 2).build().unwrap();
+            let bytes = frame.retained_bytes();
+            admitted.push(
+                callback
+                    .state
+                    .lock()
+                    .unwrap()
+                    .admit(
+                        QueuedVideoFrame::from(frame).authorize_for_test(None),
+                        bytes,
+                    )
+                    .unwrap(),
+            );
+        }
+        assert!(callback.state.lock().unwrap().free.is_empty());
+        std::thread::scope(|scope| {
+            for index in [2, 0] {
+                let callback = &callback;
+                let key = admitted[index].lent.descriptor().p_data as usize;
+                scope.spawn(move || callback.complete(key));
+            }
+        });
+        let mut state = callback.state.lock().unwrap();
+        assert_eq!(
+            (state.in_flight.len(), state.ready.len(), state.free.len()),
+            (1, 2, 0)
+        );
+        let (completed, allocations) =
+            crate::test_alloc::allocation_count(|| take_completed(&mut state).unwrap());
+        assert_eq!(allocations, 0);
+        let prior = admitted
+            .iter()
+            .find(|entry| entry.id == completed.id())
+            .unwrap();
+        let frame = VideoFrame::builder().resolution(4, 2).build().unwrap();
+        let bytes = frame.retained_bytes();
+        let replacement = state
+            .admit(
+                QueuedVideoFrame::from(frame).authorize_for_test(None),
+                bytes,
+            )
+            .unwrap();
+        assert_eq!(replacement.pointer, prior.pointer);
+        // SAFETY: the new synthetic header is initialized in the reclaimed
+        // slot and has never been given to native code.
+        assert_eq!(unsafe { (*replacement.pointer).xres }, 4);
+        for other in admitted.iter().filter(|entry| entry.id != completed.id()) {
+            assert_ne!(replacement.pointer, other.pointer);
+            // SAFETY: these retained synthetic headers were never exposed to
+            // native code, remain initialized, and their slots are not reused.
+            assert_eq!(unsafe { (*other.pointer).xres }, 2);
+        }
+        assert!(state.free.is_empty());
+    }
+
+    #[cfg(ndi_has_advanced_scatter_send)]
+    #[test]
+    fn native_admission_rejection_and_retry_use_only_reserved_descriptor_storage() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let packet =
+            super::super::VideoPacketFormat::new(super::super::VideoCodec::SpeedHq422, 16, 16)
+                .unwrap();
+        for variant in 0..3 {
+            let make = || match variant {
+                0 => QueuedVideoFrame::Pixels(
+                    VideoFrame::builder().resolution(16, 16).build().unwrap(),
+                ),
+                1 => QueuedVideoFrame::Compressed(
+                    CompressedVideoFrame::new(packet, vec![1, 2, 3, 4]).unwrap(),
+                ),
+                _ => QueuedVideoFrame::Scatter(
+                    ScatterVideoFrame::new(packet, vec![vec![1, 2, 3, 4], vec![5, 6]]).unwrap(),
+                ),
+            };
+            for limit in [QueueLimit::Frames, QueueLimit::Bytes] {
+                let first = make();
+                let limits = if limit == QueueLimit::Frames {
+                    QueueOptions::default().max_frames(1)
+                } else {
+                    QueueOptions::default()
+                        .max_frames(2)
+                        .max_bytes(first.retained_bytes())
+                };
+                let mut queue = QueuedSender::new(
+                    &ndi,
+                    &SenderOptions::new(crate::test_support::unique_name("reserved-admission"))
+                        .clock_video(false),
+                    limits,
+                )
+                .unwrap();
+                let (result, allocations) =
+                    crate::test_alloc::allocation_count(|| queue.try_submit(first));
+                let first_id = result.unwrap();
+                assert_eq!(allocations, 0, "accepted variant {variant}");
+                let second = make();
+                let (result, allocations) =
+                    crate::test_alloc::allocation_count(|| queue.try_submit(second));
+                let rejected = result.unwrap_err();
+                assert!(matches!(rejected.error(), Error::QueueFull(actual) if *actual == limit));
+                assert_eq!(allocations, 1, "only the Rejected box, variant {variant}");
+                assert_eq!(
+                    queue
+                        .wait_completed(Duration::from_secs(5))
+                        .unwrap()
+                        .unwrap()
+                        .id(),
+                    first_id
+                );
+                let second = rejected.into_parts().1;
+                let (result, allocations) =
+                    crate::test_alloc::allocation_count(|| queue.try_submit(second));
+                result.unwrap();
+                assert_eq!(allocations, 0, "accepted retry variant {variant}");
+                assert_eq!(queue.close().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn rebuilding_the_completion_index_reuses_reserved_storage_and_preserves_loans() {
+        let callback = CallbackState::new(QueueOptions::default().max_frames(4)).unwrap();
+        let admitted = (0..3)
+            .map(|_| {
+                let frame = VideoFrame::builder().resolution(2, 2).build().unwrap();
+                let bytes = frame.retained_bytes();
+                callback
+                    .state
+                    .lock()
+                    .unwrap()
+                    .admit(
+                        QueuedVideoFrame::from(frame).authorize_for_test(None),
+                        bytes,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut state = callback.state.lock().unwrap();
+        let before = (
+            state.bytes,
+            state.next,
+            state.free.len(),
+            state.in_flight.capacity(),
+            state.rehash.capacity(),
+        );
+        let ((), allocations) = crate::test_alloc::allocation_count(|| state.rebuild_index());
+        assert_eq!(allocations, 0);
+        assert_eq!(
+            (
+                state.bytes,
+                state.next,
+                state.free.len(),
+                state.in_flight.capacity(),
+                state.rehash.capacity()
+            ),
+            before
+        );
+        assert!(state.rehash.is_empty());
+        for loan in admitted {
+            let entry = state
+                .in_flight
+                .get(&(loan.lent.descriptor().p_data as usize))
+                .unwrap();
+            assert_eq!(entry.id, loan.id);
+            // SAFETY: the synthetic header remains owned and initialized in
+            // the same leased slot; no native sender accesses this test state.
+            assert_eq!(unsafe { (*loan.pointer).xres }, 2);
+        }
+    }
+
+    #[test]
+    fn descriptor_admission_and_collection_stay_allocation_free_under_churn() {
+        for capacity in [2, 4, 7, 8, 14, 16, 28, 56, 112] {
+            let callback =
+                CallbackState::new(QueueOptions::default().max_frames(capacity)).unwrap();
+            let mut frames = (0..2304)
+                .map(|_| VideoFrame::builder().resolution(2, 2).build().unwrap())
+                .collect::<Vec<_>>();
+            let mut keys = vec![0usize; capacity - 1];
+            for key in keys.iter_mut() {
+                let frame = frames.pop().unwrap();
+                let bytes = frame.retained_bytes();
+                let admitted = callback
+                    .state
+                    .lock()
+                    .unwrap()
+                    .admit(
+                        QueuedVideoFrame::from(frame).authorize_for_test(None),
+                        bytes,
+                    )
+                    .unwrap();
+                *key = admitted.lent.descriptor().p_data as usize;
+            }
+            for index in 0..2000 {
+                let frame = frames.pop().unwrap();
+                let bytes = frame.retained_bytes();
+                let authorized = QueuedVideoFrame::from(frame).authorize_for_test(None);
+                let (admitted, allocations) = crate::test_alloc::allocation_count(|| {
+                    callback.state.lock().unwrap().admit(authorized, bytes)
+                });
+                let admitted = admitted.unwrap();
+                assert_eq!(
+                    allocations, 0,
+                    "accepted submission {index}, capacity {capacity}"
+                );
+                let completed = std::mem::replace(
+                    &mut keys[index % (capacity - 1)],
+                    admitted.lent.descriptor().p_data as usize,
+                );
+                callback.complete(completed);
+                let (collected, allocations) = crate::test_alloc::allocation_count(|| {
+                    take_completed(&mut callback.state.lock().unwrap())
+                });
+                assert!(collected.is_some());
+                assert_eq!(allocations, 0);
+            }
+        }
     }
 
     #[test]
@@ -994,18 +1317,18 @@ mod tests {
                 .line_stride_bytes(stride)
                 .build()
                 .unwrap();
-            let mut frame = QueuedVideoFrame::from(borrowed.owned_copy()).authorize_for_test(None);
-            #[allow(irrefutable_let_patterns)]
-            let Lent::Frame(raw) = frame.lend(()) else {
-                panic!("pixels")
-            };
-            let QueuedStorage::Pixels { frame: pixels, .. } = &frame else {
-                panic!("pixels")
-            };
+            let pixels = borrowed.owned_copy();
+            let readable = pixels.data().len() + pixels.tail_room();
+            let pointer = pixels.data().as_ptr();
+            let bytes = pixels.retained_bytes();
+            let frame = QueuedVideoFrame::from(pixels).authorize_for_test(None);
+            let callback = CallbackState::new(QueueOptions::default()).unwrap();
+            let mut state = callback.state.lock().unwrap();
+            let admitted = state.admit(frame, bytes).unwrap();
             crate::frames::descriptor_tests::assert_extent(
-                &raw,
-                pixels.data().as_ptr(),
-                pixels.data().len() + pixels.tail_room(),
+                admitted.lent.descriptor(),
+                pointer,
+                readable,
             );
         }
     }
@@ -1058,11 +1381,16 @@ mod tests {
                 QueuedVideoFrame::Compressed(frame) => frame.data().as_ptr(),
                 QueuedVideoFrame::Scatter(frame) => frame.blocks().next().unwrap().as_ptr(),
             };
-            let mut authorized = frame.authorize_for_test(Some(table));
-            assert_eq!(
-                authorized.lend(()).descriptor().p_data.cast_const(),
-                expected
-            );
+            let bytes = frame.retained_bytes();
+            let authorized = frame.authorize_for_test(Some(table));
+            let callback = CallbackState::new(QueueOptions::default()).unwrap();
+            let admitted = callback
+                .state
+                .lock()
+                .unwrap()
+                .admit(authorized, bytes)
+                .unwrap();
+            assert_eq!(admitted.lent.descriptor().p_data.cast_const(), expected);
         }
     }
 
