@@ -88,7 +88,7 @@ fn combined_capture_receives_single_kinds_and_interleaved_media_after_reconnect(
         for epoch in 0..=reconnects {
             if epoch != 0 {
                 receiver.disconnect();
-                receiver.reconnect()?;
+                receiver.reconnect();
             }
             let marker = format!("<mixed-metadata epoch=\"{epoch}\"/>");
             let timecode = Timecode::from_ticks(1234 + epoch);

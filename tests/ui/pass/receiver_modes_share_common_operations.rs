@@ -5,7 +5,7 @@ fn common<M: ReceiverMode>(receiver: &Receiver<M>) {
     let _ = receiver.ptz().is_supported();
     let _ = receiver.connection_stats();
     let _ = receiver.connection_target();
-    let _ = receiver.reconnect();
+    receiver.reconnect();
 }
 fn metadata_and_events<M: MetadataMode>(receiver: &Receiver<M>) {
     common(receiver);

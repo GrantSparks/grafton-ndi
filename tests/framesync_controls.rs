@@ -107,7 +107,7 @@ fn exercise_kvm(library: std::path::PathBuf) {
     // Drop releases only the second session's key, before the disconnect.
     drop(session);
     receiver.disconnect();
-    receiver.reconnect().unwrap();
+    receiver.reconnect();
     drop(receiver);
 
     let log = fs::read_to_string(&log_path).unwrap();

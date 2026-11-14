@@ -95,7 +95,7 @@ fn switch(receiver: &mut Receiver, next: &Source) {
     drop(session);
     receiver.connect_to(next).unwrap();
     receiver.disconnect();
-    receiver.reconnect().unwrap();
+    receiver.reconnect();
     let mut session = receiver.kvm().unwrap();
     session.mouse_down(MouseButton::Left).unwrap();
     session.release_all().unwrap();

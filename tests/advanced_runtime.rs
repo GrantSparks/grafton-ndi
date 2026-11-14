@@ -244,7 +244,7 @@ fn advanced_native_constructors_controls_and_queue() {
         let _ = receiver.poll_event(Duration::ZERO).unwrap();
         let _ = receiver.metadata().capture(Duration::ZERO).unwrap();
         let _ = receiver.video().capture_ref(Duration::ZERO).unwrap();
-        receiver.reconnect().unwrap();
+        receiver.reconnect();
     }
     for change in [
         av.controls().set_stream_tier(StreamTier::Program).unwrap(),

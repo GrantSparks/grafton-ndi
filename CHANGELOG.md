@@ -27,6 +27,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Received video and audio survive unreadable optional per-frame metadata.
   `metadata_status()` reports why text was withheld; forwarding and owned
   copies omit it. Standalone metadata capture remains strict.
+- Synchronous `Receiver::reconnect()` returns `()` and reuses its validated
+  native target without allocating. Async reconnect remains fallible for task
+  submission; `connection_target()` still returns the latest requested source.
+
 - Async receiver callback and blocking-operation panics resume on the awaiting
   task with their original payload after native frame cleanup. `SpawnFailed`
   now carries `SpawnFailure`, distinguishing a missing runtime from cancellation.

@@ -922,6 +922,13 @@ pub struct Receiver<M: ReceiverMode = RawCapture> {
 // This deliberately does not assert RefUnwindSafe for a shared receiver borrow.
 impl<M: ReceiverMode + std::panic::UnwindSafe> std::panic::UnwindSafe for Receiver<M> {}
 
+/// A requested target and the native descriptor already validated for it.
+/// Replaced as one value under the capture guard, so neither half can be stale.
+struct ConnectionTarget {
+    source: Source,
+    raw: RawSource,
+}
+
 pub(crate) struct ReceiverCore {
     pub(crate) instance: NDIlib_recv_instance_t,
     pub(crate) _ndi: Ndi,
@@ -935,7 +942,7 @@ pub(crate) struct ReceiverCore {
     ///
     /// A shared hold is a [`CaptureLock`], taken for one [`Attempt`] only, and
     /// the native capture cannot be called without one.
-    capture_guard: RwLock<Source>,
+    capture_guard: RwLock<ConnectionTarget>,
     pending_status: AtomicBool,
     pending_source: AtomicBool,
     pending_unknown: Mutex<Option<u32>>,
@@ -1046,7 +1053,10 @@ impl Receiver {
             core: Arc::new(ReceiverCore {
                 instance,
                 _ndi: ndi.clone(),
-                capture_guard: RwLock::new(options.source.clone()),
+                capture_guard: RwLock::new(ConnectionTarget {
+                    source: options.source.clone(),
+                    raw: raw._source,
+                }),
                 pending_status: AtomicBool::new(false),
                 pending_source: AtomicBool::new(false),
                 pending_unknown: Mutex::new(None),
@@ -1229,11 +1239,13 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Invalid input leaves the target unchanged. Existing FrameSync ownership
     /// remains.
     pub fn connect_to(&self, source: &Source) -> Result<()> {
-        let raw = source.to_raw()?;
-        let source = source.clone();
+        let next = ConnectionTarget {
+            source: source.clone(),
+            raw: source.to_raw()?,
+        };
         let mut target = self.core.capture_guard.write();
-        self.core.connect_raw(Some(&raw), &target);
-        *target = source;
+        self.core.connect_raw(Some(&next.raw), &target);
+        *target = next;
         Ok(())
     }
 
@@ -1380,20 +1392,15 @@ impl<M: ReceiverMode> Receiver<M> {
     /// call, so call it off the async runtime — `AsyncReceiver::reconnect`
     /// does this for you.
     ///
-    /// # Errors
-    ///
-    /// Returns an error only if the stored [`Source`] cannot be
-    /// re-marshalled to its FFI representation; `NDIlib_recv_connect`
-    /// itself reports no status, so a returned `Ok` means the reconnect was
-    /// *issued*, not that the feed has recovered — confirm recovery via
+    /// Uses the retained, validated target without allocation or conversion.
+    /// `NDIlib_recv_connect` reports no status: returning means the request was
+    /// issued, not that the feed recovered. Confirm recovery through
     /// [`Self::connection_stats`].
-    pub fn reconnect(&self) -> Result<()> {
-        // Read the target under the same exclusive lock as the native call,
-        // so a concurrent connect_to cannot be overwritten by a stale retry.
+    pub fn reconnect(&self) {
+        // Read and submit under the same exclusive lock, so a concurrent
+        // connect_to cannot be overwritten by a stale retained descriptor.
         let target = self.core.capture_guard.write();
-        let raw = target.to_raw()?;
-        self.core.connect_raw(Some(&raw), &target);
-        Ok(())
+        self.core.connect_raw(Some(&target.raw), &target);
     }
 
     /// An owned snapshot of the latest requested connection target.
@@ -1415,7 +1422,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # }
     /// ```
     pub fn connection_target(&self) -> Source {
-        self.core.capture_guard.read().clone()
+        self.core.capture_guard.read().source.clone()
     }
 
     /// Get connection and performance statistics for this receiver.
@@ -1602,7 +1609,11 @@ impl ReceiverCore {
     /// instance, the one combination `Processing.NDI.Recv.h` does not make safe.
     /// Each attempt holds the guard for one [`Attempt`] at most, so this waits
     /// about one poll interval at most.
-    fn connect_raw(&self, source: Option<&RawSource>, _exclusive: &RwLockWriteGuard<'_, Source>) {
+    fn connect_raw(
+        &self,
+        source: Option<&RawSource>,
+        _exclusive: &RwLockWriteGuard<'_, ConnectionTarget>,
+    ) {
         let source = source.map_or(ptr::null(), |raw| ptr::from_ref(&raw.raw));
         // SAFETY: the receiver instance is live for this borrow. `source` is
         // null or points into a `RawSource`, which owns the strings its
@@ -1628,7 +1639,7 @@ impl ReceiverCore {
 
     /// Hold the lock a reconnect holds, so that a test can contend with capture.
     #[cfg(all(test, any(feature = "advanced", feature = "tokio", feature = "smol")))]
-    pub(crate) fn reconnect_lock(&self) -> parking_lot::RwLockWriteGuard<'_, Source> {
+    pub(crate) fn reconnect_lock(&self) -> impl Drop + '_ {
         self.capture_guard.write()
     }
 
@@ -1923,7 +1934,7 @@ impl ReceiverCore {
 pub(crate) struct CaptureLock<'rx> {
     core: &'rx ReceiverCore,
     attempt: Attempt,
-    _shared: RwLockReadGuard<'rx, Source>,
+    _shared: RwLockReadGuard<'rx, ConnectionTarget>,
 }
 
 impl<'rx> CaptureLock<'rx> {
@@ -2842,6 +2853,29 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_reuses_validated_name_url_and_ip_targets_without_allocating() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        for source in [
+            Source::new("retained name"),
+            Source::new("retained URL")
+                .with_address(crate::SourceAddress::Url("ndi://127.0.0.1:5961".into())),
+            Source::new("retained IP")
+                .with_address(crate::SourceAddress::Ip("127.0.0.1:5961".into())),
+        ] {
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source.clone())).unwrap();
+            let ((), allocations) = crate::test_alloc::allocation_count(|| receiver.reconnect());
+            assert_eq!(allocations, 0);
+            assert_eq!(receiver.connection_target(), source);
+            receiver.disconnect();
+            let ((), allocations) = crate::test_alloc::allocation_count(|| receiver.reconnect());
+            assert_eq!(allocations, 0);
+            assert_eq!(receiver.connection_target(), source);
+        }
+    }
+
+    #[test]
     fn receiver_allocated_strings_free_once_even_when_utf8_is_invalid() {
         use std::sync::atomic::AtomicUsize;
         static FREES: AtomicUsize = AtomicUsize::new(0);
@@ -3558,7 +3592,7 @@ mod tests {
             });
             waiting.send(()).unwrap();
             let began = Instant::now();
-            receiver.reconnect().unwrap();
+            receiver.reconnect();
             let reconnected = began.elapsed();
             let (nothing_arrived, captured_for, sdk_calls) = capture.join().unwrap();
 

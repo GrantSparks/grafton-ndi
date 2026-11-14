@@ -711,7 +711,7 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
     receiver
         .video()
         .capture_with(Duration::ZERO, move |_| {
-            reenter.receiver().reconnect().unwrap();
+            reenter.receiver().reconnect();
             assert!(reenter
                 .receiver()
                 .audio()

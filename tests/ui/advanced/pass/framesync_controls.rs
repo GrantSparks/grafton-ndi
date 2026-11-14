@@ -24,7 +24,7 @@ fn framesync(sync: &mut FrameSync) -> Result<()> {
     session.release_all()?;
     drop((video, audio, metadata));
     drop(session);
-    sync.receiver().reconnect()?;
+    sync.receiver().reconnect();
     let _ = sync.controls().kvm()?;
     Ok(())
 }
@@ -45,7 +45,7 @@ fn avsync(sync: &mut AvSync) -> Result<()> {
     session.release_all()?;
     drop(video);
     drop(session);
-    sync.receiver().reconnect()?;
+    sync.receiver().reconnect();
     let _ = sync.controls().kvm()?;
     Ok(())
 }
@@ -61,7 +61,7 @@ fn allocated(receiver: &mut AllocatedReceiver) -> Result<()> {
     session.release_all()?;
     drop(frame);
     drop(session);
-    receiver.receiver().reconnect()?;
+    receiver.receiver().reconnect();
     let _ = receiver.controls().kvm()?;
     Ok(())
 }

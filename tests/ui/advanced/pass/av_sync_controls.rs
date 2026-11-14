@@ -28,7 +28,7 @@ fn controls(receiver: &Receiver<AvSyncAttached>) {
     let _ = receiver.send_metadata(&MetadataFrame::new("<sync/>").unwrap());
     let _ = receiver.set_video_delay(Duration::ZERO);
     let _ = receiver.connect_to(&Source::new("OTHER (Program)"));
-    let _ = receiver.reconnect();
+    receiver.reconnect();
 }
 fn zero_copy(sync: &AvSync) -> grafton_ndi::Result<()> {
     controls(sync.receiver());
@@ -68,7 +68,7 @@ fn scoped(sync: &AvSync) {
         let receiver = sync.receiver();
         scope.spawn(move || {
             let _ = receiver.metadata().capture(Duration::ZERO);
-            let _ = receiver.reconnect();
+            receiver.reconnect();
         });
         let _ = sync.queued_audio(AvSyncRequest::automatic());
     });

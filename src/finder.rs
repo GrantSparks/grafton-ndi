@@ -1002,6 +1002,11 @@ pub(crate) struct RawSource {
 // it, as moving a `CString` does.
 unsafe impl Send for RawSource {}
 
+// SAFETY: a shared descriptor exposes only immutable pointers into the C strings
+// this value owns. Their buffers stay allocated for the shared borrow and no SDK
+// operation writes through them, so concurrent readers cannot race with mutation.
+unsafe impl Sync for RawSource {}
+
 impl Source {
     /// The source named `name`, without an address.
     pub fn new(name: impl Into<String>) -> Self {

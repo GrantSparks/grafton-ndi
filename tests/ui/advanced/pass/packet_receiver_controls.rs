@@ -14,7 +14,7 @@ fn controls(receiver: &Receiver<PacketAttached>) {
     let _ = receiver.ptz().is_supported();
     let _ = receiver.request_keyframe();
     let _ = receiver.send_metadata(&MetadataFrame::new("<relay/>").unwrap());
-    let _ = receiver.reconnect();
+    receiver.reconnect();
 }
 fn packet_controls(packets: &mut PacketReceiver) {
     controls(packets.receiver());

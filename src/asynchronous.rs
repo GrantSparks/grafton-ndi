@@ -695,8 +695,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// # Errors
     ///
-    /// The errors of [`Receiver::reconnect`], and [`Error::SpawnFailed`] for a
-    /// missing runtime context or cancelled blocking task.
+    /// [`Error::SpawnFailed`] for a missing runtime context or cancelled
+    /// blocking task. The synchronous [`Receiver::reconnect`] cannot fail.
     ///
     /// # Cancellation
     ///
@@ -706,7 +706,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// after this future is dropped.
     pub async fn reconnect(&self) -> Result<()> {
         let receiver = Arc::clone(&self.inner);
-        R::spawn_blocking(private::Token, move || receiver.reconnect()).await?
+        R::spawn_blocking(private::Token, move || receiver.reconnect()).await
     }
 }
 
