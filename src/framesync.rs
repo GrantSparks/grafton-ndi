@@ -339,6 +339,11 @@ pub struct FrameSync {
     receiver: Receiver<FrameSyncAttached>,
 }
 
+const _: () = {
+    const fn send_and_sync<T: Send + Sync>() {}
+    send_and_sync::<FrameSync>();
+};
+
 struct FrameSyncResource {
     instance: NDIlib_framesync_instance_t,
     // Retain the runtime directly until after native destruction.
@@ -980,7 +985,7 @@ impl FrameSync {
 /// it. It retains the SDK runtime directly. Borrowed frame guards cannot be moved
 /// between threads and keep this owner borrowed until their buffers are
 /// freed; destruction requires exclusive ownership.
-unsafe impl Send for FrameSync {}
+unsafe impl Send for FrameSyncResource {}
 
 /// # Safety
 ///
@@ -1005,10 +1010,11 @@ unsafe impl Send for FrameSync {}
 ///
 /// `one_framesync_serves_captures_from_several_threads_at_once` in
 /// tests/framesync_capture_boundary.rs repeats the last check briefly with
-/// every runtime the tests run against. Receiver attachment disables raw
-/// video and audio capture until the synchronizer is destroyed, including
-/// when the receiver is accessed through [`FrameSync::receiver`].
-unsafe impl Sync for FrameSync {}
+/// every runtime the tests run against. The enclosing FrameSync's
+/// Receiver<FrameSyncAttached> contributes its own auto traits; attachment
+/// disables raw video and audio capture until this resource is destroyed,
+/// including when the receiver is accessed through [`FrameSync::receiver`].
+unsafe impl Sync for FrameSyncResource {}
 
 impl fmt::Debug for FrameSync {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
