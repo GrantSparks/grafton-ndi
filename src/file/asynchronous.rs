@@ -46,6 +46,13 @@ const PROBE_CAPACITY: usize = 64;
 thread_local! {
     /// Joining an owner here can stall the shared timer/probe worker, or form
     /// a cycle with another owner whose executor callbacks release handles.
+    #[cfg_attr(
+        target_os = "android",
+        allow(
+            clippy::missing_const_for_thread_local,
+            reason = "Clippy 1.100 re-lints the Android OS-backed TLS expansion despite this const initializer"
+        )
+    )]
     static FILE_THREAD: Cell<bool> = const { Cell::new(false) };
 }
 
