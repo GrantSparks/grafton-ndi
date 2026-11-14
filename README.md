@@ -56,7 +56,7 @@ No Cargo feature is enabled by default. Enable the APIs your application uses:
 | `image-encoding` | PNG, JPEG, lossless/lossy WebP and data URLs from uncompressed video |
 | `tokio`, `smol` | Receiver adapters for the chosen async runtime; independent features |
 | `advanced` | Advanced SDK operations; availability also depends on build headers and runtime |
-| `file-io` | Recording and playback through the separate File library; independent of `advanced` |
+| `file-io` | Recording and playback through the separate File library |
 
 Cargo features select Rust APIs. They do not select a native library or establish
 license entitlement. Check
