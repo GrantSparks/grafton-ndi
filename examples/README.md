@@ -74,6 +74,7 @@ See [Advanced requirements](../docs/advanced.md#requirements) for headers, featu
 | [`advanced_passthrough.rs`](advanced_passthrough.rs) | `cargo run --features advanced --example advanced_passthrough` | Relay compressed video and audio without decoding. |
 | [`advanced_queued_send.rs`](advanced_queued_send.rs) | `cargo run --features advanced --example advanced_queued_send` | Queue video frames and reuse each after SDK completion. |
 | [`advanced_allocator.rs`](advanced_allocator.rs) | `cargo run --features advanced --example advanced_allocator` | Receive frames into memory the application supplies. |
+| [Allocator-backed packet capture](../docs/advanced.md#custom-receive-allocation) | Guide snippet | Borrow compressed payloads from application memory with `attach_packets` and `capture_ref`. |
 | [`advanced_avsync.rs`](advanced_avsync.rs) | `cargo run --features advanced --example advanced_avsync` | Fetch the audio that belongs to each video frame. |
 | [`advanced_genlock.rs`](advanced_genlock.rs) | `cargo run --features advanced --example advanced_genlock` | Pace a sender from another source's clock. |
 | [`advanced_kvm.rs`](advanced_kvm.rs) | `cargo run --features advanced --example advanced_kvm` | Remote keyboard and mouse control of a source that offers it. |

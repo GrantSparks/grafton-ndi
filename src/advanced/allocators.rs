@@ -21,7 +21,7 @@ use std::{
 
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use super::{invalid_frame, sdk_quantity, AudioCodec, VideoCodec};
-use super::{invalid_input, PacketItem, PacketReceiver, ReceiverControls};
+use super::{invalid_input, PacketItem, PacketItemRef, PacketReceiver, ReceiverControls};
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use crate::sys::bindings::*;
 use crate::{
@@ -1050,9 +1050,8 @@ impl AllocatorService {
 ///
 /// It is [`Send`] and [`Sync`], as the packet receiver and an
 /// [`AllocatedReceiver`] are: capturing, setting and resetting allocators,
-/// and dropping it can each happen on any thread. Capturing and changing an
-/// allocator take it mutably; a shared reference reaches only the receiver's
-/// controls.
+/// and dropping it can each happen on any thread. Captures borrow it immutably;
+/// changing allocators requires an exclusive borrow.
 pub struct AllocatedPacketReceiver {
     // Its Send and Sync are those of the allocation, which an
     // AllocatedReceiver shares. The SDK calls the policies on threads of its
@@ -1072,8 +1071,19 @@ impl AllocatedPacketReceiver {
     /// # Errors
     ///
     /// As for [`PacketReceiver::capture`].
-    pub fn capture(&mut self, timeout: std::time::Duration) -> Result<Option<PacketItem>> {
+    pub fn capture(&self, timeout: std::time::Duration) -> Result<Option<PacketItem>> {
         PacketReceiver::capture_from(self.inner.receiver(), timeout)
+    }
+
+    /// Borrow a packet directly from SDK or application-provided storage.
+    /// A held item keeps its custom allocation charged until the SDK releases
+    /// it after the item is dropped. See [`PacketReceiver::capture_ref`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`PacketReceiver::capture_ref`].
+    pub fn capture_ref(&self, timeout: std::time::Duration) -> Result<Option<PacketItemRef<'_>>> {
+        PacketReceiver::capture_ref_from(self.inner.receiver(), timeout)
     }
 
     /// The receiver, for its controls; see [`PacketReceiver::receiver`].

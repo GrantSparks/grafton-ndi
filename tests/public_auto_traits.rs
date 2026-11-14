@@ -276,6 +276,11 @@ fn advanced_types_keep_their_auto_traits() {
         ClockSource: Send, Sync, UnwindSafe, RefUnwindSafe;
         CompletedVideo: Send, Sync, UnwindSafe, RefUnwindSafe;
         CompressedAudioFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
+        CompressedAudioRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        CompressedVideoRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        PacketItemRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ReceivedAudioRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ReceivedVideoRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         CompressedSender: Send, Sync, UnwindSafe, RefUnwindSafe;
         CompressedVideoFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         EnvelopeCodec: Send, Sync, UnwindSafe, RefUnwindSafe;

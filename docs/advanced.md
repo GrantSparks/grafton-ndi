@@ -67,15 +67,19 @@ decoded mixed media use the feature-free
 
 Construct a packet receiver with `ReceiverOptions` and a `PassthroughPreset`.
 A supported format named by the preset passes through compressed; other media
-can arrive decoded. `capture(timeout)` returns an owned
-`PacketItem::{Video, Audio, Metadata, Event}`. Notifications use the common
+can arrive decoded. `capture_ref(timeout)` returns a borrowed
+`PacketItemRef::{Video, Audio, Metadata, Event}`; `capture(timeout)` makes the
+same capture and copies it into an owned `PacketItem`. Compressed references
+expose codec bytes without copying their payload or metadata. Their `to_owned`
+and `copy_into` methods make sendable owned packets; `copy_into` reuses buffers. Notifications use the common
 `ReceiverEvent` model and are consumed once. `Ok(None)` means the wait budget
 expired, rather than proof that the source disconnected. Packet receivers
 cannot feed `FrameSync`.
 
-Capture takes `&mut self`; shared controls remain available through
-`receiver()`. `controls()` reaches exclusive stream selection and KVM, and a
-packet KVM session captures through its own `capture()`. Neither route exposes
+Both capture methods take `&self`; controls remain available through
+`receiver()` while a packet is borrowed. `controls()` reaches exclusive stream selection and KVM, and a
+packet KVM session also provides `capture_ref()`. Its result borrows the
+receiver, so inputs can be released while a packet is held. Neither route exposes
 raw receiver capture. See
 [`advanced_passthrough`](../examples/advanced_passthrough.rs) for receiving and
 relaying a source's compressed packets.
@@ -175,6 +179,22 @@ unavailable generations, policy errors/panics and refused buffers. Counters
 never reset, include retired policies and saturate at `u64::MAX`. Each declined
 request increments one reason. Updates add no allocation, callback or logging
 on SDK threads.
+
+`AllocatorService::attach_packets` gives packet capture the same application
+buffers. Use `AllocatedPacketReceiver::capture_ref` to inspect those buffers
+in place; owned `capture` copies them. Keeping a packet reference retains its
+allocation and usage charge until the SDK releases that buffer after the
+reference is dropped. For example, after constructing `service` and `packets`:
+
+```rust,ignore
+let mut receiver = service.attach_packets(packets)?;
+receiver.set_video_allocator(|request| AllocationBuffer::zeroed(request))?;
+if let Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(packet))) =
+    receiver.capture_ref(Duration::from_secs(1))?
+{
+    inspect_codec_bytes(packet.data()); // Still in the policy's allocation.
+}
+```
 
 `AllocationBuffer::zeroed(request)` provides zeroed, 64-byte-aligned memory.
 Use `request.with_stride_bytes(stride)` for permitted line/channel padding.

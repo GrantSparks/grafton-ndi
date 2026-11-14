@@ -121,6 +121,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 - `QueuedVideoFrame::Scatter` queues separate encoder blocks without joining
   them and returns their original allocations after native completion.
+- Packet receivers, allocator-backed packet receivers and packet KVM sessions
+  support borrowed capture, including compressed payloads in application memory.
+  Borrowed packets can copy into reusable owned frames for relaying.
+
 - `QueuedSender::split` and `CompressedSender::split` lend video and audio
   operations to separate scoped threads without an external lock.
 - `AllocationDecline` and process-wide custom receive allocation decline

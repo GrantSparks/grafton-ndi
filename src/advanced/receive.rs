@@ -1,20 +1,23 @@
 //! Receiving compressed packets instead of decoded frames.
 
+#[cfg(test)]
+use crate::capture::CaptureKind;
 use std::time::Duration;
 
 use super::{
-    packets, AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame,
-    ReceiverControls, VideoCodec,
+    AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedAudioRef, CompressedVideoFrame,
+    CompressedVideoRef, ReceiverControls, VideoCodec,
 };
 use crate::{
-    capture::{AudioKind, CaptureKind, Delivered, Guard, MetadataKind, VideoKind},
+    capture::{AudioKind, CaptureStrategy, Delivered, Guard, MetadataKind, VideoKind},
     receiver::PacketAttached,
     sys::{
         advanced::{native, ReceiverConfiguration},
         bindings::*,
     },
     timeout::Deadline,
-    AudioFrame, MetadataFrame, Ndi, Receiver, ReceiverEvent, ReceiverOptions, Result, VideoFrame,
+    AudioFrame, AudioFrameRef, MetadataFrame, MetadataFrameRef, Ndi, Receiver, ReceiverEvent,
+    ReceiverOptions, Result, VideoFrame, VideoFrameRef,
 };
 
 /// Which compressed formats a [`PacketReceiver`] passes through.
@@ -99,10 +102,80 @@ pub enum PacketItem {
     Event(ReceiverEvent),
 }
 
+/// Borrowed video returned by a packet receiver, retaining its native buffer.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ReceivedVideoRef<'rx> {
+    /// Decoded pixels borrowed from the receiver.
+    Decoded(VideoFrameRef<'rx>),
+    /// Codec bytes borrowed in place.
+    Compressed(CompressedVideoRef<'rx>),
+}
+
+impl ReceivedVideoRef<'_> {
+    /// Copy into the corresponding owned packet or decoded frame.
+    pub fn to_owned(&self) -> ReceivedVideo {
+        match self {
+            Self::Decoded(frame) => ReceivedVideo::Decoded(frame.to_owned()),
+            Self::Compressed(frame) => ReceivedVideo::Compressed(frame.to_owned()),
+        }
+    }
+}
+
+/// Borrowed audio returned by a packet receiver.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ReceivedAudioRef<'rx> {
+    /// Decoded samples borrowed from the receiver.
+    Decoded(AudioFrameRef<'rx>),
+    /// Codec bytes borrowed in place.
+    Compressed(CompressedAudioRef<'rx>),
+}
+
+impl ReceivedAudioRef<'_> {
+    /// Copy into the corresponding owned packet or decoded samples.
+    pub fn to_owned(&self) -> ReceivedAudio {
+        match self {
+            Self::Decoded(frame) => ReceivedAudio::Decoded(frame.to_owned()),
+            Self::Compressed(frame) => ReceivedAudio::Compressed(frame.to_owned()),
+        }
+    }
+}
+
+/// One borrowed packet, decoded frame, metadata frame, or receiver event.
+///
+/// Media retains its SDK or custom-allocator buffer until dropped. Each
+/// reference borrows the receiver, and may be moved or shared across threads.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PacketItemRef<'rx> {
+    /// Video, decoded or compressed according to the preset.
+    Video(ReceivedVideoRef<'rx>),
+    /// Audio, decoded or compressed according to the preset.
+    Audio(ReceivedAudioRef<'rx>),
+    /// A standalone metadata frame.
+    Metadata(MetadataFrameRef<'rx>),
+    /// A coalesced receiver invalidation, as in owned capture.
+    Event(ReceiverEvent),
+}
+
+impl PacketItemRef<'_> {
+    /// Copy the item into independent owned storage. Events are copied directly.
+    pub fn to_owned(&self) -> PacketItem {
+        match self {
+            Self::Video(frame) => PacketItem::Video(frame.to_owned()),
+            Self::Audio(frame) => PacketItem::Audio(frame.to_owned()),
+            Self::Metadata(frame) => PacketItem::Metadata(frame.to_owned()),
+            Self::Event(event) => PacketItem::Event(*event),
+        }
+    }
+}
+
 /// A receiver that delivers compressed packets where it can.
 ///
 /// One capture call returns whichever frame or event arrives first, as a
-/// [`PacketItem`]; every result owns its data. It cannot feed a
+/// [`PacketItem`] from [`capture`](Self::capture), or a borrowed
+/// [`PacketItemRef`] from [`capture_ref`](Self::capture_ref). It cannot feed a
 /// [`FrameSync`](crate::framesync::FrameSync), which needs decoded frames.
 ///
 /// [`receiver`](Self::receiver) and [`controls`](Self::controls) reach
@@ -115,9 +188,9 @@ pub enum PacketItem {
 ///
 /// A packet receiver is [`Send`] and [`Sync`], as the [`Receiver`] it holds
 /// is: it can be created on one thread, capture on another and be dropped on a
-/// third. [`capture`](Self::capture) takes it mutably, so it captures one call
-/// at a time; through a shared reference only the receiver's controls are
-/// reached, which any number of threads may use at once.
+/// third. Both capture methods take a shared reference, so packet references
+/// coexist with shared receiver controls. Native captures run under the
+/// receiver's shared capture guard; reconnecting takes the exclusive guard.
 ///
 /// # Examples
 ///
@@ -148,8 +221,8 @@ pub struct PacketReceiver {
     // passthrough color format, and its capture is the receiver's
     // NDIlib_recv_capture_v3, which the SDK lets several threads call at
     // once (Processing.NDI.Recv.h), under the receiver's capture guard.
-    // Every result is copied into owned values and the SDK's frame freed
-    // before `capture` returns, so no SDK buffer outlives the call.
+    // Borrowed results retain their Guard until dropped; its lifetime keeps
+    // this owner alive. Owned capture copies through that same borrowed path.
     pub(crate) receiver: Receiver<PacketAttached>,
 }
 
@@ -241,42 +314,64 @@ impl PacketReceiver {
     /// [`Error::InvalidInput`]: crate::Error::InvalidInput
     /// [`Error::CaptureFailed`]: crate::Error::CaptureFailed
     /// [`Error::InvalidFrame`]: crate::Error::InvalidFrame
-    pub fn capture(&mut self, timeout: Duration) -> Result<Option<PacketItem>> {
+    pub fn capture(&self, timeout: Duration) -> Result<Option<PacketItem>> {
         Self::capture_from(&self.receiver, timeout)
     }
 
-    /// [`capture`](Self::capture) on `receiver`, in the receiver's own capture
-    /// loop.
+    /// Borrow the next packet or decoded frame without copying its payload or
+    /// metadata. The item keeps its native buffer until dropped, including
+    /// application memory charged to a custom allocator's limits.
+    ///
+    /// Timeout, event and reconnect semantics are those of [`Self::capture`].
+    /// Shared receiver controls remain available while an item is borrowed.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::capture`].
+    pub fn capture_ref(&self, timeout: Duration) -> Result<Option<PacketItemRef<'_>>> {
+        Self::capture_ref_from(&self.receiver, timeout)
+    }
+
     pub(crate) fn capture_from(
         receiver: &Receiver<PacketAttached>,
         timeout: Duration,
     ) -> Result<Option<PacketItem>> {
+        Ok(Self::capture_ref_from(receiver, timeout)?.map(|item| item.to_owned()))
+    }
+
+    pub(crate) fn capture_ref_from(
+        receiver: &Receiver<PacketAttached>,
+        timeout: Duration,
+    ) -> Result<Option<PacketItemRef<'_>>> {
         receiver.core.capture_any_until_with(
             Deadline::after(timeout)?,
             crate::receiver::NeverStop,
-            PacketItem::Event,
-            |delivered| Self::capture_result(receiver, delivered),
+            PacketItemRef::Event,
+            |delivered| Self::capture_result_ref(receiver, delivered),
         )
     }
 
-    /// Interpret one guarded native result through the same receiver event
-    /// model as raw mixed capture.
+    fn capture_result_ref<'rx>(
+        receiver: &'rx Receiver<PacketAttached>,
+        delivered: Delivered<'rx>,
+    ) -> Result<Option<PacketItemRef<'rx>>> {
+        let item = match delivered {
+            Delivered::Video(frame) => video_ref_event(frame)?,
+            Delivered::Audio(frame) => audio_ref_event(frame)?,
+            Delivered::Metadata(frame) => metadata_ref_event(frame)?,
+            Delivered::Notification(notification) => {
+                return Ok(receiver.core.event(notification).map(PacketItemRef::Event));
+            }
+        };
+        Ok(Some(item))
+    }
+
+    #[cfg(test)]
     fn capture_result(
         receiver: &Receiver<PacketAttached>,
         delivered: Delivered<'_>,
     ) -> Result<Option<PacketItem>> {
-        // Each guard borrows the receiver and frees its frame exactly once
-        // through the matching NDIlib_recv_free_* function, whether or not
-        // the copy succeeds.
-        let item = match delivered {
-            Delivered::Video(frame) => video_event(frame)?,
-            Delivered::Audio(frame) => audio_event(frame)?,
-            Delivered::Metadata(frame) => metadata_event(frame)?,
-            Delivered::Notification(notification) => {
-                return Ok(receiver.core.event(notification).map(PacketItem::Event));
-            }
-        };
-        Ok(Some(item))
+        Ok(Self::capture_result_ref(receiver, delivered)?.map(|item| item.to_owned()))
     }
 }
 
@@ -297,47 +392,46 @@ fn creation_options(
         .allow_video_fields(true)
 }
 
-// Each delivered frame is held by the receiver's shared capture guard, which
-// returns it to the SDK when dropped: after the copy, or when validation fails
-// first.
-
-/// Copy a delivered video frame: a codec packet as it is, any other frame as
-/// the receiver's owned video capture copies it.
-fn video_event(frame: Guard<'_, VideoKind>) -> Result<PacketItem> {
+fn video_ref_event(frame: Guard<'_, VideoKind>) -> Result<PacketItemRef<'_>> {
     let video = if VideoCodec::from_outer(frame.frame().FourCC).is_some() {
-        // SAFETY: the FourCC marks a compressed frame, whose descriptor holds
-        // the size of its data. The guard keeps the frame's buffers allocated
-        // until it is dropped, after the copy.
-        ReceivedVideo::Compressed(unsafe { packets::copy_video_packet(frame.frame())? })
+        ReceivedVideoRef::Compressed(CompressedVideoRef::new(frame)?)
     } else {
-        ReceivedVideo::Decoded(decoded(frame)?)
+        // SAFETY: this delivered guard owns the SDK's uncompressed frame;
+        // construction validates its descriptor while retaining its buffers.
+        ReceivedVideoRef::Decoded(unsafe { VideoKind::make_ref(frame)? })
     };
-    Ok(PacketItem::Video(video))
+    Ok(PacketItemRef::Video(video))
 }
 
-/// Copy a delivered audio frame; see [`video_event`].
-fn audio_event(frame: Guard<'_, AudioKind>) -> Result<PacketItem> {
+fn audio_ref_event(frame: Guard<'_, AudioKind>) -> Result<PacketItemRef<'_>> {
     let audio = if AudioCodec::from_outer(frame.frame().FourCC).is_some() {
-        // SAFETY: as for video.
-        ReceivedAudio::Compressed(unsafe { packets::copy_audio_packet(frame.frame())? })
+        ReceivedAudioRef::Compressed(CompressedAudioRef::new(frame)?)
     } else {
-        ReceivedAudio::Decoded(decoded(frame)?)
+        // SAFETY: as for decoded video, with this audio guard's sample storage.
+        ReceivedAudioRef::Decoded(unsafe { AudioKind::make_ref(frame)? })
     };
-    Ok(PacketItem::Audio(audio))
+    Ok(PacketItemRef::Audio(audio))
 }
 
-/// Copy a delivered metadata frame.
+fn metadata_ref_event(frame: Guard<'_, MetadataKind>) -> Result<PacketItemRef<'_>> {
+    // SAFETY: the delivered guard retains this standalone metadata allocation
+    // while the validated reference borrows it.
+    Ok(PacketItemRef::Metadata(unsafe {
+        MetadataKind::make_ref(frame)?
+    }))
+}
+
+#[cfg(test)]
+fn video_event(frame: Guard<'_, VideoKind>) -> Result<PacketItem> {
+    video_ref_event(frame).map(|frame| frame.to_owned())
+}
+#[cfg(test)]
+fn audio_event(frame: Guard<'_, AudioKind>) -> Result<PacketItem> {
+    audio_ref_event(frame).map(|frame| frame.to_owned())
+}
+#[cfg(test)]
 fn metadata_event(frame: Guard<'_, MetadataKind>) -> Result<PacketItem> {
-    decoded(frame).map(PacketItem::Metadata)
-}
-
-/// Copy an uncompressed frame through the receiver's validated borrowed view
-/// and its owned conversion, exactly as [`Receiver`] capture does.
-fn decoded<K: CaptureKind>(frame: Guard<'_, K>) -> Result<K::Owned> {
-    // SAFETY: a receiver guard of kind `K` holds a frame its capture delivered
-    // as that kind; the view validates the rest before reading through it.
-    let frame = unsafe { K::make_ref(frame)? };
-    Ok(K::ref_to_owned(&frame))
+    metadata_ref_event(frame).map(|frame| frame.to_owned())
 }
 
 #[cfg(test)]
@@ -711,3 +805,7 @@ mod tests {
         traits::<crate::advanced::AllocatedPacketReceiver>();
     }
 }
+
+#[cfg(test)]
+#[path = "receive/borrowed_tests.rs"]
+mod borrowed_tests;

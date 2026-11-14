@@ -4,7 +4,9 @@
 use std::ffi::CString;
 use std::{collections::BTreeSet, time::Duration};
 
-use super::{invalid_input, KvmReceiver, PacketAttached, PacketItem, PacketReceiver};
+use super::{
+    invalid_input, KvmReceiver, PacketAttached, PacketItem, PacketItemRef, PacketReceiver,
+};
 #[cfg(ndi_has_advanced_kvm)]
 use crate::sys::bindings::NDIlib_recv_instance_t;
 #[cfg(any(doc, test, ndi_has_advanced_kvm))]
@@ -371,20 +373,30 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     }
 }
 
-impl KvmSession<'_, PacketAttached> {
+impl<'a> KvmSession<'a, PacketAttached> {
     /// Wait up to `timeout` for the next frame or event of a
     /// [`PacketReceiver`], exactly as [`PacketReceiver::capture`] does, while
     /// the session holds its inputs.
     ///
     /// Every result owns its data, so nothing it returns keeps the session
-    /// borrowed. It takes `&mut self`, as the packet receiver's does, so one
-    /// capture runs at a time.
+    /// borrowed. Both packet capture methods use a shared borrow of the
+    /// receiver, as the packet receiver's own capture methods do.
     ///
     /// # Errors
     ///
     /// As for [`PacketReceiver::capture`].
-    pub fn capture(&mut self, timeout: Duration) -> Result<Option<PacketItem>> {
+    pub fn capture(&self, timeout: Duration) -> Result<Option<PacketItem>> {
         PacketReceiver::capture_from(self.receiver, timeout)
+    }
+
+    /// Borrow a packet for the underlying receiver's lifetime, so inputs can
+    /// still be released while the packet is held. See [`PacketReceiver::capture_ref`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`PacketReceiver::capture_ref`].
+    pub fn capture_ref(&self, timeout: Duration) -> Result<Option<PacketItemRef<'a>>> {
+        PacketReceiver::capture_ref_from(self.receiver, timeout)
     }
 }
 

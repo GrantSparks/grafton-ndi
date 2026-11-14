@@ -260,7 +260,7 @@ fn advanced_native_constructors_controls_and_queue() {
     genlock.connect(None).unwrap();
     let _ = genlock.is_active();
     drop(genlock);
-    let mut packets = PacketReceiver::new(
+    let packets = PacketReceiver::new(
         &ndi,
         &ReceiverOptions::new(Source::new("")).config(config.clone()),
         PassthroughPreset::HevcWithAudio,
@@ -1949,7 +1949,7 @@ fn a_packet_receiver_moves_between_threads() {
     let receiver = std::thread::scope(|scope| {
         let capture = scope.spawn(|| {
             let _stop = StopOnDrop(&stop);
-            let mut receiver = receiver;
+            let receiver = receiver;
             let deadline = Instant::now() + PATIENCE;
             let mut verified = 0;
             while verified < 4 {
@@ -3327,4 +3327,188 @@ fn a_genlock_moves_between_threads() {
             .join()
             .unwrap();
     });
+}
+
+/// A borrowed compressed packet stays in the exact application allocation
+/// granted to the native receiver, until its receive guard is released.
+#[test]
+fn borrowed_packet_payload_stays_in_external_allocator_memory() {
+    use std::{
+        alloc::{alloc_zeroed, dealloc, Layout},
+        ptr::NonNull,
+    };
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    struct Storage {
+        pointer: NonNull<u8>,
+        layout: Layout,
+        freed: Arc<AtomicBool>,
+    }
+    // SAFETY: Storage exclusively owns its aligned initialized allocation;
+    // transfer between SDK threads changes no pointer or storage extent.
+    unsafe impl Send for Storage {}
+    // SAFETY: alloc_zeroed provides 64-byte aligned initialized memory, the
+    // pointer/extent never change, and only the SDK accesses it before Drop.
+    unsafe impl ExternalAllocation for Storage {
+        fn pointer(&self) -> NonNull<u8> {
+            self.pointer
+        }
+        fn capacity(&self) -> usize {
+            self.layout.size()
+        }
+    }
+    impl Drop for Storage {
+        fn drop(&mut self) {
+            // SAFETY: this value owns the allocation made with this Layout,
+            // and the SDK has released its last lease before dropping it.
+            unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
+            self.freed.store(true, Ordering::Release);
+        }
+    }
+    let buffers = Arc::new(Mutex::new(Vec::new()));
+    let mut sender = CompressedSender::new(&ndi, &options("borrowed-external-packet")).unwrap();
+    let receiver = PacketReceiver::new(
+        &ndi,
+        &ReceiverOptions::new(loopback(&ndi, &sender.sender().source().unwrap())),
+        PassthroughPreset::ProtectedWithAudio,
+    )
+    .unwrap();
+    let service =
+        AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default()).unwrap();
+    let mut receiver = service.attach_packets(receiver).unwrap();
+    let grants = buffers.clone();
+    receiver
+        .set_video_allocator(move |request: AllocationRequest| {
+            let layout = Layout::from_size_align(request.minimum_bytes(), 64).unwrap();
+            // SAFETY: requests are positive bounded extents, with checked alignment.
+            let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).expect("test allocation");
+            let freed = Arc::new(AtomicBool::new(false));
+            grants
+                .lock()
+                .unwrap()
+                .push((pointer.as_ptr() as usize, layout.size(), freed.clone()));
+            AllocationBuffer::from_external(
+                request,
+                Storage {
+                    pointer,
+                    layout,
+                    freed,
+                },
+            )
+            .map_err(|error| error.into_error())
+        })
+        .unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    let held = loop {
+        assert!(
+            Instant::now() < deadline,
+            "no allocator-backed compressed packet: {}",
+            link(receiver.receiver())
+        );
+        let mut frame = keyframe(VideoCodec::H264, StreamTier::Program, FIRST_TIMECODE);
+        sender.send_video(&mut frame).unwrap();
+        if let Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(frame))) =
+            receiver.capture_ref(SLICE).unwrap()
+        {
+            break frame;
+        }
+    };
+    let pointer = held.data().as_ptr() as usize;
+    let length = held.data().len();
+    let freed = buffers
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|(start, capacity, freed)| {
+            (*start <= pointer && pointer + length <= start + capacity).then(|| freed.clone())
+        })
+        .expect("payload must be inside the application's granted allocation");
+    assert!(!freed.load(Ordering::Acquire));
+    let retained = service.usage().retained_allocations();
+    assert!(retained > 0);
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        !freed.load(Ordering::Acquire),
+        "held reference keeps its allocation alive"
+    );
+    receiver.receiver().connection_stats();
+    drop(held);
+    let deadline = Instant::now() + PATIENCE;
+    while !freed.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "native packet lease outlived its dropped guard"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(service.usage().retained_allocations() < retained);
+    drop(receiver);
+    drop(sender);
+}
+
+#[test]
+fn borrowed_packet_capture_decodes_formats_outside_its_preset() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    if !common::hx_decoder(&ndi, H264Decoder) {
+        return;
+    }
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("borrowed-decoded-fallback")).unwrap();
+    let receiver = PacketReceiver::new(
+        &ndi,
+        &ReceiverOptions::new(loopback(&ndi, &sender.sender().source().unwrap())),
+        PassthroughPreset::SpeedHq,
+    )
+    .unwrap();
+    let bitstream = include_bytes!("data/quadrants-420.h264");
+    let config = parameter_sets(bitstream, |header| matches!(header & 0x1f, 1..=5));
+    let format = VideoPacketFormat::new(VideoCodec::H264, 64, 64)
+        .unwrap()
+        .with_frame_rate(FrameRate::new(30, 1).unwrap());
+    let mut pts = 0;
+    let deadline = Instant::now() + PATIENCE;
+    let mut placeholders = 0;
+    loop {
+        let bytes =
+            PacketEnvelope::encode(EnvelopeCodec::H264, pts, pts, true, bitstream, config).unwrap();
+        let mut packet = CompressedVideoFrame::new(format, bytes).unwrap();
+        sender.send_video(&mut packet).unwrap();
+        pts += 3000;
+        match receiver.capture_ref(SLICE).unwrap() {
+            Some(PacketItemRef::Video(ReceivedVideoRef::Decoded(frame))) => {
+                if common::is_hx_placeholder((64, 64), (frame.width(), frame.height())) {
+                    placeholders += 1;
+                } else {
+                    assert_eq!((frame.width(), frame.height()), (64, 64));
+                    assert!(frame
+                        .planes()
+                        .flat_map(|plane| plane.rows())
+                        .flatten()
+                        .any(|&byte| byte != 0));
+                    assert_eq!(frame.to_owned().width(), 64);
+                    return;
+                }
+            }
+            Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(_))) => {
+                panic!("preset must decode H.264")
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            assert!(
+                placeholders > 0,
+                "no fallback video arrived: {}",
+                link(receiver.receiver())
+            );
+            common::skip(
+                H264Decoder,
+                "packet receiver delivered only the SDK decoder placeholder",
+            );
+            return;
+        }
+    }
 }

@@ -73,6 +73,41 @@ export! {
                 }; }
                 NDIlib_frame_type_e_NDIlib_frame_type_video
             }
+            "packet-video" | "bad-packet-video" if !p_video_data.is_null() => {
+                let mut bytes = Box::new([MaybeUninit::<u8>::uninit(); 64]);
+                let mut packet = [0u8; 48];
+                packet[0..4].copy_from_slice(&44i32.to_ne_bytes());
+                packet[4..8].copy_from_slice(b"H264");
+                packet[32..36].copy_from_slice(&1u32.to_ne_bytes());
+                packet[36..40].copy_from_slice(&3u32.to_ne_bytes());
+                packet[40..44].copy_from_slice(&1u32.to_ne_bytes());
+                packet[44..48].copy_from_slice(&[1,2,3,4]);
+                for (byte,value) in bytes.iter_mut().zip(packet) { byte.write(value); }
+                let data = Box::into_raw(bytes).cast::<u8>();
+                log(&format!("video-data:{}", data as usize));
+                unsafe { *p_video_data = NDIlib_video_frame_v2_t {
+                    xres: 16, yres: 16, FourCC: u32::from_le_bytes(*b"H264"),
+                    frame_rate_N: 30, frame_rate_D: 1, p_data: data,
+                    timecode: 1234, timestamp: 5678, p_metadata: c"<packet/>".as_ptr(),
+                    __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                        data_size_in_bytes: if kind == "bad-packet-video" { 1 } else { 48 },
+                    }, ..Default::default()
+                }};
+                NDIlib_frame_type_e_NDIlib_frame_type_video
+            }
+            "packet-audio" if !p_audio_data.is_null() => {
+                let mut bytes = Box::new([MaybeUninit::<f32>::uninit(); 16]);
+                bytes[0].write(f32::from_ne_bytes([1,2,3,4]));
+                let data = Box::into_raw(bytes).cast::<u8>();
+                log(&format!("audio-data:{}", data as usize));
+                unsafe { *p_audio_data = NDIlib_audio_frame_v3_t {
+                    sample_rate: 48_000, no_channels: 2, no_samples: 960,
+                    FourCC: u32::from_le_bytes(*b"Opus"), p_data: data,
+                    timecode: 2345, timestamp: 6789, p_metadata: c"<packet/>".as_ptr(),
+                    __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 { data_size_in_bytes: 4 },
+                }};
+                NDIlib_frame_type_e_NDIlib_frame_type_audio
+            }
             "video" | "planar" | "alpha" | "bad-video" | "video-invalid-metadata" | "video-unterminated-metadata" if !p_video_data.is_null() => {
                 let mut pixels = Box::new([MaybeUninit::<u8>::uninit(); 64]);
                 let (format, height, stride, planes): (_, _, _, &[(usize, usize, usize, usize)]) = match kind.as_str() {

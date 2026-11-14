@@ -787,7 +787,7 @@ pub(crate) unsafe trait VideoParts {
         let mut metadata = std::mem::take(&mut destination.metadata);
         match self.metadata_text() {
             Some(text) => metadata.copy_text(text),
-            None => metadata.inner.clear(),
+            None => metadata.clear(),
         }
         let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
         *destination = packed_video(self, packed, data, metadata);
@@ -1609,7 +1609,7 @@ impl VideoFrame {
 
     /// Remove frame metadata, retaining its allocation for later copies.
     pub fn clear_metadata(&mut self) {
-        self.metadata.inner.clear();
+        self.metadata.clear();
     }
 
     /// # Safety
@@ -1973,7 +1973,7 @@ pub(crate) unsafe trait AudioParts {
         let mut metadata = std::mem::take(&mut destination.metadata);
         match self.metadata_text() {
             Some(text) => metadata.copy_text(text),
-            None => metadata.inner.clear(),
+            None => metadata.clear(),
         }
         let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
         *destination = packed_audio(self, packed, data, metadata);
@@ -2603,7 +2603,7 @@ impl AudioFrame {
 
     /// Remove frame metadata, retaining its allocation for later copies.
     pub fn clear_metadata(&mut self) {
-        self.metadata.inner.clear();
+        self.metadata.clear();
     }
 
     /// Get mutable samples for one channel without allocating.
@@ -3416,10 +3416,15 @@ impl FrameMetadata {
     }
 
     /// Present text with its terminator, distinguishing absence from empty text.
-    fn optional_text(&self) -> Option<MetadataText<'_>> {
+    pub(crate) fn optional_text(&self) -> Option<MetadataText<'_>> {
         (!self.inner.is_empty()).then_some(MetadataText {
             with_nul: &self.inner,
         })
+    }
+
+    /// Mark metadata absent without releasing its reusable allocation.
+    pub(crate) fn clear(&mut self) {
+        self.inner.clear();
     }
 
     /// The text of standalone metadata, which always holds its terminal NUL.
