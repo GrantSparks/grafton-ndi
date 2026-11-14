@@ -65,21 +65,30 @@ fn delivering_an_event_releases_executor_state_outside_the_queue_lock() {
     assert_released_unlocked(released);
 }
 
-#[test]
-fn replacing_an_event_waker_releases_it_outside_the_queue_lock() {
-    let (mut future, _events, released) = pending_event();
-    assert!(poll(&mut future, Waker::noop()).is_pending());
-    assert_released_unlocked(released);
+#[derive(Default)]
+struct SlotState {
+    ready: Option<u32>,
+    slot: WakerSlot,
+}
+
+fn poll_slot(state: &Mutex<SlotState>, waker: &Waker) -> Option<u32> {
+    WakerSlot::poll(state, waker, |state, _| {
+        if let Some(value) = state.ready.take() {
+            WakerPoll::Ready(value, state.slot.take())
+        } else {
+            WakerPoll::Pending(Some(&mut state.slot))
+        }
+    })
 }
 
 #[test]
-fn replacing_a_response_waker_releases_it_outside_the_response_lock() {
-    let (_reply, mut future) = operation::<()>();
-    let weak = Arc::downgrade(&future.response);
+fn replacing_a_slot_waker_releases_executor_state_outside_the_state_lock() {
+    let state = Arc::new(Mutex::new(SlotState::default()));
+    let weak = Arc::downgrade(&state);
     let (waker, released) = drop_probe(move || weak.upgrade().unwrap().try_lock().is_ok());
-    assert!(poll(&mut future, &waker).is_pending());
+    assert!(poll_slot(&state, &waker).is_none());
     drop(waker);
-    assert!(poll(&mut future, Waker::noop()).is_pending());
+    assert!(poll_slot(&state, Waker::noop()).is_none());
     assert_released_unlocked(released);
 }
 
@@ -171,21 +180,80 @@ impl CloneProbe {
 }
 
 #[test]
-fn a_reply_during_waker_cloning_is_observed_by_the_same_poll() {
-    let (_reply, mut future) = operation::<u32>();
-    let weak = Arc::downgrade(&future.response);
+fn readiness_during_slot_waker_cloning_is_observed_by_the_same_poll() {
+    let state = Arc::new(Mutex::new(SlotState::default()));
+    let weak = Arc::downgrade(&state);
     let probe = CloneProbe::new(move || {
-        let response = weak.upgrade().unwrap();
-        // Fail instead of hanging if clone runs under the response lock.
-        assert!(response.try_lock().is_ok());
-        deliver(&response, Ok(7), false);
+        let state = weak.upgrade().unwrap();
+        // Fail instead of hanging if clone runs under the state lock.
+        assert!(state.try_lock().is_ok());
+        lock(&state).ready = Some(7);
     });
-    assert!(matches!(
-        poll(&mut future, &probe.waker()),
-        Poll::Ready(Ok(7))
-    ));
+    assert_eq!(poll_slot(&state, &probe.waker()), Some(7));
     assert_eq!(probe.clones.load(Ordering::Relaxed), 1);
     assert_eq!(probe.wakes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn slot_registration_avoids_clones_for_readiness_and_the_same_waker() {
+    let state = Mutex::new(SlotState::default());
+    let probe = CloneProbe::new(|| {});
+    let waker = probe.waker();
+    assert_eq!(poll_slot(&state, &waker), None);
+    assert_eq!(poll_slot(&state, &waker), None);
+    assert_eq!(probe.clones.load(Ordering::Relaxed), 1);
+    lock(&state).ready = Some(7);
+    assert_eq!(poll_slot(&state, &waker), Some(7));
+    assert_eq!(probe.clones.load(Ordering::Relaxed), 1);
+    lock(&state).ready = Some(8);
+    assert_eq!(poll_slot(&state, &waker), Some(8));
+    assert_eq!(probe.clones.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn executor_panics_during_slot_clone_and_disposal_leave_the_state_unlocked() {
+    let state = Arc::new(Mutex::new(SlotState::default()));
+    let weak = Arc::downgrade(&state);
+    let probe = CloneProbe::new(move || {
+        assert!(weak.upgrade().unwrap().try_lock().is_ok());
+        panic!("executor clone panicked");
+    });
+    assert!(catch_unwind(AssertUnwindSafe(|| poll_slot(&state, &probe.waker()))).is_err());
+    assert!(!state.is_poisoned());
+    let weak = Arc::downgrade(&state);
+    let waker = Waker::from(Arc::new(OnDrop(move || {
+        assert!(weak.upgrade().unwrap().try_lock().is_ok());
+        panic!("executor disposal panicked");
+    })));
+    assert!(poll_slot(&state, &waker).is_none());
+    drop(waker);
+    assert!(poll_slot(&state, Waker::noop()).is_none());
+    assert!(!state.is_poisoned());
+}
+
+#[test]
+fn a_waiter_registered_during_clone_keeps_its_reservation_when_the_first_poll_loses() {
+    let events = Arc::new(EventQueue::<u32>::new(1));
+    let contender = Arc::new(Mutex::new(None));
+    let competing = Arc::clone(&contender);
+    let queue = Arc::clone(&events);
+    let probe = CloneProbe::new(move || {
+        let mut future = queue.wait(Duration::from_secs(60));
+        assert!(poll(&mut future, Waker::noop()).is_pending());
+        *lock(&competing) = Some(future);
+    });
+    let mut first = events.wait(Duration::from_secs(60));
+    assert!(matches!(
+        poll(&mut first, &probe.waker()),
+        Poll::Ready(Err(Error::InvalidState(StateError::WaiterPending)))
+    ));
+    drop(first);
+    events.push(Ok(7));
+    let mut contender = lock(&contender).take().unwrap();
+    assert!(matches!(
+        poll(&mut contender, Waker::noop()),
+        Poll::Ready(Ok(Some(7)))
+    ));
 }
 
 #[test]
