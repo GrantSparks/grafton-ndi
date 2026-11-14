@@ -741,20 +741,26 @@ impl Registry {
             self.decline(AllocationDecline::GenerationUnavailable);
             return None;
         }
-        let allocation =
-            match catch_unwind(AssertUnwindSafe(|| generation.policy.allocate(request))) {
-                Ok(Ok(allocation)) => allocation,
-                Ok(Err(_)) => {
-                    self.decline(AllocationDecline::PolicyError);
-                    return None;
-                }
-                Err(_) => {
-                    self.decline(AllocationDecline::PolicyPanic);
-                    return None;
-                }
-            };
-        let pointer = allocation.storage.pointer();
-        let capacity = allocation.capacity();
+        // Storage accessors are application code too. A panic while checking a
+        // returned buffer must be counted just like a panic in the policy,
+        // before the outer native callback turns it into a refused request.
+        let (allocation, pointer, capacity) = match catch_unwind(AssertUnwindSafe(|| {
+            generation.policy.allocate(request).map(|allocation| {
+                let pointer = allocation.storage.pointer();
+                let capacity = allocation.capacity();
+                (allocation, pointer, capacity)
+            })
+        })) {
+            Ok(Ok(allocation)) => allocation,
+            Ok(Err(_)) => {
+                self.decline(AllocationDecline::PolicyError);
+                return None;
+            }
+            Err(_) => {
+                self.decline(AllocationDecline::PolicyPanic);
+                return None;
+            }
+        };
         let actual = allocation.request;
         if capacity > reservation.bytes
             || actual.format != request.format
@@ -876,7 +882,8 @@ pub enum AllocationDecline {
     ByteLimit,
     /// The application policy returned an error.
     PolicyError,
-    /// The application policy panicked; the callback contained the panic.
+    /// The application policy or its buffer inspection panicked; the callback
+    /// contained the panic.
     PolicyPanic,
     /// The policy's buffer has an inconsistent size, layout, stride or live address.
     BufferRefused,
@@ -1659,6 +1666,81 @@ mod tests {
         assert_eq!(usage.declined_allocations(), 3);
         assert_eq!(usage.retained_bytes(), 0);
         assert_eq!(usage.in_progress_allocations(), 0);
+    }
+
+    #[test]
+    fn panicking_external_buffer_inspection_counts_once_and_releases_storage() {
+        use std::cell::Cell;
+
+        struct InspectionPanics {
+            storage: OwnedStorage,
+            pointer_calls: Cell<usize>,
+            capacity_calls: Cell<usize>,
+            panic_in_pointer: bool,
+            drops: Arc<AtomicUsize>,
+        }
+        // SAFETY: OwnedStorage supplies initialized, aligned, writable memory
+        // with a stable pointer and capacity. This fixture panics on a later
+        // accessor call without ever changing either returned value. Its
+        // destructor is nonpanicking and releases the allocation exactly once.
+        unsafe impl ExternalAllocation for InspectionPanics {
+            fn pointer(&self) -> NonNull<u8> {
+                let calls = self.pointer_calls.replace(self.pointer_calls.get() + 1);
+                assert!(
+                    !self.panic_in_pointer || calls == 0,
+                    "buffer pointer inspection panicked"
+                );
+                self.storage.pointer()
+            }
+
+            fn capacity(&self) -> usize {
+                let calls = self.capacity_calls.replace(self.capacity_calls.get() + 1);
+                assert!(
+                    self.panic_in_pointer || calls == 0,
+                    "buffer capacity inspection panicked"
+                );
+                self.storage.capacity()
+            }
+        }
+        impl Drop for InspectionPanics {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        for panic_in_pointer in [true, false] {
+            let registry = Registry::new(limits());
+            let drops = Arc::new(AtomicUsize::new(0));
+            let token = registry
+                .register({
+                    let drops = drops.clone();
+                    move |request: AllocationRequest| {
+                        let storage = InspectionPanics {
+                            storage: OwnedStorage::zeroed(request.minimum_bytes())?,
+                            pointer_calls: Cell::new(0),
+                            capacity_calls: Cell::new(0),
+                            panic_in_pointer,
+                            drops: drops.clone(),
+                        };
+                        Ok(AllocationBuffer::from_external(request, storage)?)
+                    }
+                })
+                .unwrap();
+            let outcome = catch_unwind(AssertUnwindSafe(|| registry.allocate(token, request())));
+            assert!(
+                outcome.is_ok(),
+                "buffer inspection must remain inside panic containment"
+            );
+            assert!(outcome.unwrap().is_none());
+            let usage = registry.usage();
+            assert_eq!(usage.declined(AllocationDecline::PolicyPanic), 1);
+            assert_eq!(usage.declined_allocations(), 1);
+            assert_eq!(usage.retained_allocations(), 0);
+            assert_eq!(usage.retained_bytes(), 0);
+            assert_eq!(usage.in_progress_allocations(), 0);
+            assert_eq!(lock(&registry.state).reserved_bytes, 0);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+        }
     }
 
     #[test]
