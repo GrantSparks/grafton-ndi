@@ -33,6 +33,29 @@ fn target(name: &str) -> RecordingTarget {
 }
 
 #[test]
+fn generated_session_timecodes_reach_the_native_start_unchanged() {
+    for ticks in [0, 360_000_000_000] {
+        let device = mock::Recorder::new(Closing::AtStop);
+        device.install();
+        let options = RecorderOptions::new(SourceSpec::new("timecode source").unwrap());
+        let mut recorder = mock::recorder_api().create_recorder(&options).unwrap();
+        let start = SessionTimecode::new(crate::Timecode::from_ticks(ticks)).unwrap();
+        recorder
+            .start(
+                &target("generated-timecode"),
+                RecordingTimecode::GenerateFrom(start),
+            )
+            .unwrap();
+        assert_eq!(*device.start_timecodes.lock().unwrap(), [ticks]);
+        assert_eq!(device.starts.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            recorder.finish(Duration::ZERO).unwrap(),
+            FinishStatus::Closed(_)
+        ));
+    }
+}
+
+#[test]
 fn a_timeout_keeps_the_recorder_and_a_later_close_completes_without_a_second_stop() {
     let device = mock::Recorder::new(Closing::Never);
     let mut recorder = recording_on(&device);

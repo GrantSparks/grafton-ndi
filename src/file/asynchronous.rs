@@ -1606,7 +1606,8 @@ impl AsyncFileRecorder {
             |worker| Self { worker },
         )
     }
-    /// Start a session; see [`FileRecorder::start`].
+    /// Start a session; see [`FileRecorder::start`]. Generated starts carry a
+    /// [`SessionTimecode`](super::SessionTimecode), validated before queuing.
     pub fn start(
         &self,
         target: &RecordingTarget,

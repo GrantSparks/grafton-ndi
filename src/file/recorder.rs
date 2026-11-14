@@ -605,6 +605,9 @@ impl FileRecorder {
     ///
     /// The target is only read, so it stays with the caller whatever the
     /// outcome, for example to start again once a missing directory exists.
+    /// [`RecordingTimecode::GenerateFrom`] takes a validated
+    /// [`SessionTimecode`](super::SessionTimecode), so the native start always
+    /// receives an explicit timecode rather than the send synthesize sentinel.
     ///
     /// # Errors
     ///

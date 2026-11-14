@@ -575,6 +575,69 @@ fn rollovers_open_the_next_file_before_closing_the_previous_file() {
 }
 
 #[test]
+fn generated_recording_timecode_replays_its_explicit_start() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("generated-timecode");
+    let source = LiveSource::start(&ndi, "generated-timecode");
+    let file = scratch.path("timecode.mkv");
+    let start = crate::Timecode::from_ticks(360_000_000_000);
+    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
+    recorder
+        .start(
+            &RecordingTarget::new(&file).unwrap(),
+            RecordingTimecode::GenerateFrom(SessionTimecode::new(start).unwrap()),
+        )
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    thread::sleep(Duration::from_millis(500));
+    assert!(matches!(
+        recorder.finish(PATIENCE).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    assert!(api.probe(&file).unwrap().duration().is_final());
+
+    let name = format!("grafton-generated-timecode-player-{}", std::process::id());
+    let mut player = api.create_player(&PlayerOptions::new(name)).unwrap();
+    player.start(&file).unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no first playback frame event arrived"
+        );
+        let Some(event) = player.poll_event(Duration::from_millis(50)).unwrap() else {
+            continue;
+        };
+        assert_ne!(event.kind(), PlayerEventKind::Error, "{event:?}");
+        if event.kind() == PlayerEventKind::FirstFrame {
+            assert_eq!(event.source_timecode(), Some(start));
+            break;
+        }
+    }
+    let mut previous = start;
+    let mut advancing_samples = 0;
+    while advancing_samples < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "playback timecodes did not advance from {start:?}"
+        );
+        let event = player.poll_event(Duration::from_millis(50)).unwrap();
+        assert!(event.is_none_or(|event| event.kind() != PlayerEventKind::Error));
+        let timecode = player
+            .source_timecode()
+            .expect("the last displayed frame has a timecode");
+        assert!(timecode >= previous, "{timecode:?} preceded {previous:?}");
+        assert_ne!(timecode, crate::Timecode::SYNTHESIZE);
+        if timecode > previous {
+            advancing_samples += 1;
+        }
+        previous = timecode;
+    }
+}
+
+#[test]
 fn injected_metadata_is_recorded_on_the_metadata_track() {
     let Some((ndi, api)) = file_api() else {
         return;
@@ -597,7 +660,9 @@ fn injected_metadata_is_recorded_on_the_metadata_track() {
     recorder
         .start(
             &RecordingTarget::new(&file).unwrap(),
-            RecordingTimecode::GenerateFrom(crate::Timecode::from_ticks(36_000_000_000)),
+            RecordingTimecode::GenerateFrom(
+                SessionTimecode::new(crate::Timecode::from_ticks(36_000_000_000)).unwrap(),
+            ),
         )
         .unwrap();
     await_event(&mut recorder, RecorderEventKind::FirstFrame);

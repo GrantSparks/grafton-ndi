@@ -7,4 +7,6 @@ fn compile_contracts() {
     t.compile_fail("tests/ui/file/fail/*.rs");
     #[cfg(any(feature = "tokio", feature = "smol"))]
     t.compile_fail("tests/ui/async/fail/*.rs");
+    #[cfg(feature = "file-io")]
+    t.compile_fail("tests/ui/file/fail/*.rs");
 }

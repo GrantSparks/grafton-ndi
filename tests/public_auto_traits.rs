@@ -342,6 +342,7 @@ fn file_types_keep_their_auto_traits() {
         RecordingReport: Send, Sync, UnwindSafe, RefUnwindSafe;
         RecordingTarget: Send, Sync, UnwindSafe, RefUnwindSafe;
         RecordingTimecode: Send, Sync, UnwindSafe, RefUnwindSafe;
+        SessionTimecode: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceSpec: Send, Sync, UnwindSafe, RefUnwindSafe;
         StateError: Send, Sync, UnwindSafe, RefUnwindSafe;

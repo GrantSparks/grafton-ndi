@@ -158,6 +158,8 @@ pub(super) struct Recorder {
     /// starts and changes of source the wrapper passed on.
     pub(super) creates: std::sync::atomic::AtomicUsize,
     pub(super) starts: std::sync::atomic::AtomicUsize,
+    /// Explicit generated session starts, exactly as the native call received them.
+    pub(super) start_timecodes: std::sync::Mutex<Vec<i64>>,
     pub(super) source_changes: std::sync::atomic::AtomicUsize,
     /// Actual native name/URL fields, at creation and each accepted source change.
     pub(super) selected_sources: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
@@ -206,6 +208,7 @@ impl Recorder {
             injected: Default::default(),
             creates: Default::default(),
             starts: Default::default(),
+            start_timecodes: Default::default(),
             source_changes: Default::default(),
             selected_sources: Default::default(),
             created_without_format_rollover: Default::default(),
@@ -383,6 +386,17 @@ unsafe extern "C" fn recorder_capture(
     event.type_
 }
 
+unsafe extern "C" fn recorder_start_with_timecode(
+    handle: NDIlib_file_recorder_instance_t,
+    target: *const ::std::os::raw::c_char,
+    timecode: i64,
+) -> bool {
+    // SAFETY: the wrapper lends its live recorder and target through this call.
+    let recorder = unsafe { Recorder::from_handle(handle) };
+    recorder.start_timecodes.lock().unwrap().push(timecode);
+    unsafe { recorder_start(handle, target) }
+}
+
 unsafe extern "C" fn recorder_stop(handle: NDIlib_file_recorder_instance_t) {
     use std::sync::atomic::Ordering;
     // SAFETY: the wrapper passes a live handle.
@@ -497,6 +511,7 @@ pub(super) fn recorder_api() -> super::FileApi {
             NDIlib_file_recorder_create: recorder_create,
             NDIlib_file_recorder_destroy: recorder_destroy,
             NDIlib_file_recorder_start: recorder_start,
+            NDIlib_file_recorder_start_with_timecode: recorder_start_with_timecode,
             NDIlib_file_recorder_capture_event: recorder_capture,
             NDIlib_file_recorder_get_dropped_event_count: recorder_dropped,
             NDIlib_file_recorder_stop: recorder_stop,

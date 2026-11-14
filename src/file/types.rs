@@ -899,6 +899,52 @@ impl FilePosition {
     }
 }
 
+/// An explicit editorial timecode from which a recording session can advance.
+///
+/// The send-only [`Timecode::SYNTHESIZE`] sentinel is not a recording start.
+/// Choose a value such as zero when the source has no meaningful timecode.
+///
+/// ```
+/// use grafton_ndi::{file::{RecordingTimecode, SessionTimecode}, Timecode};
+///
+/// let start = SessionTimecode::new(Timecode::from_ticks(0))?;
+/// let policy = RecordingTimecode::GenerateFrom(start);
+/// assert_eq!(start.timecode(), Timecode::from_ticks(0));
+/// assert!(SessionTimecode::new(Timecode::SYNTHESIZE).is_err());
+/// # Ok::<(), grafton_ndi::Error>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionTimecode(Timecode);
+
+impl SessionTimecode {
+    /// Validate an explicit recording start without changing its ticks.
+    ///
+    /// Negative values and every value except the send sentinel are accepted.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] for [`Timecode::SYNTHESIZE`], including the
+    /// default `Timecode`. Use an explicit start such as zero instead.
+    pub fn new(timecode: Timecode) -> Result<Self> {
+        if timecode == Timecode::SYNTHESIZE {
+            return Err(Error::InvalidInput(
+                "a recording start cannot use Timecode::SYNTHESIZE; choose an explicit start such as zero".into(),
+            ));
+        }
+        Ok(Self(timecode))
+    }
+
+    /// The validated editorial timecode.
+    pub const fn timecode(self) -> Timecode {
+        self.0
+    }
+
+    /// The explicit start in 100-nanosecond ticks.
+    pub const fn ticks(self) -> i64 {
+        self.0.ticks()
+    }
+}
+
 /// Timecode policy applied when a recording session starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
@@ -908,8 +954,9 @@ pub enum RecordingTimecode {
     Preserve,
     /// Generate the session's timecode, starting at this value and advancing
     /// with the content, in place of the source's own. Use it when the source
-    /// provides no meaningful timecode.
-    GenerateFrom(Timecode),
+    /// provides no meaningful timecode. Construct the explicit start with
+    /// [`SessionTimecode::new`]; the send-only synthesize sentinel is refused.
+    GenerateFrom(SessionTimecode),
 }
 
 /// A current duration that may still be growing.
@@ -1607,6 +1654,20 @@ impl RecorderStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_timecodes_refuse_only_the_send_sentinel() {
+        for timecode in [Timecode::SYNTHESIZE, Timecode::default()] {
+            let error = SessionTimecode::new(timecode).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput(ref message) if message.contains("zero")));
+        }
+        for ticks in [i64::MIN, -1, 0, 360_000_000_000, i64::MAX - 1] {
+            let timecode = Timecode::from_ticks(ticks);
+            let start = SessionTimecode::new(timecode).unwrap();
+            assert_eq!(start.timecode(), timecode);
+            assert_eq!(start.ticks(), ticks);
+        }
+    }
 
     #[test]
     fn file_statistics_preserve_each_native_media_and_stream_counter() {
