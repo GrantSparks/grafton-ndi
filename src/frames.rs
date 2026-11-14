@@ -4,6 +4,7 @@ use std::{
     ffi::{CStr, CString},
     fmt,
     marker::PhantomData,
+    mem::size_of,
     num::NonZeroU32,
     os::raw::c_char,
     ptr, slice, str,
@@ -610,7 +611,7 @@ impl VideoHeader {
     pub(crate) const SQUARE_PIXELS: f32 = 0.0;
 
     /// Validate the header of a frame the SDK delivered.
-    fn from_sdk(raw: &NDIlib_video_frame_v2_t) -> Result<Self> {
+    pub(crate) fn from_sdk(raw: &NDIlib_video_frame_v2_t) -> Result<Self> {
         let frame_rate = FrameRate::from_sdk(raw.frame_rate_N, raw.frame_rate_D)?;
         validate_picture_aspect_ratio(raw.picture_aspect_ratio)?;
         let scan_type = ScanType::from_sdk(raw.frame_format_type).ok_or_else(|| {
@@ -2253,34 +2254,15 @@ impl<'buf> BorrowedAudioFrameBuilder<'buf> {
     /// exceeding the 64 MiB audio limit or the 4 MiB metadata cap;
     /// [`Error::InvalidUtf8`] for metadata that is not UTF-8.
     pub fn build(self) -> Result<BorrowedAudioFrame<'buf>> {
-        let packed = validate_outbound_audio_layout(
+        let layout = ValidatedAudioLayout::new_uncompressed(
+            AudioFormat::Fltp,
             self.sample_rate,
             self.num_channels,
             self.num_samples,
-            AudioFormat::Fltp,
+            self.channel_stride_bytes,
         )?;
-        let stride = self
-            .channel_stride_bytes
-            .unwrap_or(packed.channel_stride_bytes());
-        let stride = i32::try_from(stride)
-            .map_err(|_| Error::InvalidFrame("Audio channel stride exceeds i32 range".into()))?;
-        // Layout validation checks fields only; it never dereferences samples.
-        // The slice supplies alignment, and the checked extent below establishes
-        // that every active channel is initialized and borrowed for 'buf.
-        let raw = NDIlib_audio_frame_v3_t {
-            sample_rate: packed.sdk_sample_rate(),
-            no_channels: packed.sdk_num_channels(),
-            no_samples: packed.sdk_num_samples(),
-            timecode: self.timecode.ticks(),
-            FourCC: AudioFormat::Fltp.to_sdk(),
-            p_data: self.data.as_ptr().cast_mut().cast(),
-            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: stride,
-            },
-            p_metadata: ptr::null(),
-            timestamp: 0,
-        };
-        let layout = validate_audio_layout(&raw)?;
+        // The slice supplies alignment; the layout's extent establishes that
+        // every active channel is initialized and borrowed for 'buf.
         let data = self.data.get(..layout.sample_count).ok_or_else(|| {
             Error::InvalidFrame(format!(
                 "Audio buffer has {} samples, requires at least {}",
@@ -3709,15 +3691,27 @@ impl ValidatedVideoLayout {
         height: u32,
         line_stride: Option<usize>,
     ) -> Result<Self> {
+        Self::new_uncompressed_checked(pixel_format, width, height, line_stride).map_err(Into::into)
+    }
+
+    fn new_uncompressed_checked(
+        pixel_format: PixelFormat,
+        width: u32,
+        height: u32,
+        line_stride: Option<usize>,
+    ) -> LayoutResult<Self> {
         validate_video_dimensions(width.into(), height.into())?;
 
         let min_stride = min_video_line_stride_checked(pixel_format, width as usize)?;
         let line_stride = match line_stride {
             None | Some(0) => min_stride,
             Some(stride) if stride < min_stride => {
-                return Err(Error::InvalidFrame(format!(
-                    "Video line_stride_in_bytes {stride} is smaller than minimum row size {min_stride} for {pixel_format:?} width {width}"
-                )));
+                return Err(LayoutError::VideoShortStride {
+                    stride,
+                    minimum: min_stride,
+                    format: pixel_format,
+                    width,
+                });
             }
             Some(stride) => stride,
         };
@@ -3751,14 +3745,22 @@ impl ValidatedVideoLayout {
         height: i32,
         line_stride: i32,
     ) -> Result<Self> {
+        Self::from_sdk_checked(pixel_format, width, height, line_stride).map_err(Into::into)
+    }
+
+    /// Validate SDK geometry without allocating even when it is rejected.
+    /// Allocator callbacks use this before any pixel storage exists.
+    pub(crate) fn from_sdk_checked(
+        pixel_format: PixelFormat,
+        width: i32,
+        height: i32,
+        line_stride: i32,
+    ) -> LayoutResult<Self> {
         validate_video_dimensions(width.into(), height.into())?;
-        let line_stride = usize::try_from(line_stride).map_err(|_| {
-            Error::InvalidFrame(format!(
-                "Uncompressed video frame has invalid line_stride_in_bytes: {line_stride}"
-            ))
-        })?;
+        let line_stride =
+            usize::try_from(line_stride).map_err(|_| LayoutError::VideoSdkStride(line_stride))?;
         // Both dimensions were just checked positive.
-        Self::new_uncompressed(
+        Self::new_uncompressed_checked(
             pixel_format,
             width.unsigned_abs(),
             height.unsigned_abs(),
@@ -3893,31 +3895,160 @@ pub(crate) fn validate_video_frame(
     Ok((layout, header))
 }
 
+/// An allocation-free validation failure. Native allocation requests discard
+/// these reasons; API and capture paths format them only when returning Error.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LayoutError {
+    Message(&'static str),
+    VideoWidth(i64),
+    VideoOddWidth(i64),
+    VideoHeight(i64),
+    VideoSdkStride(i32),
+    VideoShortStride {
+        stride: usize,
+        minimum: usize,
+        format: PixelFormat,
+        width: u32,
+    },
+    VideoStrideOverflow {
+        format: PixelFormat,
+        width: usize,
+    },
+    VideoBytes(usize),
+    VideoPlanar420 {
+        height: usize,
+        stride: usize,
+    },
+    VideoSemiPlanar420(usize),
+    VideoUyvaStride(usize),
+    PictureAspectRatio(f32),
+    AudioRate(i64),
+    AudioCount {
+        value: i64,
+        kind: &'static str,
+    },
+    AudioStride(i64),
+    AudioStrideAlignment(usize),
+    AudioShortStride {
+        stride: usize,
+        minimum: usize,
+    },
+    AudioStrideOverflow(usize),
+    AudioChannelOffset {
+        channels: usize,
+        stride: usize,
+    },
+    AudioSampleCount {
+        offset: usize,
+        samples: usize,
+    },
+    AudioByteSize(usize),
+    AudioBytes(usize),
+}
+
+pub(crate) type LayoutResult<T> = std::result::Result<T, LayoutError>;
+
+impl fmt::Display for LayoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Message(message) => f.write_str(message),
+            Self::VideoWidth(width) => write!(f, "Video frame has invalid width: {width}"),
+            Self::VideoOddWidth(width) => {
+                write!(f, "NDI video frames require even width, got {width}")
+            }
+            Self::VideoHeight(height) => write!(f, "Video frame has invalid height: {height}"),
+            Self::VideoSdkStride(stride) => write!(
+                f,
+                "Uncompressed video frame has invalid line_stride_in_bytes: {stride}"
+            ),
+            Self::VideoShortStride { stride, minimum, format, width } => write!(
+                f,
+                "Video line_stride_in_bytes {stride} is smaller than minimum row size {minimum} for {format:?} width {width}"
+            ),
+            Self::VideoStrideOverflow { format, width } => {
+                write!(f, "Video line stride overflow for {format:?} width {width}")
+            }
+            Self::VideoBytes(bytes) => write!(
+                f,
+                "Video frame exceeds maximum size: {bytes} bytes > {MAX_VIDEO_BYTES} bytes"
+            ),
+            Self::VideoPlanar420 { height, stride } => write!(
+                f,
+                "Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height {height} and stride {stride}"
+            ),
+            Self::VideoSemiPlanar420(height) => write!(
+                f,
+                "Semi-planar 4:2:0 (NV12) video frames require even height, got {height}"
+            ),
+            Self::VideoUyvaStride(stride) => {
+                write!(f, "UYVA video frames require even line stride, got {stride}")
+            }
+            Self::PictureAspectRatio(ratio) => {
+                write!(f, "Video frame has invalid picture aspect ratio: {ratio}")
+            }
+            Self::AudioRate(rate) => write!(f, "Invalid sample rate: {rate}"),
+            Self::AudioCount { value, kind } => write!(f, "Invalid number of {kind}: {value}"),
+            Self::AudioStride(stride) => write!(f, "Invalid channel_stride_in_bytes: {stride}"),
+            Self::AudioStrideAlignment(stride) => write!(
+                f,
+                "channel_stride_in_bytes must be a multiple of {}, got {stride}",
+                size_of::<f32>()
+            ),
+            Self::AudioShortStride { stride, minimum } => write!(
+                f,
+                "channel_stride_in_bytes {stride} is smaller than one channel of audio samples {minimum}"
+            ),
+            Self::AudioStrideOverflow(samples) => write!(
+                f,
+                "Audio channel stride overflow: {samples} samples × {} bytes",
+                size_of::<f32>()
+            ),
+            Self::AudioChannelOffset { channels, stride } => write!(
+                f,
+                "Audio channel offset overflow: {channels} channels × {stride} stride samples"
+            ),
+            Self::AudioSampleCount { offset, samples } => write!(
+                f,
+                "Audio backing sample count overflow: channel offset {offset} + {samples} samples"
+            ),
+            Self::AudioByteSize(samples) => write!(
+                f,
+                "Audio byte size overflow: {samples} samples × {} bytes",
+                size_of::<f32>()
+            ),
+            Self::AudioBytes(bytes) => write!(
+                f,
+                "Audio frame exceeds maximum size: {bytes} bytes > {MAX_AUDIO_BYTES} bytes"
+            ),
+        }
+    }
+}
+
+impl From<LayoutError> for Error {
+    fn from(reason: LayoutError) -> Self {
+        Self::InvalidFrame(reason.to_string())
+    }
+}
+
 /// The one dimension check, for values from the API and from the SDK.
-fn validate_video_dimensions(width: i64, height: i64) -> Result<()> {
+fn validate_video_dimensions(width: i64, height: i64) -> LayoutResult<()> {
     validate_video_width(width)?;
     if height <= 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Video frame has invalid height: {height}"
-        )));
+        return Err(LayoutError::VideoHeight(height));
     }
 
     Ok(())
 }
 
-fn validate_video_width(width: i64) -> Result<()> {
+fn validate_video_width(width: i64) -> LayoutResult<()> {
     if width <= 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Video frame has invalid width: {width}"
-        )));
+        return Err(LayoutError::VideoWidth(width));
     }
 
     // The SDK uses 4:2:2 internally, including for RGB input/output.
     // https://docs.ndi.video/all/developing-with-ndi/sdk/frame-types
     if width % 2 != 0 {
-        return Err(Error::InvalidFrame(format!(
-            "NDI video frames require even width, got {width}"
-        )));
+        return Err(LayoutError::VideoOddWidth(width));
     }
 
     Ok(())
@@ -3926,10 +4057,12 @@ fn validate_video_width(width: i64) -> Result<()> {
 /// The one picture-aspect-ratio check: finite and nonnegative, where zero
 /// means square pixels.
 pub(crate) fn validate_picture_aspect_ratio(ratio: f32) -> Result<()> {
+    check_picture_aspect_ratio(ratio).map_err(Into::into)
+}
+
+pub(crate) fn check_picture_aspect_ratio(ratio: f32) -> LayoutResult<()> {
     if !ratio.is_finite() || ratio < 0.0 {
-        return Err(Error::InvalidFrame(format!(
-            "Video frame has invalid picture aspect ratio: {ratio}"
-        )));
+        return Err(LayoutError::PictureAspectRatio(ratio));
     }
     Ok(())
 }
@@ -3945,31 +4078,24 @@ fn check_video_data_len(layout: &ValidatedVideoLayout, len: usize) -> Result<()>
     Ok(())
 }
 
-fn validate_video_data_len(data_len_bytes: usize) -> Result<()> {
+fn validate_video_data_len(data_len_bytes: usize) -> LayoutResult<()> {
     if data_len_bytes == 0 {
-        return Err(Error::InvalidFrame(
-            "Video frame has zero calculated size".into(),
-        ));
+        return Err(LayoutError::Message("Video frame has zero calculated size"));
     }
 
     if data_len_bytes > MAX_VIDEO_BYTES {
-        return Err(Error::InvalidFrame(format!(
-            "Video frame exceeds maximum size: {} bytes > {} bytes",
-            data_len_bytes, MAX_VIDEO_BYTES
-        )));
+        return Err(LayoutError::VideoBytes(data_len_bytes));
     }
 
     Ok(())
 }
 
-fn min_video_line_stride_checked(pixel_format: PixelFormat, width: usize) -> Result<usize> {
+fn min_video_line_stride_checked(pixel_format: PixelFormat, width: usize) -> LayoutResult<usize> {
     width
         .checked_mul(pixel_format.info().bytes_per_pixel() as usize)
-        .ok_or_else(|| {
-            Error::InvalidFrame(format!(
-                "Video line stride overflow for {:?} width {}",
-                pixel_format, width
-            ))
+        .ok_or(LayoutError::VideoStrideOverflow {
+            format: pixel_format,
+            width,
         })
 }
 
@@ -3988,7 +4114,9 @@ fn calculate_buffer_len_for_info_checked(
     y_stride: usize,
     height: usize,
 ) -> Result<usize> {
-    video_plane_layouts(info, y_stride, y_stride, height).map(|(_, _, storage, _)| storage)
+    video_plane_layouts(info, y_stride, y_stride, height)
+        .map(|(_, _, storage, _)| storage)
+        .map_err(Into::into)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -4035,15 +4163,13 @@ fn video_plane_layouts(
     stride: usize,
     active: usize,
     height: usize,
-) -> Result<([VideoPlaneLayout; MAX_VIDEO_PLANES], usize, usize, usize)> {
+) -> LayoutResult<([VideoPlaneLayout; MAX_VIDEO_PLANES], usize, usize, usize)> {
     let mut dimensions = [(stride, active, height); MAX_VIDEO_PLANES];
     let count = match info.category() {
         FormatCategory::Packed => 1,
         FormatCategory::Planar420 => {
             if !height.is_multiple_of(2) || !stride.is_multiple_of(2) {
-                return Err(Error::InvalidFrame(format!(
-                    "Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height {height} and stride {stride}"
-                )));
+                return Err(LayoutError::VideoPlanar420 { height, stride });
             }
             dimensions[1] = (stride / 2, active / 2, height / 2);
             dimensions[2] = dimensions[1];
@@ -4051,18 +4177,14 @@ fn video_plane_layouts(
         }
         FormatCategory::SemiPlanar420 => {
             if !height.is_multiple_of(2) {
-                return Err(Error::InvalidFrame(format!(
-                    "Semi-planar 4:2:0 (NV12) video frames require even height, got {height}"
-                )));
+                return Err(LayoutError::VideoSemiPlanar420(height));
             }
             dimensions[1] = (stride, active, height / 2);
             2
         }
         FormatCategory::PackedAlpha => {
             if !stride.is_multiple_of(2) {
-                return Err(Error::InvalidFrame(format!(
-                    "UYVA video frames require even line stride, got {stride}"
-                )));
+                return Err(LayoutError::VideoUyvaStride(stride));
             }
             dimensions[1] = (stride / 2, active / 2, height);
             2
@@ -4086,11 +4208,11 @@ fn video_plane_layouts(
         storage = row_stride
             .checked_mul(row_count)
             .and_then(|n| storage.checked_add(n))
-            .ok_or_else(|| Error::InvalidFrame("Video buffer size overflow".into()))?;
+            .ok_or(LayoutError::Message("Video buffer size overflow"))?;
         payload = active_row_bytes
             .checked_mul(row_count)
             .and_then(|n| payload.checked_add(n))
-            .ok_or_else(|| Error::InvalidFrame("Video payload size overflow".into()))?;
+            .ok_or(LayoutError::Message("Video payload size overflow"))?;
     }
     Ok((planes, count, storage, payload))
 }
@@ -4104,7 +4226,7 @@ fn video_plane_layouts(
 /// [`validate_returned_audio`] instead. Creating this struct performs all
 /// necessary bounds checking, so consumers can safely use the cached values
 /// without re-validation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ValidatedAudioLayout {
     /// The validated audio format.
     format: AudioFormat,
@@ -4204,19 +4326,101 @@ impl ValidatedAudioLayout {
         self.sample_count
     }
 
-    fn from_packed(format: AudioFormat, sample_rate: u32, packed: &PackedAudioDimensions) -> Self {
-        Self {
+    /// Validate caller-supplied audio geometry without constructing a descriptor.
+    /// Only `None` selects packed channels; an explicit stride must be positive.
+    pub(crate) fn new_uncompressed(
+        format: AudioFormat,
+        sample_rate: u32,
+        no_channels: u32,
+        no_samples: u32,
+        channel_stride: Option<usize>,
+    ) -> Result<Self> {
+        Self::checked(
+            format,
+            sample_rate.into(),
+            no_channels.into(),
+            no_samples.into(),
+            channel_stride,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Validate signed SDK geometry. This does not examine a sample pointer;
+    /// capture validates that separately, while allocators have no storage yet.
+    fn from_sdk(
+        format: AudioFormat,
+        sample_rate: i32,
+        no_channels: i32,
+        no_samples: i32,
+        channel_stride: Option<i32>,
+    ) -> Result<Self> {
+        Self::from_sdk_checked(format, sample_rate, no_channels, no_samples, channel_stride)
+            .map_err(Into::into)
+    }
+
+    /// As `from_sdk`, retaining an allocation-free failure for SDK callbacks.
+    pub(crate) fn from_sdk_checked(
+        format: AudioFormat,
+        sample_rate: i32,
+        no_channels: i32,
+        no_samples: i32,
+        channel_stride: Option<i32>,
+    ) -> LayoutResult<Self> {
+        let stride = channel_stride
+            .map(|stride| {
+                usize::try_from(stride).map_err(|_| LayoutError::AudioStride(stride.into()))
+            })
+            .transpose()?;
+        Self::checked(
+            format,
+            sample_rate.into(),
+            no_channels.into(),
+            no_samples.into(),
+            stride,
+        )
+    }
+
+    fn checked(
+        format: AudioFormat,
+        sample_rate: i64,
+        no_channels: i64,
+        no_samples: i64,
+        channel_stride: Option<usize>,
+    ) -> LayoutResult<Self> {
+        let sample_rate = validate_audio_sample_rate(sample_rate)?;
+        let (no_channels, no_samples) = validate_positive_audio_counts(no_channels, no_samples)?;
+        let minimum = no_samples
+            .checked_mul(size_of::<f32>())
+            .ok_or(LayoutError::AudioStrideOverflow(no_samples))?;
+        let stride = channel_stride.unwrap_or(minimum);
+        if i32::try_from(stride).is_err() {
+            return Err(LayoutError::Message(
+                "Audio channel stride exceeds i32 range",
+            ));
+        }
+        if stride == 0 {
+            return Err(LayoutError::AudioStride(0));
+        }
+        if !stride.is_multiple_of(size_of::<f32>()) {
+            return Err(LayoutError::AudioStrideAlignment(stride));
+        }
+        if stride < minimum {
+            return Err(LayoutError::AudioShortStride { stride, minimum });
+        }
+        let channel_stride_samples = stride / size_of::<f32>();
+        let sample_count = checked_audio_extent(no_channels, no_samples, channel_stride_samples)?;
+        Ok(Self {
             format,
             sample_rate,
-            no_channels: packed.no_channels,
-            no_samples: packed.no_samples,
-            channel_stride_samples: packed.no_samples,
-            sample_count: packed.sample_count,
-        }
+            no_channels,
+            no_samples,
+            channel_stride_samples,
+            sample_count,
+        })
     }
 
     /// The same frame with channels stored back to back, without padding.
-    fn packed(self) -> Self {
+    pub(crate) fn packed(self) -> Self {
         Self {
             channel_stride_samples: self.no_samples,
             sample_count: self.no_channels * self.no_samples,
@@ -4224,30 +4428,30 @@ impl ValidatedAudioLayout {
         }
     }
 
-    fn num_channels(self) -> u32 {
+    pub(crate) fn num_channels(self) -> u32 {
         self.no_channels as u32
     }
 
-    fn num_samples(self) -> u32 {
+    pub(crate) fn num_samples(self) -> u32 {
         self.no_samples as u32
     }
 
-    fn channel_stride_bytes(self) -> usize {
+    pub(crate) fn channel_stride_bytes(self) -> usize {
         self.channel_stride_samples() * std::mem::size_of::<f32>()
     }
 
     /// The SDK's `sample_rate`.
-    fn sdk_sample_rate(self) -> i32 {
+    pub(crate) fn sdk_sample_rate(self) -> i32 {
         self.sample_rate as i32
     }
 
     /// The SDK's `no_channels`.
-    fn sdk_num_channels(self) -> i32 {
+    pub(crate) fn sdk_num_channels(self) -> i32 {
         self.no_channels as i32
     }
 
     /// The SDK's `no_samples`.
-    fn sdk_num_samples(self) -> i32 {
+    pub(crate) fn sdk_num_samples(self) -> i32 {
         self.no_samples as i32
     }
 
@@ -4321,14 +4525,7 @@ fn validate_outbound_audio_layout(
     no_samples: u32,
     format: AudioFormat,
 ) -> Result<ValidatedAudioLayout> {
-    let sample_rate = validate_audio_sample_rate(sample_rate.into())?;
-    let packed = validate_packed_audio_dimensions(no_channels, no_samples)?;
-
-    Ok(ValidatedAudioLayout::from_packed(
-        format,
-        sample_rate,
-        &packed,
-    ))
+    ValidatedAudioLayout::new_uncompressed(format, sample_rate, no_channels, no_samples, None)
 }
 
 /// Require supplied samples to fill the packed `layout` exactly.
@@ -4344,20 +4541,23 @@ fn check_audio_data_len(layout: &ValidatedAudioLayout, len: usize) -> Result<()>
 
 /// The one sample-rate check for every audio path, for values from the API
 /// and from the SDK: `1..=i32::MAX` Hz.
-pub(crate) fn validate_audio_sample_rate(sample_rate: i64) -> Result<u32> {
+fn validate_audio_sample_rate(sample_rate: i64) -> LayoutResult<u32> {
     u32::try_from(sample_rate)
         .ok()
         .filter(|rate| (1..=i32::MAX.unsigned_abs()).contains(rate))
-        .ok_or_else(|| Error::InvalidFrame(format!("Invalid sample rate: {sample_rate}")))
+        .ok_or(LayoutError::AudioRate(sample_rate))
 }
 
 /// Require a positive channel and sample count and widen both to `usize`.
-fn validate_positive_audio_counts(no_channels: i64, no_samples: i64) -> Result<(usize, usize)> {
-    let count = |value: i64, name: &str| {
+fn validate_positive_audio_counts(
+    no_channels: i64,
+    no_samples: i64,
+) -> LayoutResult<(usize, usize)> {
+    let count = |value: i64, kind: &'static str| {
         usize::try_from(value)
             .ok()
             .filter(|&count| count > 0)
-            .ok_or_else(|| Error::InvalidFrame(format!("Invalid number of {name}: {value}")))
+            .ok_or(LayoutError::AudioCount { value, kind })
     };
     Ok((
         count(no_channels, "channels")?,
@@ -4373,75 +4573,30 @@ fn checked_audio_extent(
     no_channels: usize,
     no_samples: usize,
     stride_samples: usize,
-) -> Result<usize> {
+) -> LayoutResult<usize> {
     let last_channel_offset = no_channels
         .checked_sub(1)
         .and_then(|last| last.checked_mul(stride_samples))
-        .ok_or_else(|| {
-            Error::InvalidFrame(format!(
-                "Audio channel offset overflow: {no_channels} channels × {stride_samples} stride samples"
-            ))
+        .ok_or(LayoutError::AudioChannelOffset {
+            channels: no_channels,
+            stride: stride_samples,
         })?;
-    let sample_count = last_channel_offset.checked_add(no_samples).ok_or_else(|| {
-        Error::InvalidFrame(format!(
-            "Audio backing sample count overflow: channel offset {last_channel_offset} + {no_samples} samples"
-        ))
-    })?;
+    let sample_count =
+        last_channel_offset
+            .checked_add(no_samples)
+            .ok_or(LayoutError::AudioSampleCount {
+                offset: last_channel_offset,
+                samples: no_samples,
+            })?;
     let byte_size = sample_count
         .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| {
-            Error::InvalidFrame(format!(
-                "Audio byte size overflow: {sample_count} samples × {} bytes",
-                std::mem::size_of::<f32>()
-            ))
-        })?;
+        .ok_or(LayoutError::AudioByteSize(sample_count))?;
 
     if byte_size > MAX_AUDIO_BYTES {
-        return Err(Error::InvalidFrame(format!(
-            "Audio frame exceeds maximum size: {byte_size} bytes > {MAX_AUDIO_BYTES} bytes"
-        )));
+        return Err(LayoutError::AudioBytes(byte_size));
     }
 
     Ok(sample_count)
-}
-
-/// Packed FLTP dimensions shared by owned frames and FrameSync requests.
-/// Checking this layout allocates nothing on success and never allocates samples.
-pub(crate) struct PackedAudioDimensions {
-    no_channels: usize,
-    no_samples: usize,
-    sample_count: usize,
-}
-
-impl PackedAudioDimensions {
-    /// The validated total `f32` sample count (`channels * samples`).
-    pub(crate) fn sample_count(&self) -> usize {
-        self.sample_count
-    }
-}
-
-pub(crate) fn validate_packed_audio_dimensions(
-    no_channels: u32,
-    no_samples: u32,
-) -> Result<PackedAudioDimensions> {
-    let (no_channels, no_samples) =
-        validate_positive_audio_counts(no_channels.into(), no_samples.into())?;
-    if no_samples
-        .checked_mul(std::mem::size_of::<f32>())
-        .and_then(|bytes| i32::try_from(bytes).ok())
-        .is_none()
-    {
-        return Err(Error::InvalidFrame(format!(
-            "Audio channel stride exceeds i32 range: {no_samples} samples"
-        )));
-    }
-    let sample_count = checked_audio_extent(no_channels, no_samples, no_samples)?;
-
-    Ok(PackedAudioDimensions {
-        no_channels,
-        no_samples,
-        sample_count,
-    })
 }
 
 /// Validate audio frame layout from raw FFI fields.
@@ -4479,62 +4634,16 @@ pub(crate) fn validate_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<Val
         ));
     }
 
-    let sample_rate = validate_audio_sample_rate(raw.sample_rate.into())?;
-    let (no_channels, no_samples) =
-        validate_positive_audio_counts(raw.no_channels.into(), raw.no_samples.into())?;
-
     let format = validate_audio_format(raw.FourCC)?;
-    // SAFETY: both members of the descriptor's union are `int`s at the same
-    // offset, so reading either one reads the four bytes the SDK or the
-    // caller wrote as a valid `i32`. `Processing.NDI.structs.h` makes the
-    // member the channel stride for planar audio that is not compressed, and
-    // `validate_audio_format` just accepted FLTP, the planar float format.
-    let channel_stride_in_bytes = unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes };
-    let channel_stride_bytes = usize::try_from(channel_stride_in_bytes)
-        .ok()
-        .filter(|&bytes| bytes > 0)
-        .ok_or_else(|| {
-            Error::InvalidFrame(format!(
-                "Invalid channel_stride_in_bytes: {channel_stride_in_bytes}"
-            ))
-        })?;
-
-    if channel_stride_bytes % std::mem::size_of::<f32>() != 0 {
-        return Err(Error::InvalidFrame(format!(
-            "channel_stride_in_bytes must be a multiple of {}, got {}",
-            std::mem::size_of::<f32>(),
-            channel_stride_in_bytes
-        )));
-    }
-
-    let minimum_channel_stride = no_samples
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| {
-            Error::InvalidFrame(format!(
-                "Audio channel stride overflow: {} samples × {} bytes",
-                no_samples,
-                std::mem::size_of::<f32>()
-            ))
-        })?;
-
-    if channel_stride_bytes < minimum_channel_stride {
-        return Err(Error::InvalidFrame(format!(
-            "channel_stride_in_bytes {} is smaller than one channel of audio samples {}",
-            channel_stride_in_bytes, minimum_channel_stride
-        )));
-    }
-
-    let channel_stride_samples = channel_stride_bytes / std::mem::size_of::<f32>();
-    let sample_count = checked_audio_extent(no_channels, no_samples, channel_stride_samples)?;
-
-    Ok(ValidatedAudioLayout {
+    // SAFETY: FLTP uses the channel-stride member of this SDK union.
+    let stride = unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes };
+    ValidatedAudioLayout::from_sdk(
         format,
-        sample_rate,
-        no_channels,
-        no_samples,
-        channel_stride_samples,
-        sample_count,
-    })
+        raw.sample_rate,
+        raw.no_channels,
+        raw.no_samples,
+        Some(stride),
+    )
 }
 
 /// Audio the SDK returned from a call that may legitimately deliver no
@@ -5913,7 +6022,11 @@ mod tests {
         for rate in [0u32, 1 << 31, u32::MAX] {
             let expected = format!("Invalid sample rate: {rate}");
             assert_eq!(
-                message(validate_audio_sample_rate(rate.into()).map(|_| ())),
+                message(
+                    validate_audio_sample_rate(rate.into())
+                        .map(|_| ())
+                        .map_err(Into::into)
+                ),
                 expected
             );
             assert_eq!(
@@ -5964,7 +6077,8 @@ mod tests {
     /// and size cap.
     #[test]
     fn audio_extent_is_shared_by_packed_and_strided_layouts() {
-        let packed = validate_packed_audio_dimensions(3, 5).unwrap();
+        let packed =
+            ValidatedAudioLayout::new_uncompressed(AudioFormat::Fltp, 48_000, 3, 5, None).unwrap();
         assert_eq!(packed.sample_count(), 15);
         assert_eq!(checked_audio_extent(3, 5, 5).unwrap(), 15);
         // Padding between channels counts, trailing padding does not.
@@ -5978,7 +6092,33 @@ mod tests {
     }
 
     #[test]
-    fn packed_audio_dimensions_match_wide_oracle_and_owned_validation() {
+    fn borrowed_audio_stride_matches_sdk_layout_without_reading_padding() {
+        let samples = [0.0, 1.0, 2.0, f32::NAN, 3.0, 4.0, 5.0];
+        let (frame, allocations) = crate::test_alloc::allocation_count(|| {
+            BorrowedAudioFrame::builder(&samples, 48_000, 2, 3)
+                .channel_stride_bytes(16)
+                .build()
+                .unwrap()
+        });
+        assert_eq!(allocations, 0);
+        let raw = frame.audio_descriptor();
+        assert_eq!(*frame.layout(), validate_audio_layout(&raw).unwrap());
+        assert_eq!(frame.channel_data(0), Some(&samples[..3]));
+        assert_eq!(frame.channel_data(1), Some(&samples[4..]));
+        assert_eq!(frame.layout().sample_count(), samples.len());
+        // A received zero stride is invalid; only caller input's None means
+        // packed. Sharing scalar checks must not change this distinction.
+        let zero_stride = NDIlib_audio_frame_v3_t {
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 0,
+            },
+            ..raw
+        };
+        assert!(validate_audio_layout(&zero_stride).is_err());
+    }
+
+    #[test]
+    fn packed_audio_layout_matches_wide_oracle_and_owned_validation() {
         fn check(channels: u32, samples: u32) {
             let bytes = i128::from(channels) * i128::from(samples) * 4;
             let stride = i128::from(samples) * 4;
@@ -5986,7 +6126,13 @@ mod tests {
                 && samples > 0
                 && stride <= i128::from(i32::MAX)
                 && bytes <= MAX_AUDIO_BYTES as i128;
-            let packed = validate_packed_audio_dimensions(channels, samples);
+            let packed = ValidatedAudioLayout::new_uncompressed(
+                AudioFormat::Fltp,
+                48_000,
+                channels,
+                samples,
+                None,
+            );
             let owned =
                 validate_outbound_audio_layout(48_000, channels, samples, AudioFormat::Fltp);
             let request = crate::FrameSyncAudioRequest::capture_at(48_000, channels, samples);
@@ -6042,14 +6188,25 @@ mod tests {
             }
         }
         // The signed stride boundary is rejected independently of the cap.
-        let at_stride_limit = validate_packed_audio_dimensions(1, i32::MAX.unsigned_abs() / 4);
+        let at_stride_limit = ValidatedAudioLayout::new_uncompressed(
+            AudioFormat::Fltp,
+            48_000,
+            1,
+            i32::MAX.unsigned_abs() / 4,
+            None,
+        );
         assert!(at_stride_limit
             .err()
             .unwrap()
             .to_string()
             .contains("maximum size"));
-        let over_stride_limit =
-            validate_packed_audio_dimensions(1, i32::MAX.unsigned_abs() / 4 + 1);
+        let over_stride_limit = ValidatedAudioLayout::new_uncompressed(
+            AudioFormat::Fltp,
+            48_000,
+            1,
+            i32::MAX.unsigned_abs() / 4 + 1,
+            None,
+        );
         assert!(over_stride_limit
             .err()
             .unwrap()
