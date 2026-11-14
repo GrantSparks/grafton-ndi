@@ -70,7 +70,8 @@
 //! library in this order is selected:
 //!
 //! 1. the directory containing the running executable;
-//! 2. the directory named by the `NDI_RUNTIME_DIR_V6` environment variable;
+//! 2. the absolute directory named by `NDI_RUNTIME_DIR_V6`; relative values
+//!    are recorded as refused locations and never searched;
 //! 3. the platform loader's own search for the library name (`rpath`,
 //!    `LD_LIBRARY_PATH`, `PATH` and the system library directories).
 //!
@@ -172,7 +173,9 @@ impl RuntimeOptions {
     ///
     /// No other location is tried, so a failure to load it is reported rather
     /// than hidden by a fallback. A statically linked target has no library to
-    /// load and rejects an explicit path.
+    /// load and rejects an absolute path with [`Error::RuntimeConflict`].
+    /// A relative path returns [`Error::InvalidInput`] on every target,
+    /// before an implementation is selected.
     #[must_use]
     pub fn library_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.library_path = Some(path.into());

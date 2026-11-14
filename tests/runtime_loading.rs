@@ -194,6 +194,7 @@ const fn scenario(name: &'static str) -> Scenario {
 }
 
 const SCENARIOS: &[Scenario] = &[
+    scenario("relative_path_selects_nothing"),
     scenario("retry_and_capabilities"),
     scenario("conflict"),
     scenario("advanced_request_needs_advanced_entry_points"),
@@ -323,6 +324,20 @@ fn child(name: &str, fixtures: &Fixtures) {
     let complete = fixtures.complete();
     let options = explicit(complete.clone());
     match name {
+        "relative_path_selects_nothing" => {
+            let relative = RuntimeOptions::new().library_path("libndi.so.6");
+            assert!(matches!(
+                Runtime::select(&relative),
+                Err(Error::InvalidInput(_))
+            ));
+            assert!(matches!(
+                Ndi::with_options(&relative),
+                Err(Error::InvalidInput(_))
+            ));
+            assert!(!Ndi::is_running());
+            assert!(!fixtures.log().exists());
+            drop(Ndi::with_options(&options).unwrap());
+        }
         "retry_and_capabilities" => {
             let reason = load_failure(Ndi::with_options(&explicit(fixtures.missing())));
             assert!(reason.contains("NDIlib_send_set_failover"), "{reason}");

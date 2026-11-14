@@ -4,7 +4,7 @@
 //! first usable module for the life of the process. Statically linked targets
 //! resolve the same tables from the archive selected at build time.
 
-use std::ffi::CStr;
+use std::{ffi::CStr, path::Path};
 
 use super::{api::Api, selection::Selection, table::Resolver};
 use crate::{
@@ -56,9 +56,21 @@ impl AdvancedEntryPoints {
 /// [`Error::RuntimeLoadFailed`] when nothing usable can be loaded (retryable),
 /// [`Error::RuntimeConflict`] when a different implementation is already pinned.
 pub(crate) fn select(options: &RuntimeOptions) -> Result<&'static Runtime> {
+    validate_library_path(options.library_path.as_deref())?;
     let runtime = SELECTED.get_or_try_load(|| Runtime::load(options))?;
     runtime.accepts(options)?;
     Ok(runtime)
+}
+
+/// Validate caller-supplied paths before either a shared or linked provider
+/// can select anything. Empty paths are relative and are refused as well.
+pub(in crate::sys) fn validate_library_path(path: Option<&Path>) -> Result<()> {
+    if path.is_some_and(|path| !path.is_absolute()) {
+        return Err(Error::InvalidInput(
+            "an explicit NDI library path must be absolute".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The editions whose libraries are searched for when [`RuntimeOptions`]
@@ -405,7 +417,7 @@ mod shared {
         let Some(requested) = requested else {
             return Ok(());
         };
-        require_absolute(requested)?;
+        super::validate_library_path(Some(requested))?;
         if same_path(requested, selected) {
             Ok(())
         } else {
@@ -445,9 +457,7 @@ mod shared {
             &self,
             accept: impl Fn(Module) -> std::result::Result<T, String>,
         ) -> Result<T> {
-            if let Some(explicit) = self.explicit {
-                require_absolute(explicit)?;
-            }
+            super::validate_library_path(self.explicit)?;
             let executable = std::env::current_exe().ok();
             let runtime_directory = std::env::var_os(RUNTIME_DIRECTORY)
                 .filter(|directory| !directory.is_empty())
@@ -498,18 +508,6 @@ mod shared {
     /// searching for another file.
     static REJECTED: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 
-    /// Reject an explicit library path the platform loader would search for
-    /// instead of opening as the named file.
-    fn require_absolute(path: &Path) -> Result<()> {
-        if path.is_absolute() {
-            Ok(())
-        } else {
-            Err(Error::InvalidInput(
-                "an explicit NDI library path must be absolute".into(),
-            ))
-        }
-    }
-
     /// Where a candidate location came from.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Origin {
@@ -547,6 +545,11 @@ mod shared {
 
     impl Candidate {
         fn open(&self, anchor: &CStr) -> std::result::Result<Module, Refusal> {
+            // A relative environment directory is a refused location, never
+            // a request to load code relative to the working directory.
+            if self.origin == Origin::RuntimeDirectory && !self.location.is_absolute() {
+                return Err(Refusal::unloaded("the runtime directory must be absolute"));
+            }
             // A directory candidate names one exact file. Skipping an absent
             // one keeps the loader from searching elsewhere for that path.
             if matches!(
@@ -632,6 +635,12 @@ mod shared {
         ];
         for (directory, origin) in directories {
             let Some(directory) = directory else { continue };
+            if origin == Origin::RuntimeDirectory && !directory.is_absolute() {
+                // Retain the refused input for diagnostics, without creating
+                // any candidate underneath the relative directory.
+                add(directory.to_owned(), origin);
+                continue;
+            }
             for name in names {
                 add(directory.join(name), origin);
             }
@@ -867,6 +876,32 @@ mod shared {
         }
 
         #[test]
+        fn a_relative_runtime_directory_is_recorded_but_never_opened() {
+            let plan = search_plan(
+                None,
+                None,
+                None,
+                Some(Path::new("relative")),
+                &["libndi.so.6", "libndi_advanced.so.6"],
+            );
+            let refused = &plan[0];
+            assert_eq!(refused.location, Path::new("relative"));
+            assert_eq!(refused.origin, Origin::RuntimeDirectory);
+            assert!(!plan
+                .iter()
+                .any(|candidate| candidate.location.parent() == Some(Path::new("relative"))));
+            let refusal = match refused.open(CORE_ANCHOR) {
+                Ok(_) => panic!("relative runtime directory was opened"),
+                Err(refusal) => refusal,
+            };
+            assert!(refusal.loaded.is_none());
+            let diagnostic = refused.describe(refusal);
+            assert!(diagnostic.contains("NDI_RUNTIME_DIR_V6"), "{diagnostic}");
+            assert!(diagnostic.contains("must be absolute"), "{diagnostic}");
+            assert_eq!(plan.last().unwrap().origin, Origin::LoaderSearch);
+        }
+
+        #[test]
         fn one_directory_named_twice_is_tried_once() {
             let plan = search_plan(
                 None,
@@ -1050,5 +1085,18 @@ mod tests {
         assert!(meets(Standard, Advanced));
         assert!(meets(Advanced, Advanced));
         assert!(!meets(Advanced, Standard));
+    }
+
+    #[test]
+    fn explicit_paths_are_validated_before_any_provider_is_consulted() {
+        assert!(validate_library_path(None).is_ok());
+        let absolute = std::env::current_dir().unwrap().join("library");
+        assert!(validate_library_path(Some(&absolute)).is_ok());
+        for path in [Path::new("library"), Path::new(""), Path::new("./library")] {
+            assert!(matches!(
+                validate_library_path(Some(path)),
+                Err(Error::InvalidInput(_))
+            ));
+        }
     }
 }

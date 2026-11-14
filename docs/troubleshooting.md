@@ -2,6 +2,11 @@
 
 ## Runtime loading
 
+Use absolute paths for `library_path` and `NDI_RUNTIME_DIR_V6`. A relative
+explicit path returns `Error::InvalidInput` before selection on every target.
+A relative environment directory is recorded as refused and never opened;
+the search continues with the platform loader.
+
 For `RuntimeLoadFailed`, inspect the attempted paths and errors, then check the
 [runtime search order](setup.md#finding-the-runtime). An absolute
 `RuntimeOptions::library_path` selects one file without fallback. Verify its

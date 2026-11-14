@@ -200,6 +200,7 @@ pub(crate) fn select_file(
     api: &Api,
     library_path: Option<&Path>,
 ) -> Result<&'static FileRuntime> {
+    super::loader::validate_library_path(library_path)?;
     let file = SELECTED.get_or_try_load(|| FileRuntime::load(core, api, library_path))?;
     file.accepts(library_path)?;
     Ok(file)

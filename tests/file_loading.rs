@@ -158,6 +158,7 @@ const fn scenario(name: &'static str) -> Scenario {
 }
 
 const SCENARIOS: &[Scenario] = &[
+    scenario("relative_path_selects_nothing"),
     Scenario {
         runtime_directory: Some("runtime"),
         ..scenario("beside_the_runtime_first_and_pinned")
@@ -262,6 +263,16 @@ fn is_loaded(name: &str) -> bool {
 fn child(name: &str, fixtures: &Fixtures) {
     let defaults = FileRuntimeOptions::default();
     match name {
+        "relative_path_selects_nothing" => {
+            let ndi = select(fixtures, &PAIRED);
+            assert!(matches!(
+                FileApi::open(&ndi, &explicit(PathBuf::from(FILE_LIBRARY))),
+                Err(Error::InvalidInput(_))
+            ));
+            assert!(!is_loaded("libndifile.so.6"));
+            let api = FileApi::open(&ndi, &defaults).unwrap();
+            assert_eq!(bound_runtime(&api), PAIRED.build);
+        }
         "beside_the_runtime_first_and_pinned" => {
             let ndi = select(fixtures, &PAIRED);
             let api = FileApi::open(&ndi, &defaults).unwrap();

@@ -19,7 +19,8 @@ is included, so enabling `file-io` alone does not generate bindings.
 Open it with `FileApi::open(&ndi, &FileRuntimeOptions::default())`. On targets
 that load libraries dynamically, discovery tries the selected runtime's
 directory, the executable's directory, `NDI_RUNTIME_DIR_V6`, then the platform
-loader. `FileRuntimeOptions::library_path` selects one absolute file without
+loader. A relative `NDI_RUNTIME_DIR_V6` is recorded as refused and never
+searched. `FileRuntimeOptions::library_path` selects one absolute file without
 fallback. A successful selection lasts for the process; a later conflicting
 selection returns `RuntimeConflict`. Use trusted library locations, including
 their dependencies, as described in [runtime selection](setup.md#selecting-a-runtime).

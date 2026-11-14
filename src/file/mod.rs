@@ -26,7 +26,8 @@
 //!
 //! 1. the directory of the selected NDI runtime library, where the SDK installs it;
 //! 2. the directory containing the running executable;
-//! 3. the directory named by the `NDI_RUNTIME_DIR_V6` environment variable;
+//! 3. the absolute directory named by `NDI_RUNTIME_DIR_V6`; relative values
+//!    are recorded as refused locations and never searched;
 //! 4. the platform loader's own search for the library name.
 //!
 //! When nothing is usable, [`Error::RuntimeLoadFailed`] names every location
@@ -242,8 +243,9 @@ impl FileRuntimeOptions {
     ///
     /// No other location is tried, so a failure to load it is reported rather
     /// than hidden by a fallback. A relative path is rejected by
-    /// [`FileApi::open`], as is any path on a target that links the SDK
-    /// statically.
+    /// [`FileApi::open`] with [`Error::InvalidInput`] on every target, before
+    /// selection. A target that links the SDK statically refuses an absolute
+    /// path with [`Error::RuntimeConflict`].
     #[must_use]
     pub fn library_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.library_path = Some(path.into());
