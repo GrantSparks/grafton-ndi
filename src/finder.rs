@@ -876,13 +876,14 @@ impl HostKeyBuffer {
 
 /// Network address of an NDI source.
 ///
-/// NDI sources can be addressed via URL (for NDI HX sources) or IP address
-/// (for standard NDI sources).
+/// The SDK supplies one address string. A string containing `://` is classified
+/// as a URL; other strings use the IP variant. This classification does not
+/// establish the source's codec or whether it uses NDI|HX.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SourceAddress {
-    /// URL address (typically for NDI HX sources).
+    /// An address classified as a URL by its `://` scheme separator.
     Url(String),
-    /// IP address (for standard NDI sources).
+    /// An address without a `://` scheme separator, such as a host or IP and port.
     Ip(String),
 }
 
@@ -1182,12 +1183,9 @@ impl Source {
         Ok(Source { name, address })
     }
 
-    /// Convert to raw format for FFI use
-    ///
-    /// # Safety
-    ///
-    /// The returned RawSource struct uses #[repr(C)] to guarantee C-compatible layout
-    /// for safe FFI interop with the NDI SDK.
+    /// Copy the source's strings into owned C strings and build the native
+    /// descriptor that points into them. RawSource keeps those allocations
+    /// alive for every SDK call that borrows its descriptor.
     pub(crate) fn to_raw(&self) -> Result<RawSource> {
         let name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
 

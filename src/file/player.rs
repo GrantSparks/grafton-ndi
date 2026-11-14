@@ -79,9 +79,12 @@ impl FilePlayer {
     /// Play a file through the advertised source.
     ///
     /// A file already playing is closed first. Playback always begins unpaused
-    /// and uses the player's looping setting. The first start of a
-    /// GOP-compressed file may wait up to about half a second for a receiver
-    /// that has just connected, so that it gets the opening keyframe.
+    /// and uses the player's looping setting. As specified by
+    /// `Processing.NDI.Lib.File.Player.h`, only the player's first start may
+    /// wait up to about half a second, and only for a GOP-compressed file with
+    /// a receiver that has just connected, so it gets the opening keyframe.
+    /// There is no wait without a connected receiver, and later starts on the
+    /// same player never wait.
     ///
     /// # Errors
     ///

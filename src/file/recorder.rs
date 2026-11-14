@@ -620,10 +620,12 @@ impl FileRecorder {
     ///   does not exist or cannot be written to, or, with an exact file name,
     ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
     ///   that file exists. The SDK is not called.
-    /// * [`Error::NativeOperationFailed`] when the SDK cannot start the source or open
-    ///   the first file. It queues an open-failed event that says why, which
-    ///   [`poll_event`](Self::poll_event) returns; the event is counted in no
-    ///   session's report.
+    /// * [`Error::NativeOperationFailed`] when the SDK cannot start the source
+    ///   or open the first file. `Processing.NDI.Lib.File.Recorder.h` specifies
+    ///   an open-failed event for an output-file open failure; source-start
+    ///   failure need not queue one. [`poll_event`](Self::poll_event) can return
+    ///   that event, counted in no session's report. Retrying `start` discards
+    ///   queued events before asking the SDK to start again.
     pub fn start(&mut self, target: &RecordingTarget, timecode: RecordingTimecode) -> Result<u64> {
         if self.ledger.session_open() {
             return Err(Error::InvalidState(StateError::PreviousSessionOpen));

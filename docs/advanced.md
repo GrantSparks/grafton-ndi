@@ -44,8 +44,9 @@ the native handle or bypass its ownership rules. See the single
 
 ## Configuration
 
-Set an options value's `config(AdvancedConfig)` before its ordinary constructor
-when the SDK object needs JSON configuration. `AdvancedConfig::parse` checks a
+For objects with an options value, set `config(AdvancedConfig)` before their
+ordinary constructor. `Genlock::new` takes its optional configuration directly
+as an argument. `AdvancedConfig::parse` checks a
 JSON object of at most one MiB and preserves its text, including unknown
 properties. Property meanings come from the SDK. Debug output and parse errors
 hide the content; `expose_json()` deliberately reveals it, so avoid logging
@@ -53,7 +54,8 @@ credentials or network details it may contain.
 
 [`advanced_source_metadata`](../examples/advanced_source_metadata.rs) shows
 `Finder::sources_with_metadata`. Configuration is also supported by sender,
-receiver, router and Discovery Server options. `CompressedSender` and
+receiver, router and Discovery Server options, and directly by `Genlock::new`.
+`CompressedSender` and
 `PacketReceiver` use the configured entry point even when given no explicit
 configuration. Refer to their constructors for defaults.
 

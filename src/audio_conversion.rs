@@ -280,6 +280,11 @@ macro_rules! conversions {
 
 impl AudioConverter {
     /// Resolve the complete current conversion group before exposing operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] when the runtime does not
+    /// provide the complete native audio-conversion group.
     pub fn new(ndi: &Ndi) -> Result<Self> {
         Ok(Self {
             audio: ndi.table()?,
@@ -326,6 +331,11 @@ macro_rules! send_interleaved {
         /// Synchronously send validated interleaved audio using the selected SDK.
         /// Source samples may be reused when this method returns. The interleaved
         /// SDK descriptors do not carry metadata or receive timestamps.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`Error::UnsupportedCapability`] when the runtime does not
+        /// provide the complete interleaved-audio send group.
         pub fn $method(&self, frame: &$input<'_>) -> Result<()> {
             let ndi = self.runtime();
             let send = ndi.table::<sys::InterleavedSend>()?;

@@ -208,6 +208,11 @@ pub struct VideoConverter {
 
 impl VideoConverter {
     /// Resolve both native utility functions from one initialized runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] when the runtime does not
+    /// provide both native V210/P216 conversion functions.
     pub fn new(ndi: &Ndi) -> Result<Self> {
         Ok(Self {
             conversion: ndi.table()?,

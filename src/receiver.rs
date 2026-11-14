@@ -1,8 +1,10 @@
 //! NDI receiving functionality for video, audio, and metadata.
 //!
-//! # Monitoring Connection Status
+//! # Connection state and SDK status reports
 //!
-//! The receiver can monitor connection status changes:
+//! Poll [`Receiver::is_connected`] or [`Receiver::connection_stats`] to track
+//! connections. Losing a connection can produce no [`ReceiverEvent::StatusChanged`]
+//! event; that event reports SDK status information, such as source capabilities:
 //!
 //! ```no_run
 //! # use grafton_ndi::{Ndi, Receiver, ReceiverEvent, ReceiverOptions, ReceiverBandwidth, Source};
@@ -14,12 +16,14 @@
 //! let options = ReceiverOptions::new(source).bandwidth(ReceiverBandwidth::MetadataOnly);
 //! let receiver = Receiver::new(&ndi, &options)?;
 //!
-//! // Poll for status changes
-//! if let Some(ReceiverEvent::StatusChanged(status)) =
+//! if let Some(ReceiverEvent::StatusChanged(_)) =
 //!     receiver.poll_event(Duration::from_millis(1000))?
 //! {
-//!     println!("Active connections: {}", status.connections());
+//!     println!("The SDK reported a status change");
 //! }
+//! // Query connection state even when no status event arrived.
+//! println!("Connected: {}", receiver.is_connected());
+//! println!("Active connections: {}", receiver.connection_stats().connections());
 //! # Ok(())
 //! # }
 //! ```
@@ -626,7 +630,11 @@ impl ReceiverOptions {
     /// Settings for monitoring a connection and controlling the source,
     /// without its video or audio.
     ///
-    /// Suited to connection tracking, tally and PTZ control:
+    /// Suited to polling connection state with [`Receiver::is_connected`] or
+    /// [`Receiver::connection_stats`], tally and PTZ control. Connection loss
+    /// need not produce a [`ReceiverEvent::StatusChanged`] event.
+    ///
+    /// Uses these settings:
     /// - bandwidth [`ReceiverBandwidth::MetadataOnly`];
     /// - the default color format, which no frame uses;
     /// - video fields not allowed.
@@ -634,7 +642,7 @@ impl ReceiverOptions {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverEvent, ReceiverOptions, Receiver};
+    /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverOptions, Receiver};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
@@ -644,12 +652,8 @@ impl ReceiverOptions {
     /// let options = ReceiverOptions::monitoring_preset(sources[0].clone()).name("Status Monitor");
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
-    /// // Poll for status changes
-    /// if let Some(ReceiverEvent::StatusChanged(status)) =
-    ///     receiver.poll_event(Duration::from_millis(1000))?
-    /// {
-    ///     println!("Active connections: {}", status.connections());
-    /// }
+    /// println!("Connected: {}", receiver.is_connected());
+    /// println!("Active connections: {}", receiver.connection_stats().connections());
     /// # Ok(())
     /// # }
     /// ```
@@ -937,7 +941,8 @@ pub struct Receiver<M: ReceiverMode = RawCapture> {
 // unwind, pending notifications are individually committed, and no public method
 // runs caller code while mutating protected receiver state. Sharing ownership for
 // advertisements therefore introduces no new partially updated public invariant.
-// This deliberately does not assert RefUnwindSafe for a shared receiver borrow.
+// ReceiverCore separately implements RefUnwindSafe for shared borrows; together
+// these preserve both unwind traits, as tests/public_auto_traits.rs asserts.
 impl<M: ReceiverMode + std::panic::UnwindSafe> std::panic::UnwindSafe for Receiver<M> {}
 
 /// A requested target and the native descriptor already validated for it.
@@ -954,9 +959,9 @@ pub(crate) struct ReceiverCore {
     ///
     /// Capture calls take this lock *shared* (so video, audio, and metadata
     /// captures still run concurrently), while [`Receiver::reconnect`] takes it
-    /// *exclusively*. This guarantees `NDIlib_recv_connect` never overlaps a
-    /// `NDIlib_recv_capture_v3` on the same instance — the one combination the
-    /// SDK does not make safe — without otherwise serializing capture.
+    /// *exclusively*. The crate conservatively excludes `NDIlib_recv_connect`
+    /// from `NDIlib_recv_capture_v3` on the same instance. `Processing.NDI.Recv.h`
+    /// documents concurrent captures, but gives no guarantee for this combination.
     ///
     /// A shared hold is a [`CaptureLock`], taken for one [`Attempt`] only, and
     /// the native capture cannot be called without one.
@@ -1395,9 +1400,10 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// # Thread safety
     ///
-    /// `NDIlib_recv_connect` is the one receive call the SDK does *not* make
-    /// safe to run concurrently with `NDIlib_recv_capture_v3` on the same
-    /// instance. This method therefore takes the receiver's capture guard
+    /// The crate conservatively serializes `NDIlib_recv_connect` against
+    /// `NDIlib_recv_capture_v3` on the same instance. `Processing.NDI.Recv.h`
+    /// documents concurrent captures, but does not establish that connection
+    /// changes may overlap them. This method takes the capture guard
     /// exclusively: it **blocks until every capture attempt in flight on this
     /// receiver returns**, and holds off any attempt that starts while it waits
     /// or runs. Every capture on the receiver — the [`Capture`] verbs,
@@ -1626,7 +1632,8 @@ impl ReceiverCore {
     /// The caller holds the capture guard exclusively for the call, waiting for
     /// capture attempts in flight to return and holding off new ones, so
     /// `NDIlib_recv_connect` never overlaps `NDIlib_recv_capture_v3` on this
-    /// instance, the one combination `Processing.NDI.Recv.h` does not make safe.
+    /// instance. This is the crate's conservative policy: `Processing.NDI.Recv.h`
+    /// documents concurrent captures without establishing that connect may overlap them.
     /// Each attempt holds the guard for one [`Attempt`] at most, so this waits
     /// about one poll interval at most.
     fn connect_raw(
@@ -1948,8 +1955,9 @@ impl ReceiverCore {
 /// Only [`ReceiverCore::capture_lock`] makes one, and every function that
 /// reaches the native capture takes one by reference, so no capture can
 /// overlap `NDIlib_recv_connect` on the same instance, which takes the guard
-/// exclusively and which `Processing.NDI.Recv.h` does not make safe to run
-/// beside a capture. The lock also fixes the receiver the capture is made on
+/// exclusively under the crate's conservative connection-change policy.
+/// `Processing.NDI.Recv.h` documents concurrent captures, without establishing
+/// that connect may overlap them. The lock also fixes the receiver the capture is made on
 /// and how long it may wait: what is left of its attempt.
 pub(crate) struct CaptureLock<'rx> {
     core: &'rx ReceiverCore,
@@ -2344,25 +2352,17 @@ impl Drop for ReceiverCore {
     }
 }
 
-/// # Safety
-///
-/// The NDI 6 SDK documentation explicitly states that recv operations are thread-safe.
-/// `NDIlib_recv_capture_v3` and related functions use internal synchronization.
-/// The Receiver struct only holds an opaque pointer returned by the SDK, and the SDK
-/// guarantees that this pointer can be safely moved between threads.
+// SAFETY: Moving the core transfers its opaque native handle without moving
+// SDK buffers or changing their lifetime. Its Ndi keeps the runtime alive.
+// Processing.NDI.Recv.h permits capture calls on separate threads, and the
+// crate's borrowed frame guards preserve their own lifetime/thread contracts.
 unsafe impl Send for ReceiverCore {}
 
-/// # Safety
-///
-/// The NDI 6 SDK documentation guarantees that `NDIlib_recv_capture_v3` is internally
-/// synchronized and can be called concurrently from multiple threads. This is explicitly
-/// mentioned in the SDK manual's thread safety section. The capture verbs (via
-/// [`Receiver::video`], [`Receiver::audio`], and [`Receiver::metadata`]) can be
-/// safely called from multiple threads simultaneously. The wrapper's capture
-/// guard excludes reconnect calls from receiver capture calls. Receiver modes
-/// prevent raw video and audio capture while a FrameSync owns this core, and
-/// raw audio capture while an Advanced AvSync, which takes the audio, owns it.
-/// Borrowed frame guards retain the receiver borrow until they free their buffers.
+// SAFETY: Processing.NDI.Recv.h documents concurrent capture calls. The
+// crate's capture guard conservatively serializes connection changes against
+// them, and query locks protect SDK strings invalidated by a later query.
+// Receiver modes reserve the media paths used by FrameSync and AvSync.
+// Borrowed frame guards retain the receiver until their native buffers are freed.
 unsafe impl Sync for ReceiverCore {}
 
 // A panic cannot leave a receiver's shared state half-changed: of its locks,
@@ -2443,7 +2443,10 @@ impl ReceiverItemRef<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ReceiverEvent {
-    /// The connection or the source's capabilities changed.
+    /// The SDK reported changed status information, such as source capabilities.
+    ///
+    /// Connection loss can produce no such event. Poll [`Receiver::is_connected`]
+    /// or [`Receiver::connection_stats`] to track the connection itself.
     StatusChanged(ReceiverStatus),
     /// The connected source changed; poll its name for the new value.
     SourceChanged,
@@ -2454,8 +2457,11 @@ pub enum ReceiverEvent {
 /// What a status-change notification reports: the current connection count.
 ///
 /// The notification may also mean that the source's capabilities or web
-/// control changed; the SDK does not say which. Tally is published upstream
-/// through [`Receiver::set_tally`], rather than received here.
+/// control changed; the SDK does not say which. Its connection count is a
+/// snapshot taken when the event is consumed, and connection loss need not
+/// produce an event. Poll [`Receiver::is_connected`] or
+/// [`Receiver::connection_stats`] for connection tracking. Tally is published
+/// upstream through [`Receiver::set_tally`], rather than received here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ReceiverStatus {
     connections: u32,

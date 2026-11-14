@@ -456,14 +456,14 @@ fn drain(state: &mut InFlight<VideoFrame>, sender: SendHandle) {
 /// Frames an asynchronous video send lends to the SDK, and the SDK calls that
 /// end the loan.
 ///
-/// `Processing.NDI.Send.h` lets the SDK keep reading a frame sent with
-/// `NDIlib_send_send_video_async_v2` until a synchronizing event: another
-/// asynchronous send, a synchronous send, an asynchronous send of a null
-/// frame, or destroying the sender. `Processing.NDI.Advanced.h` gives the
-/// scatter submission, `NDIlib_send_send_video_scatter_async`, the same
-/// rules. A [`CompressedSender`](crate::advanced::CompressedSender) keeps one
-/// frame per stream, program and preview, each until the next asynchronous
-/// send on that stream.
+/// `Processing.NDI.Send.h` lets the SDK keep reading an asynchronous frame
+/// until a later video send (asynchronous or synchronous, including a null
+/// synchronous frame) or sender destruction synchronizes it. The [NDI-Send]
+/// documentation additionally specifies the null asynchronous flush used here.
+/// `Processing.NDI.Advanced.h` gives scatter submission the same lifetime rules.
+/// A [`CompressedSender`](crate::advanced::CompressedSender) conservatively
+/// retains each stream's frame until a replacement on that stream returns,
+/// even when another stream's video send has already synchronized the SDK.
 ///
 /// [`InFlight`] holds one stream's lent frame. It hands the frame back only in
 /// exchange for [`in_flight::Synchronized`], the proof that the SDK has returned from a
@@ -480,6 +480,8 @@ fn drain(state: &mut InFlight<VideoFrame>, sender: SendHandle) {
 /// releases the native sender, and a `CompressedSender` destroys its native
 /// sender before it drops its streams. An owner that is never dropped leaks
 /// its frames rather than freeing them.
+///
+/// [NDI-Send]: https://docs.ndi.video/all/developing-with-ndi/sdk/ndi-send
 pub(crate) mod in_flight {
     use std::mem;
 
@@ -492,9 +494,9 @@ pub(crate) mod in_flight {
 
     /// Proof that the SDK has returned from a call that synchronizes a
     /// stream's asynchronous video: an asynchronous or synchronous video
-    /// send, or a null flush. `Processing.NDI.Send.h` and the [NDI-Send]
-    /// documentation list these as synchronizing events: when one returns,
-    /// the SDK no longer reads the frame previously submitted asynchronously.
+    /// send, or a null flush. `Processing.NDI.Send.h` lists subsequent video
+    /// sends; [NDI-Send] additionally documents the null asynchronous flush.
+    /// When the call returns, the SDK no longer reads the previous frame.
     ///
     /// [`InFlight::completed`] consumes it, so a frame is released only after
     /// the call that ended the SDK's access to it.
@@ -1016,7 +1018,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// metadata, and no timestamp. No reference to the source is retained.
     ///
     /// Its pixel buffer is reused when its capacity holds the packed frame
-    /// and its format's [room](PixelFormat::send_tail_room), and otherwise
+    /// and the SDK tail room required by its format and scan type, including
+    /// extra strides for interlaced UYVY/UYVA when needed. Otherwise it is
     /// replaced by one allocation of exactly that size. Its metadata string
     /// is reused when its capacity holds the new text and its terminator;
     /// otherwise it grows once. With sufficient pixel and metadata capacity,
@@ -1488,9 +1491,8 @@ impl Sender {
     /// reuses one staging allocation. Captures with padded rows also stage,
     /// since their guard guarantees only active pixels are initialized. Packed
     /// captures needing no trailing room send in place. Owned
-    /// frames use their zeroed tail; a scan type requiring extra strides may
-    /// still need staging until the owned buffer has that room. To permit
-    /// direct sending from initialized caller padding
+    /// frames retain zeroed, scan-dependent tail room and always send in place.
+    /// To permit direct sending from initialized caller padding
     /// and trailing memory, explicitly use
     /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`];
     /// [`BorrowedVideoFrame::sends_in_place`] tells which a frame is.
@@ -1594,8 +1596,9 @@ impl Sender {
 
     /// Flush pending async video operations synchronously.
     ///
-    /// Sends a true NULL video frame pointer to the SDK, blocking until all
-    /// pending async video operations are complete.
+    /// When the SDK may still read a pending frame, sends a null video frame
+    /// pointer and blocks until that asynchronous operation completes. If no
+    /// frame is in flight, returns without calling the SDK.
     ///
     /// After this returns, the SDK has released the pending buffer. The sender
     /// retains the frame; use [`Self::finish_video_async`] or the next async
@@ -1710,6 +1713,16 @@ impl<M: SenderMode> Sender<M> {
     /// 4 MiB, rather than assuming every positive native length is the exact
     /// UTF-8 byte count including its terminator. Invalid descriptor counts and
     /// invalid UTF-8 still return an error, and every captured frame is freed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] when the runtime lacks the
+    /// sender metadata capture functions, [`Error::InvalidInput`] when the
+    /// timeout exceeds [`crate::MAX_TIMEOUT`], [`Error::InvalidFrame`] for an
+    /// invalid metadata count, a positive count with null data, or a missing
+    /// bounded terminator,
+    /// [`Error::InvalidUtf8`] for non-UTF-8 text, and [`Error::CaptureFailed`]
+    /// when the SDK returns a frame type other than metadata or no frame.
     pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
         let metadata = self._ndi.table::<sys::SenderMetadata>()?;
         let deadline = Deadline::after(timeout)?;
@@ -1901,8 +1914,11 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Maximum time to wait for connection count.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    /// * `timeout` - Maximum wait for at least one connected receiver. A zero
+    ///   timeout returns the current count immediately. A nonzero timeout
+    ///   returns as soon as a receiver is connected, or returns zero when the
+    ///   wait expires, as specified by `Processing.NDI.Send.h`. Must not exceed
+    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
     ///

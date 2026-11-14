@@ -12,9 +12,9 @@
 //! exists when either feature is enabled, and each runtime only with its own
 //! feature; the crate root does not re-export any of it.
 //!
-//! The NDI SDK operations are inherently synchronous and blocking, so these wrappers
-//! use `spawn_blocking` internally to run NDI operations on a thread pool without
-//! blocking the async runtime. Besides capture, [`AsyncReceiver`] has async
+//! The NDI SDK operations are synchronous and blocking. Tokio runs them through
+//! `tokio::task::spawn_blocking`; smol uses `smol::unblock`, keeping the work off
+//! the async runtime's executor threads. Besides capture, [`AsyncReceiver`] has async
 //! versions of the receiver's other waiting calls:
 //! [`poll_event`](AsyncReceiver::poll_event), which returns the status and
 //! source changes that captures pass over and keep,
@@ -276,8 +276,10 @@ impl private::Spawn for Smol {
 ///
 /// # Thread Safety
 ///
-/// The underlying [`Receiver`] is wrapped in an [`Arc`] to allow sharing across
-/// async tasks and safe cloning. The NDI SDK receiver is inherently thread-safe.
+/// The underlying [`Receiver`] is shared through an [`Arc`]. The SDK documents
+/// concurrent capture calls in `Processing.NDI.Recv.h`; the crate's capture
+/// guard serializes connection changes against them. Receiver queries with
+/// invalidatable SDK strings have their own query lock.
 ///
 /// # Events and controls
 ///
@@ -1252,9 +1254,9 @@ mod receiver_tests {
         }
     }
 
-    /// Lending the receiver added no field: the auto traits are those the
-    /// type had before. It is not `UnwindSafe`, because its shared
-    /// [`Receiver`] is deliberately not `RefUnwindSafe`.
+    /// Lending the receiver adds no field and preserves its auto traits.
+    /// Receiver and both runtime-specific AsyncReceiver types are UnwindSafe
+    /// and RefUnwindSafe, as tests/public_auto_traits.rs asserts.
     #[test]
     fn async_receivers_keep_their_auto_traits() {
         fn shared<T: Send + Sync + Clone + 'static>() {}

@@ -378,9 +378,9 @@ impl PixelFormat {
     /// a multiple of 16. The SDK documents no such requirement, and it
     /// compresses what it reads there into the picture's last blocks. The
     /// 64-bit ARM Linux build reads every frame exactly. The figures are
-    /// measured with the Linux runtimes 6.1.1, 6.3.2 and 6.4.0.2; the SDK
-    /// validation notes in the repository's `docs` directory have the method
-    /// and the numbers. Every build but the 64-bit ARM Linux one takes the
+    /// measured with the Linux runtimes 6.1.1, 6.3.2 and 6.4.0.2, and checked
+    /// against the native SDK by `tests/send_tail_room_sdk.rs`. Every build
+    /// but the 64-bit ARM Linux one takes the
     /// x86 figure, the 32-bit x86 Linux build included.
     ///
     /// The crate keeps this room for the SDK, and fills it with zeros, so a
@@ -660,13 +660,14 @@ pub(crate) fn sdk_video_frame(
 /// The parts of a video frame that its shared accessors and owned copies
 /// read.
 ///
-/// [`VideoFrame`], a received frame's [`ValidatedFrame`] and its
-/// [`VideoFrameRef`], and [`BorrowedVideoFrame`](crate::BorrowedVideoFrame) lend
-/// their validated layout, header, pixels and metadata through it, and
-/// [`video_accessors!`] generates their public accessors and `Debug` from
-/// it, so that each is written and documented once. Each implementation
-/// takes every part from one value that was validated as a whole. The trait
-/// is crate-private, so these are its only implementations.
+/// [`VideoFrame`], [`BorrowedVideoFrame`](crate::BorrowedVideoFrame), internal
+/// validated video, and the borrowed [`VideoFrameRef`] and
+/// [`FrameSyncVideoRef`](crate::FrameSyncVideoRef) views lend their validated
+/// layout, header, pixels and metadata through it. [`video_accessors!`]
+/// generates their public accessors and `Debug`, so each is written and
+/// documented once. Each implementation takes every part from one value that
+/// was validated as a whole; the generic VideoRef implementation covers both
+/// receiver and FrameSync guards.
 ///
 /// # Safety
 ///
@@ -1853,13 +1854,13 @@ impl VideoFrameBuilder {
 /// The parts of an audio frame that its shared accessors and owned copies
 /// read.
 ///
-/// [`AudioFrame`], and a received frame's [`ValidatedFrame`] and its
-/// [`AudioFrameRef`], lend their validated layout, timing, samples and metadata
-/// through it, and [`audio_accessors!`] generates their public accessors and
-/// `Debug` from it, so that each is written and documented once. Each
-/// implementation takes every part from one value that was validated as a
-/// whole. The trait is crate-private, so these are its only
-/// implementations.
+/// [`AudioFrame`], [`BorrowedAudioFrame`], internal validated audio, and the
+/// borrowed [`AudioFrameRef`] and [`FrameSyncAudioRef`](crate::FrameSyncAudioRef)
+/// views lend their validated layout, timing, samples and metadata through it.
+/// [`audio_accessors!`] generates their public accessors and `Debug`, so each
+/// is written and documented once. Each implementation takes every part from
+/// one value that was validated as a whole; the generic AudioRef
+/// implementation covers both receiver and FrameSync guards.
 ///
 /// # Safety
 ///
@@ -5076,8 +5077,9 @@ pub(crate) use borrowed::{AudioRef, VideoRef};
 /// Borrows its receiver and frees the SDK buffer when dropped. It can be moved
 /// or shared with scoped worker threads (`Send + Sync`). Converting with
 /// `to_owned` copies the active pixels into an owned frame. No pixels are
-/// copied by capture itself. For padded buffers, `data()` returns `None`; use
-/// `planes()` and each plane's rows to read initialized active pixels.
+/// copied by capture itself. `data()` returns `None` when padding separates
+/// active rows or planes; trailing padding after a single active row does not
+/// prevent a contiguous view. Use `planes()` and each plane's rows for padded layouts.
 /// See [`crate::FrameSyncVideoRef`] for clock-driven capture.
 pub type VideoFrameRef<'rx> = VideoRef<'rx, VideoKind>;
 

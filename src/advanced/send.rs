@@ -532,10 +532,11 @@ unsafe impl Lend for PendingVideo {
 
 /// The frame most recently submitted asynchronously on each stream.
 ///
-/// The SDK uses an asynchronously sent frame until the next send on the same
-/// stream returns, so each stream keeps exactly one frame in flight, and an
-/// earlier frame comes back only with the proof that the submission that
-/// replaced it has returned, or that the native sender was destroyed.
+/// `Processing.NDI.Send.h` makes subsequent video sends synchronizing calls
+/// for the sender, across streams. The crate conservatively retains one frame
+/// per stream until the replacement on that same stream returns, or the native
+/// sender is destroyed. A synchronizing send on another stream can end the
+/// native loan earlier without releasing this retained storage to the caller.
 #[derive(Default)]
 struct PendingStreams {
     program: InFlight<PendingVideo>,
