@@ -661,62 +661,6 @@ fn take_completed(state: &mut State) -> Option<CompletedVideo> {
 mod tests {
     use super::*;
 
-    /// Measure submission with a completed backlog, reusing each collected
-    /// frame. No receiver is needed: the SDK completes sends with no peers.
-    #[test]
-    #[ignore = "manual release-mode queue submission benchmark"]
-    fn benchmark_queued_submission_backlog() {
-        use std::{hint::black_box, time::Instant};
-
-        let Some(ndi) = crate::test_support::advanced_ndi() else {
-            return;
-        };
-        for backlog in [8, 512, 4096] {
-            let options = SenderOptions::new(crate::test_support::unique_name(&format!(
-                "queue benchmark {backlog}"
-            )))
-            .clock_video(false);
-            let mut queue =
-                QueuedSender::new(&ndi, &options, QueueOptions::new().max_frames(backlog + 1))
-                    .unwrap();
-            for _ in 0..backlog {
-                queue
-                    .try_submit(VideoFrame::builder().resolution(2, 2).build().unwrap())
-                    .unwrap();
-            }
-            let deadline = Deadline::after(Duration::from_secs(5)).unwrap();
-            let mut state = queue.callback.state.lock().unwrap();
-            while state.ready.len() < backlog {
-                assert!(!deadline.is_expired(), "the SDK must complete every frame");
-                state = queue
-                    .callback
-                    .changed
-                    .wait_timeout(state, deadline.remaining())
-                    .unwrap()
-                    .0;
-            }
-            drop(state);
-
-            let mut frame =
-                QueuedVideoFrame::from(VideoFrame::builder().resolution(2, 2).build().unwrap());
-            let iterations = 10_000;
-            let start = Instant::now();
-            for _ in 0..iterations {
-                black_box(queue.try_submit(frame).unwrap());
-                frame = queue
-                    .try_take_completed()
-                    .or_else(|| queue.wait_completed(Duration::from_secs(5)).unwrap())
-                    .expect("the SDK must complete every frame")
-                    .into_frame();
-            }
-            eprintln!(
-                "{backlog} retained frames: {:.0} ns per submit/collect",
-                start.elapsed().as_nanos() as f64 / f64::from(iterations)
-            );
-            assert!(!queue.completion_protocol_failed());
-        }
-    }
-
     fn insert(state: &CallbackState, id: u64) -> usize {
         let mut frame =
             QueuedVideoFrame::Pixels(VideoFrame::builder().resolution(2, 2).build().unwrap());

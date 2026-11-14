@@ -4,7 +4,7 @@ use super::process_captured;
 use crate::{
     capture::{AudioKind, CaptureStrategy, Guard, MetadataKind, VideoKind},
     sys::bindings::*,
-    test_alloc::{allocation_count, peak_bytes},
+    test_alloc::allocation_count,
     ReceiverItemRef, VideoFrameRef,
 };
 use std::{cell::Cell, mem::MaybeUninit, ptr};
@@ -229,64 +229,6 @@ fn processing_panic_releases_guard() {
     }));
     assert!(result.is_err());
     assert_eq!(FREES.get(), before + 1);
-}
-
-/// Ownership conversion only; excludes SDK encoding, capture and scheduling.
-/// Run in release mode with --ignored --nocapture to record median/p99 times.
-#[test]
-#[ignore = "manual payload-copy benchmark"]
-fn payload_copy_benchmark() {
-    use std::{hint::black_box, time::Instant};
-    for (width, height) in [(1920, 1080), (3840, 2160)] {
-        for padding in [0, 64] {
-            let stride = width * 4 + padding;
-            let mut pixels = vec![MaybeUninit::uninit(); (stride * height) as usize];
-            for row in 0..height as usize {
-                pixels[row * stride as usize..row * stride as usize + width as usize * 4]
-                    .fill(MaybeUninit::new(37));
-            }
-            let frame = video(&mut pixels, width, height, stride);
-            let inspect = |frame: &VideoFrameRef<'_>| {
-                black_box((
-                    frame.width(),
-                    frame.height(),
-                    frame.planes().next().unwrap().rows().next().unwrap()[0],
-                ))
-            };
-            let (_, scoped_allocs) =
-                allocation_count(|| process_captured(Some(&frame), |f| inspect(f)));
-            let (_, scoped_bytes) = peak_bytes(|| process_captured(Some(&frame), |f| inspect(f)));
-            let (_, owned_bytes) = peak_bytes(|| {
-                process_captured(Some(&frame), |f| {
-                    let owned = (*f).to_owned();
-                    black_box((owned.width(), owned.height(), owned.data()[0]))
-                })
-            });
-            assert_eq!((scoped_allocs, scoped_bytes), (0, 0));
-            let mut scoped = Vec::new();
-            let mut owned = Vec::new();
-            for i in 0..510 {
-                let began = Instant::now();
-                process_captured(Some(&frame), |f| inspect(f));
-                let scoped_time = began.elapsed();
-                let began = Instant::now();
-                process_captured(Some(&frame), |f| {
-                    let copy = (*f).to_owned();
-                    black_box((copy.width(), copy.height(), copy.data()[0]));
-                    black_box(&copy);
-                });
-                let owned_time = began.elapsed();
-                if i >= 10 {
-                    scoped.push(scoped_time);
-                    owned.push(owned_time);
-                }
-            }
-            scoped.sort_unstable();
-            owned.sort_unstable();
-            eprintln!("{width}x{height} padding={padding}: scoped median={:?} p99={:?} bytes={scoped_bytes}; owned median={:?} p99={:?} bytes={owned_bytes}",
-                scoped[250], scoped[494], owned[250], owned[494]);
-        }
-    }
 }
 
 #[test]

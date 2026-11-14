@@ -2404,35 +2404,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "manual release-mode owned video preparation benchmark"]
-    fn benchmark_owned_video_preparation() {
-        use std::{hint::black_box, time::Instant};
-        for format in [PixelFormat::Uyvy, PixelFormat::Uyva] {
-            for (width, height) in [(720, 486), (1920, 1082), (3840, 2162)] {
-                let frame = VideoFrame::builder()
-                    .resolution(width, height)
-                    .pixel_format(format)
-                    .scan_type(ScanType::Interlaced)
-                    .build()
-                    .unwrap();
-                let mut staging = Pixels::default();
-                black_box(PreparedVideo::new(&frame, &mut staging));
-                let start = Instant::now();
-                for _ in 0..200 {
-                    black_box(PreparedVideo::new(
-                        black_box(&frame),
-                        black_box(&mut staging),
-                    ));
-                }
-                eprintln!(
-                    "{format:?} {width}x{height}: {:.3} us/frame",
-                    start.elapsed().as_secs_f64() * 1_000_000.0 / 200.0
-                );
-            }
-        }
-    }
-
-    #[test]
     fn default_yuv_staging_ignores_all_caller_padding_and_tail_room() {
         for format in [PixelFormat::Uyvy, PixelFormat::Uyva] {
             if format.send_tail_room() == 0 {
@@ -2513,41 +2484,6 @@ mod tests {
                             }
                         }
                     }
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "manual release-mode staging benchmark"]
-    fn benchmark_borrowed_yuv_staging() {
-        use std::{hint::black_box, time::Instant};
-        for format in [PixelFormat::Uyvy, PixelFormat::Uyva] {
-            for (width, height) in [(1280, 720), (1920, 1080), (3840, 2160)] {
-                for padding in [0, 4] {
-                    let stride = width as usize * 2 + padding;
-                    let len =
-                        ValidatedVideoLayout::new_uncompressed(format, width, height, Some(stride))
-                            .unwrap()
-                            .data_len_bytes;
-                    let buffer = vec![128; len + format.send_tail_room()];
-                    let frame = BorrowedVideoFrame::builder(&buffer, width, height, format)
-                        .line_stride_bytes(stride)
-                        .build()
-                        .unwrap();
-                    let mut staging = Pixels::default();
-                    black_box(PreparedVideo::new(&frame, &mut staging));
-                    let start = Instant::now();
-                    for _ in 0..200 {
-                        black_box(PreparedVideo::new(
-                            black_box(&frame),
-                            black_box(&mut staging),
-                        ));
-                    }
-                    eprintln!(
-                        "{format:?} {width}x{height} padding={padding}: {:.3} ms/frame",
-                        start.elapsed().as_secs_f64() * 1000.0 / 200.0
-                    );
                 }
             }
         }
