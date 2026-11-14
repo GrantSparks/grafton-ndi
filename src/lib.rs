@@ -41,7 +41,7 @@
 //! Cargo features enable `asynchronous` (`tokio` or `smol`), `advanced`,
 //! `file` (`file-io`), and image encoders (`image-encoding`). None is on by default.
 //!
-//! See the [user guides](https://github.com/GrantSparks/grafton-ndi#guides-and-examples)
+//! See the [user guides](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/README.md#guides-and-examples)
 //! for setup, platform support, examples, limitations and migration instructions.
 
 #![warn(clippy::return_self_not_must_use)]

@@ -40,6 +40,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Documentation archives link to immutable commits, checked locally.
+          fetch-depth: 0
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: '3.13'
@@ -70,6 +73,8 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps --all-features
+      - name: Documentation links and examples
+        run: python ci/docs.py --compile --rustdoc target/doc
       - name: Minimum supported Rust version
         run: |
           rustup toolchain install 1.88.0 --profile minimal
@@ -166,8 +171,8 @@ jobs:
       #                     on macOS; on Linux, the driver package a row names
       #                     in `hx-driver`, copied beside its runtime)
       #   hevc-444-decoder  the same for HEVC 4:4:4, with a 6.4 runtime
-      # No Windows row promises a decoder yet: the hosted Windows runners gave
-      # black placeholder frames for HEVC 4:4:4, and H.264 is unmeasured there.
+      # Windows Advanced rows require an H.264 decoder; no Windows row requires
+      # HEVC 4:4:4 decoding. These requirements configure checks, not past results.
       # Each step promises exactly what its build can check. A build without the
       # advanced and file-io features can check only `1` and `discovery-server`, so
       # the no-default-features step promises `require-no-default`, or `1` in a

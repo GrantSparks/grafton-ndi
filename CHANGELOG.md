@@ -6,40 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Entries and examples describe the API of their named release. For the current
-API, see the [README](README.md) and the migration guides for
-[2.0](docs/migration/1.x-to-2.0.md) and [3.0](docs/migration/2.0-to-3.0.md).
+API, see the [README](README.md) and the [migration index](docs/migration/README.md).
 
-## [Unreleased]
-
-### Breaking Changes
-
-- Video construction uses a shared 60 fps default for owned frames, borrowed
-  frames and compressed video formats. Set an explicit `FrameRate` for other
-  timing.
-- Packet capture returns `PacketItem`, with `Event(ReceiverEvent)` carrying the
-  same notifications and connection snapshot as raw receiver capture.
-- AV synchronization reports SDK internal failures through
-  `Error::NativeOperationFailed` and unknown statuses through
-  `Error::UnexpectedSdkResult`; these are no longer successful outcomes.
-- Owned compressed and scatter frames use `set_metadata`, `clear_metadata`
-  and `set_timecode` rather than consuming `with_*` methods. Their audio
-  variants use `set_protected`.
-- File statistics use named media properties and
-  `PlayerStats::video_frames(StreamTier)` instead of positional arrays. See the
-  [migration notes](docs/migration/unreleased.md).
-- `SourceCache` owns its configured `Finder` and has no lifetime parameter.
-  Move it with `SourceCache::new(finder)` and use `cache.finder()` for uncached
-  queries. This permits direct storage in server state without extra ownership
-  allocations. See the [migration notes](docs/migration/unreleased.md).
-
-### Fixed
-
-- Async recorder metadata injection accepts every `MetadataSource`, including
-  captured metadata, and copies its text and timecode once when called.
-- Contain consumer waker panics in async File API command, event and shutdown
-  notifications, preserving recording/playback and completing other waiters.
-
-## [3.0.0] - 2026-11-13
+## [3.0.0] - Unreleased
 
 Version 3.0.0 loads the NDI library when the program selects a runtime instead
 of linking it when the program is built, so building the crate no longer needs
@@ -92,6 +61,25 @@ as `None`. Most programs need changes; see the
   and require trusted native search directories or explicit first-load paths.
 
 ### Breaking Changes
+
+- Video construction uses a shared 60 fps default for owned frames, borrowed
+  frames and compressed video formats. Set an explicit `FrameRate` for other
+  timing.
+- Packet capture returns `PacketItem`, with `Event(ReceiverEvent)` carrying the
+  same notifications and connection snapshot as raw receiver capture.
+- AV synchronization reports SDK internal failures through
+  `Error::NativeOperationFailed` and unknown statuses through
+  `Error::UnexpectedSdkResult`; these are no longer successful outcomes.
+- Owned compressed and scatter frames use `set_metadata`, `clear_metadata`
+  and `set_timecode` rather than consuming `with_*` methods. Their audio
+  variants use `set_protected`.
+- File statistics use named media properties and
+  `PlayerStats::video_frames(StreamTier)` instead of positional arrays. See the
+  [migration notes](docs/migration/2.0-to-3.0.md#adapting-pre-release-30-applications).
+- `SourceCache` owns its configured `Finder` and has no lifetime parameter.
+  Move it with `SourceCache::new(finder)` and use `cache.finder()` for uncached
+  queries. This permits direct storage in server state without extra ownership
+  allocations. See the [migration notes](docs/migration/2.0-to-3.0.md#adapting-pre-release-30-applications).
 
 - The NDI library is loaded at run time. A program whose NDI library is
   missing now starts, and `Ndi::new` returns `Error::RuntimeLoadFailed` naming
@@ -170,8 +158,9 @@ as `None`. Most programs need changes; see the
   with getters of the same names, such as `tally.on_program()` and
   `status.connections()`.
 - Widths, heights, frame-rate parts, sample rates and channel and sample
-  counts are `u32`, and strides and buffer lengths are `usize`, where 2.0 used
-  `i32`: in frames, frame references, frame builders, pixel-format sizing,
+  counts are `u32`, and strides are `usize`, where 2.0 used `i32`. Buffer-length
+  results remain `usize`. These changes apply to frames, frame references,
+  frame builders, pixel-format sizing,
   `FrameSyncAudioRequest` and `FrameSync::audio_queue_depth`. A value the SDK
   cannot represent is refused before it reaches the SDK.
 - Frame rates are `FrameRate` values. `frame_rate()` replaces `frame_rate_n()`
@@ -199,7 +188,7 @@ as `None`. Most programs need changes; see the
 - `LineStrideOrSize` is removed. `VideoFrame`, `VideoFrameRef` and
   `BorrowedVideoFrame` report the first plane's stride with
   `line_stride_bytes() -> usize` instead of `line_stride_or_size()`.
-- `PixelFormat::try_line_stride` and `try_buffer_size` are `line_stride` and
+- `PixelFormat::try_line_stride` and `try_buffer_size` are `line_stride_bytes` and
   `buffer_len`, and `PixelFormatInfo::try_buffer_len` is `buffer_len`.
   `PixelFormat`, `ScanType` and `AudioFormat` no longer convert to or from
   `u32` and `i32`. A pixel format's FourCC is a `FourCc`:
@@ -226,8 +215,8 @@ as `None`. Most programs need changes; see the
   where it returned `false`.
 - `Receiver::poll_status_change` is removed. `Receiver::poll_event` returns the
   same status as `ReceiverEvent::StatusChanged`, together with the other
-  receiver events, and is the only poller, so two pollers no longer compete for
-  one notification.
+  receiver events. Combined capture and event polling consume pending events
+  once; typed capture preserves them for either consumer.
 - `Receiver::metadata` and `poll_event` need the receiver's mode to implement
   the new sealed `MetadataMode`, `Receiver::audio` the new sealed
   `CaptureMode`, which extends it, and `Receiver::video` the new sealed
@@ -241,8 +230,8 @@ as `None`. Most programs need changes; see the
   the same receiver audio, so each audio frame reached only one of them, and
   the FrameSync returned silence for every frame the raw capture took.
   Capture audio with `FrameSync::capture_audio` or `capture_audio_ref`, or
-  recover the receiver with `FrameSync::into_receiver`. Metadata capture and
-  event polling on a FrameSync's receiver are unchanged.
+  recover the receiver with `FrameSync::into_receiver`. The attached receiver
+  retains metadata capture and provides `poll_event` for receiver notifications.
 - FrameSync's owned captures take the short names: `capture_video` and
   `capture_audio` return owned frames, as `capture_video_owned` and
   `capture_audio_owned` did, and the borrowing captures are
@@ -289,9 +278,9 @@ as `None`. Most programs need changes; see the
   `picture_aspect_ratio`, `FourCc::from(frame.pixel_format())`, and
   `data().len()`: `data()` returns the frame's storage, no longer the whole
   buffer the frame was built from.
-- `SourceCache::new(&finder)` borrows its finder and retains every feed for each
-  host. `sources_by_host` replaces the old host-to-first-feed lookup; the cache
-  no longer starts NDI by itself.
+- `sources_by_host` replaces the old host-to-first-feed lookup and returns all
+  distinct feeds observed across the discovery window; the cache no longer
+  starts NDI by itself.
 - `NDI::is_supported_cpu` is removed. Use `Runtime::is_supported_cpu` on a
   selected runtime, or `ndi.runtime().is_supported_cpu()`.
 - `NDI::version` is removed. Use `ndi.info().raw_version()`, or
@@ -312,7 +301,7 @@ as `None`. Most programs need changes; see the
   that count is now `Error::UnexpectedSdkResult`. `Error::PtzCommandFailed` is
   removed; a PTZ command the SDK rejects is `Error::NativeOperationFailed`
   naming the PTZ function. `Error::Io`, which 2.0 never returned, exists only
-  with the `file-io` feature, for the File API's operating-system errors.
+  with `file-io` or `image-encoding`, for operating-system and image-writer errors.
 - `MAX_TIMEOUT` is `u32::MAX - 1` milliseconds, one millisecond less than in
   2.0, and a timeout of exactly the old value is refused. The SDK reads
   0xFFFFFFFF as a wait without a limit, so no finite timeout is passed to it as
@@ -608,8 +597,7 @@ as `None`. Most programs need changes; see the
   including receiver and FrameSync captures. Eligible video sends and strided
   audio avoid intermediate owned copies; padded video uses reusable safe staging.
   Copied async video submissions accept the same inputs and retain owned storage.
-- `SourceCache::new(&finder)` and `sources_by_host` replace host-to-first-feed
-  lookup. Addressed sources convert to direct recorder endpoints by default;
+- Addressed sources convert to direct recorder endpoints by default;
   `SourceSpec::new(name)` explicitly requests logical name discovery.
 - Sender inputs no longer need owned-to-borrowed adapter conversions, and owning
   receiver wrappers use `controls()` instead of exposing mutable receivers or
@@ -683,6 +671,11 @@ as `None`. Most programs need changes; see the
   is on docs.rs.
 
 ### Fixed
+
+- Async recorder metadata injection accepts every `MetadataSource`, including
+  captured metadata, and copies its text and timecode once when called.
+- Contain consumer waker panics in async File API command, event and shutdown
+  notifications, preserving recording/playback and completing other waiters.
 
 - Owned video frames keep complete scan-dependent SDK tail room after
   construction, copying, pixel replacement and scan-type changes. Synchronous

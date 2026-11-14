@@ -1,285 +1,135 @@
 # Image encoding
 
-With the `image-encoding` feature, every video frame type encodes itself as a
-PNG, JPEG or WebP image, or as a data URL of one: frames you capture
-from a receiver or a FrameSync, owned frames, and frames you build to send.
-Every uncompressed pixel format is supported. YUV is converted to RGB as the
-NDI SDK converts it, with BT.709, limited range and repeated chroma, unless a
-frame's metadata names another matrix. Frames tagged HDR are refused unless you
-ask for their code values, and images can be reduced by 2, 4 or 8 on the way.
+Enable `image-encoding` to encode captured, owned or borrowed uncompressed video
+frames as PNG, JPEG, lossless WebP, lossy WebP or data URLs:
 
 ```toml
 [dependencies]
 grafton-ndi = { version = "3.0", features = ["image-encoding"] }
 ```
 
-The feature adds the `png`, `jpeg-encoder`, `image-webp`, `libwebpop` and `base64` crates,
-all pure Rust. The `ColorInfo` color description and every frame's
-`color_info()` need no feature.
-
 ## Encoding a frame
 
-`ImageOptions` configures encoding:
+Run the [`NDIlib_Recv_PNG` example](../examples/NDIlib_Recv_PNG.rs) with a source
+visible on your network:
 
-| Method | Returns |
-| --- | --- |
-| `encode_image(&options)` | The image, in a new `Vec<u8>` |
-| `encode_image_to(&options, writer)` | `()`, having written the image into any `io::Write` |
-| `encode_image_data_url(&options)` | A `data:image/...;base64,` URL, allocated at its final length |
-| `encode_png()`, `encode_jpeg(quality)`, `encode_data_url(format)` | The same, with `ImageOptions::new(format)` |
-
-```rust
-use grafton_ndi::{Downscale, ImageFormat, ImageOptions, PngCompression};
-
-// A PNG, fast enough for a snapshot loop of camera video.
-let options = ImageOptions::new(ImageFormat::Png).png_compression(PngCompression::Fast);
-let png = frame.encode_image(&options)?;
-
-// A quarter-size JPEG thumbnail as a data URL.
-let thumbnail = ImageOptions::new(ImageFormat::Jpeg(85)).downscale(Downscale::Quarter);
-let url = frame.encode_image_data_url(&thumbnail)?;
-
-// Lossy WebP for a bandwidth-sensitive preview, keeping transparency exact.
-let preview = ImageOptions::new(ImageFormat::WebpLossy(75)).downscale(Downscale::Half);
-let webp = frame.encode_image(&preview)?;
-
-// Prioritize latency at the same color quality, keeping transparency exact.
-let fast_preview = preview.clone().webp_effort(0).webp_sharp_yuv(false);
-let fast_webp = frame.encode_image(&fast_preview)?;
+```sh
+cargo run --example NDIlib_Recv_PNG --features image-encoding -- --output snapshot.png
 ```
 
-A loop that takes a snapshot on a timer can reuse one buffer:
+It selects the first discovered source, captures one frame and writes
+`snapshot.png`. Use `ImageOptions::new(format)` with a frame's `encode_image`
+to allocate a `Vec<u8>`, `encode_image_to` to write to an `io::Write`, or
+`encode_image_data_url` for a base64 URL. `encode_png` and `encode_jpeg` are
+conveniences. See [`ImageOptions`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/struct.ImageOptions.html)
+for compile-checked examples and exact option/error contracts.
 
-```rust
-let options = ImageOptions::new(ImageFormat::WebpLossless);
-let mut image = Vec::new();
-while let Some(frame) = receiver.video().capture_ref(timeout)? {
-    image.clear();
-    frame.encode_image_to(&options, &mut image)?;
-    publish(&image);
-}
-```
+All frame and option validation occurs before writing. A later codec or writer
+failure can leave partial output, so publish files only after a successful
+encode. Reuse a cleared `Vec<u8>` with `encode_image_to` when retaining output
+capacity is useful. For files or sockets, consider `BufWriter` for the codecs
+that write incrementally.
 
-PNG, JPEG and lossless WebP write as they encode: wrap a file or socket in a
-`BufWriter`, because those codecs write in small pieces. Lossy WebP buffers
-the complete encoded image before writing it. Every check of the
-options and the frame happens before anything is written. After a later error,
-which is a failing writer or codec, the writer may hold part of an image.
-
-Encoding is CPU work, tens to hundreds of milliseconds for a 1080p frame.
-Async code runs it on a blocking thread with an owned frame:
-
-```rust
-let options = ImageOptions::new(ImageFormat::Jpeg(85));
-let jpeg = tokio::task::spawn_blocking(move || frame.encode_image(&options)).await??;
-```
-
-`ImageOptions` holds settings only, so one value serves any number of threads.
-For persistent snapshot services, store the owning `SourceCache` and other
-owning handles in [server state](usage.md#keep-discovery-in-server-state),
-then create capture views within each worker operation. Discovery and encoding
-both run synchronously; keep them on blocking workers and bound active and
-pending snapshot requests as described under [cost and memory](#cost-and-memory).
+Encoding is synchronous CPU work. Keep it on a blocking worker in async
+applications, with an owned frame if the worker outlives the capture borrow.
+Bound active workers and pending snapshots. [Performance guidance](image-encoding-performance.md)
+explains the buffering choices and measurement boundaries.
 
 ## Formats
 
-### What a frame can be
+All `PixelFormat` uncompressed variants are accepted; row padding is skipped.
+See [pixel layouts](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/frames/enum.PixelFormat.html)
+instead of repacking a captured frame solely for encoding.
 
-| Format | Planes | Sampling | Bits | Alpha |
-| --- | --- | --- | --- | --- |
-| BGRA, RGBA | 1 packed | RGB | 8 | Kept |
-| BGRX, RGBX | 1 packed | RGB | 8 | Written as 255 |
-| UYVY | 1 packed: Cb Y0 Cr Y1 for each pixel pair | 4:2:2 | 8 | None |
-| UYVA | UYVY, then an 8-bit alpha plane | 4:2:2 | 8 | 8-bit |
-| P216 | 16-bit Y, then interleaved 16-bit CbCr, both full height | 4:2:2 | 16 | None |
-| PA16 | P216's planes, then a 16-bit alpha plane | 4:2:2 | 16 | 16-bit |
-| NV12 | Y, then interleaved CbCr at half height | 4:2:0 | 8 | None |
-| I420, YV12 | Y, then Cb and Cr (YV12: Cr and Cb) at half width and height | 4:2:0 | 8 | None |
-| NA48, NB48 | Y, Cb, Cr (and alpha) at full resolution | 4:4:4 | 8 | NB48: 8-bit |
-| NA4G, NB4G | Y, Cb, Cr (and alpha) at full resolution | 4:4:4 | 16 | NB4G: 16-bit |
+| Output | Choose it for | Relevant settings |
+| --- | --- | --- |
+| PNG | Lossless RGB/RGBA at 8 or 16 bits per channel | `png_compression`, `depth`, `alpha` |
+| JPEG | Lossy 8-bit output without alpha | Quality 1–100 |
+| `WebpLossless` | Lossless 8-bit RGB/RGBA | `alpha` |
+| `WebpLossy(quality)` | Lossy 8-bit color with exact alpha unless discarded | Quality 0–100, `webp_effort` 0–6, `webp_sharp_yuv` |
 
-Rows are read in place, skipping any row padding, so a frame captured with
-the SDK's padded stride encodes exactly as its packed copy does.
+JPEG drops alpha. PNG and WebP keep it by default; `AlphaMode::Discard`
+removes it. Lossy WebP quality 100 is still lossy for color. Its default effort
+is 4 and SharpYUV is enabled. Effort and conversion settings affect only lossy
+WebP; they impose no time or memory limit. Measure their effect on your content.
 
-### What an image can be
-
-| Output | Channels | Bits a channel | Settings |
-| --- | --- | --- | --- |
-| PNG, `AlphaMode::Keep` (default) | RGBA; a source without alpha gets alpha 255 | 8 or 16 | `PngCompression::Fast`, `Balanced` (default) or `High` |
-| PNG, `AlphaMode::Discard` | RGB | 8 or 16 | As above |
-| JPEG | YCbCr; alpha is dropped | 8 | Quality 1 to 100; chroma halved both ways below 90, whole from 90 |
-| Lossless WebP | RGBA, or RGB with `AlphaMode::Discard` | 8 | None |
-| Lossy WebP | 4:2:0 color; exact alpha unless discarded | 8 | `ImageFormat::WebpLossy(quality)`, quality 0 to 100 |
-
-Lossy WebP trades color fidelity for fewer bytes. Lower quality values generally
-produce smaller images; 100 still changes color, so choose `WebpLossless` when
-pixels must be exact. The encoder uses `libwebpop`, a scalar Rust port of
-libwebp. `webp_effort(level)` accepts 0 to 6 and controls compression effort
-independently of quality: 0 is fastest, 6 spends the most effort, and the default is 4.
-`webp_sharp_yuv(true)`, the default, uses sharper RGB-to-YUV chroma conversion;
-false uses the faster standard conversion. Alpha quality remains 100 with every
-effort and conversion setting. Neither setting provides a latency or memory
-limit, and neither affects PNG, JPEG or lossless WebP. SharpYUV
-falls back to ordinary conversion for images narrower or shorter than four
-pixels. `AlphaMode::Discard` makes the image opaque before any reduction.
-
-`SampleDepth::Sixteen` writes a 16-bit PNG: P216, PA16, NA4G and NB4G frames
-keep their precision, and 8-bit sources scale exactly (times 257). JPEG and
-WebP are 8-bit only.
+`SampleDepth::Sixteen` is PNG-only: high-bit-depth sources retain precision,
+while 8-bit inputs scale by 257. JPEG and WebP reject that setting. Codec
+dimension limits apply after downscaling; invalid options return `InvalidInput`
+and unsupported output dimensions return `InvalidFrame`.
 
 ## Color
 
-Under the default `ColorPolicy::Sdk`, a YUV frame is converted with the
-matrix its `ndi_color_info` metadata names, or BT.709 when it names none, and
-limited range. `ColorPolicy::Override { matrix, range }` replaces both. RGB
-frames are encoded as they are.
-
-Use `ColorPolicy::Override` for an untagged source whose matrix or range differs
-from the default. Tagged frames follow their matrix, even though the SDK's own
-RGB conversion may ignore it. See [color validation](sdk-validation.md#image-color-conversion)
-for measured behavior and conversion equations.
+`ColorPolicy::Sdk`, the default, converts YUV using the matrix in readable
+`ndi_color_info`, or BT.709 when absent, with limited range. RGB pixels are
+encoded directly. For an untagged source with another matrix or range, specify
+`ColorPolicy::Override { matrix, range }`.
 
 ### `ndi_color_info`
 
-`color_info()` reads the element on any frame, with no feature:
-
-```rust
-match frame.color_info()? {
-    Some(color) if color.is_hdr() => println!("HDR: {:?}", color.transfer()),
-    Some(color) => println!("SDR, matrix {:?}", color.matrix()),
-    None => println!("BT.709 SDR"),
-}
-```
-
-- The element may stand alone or inside `ndi_metadata_group`. Comments,
-  CDATA sections and processing instructions are skipped.
-- `primaries`, `transfer` and `matrix` may come in any order, quoted with `"`
-  or `'`, and each may be missing: a missing `matrix` means BT.709, a missing
-  `transfer` SDR, and missing `primaries` unknown.
-- Values are the SDK's: `bt_601`, `bt_709`, `bt_2020` and `bt_2100` for
-  primaries and matrix, and `bt_601`, `bt_709`, `bt_2020`, `bt_2100_hlg` and
-  `bt_2100_pq` for transfer. `bt_2100` primaries and matrix read as BT.2020,
-  which they equal.
-- An element that is malformed, truncated, gives an attribute twice or a value
-  outside the list, or differs from another one in the same metadata, is an
-  `Error::InvalidFrame` naming the attribute and value. Under
-  `ColorPolicy::Sdk` such a frame is refused, so the encoder never guesses at a
-  frame that says something it cannot read; under `ColorPolicy::Override` it
-  counts as SDR with unknown primaries.
+Every frame's `color_info()` exposes this metadata without `image-encoding`.
+Malformed or conflicting descriptions produce `InvalidFrame`. The default
+encoding policy refuses them; an explicit override ignores unreadable color
+metadata and treats it as SDR with unknown primaries. Readable metadata still
+controls the HDR check and PNG tagging. See
+[`ColorInfo`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/struct.ColorInfo.html)
+for accepted metadata values.
 
 ## HDR
 
-| The frame's `transfer` | `HdrPolicy::Refuse` (default) | `HdrPolicy::CodeValues` |
-| --- | --- | --- |
-| None, `bt_601`, `bt_709` or `bt_2020` | Encoded | Encoded |
-| `bt_2100_pq` | `Error::InvalidFrame` naming PQ | A PNG of the PQ code values, tagged |
-| `bt_2100_hlg` | `Error::InvalidFrame` naming HLG | A PNG of the HLG code values, tagged |
-
-- The check applies to RGB frames as well: an RGBX receiver of a PQ-tagged
-  P216 source was measured to get the PQ code values, put through the SDK's
-  BT.709 approximation without tone mapping, with the tag still attached.
-- JPEG and WebP refuse PQ and HLG frames under `HdrPolicy::CodeValues` with
-  `Error::InvalidInput`: neither can say what its numbers mean.
-- Nothing tone-maps. A program that wants an SDR rendering of HDR video makes
-  it itself, from a 16-bit PNG or from the frame.
-- On Linux the Standard 6.4 runtime passes PQ-tagged P216 frames, tag intact,
-  from its sender to its receivers on loopback, although the manual says the
-  Standard SDK cannot send HDR metadata.
+`HdrPolicy::Refuse` rejects PQ- and HLG-tagged frames, including RGB frames.
+Use `HdrPolicy::CodeValues` to preserve their nonlinear values in a tagged PNG;
+combine it with `SampleDepth::Sixteen` for high-bit-depth sources. JPEG and WebP
+reject that HDR mode. The encoder does not tone-map; create an SDR rendering
+explicitly if that is what the consumer needs.
 
 ### Tagging a PNG
 
-A PNG is tagged with a `cICP` chunk when an untagged viewer would show its
-colors wrongly: BT.2020 primaries, or a PQ or HLG transfer. BT.601 and BT.709
-SDR stay untagged, since viewers assume sRGB for them, and a frame without
-`ndi_color_info` is never tagged. The chunk follows the header and comes
-before the image data, as PNG requires. Its code points are ITU-T H.273's:
-
-| Field | Values |
-| --- | --- |
-| Primaries | BT.709 1, BT.601 6, BT.2020 9, and 2 (unspecified) for an HDR frame that does not give its primaries |
-| Transfer | PQ 16, HLG 18, and 1 for every SDR transfer, which H.273 defines as one curve |
-| Matrix | 0, the only value PNG allows for RGB |
-| Full range | 1, because the RGB written is full range |
-
-PNG's `mDCV` and `cLLI` chunks are not written: NDI metadata carries no
-mastering display or content light level.
+The encoder writes a `cICP` color tag for BT.2020 primaries or PQ/HLG transfer
+metadata. It leaves BT.601/BT.709 SDR and untagged inputs without that chunk.
+See [`HdrPolicy`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/enum.HdrPolicy.html)
+for the code-value contract.
 
 ## Reducing an image
 
-`Downscale::Half`, `Quarter` and `Eighth` average 2×2, 4×4 or 8×8 blocks of
-converted pixels inside the row loop, so a thumbnail of a full-size frame
-never holds a full-size image.
-
-- The image is ceil(width / f) by ceil(height / f); a block at the right or
-  bottom edge averages the pixels it has.
-- Averages are taken on code values, as previews usually are, and round half
-  up.
-- With alpha kept, color is weighted by alpha, Σ(a·c) / Σa, so transparent
-  pixels do not darken edges; a block transparent throughout takes the plain
-  mean. Alpha itself is a plain mean.
-
-It serves frames that arrive full size: from a FrameSync, from receivers with
-`ReceiverOptions::high_quality_preset`, and frames being sent. A
-`snapshot_preset` receiver already gets the source's smaller preview stream.
+`Downscale::Half`, `Quarter` and `Eighth` average blocks during conversion.
+Output dimensions round upward; partial edge blocks use their available pixels.
+With alpha retained, colors are weighted by alpha to avoid darkening edges.
+The reduction operates on code values and does not allocate a full-size RGB
+image. It reduces full-size frames independently of the receiver's bandwidth
+selection; a `snapshot_preset` receiver already requests the preview stream.
 
 ## Cost and memory
 
-Encoding can take tens to hundreds of milliseconds per 1080p frame. Keep it off
-capture and executor threads. Choose `PngCompression::Fast` or lossless WebP for
-camera snapshots; compare output sizes on your content.
-
-PNG and JPEG convert rows incrementally. Both WebP codecs may hold a whole
-converted image. Lossless WebP uses RGB with alpha discarded, while lossy WebP's
-backend always takes RGBA, with alpha set to 255 when discarded. Lossy WebP
-also holds a complete encoded image before writing, even with `encode_image_to`.
-Codec state and encoded output use additional memory. See the
-[performance measurements](image-encoding-performance.md) for timings, memory bounds
-and the hardware and inputs used.
-
-The [five-worker snapshot measurements](image-encoding-performance.md#five-concurrent-snapshot-round-trips)
-include lossy WebP 75 taking 56.6–65.3 ms at preview sizes and 283.2–412.6 ms
-at larger sizes, including final RGB decode. These are concurrent batch times,
-not per-frame encode times. Smaller files can therefore cost more CPU and
-latency than an existing JPEG pipeline. Keep pending snapshots and active
-encoding workers bounded: each lossy WebP worker owns codec state, a complete
-encoded result and, when conversion is needed, four bytes per output pixel.
-`encode_image_to` still buffers that encoded result before the first write.
+PNG and JPEG convert rows incrementally. WebP may need a complete converted
+image; lossy WebP also buffers its complete encoded output, even when using
+`encode_image_to`. Codec state and output add memory beyond conversion storage.
+See [buffering and concurrency](image-encoding-performance.md#whole-image-buffering-and-concurrency)
+for application planning.
 
 ## Errors
 
-| Problem | Error |
-| --- | --- |
-| A JPEG quality outside 1 to 100, from `encode_jpeg` or `ImageOptions` | `InvalidInput` |
-| A lossy WebP quality outside 0 to 100 | `InvalidInput` |
-| A lossy WebP effort outside 0 to 6 | `InvalidInput` |
-| JPEG or WebP with `SampleDepth::Sixteen` | `InvalidInput` |
-| JPEG or WebP with `HdrPolicy::CodeValues` for a PQ or HLG frame | `InvalidInput` |
-| A PQ or HLG frame under `HdrPolicy::Refuse`, in any pixel format | `InvalidFrame`, naming the transfer and `HdrPolicy::CodeValues` |
-| Unreadable `ndi_color_info` under `ColorPolicy::Sdk` | `InvalidFrame`, naming the attribute and value |
-| An image wider or taller than JPEG's 65,535, lossless WebP's 16,384 or lossy WebP's 16,383 pixels | `InvalidFrame`, naming the dimension; `Downscale` can bring it within |
-| The writer given to `encode_image_to` fails | `Io`, the writer's own error |
-| The codec fails for another reason | `InvalidFrame`: "PNG encoding failed", "JPEG encoding failed" or "WebP encoding failed" |
-
-`PngCompression` has no effect on JPEG or WebP and is no error with them.
+Inspect the method's `Result`: invalid quality, effort or depth settings return
+`InvalidInput`; malformed color descriptions, HDR refusal, excessive dimensions
+or codec failures return `InvalidFrame`; writer failures retain their `Io`
+error. The [API reference](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/struct.ImageOptions.html#errors)
+lists the complete option rules.
 
 ## Thumbnails from a recording
 
-[`examples/file_thumbnails.rs`](../examples/file_thumbnails.rs), which needs
-`file-io` and `image-encoding`, is where the two features meet: it plays a
-recording into a private NDI group, seeks to evenly spaced positions and
-writes a quarter-size JPEG of the frame at each.
+The [`file_thumbnails` example](../examples/file_thumbnails.rs) plays a recording
+into a private NDI group, seeks to spaced positions and writes quarter-size
+JPEGs. After each seek it waits for a frame matching the player's `FirstFrame`
+timecode when the SDK provides one; otherwise it takes the next frame:
 
-```bash
+```sh
 cargo run --example file_thumbnails --features file-io,image-encoding -- take_001.mkv 8
 ```
 
-The example discovers the player's source in its private group, receives at full
-bandwidth and reduces each image with `Downscale::Quarter`. After seeking, it
-waits for a frame matching the `FirstFrame` event's timecode to avoid queued frames
-from before the seek. This workflow was measured with a SpeedHQ recording;
-H.264 and HEVC seek behavior was not measured.
+Its accuracy depends on the recording and native seek behavior; validate the
+workflow with your media. See [File API requirements](file-io.md#requirements).
 
 ## Validation
 
-See [SDK validation](sdk-validation.md#image-encoding) and the
-[performance notes](image-encoding-performance.md) for tests and benchmark commands.
+See [SDK validation](sdk-validation.md) for configured coverage and
+[performance guidance](image-encoding-performance.md) for the resource harness.

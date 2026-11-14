@@ -1231,7 +1231,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Returns `true` if there is at least one native connection to the source,
     /// `false` otherwise. A connection does not establish progress of any
     /// particular media stream; see the
-    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
+    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/docs/usage.md#monitor-reception-of-the-expected-media).
     ///
     /// # Examples
     ///
@@ -1343,7 +1343,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// receiver queue or processing. These three native calls do not form an
     /// atomic connection/performance/queue snapshot. Counters may reset on
     /// connection changes; see [`ConnectionStats`] and the
-    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
+    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/docs/usage.md#monitor-reception-of-the-expected-media).
     ///
     /// # Examples
     ///
@@ -1951,7 +1951,7 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
     ///
     /// A delivered frame may have waited in the native queue; `None` alone
     /// does not establish disconnection or freshness. See the
-    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
+    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/docs/usage.md#monitor-reception-of-the-expected-media).
     ///
     /// See [`Capture`] for how the timeout is spent; [`Duration::ZERO`]
     /// makes one attempt without waiting.

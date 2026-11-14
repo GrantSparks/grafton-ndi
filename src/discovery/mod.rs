@@ -41,7 +41,7 @@
 //!   report `is_connected`, the interval at which the runtime tries again.
 //!
 //! The measurements are in the
-//! [SDK validation record](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/sdk-validation.md#discovery-server-objects).
+//! [SDK validation guide](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/docs/sdk-validation.md#discovery-server-objects).
 //!
 //! # Threads
 //!

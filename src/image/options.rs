@@ -15,7 +15,7 @@ use crate::YuvMatrix;
 /// // JPEG at quality 85: lossy, without alpha.
 /// let jpeg = ImageFormat::Jpeg(85);
 ///
-/// // Lossless WebP: smaller and far faster than PNG on camera video.
+/// // Lossless WebP: 8-bit color with optional alpha.
 /// let webp = ImageFormat::WebpLossless;
 ///
 /// // Lossy WebP at quality 80, preserving alpha exactly.
@@ -109,19 +109,12 @@ impl ImageFormat {
 /// | Lossless WebP | RGBA, or RGB with [`AlphaMode::Discard`] | 8 |
 /// | Lossy WebP | Lossy color, exact alpha unless discarded | 8 |
 ///
-/// An untagged frame, or one tagged BT.601 or BT.709 SDR, in one of the four
-/// RGB formats encodes, with the default options, to the same bytes as in
-/// grafton-ndi 2.0.
-///
 /// # Color
 ///
-/// YUV frames are converted with BT.709, limited range and repeated chroma,
-/// as the NDI 6.4 SDK converts at every frame size, unless the frame's
-/// `ndi_color_info` metadata ([`ColorInfo`](crate::ColorInfo)) names another
-/// matrix: the encoder then follows the tag, which the SDK ignores.
-/// [`ColorPolicy::Override`] replaces the matrix and range. The coefficients
-/// are exact, so white is 255 where the SDK's own RGB output gives 253. See
-/// [`ColorPolicy`].
+/// By default, YUV frames use BT.709, limited range and repeated chroma,
+/// unless `ndi_color_info` metadata ([`ColorInfo`](crate::ColorInfo)) names
+/// another matrix. [`ColorPolicy::Override`] replaces the matrix and range.
+/// See [`ColorPolicy`] for malformed metadata handling.
 ///
 /// # HDR
 ///
@@ -132,15 +125,11 @@ impl ImageFormat {
 ///
 /// # Performance
 ///
-/// Encoding is CPU work. Measured on one thread for a photographic 1920×1080
-/// RGBA frame: 554 ms as PNG at [`PngCompression::Balanced`], the default,
-/// 24 ms at [`PngCompression::Fast`], 19 ms as lossless WebP and 21 ms as
-/// JPEG at quality 85. Converting a YUV frame adds about 6 ms. A snapshot loop
-/// of camera video should use `Fast` or lossless WebP; see [`PngCompression`].
-/// Lossy WebP can cost substantially more CPU than JPEG. Lower
-/// [`Self::webp_effort`] and disable [`Self::webp_sharp_yuv`] to prioritize
-/// latency independently of quality; measure your content and bound concurrent
-/// encoding jobs. Neither setting provides a time or memory limit.
+/// Encoding is synchronous CPU work. Compare formats, PNG compression and
+/// lossy WebP effort on representative content at acceptable visual quality.
+/// Lower [`Self::webp_effort`] and disable [`Self::webp_sharp_yuv`] when
+/// prioritizing latency independently of quality; measure the result and bound
+/// concurrent encoding jobs. Neither setting provides a time or memory limit.
 ///
 /// Async code runs the encoder on a blocking thread, with an owned frame:
 ///
@@ -373,16 +362,9 @@ impl ImageOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum ColorPolicy {
-    /// Convert as the NDI SDK converts, with BT.709 and limited range,
-    /// unless the frame's `ndi_color_info` metadata names another matrix,
-    /// which is then used.
-    ///
-    /// The NDI 6.4 SDK uses BT.709 limited range for every frame size, in
-    /// both directions, whatever the frame's metadata says, although its
-    /// manual describes BT.601 for SD and BT.2020 for UHD. A frame tagged
-    /// with another matrix, BT.2020 for example, therefore encodes correctly
-    /// here but shows BT.709 coefficients in an RGB receiver of the same
-    /// source. An untagged BT.601 source, such as older SD hardware, needs
+    /// Convert with BT.709 and limited range, unless the frame's
+    /// `ndi_color_info` metadata names another matrix, which is then used.
+    /// An untagged source with different color encoding needs
     /// [`ColorPolicy::Override`].
     ///
     /// A frame whose `ndi_color_info` cannot be read is refused with
@@ -450,8 +432,7 @@ pub enum AlphaMode {
     /// depth; one without gets alpha 255, or 65535 at 16 bits.
     #[default]
     Keep,
-    /// Write RGB, dropping any alpha. Smaller when the alpha is opaque
-    /// anyway.
+    /// Write RGB, dropping any alpha.
     Discard,
 }
 
@@ -464,10 +445,9 @@ pub enum AlphaMode {
 /// | `bt_2100_pq` | [`Error::InvalidFrame`] | PNG of the PQ code values, tagged |
 /// | `bt_2100_hlg` | [`Error::InvalidFrame`] | PNG of the HLG code values, tagged |
 ///
-/// The check applies to every pixel format, RGB as well as YUV: an RGB
-/// receiver of a PQ source gets the PQ code values, with the tag still
-/// attached. Nothing tone-maps. A program that wants an SDR rendering of HDR
-/// video makes it itself, from a 16-bit PNG or from the frame, and
+/// The check applies to every pixel format, RGB as well as YUV. The encoder
+/// does not tone-map. A program that wants an SDR rendering of HDR video
+/// makes it itself, from a 16-bit PNG or from the frame, and
 /// [`color_info`](crate::VideoFrame::color_info) lets it check a frame before
 /// encoding it.
 ///
@@ -479,8 +459,7 @@ pub enum AlphaMode {
 #[non_exhaustive]
 pub enum HdrPolicy {
     /// Refuse a PQ or HLG frame with
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame), rather than write
-    /// an image whose colors every SDR viewer shows washed out.
+    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame).
     #[default]
     Refuse,
     /// Write a PQ or HLG frame's non-linear code values to a PNG, tagged with
@@ -489,8 +468,8 @@ pub enum HdrPolicy {
     /// high-bit-depth frame's precision.
     ///
     /// JPEG and WebP refuse such a frame with
-    /// [`Error::InvalidInput`](crate::Error::InvalidInput): neither can say
-    /// what its numbers mean, and untagged PQ looks wrong in every viewer.
+    /// [`Error::InvalidInput`](crate::Error::InvalidInput): this encoder only
+    /// writes the required HDR color tag in PNG.
     CodeValues,
 }
 
@@ -542,33 +521,20 @@ impl Downscale {
 
 /// How hard PNG compresses.
 ///
-/// PNG's cost is compression; converting the pixels takes a few milliseconds.
-/// Measured on one thread for a 1920×1080 RGBA frame:
-///
-/// | Content | `Balanced` | `Fast` | `High` | Lossless WebP |
-/// |---|---|---|---|---|
-/// | Photographic | 3.38 MB, 554 ms | 3.76 MB, 24 ms | 3.35 MB, 1,198 ms | 2.80 MB, 19 ms |
-/// | Graphics | 150 KB, 40 ms | 492 KB, 8 ms | 135 KB, 104 ms | 329 KB, 8 ms |
-///
-/// `Fast` is about 23 times faster than `Balanced` for 11% more bytes on
-/// camera video, but 3.3 times the bytes on graphics; lossless WebP is
-/// smaller still on camera video and as fast. A snapshot loop of camera video
-/// should use one of them. `Balanced` stays the default because it suits
-/// graphics and keeps the bytes grafton-ndi 2.0 wrote. Every level is
-/// lossless.
+/// Every level is lossless. The level selects the `png` crate's compression
+/// setting; compare encoded size and CPU cost on representative content.
+/// `Balanced` is the default. No setting imposes a latency or memory limit.
 ///
 /// This enum is marked `#[non_exhaustive]` so that levels can be added
 /// without a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum PngCompression {
-    /// The `png` crate's fast DEFLATE: about 23 times faster than `Balanced`
-    /// on camera video.
+    /// The `png` crate's `Fast` compression setting.
     Fast,
-    /// The `png` crate's default level.
+    /// The `png` crate's `Balanced` compression setting.
     #[default]
     Balanced,
-    /// Maximum DEFLATE compression: about 1% smaller than `Balanced` on camera
-    /// video and 10% smaller on graphics, at about twice its time.
+    /// The `png` crate's `High` compression setting.
     High,
 }

@@ -821,7 +821,7 @@ impl FrameSync {
     /// the request's channels and samples per channel; the SDK can supply
     /// silence whenever current input is unavailable, including after input
     /// previously arrived. Successful output does not prove fresh reception.
-    /// See the [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
+    /// See the [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/docs/usage.md#monitor-reception-of-the-expected-media).
     ///
     /// # Following the source's format
     ///
@@ -934,7 +934,7 @@ impl FrameSync {
     /// way. For most applications, simply call `capture_audio` at your desired
     /// rate and let the SDK handle timing.
     /// A positive depth does not establish fresh input; see the
-    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
+    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/docs/usage.md#monitor-reception-of-the-expected-media).
     ///
     /// # Example
     ///

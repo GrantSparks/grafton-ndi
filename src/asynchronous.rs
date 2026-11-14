@@ -581,7 +581,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// the blocking pool. Watch the received counter for the media the
     /// application expects; connection state and a video counter alone do
     /// not establish audio or metadata progress. See the
-    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
+    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/docs/usage.md#monitor-reception-of-the-expected-media).
     pub fn connection_stats(&self) -> ConnectionStats {
         self.inner.connection_stats()
     }

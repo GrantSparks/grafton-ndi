@@ -1,541 +1,230 @@
 # Advanced SDK integration
 
-The `advanced` Cargo feature adds the `grafton_ndi::advanced` module: the parts
-of NDI that only the NDI Advanced SDK provides.
+Enable `advanced` for compressed packets, queued sending, custom receive
+allocation, AV synchronization, genlock and KVM. Start with
+[SDK editions and build requirements](setup.md#sdk-editions); the
+[example index](../examples/README.md#advanced-sdk) supplies complete programs.
+Exact per-method contracts are in the
+[3.0 Advanced API reference](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/advanced/).
 
 ## Requirements
 
-To run Advanced operations:
+Native Advanced operations need Advanced SDK headers and `libclang` at build
+time, and an Advanced runtime at execution time. Set `NDI_SDK_DIR` to the SDK
+root to generate declarations. The Rust API also compiles without those
+headers, allowing data types to remain usable while unavailable native
+operations return `Error::UnsupportedCapability`.
 
-1. The `advanced` Cargo feature.
-
-   ```toml
-   [dependencies]
-   grafton-ndi = { version = "3.0", features = ["advanced"] }
-   ```
-
-2. An installed NDI Advanced SDK and `libclang` on the build machine. Set
-   `NDI_SDK_DIR` to the SDK root, or use the default Advanced SDK installation.
-   The build generates declarations locally because the headers cannot be redistributed.
-
-3. An Advanced SDK runtime when the program runs. Without an edition request
-   the search accepts either edition and, in a build with this feature, tries
-   the Advanced library first at each location. If it finds only a Standard
-   runtime, `Ndi::new()` succeeds and the Advanced operations report
-   `Error::UnsupportedCapability`. Request `SdkEdition::Advanced` to require
-   the Advanced runtime when it is selected. See
-   [SDK editions](setup.md#sdk-editions).
-
-Enabling the feature neither selects an SDK edition nor grants a license
-entitlement. The Advanced SDK 6.3.2 and 6.4.0.2 have been tested; see
-[SDK validation](sdk-validation.md).
+A Cargo feature does not require a runtime edition or establish license
+entitlements. Use `SdkEdition::Advanced` when selecting a runtime to require
+that edition. Otherwise `Ndi::new()` can succeed with a Standard runtime and an
+Advanced operation can fail later. See [runtime selection](setup.md).
 
 ## Check availability
 
-The public API compiles with or without Advanced headers. Native operations
-report missing requirements at runtime; pure data types remain usable.
-
-Call `ndi.require_feature(feature)` before an optional workflow, or inspect
-`ndi.capabilities().status(feature)`. `UnsupportedCapability` reports the feature,
-reason and detail. Missing build declarations produce `BuildAbiUnavailable`; a
-Standard runtime produces `WrongEdition`; missing runtime functions produce
-`SymbolUnavailable`. Older headers disable only the operations they lack.
-Discovery Server objects also require NDI 6.4 or later.
-
-The [capability reference](https://docs.rs/grafton-ndi/latest/grafton_ndi/enum.RuntimeFeature.html)
-lists each feature. Packet formats, envelopes and options work without native
-support. See [runtime setup](setup.md#runtime-capabilities).
+Before an optional workflow, call `ndi.require_feature(feature)` or inspect
+`ndi.capabilities().status(feature)`. Failure identifies a feature, reason and
+detail: for example `BuildAbiUnavailable`, `WrongEdition` or
+`SymbolUnavailable`. Missing header families disable their own operations.
+Packet formats, envelopes and options are usable independently of native
+support. Consult [`RuntimeFeature`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/capabilities/enum.RuntimeFeature.html)
+for the capability to check.
 
 ## Ownership
 
-An operation that takes ownership of a receiver, a sender or a frame hands the
-value back when it fails. The error type is `grafton_ndi::Rejected<T>`:
+Fallible operations that take a receiver, sender, frame or allocation return
+the supplied value inside `Rejected<T>` when they fail. Use `into_inner()` or
+`into_parts()` to repair or retry it. Converting `Rejected` to `Error`, including
+through `?`, drops that value.
 
-```rust
-use grafton_ndi::advanced::{CompressedVideoFrame, VideoCodec, VideoPacketFormat};
-
-fn main() -> grafton_ndi::Result<()> {
-    let format = VideoPacketFormat::new(VideoCodec::H264, 1920, 1080)?;
-    // Not an H.264 packet envelope, so the bytes come back with the reason.
-    let rejected = CompressedVideoFrame::new(format, vec![0; 16]).unwrap_err();
-    println!("not sendable: {}", rejected.error());
-    let bytes: Vec<u8> = rejected.into_inner();
-    assert_eq!(bytes.len(), 16);
-    Ok(())
-}
-```
-
-`Rejected<T>` converts into `Error`, dropping the value, so `?` works in a
-function that returns `grafton_ndi::Result`. Use `into_inner` or `into_parts`
-when the value matters: a receiver to keep using, a frame to retry.
+Attached handles reserve the capture or send paths they manage. Their shared
+`receiver()`/`sender()` views preserve compatible controls but cannot replace
+the native handle or bypass its ownership rules. See the single
+[receiver ownership table](usage.md#use-framesync) for available media paths.
 
 ## Configuration
 
-`AdvancedConfig` holds the JSON document the Advanced SDK accepts when it
-creates an object. `AdvancedConfig::parse` checks that the text is a JSON object
-of at most one mebibyte and keeps it byte for byte, unknown properties
-included. The properties themselves are defined by the NDI Advanced SDK
-documentation.
+Set an options value's `config(AdvancedConfig)` before its ordinary constructor
+when the SDK object needs JSON configuration. `AdvancedConfig::parse` checks a
+JSON object of at most one MiB and preserves its text, including unknown
+properties. Property meanings come from the SDK. Debug output and parse errors
+hide the content; `expose_json()` deliberately reveals it, so avoid logging
+credentials or network details it may contain.
 
-A configuration can carry credentials or network details. Its `Debug` output
-shows no content, and no error quotes it. `expose_json` returns the text and is
-named as a reminder not to log it.
-
-A configuration is part of an object's options: the `config` setter of
-`FinderOptions`, `SenderOptions`, `ReceiverOptions`, `RouterOptions`,
-`AdvertiserOptions` and `ListenerOptions`, which exists with the `advanced`
-feature. The ordinary constructor (`Finder::new`, `Sender::new`,
-`Receiver::new`, `Router::new`, both advertisers' and both listeners' `new`)
-then creates the object through the SDK's configured entry point.
-`QueuedSender::new` creates its sender the same way. `CompressedSender::new`
-and `PacketReceiver::new` always use the configured entry point, with the
-options' configuration or, when they carry none, the empty one, `{}`.
-`Genlock::new` takes an optional reference source and an optional
-configuration. Each object keeps its configuration for as long as it lives.
-
-```rust
-use grafton_ndi::{advanced::AdvancedConfig, Ndi, Sender, SenderOptions};
-
-fn main() -> grafton_ndi::Result<()> {
-    let ndi = Ndi::new()?;
-    let config = AdvancedConfig::parse(r#"{"ndi": {"machinename": "studio-a"}}"#)?;
-    let sender = Sender::new(&ndi, &SenderOptions::new("Program").config(config))?;
-    println!("advertised as {}", sender.source()?);
-    Ok(())
-}
-```
-
-`Router::add_connection_metadata` and `clear_connection_metadata` are Advanced
-SDK operations too: a router sends the added metadata to every connected
-receiver, and to each receiver that connects later, until it is cleared.
-
-`Finder::sources_with_metadata` returns each source together with the metadata
-it advertises. A sender advertises metadata through its configuration, and a
-finder learns it only from a Discovery Server. The metadata of a source that
-advertises none is `None`.
-
-Example: `examples/advanced_source_metadata.rs`.
+[`advanced_source_metadata`](../examples/advanced_source_metadata.rs) shows
+`Finder::sources_with_metadata`. Configuration is also supported by sender,
+receiver, router and Discovery Server options. `CompressedSender` and
+`PacketReceiver` use the configured entry point even when given no explicit
+configuration. Refer to their constructors for defaults.
 
 ## Compressed streams
 
 ### Receiving packets
 
-For ordinary decoded media, Standard `Receiver::capture_any_ref` and
-`Receiver::capture_any` already wait once for video, audio, metadata or receiver
-invalidations. Their async equivalent returns owned items on Tokio or smol.
-Use `PacketReceiver` when the application needs compressed codec packets; its
-all-slot native dispatch is shared, while packet interpretation and capability
-checks remain in the Advanced layer. See the
-[mixed-media receive guide](usage.md#receive-whichever-media-arrives-next).
+Choose `PacketReceiver` when the application needs codec packets. For ordinary
+decoded mixed media use the feature-free
+[`Receiver::capture_any_ref` workflow](usage.md#receive-whichever-media-arrives-next).
 
-`PacketReceiver` delivers a frame as the codec packet the source sent when the
-frame's format is one that its `PassthroughPreset` names, and as a decoded frame
-otherwise. One `capture` call returns whichever frame or event arrives first as
-a `PacketItem`, and every result owns its data. It waits up to its timeout as
-a `Receiver`'s capture does, capturing again when the SDK returns early with
-nothing, and returns `None` only once the whole timeout is spent. A
-`PacketReceiver` is `Send` and `Sync`, as a `Receiver` is: it can be created
-on one thread, capture on another and be dropped on a third. `capture` takes
-it mutably, so one call captures at a time, while other threads use the
-receiver's controls through a shared reference. It cannot feed a
-`FrameSync`. Use an ordinary `Receiver` for decoded media only. The preset's
-color format replaces the options' own, and only the preset's is checked
-against the runtime: options that ask for `ReceiverColorFormat::Best444`, which
-needs NDI 6.4, still make a packet receiver on an older Advanced runtime.
+Construct a packet receiver with `ReceiverOptions` and a `PassthroughPreset`.
+A supported format named by the preset passes through compressed; other media
+can arrive decoded. `capture(timeout)` returns an owned
+`PacketItem::{Video, Audio, Metadata, Event}`. Notifications use the common
+`ReceiverEvent` model and are consumed once. `Ok(None)` means the wait budget
+expired, rather than proof that the source disconnected. Packet receivers
+cannot feed `FrameSync`.
 
-`receiver()` returns the `Receiver<PacketAttached>` the packet receiver holds,
-with the controls every receiver mode has: `set_tally`, `ptz`,
-`connection_stats`, `send_metadata`, `request_keyframe`, the delays,
-`reconnect` and `poll_source_name_change`. `controls()` lends exclusive `set_stream_tier`, `set_streams` and `kvm`
-without permitting replacement of the attached receiver. The receiver's own `video`, `audio`, `metadata` and `poll_event` do not
-exist in this mode, because `capture` takes every frame and event:
-
-```rust
-use std::time::Duration;
-use grafton_ndi::{
-    advanced::{PacketItem, PacketReceiver, PassthroughPreset},
-    Ndi, ReceiverEvent, ReceiverOptions, Source, StreamTier, Tally,
-};
-
-fn relay(ndi: &Ndi, source: Source) -> grafton_ndi::Result<()> {
-    let mut packets =
-        PacketReceiver::new(ndi, &ReceiverOptions::new(source), PassthroughPreset::Hevc)?;
-    packets.receiver().set_tally(Tally::new(true, false));
-    packets.controls().set_stream_tier(StreamTier::Program)?;
-    if let Some(PacketItem::Event(ReceiverEvent::StatusChanged(status))) =
-        packets.capture(Duration::from_secs(1))?
-    {
-        println!("connections: {}", status.connections());
-    }
-    Ok(())
-}
-```
+Capture takes `&mut self`; shared controls remain available through
+`receiver()`. `controls()` reaches exclusive stream selection and KVM, and a
+packet KVM session captures through its own `capture()`. Neither route exposes
+raw receiver capture. See
+[`advanced_passthrough`](../examples/advanced_passthrough.rs) for receiving and
+relaying a source's compressed packets.
 
 ### Packet formats
 
-`CompressedVideoFrame` and `CompressedAudioFrame` own their bytes. A video
-frame's `VideoPacketFormat` names its codec, its stream (program or preview,
-`StreamTier`), dimensions, `FrameRate`, picture aspect ratio and scan type; its
-`with_*` methods adjust each. An aspect ratio of zero means square pixels and
-is the default. An audio frame states its sample rate, channel count and
-samples per channel. Every frame carries a `Timecode`, which the SDK
-synthesizes unless one is set, and a received frame also carries the
-`SdkTimestamp` of its sending.
+`CompressedVideoFrame` and `CompressedAudioFrame` own their bytes.
+`VideoPacketFormat` describes codec, stream tier, dimensions, timing, picture
+aspect and scan type. Its default timing is 60 fps: set the rate to match your
+encoded media. `PacketEnvelope::encode` constructs the H.264, HEVC or AAC
+envelope; `parse` reads one. Opus and SpeedHQ use no envelope.
 
-Video construction defaults to 60 frames per second across owned, borrowed and
-compressed frames. Set the `FrameRate` explicitly to match encoded media.
-Owned raw, compressed and scatter frames use `set_timecode`, `set_metadata` and
-`clear_metadata` for editing. Invalid metadata leaves the prior value intact;
-clearing removes it, while setting `""` retains present but empty metadata.
-Compressed and scatter audio use `set_protected`; the reusable
-`VideoPacketFormat` uses `with_protected` along with its other fluent settings.
+Constructors validate layout and wrapper send constraints, **not codec
+bitstreams**. Supply valid encoded media and required codec configuration.
+Received envelopes can preserve unknown header fields that sending refuses;
+call `validate_for_send` before forwarding an arbitrary received packet.
+Protection flags describe packet conventions and do not encrypt content.
+The [packet types](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/advanced/struct.CompressedVideoFrame.html)
+and [envelope reference](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/advanced/struct.PacketEnvelope.html)
+specify exact limits and send validation.
 
-H.264, HEVC and AAC payloads travel inside a packet envelope: a 44-byte header
-followed by the payload and the codec configuration. `PacketEnvelope::encode`
-builds one and `PacketEnvelope::parse` reads one. Opus and SpeedHQ frames have
-no envelope.
-
-Construction validates the memory layout the SDK relies on: sizes and, where
-there is one, the envelope. It does not decode or validate the codec bitstream;
-supplying a correct bitstream, and the codec configuration that keyframes and
-AAC packets need, is the application's job. A frame that fails is refused with
-`Error::InvalidFrame`; a `VideoPacketFormat` value out of range is refused with
-`Error::InvalidInput` when the format is made. The protected-stream setting
-describes an SDK packet convention. It does not encrypt anything.
-
-The SDK accepts any compressed frame and silently discards those it will not
-deliver. Construction therefore also refuses frames that would be discarded:
-
-- a SpeedHQ frame whose first byte, its quality, is 100 or more;
-- an H.264 or HEVC picture on the preview stream that is wider or taller than
-  640 pixels;
-- Opus at a sample rate other than 8, 12, 16, 24 or 48 kHz, or with a frame
-  length other than 2.5, 5, 10, 20, 40 or 60 ms;
-- an AAC frame that does not hold 1024 samples per channel, lacks its
-  AudioSpecificConfig, or whose configuration names another sample rate or
-  channel layout than the frame's own. AAC is sent at one of the thirteen
-  indexed sample rates from 7350 Hz to 96 kHz, with one to six or eight
-  channels.
-
-These rules were observed with the 6.4.0.2 runtime on Linux. A compressed
-frame holds at most 256 MiB (`MAX_PACKET_BYTES`).
-
-Parsing a received envelope keeps what it does not understand: later header
-versions, unknown flags and the reserved field stay readable. Sending is
-stricter. A frame is sendable only with a version-0 header, no unknown flags
-and no bytes after the lengths the header declares; `validate_for_send` checks
-this.
+Owned compressed/scatter frames edit timecode and metadata with `set_timecode`,
+`set_metadata` and `clear_metadata`. Invalid replacement metadata preserves the
+old value. Audio uses `set_protected`; reusable `VideoPacketFormat` uses fluent
+`with_*` settings. Scatter frames retain separate owned blocks rather than
+joining payloads; `into_contiguous_copy` explicitly joins them.
 
 ### Sending packets
 
-`CompressedSender` owns its sender exclusively. `sender()` lends it as a
-`Sender<CompressedAttached>`, which has every operation the sender modes
-share: the source, `send_metadata` and `capture_metadata` (a camera source
-receives PTZ and KVM requests this way), tally, connection count and
-connection metadata, failover, and the encoder guidance, keyframe and external
-tally controls. It has none of the uncompressed sends, and
-`SendAdvertiser::register` does not accept it: a registration would keep the
-native sender alive after `CompressedSender` has released the frames the SDK
-was still sending.
+`CompressedSender` owns its sender. Synchronous video/audio and scatter sends
+borrow frames **mutably**, since the SDK can write their bytes during the call.
+The frame is reusable afterwards. Asynchronous video sends hold a frame until
+the next asynchronous send on the same program/preview stream returns it.
+Audio sends are synchronous. `close()` waits for pending SDK use and returns
+remaining video as `ReclaimedVideo`; reclamation does not confirm delivery.
+Moving owned payloads into this wrapper makes no payload copy in the crate;
+the SDK can still copy internally.
 
-Its program and preview streams are independent. The synchronous sends
-(`send_video`, `send_audio`, `send_scatter_video`, `send_scatter_audio`) borrow
-the frame mutably, because the SDK writes to the frame's bytes while it sends
-them. A frame can be sent again afterwards. A received packet can be relayed
-when `validate_for_send` accepts it; a frame the sender refuses stays with the
-caller. Video can also be sent asynchronously (`send_video_async`,
-`send_scatter_video_async`): the sender keeps the frame until the next
-asynchronous send on the same stream, which returns the earlier frame for
-reuse. Audio is always sent synchronously. `close` destroys the native sender,
-which waits for the SDK to finish with pending frames, and returns the frames
-that were still held as `ReclaimedVideo`, one field per stream. These frames
-are ready for reuse; their return does not report delivery to a receiver.
-
-`ScatterVideoFrame` and `ScatterAudioFrame` hold one frame in up to 65,536
-owned, non-empty blocks, which are sent without being joined. The first block
-must hold the frame's complete header: the 44-byte envelope header for H.264,
-HEVC and AAC, the first four bytes for SpeedHQ. `into_contiguous_copy` joins the
-blocks into an ordinary compressed frame.
-
-Moving a frame into a sender does not copy it in this crate. The SDK may still
-copy data internally.
-
-Example: `examples/advanced_passthrough.rs` relays a source's packets
-unchanged.
+The attached sender retains metadata, tally, connection and encoder controls,
+but offers no uncompressed sends and cannot be registered with a
+`SendAdvertiser`. This keeps the native sender from outliving pending storage.
 
 ## Queued sending
 
-An ordinary asynchronous video send has to wait for the previous frame before
-it accepts the next. `QueuedSender` keeps every submitted frame until the SDK
-reports it sent, so submission does not wait for a slow connection.
+Use `QueuedSender` to submit multiple owned raw or compressed video frames
+without waiting for the previous frame's completion on each submission.
+`QueueOptions` bounds retained frames and bytes, including completed frames not
+yet collected and spare payload/metadata capacity. Check defaults and exact
+accounting in [`QueueOptions`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/advanced/struct.QueueOptions.html).
 
-- It takes uncompressed `VideoFrame`s and `CompressedVideoFrame`s, both as a
-  `QueuedVideoFrame`.
-- Submission moves owned pixels and metadata without copies or growth and does
-  not scan retained frames. It allocates a native descriptor; owned uncompressed
-  frames already hold their complete SDK tail room.
-- `QueueOptions` bounds the queue by frame count and by bytes. A frame counts
-  from submission until the application takes it back. The byte budget includes
-  unused retained payload capacity, including spare capacity in compressed
-  vectors and metadata strings. The defaults are 8 frames and 512 MiB.
-- `try_submit` returns a `SubmissionId`, or returns the frame in a `Rejected`.
-  Its error is `Error::QueueFull` when the frame would take the queue past its
-  frame or byte limit (`QueueLimit::Frames` or `QueueLimit::Bytes`): collect
-  completed frames and submit it again. Any other error means the frame cannot
-  be sent, for example an uncompressed pixel format the runtime cannot send,
-  which it checks as `Sender::send_video` does.
-- `try_take_completed` and `wait_completed` return completed frames on the
-  application's thread. No application code runs on an SDK thread.
-- `from_sender` converts an existing `Sender`. It drains the sender's
-  asynchronous video and returns the frame the sender was still holding, if
-  any. The sender's completion handler is dropped without being called, so a
-  handler that would panic cannot lose the sender. It refuses, and returns the
-  sender unchanged, when the sender is registered with an advertiser.
-- `sender()` lends the sender as a `Sender<QueueAttached>`: the source,
-  `send_audio`, metadata in both directions, tally, connections, failover and
-  the Advanced controls. It has no video sends, which would bypass the queue,
-  and `SendAdvertiser::register` does not accept it, so the native sender never
-  outlives the completion state.
-- A `QueuedSender`, like a `CompressedSender`, is `Send` and `Sync`, with or
-  without the Advanced headers in the build: it can be moved to another
-  thread, such as an async task, and its read-only methods called from any
-  thread, while submitting and collecting frames take it mutably. The SDK
-  calls the completion handler on threads of its own and ties the sender to
-  none. Dropping it destroys the native sender, which waits without a timeout
-  for the SDK to finish with the frames still queued.
+`try_submit` returns a `SubmissionId` or the rejected frame. For `QueueFull`,
+collect completions and retry; inspect other errors before retrying.
+`try_take_completed` and `wait_completed` return reusable frames on the
+application thread. Submitting moves payload ownership but allocates a native
+descriptor. The queue's SDK completion callback runs no application code.
 
-Example: `examples/advanced_queued_send.rs`.
+`from_sender` drains an ordinary sender's async pipeline and returns any held
+frame; it refuses advertised senders. The queue lends audio, metadata and
+shared controls through `sender()`, but reserves video sends. `QueuedSender` is
+`Send + Sync`; submission/collection require mutable access. **Drop waits
+without a timeout** for the SDK to finish with queued frames. Keep this blocking
+shutdown off an async executor. See
+[`advanced_queued_send`](../examples/advanced_queued_send.rs).
 
 ## Custom receive allocation
 
-By default the SDK allocates the memory of received frames. An
-`AllocatorService` lets the application supply that memory instead.
+Use `AllocatorService` when received buffers must come from application memory.
+Construction requires `ndi.process_lifetime()`, which permanently retains an
+initialized runtime reference. If this crate is loaded in a plug-in, its module
+must also remain loaded for the process lifetime because the SDK retains
+callback pointers. Applications that do not opt in keep ordinary lifetimes.
 
-The SDK can call an allocator's free function long after the allocator was
-replaced. Custom allocation therefore needs the runtime to stay initialized
-until the process exits, and creating the service requires the explicit opt-in
-for that:
+Attach an ordinary or packet receiver, then install video/audio allocation
+policies. Policies execute on SDK threads, potentially concurrently; return
+quickly. An error or contained panic declines the allocation. Replacing a policy
+keeps the old one alive until the SDK releases its outstanding buffers.
+Process-wide `AllocatorLimits` include those older allocations and are fixed by
+the first service; later services must request identical limits. Use `usage()`
+to inspect retained allocations.
 
-```rust
-use grafton_ndi::advanced::{
-    AllocationBuffer, AllocationRequest, AllocatorLimits, AllocatorService,
-};
-use grafton_ndi::{Receiver, Ndi};
+`AllocationBuffer::zeroed(request)` provides zeroed, 64-byte-aligned memory.
+Use `request.with_stride_bytes(stride)` for permitted line/channel padding.
+`AllocationBuffer::from_external` supports a custom pool only under the
+[`ExternalAllocation` unsafe contract](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/advanced/trait.ExternalAllocation.html):
+initialized CPU-accessible memory, stable address/capacity, required alignment
+and exclusive SDK access until release. Do not infer these guarantees from a
+buffer's size alone.
 
-fn customize(ndi: &Ndi, receiver: Receiver) -> grafton_ndi::Result<Receiver> {
-    let service = AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default())?;
-    let mut receiver = service.attach(receiver)?;
-    // Pad every video line to a multiple of 256 bytes.
-    receiver.set_video_allocator(|request: AllocationRequest| {
-        let stride = request.stride_bytes().next_multiple_of(256);
-        AllocationBuffer::zeroed(request.with_stride_bytes(stride)?)
-    })?;
-    // ... capture through `receiver.receiver()` ...
-    receiver.reset_video_allocator();
-    Ok(receiver.into_receiver())
-}
-```
-
-`Ndi::process_lifetime` keeps one initialized runtime reference permanently.
-Dropping the returned value does not undo it. Applications that never call it
-keep the normal lifecycle. A program that loads this crate inside a plug-in
-must also keep that plug-in loaded for the life of the process, because the SDK
-holds pointers to the crate's callbacks.
-
-What to know about allocator policies:
-
-- A policy runs on SDK threads, possibly several at once. It should return
-  quickly. A panic in a policy is contained; like an error it fails that
-  allocation, and the SDK then drops the frame.
-- `AllocationBuffer::zeroed` supplies zeroed, 64-byte-aligned memory.
-  `AllocationRequest::with_stride` asks for padded lines, and refuses a stride
-  the frame's layout does not allow with `Error::InvalidInput`.
-  `ExternalAllocation` is the `unsafe` trait for memory from another pool; its
-  implementer guarantees the properties the trait documents.
-- Setting an allocator replaces the previous one for frames allocated from then
-  on. Frames allocated earlier stay in the memory the earlier policy supplied,
-  and that policy is kept until the SDK has freed the last of them.
-- `AllocatorLimits` are process-wide and fixed by the first service; later
-  services must name the same limits. They count allocations made by policies
-  that have since been replaced. The defaults allow 16 concurrent policy calls
-  and 64 MiB per allocation, within 1 GiB in total. Limits that could not all
-  be honored at once are rejected. A request the limits do not admit is
-  declined, and the SDK then drops that frame. `AllocatorService::usage`
-  reports what is currently held.
-- `set_video_allocator`, `set_audio_allocator` and
-  `AllocationBuffer::from_external` return what they were given inside
-  `Rejected` when they fail.
-- `attach_packets` does for a `PacketReceiver` what `attach` does for a
-  `Receiver`, and hands the `PacketReceiver` back inside `Rejected` when it
-  fails. The `AllocatedPacketReceiver` it returns has the packet receiver's
-  `capture`, `receiver()` and `controls()`. Both allocated wrappers use the
-  same restricted control view, including KVM, so their receiver cannot be
-  swapped while its allocators remain installed. `into_packet_receiver`
-  gives the packet receiver back. Both allocated receivers are `Send` and
-  `Sync`: the SDK calls the policies on threads of its own whatever thread
-  set them, so a receiver can be attached, given allocators, capture and be
-  dropped on different threads.
-- Dropping an allocated receiver, or taking its receiver back, first returns
-  the receiver to the SDK's own memory. A receiver that a `RecvAdvertiser`
-  registration keeps alive afterwards frees the allocations it still holds
-  through the same process-wide registry, which outlives every receiver.
-
-Example: `examples/advanced_allocator.rs`.
+Recover the receiver with `into_receiver()` or `into_packet_receiver()`;
+outstanding SDK allocations still retain their policies. See
+[`advanced_allocator`](../examples/advanced_allocator.rs), including the
+explicit process-lifetime opt-in and padded-stride policy.
 
 ## Synchronization
 
-`AvSync` returns the audio that belongs to each video frame's timestamp. It
-takes over the receiver's audio, so it owns the receiver: capture video through
-`AvSync::receiver`, then call `synchronize`. `AvSync::new` takes the receiver
-and hands it back inside `Rejected` when it fails.
+`AvSync` matches audio to a captured video's timestamp. It owns the receiver
+and reserves audio capture; capture video through `sync.receiver()`, then pass
+the borrowed or owned video to `synchronize`. `AvSyncRequest::automatic()` lets
+the SDK choose audio shape. `AvSyncOutcome` distinguishes audio, no matching
+samples, format changes and absent audio; SDK internal failures return
+`Error::NativeOperationFailed`, unknown codes `Error::UnexpectedSdkResult`.
+These successful absence outcomes do not prove recent reception; use the
+[media-progress monitor](usage.md#monitor-reception-of-the-expected-media).
 
-`receiver()` returns the `Receiver<AvSyncAttached>` the synchronizer holds. In
-this mode the receiver keeps its own `video` and `metadata` capture and
-`poll_event`, and the controls every receiver mode has: `set_tally`, `ptz`,
-`connection_stats`, `send_metadata`, `request_keyframe`, the delays,
-`connect_to`, `reconnect` and `poll_source_name_change`. Its `audio` does not
-exist in this mode, because the synchronizer takes the audio. The receiver is
-never lent mutably, since the synchronizer reads its native instance and a
-mutable receiver could be swapped for another `AvSync`'s. `controls()` lends
-exclusive stream controls and KVM. `split()` lends `AvSyncCapture` separately
-from those controls, so a KVM session can hold input while `synchronize`
-continues matching audio to video captured through the session's receiver.
+`AvSync` is `Send` but not `Sync`; synchronization runs on one thread at a
+time. Its shared receiver permits concurrent compatible capture/control work.
+`split()` separates synchronization and exclusive controls for KVM;
+`into_receiver()` restores audio capture. See
+[`advanced_avsync`](../examples/advanced_avsync.rs).
 
-`synchronize` takes the frame by reference, either a `VideoFrameRef` captured
-with `capture_ref` or an owned `VideoFrame`, and reads it in place, so the
-usual loop copies no pixels:
-
-```rust
-use std::time::Duration;
-use grafton_ndi::{
-    advanced::{AvSync, AvSyncOutcome, AvSyncRequest},
-    Receiver, Tally,
-};
-
-fn play(receiver: Receiver) -> grafton_ndi::Result<()> {
-    let sync = AvSync::new(receiver)?;
-    sync.receiver().set_tally(Tally::new(true, false));
-    while let Some(video) = sync.receiver().video().capture_ref(Duration::from_secs(1))? {
-        if let AvSyncOutcome::Audio { frame, .. } =
-            sync.synchronize(Some(&video), AvSyncRequest::automatic())?
-        {
-            println!("{} samples for {}x{}", frame.num_samples(), video.width(), video.height());
-        }
-    }
-    Ok(())
-}
-```
-
-An `AvSync` is `Send` but not `Sync`: it can be created on one thread and
-synchronize and be dropped on another, such as a worker thread, but one call
-synchronizes at a time, because the SDK does not document two
-synchronizations of one synchronizer running at once. The receiver it lends
-is both, so scoped threads can capture video or metadata, poll events or
-reconnect through it meanwhile. `synchronize` does not take the receiver's
-capture guard, as FrameSync's captures do not, so a reconnect neither waits
-for it nor holds it off.
-
-`AvSyncRequest::automatic()`
-takes whatever audio belongs to the frame. `AvSyncRequest::new(Some(sample_rate),
-Some(num_samples))` asks for that many samples per channel, computed for that
-sample rate; each `None` leaves the choice to the SDK. The SDK may return a
-different number of samples to follow the audio that belongs to the frame, and
-then reports the count as adjusted. The outcome is the audio, or says why there
-is none: no samples for this frame, a changed audio format (with the source's
-sample rate and channel count), no audio stream, no samples matching the
-frame's time. An SDK internal error returns `Error::NativeOperationFailed`;
-an unknown status returns `Error::UnexpectedSdkResult`, preserving its code in
-the diagnostic. Both propagate through `?`. Nothing is retried or converted.
-`into_receiver` stops synchronizing and returns the receiver, with its own
-audio capture again.
-
-`Genlock` paces a sender from the timing of a reference source. `clocks`
-returns a video clock and an audio clock; wait on the matching one before
-submitting each frame, and create the sender with its own clocking disabled.
-The video clock waits for a `FrameRate` and `ScanType`, the audio clock for a
-sample rate and a number of samples per channel.
-Each wait reports whether the reference or the system clock paced it; the
-system clock is used while no reference signal arrives. The waits block their
-thread and cannot be cancelled or given a deadline. Both clocks borrow the
-genlock, so the reference cannot be changed while a clock is in use. A
-`Genlock` is `Send` but not `Sync`: it can be created on one thread and
-connected, waited on and dropped on others, and each clock can wait on a
-thread of its own, but `is_active`, which the SDK does not document as safe
-to call from several threads at once, is called through the genlock on one
-thread at a time.
-
-Examples: `examples/advanced_avsync.rs`, `examples/advanced_genlock.rs`.
+`Genlock` paces a sender from a reference source. Disable the sender's own
+clocking, obtain `clocks()`, then wait on the video/audio clock before sending
+that media. Each wait reports reference or fallback system clock pacing.
+**Waits block without a cancellation or deadline mechanism.** The clocks borrow
+the genlock, preventing a reference change while in use. `Genlock` is `Send`
+but not `Sync`; the two clocks can wait on separate threads. See
+[`advanced_genlock`](../examples/advanced_genlock.rs).
 
 ## Encoder guidance, keyframes and stream selection
 
-These are methods on the ordinary `Sender` and `Receiver`:
+Advanced methods on ordinary `Sender` and `Receiver` provide encoder size/rate
+and quality guidance, keyframe requests and external tally. A receiver's
+keyframe request is a request to the source, rather than confirmation that a
+keyframe was sent. SpeedHQ-only quality methods reject other codecs.
 
-- `Sender::target_frame_bytes`, `target_bit_rate`, `legacy_quality` and
-  `quality_plan` report what an encoder should aim for when it produces a given
-  `VideoPacketFormat` for the sender's connections. `legacy_quality` and
-  `quality_plan` apply to SpeedHQ formats only, and refuse any other with
-  `Error::InvalidInput`.
-- `Sender::keyframe_required` reports whether a connected receiver needs a
-  keyframe, and `wait_for_keyframe_change` waits for that to change.
-  `Receiver::request_keyframe` asks the source for one; the source decides
-  whether to send it.
-- `Sender::set_external_tally` sets the sender's own contribution to its tally.
-- `Receiver::set_stream_tier` switches between the source's program and
-  preview streams (`StreamTier`). `Receiver::set_streams` chooses which streams
-  the source sends (`MediaTypes`). The SDK reports only whether the setting
-  changed, so the `SettingChange::Unchanged` they return cannot tell "already
-  in effect" from "refused". The SDK applies either change only under a vendor
-  ID that licenses the function, and reports no change without one.
-
-The senders that `CompressedSender::sender` and `QueuedSender::sender` lend
-have the same encoder guidance, keyframe and tally methods as `Sender`.
-
-Receiver ownership determines media access and the route to exclusive controls:
-
-| Owner | Available capture | Stream/tier controls | Capture during KVM |
-| --- | --- | --- | --- |
-| `Receiver` | Typed video/audio/metadata, events, combined media | Direct methods | Session's `receiver()` |
-| `FrameSync` | Clocked video/audio; receiver metadata/events | `controls()` | `split()` capture view |
-| `AvSync` | Matched audio; receiver video/metadata/events | `controls()` | `split()` synchronization view |
-| `PacketReceiver` | Owned packet/decoded media and events | `controls()` | Session's `capture()` |
-| `AllocatedReceiver` | Receiver's typed and combined media/events | `controls()` | Session's `receiver()` |
-| `AllocatedPacketReceiver` | Owned packet/decoded media and events | `controls()` | Session's `capture()` |
-
-Every row retains connection changes, diagnostics, upstream metadata, delays,
-tally, PTZ and keyframe requests, subject to the same runtime capability checks.
-Use the owner directly for a raw receiver, or its shared `receiver()` otherwise.
-The restricted control views also start KVM sessions. They never lend a mutable
-receiver, and reserve no additional capture path in attached modes. Split views
-stay on their borrowing thread; the existing owners retain their documented
-threading contracts. Release held inputs before a source change.
+`set_stream_tier` chooses program/preview; `set_streams` chooses media types.
+Their `SettingChange::Unchanged` cannot distinguish a redundant request from a
+refused request. Consult SDK licensing for permitted use. Attached receiver
+owners expose these controls through `controls()`; see the
+[ownership table](usage.md#use-framesync).
 
 ## KVM
 
-`Receiver::kvm` starts a `KvmSession`, exclusive remote control of the source
-the receiver is connected to. The receiver is borrowed mutably to start the
-session, so a receiver has one session at a time, and the session lends it back
-as `&Receiver` through `receiver()` for the session's whole lifetime. A video
-frame captured through it can be held while the session sends input, so a key,
-button or touch stays down across captured frames. For a `PacketReceiver`,
-start the session with `controls().kvm()` and capture with
-`KvmSession::capture`, which behaves as `PacketReceiver::capture` does. A
-source change through the lent receiver (`connect_to`, `reconnect`,
-`disconnect`) leaves held inputs on the previous source: call `release_all`
-first. The session sends pointer, button, wheel, key, touch and clipboard messages. A
-message the SDK does not send, for example because nothing is connected, is
-reported as `Error::NativeOperationFailed` naming the SDK function; a message
-it sends is not a confirmation that the source acted on it. `is_supported`
-reports whether the connected source accepts remote control. Pointer and touch
-positions are fractions of the source's screen, `0.0..=1.0` on each axis, and
-keys are X11 key symbols; a value outside those ranges is refused with
-`Error::InvalidInput`. The session never reads the local clipboard. It
-remembers what it has pressed and touched and releases it when dropped, on a
-best-effort basis; call `release_all` to learn whether that succeeded.
+`Receiver::kvm()` creates an exclusive `KvmSession`; attached owners use
+`controls().kvm()`. A source must offer remote control. The session lends shared
+receiver access for compatible capture while input stays held. Use `split()`
+for simultaneous FrameSync/AVSync output and a session; packet sessions provide
+`capture()` directly.
 
-Example: `examples/advanced_kvm.rs`.
+The session sends pointer, button, wheel, key, touch and explicit clipboard
+text; it never reads the local clipboard. Pointer/touch coordinates are
+fractions in `0.0..=1.0`, and keys use X11 key symbols. A native send failure
+returns `Error::NativeOperationFailed`; success does not confirm the source
+acted on the message. **Call `release_all()` before changing source.** Drop
+attempts release only on a best-effort basis; explicit release reports failure.
+See [`advanced_kvm`](../examples/advanced_kvm.rs).
 
 ## Validation
 
-See [SDK validation](sdk-validation.md) and the [contributor checks](../CONTRIBUTING.md).
-The suite includes H.264 and HEVC decode tests where a decoder is available.
-It does not establish interoperability with arbitrary hardware or license entitlements.
+[SDK validation](sdk-validation.md) describes configured tests and how to record
+runtime evidence. Compiling these APIs does not establish runtime capabilities,
+hardware interoperability or license entitlements.
