@@ -2876,8 +2876,9 @@ fn concurrent_keyframe_waiters_observe_the_same_request() {
                 {}
             }
             let ready = std::sync::Barrier::new(3);
+            let (mut video, audio) = sender.split();
             std::thread::scope(|scope| {
-                let sender = sender.sender();
+                let sender = audio.sender();
                 let idle_stream = scope.spawn(|| {
                     sender
                         .wait_for_keyframe_change(
@@ -2886,23 +2887,31 @@ fn concurrent_keyframe_waiters_observe_the_same_request() {
                         )
                         .unwrap()
                 });
-                let waits: Vec<_> = selectors
-                    .into_iter()
-                    .map(|selector| {
-                        let ready = &ready;
-                        scope.spawn(move || {
-                            ready.wait();
-                            sender
-                                .wait_for_keyframe_change(Duration::from_secs(2), selector)
-                                .unwrap()
-                        })
-                    })
-                    .collect();
+                let ready = &ready;
+                let frame = &mut frame;
+                let consumer = scope.spawn(move || {
+                    ready.wait();
+                    let changed = sender
+                        .wait_for_keyframe_change(Duration::from_secs(2), selectors[0])
+                        .unwrap();
+                    if changed {
+                        // Sending the requested keyframe may clear native demand
+                        // before another observer resumes. Its report stays latched.
+                        video.send_video(frame).unwrap();
+                    }
+                    changed
+                });
+                let follower = scope.spawn(move || {
+                    ready.wait();
+                    sender
+                        .wait_for_keyframe_change(Duration::from_secs(2), selectors[1])
+                        .unwrap()
+                });
                 ready.wait();
                 std::thread::sleep(Duration::from_millis(100));
                 let requested = Instant::now();
                 receiver.receiver().request_keyframe().unwrap();
-                for wait in waits {
+                for wait in [consumer, follower] {
                     assert!(
                         wait.join().unwrap(),
                         "a keyframe waiter missed {selectors:?}"

@@ -91,7 +91,7 @@ struct Inner {
     metadata_capture: parking_lot::Mutex<()>,
     tally: TallyState,
     #[cfg(ndi_has_advanced_keyframe_demand)]
-    keyframe_changes: crate::change_feed::ChangeFeed,
+    keyframe_changes: crate::keyframe_changes::KeyframeChanges,
 }
 
 // A panic cannot leave metadata capture or tally half-changed: their locks
@@ -1395,7 +1395,7 @@ impl<M: SenderMode> Sender<M> {
                 metadata_capture: parking_lot::Mutex::new(()),
                 tally: TallyState::default(),
                 #[cfg(ndi_has_advanced_keyframe_demand)]
-                keyframe_changes: crate::change_feed::ChangeFeed::default(),
+                keyframe_changes: crate::keyframe_changes::KeyframeChanges::default(),
             },
             native: NativeOwner::new(SenderResource {
                 instance,
@@ -1670,7 +1670,7 @@ impl<M: SenderMode> Sender<M> {
     /// null selector beside a format-specific selector. Share the native wait
     /// across them and filter the current demand at each caller.
     #[cfg(ndi_has_advanced_keyframe_demand)]
-    pub(crate) fn keyframe_changes(&self) -> &crate::change_feed::ChangeFeed {
+    pub(crate) fn keyframe_changes(&self) -> &crate::keyframe_changes::KeyframeChanges {
         &self.inner.keyframe_changes
     }
 

@@ -173,6 +173,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Sender tally polls retain changes for the next waiter. Concurrent native
   tally queries serialize within the wait budget, while polls return the
   cached state without blocking.
+- Keyframe change waiters latch each active stream's demand before waking any
+  observer, so a keyframe sent by the first observer cannot erase another's report.
 - Concurrent Finder lookups and keyframe waiters share native change reports,
   so one waiter cannot consume another waiter's notification. Native and
   shared waits use the same deadline, including native waiter handoff.

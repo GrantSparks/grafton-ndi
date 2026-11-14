@@ -69,7 +69,14 @@ pub unsafe extern "C" fn NDIlib_send_is_keyframe_required(
     _format: *const NDIlib_video_frame_v2_t,
 ) -> bool {
     let program = _format.is_null() || unsafe { (*_format).FourCC }.to_le_bytes()[0].is_ascii_uppercase();
-    program && KEYFRAME_REQUIRED.load(Ordering::Acquire)
+    if !program { return false; }
+    if std::env::var_os("GRAFTON_FAKE_CLEAR_KEYFRAME_AFTER_QUERY").is_some() {
+        // Model a send clearing demand as soon as the first observer sees it.
+        // Every observer of that native report must retain the same result.
+        KEYFRAME_REQUIRED.swap(false, Ordering::AcqRel)
+    } else {
+        KEYFRAME_REQUIRED.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(fake_advanced)]

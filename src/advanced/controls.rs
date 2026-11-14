@@ -266,12 +266,14 @@ impl<M: SenderMode> Sender<M> {
     /// Returns whether a change was signalled; call
     /// [`keyframe_required`](Self::keyframe_required) for the new state.
     /// Concurrent waiters share one native update report. A format-specific
-    /// waiter reports the update when that stream currently needs a keyframe;
-    /// otherwise it keeps waiting within the same timeout. These reports are
-    /// coalesced invalidations, not a per-stream event history: pending demand
-    /// can be reported again, or a concurrent send can clear it before the
-    /// query. A zero timeout beside another native waiter only reads reports
-    /// that waiter has already published.
+    /// waiter reports the update when the shared sample observes demand for
+    /// that stream; otherwise it keeps waiting within the same timeout. Demand is sampled
+    /// once per active stream selector before any observer is woken, so a send
+    /// made by the first observer cannot erase another observer's report.
+    /// These are coalesced invalidations, not a per-stream event history:
+    /// pending demand can be reported again, or a concurrent send can clear it
+    /// before the shared sample. A zero timeout beside another native waiter
+    /// only reads reports that waiter has already published.
     ///
     /// # Errors
     ///
@@ -287,31 +289,25 @@ impl<M: SenderMode> Sender<M> {
         let table = self.runtime().table::<KeyframeDemand>()?;
         native!(KeyframeDemand, table => {
             let deadline = crate::timeout::Deadline::after(_timeout)?;
-            let format = _format.map(VideoPacketFormat::raw);
-            let changes = self.keyframe_changes();
-            let mut generation = changes.generation();
-            loop {
-                // SAFETY: the sender lives for this borrow. A null selector
-                // observes all updates; separate native waits for overlapping
-                // selectors can consume one another's report.
-                let changed = changes.wait_since(generation, deadline, |timeout| unsafe {
-                    table.NDIlib_send_wait_for_keyframe_request(
+            Ok(self.keyframe_changes().wait(
+                _format,
+                deadline,
+                |timeout| {
+                    // SAFETY: the sender lives for the wait. A null selector
+                    // observes all updates without competing native selectors.
+                    unsafe { table.NDIlib_send_wait_for_keyframe_request(
                         self.native_instance(), timeout, std::ptr::null(),
-                    )
-                });
-                if !changed { return Ok(false); }
-                // Observe before filtering so a later report cannot fall into
-                // a gap between the demand query and the next wait.
-                generation = changes.generation();
-                // SAFETY: this query does not consume an update. The optional
-                // descriptor lives through the synchronous call.
-                if format.is_none() || unsafe {
-                    table.NDIlib_send_is_keyframe_required(self.native_instance(), stream(format.as_ref()))
-                } {
-                    return Ok(true);
-                }
-                if deadline.is_expired() { return Ok(false); }
-            }
+                    ) }
+                },
+                |format| {
+                    let format = format.raw();
+                    // SAFETY: this non-consuming query reads only the live
+                    // sender and the descriptor, which lasts through the call.
+                    unsafe { table.NDIlib_send_is_keyframe_required(
+                        self.native_instance(), &format,
+                    ) }
+                },
+            ))
         })
     }
 }

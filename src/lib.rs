@@ -62,6 +62,8 @@ mod capture;
 mod change_feed;
 mod color_info;
 mod error;
+#[cfg(any(ndi_has_advanced_keyframe_demand, all(test, feature = "advanced")))]
+mod keyframe_changes;
 mod media;
 mod pixels;
 mod rejected;

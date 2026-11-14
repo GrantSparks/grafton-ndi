@@ -68,7 +68,9 @@ fn shared_native_change_reports() {
             "wait" => wait(&ndi, || unsafe { publish() }),
             "handoff" => handoff(&ndi, || unsafe { publish() }),
             #[cfg(feature = "advanced")]
-            "keyframe" => keyframe(&ndi),
+            "keyframe" => keyframe(&ndi, false),
+            #[cfg(feature = "advanced")]
+            "keyframe-cleared" => keyframe(&ndi, true),
             case => panic!("unknown change scenario {case}"),
         }
         return;
@@ -88,7 +90,7 @@ fn shared_native_change_reports() {
     .build(&library);
     let mut cases = vec!["find", "wait", "handoff"];
     if cfg!(feature = "advanced") {
-        cases.push("keyframe");
+        cases.extend(["keyframe", "keyframe-cleared"]);
     }
     for case in cases {
         run_child(directory.path(), &library, case);
@@ -202,7 +204,7 @@ fn handoff(ndi: &Ndi, publish: impl Fn()) {
 }
 
 #[cfg(feature = "advanced")]
-fn keyframe(ndi: &Ndi) {
+fn keyframe(ndi: &Ndi, clear_after_query: bool) {
     use grafton_ndi::{
         advanced::{VideoCodec, VideoPacketFormat},
         capabilities::RuntimeFeature,
@@ -216,10 +218,19 @@ fn keyframe(ndi: &Ndi) {
     let receiver = Receiver::new(ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
     let h264 = VideoPacketFormat::new(VideoCodec::H264, 64, 32).unwrap();
     let different_size = VideoPacketFormat::new(VideoCodec::H264, 128, 64).unwrap();
-    let ready = Barrier::new(5);
+    if clear_after_query {
+        std::env::set_var("GRAFTON_FAKE_CLEAR_KEYFRAME_AFTER_QUERY", "1");
+    }
+    let formats = if clear_after_query {
+        vec![Some(h264), Some(different_size)]
+    } else {
+        vec![None, None, Some(h264), Some(different_size)]
+    };
+    let waiters = formats.len();
+    let ready = Barrier::new(waiters + 1);
     let (tx, rx) = mpsc::channel();
     thread::scope(|scope| {
-        for format in [None, None, Some(h264), Some(different_size)] {
+        for format in formats {
             let (sender, ready, tx) = (&sender, &ready, tx.clone());
             scope.spawn(move || {
                 ready.wait();
@@ -244,7 +255,7 @@ fn keyframe(ndi: &Ndi) {
         }
         thread::sleep(Duration::from_millis(40));
         receiver.request_keyframe().unwrap();
-        for _ in 0..4 {
+        for _ in 0..waiters {
             assert!(rx
                 .recv_timeout(Duration::from_secs(1))
                 .expect("a keyframe waiter lost the update"));
