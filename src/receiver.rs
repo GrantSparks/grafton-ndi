@@ -155,6 +155,22 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// value: the SDK's early return, which would otherwise busy-wait.
 const EARLY_RETURN_PAUSE: Duration = Duration::from_millis(10);
 
+/// Maximum consecutive notifications retried without yielding. An idle
+/// response always backs off; an endless notification stream must do so too.
+const IMMEDIATE_NOTIFICATION_RETRIES: usize = 8;
+
+enum Retry<T> {
+    Item(T),
+    Progress,
+    Idle,
+}
+
+impl<T> From<Option<T>> for Retry<T> {
+    fn from(value: Option<T>) -> Self {
+        value.map_or(Self::Idle, Self::Item)
+    }
+}
+
 /// Run `attempt` until it returns a value or `deadline` is spent: the one
 /// capture loop behind every receiver capture, for all frame kinds, for both
 /// [`Capture`] verbs and the async ones, and behind [`Receiver::poll_event`]
@@ -168,9 +184,9 @@ const EARLY_RETURN_PAUSE: Duration = Duration::from_millis(10);
 ///
 /// Returns `Ok(None)` once the budget is spent without a value. An error from
 /// an attempt ends the loop.
-pub(crate) fn capture_within<T>(
+fn capture_within<T, R: Into<Retry<T>>>(
     deadline: Deadline,
-    attempt: impl FnMut(Attempt) -> Result<Option<T>>,
+    attempt: impl FnMut(Attempt) -> Result<R>,
 ) -> Result<Option<T>> {
     capture_within_clock(deadline, attempt, Instant::now, std::thread::sleep)
 }
@@ -181,27 +197,39 @@ pub(crate) fn capture_within<T>(
 /// The first attempt is made even when nothing is left of `deadline`, so a
 /// spent or zero budget makes exactly one attempt, with a zero timeout.
 ///
-/// Only an attempt that returned before its own end is followed by
-/// [`EARLY_RETURN_PAUSE`], never past the end of `deadline`: that is the
-/// SDK's early return, which would otherwise spin. An attempt that waited
+/// Idle early returns and exhausted notification bursts are followed by
+/// [`EARLY_RETURN_PAUSE`], never past the end of `deadline`. Notifications
+/// otherwise retry immediately. An attempt that waited
 /// until its end is followed at once by the next, so that a frame arriving in
 /// between is not delayed by a pause.
-fn capture_within_clock<T>(
+fn capture_within_clock<T, R: Into<Retry<T>>>(
     deadline: Deadline,
-    mut attempt: impl FnMut(Attempt) -> Result<Option<T>>,
+    mut attempt: impl FnMut(Attempt) -> Result<R>,
     mut now: impl FnMut() -> Instant,
     mut sleep: impl FnMut(Duration),
 ) -> Result<Option<T>> {
+    let mut notifications = 0;
     loop {
         let this = Attempt(deadline.within_at(now(), POLL_INTERVAL));
-        if let Some(value) = attempt(this)? {
-            return Ok(Some(value));
-        }
+        let progress = match attempt(this)?.into() {
+            Retry::Item(value) => return Ok(Some(value)),
+            Retry::Progress => true,
+            Retry::Idle => false,
+        };
         let mut returned = now();
-        if returned < this.0.end() {
+        if deadline.remaining_at(returned).is_zero() {
+            return Ok(None);
+        }
+        if returned < this.0.end() && (!progress || notifications >= IMMEDIATE_NOTIFICATION_RETRIES)
+        {
             // Before the attempt's end, and so before the deadline's.
             sleep(EARLY_RETURN_PAUSE.min(deadline.remaining_at(returned)));
             returned = now();
+            notifications = 0;
+        } else if progress && returned < this.0.end() {
+            notifications += 1;
+        } else {
+            notifications = 0;
         }
         if deadline.remaining_at(returned).is_zero() {
             return Ok(None);
@@ -1551,13 +1579,20 @@ impl ReceiverCore {
     /// [`reconnect`](Receiver::reconnect). `None` when the guard was not free
     /// in time, or the SDK returned without a frame of this kind; a
     /// notification it returned instead is kept for [`Receiver::poll_event`].
-    fn poll_ref_until<K: CaptureKind>(&self, attempt: Attempt) -> Result<Option<K::Ref<'_>>> {
+    fn poll_ref_until<K: CaptureKind>(&self, attempt: Attempt) -> Result<Retry<K::Ref<'_>>> {
         let Some(lock) = self.capture_lock(attempt) else {
-            return Ok(None);
+            return Ok(Retry::Idle);
         };
         let result = capture_raw::<K>(&lock)?;
         drop(lock);
-        self.capture_result::<K>(result)
+        // Classify the result itself, rather than inspecting pending events:
+        // another consumer may take a retained event concurrently.
+        let progress = matches!(result, CaptureResult::Notification(n) if n != Notification::None);
+        Ok(match self.capture_result::<K>(result)? {
+            Some(frame) => Retry::Item(frame),
+            None if progress => Retry::Progress,
+            None => Retry::Idle,
+        })
     }
 
     fn capture_result<'rx, K: CaptureKind>(
@@ -3546,6 +3581,80 @@ mod tests {
     }
 
     #[test]
+    fn retry_notifications_reach_a_queued_frame_without_sleeping() {
+        for count in 1..=IMMEDIATE_NOTIFICATION_RETRIES {
+            let clock = FakeClock::new();
+            let mut calls = 0;
+            let result = capture_within_clock(
+                clock.deadline(Duration::from_secs(1)),
+                |_| {
+                    calls += 1;
+                    Ok(if calls <= count {
+                        Retry::Progress
+                    } else {
+                        Retry::Item(42)
+                    })
+                },
+                || clock.now(),
+                |_| panic!("a queued frame after a notification must not be delayed"),
+            );
+            assert_eq!(result.unwrap(), Some(42));
+            assert_eq!(calls, count + 1);
+        }
+    }
+
+    #[test]
+    fn retry_notification_storm_is_bounded_and_idle_still_backs_off() {
+        for idle in [false, true] {
+            let clock = FakeClock::new();
+            let mut calls = 0;
+            let mut sleeps = 0;
+            let result: Result<Option<()>> = capture_within_clock(
+                clock.deadline(Duration::from_millis(25)),
+                |_| {
+                    calls += 1;
+                    Ok(if idle && calls % 2 == 0 {
+                        Retry::Idle
+                    } else {
+                        Retry::Progress
+                    })
+                },
+                || clock.now(),
+                |pause| {
+                    sleeps += 1;
+                    clock.advance(pause);
+                },
+            );
+            assert!(result.unwrap().is_none());
+            assert_eq!(sleeps, 3);
+            assert!(calls <= 3 * (IMMEDIATE_NOTIFICATION_RETRIES + 1));
+            assert_eq!(clock.elapsed(), Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn retry_zero_or_spent_budget_observes_only_one_notification() {
+        for spent in [Duration::ZERO, Duration::from_millis(30)] {
+            let clock = FakeClock::new();
+            let deadline = clock.deadline(Duration::ZERO);
+            clock.advance(spent);
+            let mut calls = 0;
+            let result: Result<Option<()>> = capture_within_clock(
+                deadline,
+                |attempt| {
+                    calls += 1;
+                    assert!(clock.timeout(attempt).is_zero());
+                    Ok(Retry::Progress)
+                },
+                || clock.now(),
+                |_| panic!("spent budgets must not sleep"),
+            );
+            assert!(result.unwrap().is_none());
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
     fn retry_caps_sub_poll_timeout_to_total_budget() {
         let clock = FakeClock::new();
         let mut polls = Vec::new();
@@ -3876,7 +3985,7 @@ mod tests {
             clock.deadline(Duration::from_secs(1)),
             |_| {
                 attempts.set(attempts.get() + 1);
-                Err(Error::CaptureFailed("test error".into()))
+                Err::<Option<i32>, _>(Error::CaptureFailed("test error".into()))
             },
             || clock.now(),
             |sleep| sleeps.push(sleep),
