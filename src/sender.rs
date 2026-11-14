@@ -1437,9 +1437,7 @@ impl Sender {
     ///
     /// The pipeline is retired: the SDK is drained, so nothing this sender
     /// submitted is in flight once the sender is in mode `T`, which has no
-    /// pipeline, and the completion handler is dropped without being called,
-    /// so a handler that would panic cannot lose the sender. Returns the
-    /// sender unchanged, with nothing synchronized,
+    /// pipeline. Returns the sender unchanged, with nothing synchronized,
     /// when an advertiser registration shares its native sender: the
     /// registration could keep it alive after the frames an Advanced sender
     /// lends the SDK are freed.
@@ -1601,8 +1599,8 @@ impl Sender {
     /// frame is in flight, returns without calling the SDK.
     ///
     /// After this returns, the SDK has released the pending buffer. The sender
-    /// retains the frame; use [`Self::finish_video_async`] or the next async
-    /// submission to recover it without copying.
+    /// retains the frame; use [`Self::finish_video_async`] or an owned
+    /// submission through [`Self::send_video_async`] to recover it without copying.
     pub fn flush_async_blocking(&self) {
         self.native.video.flush();
     }

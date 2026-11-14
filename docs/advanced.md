@@ -73,16 +73,16 @@ can arrive decoded. `capture_ref(timeout)` returns a borrowed
 `PacketItemRef::{Video, Audio, Metadata, Event}`; `capture(timeout)` makes the
 same capture and copies it into an owned `PacketItem`. Compressed references
 expose codec bytes without copying their payload or metadata. Their `to_owned`
-and `copy_into` methods make sendable owned packets; `copy_into` reuses buffers. Notifications use the common
-`ReceiverEvent` model and are consumed once. `Ok(None)` means the wait budget
-expired, rather than proof that the source disconnected. Packet receivers
-cannot feed `FrameSync`.
+and `copy_into` methods make sendable owned packets; `copy_into` reuses buffers.
+Notifications use the common `ReceiverEvent` model and are consumed once.
+`Ok(None)` means the wait budget expired, rather than proof that the source
+disconnected. Packet receivers cannot feed `FrameSync`.
 
 Both capture methods take `&self`; controls remain available through
-`receiver()` while a packet is borrowed. `controls()` reaches exclusive stream selection and KVM, and a
-packet KVM session also provides `capture_ref()`. Its result borrows the
-receiver, so inputs can be released while a packet is held. Neither route exposes
-raw receiver capture. See
+`receiver()` while a packet is borrowed. `controls()` reaches exclusive stream
+selection and KVM, and a packet KVM session also provides `capture_ref()`. Its
+result borrows the receiver, so inputs can be released while a packet is held.
+Neither route exposes raw receiver capture. See
 [`advanced_passthrough`](../examples/advanced_passthrough.rs) for receiving and
 relaying a source's compressed packets.
 
@@ -129,8 +129,8 @@ threads. Each view is `Send` and neither is `Sync` or `Clone`; the audio view's
 
 ## Queued sending
 
-Use `QueuedSender` to submit multiple owned raw, compressed or scatter video frames
-without waiting for the previous frame's completion on each submission.
+Use `QueuedSender` to submit multiple owned raw, compressed or scatter video
+frames without waiting for the previous frame's completion on each submission.
 `QueueOptions` bounds retained frames and bytes, including completed frames not
 yet collected and spare payload/metadata capacity. Check defaults and exact
 accounting in [`QueueOptions`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.QueueOptions.html).

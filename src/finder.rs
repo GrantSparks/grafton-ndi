@@ -881,9 +881,10 @@ impl HostKeyBuffer {
 /// establish the source's codec or whether it uses NDI|HX.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SourceAddress {
-    /// An address classified as a URL by its `://` scheme separator.
+    /// A URL address. SDK address strings containing `://` use this variant.
     Url(String),
-    /// An address without a `://` scheme separator, such as a host or IP and port.
+    /// A host or IP address, optionally with a port. SDK strings without
+    /// `://` use this variant.
     Ip(String),
 }
 

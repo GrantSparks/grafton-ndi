@@ -118,8 +118,8 @@ pub enum Error {
         detail: String,
     },
 
-    /// The request cannot be met by the implementation already selected for
-    /// this process, which cannot be replaced.
+    /// Runtime or File library selection conflicts with the process's native
+    /// libraries or a selection already in progress.
     ///
     /// `kind` identifies the [`SelectionConflict`] without parsing `detail`;
     /// the latter preserves the diagnostic text.
