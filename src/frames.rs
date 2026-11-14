@@ -8312,14 +8312,14 @@ mod tests {
         let frame = unsafe { VideoFrame::from_raw(&raw) }.unwrap();
         assert_eq!(frame.metadata(), None);
         assert_eq!(frame.data(), data);
-        assert!(frame.to_raw().p_metadata.is_null());
+        assert!(frame.as_test_raw().p_metadata.is_null());
 
         metadata[0] = 0xFF;
         metadata[1] = 0;
         let frame = unsafe { VideoFrame::from_raw(&raw) }.unwrap();
         assert_eq!(frame.metadata(), None);
         assert_eq!(frame.data(), data);
-        assert!(frame.to_raw().p_metadata.is_null());
+        assert!(frame.as_test_raw().p_metadata.is_null());
     }
 
     #[test]

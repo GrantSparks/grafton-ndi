@@ -50,7 +50,10 @@ where
         assert_eq!(VideoSource::metadata_status(&frame), status);
         assert_eq!(VideoSource::data(&frame), Some(pixels.as_slice()));
         assert_eq!(
-            frame.video_descriptor().p_metadata.is_null(),
+            frame
+                .video_descriptor(SendableVideoLayout::for_test(*frame.layout()))
+                .p_metadata
+                .is_null(),
             status != FrameMetadataStatus::Text
         );
     });
@@ -66,7 +69,7 @@ where
     frame.copy_into_owned(&mut owned);
     assert_eq!(owned.metadata_status(), owned_status);
     assert_eq!(
-        owned.to_raw().p_metadata.is_null(),
+        owned.as_test_raw().p_metadata.is_null(),
         status != FrameMetadataStatus::Text
     );
     assert_eq!(FREES.with(Cell::get), 0);
@@ -240,7 +243,7 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
     let captured_video = unsafe {
         VideoFrameRef::new(Guard::with_test_free(
             ptr::null_mut(),
-            present_video.video_descriptor(),
+            present_video.video_descriptor(SendableVideoLayout::for_test(*present_video.layout())),
             count_free,
         ))
         .unwrap()
@@ -248,7 +251,7 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
     let captured_bare_video = unsafe {
         VideoFrameRef::new(Guard::with_test_free(
             ptr::null_mut(),
-            absent_video.video_descriptor(),
+            absent_video.video_descriptor(SendableVideoLayout::for_test(*absent_video.layout())),
             count_free,
         ))
         .unwrap()
@@ -314,7 +317,7 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
                 assert_eq!(video.metadata(), video_source.metadata());
                 assert_eq!(audio.metadata(), audio_source.metadata());
                 assert_eq!(
-                    video.to_raw().p_metadata.is_null(),
+                    video.as_test_raw().p_metadata.is_null(),
                     video_source.metadata().is_none()
                 );
                 assert_eq!(
