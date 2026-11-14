@@ -489,6 +489,9 @@ for queue limits, cancellation and shutdown behavior.
 Await `finish` and inspect its `FinishStatus` and report, then await `close`.
 `close` ends the object for all clones without blocking the executor. Later
 operations return `StateError::Closed`; a failed worker returns `OwnerFailed`.
+Consumer waker panics are contained when notifying command and event futures,
+so they do not stop recording or playback or prevent other close requests from
+completing. An operation that panics on the owner thread still fails that owner.
 
 **Dropping the last clone blocks** until its worker exits. A recorder attempts
 to stop and waits up to `drop_wait` for closure events, then destroys the native

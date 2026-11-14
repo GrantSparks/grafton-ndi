@@ -118,6 +118,7 @@ fn deadline_gate(trigger: &str, entered: &str, release: &str) {
 
 export! {
     fn NDIlib_find_create_v2(p_create_settings: *const NDIlib_find_create_t) -> NDIlib_find_instance_t {
+        log("finder-create");
         let settings = unsafe { &*p_create_settings };
         let text = |pointer: *const c_char| if pointer.is_null() { String::new() } else { unsafe { CStr::from_ptr(pointer) }.to_str().unwrap().to_owned() };
         let scope = text(settings.p_groups);
@@ -129,6 +130,7 @@ export! {
         Box::into_raw(Box::new(Snapshot { generation: 0, scope, text: Vec::new(), plain: Vec::new(), extended: Vec::new() })).cast()
     }
     fn NDIlib_find_destroy(p_instance: NDIlib_find_instance_t) {
+        log("finder-destroy");
         unsafe { drop(Box::from_raw(p_instance.cast::<Snapshot>())) };
     }
     fn NDIlib_find_get_current_sources(p_instance: NDIlib_find_instance_t, p_no_sources: *mut u32) -> *const NDIlib_source_t {

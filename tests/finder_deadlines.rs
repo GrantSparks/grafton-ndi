@@ -127,7 +127,8 @@ fn expired_during_wait<T: Send>(
     })
 }
 
-fn exercise(finder: &Finder, gate: &Gate) {
+fn exercise(cache: &SourceCache, gate: &Gate) {
+    let finder = cache.finder();
     assert!(contended(finder, gate, |finder| finder
         .find_source(Duration::ZERO, |_| true)
         .unwrap())
@@ -140,8 +141,7 @@ fn exercise(finder: &Finder, gate: &Gate) {
         .find_sources(Duration::ZERO)
         .unwrap())
     .is_empty());
-    let (sources, cached) = contended(finder, gate, |finder| {
-        let cache = SourceCache::new(finder);
+    let (sources, cached) = contended(finder, gate, |_| {
         (
             cache.sources_by_host("studio", Duration::ZERO).unwrap(),
             cache.len(),
@@ -171,8 +171,8 @@ fn exercise(finder: &Finder, gate: &Gate) {
         finder.find_sources(Duration::from_millis(20)).unwrap()
     });
     assert_eq!(accumulated.len(), 1);
-    let sources = expired_during_wait(finder, gate, |finder| {
-        SourceCache::new(finder)
+    let sources = expired_during_wait(finder, gate, |_| {
+        cache
             .sources_by_host("studio", Duration::from_millis(20))
             .unwrap()
     });
@@ -244,7 +244,7 @@ fn finder_lookup_snapshot_contention_spends_one_wait_budget() {
         let gate = Gate(PathBuf::from(
             std::env::var_os("GRAFTON_FAKE_FINDER_GATE").unwrap(),
         ));
-        exercise(&finder, &gate);
+        exercise(&SourceCache::new(finder), &gate);
         return;
     }
     let directory = FixtureDir::create("finder-deadlines");

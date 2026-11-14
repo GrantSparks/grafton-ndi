@@ -131,7 +131,7 @@ fn crate_root_types_keep_their_auto_traits() {
         SettingChange: Send, Sync, UnwindSafe, RefUnwindSafe;
         Source: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceAddress: Send, Sync, UnwindSafe, RefUnwindSafe;
-        SourceCache<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        SourceCache: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceNameChange: Send, Sync, UnwindSafe, RefUnwindSafe;
         StreamTier: Send, Sync, UnwindSafe, RefUnwindSafe;
         Tally: Send, Sync, UnwindSafe, RefUnwindSafe;

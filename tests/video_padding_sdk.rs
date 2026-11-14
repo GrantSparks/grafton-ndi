@@ -92,7 +92,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
     let advertised = sender.source().unwrap();
     let host = advertised.name().split_once(" (").unwrap().0;
     let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
-    let cache = SourceCache::new(&finder);
+    let cache = SourceCache::new(finder);
     let first = cache
         .sources_by_host(&host.to_ascii_uppercase(), Duration::from_secs(1))
         .unwrap();

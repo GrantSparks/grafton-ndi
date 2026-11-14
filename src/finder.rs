@@ -1236,9 +1236,11 @@ impl Display for Source {
 /// choosing a feed by arrival order. Use [`Finder::find_source`] for a selection
 /// that should return as soon as a particular feed appears.
 ///
-/// This cache borrows its configured finder, keeping its runtime and discovery
-/// scope fixed. It never substitutes default discovery settings or adds IP hints;
-/// configure those on the finder before constructing the cache.
+/// The cache owns its configured finder, keeping it and the NDI runtime alive.
+/// Configure groups, IP hints and Advanced settings before constructing the
+/// cache: a lookup never creates another finder or changes its configuration.
+/// Store it directly in server state, or share it through [`std::sync::Arc`].
+/// [`finder`](Self::finder) lends the configured finder for uncached selection.
 ///
 /// Entries remain until [`Self::invalidate`] or [`Self::clear`]; they can contain
 /// offline endpoints and omit feeds announced after the original window. Empty
@@ -1248,6 +1250,8 @@ impl Display for Source {
 /// The cache is `Send + Sync`. Discovery runs outside its mutex so unrelated
 /// lookups and invalidation remain available; SDK snapshots retain their normal
 /// per-finder serialization. Returned vectors own copies of the descriptors.
+/// Dropping the cache destroys its native finder and releases its runtime
+/// handle synchronously on the dropping thread.
 ///
 /// ```no_run
 /// # use grafton_ndi::{Ndi, Finder, FinderOptions, SourceCache};
@@ -1256,14 +1260,14 @@ impl Display for Source {
 /// let ndi = Ndi::new()?;
 /// let finder = Finder::new(&ndi, &FinderOptions::new().groups("Studio")
 ///     .extra_ips("192.168.0.107"))?;
-/// let cache = SourceCache::new(&finder);
+/// let cache = SourceCache::new(finder);
 /// let feeds = cache.sources_by_host("192.168.0.107", Duration::from_secs(5))?;
 /// for feed in feeds { println!("{feed}"); }
 /// # Ok(())
 /// # }
 /// ```
-pub struct SourceCache<'finder> {
-    finder: &'finder Finder,
+pub struct SourceCache {
+    finder: Finder,
     entries: CachedSources,
 }
 
@@ -1292,14 +1296,44 @@ impl CacheState {
     }
 }
 
-impl<'finder> SourceCache<'finder> {
-    /// Create an empty cache bound to `finder` and its discovery configuration.
-    /// This allocates no source storage and makes no SDK call.
-    pub fn new(finder: &'finder Finder) -> Self {
+impl SourceCache {
+    /// Create an empty cache owning `finder` and its discovery configuration.
+    ///
+    /// This moves the finder without allocating, cloning or making an SDK call.
+    /// It keeps the finder alive and NDI initialized until the cache is dropped.
+    /// Share the cache through [`std::sync::Arc`] for long-lived server workers;
+    /// [`finder`](Self::finder) reaches the same finder for uncached lookups.
+    ///
+    /// ```no_run
+    /// use grafton_ndi::{Finder, FinderOptions, Ndi, Result, SourceCache};
+    /// use std::sync::Arc;
+    ///
+    /// struct ServerState {
+    ///     sources: SourceCache,
+    /// }
+    ///
+    /// fn server_state(ndi: &Ndi) -> Result<Arc<ServerState>> {
+    ///     let options = FinderOptions::new().groups("Studio");
+    ///     let finder = Finder::new(ndi, &options)?;
+    ///     Ok(Arc::new(ServerState {
+    ///         sources: SourceCache::new(finder),
+    ///     }))
+    /// }
+    /// ```
+    pub fn new(finder: Finder) -> Self {
         Self {
             finder,
             entries: CachedSources::default(),
         }
+    }
+
+    /// The configured finder, borrowed for uncached discovery and selection.
+    ///
+    /// This allocates nothing and makes no SDK call. The finder cannot be
+    /// replaced through this borrow, so cached entries retain their scope.
+    #[must_use]
+    pub fn finder(&self) -> &Finder {
+        &self.finder
     }
 
     /// All feeds observed on a complete hostname or IP within `timeout`.
@@ -1329,7 +1363,7 @@ impl<'finder> SourceCache<'finder> {
             let mut seen = HashSet::new();
             let mut discovered = Vec::new();
             let mut retained_bytes = 0;
-            self.finder.poll_until_deadline(timeout, |mut sources| {
+            self.finder().poll_until_deadline(timeout, |mut sources| {
                 sources.retain(|source| source.matches_query(query));
                 accumulate_sources(&mut discovered, &mut seen, &mut retained_bytes, sources)?;
                 Ok(None::<()>)
@@ -1465,6 +1499,20 @@ impl CachedSources {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_cache_moves_its_finder_without_allocating_or_recreating_it() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let finder = Finder::new(&ndi, &FinderOptions::new().groups("Studio")).unwrap();
+        let instance = finder.instance;
+        let (cache, allocations) = crate::test_alloc::allocation_count(|| SourceCache::new(finder));
+        assert_eq!(allocations, 0);
+        assert_eq!(cache.finder().instance, instance);
+        assert_eq!(cache.finder()._groups.as_deref(), Some(c"Studio"));
+        assert!(cache.is_empty());
+    }
 
     fn host_key(host: &str) -> HostKey {
         HostKeyBuffer::new(HostQuery::parse(host).unwrap()).into_owned()

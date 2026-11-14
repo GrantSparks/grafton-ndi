@@ -11,6 +11,18 @@ API, see the [README](README.md) and the migration guides for
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `SourceCache` owns its configured `Finder` and has no lifetime parameter.
+  Move it with `SourceCache::new(finder)` and use `cache.finder()` for uncached
+  queries. This permits direct storage in server state without extra ownership
+  allocations. See the [migration notes](docs/migration/unreleased.md).
+
+### Fixed
+
+- Contain consumer waker panics in async File API command, event and shutdown
+  notifications, preserving recording/playback and completing other waiters.
+
 ## [3.0.0] - 2026-11-13
 
 Version 3.0.0 loads the NDI library when the program selects a runtime instead

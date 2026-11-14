@@ -75,6 +75,11 @@ let jpeg = tokio::task::spawn_blocking(move || frame.encode_image(&options)).awa
 ```
 
 `ImageOptions` holds settings only, so one value serves any number of threads.
+For persistent snapshot services, store the owning `SourceCache` and other
+owning handles in [server state](usage.md#keep-discovery-in-server-state),
+then create capture views within each worker operation. Discovery and encoding
+both run synchronously; keep them on blocking workers and bound active and
+pending snapshot requests as described under [cost and memory](#cost-and-memory).
 
 ## Formats
 

@@ -254,6 +254,15 @@ fn operation<T>() -> (Reply<T>, FileOperation<T>) {
     )
 }
 
+/// Notify a consumer after committing state and releasing internal locks.
+/// A waker runs executor code: its panic must not stop a native owner, skip
+/// other replies during shutdown, or escape a reply's destructor on unwind.
+fn wake_waiter(waker: Option<Waker>) {
+    if let Some(waker) = waker {
+        let _ = catch_unwind(AssertUnwindSafe(|| waker.wake()));
+    }
+}
+
 fn deliver<T>(response: &Mutex<Response<T>>, value: Result<T>, replace: bool) {
     let wake = {
         let mut response = lock(response);
@@ -264,9 +273,7 @@ fn deliver<T>(response: &Mutex<Response<T>>, value: Result<T>, replace: bool) {
         response.completed = true;
         response.waker.take()
     };
-    if let Some(wake) = wake {
-        wake.wake();
-    }
+    wake_waiter(wake);
 }
 
 /// The error for an operation that did not run because its owner thread is
@@ -531,9 +538,7 @@ impl<E> EventQueue<E> {
             events.queue.push_back(value);
             events.waiter.as_ref().map(|w| w.waker.clone())
         };
-        if let Some(wake) = wake {
-            wake.wake();
-        }
+        wake_waiter(wake);
     }
 
     /// End every wait: nothing more will be pushed. Idempotent. `failed`
@@ -546,9 +551,7 @@ impl<E> EventQueue<E> {
             events.failed |= failed;
             events.waiter.take().map(|w| w.waker)
         };
-        if let Some(wake) = wake {
-            wake.wake();
-        }
+        wake_waiter(wake);
     }
 }
 
@@ -579,9 +582,7 @@ impl<E: Send> Expire for EventQueue<E> {
                 .filter(|w| w.token.ptr_eq(token) && w.deadline <= now)
                 .map(|w| w.waker.clone())
         };
-        if let Some(wake) = wake {
-            wake.wake();
-        }
+        wake_waiter(wake);
     }
 }
 
@@ -1655,6 +1656,21 @@ mod tests {
             self.1.notify_one();
         }
     }
+
+    struct PanickingWake(mpsc::Sender<()>);
+
+    impl Wake for PanickingWake {
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.send(());
+            panic!("consumer waker panicked");
+        }
+    }
+
+    fn panicking_waker() -> (Waker, Receiver<()>) {
+        let (called, calls) = mpsc::channel();
+        (Waker::from(Arc::new(PanickingWake(called))), calls)
+    }
+
     fn block_on<F: Future>(future: F) -> F::Output {
         let signal = Arc::new(Signal(Mutex::new(false), Condvar::new()));
         let waker = Waker::from(Arc::clone(&signal));
@@ -1716,6 +1732,206 @@ mod tests {
         ))
         .unwrap();
         (worker, rx)
+    }
+
+    /// Hold the owner until the test has registered its futures' wakers.
+    fn block_owner<H: Owner>(worker: &Worker<H>) -> (FileOperation<()>, Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocked = worker
+            .call(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+            .submit();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        (blocked, release_tx)
+    }
+
+    #[test]
+    fn a_panicking_creation_waker_does_not_destroy_the_returned_owner() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let mut creating = Box::pin(spawn_owner(
+            "file-test-create-wake",
+            move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(LocalOwner {
+                    created: thread::current().id(),
+                    dropped: dropped_tx,
+                    counter: 0,
+                    _not_send: Rc::new(()),
+                })
+            },
+            AsyncFileOptions::new(),
+            |worker| worker,
+        ));
+        let (waker, woken) = panicking_waker();
+        assert!(creating
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_tx.send(()).unwrap();
+        woken.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let worker = block_on(creating).unwrap();
+        let created = block_on(worker.call(|owner| Ok(owner.created))).unwrap();
+        assert!(dropped_rx.try_recv().is_err());
+        drop(worker);
+        assert_eq!(
+            dropped_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            created
+        );
+    }
+
+    #[test]
+    fn a_panicking_command_waker_does_not_stop_recording() {
+        let (device, recorder) = mock_recorder(Closing::AtStop);
+        let (blocked, release) = block_owner(&recorder.worker);
+        let (waker, woken) = panicking_waker();
+        let mut first = Box::pin(recorder.is_recording());
+        assert!(first
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        let queued = recorder.is_recording().submit();
+        release.send(()).unwrap();
+        block_on(blocked).unwrap();
+
+        assert!(block_on(queued).unwrap());
+        assert!(block_on(first).unwrap());
+        woken.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(woken.try_recv().is_err(), "the reply was notified twice");
+        assert_eq!(device.stops.load(Ordering::Acquire), 0);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 0);
+        block_on(recorder.close()).unwrap();
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        assert!(device.closed_before_destroy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_panicking_event_waker_does_not_stop_recording_or_lose_the_event() {
+        let (device, recorder) = mock_recorder(Closing::AtStop);
+        let started = block_on(recorder.next_event(Duration::from_secs(1)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(started.kind(), RecorderEventKind::Started);
+        let (waker, woken) = panicking_waker();
+        let mut event = Box::pin(recorder.next_event(Duration::from_secs(30)));
+        assert!(event
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+
+        device.push(mock::FIRST_FRAME, mock::TAKE);
+        woken.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(block_on(recorder.is_recording()).unwrap());
+        assert_eq!(
+            block_on(event).unwrap().unwrap().kind(),
+            RecorderEventKind::FirstFrame
+        );
+        assert_eq!(device.stops.load(Ordering::Acquire), 0);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 0);
+        block_on(recorder.close()).unwrap();
+        assert!(device.closed_before_destroy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn panicking_shutdown_wakers_do_not_skip_other_closes_or_recorder_cleanup() {
+        for event_panics in [false, true] {
+            let (device, recorder) = mock_recorder(Closing::AtStop);
+            block_on(recorder.next_event(Duration::from_secs(1)))
+                .unwrap()
+                .unwrap();
+            let (blocked, release) = block_owner(&recorder.worker);
+            let (event_waker, event_woken) = panicking_waker();
+            let event_waker = if event_panics {
+                event_waker
+            } else {
+                idle_waker()
+            };
+            let mut event = Box::pin(recorder.next_event(Duration::from_secs(30)));
+            assert!(event
+                .as_mut()
+                .poll(&mut Context::from_waker(&event_waker))
+                .is_pending());
+            let (close_waker, close_woken) = panicking_waker();
+            let mut first = Box::pin(recorder.close());
+            assert!(first
+                .as_mut()
+                .poll(&mut Context::from_waker(&close_waker))
+                .is_pending());
+            let mut second = Box::pin(recorder.close());
+            assert!(second
+                .as_mut()
+                .poll(&mut Context::from_waker(&idle_waker()))
+                .is_pending());
+            release.send(()).unwrap();
+            block_on(blocked).unwrap();
+
+            block_on(second).unwrap();
+            block_on(first).unwrap();
+            closed(block_on(event));
+            close_woken.recv_timeout(Duration::from_secs(1)).unwrap();
+            if event_panics {
+                event_woken.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+            assert_eq!(device.stops.load(Ordering::Acquire), 1);
+            assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+            assert!(device.closed_before_destroy.load(Ordering::Acquire));
+            // A failed notification must not misclassify a normal shutdown.
+            block_on(recorder.close()).unwrap();
+            closed(block_on(recorder.is_recording()));
+        }
+    }
+
+    #[test]
+    fn a_reply_can_wake_a_panicking_consumer_during_owner_unwind() {
+        let (worker, dropped) = local_worker();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut failing = Box::pin(worker.call(move |_| -> Result<()> {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            panic!("owner work panicked");
+        }));
+        let (waker, woken) = panicking_waker();
+        assert!(failing
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let queued = worker.call(|_| Ok(())).submit();
+        release_tx.send(()).unwrap();
+
+        owner_failed(block_on(queued));
+        owner_failed(block_on(failing));
+        woken.recv_timeout(Duration::from_secs(1)).unwrap();
+        dropped.recv_timeout(Duration::from_secs(1)).unwrap();
+        owner_failed(block_on(worker.control.request_close()));
+    }
+
+    #[test]
+    fn a_panicking_timeout_waker_does_not_stop_other_event_deadlines() {
+        let events = Arc::new(EventQueue::<u32>::new(1));
+        let (waker, woken) = panicking_waker();
+        let mut event = Box::pin(events.wait(Duration::from_millis(10)));
+        assert!(event
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        woken.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(block_on(event).unwrap(), None);
+        let other = Arc::new(EventQueue::<u32>::new(1));
+        assert_eq!(
+            block_on(other.wait(Duration::from_millis(10))).unwrap(),
+            None
+        );
     }
 
     #[test]

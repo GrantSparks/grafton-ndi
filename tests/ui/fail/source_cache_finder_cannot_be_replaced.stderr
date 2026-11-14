@@ -1,0 +1,5 @@
+error[E0594]: cannot assign to data in a `&` reference
+ --> tests/ui/fail/source_cache_finder_cannot_be_replaced.rs:4:5
+  |
+4 |     *cache.finder() = finder;
+  |     ^^^^^^^^^^^^^^^ cannot assign

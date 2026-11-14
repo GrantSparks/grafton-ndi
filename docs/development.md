@@ -39,6 +39,13 @@ separate receive, send, and FrameSync calculations.
 SDK routing and free strategies are private. New generic APIs should not expose
 raw handles or SDK structures merely to reuse an internal implementation.
 
+Long-lived adapters own their configured dependencies, as `SourceCache` owns
+its finder and `FrameSync` owns its receiver. They must be storable in service
+state without borrowing another field. Borrowed frame, capture, clock and
+control views express buffer lifetimes or exclusive operations; obtain them
+from the owning handle where they are used. Preserve those constraints in
+compile contracts rather than adding shared ownership to every view.
+
 ## Native functions and bindings
 
 Nothing outside `src/sys` converts an address into a function pointer or looks a

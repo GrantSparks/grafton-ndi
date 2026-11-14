@@ -11,7 +11,9 @@ fn finder_enforces_snapshot_and_whole_window_limits() {
     if let Ok(scenario) = std::env::var("GRAFTON_FAKE_FINDER_CASE") {
         let path = PathBuf::from(std::env::var_os("GRAFTON_FAKE_FINDER_RUNTIME").unwrap());
         let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(path)).unwrap();
-        let finder = Finder::new(&ndi, &FinderOptions::new()).unwrap();
+        let cache =
+            grafton_ndi::SourceCache::new(Finder::new(&ndi, &FinderOptions::new()).unwrap());
+        let finder = cache.finder();
         let limited = |result: grafton_ndi::Result<Vec<grafton_ndi::Source>>| {
             let (expected, maximum) = if scenario == "count" {
                 (ResourceKind::FinderSnapshotSources, 16_384)
@@ -43,7 +45,6 @@ fn finder_enforces_snapshot_and_whole_window_limits() {
                 finder.find_source(Duration::ZERO, |_| true),
                 Err(Error::ResourceLimit { .. })
             ));
-            let cache = grafton_ndi::SourceCache::new(&finder);
             limited(cache.sources_by_host("studio", Duration::ZERO));
             assert!(cache.is_empty());
         }

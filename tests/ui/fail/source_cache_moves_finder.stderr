@@ -1,0 +1,9 @@
+error[E0382]: borrow of moved value: `finder`
+ --> tests/ui/fail/source_cache_moves_finder.rs:5:13
+  |
+3 | fn moved(finder: Finder) {
+  |          ------ move occurs because `finder` has type `Finder`, which does not implement the `Copy` trait
+4 |     let _cache = SourceCache::new(finder);
+  |                                   ------ value moved here
+5 |     let _ = finder.current_sources();
+  |             ^^^^^^ value borrowed here after move

@@ -10,8 +10,97 @@ use grafton_ndi::{
 use std::{
     path::PathBuf,
     process::Command,
+    sync::Arc,
     time::{Duration, Instant},
 };
+
+#[test]
+fn owning_cache_retains_discovery_scope_and_runtime_across_server_workers() {
+    if std::env::var_os("GRAFTON_OWNED_CACHE_CHILD").is_some() {
+        let cache = {
+            let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(PathBuf::from(
+                std::env::var_os("GRAFTON_FAKE_FINDER_RUNTIME").unwrap(),
+            )))
+            .unwrap();
+            SourceCache::new(finder(&ndi, "Remote"))
+        };
+        assert!(Ndi::is_running(), "the cache keeps its runtime initialized");
+        let feeds = cache
+            .sources_by_host("studio", Duration::from_millis(80))
+            .unwrap();
+        assert_eq!(feeds.len(), 4);
+        assert!(feeds.iter().all(|feed| feed.matches_host("192.0.2.20")));
+        let selected = cache
+            .finder()
+            .find_source_by_name("STUDIO (Camera 2)", Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        assert!(feeds.contains(&selected));
+
+        let state = Arc::new(cache);
+        let worker = Arc::clone(&state);
+        drop(state);
+        std::thread::spawn(move || {
+            assert!(Ndi::is_running());
+            assert_eq!(
+                worker.sources_by_host("STUDIO.", Duration::ZERO).unwrap(),
+                feeds
+            );
+            worker.invalidate("studio");
+            assert!(worker.is_empty());
+            assert_eq!(
+                worker
+                    .sources_by_host("studio", Duration::ZERO)
+                    .unwrap()
+                    .len(),
+                4
+            );
+            worker.clear();
+            assert!(worker.is_empty());
+        })
+        .join()
+        .unwrap();
+        assert!(
+            !Ndi::is_running(),
+            "the last cache owner releases its runtime"
+        );
+        let calls =
+            std::fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap();
+        for operation in ["initialize", "finder-create", "finder-destroy", "destroy"] {
+            assert_eq!(
+                calls.lines().filter(|line| *line == operation).count(),
+                1,
+                "{calls}"
+            );
+        }
+        assert!(calls.find("finder-destroy").unwrap() < calls.rfind("destroy").unwrap());
+        return;
+    }
+    let directory = FixtureDir::create("owned-source-cache");
+    let library = directory.path().join("finder.so");
+    FakeRuntime::new()
+        .version("6.4.0.2")
+        .with("fake_finder")
+        .build(&library);
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "owning_cache_retains_discovery_scope_and_runtime_across_server_workers",
+            "--nocapture",
+        ])
+        .env("GRAFTON_OWNED_CACHE_CHILD", "1")
+        .env("GRAFTON_FAKE_FINDER_CASE", "selection-forward")
+        .env("GRAFTON_FAKE_FINDER_RUNTIME", &library)
+        .env("GRAFTON_FAKE_NDI_LOG", directory.path().join("calls.log"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 
 fn finder(ndi: &Ndi, group: &str) -> Finder {
     Finder::new(
@@ -93,7 +182,7 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
             .unwrap()
             .is_none());
         assert!(before.elapsed() >= Duration::from_millis(40));
-        let cache = SourceCache::new(&studio);
+        let cache = SourceCache::new(studio);
         let feeds = cache.sources_by_host("STUDIO", Duration::ZERO).unwrap();
         assert_eq!(
             feeds.len(),
@@ -118,8 +207,9 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
         cache.invalidate("sTuDiO.");
         assert!(cache.is_empty());
         let remote = finder(&ndi, "Remote");
-        let remote_cache = SourceCache::new(&remote);
-        let _ = remote
+        let remote_cache = SourceCache::new(remote);
+        let _ = remote_cache
+            .finder()
             .find_source_by_name("STUDIO (Camera 2)", Duration::from_secs(1))
             .unwrap()
             .unwrap();
@@ -136,7 +226,7 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
             .all(|feed| feed.matches_host("192.0.2.10")));
         // An initially incomplete host snapshot must enumerate the full window.
         let staggered = finder(&ndi, "Studio");
-        let staggered_cache = SourceCache::new(&staggered);
+        let staggered_cache = SourceCache::new(staggered);
         let started = Instant::now();
         let all = staggered_cache
             .sources_by_host("studio", Duration::from_millis(80))
@@ -145,7 +235,10 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
         assert_eq!(all.len(), 4);
         assert!(all.iter().any(|feed| feed == &selected));
         // A caller may deliberately request first match without implying host identity.
-        let _: Option<Source> = studio.find_source(Duration::ZERO, |_| true).unwrap();
+        let _: Option<Source> = cache
+            .finder()
+            .find_source(Duration::ZERO, |_| true)
+            .unwrap();
         return;
     }
     let directory = FixtureDir::create("finder-selection");

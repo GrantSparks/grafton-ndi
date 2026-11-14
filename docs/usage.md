@@ -51,14 +51,14 @@ typed `ResourceKind` identifying the scope and count/byte units. Match the enum
 to handle a budget limit; its displayed text is diagnostic. Malformed native
 descriptors and allocation failures remain separate errors.
 
-A host can publish several feeds. `SourceCache::new(&finder)` binds a cache to
-that finder's groups, IP hints and configuration. `sources_by_host` observes the
-full window and caches every distinct matching descriptor, leaving feed selection
-explicit:
+A host can publish several feeds. `SourceCache::new(finder)` moves a finder into
+a cache bound to that finder's groups, IP hints and configuration.
+`sources_by_host` observes the full window and caches every distinct matching
+descriptor, leaving feed selection explicit:
 
 ```rust
 use grafton_ndi::SourceCache;
-let cache = SourceCache::new(&finder);
+let cache = SourceCache::new(finder);
 let feeds = cache.sources_by_host("192.168.1.100", Duration::from_secs(5))?;
 for feed in feeds { println!("{feed}"); }
 ```
@@ -69,6 +69,44 @@ creates another finder or changes scope. Cache hits return owned descriptor
 copies; misses use the same bounded allocations and snapshot-lock wait budget as
 full-window enumeration. Cache access and descriptor copies can briefly serialize
 on the cache mutex; this time is outside a miss's discovery observation window.
+
+### Keep discovery in server state
+
+`SourceCache` owns its finder and keeps its NDI runtime initialized. It needs no
+lifetime parameter or separately stored finder. Construct it once with the
+server's discovery configuration and share the state through `Arc`:
+
+```rust
+use grafton_ndi::{Finder, FinderOptions, Ndi, Result, SourceCache};
+use std::sync::Arc;
+
+struct ServerState {
+    sources: SourceCache,
+}
+
+fn server_state(ndi: &Ndi, options: &FinderOptions) -> Result<Arc<ServerState>> {
+    Ok(Arc::new(ServerState {
+        sources: SourceCache::new(Finder::new(ndi, options)?),
+    }))
+}
+```
+
+Use `state.sources.finder()` for uncached discovery or selection on that same
+finder. The accessor is read-only, so the cached discovery scope cannot be
+replaced. Share the cache itself rather than constructing a cache per request;
+apply the invalidation policy above when sources change.
+
+The same ownership pattern applies to receivers, senders, converters,
+synchronizers and File API handles: store the owning handle in service state or
+its worker. Create capture and control views while handling an operation, and
+keep borrowed frames within their owner's lifetime. Async receiver and File API
+adapters own their underlying resources; their futures' cancellation and
+threading contracts still apply. FrameSync and AVSync own their receivers,
+while their split views and Genlock clocks retain the borrows that prevent
+resource replacement or conflicting operations. Retain owned frames or encoded
+bytes between requests; `copy_into` reuses owned frame storage when a copy is
+needed. See [async receiving](#integrate-with-async-runtimes)
+and [File API threading](file-io.md#threads-and-async-code).
 
 ## Receive streams
 
