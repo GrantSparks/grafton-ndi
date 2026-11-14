@@ -2443,6 +2443,45 @@ mod tests {
     }
 
     #[test]
+    fn copied_async_sends_reuse_metadata_across_absent_and_empty_frames() {
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
+        let pixels = vec![128; 16 * 16 * 4];
+        let absent = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
+            .build()
+            .unwrap();
+        let empty = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
+            .metadata(c"")
+            .build()
+            .unwrap();
+        let present = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
+            .metadata(c"<metadata/>")
+            .build()
+            .unwrap();
+        sender.send_video_async_copy(&present).unwrap();
+        sender.send_video_async_copy(&present).unwrap();
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            for _ in 0..4 {
+                for (source, expected) in [
+                    (&absent, None),
+                    (&empty, Some("")),
+                    (&present, Some("<metadata/>")),
+                ] {
+                    sender.send_video_async_copy(source).unwrap();
+                    let state = sender.native.video.state.lock().unwrap();
+                    assert_eq!(state.in_flight.frame().unwrap().metadata(), expected);
+                }
+            }
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(
+            sender.finish_video_async().unwrap().metadata(),
+            Some("<metadata/>")
+        );
+    }
+
+    #[test]
     fn copied_async_storage_grows_once_per_buffer_then_reuses_capacity() {
         let Some(mut sender) = test_sender() else {
             return;
