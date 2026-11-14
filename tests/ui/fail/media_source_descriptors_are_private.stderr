@@ -17,8 +17,8 @@ error[E0624]: method `video_descriptor` is private
   |
  ::: src/frames.rs
   |
-  |     fn video_descriptor(&self) -> NDIlib_video_frame_v2_t {
-  |     ----------------------------------------------------- private method defined here
+  |     fn video_descriptor(&self, authorized: SendableVideoLayout) -> NDIlib_video_frame_v2_t {
+  |     -------------------------------------------------------------------------------------- private method defined here
 
 error[E0624]: method `samples` is private
  --> tests/ui/fail/media_source_descriptors_are_private.rs:9:19
