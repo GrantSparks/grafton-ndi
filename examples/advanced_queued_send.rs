@@ -16,11 +16,11 @@ use std::{
 
 use grafton_ndi::{
     advanced::{QueueOptions, QueuedSender, QueuedVideoFrame},
-    Error, Ndi, SenderOptions, VideoFrame,
+    Error, Ndi, RuntimeOptions, SdkEdition, SenderOptions, VideoFrame,
 };
 
 fn main() -> Result<(), Error> {
-    let ndi = Ndi::new()?;
+    let ndi = Ndi::with_options(&RuntimeOptions::new().edition(SdkEdition::Advanced))?;
     let mut sender = QueuedSender::new(
         &ndi,
         // Completion-based sends are paced by the application below.
@@ -59,5 +59,7 @@ fn main() -> Result<(), Error> {
         next_tick = next_tick.max(Instant::now());
     }
     println!("{} frames still queued at exit", sender.retained_frames());
+    // Drop waits for native completion before freeing any retained frame.
+    drop(sender);
     Ok(())
 }

@@ -18,13 +18,16 @@
 //! * A receiver cannot connect to `player.advertised_source()` as it is: it
 //!   has no address. A [`Finder`] in the player's groups lists the source
 //!   with one.
-//! * A `Lowest`-bandwidth receiver, as `ReceiverOptions::snapshot_preset`
-//!   makes, gets video only from a recording with a proxy track. A
-//!   full-bandwidth receiver and [`Downscale::Quarter`] work for every
-//!   recording.
+//! * This example requires exactly one video track. With program and proxy
+//!   tracks, the 6.4 File player can report a `FirstFrame` timecode that does
+//!   not arrive at the full-bandwidth receiver. Record with
+//!   `RecorderOptions::proxy(false)`, as `file_record` does. A full-bandwidth
+//!   receiver and [`Downscale::Quarter`] need no recorded proxy.
 //! * After a seek the receiver first delivers the frames it had queued. The
 //!   `FirstFrame` event carries the source timecode of the frame the seek
-//!   landed on, so frames are discarded until one carries it.
+//!   landed on, so frames are discarded until one carries it. Video and
+//!   events are drained together; playback pauses at that event while the
+//!   receiver catches up and the image is encoded.
 //!
 //! The File library ships with the NDI SDK, beside the runtime library. On
 //! Linux, macOS and Android it needs the Advanced SDK runtime.
@@ -36,8 +39,8 @@ use std::{
 
 use grafton_ndi::{
     file::{FileApi, FilePlayer, FilePosition, FileRuntimeOptions, PlayerEventKind, PlayerOptions},
-    Downscale, Finder, FinderOptions, ImageFormat, ImageOptions, Ndi, Receiver, ReceiverOptions,
-    Timecode,
+    Downscale, Finder, FinderOptions, ImageFormat, ImageOptions, ImageWorkspace, Ndi, Receiver,
+    ReceiverOptions, VideoFrameRef,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -58,7 +61,14 @@ fn main() -> Result<()> {
 
     let ndi = Ndi::new()?;
     let file = FileApi::open(&ndi, &FileRuntimeOptions::default())?;
-    let length = file.probe(&recording)?.duration().value().duration();
+    let info = file.probe(&recording)?;
+    if info.video_track_count() != 1 {
+        return Err(
+            "thumbnails require exactly one video track; record with RecorderOptions::proxy(false)"
+                .into(),
+        );
+    }
+    let length = info.duration().value().duration();
 
     // A group of its own keeps the player's source off every other
     // receiver's list.
@@ -75,29 +85,34 @@ fn main() -> Result<()> {
         .ok_or_else(|| format!("the player's source {name} was not listed"))?;
     let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
     let options = ImageOptions::new(ImageFormat::Jpeg(85)).downscale(Downscale::Quarter);
+    let mut workspace = ImageWorkspace::new();
+    let mut encoded = Vec::new();
 
+    // The initial frame can be sent before a new receiver has connected.
+    // Establish the connection before starting the recording's timeline.
+    let connected_by = Instant::now() + PATIENCE;
+    while !receiver.is_connected() {
+        if Instant::now() >= connected_by {
+            return Err("the thumbnail receiver did not connect".into());
+        }
+        receiver.poll_event(Duration::from_millis(50))?;
+    }
     player.start(&recording)?;
-    first_frame_timecode(&mut player)?;
     for i in 0..count {
         let position = length * i / count;
-        player.seek(FilePosition::from_duration(position)?)?;
-        let wanted = first_frame_timecode(&mut player)?;
-        let deadline = Instant::now() + PATIENCE;
-        let frame = loop {
-            if Instant::now() > deadline {
-                return Err(format!("no frame of the seek to {position:?} arrived").into());
-            }
-            let Some(frame) = receiver.video().capture_ref(Duration::from_secs(1))? else {
-                continue;
-            };
-            // Without a timecode the SDK cannot say which frame is the
-            // target, and the first one to arrive is taken.
-            if wanted.is_none_or(|wanted| frame.timecode() == wanted) {
-                break frame;
-            }
-        };
+        // Start already positioned the player at zero; reuse that first frame.
+        if i != 0 {
+            player.seek(FilePosition::from_duration(position)?)?;
+            player.set_paused(false);
+        }
+        let frame = first_frame(&mut player, &receiver)
+            .map_err(|error| format!("thumbnail at {position:?}: {error}"))?;
         let path = format!("thumb_{i:03}.jpg");
-        std::fs::write(&path, frame.encode_image(&options)?)?;
+        // Retain conversion scratch and output capacity between thumbnails.
+        // Finish encoding before creating the output file.
+        encoded.clear();
+        workspace.encode_to(&frame, &options, &mut encoded)?;
+        std::fs::write(&path, &encoded)?;
         println!(
             "{path}: {:.2} s, {}x{} reduced to a quarter",
             position.as_secs_f64(),
@@ -108,14 +123,23 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Wait for the player's next `FirstFrame` event, and return the source
-/// timecode of the frame it shows, when the SDK knows it.
-fn first_frame_timecode(player: &mut FilePlayer) -> Result<Option<Timecode>> {
+/// Drain video while awaiting the player's event, then match its timecode.
+/// Waiting only on events can fill the receive queue and lose the target frame.
+fn first_frame<'a>(player: &mut FilePlayer, receiver: &'a Receiver) -> Result<VideoFrameRef<'a>> {
     let deadline = Instant::now() + PATIENCE;
+    let mut first_frame = None;
     while Instant::now() < deadline {
-        if let Some(event) = player.poll_event(Duration::from_millis(100))? {
+        let frame = receiver.video().capture_ref(Duration::from_millis(10))?;
+        // Read events after capture so a first-frame event queued during that
+        // capture can identify this frame before it is released.
+        while let Some(event) = player.poll_event(Duration::ZERO)? {
             match event.kind() {
-                PlayerEventKind::FirstFrame => return Ok(event.source_timecode()),
+                PlayerEventKind::FirstFrame => {
+                    // Keep playback from outrunning capture/encoding and
+                    // discarding the seek target from the receiver's queue.
+                    player.set_paused(true);
+                    first_frame = Some(event);
+                }
                 PlayerEventKind::Error => {
                     return Err(
                         format!("playback failed: {}", event.message().to_string_lossy()).into(),
@@ -124,6 +148,15 @@ fn first_frame_timecode(player: &mut FilePlayer) -> Result<Option<Timecode>> {
                 _ => {}
             }
         }
+        if let (Some(frame), Some(event)) = (frame, first_frame.as_ref()) {
+            // Without a preserved timecode, take the first available frame.
+            if event
+                .source_timecode()
+                .is_none_or(|wanted| frame.timecode() == wanted)
+            {
+                return Ok(frame);
+            }
+        }
     }
-    Err("the player reported no first frame".into())
+    Err("the player's first frame was not received within ten seconds".into())
 }

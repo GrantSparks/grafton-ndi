@@ -138,7 +138,16 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   applications must still account for filesystem races and native search-path
   trust. See [File requirements](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/file-io.md#requirements).
 - Async File command, event and shutdown notification paths contain consumer
-  waker panics so other waiters and recording/playback can continue.
+  waker panics so other waiters and recording/playback can continue. Executor
+  wakers are cloned, notified and released outside internal locks, preventing
+  reentrant cleanup from deadlocking polling, cancellation or shutdown.
+- Examples select the required Advanced runtime, stop the reception monitor
+  on capture errors, align KVM audio blocks with the output cadence and reuse
+  thumbnail conversion/output buffers. The recording example checks write
+  failures, empty files and unexpected SDK stops before reporting success. It
+  disables proxy recording to match the thumbnail example's one-video-track
+  requirement; thumbnails drain video and events together and pause playback
+  while encoding to avoid overrunning capture.
 - The release also includes the fixes already shipped in
   [2.1.0](#210---2026-11-13), including bounded SDK text handling, finite wait
   conversion, reconnect-friendly status polling and NV12 stride validation.

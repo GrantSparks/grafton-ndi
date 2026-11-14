@@ -18,6 +18,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+// End the scoped worker on success, error or unwind, without a channel or
+// heap allocation. The guard must live inside the scope, before its join.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let source = args
@@ -38,16 +48,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let framesync = FrameSync::new(receiver).map_err(Error::from)?;
     let request = FrameSyncAudioRequest::capture_at(48_000, 1, 480)?;
     let stopped = AtomicBool::new(false);
-
-    thread::scope(|scope| {
-        scope.spawn(|| {
+    thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+        let monitor = scope.spawn(|| -> grafton_ndi::Result<()> {
             let mut monitor = ReceptionMonitor::new(Duration::from_millis(grace_ms));
             let mut previous = None;
             while !stopped.load(Ordering::Relaxed) {
                 if framesync
                     .receiver()
-                    .poll_source_name_change(Duration::ZERO)
-                    .unwrap()
+                    .poll_source_name_change(Duration::ZERO)?
                     .is_some()
                 {
                     monitor.reset();
@@ -65,12 +73,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Drops and expected throughput are separate quality checks.
                 thread::sleep(Duration::from_millis(100));
             }
+            Ok(())
         });
+        let stop = StopOnDrop(&stopped);
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             let tick = Instant::now();
             // Fixed mono output remains usable even when no input arrives.
-            let audio = framesync.capture_audio_ref(request).unwrap();
+            let audio = framesync.capture_audio_ref(request)?;
             assert_eq!(
                 (
                     audio.sample_rate(),
@@ -79,9 +89,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 (48_000, 1, 480)
             );
+            drop(audio);
             thread::sleep(Duration::from_millis(10).saturating_sub(tick.elapsed()));
         }
-        stopped.store(true, Ordering::Relaxed);
-    });
+        drop(stop);
+        monitor.join().map_err(|_| "reception monitor panicked")??;
+        Ok(())
+    })?;
     Ok(())
 }

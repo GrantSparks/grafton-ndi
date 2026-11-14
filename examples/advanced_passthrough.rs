@@ -23,7 +23,7 @@ use grafton_ndi::{
         CompressedSender, PacketItem, PacketReceiver, PassthroughPreset, ReceivedAudio,
         ReceivedVideo,
     },
-    Error, Ndi, ReceiverOptions, SenderOptions, Tally,
+    Error, Ndi, ReceiverOptions, RuntimeOptions, SdkEdition, SenderOptions, Tally,
 };
 
 #[path = "common/finder.rs"]
@@ -35,7 +35,7 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
 
-    let ndi = Ndi::new()?;
+    let ndi = Ndi::with_options(&RuntimeOptions::new().edition(SdkEdition::Advanced))?;
     let finder = finder_with_extra_ips(&ndi, &extra_ips)?;
     let Some(source) = finder
         .find_sources(Duration::from_secs(5))?

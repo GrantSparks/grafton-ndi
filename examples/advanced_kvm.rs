@@ -12,11 +12,14 @@
 //! Optional arguments:
 //! - IP address to search: `cargo run --features advanced --example advanced_kvm -- 192.168.0.110`
 
-use std::{env, thread, time::Duration};
+use std::{
+    env, thread,
+    time::{Duration, Instant},
+};
 
 use grafton_ndi::{
     advanced::MouseButton, Error, FrameSync, FrameSyncAudioRequest, Ndi, Receiver, ReceiverOptions,
-    ScanType,
+    RuntimeOptions, ScanType, SdkEdition,
 };
 
 #[path = "common/finder.rs"]
@@ -28,7 +31,7 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
 
-    let ndi = Ndi::new()?;
+    let ndi = Ndi::with_options(&RuntimeOptions::new().edition(SdkEdition::Advanced))?;
     let finder = finder_with_extra_ips(&ndi, &extra_ips)?;
     let Some(source) = finder
         .find_sources(Duration::from_secs(5))?
@@ -54,10 +57,13 @@ fn main() -> Result<(), Error> {
 
     // Drag from the left of the source's screen to the right. The button
     // stays down while the independent capture view samples clocked output.
-    let audio_request = FrameSyncAudioRequest::capture_at(48_000, 2, 480)?;
+    // This demonstration samples output every 100 ms: 4,800 samples at 48 kHz.
+    // Real playback should use the audio device's clock and block size.
+    let audio_request = FrameSyncAudioRequest::capture_at(48_000, 2, 4_800)?;
     session.move_pointer(0.25, 0.5)?;
     session.mouse_down(MouseButton::Left)?;
     for step in 1..=5u8 {
+        let tick = Instant::now();
         // The frame stays borrowed from the receiver while input is sent.
         let frame = capture.capture_video_ref(ScanType::Progressive)?;
         let audio = capture.capture_audio_ref(audio_request)?;
@@ -66,13 +72,13 @@ fn main() -> Result<(), Error> {
         }
         session.move_pointer(0.25 + 0.1 * f32::from(step), 0.5)?;
         println!("{} synchronized audio samples", audio.num_samples());
-        thread::sleep(Duration::from_millis(100));
+        drop(audio);
+        drop(frame);
+        thread::sleep(Duration::from_millis(100).saturating_sub(tick.elapsed()));
     }
     session.mouse_up(MouseButton::Left)?;
 
-    match session.release_all() {
-        Ok(()) => println!("Dragged, and nothing is left pressed"),
-        Err(error) => println!("Something may still be pressed: {error}"),
-    }
+    session.release_all()?;
+    println!("Dragged, and nothing is left pressed");
     Ok(())
 }

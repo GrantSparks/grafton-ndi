@@ -3,7 +3,7 @@
 //! Run: cargo run --example mixed_media_relay -- "HOST (Camera)" "Relay"
 //! Input is the complete source name; stop with Ctrl-C. Synchronous media
 //! sends borrow their capture guard, with reusable video staging where the
-//! SDK requires initialized padding/tail. Metadata is copied to an owned frame.
+//! SDK requires initialized padding/tail. Metadata is forwarded from its borrow.
 use grafton_ndi::{
     Error, Ndi, Receiver, ReceiverItemRef, ReceiverOptions, Sender, SenderOptions, Source,
 };

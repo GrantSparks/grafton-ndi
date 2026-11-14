@@ -14,11 +14,19 @@ cargo clippy --locked --examples --all-features -- -D warnings
 Compilation does not prove that a runtime supplies an optional capability. To
 exercise the Advanced examples, set `NDI_SDK_DIR` to the Advanced SDK before
 building and `NDI_RUNTIME_DIR_V6` to its runtime directory before running.
+The Advanced examples explicitly select `SdkEdition::Advanced`, so an
+incompatible runtime fails at initialization.
 
 Start a source producing the required media before running a receiving example.
 For IP hints, source selection and output options, follow that example's usage.
 PTZ/KVM examples also need a source that offers those controls. The
 [usage guide](../docs/usage.md) explains capture ownership and buffer reuse.
+
+These examples use the current 3.0 APIs: borrowed `_ref` captures for immediate
+processing, validated `FrameSyncAudioRequest` values, reusable send buffers and
+explicit completion for async sends and recordings. Software output timers are
+demonstrations; use the output device's clock for playback. See the
+[migration guide](../docs/migration/2.0-to-3.0.md) when adapting older code.
 
 ## Discovery and monitoring
 
@@ -76,6 +84,6 @@ See [File API requirements](../docs/file-io.md) for the `file-io` feature and ru
 
 | Example | Command | What it shows |
 | --- | --- | --- |
-| [`file_record.rs`](file_record.rs) | `cargo run --example file_record --features file-io -- "MACHINE (Source)" take 10` | Record a source to disk and wait for the file to be finalized. |
+| [`file_record.rs`](file_record.rs) | `cargo run --example file_record --features file-io -- "MACHINE (Source)" take 10` | Record without a proxy track, wait for finalization and check the session report. |
 | [`file_play.rs`](file_play.rs) | `cargo run --example file_play --features file-io -- take_001.mkv "Replay"` | Play a recording back as an NDI source. |
-| [`file_thumbnails.rs`](file_thumbnails.rs) | `cargo run --example file_thumbnails --features file-io,image-encoding -- take_001.mkv 8` | Seek through a recording and write a quarter-size JPEG thumbnail at each position. |
+| [`file_thumbnails.rs`](file_thumbnails.rs) | `cargo run --example file_thumbnails --features file-io,image-encoding -- take_001.mkv 8` | Seek through a recording with one video track and write quarter-size JPEGs with reusable conversion and output buffers. |

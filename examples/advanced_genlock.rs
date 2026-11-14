@@ -16,7 +16,7 @@ use std::{env, time::Duration};
 
 use grafton_ndi::{
     advanced::{ClockSource, Genlock},
-    Error, FrameRate, Ndi, ScanType, Sender, SenderOptions, VideoFrame,
+    Error, FrameRate, Ndi, RuntimeOptions, ScanType, SdkEdition, Sender, SenderOptions, VideoFrame,
 };
 
 #[path = "common/finder.rs"]
@@ -28,7 +28,7 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
 
-    let ndi = Ndi::new()?;
+    let ndi = Ndi::with_options(&RuntimeOptions::new().edition(SdkEdition::Advanced))?;
     let finder = finder_with_extra_ips(&ndi, &extra_ips)?;
     let reference = finder
         .find_sources(Duration::from_secs(5))?

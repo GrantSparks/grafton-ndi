@@ -197,15 +197,30 @@ impl<T> Future for FileOperation<T> {
         let this = self.get_mut();
         assert!(!this.consumed, "a completed FileOperation was polled again");
         this.start();
-        let value = {
+        let mut incoming = None;
+        let (value, retired) = loop {
             let mut response = lock(&this.response);
             if let Some(value) = response.value.take() {
-                Some(value)
-            } else {
-                response.waker = Some(cx.waker().clone());
-                None
+                break (Some(value), response.waker.take());
             }
+            if response
+                .waker
+                .as_ref()
+                .is_some_and(|waker| waker.will_wake(cx.waker()))
+            {
+                break (None, None);
+            }
+            if let Some(waker) = incoming.take() {
+                break (None, response.waker.replace(waker));
+            }
+            // Cloning and dropping a Waker both run executor code. Recheck
+            // readiness after cloning outside the lock, so a concurrent reply
+            // cannot be missed. Ready/same-waker polls need no clone.
+            drop(response);
+            incoming = Some(cx.waker().clone());
         };
+        discard_waker(retired);
+        discard_waker(incoming);
         if let Some(value) = value {
             this.consumed = true;
             Poll::Ready(value)
@@ -218,6 +233,11 @@ impl<T> Future for FileOperation<T> {
 impl<T> Drop for FileOperation<T> {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
+        // A queued reply may outlive this future, including a cancelled close
+        // pruned under Control::closing. Remove executor state before releasing
+        // our response ownership, and run its destructor without either lock.
+        let waker = lock(&self.response).waker.take();
+        discard_waker(waker);
     }
 }
 
@@ -261,6 +281,11 @@ fn wake_waiter(waker: Option<Waker>) {
     if let Some(waker) = waker {
         let _ = catch_unwind(AssertUnwindSafe(|| waker.wake()));
     }
+}
+
+/// Release executor state outside internal locks, including during unwinding.
+fn discard_waker(waker: Option<Waker>) {
+    let _ = catch_unwind(AssertUnwindSafe(|| drop(waker)));
 }
 
 fn deliver<T>(response: &Mutex<Response<T>>, value: Result<T>, replace: bool) {
@@ -501,7 +526,9 @@ impl DeadlineTimer {
 struct EventWaiter {
     token: Weak<()>,
     deadline: Instant,
-    waker: Waker,
+    // Taken on notification, then rearmed by polling. The token still reserves
+    // the one waiter while its task is scheduled; bursts need only one wake.
+    waker: Option<Waker>,
 }
 
 struct Events<E> {
@@ -536,7 +563,7 @@ impl<E> EventQueue<E> {
                 events.dropped = events.dropped.saturating_add(1);
             }
             events.queue.push_back(value);
-            events.waiter.as_ref().map(|w| w.waker.clone())
+            events.waiter.as_mut().and_then(|w| w.waker.take())
         };
         wake_waiter(wake);
     }
@@ -549,7 +576,7 @@ impl<E> EventQueue<E> {
             let mut events = lock(&self.0);
             events.closed = true;
             events.failed |= failed;
-            events.waiter.take().map(|w| w.waker)
+            events.waiter.take().and_then(|w| w.waker)
         };
         wake_waiter(wake);
     }
@@ -575,12 +602,12 @@ impl<E: Send + 'static> EventQueue<E> {
 impl<E: Send> Expire for EventQueue<E> {
     fn expire(&self, token: &Weak<()>, now: Instant) {
         let wake = {
-            let events = lock(&self.0);
+            let mut events = lock(&self.0);
             events
                 .waiter
-                .as_ref()
+                .as_mut()
                 .filter(|w| w.token.ptr_eq(token) && w.deadline <= now)
-                .map(|w| w.waker.clone())
+                .and_then(|w| w.waker.take())
         };
         wake_waiter(wake);
     }
@@ -636,8 +663,9 @@ impl<E> FileEventFuture<E> {
         Poll::Ready(value)
     }
 
-    /// Stop being the queue's waiter, if this future is.
-    fn release_waiter(&self) {
+    /// Stop being the queue's waiter and return executor state for disposal
+    /// after unlocking. Another future's waiter is never removed.
+    fn release_waiter(&self) -> Option<Waker> {
         let token = Arc::downgrade(&self.token);
         let mut events = lock(&self.events.0);
         if events
@@ -645,7 +673,9 @@ impl<E> FileEventFuture<E> {
             .as_ref()
             .is_some_and(|w| w.token.ptr_eq(&token))
         {
-            events.waiter = None;
+            events.waiter.take().and_then(|w| w.waker)
+        } else {
+            None
         }
     }
 }
@@ -669,35 +699,54 @@ impl<E> Future for FileEventFuture<E> {
             },
         };
         let token = Arc::downgrade(&this.token);
-        let ready = {
+        let mut incoming = None;
+        let (ready, retired) = loop {
             let mut events = lock(&this.events.0);
             if events
                 .waiter
                 .as_ref()
                 .is_some_and(|w| w.token.strong_count() != 0 && !w.token.ptr_eq(&token))
             {
-                Some(Err(Error::InvalidState(StateError::WaiterPending)))
-            } else {
-                let ready = if let Some(event) = events.queue.pop_front() {
-                    Some(event.map(Some))
-                } else if events.closed {
-                    Some(Err(stopped(events.failed)))
-                } else if deadline.is_expired() {
-                    Some(Ok(None))
-                } else {
-                    None
-                };
-                events.waiter = match ready {
-                    Some(_) => None,
-                    None => Some(EventWaiter {
-                        token: Weak::clone(&token),
-                        deadline: deadline.end(),
-                        waker: cx.waker().clone(),
-                    }),
-                };
-                ready
+                break (
+                    Some(Err(Error::InvalidState(StateError::WaiterPending))),
+                    None,
+                );
             }
+            let ready = if let Some(event) = events.queue.pop_front() {
+                Some(event.map(Some))
+            } else if events.closed {
+                Some(Err(stopped(events.failed)))
+            } else if deadline.is_expired() {
+                Some(Ok(None))
+            } else {
+                None
+            };
+            if ready.is_some() {
+                break (ready, events.waiter.take().and_then(|w| w.waker));
+            }
+            if events
+                .waiter
+                .as_ref()
+                .and_then(|w| w.waker.as_ref())
+                .is_some_and(|waker| waker.will_wake(cx.waker()))
+            {
+                break (None, None);
+            }
+            if let Some(waker) = incoming.take() {
+                let retired = events.waiter.replace(EventWaiter {
+                    token: Weak::clone(&token),
+                    deadline: deadline.end(),
+                    waker: Some(waker),
+                });
+                break (None, retired.and_then(|w| w.waker));
+            }
+            // The clone may reenter the queue or race delivery, closure or a
+            // competing waiter. Recheck all of those before registering it.
+            drop(events);
+            incoming = Some(cx.waker().clone());
         };
+        discard_waker(retired);
+        discard_waker(incoming);
         if let Some(value) = ready {
             return this.complete(value);
         }
@@ -708,7 +757,7 @@ impl<E> Future for FileEventFuture<E> {
             match TIMER.register(deadline.end(), Weak::clone(&this.expiry), token) {
                 Ok(key) => this.timer = Some(key),
                 Err(error) => {
-                    this.release_waiter();
+                    discard_waker(this.release_waiter());
                     return this.complete(Err(Error::Io(error)));
                 }
             }
@@ -719,10 +768,11 @@ impl<E> Future for FileEventFuture<E> {
 
 impl<E> Drop for FileEventFuture<E> {
     fn drop(&mut self) {
-        self.release_waiter();
+        let waker = self.release_waiter();
         if let Some(key) = self.timer.take() {
             TIMER.cancel(key);
         }
+        discard_waker(waker);
     }
 }
 
@@ -1665,6 +1715,9 @@ impl AsyncFileRecorder {
         self.worker.control.request_close()
     }
 }
+
+#[cfg(test)]
+mod waker_tests;
 
 #[cfg(test)]
 mod tests {

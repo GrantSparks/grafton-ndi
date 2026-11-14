@@ -132,8 +132,16 @@ lists the complete option rules.
 
 The [`file_thumbnails` example](../examples/file_thumbnails.rs) plays a recording
 into a private NDI group, seeks to spaced positions and writes quarter-size
-JPEGs. After each seek it waits for a frame matching the player's `FirstFrame`
-timecode when the SDK provides one; otherwise it takes the next frame:
+JPEGs. It requires exactly one video track: with program and proxy tracks, the
+6.4 File player's `FirstFrame` timecode can fail to match the received video.
+The [`file_record` example](../examples/file_record.rs) uses
+`RecorderOptions::proxy(false)` to produce suitable recordings.
+
+The receiver connects before playback starts. Video and events are drained
+together; playback pauses at `FirstFrame` while the receiver catches up and
+encoding completes. The example matches the event's timecode when the SDK
+provides one; otherwise it takes the next available frame. Conversion scratch
+and encoded-output capacity are reused:
 
 ```sh
 cargo run --example file_thumbnails --features file-io,image-encoding -- take_001.mkv 8

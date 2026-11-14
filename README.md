@@ -16,6 +16,16 @@ raw capture exposes incoming frames and their timing. The native SDK performs th
 network and codec work. Applications still need to choose their buffering,
 threading and backpressure policies.
 
+## Supported SDKs and platforms
+
+- **NDI SDKs:** 6.1.1 Standard; 6.3.2 and 6.4.0.2 Standard and Advanced.
+- **Platforms:** Linux (glibc), Windows (MSVC), macOS, Android, iOS, tvOS and visionOS.
+
+Runtime coverage varies by version and architecture. Android and Linux ARMv7
+have compile checks; Apple mobile targets have static build checks. See the
+[support matrix](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/setup.md#supported-ndi-versions-and-platforms)
+for supported architectures and requirements.
+
 ## Install
 
 ```toml

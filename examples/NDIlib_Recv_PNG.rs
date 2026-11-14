@@ -9,7 +9,7 @@
 //!
 //! 1. Using `receiver.video().capture_ref()` for reliable frame capture with
 //!    automatic retry logic (handles NDI SDK timeout quirks internally)
-//! 2. `ReceiverVideoFrameRef::encode_png()` for crate-provided image conversion, which
+//! 2. `VideoFrameRef::encode_png()` for crate-provided image conversion, which
 //!    handles RGBX/BGRX padding bytes and padded rows
 //!
 //! Run with: `cargo run --features image-encoding --example NDIlib_Recv_PNG`

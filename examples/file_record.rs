@@ -17,9 +17,9 @@
 //! such as `192.168.1.20:5961`, is taken as an address instead of a name, which
 //! records it without discovering it first.
 //!
-//! With the default options the recorder waits a few seconds at start-up for
-//! the source's low-bandwidth proxy stream, so a very short recording can be
-//! empty; `RecorderOptions::proxy(false)` starts at once.
+//! Records the program stream with `RecorderOptions::proxy(false)`. This
+//! avoids waiting for an optional proxy stream at startup and produces the
+//! single-video-track input supported by the `file_thumbnails` example.
 //!
 //! The File library ships with the NDI SDK, beside the runtime library. On
 //! Linux and macOS it needs the Advanced SDK runtime.
@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         SourceSpec::from_url(&source)?
     };
-    let mut recorder = file.create_recorder(&RecorderOptions::new(spec))?;
+    let mut recorder = file.create_recorder(&RecorderOptions::new(spec).proxy(false))?;
     recorder.start(&RecordingTarget::new(&prefix)?, RecordingTimecode::Preserve)?;
     println!("Recording {source} for {seconds} s...");
 
@@ -119,23 +119,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // A recording is complete only when the SDK reports its last file closed.
+    // Closure alone does not prove a usable recording. Check the session's
+    // separate error, write-failure and empty-file counters as well.
     match recorder.finish(Duration::from_secs(10))? {
         FinishStatus::Closed(report) => {
-            println!(
-                "Finalized {} file(s); {} error event(s) during the session.",
-                report.closed_files(),
-                report.error_events()
-            );
-            if report.error_events() > 0 {
+            println!("Finalized {} file(s).", report.closed_files());
+            if report.error_events() > 0
+                || report.write_failures() > 0
+                || report.empty_files() > 0
+                || report.stopped_by_sdk()
+            {
                 return Err(format!(
-                    "recording reported {} error event(s)",
-                    report.error_events()
+                    "recording incomplete: {} error event(s), {} write failure(s), \
+                     {} empty file(s); stopped by SDK: {}",
+                    report.error_events(),
+                    report.write_failures(),
+                    report.empty_files(),
+                    report.stopped_by_sdk()
                 )
                 .into());
-            }
-            if report.stopped_by_sdk() {
-                println!("The SDK ended the session before it was asked to stop.");
             }
         }
         other => return Err(format!("recording was not confirmed complete: {other:?}").into()),

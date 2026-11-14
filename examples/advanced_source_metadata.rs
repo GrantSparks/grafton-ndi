@@ -16,10 +16,12 @@
 
 use std::time::Duration;
 
-use grafton_ndi::{advanced::AdvancedConfig, Error, Finder, FinderOptions, Ndi};
+use grafton_ndi::{
+    advanced::AdvancedConfig, Error, Finder, FinderOptions, Ndi, RuntimeOptions, SdkEdition,
+};
 
 fn main() -> Result<(), Error> {
-    let ndi = Ndi::new()?;
+    let ndi = Ndi::with_options(&RuntimeOptions::new().edition(SdkEdition::Advanced))?;
     // The properties of this JSON document are defined by the NDI Advanced SDK.
     let config = AdvancedConfig::parse("{}")?;
     let finder = Finder::new(&ndi, &FinderOptions::new().config(config))?;
