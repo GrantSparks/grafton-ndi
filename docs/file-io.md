@@ -112,6 +112,13 @@ seconds by default), but cannot report the outcome. Use explicit finishing when
 the result matters. See [`FileRecorder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorder.html)
 for state transitions, error conditions and recovery.
 
+If another async clone calls `close` while `finish` or `wait_finished` runs,
+the wait uses the earlier of its own deadline and `drop_wait` measured from
+the close's submission. It reports `Closed` or `Indeterminate` if the session
+settles, or `InvalidState(Closed)` if that budget ends first. `TimedOut` would
+suggest another wait, which a closed handle cannot perform. Destruction does
+not start a second finalization wait after the running wait spends its budget.
+
 ## Limits of the NDI 6.4 File library
 
 `Closed` confirms the SDK's closure events. It does not establish that every

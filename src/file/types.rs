@@ -44,6 +44,8 @@ pub enum StateError {
     /// The async handle's object has been closed, or its thread stopped
     /// normally before it carried out the operation. A thread that failed
     /// reports [`OwnerFailed`](Self::OwnerFailed) instead.
+    /// Also returned by an in-flight async finish or wait when a concurrent
+    /// close's remaining finalization budget ends without a settled outcome.
     Closed,
     /// The async handle's thread failed, for example by panicking. The
     /// operation it was running, every command queued behind it, every later

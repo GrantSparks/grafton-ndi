@@ -173,6 +173,8 @@ pub(super) struct Recorder {
     pub(super) oversize_next_event: std::sync::atomic::AtomicBool,
     pub(super) dropped_events: std::sync::atomic::AtomicU64,
     pub(super) stops: std::sync::atomic::AtomicUsize,
+    /// Calls that wait for an event, rather than the owner's nonblocking pump.
+    pub(super) waits: std::sync::atomic::AtomicUsize,
     pub(super) destroys: std::sync::atomic::AtomicUsize,
     /// Whether the file-closed event had been captured when the recorder was destroyed.
     pub(super) closed_before_destroy: std::sync::atomic::AtomicBool,
@@ -213,6 +215,7 @@ impl Recorder {
             oversize_next_event: Default::default(),
             dropped_events: Default::default(),
             stops: Default::default(),
+            waits: Default::default(),
             destroys: Default::default(),
             closed_before_destroy: Default::default(),
             close_captured: Default::default(),
@@ -353,6 +356,9 @@ unsafe extern "C" fn recorder_capture(
     use std::sync::atomic::Ordering;
     // SAFETY: the wrapper passes a live handle.
     let recorder = unsafe { Recorder::from_handle(handle) };
+    if wait_ms != 0 {
+        recorder.waits.fetch_add(1, Ordering::Release);
+    }
     if wait_ms != 0 && recorder.close_owed_to_a_wait.swap(false, Ordering::AcqRel) {
         recorder.close();
     }

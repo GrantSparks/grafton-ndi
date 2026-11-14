@@ -206,7 +206,8 @@ impl RecordingReport {
 
 /// The outcome of waiting for a session to end.
 ///
-/// The recorder stays usable whatever the outcome.
+/// A synchronous recorder stays usable whatever the outcome. An async
+/// recorder can be closed by another clone while the wait is running.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum FinishStatus {
@@ -216,6 +217,8 @@ pub enum FinishStatus {
     /// recording ran until it was asked to stop or the SDK ended it sooner.
     Closed(RecordingReport),
     /// The wait ended first. Call [`FileRecorder::wait_finished`] to keep waiting.
+    /// An async wait interrupted by a close reports [`StateError::Closed`]
+    /// instead when closure cannot be established in its remaining budget.
     TimedOut(RecordingReport),
     /// The session ended, but its events do not show that every file was
     /// finalized. Waiting longer will not change this.
@@ -512,6 +515,8 @@ pub struct FileRecorder {
     /// refuses to start another.
     native_stop_owed: bool,
     drop_wait: Duration,
+    /// An async shutdown's existing budget, shared with a running finish.
+    drop_deadline: Option<Deadline>,
     // Keeps the NDI runtime initialized.
     _api: FileApi,
     // Neither the NDI File Format API documentation nor
@@ -561,6 +566,7 @@ impl FileRecorder {
             records_media: options.tracks.contains(MediaTypes::VIDEO)
                 || options.tracks.contains(MediaTypes::AUDIO),
             drop_wait: options.drop_wait,
+            drop_deadline: None,
             accepted_source: Some(options.source.clone()),
             naming: resolved.naming,
             ledger: Ledger::idle(),
@@ -837,6 +843,18 @@ impl FileRecorder {
     pub(super) fn wait_finished_from(
         &mut self,
         deadline: Deadline,
+        each: impl FnMut(Result<Option<RecorderEvent>>) -> bool,
+    ) -> Result<FinishStatus> {
+        self.wait_finished_with(deadline, |_, deadline| deadline, each)
+    }
+
+    /// The same wait, with a budget the async shutdown path can narrow before
+    /// each poll. Cancellation stays separate from shutdown and ends the wait
+    /// after the current poll, whose event is still delivered by `each`.
+    pub(super) fn wait_finished_with(
+        &mut self,
+        mut deadline: Deadline,
+        mut budget: impl FnMut(&mut Self, Deadline) -> Deadline,
         mut each: impl FnMut(Result<Option<RecorderEvent>>) -> bool,
     ) -> Result<FinishStatus> {
         if matches!(self.state(), RecorderState::Idle | RecorderState::Recording) {
@@ -845,6 +863,7 @@ impl FileRecorder {
         let mut interrupted = false;
         let mut late_polls = 0;
         loop {
+            deadline = budget(self, deadline);
             match self.state() {
                 RecorderState::Closed => return Ok(FinishStatus::Closed(self.report())),
                 RecorderState::Indeterminate => {
@@ -887,6 +906,31 @@ impl FileRecorder {
                 });
             }
         }
+    }
+
+    /// Reuse the close's deadline for both an active finish and destruction.
+    pub(super) fn limit_shutdown_wait(
+        &mut self,
+        deadline: Deadline,
+        requested: Instant,
+    ) -> Deadline {
+        let deadline = deadline.within_at(requested, self.drop_wait);
+        self.drop_deadline = Some(deadline);
+        deadline
+    }
+
+    pub(super) fn bound_shutdown_wait(&mut self, requested: Instant) {
+        if self.drop_deadline.is_none() {
+            self.drop_deadline = Deadline::starting(requested, self.drop_wait).ok();
+            if self.drop_deadline.is_none() {
+                // An unrepresentable deadline cannot provide a bounded wait.
+                self.drop_wait = Duration::ZERO;
+            }
+        }
+    }
+
+    pub(super) fn shutdown_wait_spent(&mut self) {
+        self.drop_wait = Duration::ZERO;
     }
 
     /// Stop and destroy the recorder at once, without waiting for the SDK to
@@ -1149,7 +1193,11 @@ impl Drop for FileRecorder {
                 // cannot fail: the session is stopping and `drop_wait` was
                 // checked when the recorder was created, and a malformed
                 // event does not end it.
-                let _ = self.wait_finished(self.drop_wait);
+                if let Some(deadline) = self.drop_deadline {
+                    let _ = self.wait_finished_from(deadline, |_| false);
+                } else {
+                    let _ = self.wait_finished(self.drop_wait);
+                }
             }
         }
         // SAFETY: the recorder is live and is destroyed exactly once, on the

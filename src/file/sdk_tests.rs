@@ -33,10 +33,10 @@ const PATIENCE: Duration = Duration::from_secs(15);
 /// Its name is taken exclusively, so runs that share a temporary directory,
 /// even with the same process identifier in different namespaces, cannot use
 /// or remove each other's recordings.
-struct Scratch(PathBuf);
+pub(super) struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new(test: &str) -> Self {
+    pub(super) fn new(test: &str) -> Self {
         let mut attempt = 0u32;
         loop {
             let nanos = std::time::SystemTime::now()
@@ -54,7 +54,7 @@ impl Scratch {
         }
     }
 
-    fn path(&self, name: &str) -> PathBuf {
+    pub(super) fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
 }
@@ -66,7 +66,7 @@ impl Drop for Scratch {
 }
 
 /// A sender that produces video until dropped, reachable over loopback.
-struct LiveSource {
+pub(super) struct LiveSource {
     spec: SourceSpec,
     running: Arc<AtomicBool>,
     larger_frames: Arc<AtomicBool>,
@@ -74,7 +74,7 @@ struct LiveSource {
 }
 
 impl LiveSource {
-    fn start(ndi: &crate::Ndi, test: &str) -> Self {
+    pub(super) fn start(ndi: &crate::Ndi, test: &str) -> Self {
         let name = format!("grafton-file-{}-{test}", std::process::id());
         let sender = crate::Sender::new(ndi, &crate::SenderOptions::new(name.as_str())).unwrap();
         let spec = Self::loopback(ndi, &sender);
@@ -149,7 +149,7 @@ impl Drop for LiveSource {
 }
 
 /// Options that record the live source's video to exactly the given file name.
-fn exact_video(source: &LiveSource) -> RecorderOptions {
+pub(super) fn exact_video(source: &LiveSource) -> RecorderOptions {
     RecorderOptions::new(source.spec.clone())
         .naming(FileNaming::Exact)
         .proxy(false)
