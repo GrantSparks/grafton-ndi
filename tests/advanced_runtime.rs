@@ -1628,6 +1628,63 @@ fn a_queued_frame_larger_than_the_byte_limit_is_not_retryable() {
     assert!(queue.wait_completed(Duration::ZERO).unwrap().is_none());
 }
 
+/// Scatter completions return each original block allocation for reuse.
+#[test]
+fn queued_scatter_frames_return_their_original_blocks() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut queue =
+        QueuedSender::new(&ndi, &options("queued-scatter"), QueueOptions::default()).unwrap();
+    let mut receiver = packet_receiver(
+        &ndi,
+        &queue.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
+    connect(&mut receiver, "queued scatter receiver", |timecode| {
+        queue
+            .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
+            .unwrap();
+        queue.wait_completed(PATIENCE).unwrap().unwrap();
+    });
+    for number in 1..=6 {
+        let timecode = FIRST_TIMECODE + number;
+        let bytes = video_bytes(VideoCodec::H264, timecode, true);
+        let blocks = vec![
+            bytes[..44].to_vec(),
+            bytes[44..2000].to_vec(),
+            bytes[2000..].to_vec(),
+        ];
+        let pointers = blocks
+            .iter()
+            .map(|block| (block.as_ptr() as usize, block.capacity()))
+            .collect::<Vec<_>>();
+        let mut frame =
+            ScatterVideoFrame::new(video_format(VideoCodec::H264, StreamTier::Program), blocks)
+                .unwrap();
+        frame.set_timecode(Timecode::from_ticks(timecode));
+        let id = queue.try_submit(frame).unwrap();
+        let received = await_video(&mut receiver, timecode);
+        assert_same_packet(received.data(), &bytes, Some(EnvelopeCodec::H264));
+        let done = queue.wait_completed(PATIENCE).unwrap().unwrap();
+        assert_eq!(done.id(), id);
+        let QueuedVideoFrame::Scatter(frame) = done.into_frame() else {
+            panic!("scatter frame changed type")
+        };
+        let blocks = frame.into_blocks();
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| (block.as_ptr() as usize, block.capacity()))
+                .collect::<Vec<_>>(),
+            pointers
+        );
+    }
+    assert_eq!(queue.retained_frames(), 0);
+    assert!(!queue.completion_protocol_failed());
+}
+
 /// A frame a queue has sent comes back complete and can be queued again.
 #[test]
 fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {

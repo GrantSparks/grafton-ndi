@@ -119,6 +119,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Added
 
+- `QueuedVideoFrame::Scatter` queues separate encoder blocks without joining
+  them and returns their original allocations after native completion.
 - `QueuedSender::split` and `CompressedSender::split` lend video and audio
   operations to separate scoped threads without an external lock.
 - `AllocationDecline` and process-wide custom receive allocation decline

@@ -431,7 +431,11 @@ mod objects {
             let Some(completion) = sender.completion else {
                 return;
             };
-            if std::env::var_os("GRAFTON_FAKE_CALLBACK_MODE").is_some_and(|mode| mode == "immediate") {
+            let mode = std::env::var("GRAFTON_FAKE_CALLBACK_MODE").unwrap_or_default();
+            if mode == "immediate" || mode == "drain" {
+                if mode == "drain" {
+                    unsafe { sender.complete() };
+                }
                 log("sender-completion");
                 unsafe { completion(sender.opaque, p_video_data) };
                 // The submitting call must still own its header and pixels.
@@ -902,6 +906,47 @@ pub unsafe extern "C" fn NDIlib_send_set_video_async_completion(
     sender.opaque = p_opaque;
     sender.completion = p_deallocator;
 }
+
+#[cfg(all(fake_advanced, fake_objects, not(fake_omit_scatter)))]
+#[repr(C)]
+pub struct FrameScatter {
+    pointers: *const *const u8,
+    sizes: *const i32,
+}
+
+#[cfg(all(fake_advanced, fake_objects, not(fake_omit_scatter)))]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_send_send_video_scatter_async(
+    instance: NDIlib_send_instance_t,
+    frame: *const NDIlib_video_frame_v2_t,
+    scatter: *const FrameScatter,
+) {
+    log("sender-scatter-submit");
+    let mut descriptor = unsafe { *frame };
+    let scatter = unsafe { &*scatter };
+    assert_eq!(descriptor.p_data.cast_const(), unsafe { *scatter.pointers });
+    assert_eq!(unsafe { descriptor.__bindgen_anon_1.data_size_in_bytes }, unsafe { *scatter.sizes });
+    if std::env::var_os("GRAFTON_FAKE_SCATTER_KEY").is_some() {
+        descriptor.p_data = descriptor.p_data.wrapping_add(1);
+    }
+    unsafe { objects::NDIlib_send_send_video_async_v2(instance, &descriptor) };
+}
+
+#[cfg(all(fake_advanced, fake_objects, not(fake_omit_scatter)))]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_send_send_video_scatter(
+    _instance: NDIlib_send_instance_t,
+    _frame: *const NDIlib_video_frame_v2_t,
+    _scatter: *const FrameScatter,
+) {}
+
+#[cfg(all(fake_advanced, fake_objects, not(fake_omit_scatter)))]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_send_send_audio_scatter(
+    _instance: NDIlib_send_instance_t,
+    _frame: *const NDIlib_audio_frame_v3_t,
+    _scatter: *const FrameScatter,
+) {}
 
 /// Export the Advanced entry points that create an object from its settings
 /// and a configuration. Each logs its call and creates nothing.

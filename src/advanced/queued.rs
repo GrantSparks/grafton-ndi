@@ -13,11 +13,12 @@ use std::{
 #[cfg(any(test, ndi_has_advanced_send_completion))]
 use std::ffi::c_void;
 
-use super::CompressedVideoFrame;
+use super::{send::PendingVideo, CompressedVideoFrame, ScatterVideoFrame, SubmittedVideo};
 use crate::{
     frames::{SendableVideoLayout, VideoParts},
+    sender::in_flight::{Lend, Lent},
     sys::{
-        advanced::{native, SendCompletion},
+        advanced::{native, ScatterSend, SendCompletion},
         bindings::*,
     },
     timeout::Deadline,
@@ -111,9 +112,9 @@ impl SubmissionId {
 
 /// A video frame a [`QueuedSender`] can send.
 ///
-/// Each variant owns its complete, nonempty video allocation. Cloning copies
-/// the bytes into independent storage; submission moves that storage into the
-/// queue until it is collected.
+/// Each variant owns its complete, nonempty video storage. Cloning copies the
+/// bytes into independent allocations; submission moves that storage into the
+/// queue until it is collected. Scatter frames retain their separate blocks.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum QueuedVideoFrame {
@@ -121,6 +122,8 @@ pub enum QueuedVideoFrame {
     Pixels(VideoFrame),
     /// A compressed frame.
     Compressed(CompressedVideoFrame),
+    /// A compressed frame held in separate owned blocks.
+    Scatter(ScatterVideoFrame),
 }
 
 impl From<VideoFrame> for QueuedVideoFrame {
@@ -135,28 +138,26 @@ impl From<CompressedVideoFrame> for QueuedVideoFrame {
     }
 }
 
+impl From<ScatterVideoFrame> for QueuedVideoFrame {
+    fn from(frame: ScatterVideoFrame) -> Self {
+        Self::Scatter(frame)
+    }
+}
+
+#[derive(Clone, Copy)]
 enum QueuedAuthorization {
     Pixels(SendableVideoLayout),
     Compressed,
+    #[cfg(ndi_has_advanced_scatter_send)]
+    Scatter(&'static ScatterSend),
 }
 
 impl QueuedVideoFrame {
-    /// A native descriptor that lends this frame to the SDK, which may write
-    /// to a compressed frame's bytes for as long as it holds the descriptor.
-    fn raw(&mut self, authorized: QueuedAuthorization) -> NDIlib_video_frame_v2_t {
-        match self {
-            Self::Pixels(v) => match authorized {
-                QueuedAuthorization::Pixels(proof) => v.to_raw(proof),
-                _ => unreachable!("authorization matches queued frame"),
-            },
-            Self::Compressed(v) => v.raw(),
-        }
-    }
-
     fn retained_bytes(&self) -> usize {
         match self {
             Self::Pixels(v) => v.retained_bytes(),
             Self::Compressed(v) => v.retained_bytes(),
+            Self::Scatter(v) => v.retained_bytes(),
         }
     }
 
@@ -169,6 +170,109 @@ impl QueuedVideoFrame {
             Self::Compressed(v) => v
                 .validate_for_send()
                 .map(|()| QueuedAuthorization::Compressed),
+            Self::Scatter(_) => {
+                let table = sender.runtime().table::<ScatterSend>()?;
+                native!(ScatterSend, table => Ok(QueuedAuthorization::Scatter(table)))
+            }
+        }
+    }
+}
+
+/// The storage a queue lends. Packet lending shares the compressed sender's
+/// stable scatter list and its existing ownership contract.
+enum QueuedStorage {
+    Pixels(VideoFrame),
+    Packet(PendingVideo),
+    #[cfg(ndi_has_advanced_scatter_send)]
+    Scatter {
+        pending: PendingVideo,
+        key: usize,
+        first_bytes: i32,
+    },
+}
+
+impl QueuedStorage {
+    fn new(frame: QueuedVideoFrame, authorized: QueuedAuthorization) -> Self {
+        match (frame, authorized) {
+            (QueuedVideoFrame::Pixels(frame), QueuedAuthorization::Pixels(_)) => {
+                Self::Pixels(frame)
+            }
+            (QueuedVideoFrame::Compressed(frame), QueuedAuthorization::Compressed) => {
+                Self::Packet(PendingVideo::Contiguous(frame))
+            }
+            #[cfg(ndi_has_advanced_scatter_send)]
+            (QueuedVideoFrame::Scatter(frame), QueuedAuthorization::Scatter(table)) => {
+                // Construction requires a nonempty, separately owned first
+                // block. The queue retains it until completion or destruction.
+                let (key, first_bytes) = {
+                    let first = frame.blocks().next().expect("validated scatter block");
+                    (first.as_ptr() as usize, first.len() as i32)
+                };
+                Self::Scatter {
+                    pending: PendingVideo::scatter(frame, table),
+                    key,
+                    first_bytes,
+                }
+            }
+            _ => unreachable!("authorization matches queued frame"),
+        }
+    }
+
+    fn into_frame(self) -> QueuedVideoFrame {
+        let packet = match self {
+            Self::Pixels(frame) => return QueuedVideoFrame::Pixels(frame),
+            Self::Packet(packet) => packet,
+            #[cfg(ndi_has_advanced_scatter_send)]
+            Self::Scatter { pending, .. } => pending,
+        };
+        match packet.into_submitted() {
+            SubmittedVideo::Contiguous(frame) => QueuedVideoFrame::Compressed(frame),
+            SubmittedVideo::Scatter(frame) => QueuedVideoFrame::Scatter(frame),
+        }
+    }
+}
+
+// SAFETY: Pixels owns initialized payload and terminated metadata, and lending
+// takes the runtime proof for that exact validated layout. Packet/Scatter delegate to
+// PendingVideo, which owns all payload, metadata and stable scatter-list
+// storage. The completion key points into the retained, nonempty first block.
+// Moving this value moves none of its allocations; Entry gives no access to
+// them between lending and native completion or sender destruction.
+unsafe impl Lend for QueuedStorage {
+    type Authorization = QueuedAuthorization;
+
+    fn lend(&mut self, authorized: Self::Authorization) -> Lent {
+        match self {
+            Self::Pixels(frame) => match authorized {
+                QueuedAuthorization::Pixels(proof) => frame.lend(proof),
+                _ => unreachable!("authorization matches queued storage"),
+            },
+            Self::Packet(frame) => frame.lend(()),
+            #[cfg(ndi_has_advanced_scatter_send)]
+            Self::Scatter {
+                pending,
+                key,
+                first_bytes,
+            } => {
+                let Lent::Scatter {
+                    table,
+                    mut frame,
+                    scatter,
+                } = pending.lend(())
+                else {
+                    unreachable!("scatter storage lends a scatter list");
+                };
+                // The SDK ignores these fields for scatter data, but reports
+                // them unchanged in completions on supported Advanced runtimes.
+                // Native tests pin that behavior, including destroy callbacks.
+                frame.p_data = *key as *mut u8;
+                frame.__bindgen_anon_1.data_size_in_bytes = *first_bytes;
+                Lent::Scatter {
+                    table,
+                    frame,
+                    scatter,
+                }
+            }
         }
     }
 }
@@ -205,7 +309,7 @@ struct Entry {
     // Kept so that the address given to the SDK stays valid. Its data
     // pointer identifies the submission.
     _header: AliasableBox<NDIlib_video_frame_v2_t>,
-    frame: QueuedVideoFrame,
+    frame: QueuedStorage,
     bytes: usize,
 }
 
@@ -545,9 +649,10 @@ impl QueuedSender {
     /// The queue owns the frame until it is collected: the SDK writes to a
     /// compressed frame's bytes while it sends them. A collected frame can be
     /// submitted again. Submission does not scan previously submitted frames.
-    /// It allocates one retained native descriptor. Pixels and metadata move
-    /// without copies or growth; owned uncompressed frames already hold all
-    /// SDK tail room their layout and scan type need.
+    /// It allocates one retained native descriptor, and for scatter frames one
+    /// stable scatter-list descriptor. Pixels, blocks and metadata move without
+    /// copies or growth; owned uncompressed frames already hold all SDK tail
+    /// room their layout and scan type need.
     ///
     /// # Errors
     ///
@@ -558,8 +663,9 @@ impl QueuedSender {
     /// [`QueueLimit::Bytes`]; collect completed frames and submit it again),
     /// with [`Error::UnexpectedSdkResult`] when the queue has failed (see
     /// [`completion_protocol_failed`](Self::completion_protocol_failed)),
-    /// with [`Error::UnsupportedCapability`] when the runtime cannot send an
-    /// uncompressed frame's pixel format (as [`Sender::send_video`] checks),
+    /// with [`Error::UnsupportedCapability`] when the runtime lacks scatter
+    /// sending or cannot send an uncompressed frame's pixel format
+    /// (as [`Sender::send_video`] checks),
     /// and with [`Error::InvalidFrame`] when the frame is not sendable.
     pub fn try_submit(
         &mut self,
@@ -623,7 +729,7 @@ impl QueuedVideo<'_> {
         &mut self,
         frame: impl Into<QueuedVideoFrame>,
     ) -> std::result::Result<SubmissionId, Rejected<QueuedVideoFrame>> {
-        let mut frame = frame.into();
+        let frame = frame.into();
         let failure = Rejected::new;
         let authorized = match frame.validate(self.sender) {
             Ok(proof) => proof,
@@ -641,7 +747,14 @@ impl QueuedVideo<'_> {
                 frame,
             ));
         }
-        let header = AliasableBox::new(Box::new(frame.raw(authorized)));
+        let mut frame = QueuedStorage::new(frame, authorized);
+        let lent = frame.lend(authorized);
+        let descriptor = match &lent {
+            Lent::Frame(descriptor) => *descriptor,
+            #[cfg(ndi_has_advanced_scatter_send)]
+            Lent::Scatter { frame, .. } => *frame,
+        };
+        let header = AliasableBox::new(Box::new(descriptor));
         let key = header.p_data as usize;
         let pointer = header.as_ptr();
         let id = {
@@ -655,26 +768,30 @@ impl QueuedVideo<'_> {
                 .checked_add(bytes)
                 .filter(|total| *total <= state.options.bytes)
             else {
-                return Err(failure(Error::QueueFull(QueueLimit::Bytes), frame));
+                return Err(failure(
+                    Error::QueueFull(QueueLimit::Bytes),
+                    frame.into_frame(),
+                ));
             };
             if state.retained() >= state.options.frames {
-                return Err(failure(Error::QueueFull(QueueLimit::Frames), frame));
+                return Err(failure(
+                    Error::QueueFull(QueueLimit::Frames),
+                    frame.into_frame(),
+                ));
             }
             let Some(next) = state.next.checked_add(1) else {
                 return Err(failure(
                     Error::InvalidInput("queue submission identifiers exhausted".into()),
-                    frame,
+                    frame.into_frame(),
                 ));
             };
             let id = SubmissionId(state.next);
             state.next = next;
             state.bytes = total;
-            // Both QueuedVideoFrame variants own nonempty allocations:
-            // VideoFrame's validated Pixels and CompressedVideoFrame's
-            // AliasableVec<u8>. Neither exposes shared ownership, cloning
-            // copies the bytes, and submission moves the frame here until
-            // collection. Its data address is therefore non-null and distinct
-            // from every retained frame, without searching either collection.
+            // Each frame owns its nonempty data allocation (the first block
+            // for scatter). Cloning copies storage, and moving a submission
+            // here retains it until collection, so its key is non-null and
+            // distinct from every retained frame without scanning the queue.
             state.in_flight.insert(
                 key,
                 Entry {
@@ -691,9 +808,18 @@ impl QueuedVideo<'_> {
         // SAFETY: the sender is live, and the queue owns the descriptor and
         // the frame it lends until the SDK reports completion.
         unsafe {
-            self.sender
-                .core()
-                .NDIlib_send_send_video_async_v2(self.sender.native_instance(), pointer)
+            match lent {
+                Lent::Frame(_) => self
+                    .sender
+                    .core()
+                    .NDIlib_send_send_video_async_v2(self.sender.native_instance(), pointer),
+                #[cfg(ndi_has_advanced_scatter_send)]
+                Lent::Scatter { table, scatter, .. } => table.NDIlib_send_send_video_scatter_async(
+                    self.sender.native_instance(),
+                    pointer,
+                    scatter,
+                ),
+            }
         };
         Ok(id)
     }
@@ -758,7 +884,7 @@ fn take_completed(state: &mut State) -> Option<CompletedVideo> {
     state.bytes -= entry.bytes;
     Some(CompletedVideo {
         id: entry.id,
-        frame: entry.frame,
+        frame: entry.frame.into_frame(),
     })
 }
 
@@ -808,16 +934,21 @@ mod tests {
     }
 
     fn insert(state: &CallbackState, id: u64) -> usize {
-        let mut frame =
-            QueuedVideoFrame::Pixels(VideoFrame::builder().resolution(2, 2).build().unwrap());
-        let header = AliasableBox::new(Box::new(frame.raw(match &frame {
-            QueuedVideoFrame::Pixels(v) => {
-                QueuedAuthorization::Pixels(SendableVideoLayout::for_test(*v.layout()))
-            }
-            QueuedVideoFrame::Compressed(_) => QueuedAuthorization::Compressed,
-        })));
+        let pixels = VideoFrame::builder().resolution(2, 2).build().unwrap();
+        let bytes = pixels.retained_bytes();
+        let authorized =
+            QueuedAuthorization::Pixels(SendableVideoLayout::for_test(*pixels.layout()));
+        let mut frame = QueuedStorage::new(pixels.into(), authorized);
+        let lent = frame.lend(authorized);
+        #[cfg(ndi_has_advanced_scatter_send)]
+        let Lent::Frame(raw) = lent
+        else {
+            unreachable!()
+        };
+        #[cfg(not(ndi_has_advanced_scatter_send))]
+        let Lent::Frame(raw) = lent;
+        let header = AliasableBox::new(Box::new(raw));
         let key = header.p_data as usize;
-        let bytes = frame.retained_bytes();
         let mut s = state.state.lock().unwrap();
         s.bytes += bytes;
         s.in_flight.insert(

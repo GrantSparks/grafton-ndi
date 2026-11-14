@@ -66,6 +66,18 @@ impl Clone for ScatterStorage {
 }
 
 impl ScatterStorage {
+    fn retained_bytes(&self) -> usize {
+        let bytes = self.blocks.iter().fold(
+            self.blocks.len() * size_of::<AliasableVec<u8>>(),
+            |total, block| total.saturating_add(block.capacity()),
+        );
+        #[cfg(any(test, ndi_has_advanced_scatter_send))]
+        let bytes = bytes
+            .saturating_add(self.pointers.len() * size_of::<*const u8>())
+            .saturating_add(self.sizes.len() * size_of::<i32>());
+        bytes
+    }
+
     /// Check a block list and return its total size in bytes.
     fn total(blocks: &[Vec<u8>]) -> Result<usize> {
         if blocks.is_empty() || blocks.len() > MAX_SCATTER_BLOCKS {
@@ -251,6 +263,12 @@ impl ScatterVideoFrame {
     /// The size of the whole frame in bytes.
     pub fn total_bytes(&self) -> usize {
         self.storage.total
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.storage
+            .retained_bytes()
+            .saturating_add(self.extras.retained_bytes())
     }
 
     /// Join the blocks into one newly allocated contiguous frame.
@@ -439,7 +457,7 @@ pub struct ReclaimedVideo {
 ///
 /// The entry owns all of these, so nothing can read the frame's bytes while
 /// the SDK may still write to them.
-enum PendingVideo {
+pub(super) enum PendingVideo {
     /// A frame submitted with [`CompressedSender::send_video_async`].
     Contiguous(CompressedVideoFrame),
     /// A frame submitted with [`CompressedSender::send_scatter_video_async`].
@@ -470,7 +488,7 @@ impl PendingVideo {
     /// The entry for a scatter frame, sent through `table`, with a scatter
     /// list that stays where it is for as long as the entry exists.
     #[cfg(ndi_has_advanced_scatter_send)]
-    fn scatter(mut frame: ScatterVideoFrame, table: &'static ScatterSend) -> Self {
+    pub(super) fn scatter(mut frame: ScatterVideoFrame, table: &'static ScatterSend) -> Self {
         let list = AliasableBox::new(Box::new(frame.storage.descriptor(table)));
         Self::Scatter { frame, list, table }
     }
@@ -484,7 +502,7 @@ impl PendingVideo {
         }
     }
 
-    fn into_submitted(self) -> SubmittedVideo {
+    pub(super) fn into_submitted(self) -> SubmittedVideo {
         match self {
             Self::Contiguous(frame) => SubmittedVideo::Contiguous(frame),
             #[cfg(ndi_has_advanced_scatter_send)]

@@ -123,7 +123,7 @@ threads. Each view is `Send` and neither is `Sync` or `Clone`; the audio view's
 
 ## Queued sending
 
-Use `QueuedSender` to submit multiple owned raw or compressed video frames
+Use `QueuedSender` to submit multiple owned raw, compressed or scatter video frames
 without waiting for the previous frame's completion on each submission.
 `QueueOptions` bounds retained frames and bytes, including completed frames not
 yet collected and spare payload/metadata capacity. Check defaults and exact
@@ -134,8 +134,14 @@ collect completions and retry. A frame whose retained allocation capacity
 alone exceeds `max_bytes` returns `InvalidInput`; waiting cannot make it fit.
 Inspect other errors before retrying.
 `try_take_completed` and `wait_completed` return reusable frames on the
-application thread. Submitting moves payload ownership but allocates a native
-descriptor. The queue's SDK completion callback runs no application code.
+application thread. Pass a `ScatterVideoFrame` directly to `try_submit` when
+the encoder supplies separate header, payload and parameter-set blocks; it
+returns as `QueuedVideoFrame::Scatter`, and `into_blocks()` recovers the original
+allocations. This requires scatter-send support as well as completion support.
+The byte budget counts block capacities, the owned block collection, both
+scatter arrays and metadata. Submitting allocates a native frame descriptor
+and, for scatter, one stable list descriptor. The SDK completion callback runs
+no application code.
 
 `from_sender` drains an ordinary sender's async pipeline and returns any held
 frame; it refuses advertised senders. The queue lends audio, metadata and

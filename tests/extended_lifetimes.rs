@@ -76,6 +76,14 @@ fn native_resource_ownership() {
     fs::create_dir_all(&directory).unwrap();
     let standard = fixture(&directory, false);
     let advanced = fixture(&directory, true);
+    let missing_scatter = directory.join("missing-scatter");
+    fs::create_dir_all(&missing_scatter).unwrap();
+    let missing_scatter = FakeRuntime {
+        cfgs: vec!["fake_objects", "fake_advanced", "fake_omit_scatter"],
+        version: Some("6.4.0.0"),
+        ..Default::default()
+    }
+    .build(&missing_scatter.join("libndi_advanced.so"));
     let mut scenarios = vec![
         "sender_unregistered",
         "sender_copy_reuse",
@@ -93,6 +101,10 @@ fn native_resource_ownership() {
             "queue_immediate",
             "queue_backlog",
             "queue_split",
+            "queue_scatter_immediate",
+            "queue_scatter_delayed",
+            "queue_scatter_protocol",
+            "queue_scatter_unavailable",
             "queue_destroy",
             "queue_registered_sender",
         ]);
@@ -104,7 +116,9 @@ fn native_resource_ownership() {
             .env("GRAFTON_OWNERSHIP_CHILD", case)
             .env(
                 "GRAFTON_OWNERSHIP_LIBRARY",
-                if case.starts_with("queue_") {
+                if case == "queue_scatter_unavailable" {
+                    &missing_scatter
+                } else if case.starts_with("queue_") {
                     &advanced
                 } else {
                     &standard
@@ -112,7 +126,13 @@ fn native_resource_ownership() {
             )
             .env(
                 "GRAFTON_FAKE_CALLBACK_MODE",
-                if matches!(case, "queue_immediate" | "queue_backlog") {
+                if matches!(
+                    case,
+                    "queue_immediate"
+                        | "queue_backlog"
+                        | "queue_scatter_immediate"
+                        | "queue_scatter_protocol"
+                ) {
                     "immediate"
                 } else {
                     "delayed"
@@ -528,6 +548,105 @@ fn child(case: &str) {
             );
             exact.try_submit(rejected.into_inner()).unwrap();
             assert_eq!(log().matches("sender-submit-return\n").count(), 4);
+        }
+        #[cfg(feature = "advanced")]
+        "queue_scatter_immediate"
+        | "queue_scatter_delayed"
+        | "queue_scatter_protocol"
+        | "queue_scatter_unavailable" => {
+            use grafton_ndi::advanced::{
+                QueueOptions, QueuedSender, QueuedVideoFrame, ScatterVideoFrame, VideoCodec,
+                VideoPacketFormat,
+            };
+            let packet = || {
+                ScatterVideoFrame::new(
+                    VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16).unwrap(),
+                    vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+                )
+                .unwrap()
+            };
+            let mut queue = QueuedSender::new(
+                &ndi,
+                &SenderOptions::new("scatter queue"),
+                QueueOptions::default(),
+            )
+            .unwrap();
+            if case == "queue_scatter_unavailable" {
+                let frame = packet();
+                let original = frame
+                    .blocks()
+                    .map(|block| block.as_ptr())
+                    .collect::<Vec<_>>();
+                let rejected = queue.try_submit(frame).unwrap_err();
+                assert!(matches!(
+                    rejected.error(),
+                    Error::UnsupportedCapability {
+                        feature: RuntimeFeature::ScatterSend,
+                        ..
+                    }
+                ));
+                let QueuedVideoFrame::Scatter(frame) = rejected.into_inner() else {
+                    panic!("the frame changed type")
+                };
+                assert_eq!(
+                    frame
+                        .blocks()
+                        .map(|block| block.as_ptr())
+                        .collect::<Vec<_>>(),
+                    original
+                );
+                assert!(!log().contains("sender-scatter-submit"));
+            } else if case == "queue_scatter_protocol" {
+                std::env::set_var("GRAFTON_FAKE_SCATTER_KEY", "altered");
+                queue.try_submit(packet()).unwrap();
+                assert!(queue.completion_protocol_failed());
+                assert_eq!(queue.retained_frames(), 1);
+                assert!(queue.try_take_completed().is_none());
+                assert!(matches!(
+                    queue.try_submit(packet()).unwrap_err().error(),
+                    Error::UnexpectedSdkResult(_)
+                ));
+            } else {
+                let mut submitted = Vec::new();
+                for _ in 0..3 {
+                    let frame = packet();
+                    let original = frame
+                        .blocks()
+                        .map(|block| block.as_ptr() as usize)
+                        .collect::<Vec<_>>();
+                    let id = queue.try_submit(frame).unwrap();
+                    submitted.push((id, original));
+                }
+                if case == "queue_scatter_delayed" {
+                    assert!(queue.try_take_completed().is_none());
+                    std::env::set_var("GRAFTON_FAKE_CALLBACK_MODE", "drain");
+                    let frame = packet();
+                    let original = frame
+                        .blocks()
+                        .map(|block| block.as_ptr() as usize)
+                        .collect::<Vec<_>>();
+                    let id = queue.try_submit(frame).unwrap();
+                    submitted.push((id, original));
+                }
+                for _ in 0..submitted.len() {
+                    let done = queue.wait_completed(Duration::ZERO).unwrap().unwrap();
+                    let original = &submitted.iter().find(|(id, _)| *id == done.id()).unwrap().1;
+                    let QueuedVideoFrame::Scatter(frame) = done.into_frame() else {
+                        panic!("the frame changed type")
+                    };
+                    let blocks = frame.into_blocks();
+                    assert_eq!(
+                        blocks
+                            .iter()
+                            .map(|block| block.as_ptr() as usize)
+                            .collect::<Vec<_>>(),
+                        *original
+                    );
+                    assert_eq!(blocks, [vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
+                }
+                assert_eq!(queue.retained_frames(), 0);
+                assert!(!queue.completion_protocol_failed());
+            }
         }
         #[cfg(feature = "advanced")]
         "queue_split" => {

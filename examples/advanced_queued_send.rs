@@ -9,6 +9,20 @@
 //! Needs the NDI Advanced SDK at build time and an Advanced runtime.
 //!
 //! Run with: `cargo run --features advanced --example advanced_queued_send`
+//!
+//! An encoder that already owns separate blocks can use the same queue without
+//! concatenating them. The first block must hold the codec's complete header:
+//!
+//! ```no_run
+//! use grafton_ndi::advanced::{QueuedVideo, ScatterVideoFrame, VideoPacketFormat};
+//! fn submit_encoded(
+//!     queue: &mut QueuedVideo<'_>, format: VideoPacketFormat, blocks: Vec<Vec<u8>>,
+//! ) -> grafton_ndi::Result<()> {
+//!     let frame = ScatterVideoFrame::new(format, blocks)?;
+//!     queue.try_submit(frame)?;
+//!     Ok(())
+//! }
+//! ```
 
 use std::{
     thread,
