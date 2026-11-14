@@ -209,6 +209,9 @@ linkage and Rust 1.88 baseline.
 
 ### Fixed
 
+- Video and audio copies retain metadata storage across frames without text,
+  avoiding allocations when per-frame metadata alternates in a reused buffer.
+
 - Sending a captured single-row video frame with a padded stride uses staging
   so the SDK reads only initialized pixels and padding.
 

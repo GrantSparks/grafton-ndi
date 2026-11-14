@@ -753,7 +753,8 @@ pub(crate) unsafe trait VideoParts {
         let packed = self.layout().packed();
         let metadata = self
             .metadata_text()
-            .map(|text| FrameMetadata::copy_from(text, None));
+            .map(|text| FrameMetadata::copy_from(text, None))
+            .unwrap_or_default();
         let room = crate::pixels::send_room(&packed, self.header().scan_type);
         packed_video(
             self,
@@ -783,10 +784,11 @@ pub(crate) unsafe trait VideoParts {
         let room = crate::pixels::send_room(&packed, self.header().scan_type);
         let replacement =
             (!destination.data.holds(len, room)).then(|| Pixels::with_room(len, room));
-        let storage = destination.metadata.take();
-        let metadata = self
-            .metadata_text()
-            .map(|text| FrameMetadata::copy_from(text, storage));
+        let mut metadata = std::mem::take(&mut destination.metadata);
+        match self.metadata_text() {
+            Some(text) => metadata.copy_text(text),
+            None => metadata.inner.clear(),
+        }
         let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
         *destination = packed_video(self, packed, data, metadata);
     }
@@ -904,7 +906,8 @@ pub trait VideoSource: VideoParts {
     /// Copy active pixels and metadata into an owned destination, preserving
     /// the header and timestamp. Row padding is omitted. Pixel and metadata
     /// allocations are reused when their capacities/layouts permit; this has
-    /// the same allocation behavior as a captured frame's `copy_into`.
+    /// the same allocation behavior as a captured frame's `copy_into`. A copy
+    /// without metadata retains the destination's text allocation.
     fn copy_into(&self, destination: &mut VideoFrame) {
         self.copy_into_owned(destination);
     }
@@ -929,7 +932,7 @@ fn packed_video<P: VideoParts + ?Sized>(
     source: &P,
     packed: ValidatedVideoLayout,
     mut data: Pixels,
-    metadata: Option<FrameMetadata>,
+    metadata: FrameMetadata,
 ) -> VideoFrame {
     let room = crate::pixels::send_room(&packed, source.header().scan_type);
     source.copy_active_pixels(&mut data, &packed, room);
@@ -1383,7 +1386,7 @@ pub struct VideoFrame {
     header: VideoHeader,
     /// The pixels, followed by the room required by the layout and scan type.
     data: Pixels,
-    metadata: Option<FrameMetadata>,
+    metadata: FrameMetadata,
     timestamp: Option<SdkTimestamp>,
 }
 
@@ -1405,7 +1408,7 @@ unsafe impl VideoParts for VideoFrame {
     }
     #[inline]
     fn metadata_text(&self) -> Option<MetadataText<'_>> {
-        self.metadata.as_ref().map(FrameMetadata::text)
+        self.metadata.optional_text()
     }
     #[inline]
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
@@ -1473,11 +1476,9 @@ impl VideoFrame {
     /// Backing allocations retained when a frame enters a bounded send queue.
     #[cfg(feature = "advanced")]
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.data.capacity().saturating_add(
-            self.metadata
-                .as_ref()
-                .map_or(0, FrameMetadata::retained_bytes),
-        )
+        self.data
+            .capacity()
+            .saturating_add(self.metadata.retained_bytes())
     }
 
     /// The SDK descriptor of this frame, borrowing its pixels and metadata.
@@ -1586,8 +1587,8 @@ impl VideoFrame {
 
     #[cfg(test)]
     pub(crate) fn metadata_cstr(&self) -> Option<&CStr> {
-        self.metadata.as_ref().map(|metadata| {
-            CStr::from_bytes_with_nul(metadata.inner.as_bytes())
+        self.metadata.optional_text().map(|metadata| {
+            CStr::from_bytes_with_nul(metadata.with_nul.as_bytes())
                 .expect("owned metadata ends in its only NUL byte")
         })
     }
@@ -1602,13 +1603,13 @@ impl VideoFrame {
     /// byte, or [`Error::InvalidFrame`] if the emitted C string would exceed
     /// the metadata size cap.
     pub fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<()> {
-        self.metadata = Some(FrameMetadata::new(metadata)?);
+        self.metadata = FrameMetadata::new(metadata)?;
         Ok(())
     }
 
-    /// Remove the frame metadata.
+    /// Remove frame metadata, retaining its allocation for later copies.
     pub fn clear_metadata(&mut self) {
-        self.metadata = None;
+        self.metadata.inner.clear();
     }
 
     /// # Safety
@@ -1652,7 +1653,9 @@ impl VideoFrame {
                 data,
                 crate::pixels::send_room(&layout, ScanType::Progressive),
             ),
-            metadata: metadata.map(|text| FrameMetadata::new(text).unwrap()),
+            metadata: metadata
+                .map(|text| FrameMetadata::new(text).unwrap())
+                .unwrap_or_default(),
             timestamp: None,
         }
     }
@@ -1819,7 +1822,7 @@ impl VideoFrameBuilder {
             }
             // The last fallible check transfers metadata only on success,
             // preserving the complete builder on every rejected input.
-            let metadata = FrameMetadata::take_from(&mut self.metadata)?;
+            let metadata = FrameMetadata::take_from(&mut self.metadata)?.unwrap_or_default();
             Ok((layout, metadata))
         };
         let (layout, metadata) = match validate() {
@@ -1944,7 +1947,8 @@ pub(crate) unsafe trait AudioParts {
         let packed = self.layout().packed();
         let metadata = self
             .metadata_text()
-            .map(|text| FrameMetadata::copy_from(text, None));
+            .map(|text| FrameMetadata::copy_from(text, None))
+            .unwrap_or_default();
         packed_audio(
             self,
             packed,
@@ -1966,10 +1970,11 @@ pub(crate) unsafe trait AudioParts {
         let packed = self.layout().packed();
         let len = packed.sample_count();
         let replacement = (destination.data.capacity() < len).then(|| Vec::with_capacity(len));
-        let storage = destination.metadata.take();
-        let metadata = self
-            .metadata_text()
-            .map(|text| FrameMetadata::copy_from(text, storage));
+        let mut metadata = std::mem::take(&mut destination.metadata);
+        match self.metadata_text() {
+            Some(text) => metadata.copy_text(text),
+            None => metadata.inner.clear(),
+        }
         let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
         *destination = packed_audio(self, packed, data, metadata);
     }
@@ -2054,7 +2059,8 @@ pub trait AudioSource: AudioParts {
     }
 
     /// Copy into an owned destination, reusing sample and metadata allocations
-    /// when their capacities permit. Padding is omitted.
+    /// when their capacities permit. Padding is omitted. Absent source metadata
+    /// clears the destination text while retaining its allocation.
     fn copy_into(&self, destination: &mut AudioFrame) {
         self.copy_into_owned(destination);
     }
@@ -2145,7 +2151,8 @@ impl<'buf> BorrowedAudioFrame<'buf> {
     }
 
     /// Copy into an existing packed frame, reusing its sample and metadata
-    /// allocations when their capacity and lengths permit.
+    /// allocations when their capacity and lengths permit. A copy without
+    /// metadata retains the destination's text allocation.
     pub fn copy_into(&self, destination: &mut AudioFrame) {
         self.copy_into_owned(destination);
     }
@@ -2271,7 +2278,7 @@ fn packed_audio<P: AudioParts + ?Sized>(
     source: &P,
     packed: ValidatedAudioLayout,
     mut data: Vec<f32>,
-    metadata: Option<FrameMetadata>,
+    metadata: FrameMetadata,
 ) -> AudioFrame {
     data.clear();
     // The views read channel samples only, never padding between channels.
@@ -2441,7 +2448,7 @@ pub struct AudioFrame {
     layout: ValidatedAudioLayout,
     timecode: Timecode,
     data: Vec<f32>,
-    metadata: Option<FrameMetadata>,
+    metadata: FrameMetadata,
     timestamp: Option<SdkTimestamp>,
 }
 
@@ -2467,7 +2474,7 @@ unsafe impl AudioParts for AudioFrame {
     }
     #[inline]
     fn metadata_text(&self) -> Option<MetadataText<'_>> {
-        self.metadata.as_ref().map(FrameMetadata::text)
+        self.metadata.optional_text()
     }
 }
 
@@ -2590,13 +2597,13 @@ impl AudioFrame {
     /// byte, or [`Error::InvalidFrame`] if the emitted C string would exceed
     /// the metadata size cap.
     pub fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<()> {
-        self.metadata = Some(FrameMetadata::new(metadata)?);
+        self.metadata = FrameMetadata::new(metadata)?;
         Ok(())
     }
 
-    /// Remove the frame metadata.
+    /// Remove frame metadata, retaining its allocation for later copies.
     pub fn clear_metadata(&mut self) {
-        self.metadata = None;
+        self.metadata.inner.clear();
     }
 
     /// Get mutable samples for one channel without allocating.
@@ -2757,7 +2764,7 @@ impl AudioFrameBuilder {
             }
             // Transfer metadata only after every rejection check, before
             // interleaving conversion or changing sample storage.
-            let metadata = FrameMetadata::take_from(&mut self.metadata)?;
+            let metadata = FrameMetadata::take_from(&mut self.metadata)?.unwrap_or_default();
             Ok((layout, metadata))
         };
         let (audio_layout, metadata) = match validate() {
@@ -3366,12 +3373,13 @@ impl FrameMetadataState {
 
 /// Owned video/audio per-frame metadata.
 ///
-/// The string includes its only NUL as its last byte and fits within the
-/// metadata size cap. Keeping its capacity, unlike a `CString`, lets copies
+/// Present text includes its only NUL as its last byte and fits within the
+/// metadata size cap. An empty string buffer means absent metadata while
+/// retaining its capacity; explicit empty text holds its one NUL byte. Keeping its capacity, unlike a `CString`, lets copies
 /// reuse storage when per-frame text changes length. UTF-8 is guaranteed by
 /// `String`; the private constructors preserve termination. `None` on a frame
 /// means a null SDK `p_metadata`; `Some("")` is a non-null empty C string.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub(crate) struct FrameMetadata {
     inner: String,
 }
@@ -3407,15 +3415,21 @@ impl FrameMetadata {
         Ok(metadata.take().map(|inner| Self { inner }))
     }
 
-    /// The text with its terminator.
-    pub(crate) fn text(&self) -> MetadataText<'_> {
-        MetadataText {
+    /// Present text with its terminator, distinguishing absence from empty text.
+    fn optional_text(&self) -> Option<MetadataText<'_>> {
+        (!self.inner.is_empty()).then_some(MetadataText {
             with_nul: &self.inner,
-        }
+        })
+    }
+
+    /// The text of standalone metadata, which always holds its terminal NUL.
+    pub(crate) fn text(&self) -> MetadataText<'_> {
+        self.optional_text()
+            .expect("standalone metadata holds terminated text")
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        self.text().as_str()
+        self.optional_text().map_or("", MetadataText::as_str)
     }
 
     pub(crate) fn into_string(mut self) -> String {
@@ -3424,7 +3438,11 @@ impl FrameMetadata {
     }
 
     pub(crate) fn as_ptr(&self) -> *const c_char {
-        self.inner.as_ptr().cast()
+        if self.inner.is_empty() {
+            ptr::null()
+        } else {
+            self.inner.as_ptr().cast()
+        }
     }
 
     /// All bytes retained by this metadata, including spare string capacity.
@@ -5123,7 +5141,9 @@ macro_rules! borrowed_video_methods {
             /// replaced by one allocation of exactly that size. Its
             /// metadata string is reused when its capacity holds the new text and
             /// its terminator; otherwise it grows once. With sufficient pixel and
-            /// metadata capacity, subsequent copies allocate nothing.
+            /// metadata capacity, subsequent copies allocate nothing, including
+            /// when sources alternate between absent and present metadata. A
+            /// copy without metadata retains the destination's text allocation.
             ///
             /// The copy makes no SDK call. It runs wherever this reference may be
             /// used: a receiver frame can be copied on a scoped worker thread, while a
@@ -5280,7 +5300,9 @@ macro_rules! borrowed_audio_methods {
             /// samples, and otherwise replaced by one allocation of exactly that
             /// size. Its metadata string is reused when its capacity holds the new
             /// text and its terminator; otherwise it grows once. With sufficient
-            /// sample and metadata capacity, subsequent copies allocate nothing.
+            /// sample and metadata capacity, subsequent copies allocate nothing,
+            /// including when sources alternate between absent and present
+            /// metadata. A copy without text retains its allocation.
             ///
             /// The copy makes no SDK call. It runs wherever this reference may be
             /// used: a receiver frame can be copied on a scoped worker thread, while a
@@ -7761,7 +7783,7 @@ mod tests {
         let (video, allocations) = crate::test_alloc::allocation_count(|| builder.build().unwrap());
         assert_eq!(allocations, 0);
         assert_eq!(video.metadata().unwrap().as_ptr(), pointer);
-        assert_eq!(video.metadata.as_ref().unwrap().inner.capacity(), capacity);
+        assert_eq!(video.metadata.inner.capacity(), capacity);
 
         let supplied = text();
         let (pointer, capacity) = (supplied.as_ptr(), supplied.capacity());
@@ -7773,7 +7795,7 @@ mod tests {
         let (audio, allocations) = crate::test_alloc::allocation_count(|| builder.build().unwrap());
         assert_eq!(allocations, 0);
         assert_eq!(audio.metadata().unwrap().as_ptr(), pointer);
-        assert_eq!(audio.metadata.as_ref().unwrap().inner.capacity(), capacity);
+        assert_eq!(audio.metadata.inner.capacity(), capacity);
     }
 
     #[test]
@@ -9772,9 +9794,7 @@ mod tests {
             self.metadata()
         }
         fn text_capacity(&self) -> usize {
-            self.metadata
-                .as_ref()
-                .map_or(0, |text| text.inner.capacity())
+            self.metadata.inner.capacity()
         }
         fn assert_same(&self, expected: &Self) {
             assert_eq!(self.data.len(), self.layout.data_len_bytes);
@@ -9809,9 +9829,7 @@ mod tests {
             self.metadata()
         }
         fn text_capacity(&self) -> usize {
-            self.metadata
-                .as_ref()
-                .map_or(0, |text| text.inner.capacity())
+            self.metadata.inner.capacity()
         }
         fn assert_same(&self, expected: &Self) {
             assert_eq!(self.data.len(), self.layout.sample_count);

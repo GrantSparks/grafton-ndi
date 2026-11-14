@@ -970,7 +970,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// is reused when its capacity holds the new text and its terminator;
     /// otherwise it grows once. With sufficient pixel and metadata capacity,
     /// subsequent copies allocate nothing. The copy makes no SDK call and can
-    /// run on any thread.
+    /// run on any thread. Copies without metadata retain the destination's
+    /// text allocation for later frames.
     ///
     /// # Example
     ///
