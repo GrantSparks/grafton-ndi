@@ -1910,6 +1910,38 @@ fn a_queued_sender_moves_between_threads() {
     std::thread::spawn(move || drop(queue)).join().unwrap();
 }
 
+/// Closing immediately after submission returns each retained id and its
+/// original allocation once, whether completion came before or during close.
+#[test]
+fn closing_a_queued_sender_returns_every_submission_once() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut queue = QueuedSender::new(
+        &ndi,
+        &options("close-queue"),
+        QueueOptions::default().max_frames(8),
+    )
+    .unwrap();
+    let original = std::array::from_fn::<_, 8, _>(|_| {
+        let frame = video();
+        let pointer = frame.data().as_ptr();
+        (queue.try_submit(frame).unwrap(), pointer)
+    });
+    assert_eq!(queue.retained_frames(), original.len());
+    let mut reclaimed = queue.close();
+    assert_eq!(reclaimed.len(), original.len());
+    reclaimed.sort_unstable_by_key(|done| done.id().get());
+    for (completed, (id, pointer)) in reclaimed.into_iter().zip(original) {
+        assert_eq!(completed.id(), id);
+        let QueuedVideoFrame::Pixels(frame) = completed.into_frame() else {
+            panic!("the frame changed type");
+        };
+        assert_eq!(frame.data().as_ptr(), pointer);
+    }
+}
+
 /// Use `receiver` through shared references from four threads at once, each
 /// making every call the receiver's controls offer that changes nothing at
 /// the source; it is connected, so each sees the connection.

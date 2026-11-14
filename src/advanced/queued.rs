@@ -16,7 +16,7 @@ use std::ffi::c_void;
 use super::{send::PendingVideo, CompressedVideoFrame, ScatterVideoFrame, SubmittedVideo};
 use crate::{
     frames::{SendableVideoLayout, VideoParts},
-    sender::in_flight::{Lend, Lent},
+    sender::in_flight::{self, Destroyed, Lend, Lent},
     sys::{
         advanced::{native, ScatterSend, SendCompletion},
         bindings::*,
@@ -276,7 +276,10 @@ unsafe impl Lend for QueuedStorage {
         }
     }
 }
-/// A frame the SDK has finished sending, ready to be reused.
+/// A frame the SDK has finished with, ready to be reused.
+///
+/// It was either reported complete or reclaimed by [`QueuedSender::close`]
+/// after native destruction ended the SDK's access to it.
 #[derive(Clone, Debug)]
 pub struct CompletedVideo {
     id: SubmissionId,
@@ -313,12 +316,21 @@ struct Entry {
     bytes: usize,
 }
 
+impl Entry {
+    fn into_completed(self) -> CompletedVideo {
+        CompletedVideo {
+            id: self.id,
+            frame: self.frame.into_frame(),
+        }
+    }
+}
+
 // SAFETY: the descriptor points only into allocations this entry owns, and
 // moving the entry moves none of them. While the frame is queued only the
 // SDK reads or writes them: the completion callback moves the entry from
 // `State::in_flight` to `State::ready` without touching the frame, and the
 // queue hands the frame out only from `ready`, after the SDK has reported
-// it complete.
+// it complete, or after native destruction has ended access to every entry.
 unsafe impl Send for Entry {}
 
 /// The frames a queue holds. Each is in exactly one place: in flight until
@@ -337,6 +349,29 @@ impl State {
     /// The frames held, in flight or ready.
     fn retained(&self) -> usize {
         self.in_flight.len() + self.ready.len()
+    }
+
+    /// Release every retained entry only after native destruction. Both
+    /// explicit close and implicit drop use this path, so even an unmatched
+    /// completion cannot release a frame while the SDK might still use it.
+    fn release_retained(&mut self, _destroyed: &Destroyed, mut release: impl FnMut(Entry)) {
+        for entry in self.ready.drain(..) {
+            release(entry);
+        }
+        for (_, entry) in self.in_flight.drain() {
+            release(entry);
+        }
+        self.bytes = 0;
+    }
+
+    fn take_retained(&mut self, destroyed: &Destroyed) -> Vec<CompletedVideo> {
+        let mut completed = Vec::with_capacity(self.retained());
+        let ready = self.ready.len();
+        self.release_retained(destroyed, |entry| completed.push(entry.into_completed()));
+        // The ready prefix already records completion order. Sorting only the
+        // unmatched suffix needs no allocation beyond the returned vector.
+        completed[ready..].sort_unstable_by_key(|entry| entry.id.get());
+        completed
     }
 }
 
@@ -468,8 +503,11 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 ///
 /// It is [`Send`] and [`Sync`]: it can be moved to, and its read-only methods
 /// called from, any thread, while submitting and collecting frames takes it
-/// mutably. Dropping it destroys the native sender, which waits, without a
-/// timeout, for the SDK to finish with every frame still queued.
+/// mutably. [`close`](Self::close) destroys the native sender and returns
+/// every retained frame with its submission id. Dropping it destroys the
+/// sender and frees those frames instead. Both wait, without a timeout, for
+/// the SDK to finish with every frame still queued, so run teardown on a
+/// blocking thread when using an async executor.
 ///
 /// [`sender`](Self::sender) lends the native sender in the [`QueueAttached`]
 /// mode, which has the operations every sender shares (the source, metadata
@@ -502,13 +540,37 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 /// # }
 /// ```
 pub struct QueuedSender {
-    // Declared first so that it is destroyed first: destroying the native
-    // sender is what ends the SDK's completion callbacks. Its mode owns the
-    // native sender exclusively, so no other owner, such as an advertiser
-    // registration, can keep it alive after the callback state is freed.
+    // Taking this value lets close and Drop share the same proof-gated
+    // teardown, without relying on the declaration order of owned fields.
+    inner: Option<QueuedSenderInner>,
+}
+
+struct QueuedSenderInner {
     sender: Sender<QueueAttached>,
     // The SDK holds this address for as long as the sender exists.
     callback: AliasableBox<CallbackState>,
+}
+
+impl QueuedSenderInner {
+    fn teardown<T>(self, release: impl FnOnce(&mut State, &Destroyed) -> T) -> T {
+        let Self { sender, callback } = self;
+        // The attached mode owns the native sender exclusively. Destruction
+        // delivers outstanding callbacks, so keep their state alive and do
+        // not hold its mutex until destruction returns and supplies proof.
+        let destroyed = in_flight::destroy(sender);
+        let mut state = callback.state.lock().unwrap_or_else(|p| p.into_inner());
+        release(&mut state, &destroyed)
+    }
+}
+
+impl Drop for QueuedSender {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            // Drop needs no recovery collection; entries are freed only
+            // through the same destruction-proof gate used by close.
+            inner.teardown(|state, destroyed| state.release_retained(destroyed, drop));
+        }
+    }
 }
 
 // `QueuedSender` is `Send` and `Sync` from its fields, with no impl of its
@@ -528,6 +590,10 @@ const _: () = {
 };
 
 impl QueuedSender {
+    fn inner(&self) -> &QueuedSenderInner {
+        self.inner.as_ref().expect("live queued sender")
+    }
+
     /// Create a sender, with the options' Advanced SDK
     /// [configuration](SenderOptions::config) when they carry one.
     ///
@@ -608,7 +674,9 @@ impl QueuedSender {
                 Some(completion),
             )
         };
-        Self { sender, callback }
+        Self {
+            inner: Some(QueuedSenderInner { sender, callback }),
+        }
     }
 
     /// The sender this queue sends through, for the operations that do not
@@ -623,7 +691,7 @@ impl QueuedSender {
     /// it cannot be registered with an advertiser. Use [`split`](Self::split)
     /// to send audio or metadata through it while another thread submits video.
     pub fn sender(&self) -> &Sender<QueueAttached> {
-        &self.sender
+        &self.inner().sender
     }
 
     /// Lend video submission and completion collection separately from audio,
@@ -632,12 +700,13 @@ impl QueuedSender {
     ///
     /// Only the video half submits video, and it is neither `Sync` nor `Clone`.
     pub fn split(&mut self) -> (QueuedVideo<'_>, &Sender<QueueAttached>) {
+        let inner = self.inner();
         let video = QueuedVideo {
-            sender: &self.sender,
-            callback: &self.callback,
+            sender: &inner.sender,
+            callback: &inner.callback,
             _not_sync: std::marker::PhantomData,
         };
-        (video, &self.sender)
+        (video, &inner.sender)
     }
 
     fn video(&mut self) -> QueuedVideo<'_> {
@@ -694,7 +763,7 @@ impl QueuedSender {
     /// The number of frames held: those still being sent and those completed
     /// but not yet collected.
     pub fn retained_frames(&self) -> usize {
-        self.callback.retained_frames()
+        self.inner().callback.retained_frames()
     }
 
     /// Whether the SDK has reported a completion that matches no queued frame,
@@ -702,9 +771,29 @@ impl QueuedSender {
     ///
     /// The queue then no longer knows which frames the SDK still reads, so it
     /// accepts no more submissions; frames already completed can still be
-    /// collected, and dropping the sender releases the rest safely.
+    /// collected. Use [`close`](Self::close) to destroy the native sender and
+    /// take back every frame still retained, including unmatched submissions.
     pub fn completion_protocol_failed(&self) -> bool {
-        self.callback.completion_protocol_failed()
+        self.inner().callback.completion_protocol_failed()
+    }
+
+    /// Destroy the sender and take back every frame it still holds.
+    ///
+    /// The returned count equals [`retained_frames`](Self::retained_frames)
+    /// immediately before this call. Frames reported complete, including by
+    /// callbacks during destruction, come first in completion order. Any
+    /// unmatched frames follow in submission-id order. Each frame keeps its
+    /// original allocations and submission id, even after a
+    /// [completion-protocol failure](Self::completion_protocol_failed).
+    ///
+    /// Native destruction waits without a timeout for the SDK to finish with
+    /// every pending frame. Run this on a blocking thread when using an async
+    /// executor. Only the returned collection is allocated.
+    pub fn close(mut self) -> Vec<CompletedVideo> {
+        self.inner
+            .take()
+            .expect("live queued sender")
+            .teardown(State::take_retained)
     }
 }
 
@@ -742,7 +831,7 @@ impl QueuedVideo<'_> {
         if self.callback.protocol_error.load(Ordering::Acquire) {
             return Err(failure(
                 Error::UnexpectedSdkResult(
-                    "native completion protocol failed; drain and close this queue".into(),
+                    "native completion protocol failed; use QueuedSender::close to recover retained frames".into(),
                 ),
                 frame,
             ));
@@ -852,7 +941,7 @@ impl QueuedVideo<'_> {
             }
             if self.callback.protocol_error.load(Ordering::Acquire) {
                 return Err(Error::UnexpectedSdkResult(
-                    "native completion protocol failed".into(),
+                    "native completion protocol failed; use QueuedSender::close to recover retained frames".into(),
                 ));
             }
             let remaining = deadline.remaining();
@@ -882,10 +971,7 @@ impl QueuedVideo<'_> {
 fn take_completed(state: &mut State) -> Option<CompletedVideo> {
     let entry = state.ready.pop_front()?;
     state.bytes -= entry.bytes;
-    Some(CompletedVideo {
-        id: entry.id,
-        frame: entry.frame.into_frame(),
-    })
+    Some(entry.into_completed())
 }
 
 #[cfg(test)]
@@ -996,6 +1082,82 @@ mod tests {
             },
         );
         key
+    }
+
+    #[test]
+    fn close_recovers_ready_then_unmatched_frames_with_only_the_result_allocation() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let queue = QueuedSender::new(
+            &ndi,
+            &SenderOptions::new(crate::test_support::unique_name("close-order")),
+            QueueOptions::default(),
+        )
+        .unwrap();
+        let state = &queue.inner().callback;
+        // These entries were not sent, so the native sender cannot report
+        // additional completions. They exercise both teardown collections.
+        let original = [5, 3, 4, 1, 2].map(|id| (id, insert(state, id)));
+        state.complete(original[2].1);
+        state.complete(original[4].1);
+        let retained = queue.retained_frames();
+        let (completed, allocations) = crate::test_alloc::allocation_count(|| queue.close());
+        assert_eq!(allocations, 1, "only the returned frame collection");
+        assert_eq!(completed.len(), retained);
+        assert_eq!(
+            completed
+                .iter()
+                .map(|done| done.id().get())
+                .collect::<Vec<_>>(),
+            [4, 2, 1, 3, 5]
+        );
+        for done in completed {
+            let QueuedVideoFrame::Pixels(frame) = done.frame() else {
+                panic!("the frame changed type");
+            };
+            let expected = original
+                .iter()
+                .find(|(id, _)| *id == done.id().get())
+                .unwrap()
+                .1;
+            assert_eq!(frame.data().as_ptr() as usize, expected);
+        }
+    }
+
+    #[test]
+    fn drop_releases_retained_frames_without_allocating_a_recovery_collection() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let queue = QueuedSender::new(
+            &ndi,
+            &SenderOptions::new(crate::test_support::unique_name("drop-allocation")),
+            QueueOptions::default(),
+        )
+        .unwrap();
+        let state = &queue.inner().callback;
+        let first = insert(state, 1);
+        insert(state, 2);
+        state.complete(first);
+        let ((), allocations) = crate::test_alloc::allocation_count(|| drop(queue));
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn closing_an_empty_queue_needs_no_result_allocation() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let queue = QueuedSender::new(
+            &ndi,
+            &SenderOptions::new(crate::test_support::unique_name("close-empty")),
+            QueueOptions::default(),
+        )
+        .unwrap();
+        let (completed, allocations) = crate::test_alloc::allocation_count(|| queue.close());
+        assert!(completed.is_empty());
+        assert_eq!(allocations, 0);
     }
 
     #[test]
