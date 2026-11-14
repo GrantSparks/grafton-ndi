@@ -161,13 +161,23 @@ def release_link_violations(root, source, text, release):
         label = f'{source.relative_to(root)}:{line}'
         if re.match(r'https://docs\.rs/grafton-ndi/latest(?:/|$)', url):
             found.append(f'{label}: API link must name version {release}: {url}')
-        if url.startswith(REPOSITORY + '/'):
-            parts = urlsplit(url).path.split('/')
-            if (len(parts) >= 6 and parts[3] in ('blob', 'tree')
-                    and parts[4] in ('main', 'master', 'HEAD')):
-                relative = '/'.join(parts[5:])
-                if relative.startswith('docs/') or relative in ('README.md', 'examples/README.md'):
-                    found.append(f'{label}: guide link must name a release or immutable commit, not a moving branch: {url}')
+    return found
+
+
+def readme_link_violations(root):
+    """The README must work outside the checkout, including on crates.io."""
+    package = tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))['package']
+    name = package.get('readme', 'README.md')
+    if name is False:
+        return []
+    path = root / (name if isinstance(name, str) else 'README.md')
+    if not path.is_file():
+        return [f'{name}: packaged README is missing']
+    found = []
+    for url, line in links(prose(path.read_text(encoding='utf-8'))):
+        parsed = urlsplit(url)
+        if not parsed.scheme and not parsed.netloc and not url.startswith('#'):
+            found.append(f'{path.relative_to(root)}:{line}: packaged README links must use absolute URLs: {url}')
     return found
 
 
@@ -184,8 +194,8 @@ def destination(root, source, url, release):
             return None
         ref = parts[4]
         relative = unquote('/'.join(parts[5:]))
-        if ref in (release, 'v' + release):
-            return root / relative, fragment, None
+        if re.fullmatch(r'v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', ref):
+            return Path(relative), fragment, 'refs/tags/' + ref
         if re.fullmatch(r'[0-9a-f]{40}', ref):
             return Path(relative), fragment, ref
         # Branch links describe the checkout only for the development branch.
@@ -206,8 +216,16 @@ def link_violations(root, source, text, release, repository_only=False):
         path, fragment, ref = target
         label = f'{source.relative_to(root)}:{line}'
         if ref:
-            # Existing historical objects are authoritative. No network access
-            # or assumption that a release tag already exists is needed.
+            if ref.startswith('refs/tags/'):
+                # CI fetches published tags. A future release name is not a
+                # live URL merely because its target exists in this checkout.
+                exists = subprocess.run(['git', '-C', str(root), 'rev-parse', '--verify', '--quiet', ref],
+                                        text=True, capture_output=True)
+                if exists.returncode:
+                    found.append(f'{label}: unpublished release tag: {url}; use main for unreleased documentation')
+                    continue
+            # Validate the ref's actual content, including anchors, rather than
+            # substituting files from the current checkout.
             command = ['git', '-C', str(root), 'show', f'{ref}:{path.as_posix()}']
             result = subprocess.run(command, text=True, capture_output=True)
             if result.returncode:
@@ -378,6 +396,7 @@ def main():
     parser.add_argument('--rustdoc', type=Path, help='check Pages and versioned docs.rs API links against this generated rustdoc directory')
     args = parser.parse_args()
     found, snippets = check(ROOT)
+    found.extend(readme_link_violations(ROOT))
     if args.rustdoc:
         found.extend(rustdoc_violations(ROOT, args.rustdoc))
     if not found and args.compile:

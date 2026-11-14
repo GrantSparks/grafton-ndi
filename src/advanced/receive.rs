@@ -217,7 +217,7 @@ impl PacketReceiver {
     /// A delivered packet may have been queued; a timeout alone does not
     /// establish disconnection. Use the attached receiver's per-media
     /// counters as described in the
-    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/docs/usage.md#monitor-reception-of-the-expected-media).
+    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
     /// Notifications are coalesced [`ReceiverEvent`] invalidations, consumed
     /// once. Status changes include the current connection count, as in raw
     /// mixed capture; pending notifications are delivered before waiting.

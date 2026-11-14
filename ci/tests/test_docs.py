@@ -48,12 +48,32 @@ class Documentation(unittest.TestCase):
         self.write('docs/README.md', '# Guide')
         self.assertEqual(self.check('[directory](docs/#guide)')[0], [])
 
-    def test_release_links_are_checked_locally_before_tag_exists(self):
+    def test_release_links_require_a_tag_and_check_its_actual_content(self):
         self.write('docs/setup.md', '# Setup')
         prefix = docs.REPOSITORY + '/blob/v3.0.0/'
+        errors, _ = self.check(f'[setup]({prefix}docs/setup.md#setup)')
+        self.assertEqual(len(errors), 1)
+        self.assertIn('unpublished release tag', errors[0])
+        future = docs.REPOSITORY + '/blob/v9.0.0/docs/setup.md#setup'
+        self.assertIn('unpublished release tag', self.check(f'[future]({future})')[0][0])
+        subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
+        subprocess.run(['git', '-C', str(self.root), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                        'commit', '-qm', 'published fixture'], check=True)
+        subprocess.run(['git', '-C', str(self.root), 'tag', 'v3.0.0'], check=True)
+        self.write('docs/setup.md', '# Changed after release')
         self.assertEqual(self.check(f'[setup]({prefix}docs/setup.md#setup)')[0], [])
-        self.assertIn('missing target', self.check(f'[bad]({prefix}docs/absent.md)')[0][0])
-        self.assertIn('missing anchor', self.check(f'[bad]({prefix}docs/setup.md#wrong)')[0][0])
+        self.assertIn('historical target is absent', self.check(f'[bad]({prefix}docs/absent.md)')[0][0])
+        self.assertIn('missing anchor', self.check(f'[bad]({prefix}docs/setup.md#changed-after-release)')[0][0])
+
+    def test_packaged_readme_requires_absolute_links_and_images(self):
+        self.write('README.md', '[guide](docs/setup.md) ![image](logo.svg) [section](#install)')
+        errors = docs.readme_link_violations(self.root)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(all('must use absolute URLs' in error for error in errors))
+        self.write('README.md', '[guide](' + docs.REPOSITORY + '/blob/main/docs/setup.md) '
+                   '![image](https://img.shields.io/crates/v/grafton-ndi.svg) [section](#install)')
+        self.assertEqual(docs.readme_link_violations(self.root), [])
 
     def test_historical_commit_links_use_historical_content(self):
         self.write('docs/old.md', '# Historical')
@@ -81,7 +101,7 @@ class Documentation(unittest.TestCase):
         self.assertIn('unsupported source anchor', self.check('[source](src/lib.rs#L3)')[0][0])
 
     def test_rustdoc_guide_entry_uses_the_same_link_checks(self):
-        prefix = docs.REPOSITORY + '/blob/v3.0.0/'
+        prefix = docs.REPOSITORY + '/blob/main/'
         self.write('src/lib.rs', f'//! See [guides]({prefix}docs/missing.md).\n')
         errors, _ = self.check('# Example')
         self.assertIn('src/lib.rs:1: missing target', errors[0])
@@ -91,7 +111,7 @@ class Documentation(unittest.TestCase):
         self.assertEqual(docs.doc_comment_text(text), '\nInner docs\n\nOuter docs\n\n')
 
     def test_nested_module_guides_checked_without_treating_intradoc_names_as_paths(self):
-        prefix = docs.REPOSITORY + '/blob/v3.0.0/'
+        prefix = docs.REPOSITORY + '/blob/main/'
         self.write('src/nested/mod.rs', '//! [Frame](VideoFrame)\n\npub struct X;\n'
                    f'/// Read [guide]({prefix}docs/missing.md).\n')
         errors, _ = self.check('# Example')
@@ -100,13 +120,15 @@ class Documentation(unittest.TestCase):
         self.write('src/nested/mod.rs', '//! [Frame](VideoFrame)\n/// [Module](crate::frames)\n')
         self.assertEqual(self.check('# Example')[0], [])
 
-    def test_current_guides_reject_moving_branch_urls_in_markdown_and_module_docs(self):
+    def test_main_guides_check_paths_and_anchors_in_markdown_and_module_docs(self):
         self.write('docs/setup.md', '# Setup')
         url = docs.REPOSITORY + '/blob/main/docs/setup.md#setup'
         self.write('src/nested/mod.rs', f'// ordinary\n\n/// Read [setup]({url}).\n')
+        self.assertEqual(self.check(f'[Setup]({url})')[0], [])
+        self.write('docs/setup.md', '# Changed')
         errors, _ = self.check(f'[Setup]({url})')
         self.assertEqual(len(errors), 2)
-        self.assertTrue(all('not a moving branch' in error for error in errors))
+        self.assertTrue(all('missing anchor' in error for error in errors))
         self.assertTrue(any('src/nested/mod.rs:3:' in error for error in errors))
 
     def test_latest_api_link_fails_but_external_pages_are_not_fetched(self):

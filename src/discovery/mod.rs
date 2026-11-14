@@ -40,7 +40,7 @@
 //!   server is up, or replace a listener that took ten seconds or more to
 //!   report `is_connected`, the interval at which the runtime tries again.
 //!
-//! See [Discovery Server deployment guidance](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/docs/troubleshooting.md#discovery-server)
+//! See [Discovery Server deployment guidance](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/troubleshooting.md#discovery-server)
 //! when validating an application with its selected runtime and network.
 //!
 //! # Threads
