@@ -216,8 +216,10 @@ pub enum Error {
     /// which queue and limit.
     ///
     /// * `advanced::QueuedSender::try_submit`, when the frame would take the
-    ///   queue past its frame limit ([`QueueLimit::Frames`]) or its byte limit
-    ///   ([`QueueLimit::Bytes`]). The frame comes back in the `Rejected`;
+    ///   queue past its frame limit ([`QueueLimit::Frames`]) or the retained
+    ///   frames leave insufficient byte capacity ([`QueueLimit::Bytes`]). A
+    ///   frame exceeding the entire byte limit gets [`Error::InvalidInput`].
+    ///   The frame comes back in the `Rejected`;
     ///   collect completed frames and submit it again.
     /// * An operation of an async File handle, when the handle's command
     ///   queue is full ([`QueueLimit::FileCommands`]). A request to stop is
@@ -396,8 +398,9 @@ pub enum QueueLimit {
     /// An Advanced `QueuedSender` already holds as many frames as its
     /// `QueueOptions::max_frames` allows.
     Frames,
-    /// The frame would take an Advanced `QueuedSender` past its
-    /// `QueueOptions::max_bytes`.
+    /// The frames an Advanced `QueuedSender` retains leave too little room
+    /// within `QueueOptions::max_bytes` for this frame. The frame itself fits
+    /// the limit, so collecting completions makes room.
     Bytes,
     /// An async File handle already has as many commands waiting as its
     /// `AsyncFileOptions::command_capacity` allows, and, for a request to

@@ -420,10 +420,7 @@ fn child(case: &str) {
             )
             .unwrap();
             let rejected = small.try_submit(frame()).unwrap_err();
-            assert!(matches!(
-                rejected.error(),
-                Error::QueueFull(QueueLimit::Bytes)
-            ));
+            assert!(matches!(rejected.error(), Error::InvalidInput(_)));
             assert_eq!(small.retained_frames(), 0);
             assert_eq!(log().matches("sender-submit-return\n").count(), 2);
 
@@ -446,10 +443,7 @@ fn child(case: &str) {
             )
             .unwrap();
             let rejected = bounded.try_submit(packet).unwrap_err();
-            assert!(matches!(
-                rejected.error(),
-                Error::QueueFull(QueueLimit::Bytes)
-            ));
+            assert!(matches!(rejected.error(), Error::InvalidInput(_)));
             let grafton_ndi::advanced::QueuedVideoFrame::Compressed(packet) = rejected.into_inner()
             else {
                 panic!("the rejected frame changed type");
@@ -457,6 +451,45 @@ fn child(case: &str) {
             assert_eq!(packet.metadata().unwrap().as_ptr(), metadata_pointer);
             assert_eq!(bounded.retained_frames(), 0);
             assert_eq!(log().matches("sender-submit-return\n").count(), 2);
+
+            let packet = |capacity| {
+                let mut bytes = Vec::with_capacity(capacity);
+                bytes.extend_from_slice(&[0; 4]);
+                CompressedVideoFrame::new(
+                    VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16).unwrap(),
+                    bytes,
+                )
+                .unwrap()
+            };
+            let mut exact = QueuedSender::new(
+                &ndi,
+                &SenderOptions::new("queue exact capacity"),
+                QueueOptions::default().max_bytes(4),
+            )
+            .unwrap();
+            let first = exact.try_submit(packet(4)).unwrap();
+            let rejected = exact.try_submit(packet(4)).unwrap_err();
+            assert!(matches!(
+                rejected.error(),
+                Error::QueueFull(QueueLimit::Bytes)
+            ));
+            let pooled = packet(1024);
+            let original = pooled.data().as_ptr();
+            let refused = exact.try_submit(pooled).unwrap_err();
+            assert!(matches!(refused.error(), Error::InvalidInput(_)));
+            let grafton_ndi::advanced::QueuedVideoFrame::Compressed(pooled) = refused.into_inner()
+            else {
+                panic!("the rejected frame changed type");
+            };
+            assert_eq!(pooled.data().as_ptr(), original);
+            assert_eq!(exact.retained_frames(), 1);
+            assert_eq!(log().matches("sender-submit-return\n").count(), 3);
+            assert_eq!(
+                exact.wait_completed(Duration::ZERO).unwrap().unwrap().id(),
+                first
+            );
+            exact.try_submit(rejected.into_inner()).unwrap();
+            assert_eq!(log().matches("sender-submit-return\n").count(), 4);
         }
         #[cfg(feature = "advanced")]
         "queue_backlog" => {

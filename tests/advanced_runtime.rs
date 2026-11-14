@@ -1601,6 +1601,34 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
     }
 }
 
+/// Waiting cannot admit a frame that exceeds the entire queue byte budget.
+#[test]
+fn a_queued_frame_larger_than_the_byte_limit_is_not_retryable() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut queue = QueuedSender::new(
+        &ndi,
+        &options("queue-byte-limit"),
+        QueueOptions::default().max_bytes(1 << 20),
+    )
+    .unwrap();
+    let frame = VideoFrame::builder()
+        .resolution(1920, 1080)
+        .build()
+        .unwrap();
+    let original = frame.data().as_ptr();
+    let refused = queue.try_submit(frame).unwrap_err();
+    assert!(matches!(refused.error(), Error::InvalidInput(_)));
+    let QueuedVideoFrame::Pixels(frame) = refused.into_inner() else {
+        panic!("the rejected frame changed type");
+    };
+    assert_eq!(frame.data().as_ptr(), original);
+    assert_eq!(queue.retained_frames(), 0);
+    assert!(queue.wait_completed(Duration::ZERO).unwrap().is_none());
+}
+
 /// A frame a queue has sent comes back complete and can be queued again.
 #[test]
 fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {

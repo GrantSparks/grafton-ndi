@@ -73,7 +73,9 @@ impl QueueOptions {
     }
 
     /// Set the maximum retained bytes of frame data and metadata, including
-    /// unused payload capacity reserved by pooled vectors.
+    /// unused payload capacity reserved by pooled vectors. A frame larger
+    /// than this limit is refused with [`Error::InvalidInput`]; collecting
+    /// completions cannot make it fit.
     #[must_use]
     pub fn max_bytes(mut self, bytes: usize) -> Self {
         self.bytes = bytes;
@@ -222,6 +224,9 @@ impl State {
 }
 
 struct CallbackState {
+    // Immutable, so permanent admission failures need neither the state lock
+    // nor a native descriptor allocation.
+    max_bytes: usize,
     state: Mutex<State>,
     changed: Condvar,
     protocol_error: AtomicBool,
@@ -240,6 +245,7 @@ impl CallbackState {
             .try_reserve_exact(options.frames)
             .map_err(unavailable)?;
         let state = Box::new(Self {
+            max_bytes: options.bytes,
             state: Mutex::new(State {
                 in_flight,
                 ready,
@@ -258,6 +264,16 @@ impl CallbackState {
         drop(state.state.lock());
         state.changed.notify_all();
         Ok(state)
+    }
+
+    fn validate_frame_size(&self, bytes: usize) -> Result<()> {
+        if bytes > self.max_bytes {
+            return Err(Error::InvalidInput(format!(
+                "frame retains {bytes} bytes of allocation capacity, exceeding the queue's {} byte limit",
+                self.max_bytes
+            )));
+        }
+        Ok(())
     }
 
     /// Record that the SDK has finished with the frame whose data is at
@@ -494,8 +510,10 @@ impl QueuedSender {
     ///
     /// # Errors
     ///
-    /// Returns the frame with [`Error::QueueFull`] when the frame would take
-    /// the queue past a limit in [`QueueOptions`] ([`QueueLimit::Frames`] or
+    /// Returns the frame with [`Error::InvalidInput`] when its retained
+    /// allocation capacity alone exceeds [`QueueOptions::max_bytes`], or with
+    /// [`Error::QueueFull`] when the frames already retained leave no room
+    /// within [`QueueOptions`] ([`QueueLimit::Frames`] or
     /// [`QueueLimit::Bytes`]; collect completed frames and submit it again),
     /// with [`Error::UnexpectedSdkResult`] when the queue has failed (see
     /// [`completion_protocol_failed`](Self::completion_protocol_failed)),
@@ -511,6 +529,10 @@ impl QueuedSender {
         if let Err(error) = frame.validate(&self.sender) {
             return Err(failure(error, frame));
         }
+        let bytes = frame.retained_bytes();
+        if let Err(error) = self.callback.validate_frame_size(bytes) {
+            return Err(failure(error, frame));
+        }
         if self.callback.protocol_error.load(Ordering::Acquire) {
             return Err(failure(
                 Error::UnexpectedSdkResult(
@@ -520,7 +542,6 @@ impl QueuedSender {
             ));
         }
         let header = AliasableBox::new(Box::new(frame.raw()));
-        let bytes = frame.retained_bytes();
         let key = header.p_data as usize;
         let pointer = header.as_ptr();
         let id = {
@@ -657,6 +678,26 @@ fn take_completed(state: &mut State) -> Option<CompletedVideo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permanent_admission_check_needs_no_lock_or_descriptor() {
+        let state = CallbackState::new(QueueOptions::default().max_bytes(4)).unwrap();
+        // An occupied lock cannot delay this check. The error's diagnostic
+        // String is its only allocation; there is no descriptor allocation.
+        let _locked = state.state.lock().unwrap();
+        let (result, allocations) =
+            crate::test_alloc::allocation_count(|| state.validate_frame_size(1024));
+        let Error::InvalidInput(message) = result.unwrap_err() else {
+            panic!("an oversized frame is not retryable");
+        };
+        assert!(message.contains("1024"));
+        assert!(message.contains("4 byte limit"));
+        assert_eq!(allocations, 1);
+        let (result, allocations) =
+            crate::test_alloc::allocation_count(|| state.validate_frame_size(4));
+        result.unwrap();
+        assert_eq!(allocations, 0);
+    }
 
     fn insert(state: &CallbackState, id: u64) -> usize {
         let mut frame =

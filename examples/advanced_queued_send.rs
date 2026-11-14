@@ -50,7 +50,8 @@ fn main() -> Result<(), Error> {
                     spare.push(done.into_frame());
                 }
             }
-            // Any other rejection would not succeed by waiting.
+            // Other rejections, including a frame larger than max_bytes,
+            // would not succeed by waiting.
             Err(rejected) => return Err(rejected.into_error()),
         }
         next_tick += interval;

@@ -127,7 +127,9 @@ yet collected and spare payload/metadata capacity. Check defaults and exact
 accounting in [`QueueOptions`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.QueueOptions.html).
 
 `try_submit` returns a `SubmissionId` or the rejected frame. For `QueueFull`,
-collect completions and retry; inspect other errors before retrying.
+collect completions and retry. A frame whose retained allocation capacity
+alone exceeds `max_bytes` returns `InvalidInput`; waiting cannot make it fit.
+Inspect other errors before retrying.
 `try_take_completed` and `wait_completed` return reusable frames on the
 application thread. Submitting moves payload ownership but allocates a native
 descriptor. The queue's SDK completion callback runs no application code.
