@@ -597,9 +597,13 @@ impl FrameSync {
     /// Access the underlying receiver.
     ///
     /// Use this to access receiver functionality like tally, PTZ, status
-    /// queries, metadata capture or event polling while the FrameSync is
-    /// active. Tally control publishes state upstream; it does not query
-    /// incoming tally.
+    /// queries and metadata capture while FrameSync is active. Native
+    /// synchronization can consume status notifications, so this receiver has
+    /// no event polling. Query capabilities with `ptz().is_supported()`,
+    /// `web_control_url()` and Advanced KVM's `is_supported()`; observe the
+    /// source with `poll_source_name_change()` and connection state with
+    /// `is_connected()` or `connection_stats()`.
+    /// Tally control publishes state upstream; it does not query incoming tally.
     ///
     /// This receiver mode has no raw video or audio capture, because the
     /// synchronizer takes the receiver's video and audio: raw audio capture
@@ -748,7 +752,8 @@ impl FrameSync {
     ///
     /// Returns [`Error::InvalidFrame`] when the SDK returned an unsupported
     /// format or malformed frame descriptor, including invalid dimensions,
-    /// stride, buffers, or metadata.
+    /// stride, or buffers. Unreadable per-frame metadata is withheld; inspect
+    /// [`VideoSource::metadata_status`](crate::VideoSource::metadata_status).
     pub fn capture_video_ref(&self, scan_type: ScanType) -> Result<Option<FrameSyncVideoRef<'_>>> {
         FrameSyncCapture {
             resource: &self.resource,
@@ -822,6 +827,8 @@ impl FrameSync {
     /// the request's channels and samples per channel; the SDK can supply
     /// silence whenever current input is unavailable, including after input
     /// previously arrived. Successful output does not prove fresh reception.
+    /// Output without a source timestamp reports `timestamp() == None`; without
+    /// a source timecode it carries [`crate::Timecode::SYNTHESIZE`].
     /// See the [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
     ///
     /// # Following the source's format
@@ -834,7 +841,8 @@ impl FrameSync {
     /// # Errors
     ///
     /// Returns frame-validation errors only if the SDK returns malformed audio
-    /// dimensions, sample layout, buffers, or metadata. A capture before any
+    /// dimensions, sample layout, or buffers. Unreadable per-frame metadata is
+    /// withheld; inspect [`AudioSource::metadata_status`](crate::AudioSource::metadata_status). A capture before any
     /// audio has arrived is not an error. Request dimensions were already
     /// validated at construction.
     ///
@@ -1039,7 +1047,8 @@ fn input_format(returned: &NDIlib_audio_frame_v3_t) -> Result<Option<AudioInputF
         ReturnedAudio::Empty(format) => Ok(format),
         ReturnedAudio::Samples(layout) => Err(Error::InvalidFrame(format!(
             "FrameSync audio input-format query returned {} channels of {} samples",
-            layout.no_channels, layout.no_samples
+            layout.no_channels(),
+            layout.no_samples()
         ))),
     }
 }
@@ -1250,10 +1259,12 @@ mod tests {
                 assert!(frame
                     .channels()
                     .all(|channel| channel.iter().all(|&s| s == 0.0)));
+                assert_eq!(frame.timestamp(), None);
             });
             assert_eq!(allocations, 0);
             assert_eq!(audio_test_calls::take(), (1, 1));
             let owned = fs.capture_audio(request).unwrap();
+            assert_eq!(owned.timestamp(), None);
             assert_eq!((owned.num_channels(), owned.num_samples()), (2, 1024));
             assert_eq!(audio_test_calls::take(), (1, 1));
         }
@@ -1382,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn test_framesync_video_ref_rejects_malformed_metadata() {
+    fn test_framesync_video_ref_withholds_malformed_metadata() {
         let width = 16;
         let height = 8;
         let stride = width * 4;
@@ -1409,10 +1420,13 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        assert!(matches!(
-            unsafe { FrameSyncVideoRef::new(guard) },
-            Err(Error::InvalidFrame(_))
-        ));
+        let frame = unsafe { FrameSyncVideoRef::new(guard) }.unwrap();
+        assert_eq!(frame.metadata(), None);
+        assert_eq!(
+            frame.metadata_status(),
+            crate::FrameMetadataStatus::Unterminated
+        );
+        assert_eq!(frame.to_owned().metadata(), None);
     }
 
     #[test]
@@ -1575,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn test_framesync_audio_ref_rejects_invalid_utf8_metadata() {
+    fn test_framesync_audio_ref_withholds_invalid_utf8_metadata() {
         let no_samples = 4;
         let no_channels = 2;
         let mut data = vec![0.0f32; (no_samples * no_channels) as usize];
@@ -1597,9 +1611,9 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        assert!(matches!(
-            unsafe { FrameSyncAudioRef::new(guard) },
-            Err(Error::InvalidUtf8(_))
-        ));
+        let frame = unsafe { FrameSyncAudioRef::new(guard) }.unwrap();
+        assert_eq!(frame.metadata(), None);
+        assert_eq!(frame.metadata_status(), crate::FrameMetadataStatus::NotUtf8);
+        assert_eq!(frame.to_owned().metadata(), None);
     }
 }

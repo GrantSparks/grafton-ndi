@@ -6,6 +6,8 @@
 //! `GRAFTON_NDI_REQUIRE_RUNTIME` promises `file`. Each test records its own
 //! material from a sender on the loopback interface; none needs a prepared file.
 
+mod async_shutdown;
+
 use super::*;
 use crate::{
     test_support::{self, file_api},
@@ -31,10 +33,10 @@ const PATIENCE: Duration = Duration::from_secs(15);
 /// Its name is taken exclusively, so runs that share a temporary directory,
 /// even with the same process identifier in different namespaces, cannot use
 /// or remove each other's recordings.
-struct Scratch(PathBuf);
+pub(super) struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new(test: &str) -> Self {
+    pub(super) fn new(test: &str) -> Self {
         let mut attempt = 0u32;
         loop {
             let nanos = std::time::SystemTime::now()
@@ -52,7 +54,7 @@ impl Scratch {
         }
     }
 
-    fn path(&self, name: &str) -> PathBuf {
+    pub(super) fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
 }
@@ -64,7 +66,7 @@ impl Drop for Scratch {
 }
 
 /// A sender that produces video until dropped, reachable over loopback.
-struct LiveSource {
+pub(super) struct LiveSource {
     spec: SourceSpec,
     running: Arc<AtomicBool>,
     larger_frames: Arc<AtomicBool>,
@@ -72,7 +74,7 @@ struct LiveSource {
 }
 
 impl LiveSource {
-    fn start(ndi: &crate::Ndi, test: &str) -> Self {
+    pub(super) fn start(ndi: &crate::Ndi, test: &str) -> Self {
         let name = format!("grafton-file-{}-{test}", std::process::id());
         let sender = crate::Sender::new(ndi, &crate::SenderOptions::new(name.as_str())).unwrap();
         let spec = Self::loopback(ndi, &sender);
@@ -147,7 +149,7 @@ impl Drop for LiveSource {
 }
 
 /// Options that record the live source's video to exactly the given file name.
-fn exact_video(source: &LiveSource) -> RecorderOptions {
+pub(super) fn exact_video(source: &LiveSource) -> RecorderOptions {
     RecorderOptions::new(source.spec.clone())
         .naming(FileNaming::Exact)
         .proxy(false)
@@ -196,9 +198,9 @@ fn await_event(recorder: &mut FileRecorder, kind: RecorderEventKind) -> Recorder
 
 /// The events a test has taken from a recorder, with the time each arrived.
 ///
-/// A test waits on it for an event about one particular file, whatever order
-/// the SDK reports the events of a rollover in, and prints it when a check
-/// fails, so that the failure says what the SDK reported and when.
+/// A test waits on it for an event about one particular file. Rollover checks
+/// assert that the next file opens before the previous one closes, and print
+/// the timeline on failure so the report includes native event order and time.
 struct Timeline {
     began: Instant,
     events: Vec<(Duration, RecorderEvent)>,
@@ -260,6 +262,21 @@ impl Timeline {
         let next = self.await_event(recorder, since, RecorderEventKind::Rollover, None);
         self.await_event(recorder, since, RecorderEventKind::FileClosed, Some(left));
         self.await_event(recorder, since, RecorderEventKind::FirstFrame, Some(&next));
+        let position = |kind, file: &Path| {
+            self.events[since..]
+                .iter()
+                .position(|(_, event)| {
+                    event.kind() == kind
+                        && Path::new(event.path().to_string_lossy().as_ref()) == file
+                })
+                .unwrap_or_else(|| panic!("no {kind:?} for {file:?}:\n{self}"))
+        };
+        assert!(
+            position(RecorderEventKind::Rollover, &next)
+                < position(RecorderEventKind::FileClosed, left),
+            "the next file must open before the previous file closes; recorder finality \
+             depends on this native event order:\n{self}"
+        );
         assert_eq!(recorder.state(), RecorderState::Recording, "{self}");
         next
     }
@@ -495,6 +512,132 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
 }
 
 #[test]
+fn rollovers_open_the_next_file_before_closing_the_previous_file() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("rollover-order");
+    let source = LiveSource::start(&ndi, "rollover-order");
+    // Sixteen changes per case pin thirty-two rollovers for each mechanism,
+    // including recording both with and without the source's proxy stream.
+    const CHANGES: usize = 16;
+    for proxy in [false, true] {
+        for mechanism in ["explicit", "source", "size"] {
+            let prefix = format!("{mechanism}-proxy-{proxy}");
+            let options = RecorderOptions::new(source.spec.clone())
+                .naming(FileNaming::Indexed)
+                .proxy(proxy)
+                .tracks(MediaTypes::VIDEO)
+                .rollover_size(if mechanism == "size" { 65_536 } else { 0 });
+            let mut recorder = api.create_recorder(&options).unwrap();
+            let mut timeline = Timeline::new();
+            recorder
+                .start(
+                    &RecordingTarget::new(scratch.path(&prefix)).unwrap(),
+                    RecordingTimecode::Preserve,
+                )
+                .unwrap();
+            let mut current =
+                timeline.await_event(&mut recorder, 0, RecorderEventKind::Started, None);
+            timeline.await_event(
+                &mut recorder,
+                0,
+                RecorderEventKind::FirstFrame,
+                Some(&current),
+            );
+            for index in 0..CHANGES {
+                let since = timeline.mark();
+                match mechanism {
+                    "explicit" => recorder
+                        .rollover(
+                            &RecordingTarget::new(scratch.path(&format!("{prefix}-{index}")))
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                    "source" => recorder.set_source(&source.spec).unwrap(),
+                    "size" => {} // The configured size threshold triggers this change.
+                    _ => unreachable!(),
+                }
+                current = timeline.await_change(&mut recorder, since, &current);
+            }
+            let outcome = recorder.finish(PATIENCE).unwrap();
+            let FinishStatus::Closed(report) = outcome else {
+                panic!("{prefix} did not reach confirmed closure: {outcome:?}\n{timeline}");
+            };
+            assert!(report.closure_confirmed(), "{prefix}: {timeline}");
+            assert!(
+                report.closed_files() > CHANGES as u64,
+                "{prefix}: {timeline}"
+            );
+            assert_eq!(report.dropped_events(), 0, "{prefix}: {timeline}");
+        }
+    }
+}
+
+#[test]
+fn generated_recording_timecode_replays_its_explicit_start() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("generated-timecode");
+    let source = LiveSource::start(&ndi, "generated-timecode");
+    let file = scratch.path("timecode.mkv");
+    let start = crate::Timecode::from_ticks(360_000_000_000);
+    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
+    recorder
+        .start(
+            &RecordingTarget::new(&file).unwrap(),
+            RecordingTimecode::GenerateFrom(SessionTimecode::new(start).unwrap()),
+        )
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    thread::sleep(Duration::from_millis(500));
+    assert!(matches!(
+        recorder.finish(PATIENCE).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    assert!(api.probe(&file).unwrap().duration().is_final());
+
+    let name = format!("grafton-generated-timecode-player-{}", std::process::id());
+    let mut player = api.create_player(&PlayerOptions::new(name)).unwrap();
+    player.start(&file).unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no first playback frame event arrived"
+        );
+        let Some(event) = player.poll_event(Duration::from_millis(50)).unwrap() else {
+            continue;
+        };
+        assert_ne!(event.kind(), PlayerEventKind::Error, "{event:?}");
+        if event.kind() == PlayerEventKind::FirstFrame {
+            assert_eq!(event.source_timecode(), Some(start));
+            break;
+        }
+    }
+    let mut previous = start;
+    let mut advancing_samples = 0;
+    while advancing_samples < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "playback timecodes did not advance from {start:?}"
+        );
+        let event = player.poll_event(Duration::from_millis(50)).unwrap();
+        assert!(event.is_none_or(|event| event.kind() != PlayerEventKind::Error));
+        let timecode = player
+            .source_timecode()
+            .expect("the last displayed frame has a timecode");
+        assert!(timecode >= previous, "{timecode:?} preceded {previous:?}");
+        assert_ne!(timecode, crate::Timecode::SYNTHESIZE);
+        if timecode > previous {
+            advancing_samples += 1;
+        }
+        previous = timecode;
+    }
+}
+
+#[test]
 fn injected_metadata_is_recorded_on_the_metadata_track() {
     let Some((ndi, api)) = file_api() else {
         return;
@@ -517,7 +660,9 @@ fn injected_metadata_is_recorded_on_the_metadata_track() {
     recorder
         .start(
             &RecordingTarget::new(&file).unwrap(),
-            RecordingTimecode::GenerateFrom(crate::Timecode::from_ticks(36_000_000_000)),
+            RecordingTimecode::GenerateFrom(
+                SessionTimecode::new(crate::Timecode::from_ticks(36_000_000_000)).unwrap(),
+            ),
         )
         .unwrap();
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
@@ -782,7 +927,10 @@ fn the_file_library_stays_selected_after_its_handles_are_dropped() {
                 &ndi,
                 &FileRuntimeOptions::default().library_path(selected.with_file_name("other"))
             ),
-            Err(Error::RuntimeConflict(_))
+            Err(Error::RuntimeConflict {
+                kind: crate::SelectionConflict::DifferentLibrary,
+                ..
+            })
         ));
         FileApi::open(&ndi, &FileRuntimeOptions::default().library_path(selected)).unwrap();
     }

@@ -21,6 +21,16 @@ impl Snapshot {
     fn refresh(&mut self) {
         self.generation += 1;
         let scenario = std::env::var("GRAFTON_FAKE_FINDER_CASE").unwrap();
+        #[cfg(fake_changes)]
+        if scenario == "broadcast" {
+            self.plain = [c"OTHER (Unrelated)", c"STUDIO (Camera 1)", c"STUDIO (Camera 2)", c"STUDIO (Camera 3)"]
+                .into_iter().take(1 + super::changes::sources().generation().min(3))
+                .map(|name| NDIlib_source_t {
+                    p_ndi_name: name.as_ptr(),
+                    ..Default::default()
+                }).collect();
+            return;
+        }
         if scenario.starts_with("selection") {
             let alternate = self.scope == "Remote";
             let (first, second) = if alternate {
@@ -142,6 +152,10 @@ export! {
         snapshot.plain.as_ptr()
     }
     fn NDIlib_find_wait_for_sources(_p_instance: NDIlib_find_instance_t, timeout_in_ms: u32) -> bool {
+        #[cfg(fake_changes)]
+        if std::env::var("GRAFTON_FAKE_FINDER_CASE").unwrap() == "broadcast" {
+            return super::changes::sources().wait(timeout_in_ms, "finder");
+        }
         if std::env::var("GRAFTON_FAKE_FINDER_CASE").unwrap() == "deadline" {
             deadline_gate("hold-wait", "waiting", "wait-release");
             return false;

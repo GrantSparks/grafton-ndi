@@ -8,9 +8,10 @@ use crate::{Error, Result};
 /// and several other objects; the document's properties are defined by the
 /// NDI Advanced SDK documentation. This type holds one such document: it is
 /// checked to be a JSON object, kept byte for byte (unknown properties
-/// included), immutable, and cheap to clone. An object takes it through the
-/// `config` setter of its options, such as
+/// included), immutable, and cheap to clone. Most objects take it through an
+/// options value's `config` setter, such as
 /// [`SenderOptions::config`](crate::SenderOptions::config).
+/// [`Genlock::new`](super::Genlock::new) takes it directly as an argument.
 ///
 /// A configuration can carry vendor credentials or network details, so its
 /// `Debug` output shows no content and no error message quotes it.

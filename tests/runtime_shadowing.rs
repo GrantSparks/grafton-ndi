@@ -12,7 +12,10 @@ mod fixture;
 mod runtime_fixture;
 
 use fixture::FixtureDir;
-use grafton_ndi::{capabilities::SdkEdition, runtime::RuntimeOptions, Error, Ndi};
+use grafton_ndi::{
+    capabilities::SdkEdition, runtime::RuntimeOptions, Error, LibraryKind, LoadFailure, LoadOrigin,
+    LoadRefusal, Ndi,
+};
 use runtime_fixture::FakeRuntime;
 use std::{
     fs,
@@ -102,9 +105,13 @@ fn standard() -> RuntimeOptions {
     RuntimeOptions::default().edition(SdkEdition::Standard)
 }
 
-fn load_failure() -> String {
+fn load_failure() -> LoadFailure {
     match Ndi::with_options(&standard()) {
-        Err(Error::RuntimeLoadFailed(reason)) => reason,
+        Err(Error::RuntimeLoadFailed(reason)) => {
+            assert_eq!(reason.library(), LibraryKind::Runtime);
+            assert!(reason.loaded_any());
+            reason
+        }
         Err(other) => panic!("expected a load failure, got {other}"),
         Ok(ndi) => panic!("expected a load failure, but loaded {:?}", ndi.info()),
     }
@@ -113,30 +120,31 @@ fn load_failure() -> String {
 fn child(name: &str, root: &Path) {
     let rejected = root.join("rejected").join(NAME);
     let usable = root.join("usable").join(NAME);
-    let missing_entry_point =
-        "it does not export the required entry point NDIlib_send_set_failover";
+    let missing_entry_point = LoadRefusal::MissingEntryPoint {
+        symbol: "NDIlib_send_set_failover".into(),
+        required: true,
+        detail: None,
+    };
     match name {
         "rejected_module_shadows_the_loader_search" => {
             let reason = load_failure();
-            // The file in the runtime directory is rejected for its own defect.
-            assert!(
-                reason.contains(&format!(
-                    "{} (NDI_RUNTIME_DIR_V6): {missing_entry_point}",
-                    rejected.display()
-                )),
-                "{reason}"
+            let environment = reason
+                .attempts()
+                .iter()
+                .find(|a| a.origin() == LoadOrigin::RuntimeDirectory)
+                .unwrap();
+            assert_eq!(environment.location(), rejected);
+            assert_eq!(environment.refusal(), &missing_entry_point);
+            assert!(environment.loaded());
+            let loader = reason.attempts().last().unwrap();
+            assert_eq!(loader.origin(), LoadOrigin::LoaderSearch);
+            assert_eq!(
+                loader.refusal(),
+                &LoadRefusal::AlreadyRefused {
+                    path: rejected.clone(),
+                    refusal: Box::new(missing_entry_point.clone())
+                }
             );
-            // The search by name gets that same module back, and says so
-            // rather than reporting the defect as another library's.
-            assert!(
-                reason.contains(&format!(
-                    "{NAME} (system library search): the platform loader returned {}, which is \
-                     already loaded and was rejected",
-                    rejected.display()
-                )),
-                "{reason}"
-            );
-            assert!(reason.contains("pass an explicit library path"), "{reason}");
             // The usable library was never reached by name; naming its file
             // reaches it.
             let ndi = Ndi::with_options(&standard().library_path(usable.clone())).unwrap();
@@ -144,41 +152,40 @@ fn child(name: &str, root: &Path) {
         }
         "loader_search_reports_the_file_it_resolved" => {
             let reason = load_failure();
-            assert!(
-                reason.contains(&format!(
-                    "{NAME} (system library search) resolved to {}: {missing_entry_point}",
-                    rejected.display()
-                )),
-                "{reason}"
-            );
-            // A second search meets the same loaded module again.
+            let loader = reason.attempts().last().unwrap();
+            assert_eq!(loader.origin(), LoadOrigin::LoaderSearch);
+            assert_eq!(loader.resolved_path(), Some(rejected.as_path()));
+            assert_eq!(loader.refusal(), &missing_entry_point);
             let again = load_failure();
-            assert!(
-                again.contains(&format!(
-                    "the platform loader returned {}, which is already loaded and was rejected",
-                    rejected.display()
-                )),
-                "{again}"
+            assert_eq!(
+                again.attempts().last().unwrap().refusal(),
+                &LoadRefusal::AlreadyRefused {
+                    path: rejected.clone(),
+                    refusal: Box::new(missing_entry_point.clone())
+                }
             );
         }
         "module_that_cannot_be_identified_shadows_the_loader_search" => {
             let anchorless = root.join("anchorless").join(NAME);
             let reason = load_failure();
+            let environment = reason
+                .attempts()
+                .iter()
+                .find(|a| a.origin() == LoadOrigin::RuntimeDirectory)
+                .unwrap();
+            assert_eq!(environment.location(), anchorless);
+            assert!(environment.loaded());
             assert!(
-                reason.contains(&format!(
-                    "{} (NDI_RUNTIME_DIR_V6): it does not export NDIlib_version",
-                    anchorless.display()
-                )),
-                "{reason}"
+                matches!(environment.refusal(), LoadRefusal::MissingEntryPoint { symbol, required: false, .. } if symbol == "NDIlib_version")
             );
-            // It stays loaded all the same, and the search by name gets it back.
-            assert!(
-                reason.contains(&format!(
-                    "{NAME} (system library search): the platform loader returned {}, which is \
-                     already loaded and was rejected",
-                    anchorless.display()
-                )),
-                "{reason}"
+            let loader = reason.attempts().last().unwrap();
+            assert_eq!(loader.origin(), LoadOrigin::LoaderSearch);
+            assert_eq!(
+                loader.refusal(),
+                &LoadRefusal::AlreadyRefused {
+                    path: anchorless,
+                    refusal: Box::new(environment.refusal().clone())
+                }
             );
             let ndi = Ndi::with_options(&standard().library_path(usable.clone())).unwrap();
             assert_eq!(ndi.info().library_path(), Some(usable.as_path()));

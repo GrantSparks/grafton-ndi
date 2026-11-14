@@ -76,7 +76,17 @@ fn native_resource_ownership() {
     fs::create_dir_all(&directory).unwrap();
     let standard = fixture(&directory, false);
     let advanced = fixture(&directory, true);
+    let missing_scatter = directory.join("missing-scatter");
+    fs::create_dir_all(&missing_scatter).unwrap();
+    let missing_scatter = FakeRuntime {
+        cfgs: vec!["fake_objects", "fake_advanced", "fake_omit_scatter"],
+        version: Some("6.4.0.0"),
+        ..Default::default()
+    }
+    .build(&missing_scatter.join("libndi_advanced.so"));
     let mut scenarios = vec![
+        "sender_unregistered",
+        "sender_copy_reuse",
         "sender_registration",
         "dropped_sender_advertiser",
         "receiver_registration",
@@ -90,6 +100,11 @@ fn native_resource_ownership() {
         scenarios.extend([
             "queue_immediate",
             "queue_backlog",
+            "queue_split",
+            "queue_scatter_immediate",
+            "queue_scatter_delayed",
+            "queue_scatter_protocol",
+            "queue_scatter_unavailable",
             "queue_destroy",
             "queue_registered_sender",
         ]);
@@ -101,7 +116,9 @@ fn native_resource_ownership() {
             .env("GRAFTON_OWNERSHIP_CHILD", case)
             .env(
                 "GRAFTON_OWNERSHIP_LIBRARY",
-                if case.starts_with("queue_") {
+                if case == "queue_scatter_unavailable" {
+                    &missing_scatter
+                } else if case.starts_with("queue_") {
                     &advanced
                 } else {
                     &standard
@@ -109,7 +126,13 @@ fn native_resource_ownership() {
             )
             .env(
                 "GRAFTON_FAKE_CALLBACK_MODE",
-                if matches!(case, "queue_immediate" | "queue_backlog") {
+                if matches!(
+                    case,
+                    "queue_immediate"
+                        | "queue_backlog"
+                        | "queue_scatter_immediate"
+                        | "queue_scatter_protocol"
+                ) {
                     "immediate"
                 } else {
                     "delayed"
@@ -169,6 +192,51 @@ fn child(case: &str) {
         }
     }
     match case {
+        "sender_copy_reuse" => {
+            use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
+            std::env::set_var("GRAFTON_FAKE_VALIDATE_VIDEO_COPY", "1");
+            let mut sender = sender(&ndi);
+            let mut pixels = vec![0; 16 * 16 * 4];
+            // The fake SDK rereads each previous submission during the next
+            // native call, before returning its release proof. Refilling the
+            // frame still in flight would change the byte it expects.
+            for value in 1..=6 {
+                pixels.fill(value);
+                let source = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
+                    .build()
+                    .unwrap();
+                sender.send_video_async_copy(&source).unwrap();
+            }
+            pixels.fill(9);
+            drop(pixels);
+            drop(sender);
+            let events = log();
+            for value in 1..=6 {
+                assert_eq!(
+                    events
+                        .matches(&format!("sender-copy-released={value}\n"))
+                        .count(),
+                    1
+                );
+            }
+            assert_eq!(events.matches("sender-submit-return\n").count(), 6);
+            assert!(
+                position(&events, "sender-flush") < position(&events, "sender-copy-released=6")
+            );
+            assert!(
+                position(&events, "sender-copy-released=6")
+                    < position(&events, "sender-destroy-begin")
+            );
+        }
+        "sender_unregistered" => {
+            let mut sender = sender(&ndi);
+            sender.send_video_async(frame()).unwrap();
+            drop(sender);
+            let events = log();
+            assert_eq!(events.matches("sender-flush\n").count(), 1);
+            assert!(position(&events, "sender-flush") < position(&events, "sender-destroy-begin"));
+            assert_eq!(events.matches("sender-destroy\n").count(), 1);
+        }
         "sender_registration" => {
             let mut sender = sender(&ndi);
             let mut advertiser = SendAdvertiser::new(&ndi, &server()).unwrap();
@@ -410,10 +478,7 @@ fn child(case: &str) {
             )
             .unwrap();
             let rejected = small.try_submit(frame()).unwrap_err();
-            assert!(matches!(
-                rejected.error(),
-                Error::QueueFull(QueueLimit::Bytes)
-            ));
+            assert!(matches!(rejected.error(), Error::InvalidInput(_)));
             assert_eq!(small.retained_frames(), 0);
             assert_eq!(log().matches("sender-submit-return\n").count(), 2);
 
@@ -436,10 +501,7 @@ fn child(case: &str) {
             )
             .unwrap();
             let rejected = bounded.try_submit(packet).unwrap_err();
-            assert!(matches!(
-                rejected.error(),
-                Error::QueueFull(QueueLimit::Bytes)
-            ));
+            assert!(matches!(rejected.error(), Error::InvalidInput(_)));
             let grafton_ndi::advanced::QueuedVideoFrame::Compressed(packet) = rejected.into_inner()
             else {
                 panic!("the rejected frame changed type");
@@ -447,6 +509,190 @@ fn child(case: &str) {
             assert_eq!(packet.metadata().unwrap().as_ptr(), metadata_pointer);
             assert_eq!(bounded.retained_frames(), 0);
             assert_eq!(log().matches("sender-submit-return\n").count(), 2);
+
+            let packet = |capacity| {
+                let mut bytes = Vec::with_capacity(capacity);
+                bytes.extend_from_slice(&[0; 4]);
+                CompressedVideoFrame::new(
+                    VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16).unwrap(),
+                    bytes,
+                )
+                .unwrap()
+            };
+            let mut exact = QueuedSender::new(
+                &ndi,
+                &SenderOptions::new("queue exact capacity"),
+                QueueOptions::default().max_bytes(4),
+            )
+            .unwrap();
+            let first = exact.try_submit(packet(4)).unwrap();
+            let rejected = exact.try_submit(packet(4)).unwrap_err();
+            assert!(matches!(
+                rejected.error(),
+                Error::QueueFull(QueueLimit::Bytes)
+            ));
+            let pooled = packet(1024);
+            let original = pooled.data().as_ptr();
+            let refused = exact.try_submit(pooled).unwrap_err();
+            assert!(matches!(refused.error(), Error::InvalidInput(_)));
+            let grafton_ndi::advanced::QueuedVideoFrame::Compressed(pooled) = refused.into_inner()
+            else {
+                panic!("the rejected frame changed type");
+            };
+            assert_eq!(pooled.data().as_ptr(), original);
+            assert_eq!(exact.retained_frames(), 1);
+            assert_eq!(log().matches("sender-submit-return\n").count(), 3);
+            assert_eq!(
+                exact.wait_completed(Duration::ZERO).unwrap().unwrap().id(),
+                first
+            );
+            exact.try_submit(rejected.into_inner()).unwrap();
+            assert_eq!(log().matches("sender-submit-return\n").count(), 4);
+        }
+        #[cfg(feature = "advanced")]
+        "queue_scatter_immediate"
+        | "queue_scatter_delayed"
+        | "queue_scatter_protocol"
+        | "queue_scatter_unavailable" => {
+            use grafton_ndi::advanced::{
+                QueueOptions, QueuedSender, QueuedVideoFrame, ScatterVideoFrame, VideoCodec,
+                VideoPacketFormat,
+            };
+            let packet = || {
+                ScatterVideoFrame::new(
+                    VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16).unwrap(),
+                    vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+                )
+                .unwrap()
+            };
+            let mut queue = QueuedSender::new(
+                &ndi,
+                &SenderOptions::new("scatter queue"),
+                QueueOptions::default(),
+            )
+            .unwrap();
+            if case == "queue_scatter_unavailable" {
+                let frame = packet();
+                let original = frame
+                    .blocks()
+                    .map(|block| block.as_ptr())
+                    .collect::<Vec<_>>();
+                let rejected = queue.try_submit(frame).unwrap_err();
+                assert!(matches!(
+                    rejected.error(),
+                    Error::UnsupportedCapability {
+                        feature: RuntimeFeature::ScatterSend,
+                        ..
+                    }
+                ));
+                let QueuedVideoFrame::Scatter(frame) = rejected.into_inner() else {
+                    panic!("the frame changed type")
+                };
+                assert_eq!(
+                    frame
+                        .blocks()
+                        .map(|block| block.as_ptr())
+                        .collect::<Vec<_>>(),
+                    original
+                );
+                assert!(!log().contains("sender-scatter-submit"));
+            } else if case == "queue_scatter_protocol" {
+                std::env::set_var("GRAFTON_FAKE_SCATTER_KEY", "altered");
+                queue.try_submit(packet()).unwrap();
+                assert!(queue.completion_protocol_failed());
+                assert_eq!(queue.retained_frames(), 1);
+                assert!(queue.try_take_completed().is_none());
+                assert!(matches!(
+                    queue.try_submit(packet()).unwrap_err().error(),
+                    Error::UnexpectedSdkResult(_)
+                ));
+            } else {
+                let mut submitted = Vec::new();
+                for _ in 0..3 {
+                    let frame = packet();
+                    let original = frame
+                        .blocks()
+                        .map(|block| block.as_ptr() as usize)
+                        .collect::<Vec<_>>();
+                    let id = queue.try_submit(frame).unwrap();
+                    submitted.push((id, original));
+                }
+                if case == "queue_scatter_delayed" {
+                    assert!(queue.try_take_completed().is_none());
+                    std::env::set_var("GRAFTON_FAKE_CALLBACK_MODE", "drain");
+                    let frame = packet();
+                    let original = frame
+                        .blocks()
+                        .map(|block| block.as_ptr() as usize)
+                        .collect::<Vec<_>>();
+                    let id = queue.try_submit(frame).unwrap();
+                    submitted.push((id, original));
+                }
+                for _ in 0..submitted.len() {
+                    let done = queue.wait_completed(Duration::ZERO).unwrap().unwrap();
+                    let original = &submitted.iter().find(|(id, _)| *id == done.id()).unwrap().1;
+                    let QueuedVideoFrame::Scatter(frame) = done.into_frame() else {
+                        panic!("the frame changed type")
+                    };
+                    let blocks = frame.into_blocks();
+                    assert_eq!(
+                        blocks
+                            .iter()
+                            .map(|block| block.as_ptr() as usize)
+                            .collect::<Vec<_>>(),
+                        *original
+                    );
+                    assert_eq!(blocks, [vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
+                }
+                assert_eq!(queue.retained_frames(), 0);
+                assert!(!queue.completion_protocol_failed());
+            }
+        }
+        #[cfg(feature = "advanced")]
+        "queue_split" => {
+            use grafton_ndi::{
+                advanced::{QueueOptions, QueuedSender},
+                AudioFrame,
+            };
+            use std::sync::{
+                atomic::{AtomicBool, Ordering},
+                Barrier,
+            };
+            let mut queue = QueuedSender::new(
+                &ndi,
+                &SenderOptions::new("split queue"),
+                QueueOptions::default(),
+            )
+            .unwrap();
+            queue.try_submit(frame()).unwrap();
+            let audio = AudioFrame::builder()
+                .num_samples(480)
+                .num_channels(2)
+                .build()
+                .unwrap();
+            let started = Barrier::new(2);
+            let finished = AtomicBool::new(false);
+            let (mut video, sender) = queue.split();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    started.wait();
+                    assert!(video
+                        .wait_completed(Duration::from_millis(250))
+                        .unwrap()
+                        .is_none());
+                    finished.store(true, Ordering::Release);
+                });
+                scope.spawn(|| {
+                    started.wait();
+                    sender.send_audio(&audio);
+                    assert!(!finished.load(Ordering::Acquire));
+                    assert_eq!(log().matches("sender-audio\n").count(), 1);
+                });
+            });
+            drop(queue);
+            let events = log();
+            assert!(position(&events, "sender-audio") < position(&events, "sender-destroy-begin"));
+            assert_eq!(events.matches("sender-completion\n").count(), 1);
         }
         #[cfg(feature = "advanced")]
         "queue_backlog" => {

@@ -5,7 +5,7 @@ use std::{
     ptr::NonNull,
 };
 
-use crate::Result;
+use crate::LoadRefusal;
 
 /// A source of native entry points: a pinned shared module or the statically
 /// linked SDK.
@@ -15,7 +15,7 @@ pub(crate) trait Resolver {
     /// # Errors
     ///
     /// Fails when the name resolves to code outside the selected implementation.
-    fn resolve(&self, name: &CStr) -> Result<Option<NonNull<c_void>>>;
+    fn resolve(&self, name: &CStr) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal>;
 }
 
 /// A table's exported symbol name, validated at compile time.
@@ -66,7 +66,7 @@ macro_rules! native_table {
             /// Resolve every entry point, or name the first one `resolver` lacks.
             pub(crate) fn load(
                 resolver: &dyn $crate::sys::table::Resolver,
-            ) -> $crate::Result<::std::result::Result<Self, &'static ::std::ffi::CStr>> {
+            ) -> ::std::result::Result<::std::result::Result<Self, &'static ::std::ffi::CStr>, $crate::LoadRefusal> {
                 Ok(Ok(Self {
                     $($name: {
                         const NAME: &::std::ffi::CStr =
@@ -112,7 +112,7 @@ pub(crate) struct ExportsWhere<F: Fn(&str) -> bool>(pub(crate) F);
 
 #[cfg(test)]
 impl<F: Fn(&str) -> bool> Resolver for ExportsWhere<F> {
-    fn resolve(&self, name: &CStr) -> Result<Option<NonNull<c_void>>> {
+    fn resolve(&self, name: &CStr) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
         let exported = (self.0)(name.to_str().expect("symbol names are ASCII"));
         Ok(exported.then(NonNull::dangling))
     }
@@ -161,7 +161,10 @@ mod tests {
 
         struct Stubs;
         impl Resolver for Stubs {
-            fn resolve(&self, name: &CStr) -> Result<Option<NonNull<c_void>>> {
+            fn resolve(
+                &self,
+                name: &CStr,
+            ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
                 Ok(NonNull::new(match name.to_bytes() {
                     b"NDIlib_initialize" => initialize as *mut c_void,
                     b"NDIlib_recv_destroy" => destroy as *mut c_void,
@@ -185,8 +188,14 @@ mod tests {
     fn a_provenance_failure_is_an_error_not_a_missing_symbol() {
         struct Foreign;
         impl Resolver for Foreign {
-            fn resolve(&self, _name: &CStr) -> Result<Option<NonNull<c_void>>> {
-                Err(crate::Error::RuntimeLoadFailed("outside the module".into()))
+            fn resolve(
+                &self,
+                _name: &CStr,
+            ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
+                Err(LoadRefusal::EntryPointOutsideModule {
+                    symbol: "NDIlib_initialize".into(),
+                    module: "selected module".into(),
+                })
             }
         }
         assert!(Pair::load(&Foreign).is_err());

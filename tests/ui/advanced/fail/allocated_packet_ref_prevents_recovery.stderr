@@ -1,0 +1,11 @@
+error[E0505]: cannot move out of `receiver` because it is borrowed
+ --> tests/ui/advanced/fail/allocated_packet_ref_prevents_recovery.rs:5:18
+  |
+3 | fn recover(receiver: AllocatedPacketReceiver) {
+  |            -------- binding `receiver` declared here
+4 |     let frame = receiver.capture_ref(Duration::ZERO).unwrap();
+  |                 -------- borrow of `receiver` occurs here
+5 |     let _owner = receiver.into_packet_receiver();
+  |                  ^^^^^^^^ move out of `receiver` occurs here
+6 |     drop(frame);
+  |          ----- borrow later used here

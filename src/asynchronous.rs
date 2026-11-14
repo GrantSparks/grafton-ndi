@@ -12,9 +12,9 @@
 //! exists when either feature is enabled, and each runtime only with its own
 //! feature; the crate root does not re-export any of it.
 //!
-//! The NDI SDK operations are inherently synchronous and blocking, so these wrappers
-//! use `spawn_blocking` internally to run NDI operations on a thread pool without
-//! blocking the async runtime. Besides capture, [`AsyncReceiver`] has async
+//! The NDI SDK operations are synchronous and blocking. Tokio runs them through
+//! `tokio::task::spawn_blocking`; smol uses `smol::unblock`, keeping the work off
+//! the async runtime's executor threads. Besides capture, [`AsyncReceiver`] has async
 //! versions of the receiver's other waiting calls:
 //! [`poll_event`](AsyncReceiver::poll_event), which returns the status and
 //! source changes that captures pass over and keep,
@@ -42,11 +42,14 @@
 //! metadata into new allocations (33,177,600 pixel bytes for 4K BGRA).
 //!
 //! Dropping a future sets a cancellation flag. Work is skipped if the blocking
-//! closure observes that flag at its entry gate. After passing that gate, work
-//! continues, including waiting for receiver access; it cannot be interrupted by
-//! dropping the future. A scoped callback may therefore execute after the
-//! future was dropped. Its time and side effects are not cancelled by the wait
-//! timeout either; callback panics become [`Error::SpawnFailed`].
+//! closure observes that flag at its entry gate. A budgeted wait also checks
+//! it before each subsequent attempt. An attempt already in flight, lasting at
+//! most 100 ms in the SDK, can still consume an item and run its scoped callback
+//! after the future was dropped. Callback time and side effects are not cancelled
+//! by the wait timeout either. A panic is caught on the worker, where SDK guards
+//! are released, then resumed on the awaiting task with its original payload.
+//! It unwinds through `select!` or `join!` as any other task panic does. If the
+//! future was dropped, its panic payload is discarded with the result.
 //!
 //! # Features
 //!
@@ -96,11 +99,11 @@ use crate::{
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
     timeout::Deadline,
     ConnectionStats, Error, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef, Result, Source,
-    SourceNameChange,
+    SourceNameChange, SpawnFailure,
 };
 
 mod private {
-    use std::future::Future;
+    use std::{future::Future, sync::atomic::AtomicBool};
 
     use crate::Result;
 
@@ -121,16 +124,25 @@ mod private {
         /// # Errors
         ///
         /// [`Error::SpawnFailed`](crate::Error::SpawnFailed) when the work
-        /// cannot be submitted, is cancelled before it starts, or panics.
+        /// has no runtime context or its task is cancelled. Panics are resumed
+        /// on the awaiting task after worker-owned resources are released.
         fn spawn_blocking<F, T>(token: Token, f: F) -> impl Future<Output = Result<T>> + Send
         where
             F: FnOnce() -> T + Send + 'static,
+            T: Send + 'static,
+        {
+            Self::spawn_stoppable(token, move |_| f())
+        }
+
+        fn spawn_stoppable<F, T>(token: Token, f: F) -> impl Future<Output = Result<T>> + Send
+        where
+            F: FnOnce(&AtomicBool) -> T + Send + 'static,
             T: Send + 'static;
     }
 }
 
-// Dropping a future prevents its queued closure from starting SDK work. Work
-// that has already passed this gate cannot be interrupted safely.
+// Dropping a future skips queued work and stops budgeted receiver waits
+// before their next attempt. An attempt or callback already in flight finishes.
 struct CancelOnDrop(Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
@@ -139,28 +151,50 @@ impl Drop for CancelOnDrop {
     }
 }
 
+#[cfg(test)]
 fn blocking_operation<F, T>(operation: F) -> (CancelOnDrop, impl FnOnce() -> Result<T> + Send)
 where
     F: FnOnce() -> T + Send,
+{
+    let (guard, work) = blocking_operation_with_stop(move |_| operation());
+    (guard, move || work().map(resume_work))
+}
+
+fn blocking_operation_with_stop<F, T>(
+    operation: F,
+) -> (
+    CancelOnDrop,
+    impl FnOnce() -> Result<std::thread::Result<T>> + Send,
+)
+where
+    F: FnOnce(&AtomicBool) -> T + Send,
 {
     let cancelled = Arc::new(AtomicBool::new(false));
     let guard = CancelOnDrop(Arc::clone(&cancelled));
     let work = move || {
         if cancelled.load(Ordering::Acquire) {
-            return Err(Error::SpawnFailed(
-                "Blocking operation cancelled before starting".into(),
-            ));
+            return Err(Error::SpawnFailed(SpawnFailure::TaskCancelled));
         }
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).map_err(|payload| {
-            let message = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("non-string panic payload");
-            Error::SpawnFailed(format!("Blocking operation panicked: {message}"))
-        })
+        Ok(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || operation(&cancelled),
+        )))
     };
     (guard, work)
+}
+
+fn resume_work<T>(outcome: std::thread::Result<T>) -> T {
+    match outcome {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[cfg(feature = "tokio")]
+fn tokio_join_error(error: ::tokio::task::JoinError) -> Error {
+    if error.is_panic() {
+        std::panic::resume_unwind(error.into_panic());
+    }
+    Error::SpawnFailed(SpawnFailure::TaskCancelled)
 }
 
 /// An async runtime whose blocking thread pool runs the NDI operations of an
@@ -188,19 +222,20 @@ impl private::Spawn for Tokio {
     // Using `impl Future` instead of `async fn` in trait because we need explicit
     // Send bounds on the returned future. This pattern is intentional.
     #[allow(clippy::manual_async_fn)]
-    fn spawn_blocking<F, T>(_: private::Token, f: F) -> impl Future<Output = Result<T>> + Send
+    fn spawn_stoppable<F, T>(_: private::Token, f: F) -> impl Future<Output = Result<T>> + Send
     where
-        F: FnOnce() -> T + Send + 'static,
+        F: FnOnce(&AtomicBool) -> T + Send + 'static,
         T: Send + 'static,
     {
         async {
             let handle = ::tokio::runtime::Handle::try_current()
-                .map_err(|e| Error::SpawnFailed(e.to_string()))?;
-            let (_cancellation, work) = blocking_operation(f);
-            handle
+                .map_err(|_| Error::SpawnFailed(SpawnFailure::NoRuntime))?;
+            let (_cancellation, work) = blocking_operation_with_stop(f);
+            let outcome = handle
                 .spawn_blocking(work)
                 .await
-                .map_err(|e| Error::SpawnFailed(e.to_string()))?
+                .map_err(tokio_join_error)??;
+            Ok(resume_work(outcome))
         }
     }
 }
@@ -220,14 +255,14 @@ impl private::Spawn for Smol {
     // Using `impl Future` instead of `async fn` in trait because we need explicit
     // Send bounds on the returned future. This pattern is intentional.
     #[allow(clippy::manual_async_fn)]
-    fn spawn_blocking<F, T>(_: private::Token, f: F) -> impl Future<Output = Result<T>> + Send
+    fn spawn_stoppable<F, T>(_: private::Token, f: F) -> impl Future<Output = Result<T>> + Send
     where
-        F: FnOnce() -> T + Send + 'static,
+        F: FnOnce(&AtomicBool) -> T + Send + 'static,
         T: Send + 'static,
     {
         async {
-            let (_cancellation, work) = blocking_operation(f);
-            ::smol::unblock(work).await
+            let (_cancellation, work) = blocking_operation_with_stop(f);
+            Ok(resume_work(::smol::unblock(work).await?))
         }
     }
 }
@@ -241,8 +276,10 @@ impl private::Spawn for Smol {
 ///
 /// # Thread Safety
 ///
-/// The underlying [`Receiver`] is wrapped in an [`Arc`] to allow sharing across
-/// async tasks and safe cloning. The NDI SDK receiver is inherently thread-safe.
+/// The underlying [`Receiver`] is shared through an [`Arc`]. The SDK documents
+/// concurrent capture calls in `Processing.NDI.Recv.h`; the crate's capture
+/// guard serializes connection changes against them. Receiver queries with
+/// invalidatable SDK strings have their own query lock.
 ///
 /// # Events and controls
 ///
@@ -254,9 +291,10 @@ impl private::Spawn for Smol {
 ///
 /// # Error Handling
 ///
-/// The methods that run on the blocking pool convert a panic there, or the
-/// cancellation of the blocking task, into [`Error::SpawnFailed`] rather than
-/// propagating it.
+/// [`Error::SpawnFailed`] carries a typed [`SpawnFailure`] for a missing Tokio
+/// context or a cancelled task. A panic on the worker is resumed on the awaiting
+/// task with its original payload, after SDK guards are released on the worker.
+/// An abandoned operation discards its result and any caught panic payload.
 ///
 /// # Example
 ///
@@ -297,11 +335,11 @@ pub struct AsyncReceiver<R: AsyncRuntime> {
 async fn with_timeout_budget<R, F, T>(timeout: Duration, operation: F) -> Result<T>
 where
     R: AsyncRuntime,
-    F: FnOnce(Deadline) -> Result<T> + Send + 'static,
+    F: FnOnce(Deadline, &AtomicBool) -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
     let deadline = Deadline::after(timeout)?;
-    R::spawn_blocking(private::Token, move || operation(deadline)).await?
+    R::spawn_stoppable(private::Token, move |stop| operation(deadline, stop)).await?
 }
 
 // Keep ownership of the validated guard throughout application processing.
@@ -428,14 +466,14 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// # Errors
     ///
     /// The errors of [`Receiver::capture_any`], and [`Error::SpawnFailed`]
-    /// when the blocking task panicked or was cancelled. Oversize timeouts
+    /// when no runtime context is entered or the blocking task is cancelled. Oversize timeouts
     /// are rejected before submitting work.
     ///
     /// # Cancellation
     ///
-    /// Dropping the future suppresses work only before its entry gate. Work
-    /// that passed the gate may still consume an item whose result is then
-    /// discarded; a native wait cannot be interrupted by dropping a future.
+    /// Dropping the future skips queued work and stops a started wait before
+    /// its next attempt. The attempt already in flight can still consume an
+    /// item whose result is discarded; each native wait lasts at most 100 ms.
     pub async fn capture_any(&self, timeout: Duration) -> Result<Option<ReceiverItem>> {
         self.capture_any_with(timeout, |item| item.to_owned()).await
     }
@@ -460,22 +498,28 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// The wait budget, event delivery and cancellation rules are those of
     /// [`capture_any`](Self::capture_any). Callback execution time and side
     /// effects are not cancelled by the timeout or by dropping the future.
-    /// After the cancellation gate it may run even if the future was dropped.
+    /// An item delivered by the attempt in flight still runs its callback
+    /// even if the future was dropped.
     ///
     /// # Errors
     ///
     /// The errors of [`Receiver::capture_any_ref`], and [`Error::SpawnFailed`]
-    /// for a blocking-task failure or callback panic. Oversize timeouts are
+    /// for a missing runtime context or cancelled task. Oversize timeouts are
     /// rejected before submitting work.
+    ///
+    /// # Panics
+    ///
+    /// A callback or blocking-operation panic is resumed on the awaiting task
+    /// with its original payload, after the native frame is freed on the worker.
     pub async fn capture_any_with<F, T>(&self, timeout: Duration, process: F) -> Result<Option<T>>
     where
         F: for<'frame> FnOnce(&ReceiverItemRef<'frame>) -> T + Send + 'static,
         T: Send + 'static,
     {
         let receiver = Arc::clone(&self.inner);
-        with_timeout_budget::<R, _, _>(timeout, move |deadline| {
+        with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
             Ok(process_captured(
-                receiver.core.capture_any_ref_until(deadline)?,
+                receiver.core.capture_any_ref_until(deadline, stop)?,
                 process,
             ))
         })
@@ -506,18 +550,17 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// # Errors
     ///
     /// The errors of [`Receiver::poll_event`], and [`Error::SpawnFailed`]
-    /// when the blocking task panicked or was cancelled.
+    /// when no runtime context is entered or the blocking task is cancelled.
     ///
     /// # Cancellation
     ///
-    /// Dropping this future skips work if the blocking closure observes the
-    /// cancellation flag at its entry gate. After passing that gate, work
-    /// continues, including waiting for receiver access, and can consume an
-    /// event whose result is discarded.
+    /// Dropping the future skips queued work and stops a started wait before
+    /// its next attempt. The attempt already in flight can still consume an
+    /// event whose result is discarded; each native wait lasts at most 100 ms.
     pub async fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
         let receiver = Arc::clone(&self.inner);
-        with_timeout_budget::<R, _, _>(timeout, move |deadline| {
-            receiver.core.poll_event_until(deadline)
+        with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
+            receiver.core.poll_event_until(deadline, stop)
         })
         .await
     }
@@ -545,22 +588,22 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// [`Error::UnsupportedCapability`] without
     /// [`RuntimeFeature::ConnectedSourceName`](crate::RuntimeFeature::ConnectedSourceName),
     /// and [`Error::UnexpectedSdkResult`] for a name the SDK did not
-    /// terminate; and [`Error::SpawnFailed`] when the blocking task panicked
-    /// or was cancelled.
+    /// terminate; and [`Error::SpawnFailed`] for a missing runtime context or
+    /// cancelled blocking task.
     ///
     /// # Cancellation
     ///
-    /// Dropping this future skips work if the blocking closure observes the
-    /// cancellation flag at its entry gate. After passing that gate, work
-    /// continues, including waiting for a concurrent poller, and can consume
-    /// a change whose result is discarded; the SDK reports each change once.
+    /// Dropping the future skips queued work and stops a started wait before
+    /// its next attempt. The attempt already in flight can still consume a
+    /// change whose result is discarded; each native wait lasts at most 100 ms.
+    /// The SDK reports each change once.
     pub async fn poll_source_name_change(
         &self,
         timeout: Duration,
     ) -> Result<Option<SourceNameChange>> {
         let receiver = Arc::clone(&self.inner);
-        with_timeout_budget::<R, _, _>(timeout, move |deadline| {
-            receiver.core.poll_source_name_change_until(deadline)
+        with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
+            receiver.core.poll_source_name_change_until(deadline, stop)
         })
         .await
     }
@@ -603,8 +646,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// The errors of [`Receiver::connect_to`]: [`Error::InvalidCString`] when
     /// the source's name or address contains a NUL byte; and
-    /// [`Error::SpawnFailed`] when the blocking task panicked or was
-    /// cancelled.
+    /// [`Error::SpawnFailed`] for a missing runtime context or
+    /// cancelled blocking task.
     ///
     /// # Cancellation
     ///
@@ -627,8 +670,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// # Errors
     ///
-    /// [`Error::SpawnFailed`] when the blocking task panicked or was
-    /// cancelled; [`Receiver::disconnect`] itself does not fail.
+    /// [`Error::SpawnFailed`] for a missing runtime context or
+    /// cancelled blocking task; [`Receiver::disconnect`] itself does not fail.
     ///
     /// # Cancellation
     ///
@@ -654,8 +697,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// # Errors
     ///
-    /// The errors of [`Receiver::reconnect`], and [`Error::SpawnFailed`] when
-    /// the blocking task panicked or was cancelled.
+    /// [`Error::SpawnFailed`] for a missing runtime context or cancelled
+    /// blocking task. The synchronous [`Receiver::reconnect`] cannot fail.
     ///
     /// # Cancellation
     ///
@@ -665,7 +708,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// after this future is dropped.
     pub async fn reconnect(&self) -> Result<()> {
         let receiver = Arc::clone(&self.inner);
-        R::spawn_blocking(private::Token, move || receiver.reconnect()).await?
+        R::spawn_blocking(private::Token, move || receiver.reconnect()).await
     }
 }
 
@@ -726,15 +769,14 @@ where
     /// # Errors
     ///
     /// The errors of [`Capture::capture`](crate::Capture::capture), and
-    /// [`Error::SpawnFailed`] when the blocking task panicked or was
-    /// cancelled.
+    /// [`Error::SpawnFailed`] for a missing runtime context or
+    /// cancelled blocking task.
     ///
     /// # Cancellation
     ///
-    /// Dropping this future skips work if the blocking closure observes the
-    /// cancellation flag at its entry gate. After passing that gate, work
-    /// continues, including waiting for receiver access, and can consume a frame
-    /// whose result is discarded.
+    /// Dropping the future skips queued work and stops a started wait before
+    /// its next attempt. The attempt already in flight can still consume a
+    /// frame whose result is discarded; each native wait lasts at most 100 ms.
     pub async fn capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
         self.capture_with(timeout, K::ref_to_owned).await
     }
@@ -758,14 +800,19 @@ where
     ///
     /// The timeout and cancellation rules of [`capture`](Self::capture) apply.
     /// Neither the callback's execution time nor its side effects are cancelled
-    /// by the timeout or by dropping the future. Once the task passes its
-    /// cancellation gate, the callback may run even if the future was dropped.
+    /// by the timeout or by dropping the future. An item delivered by the
+    /// attempt in flight still runs its callback after the future was dropped.
     ///
     /// # Errors
     ///
     /// The errors of [`Capture::capture_ref`](crate::Capture::capture_ref), and
-    /// [`Error::SpawnFailed`] for a blocking-task failure or callback panic.
+    /// [`Error::SpawnFailed`] for a missing runtime context or cancelled task.
     /// Oversize timeouts are rejected before submitting work.
+    ///
+    /// # Panics
+    ///
+    /// A callback or blocking-operation panic is resumed on the awaiting task
+    /// with its original payload, after the native frame is freed on the worker.
     ///
     /// # Example
     ///
@@ -787,9 +834,9 @@ where
         T: Send + 'static,
     {
         let receiver = Arc::clone(&self.recv.inner);
-        with_timeout_budget::<R, _, _>(timeout, move |deadline| {
+        with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
             Ok(process_captured(
-                receiver.core.capture_ref_until::<K>(deadline)?,
+                receiver.core.capture_ref_until::<K>(deadline, stop)?,
                 process,
             ))
         })
@@ -907,9 +954,10 @@ mod timeout_tests {
             started_rx.recv().unwrap();
 
             let budget = Duration::from_millis(20);
-            let mut capture = Box::pin(with_timeout_budget::<Tokio, _, _>(budget, |deadline| {
-                Ok((deadline.remaining(), deadline.remaining_ms()))
-            }));
+            let mut capture =
+                Box::pin(with_timeout_budget::<Tokio, _, _>(budget, |deadline, _| {
+                    Ok((deadline.remaining(), deadline.remaining_ms()))
+                }));
             let mut context = Context::from_waker(Waker::noop());
             assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
             // Keep the sole worker occupied until the whole budget has elapsed.
@@ -923,15 +971,15 @@ mod timeout_tests {
     }
 
     #[test]
-    fn budgeted_work_that_panics_reports_spawn_failed() {
-        // The path of `capture`, `poll_event` and `poll_source_name_change`.
-        let result = runtime()
-            .block_on(with_timeout_budget::<Tokio, _, ()>(Duration::ZERO, |_| {
-                panic!("budgeted panic")
-            }));
-        assert!(
-            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("budgeted panic"))
-        );
+    fn budgeted_work_resumes_the_original_panic() {
+        let panic = std::panic::catch_unwind(|| {
+            runtime().block_on(with_timeout_budget::<Tokio, _, ()>(
+                Duration::ZERO,
+                |_, _| std::panic::panic_any(42_u32),
+            ))
+        })
+        .expect_err("a worker panic must unwind the awaiting caller");
+        assert_eq!(*panic.downcast::<u32>().unwrap(), 42);
     }
 
     #[test]
@@ -939,7 +987,7 @@ mod timeout_tests {
         // No entered runtime: trying to submit work would panic.
         let mut capture = Box::pin(with_timeout_budget::<Tokio, _, ()>(
             crate::MAX_TIMEOUT + Duration::from_nanos(1),
-            |_| panic!("invalid timeout must not execute blocking work"),
+            |_, _| panic!("invalid timeout must not execute blocking work"),
         ));
         let mut context = Context::from_waker(Waker::noop());
         assert!(matches!(
@@ -1002,7 +1050,7 @@ mod smol_tests {
         let worker_called = Arc::clone(&called);
         let result = ::smol::block_on(with_timeout_budget::<Smol, _, _>(
             crate::MAX_TIMEOUT + Duration::from_nanos(1),
-            move |_| {
+            move |_, _| {
                 worker_called.store(true, Ordering::Release);
                 Ok(())
             },
@@ -1012,14 +1060,15 @@ mod smol_tests {
     }
 
     #[test]
-    fn budgeted_work_that_panics_reports_spawn_failed() {
-        // The path of `capture`, `poll_event` and `poll_source_name_change`.
-        let result = ::smol::block_on(with_timeout_budget::<Smol, _, ()>(Duration::ZERO, |_| {
-            panic!("budgeted panic")
-        }));
-        assert!(
-            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("budgeted panic"))
-        );
+    fn budgeted_work_resumes_the_original_panic() {
+        let panic = std::panic::catch_unwind(|| {
+            ::smol::block_on(with_timeout_budget::<Smol, _, ()>(
+                Duration::ZERO,
+                |_, _| std::panic::panic_any(42_u32),
+            ))
+        })
+        .expect_err("a worker panic must unwind the awaiting caller");
+        assert_eq!(*panic.downcast::<u32>().unwrap(), 42);
     }
 
     #[test]
@@ -1029,7 +1078,7 @@ mod smol_tests {
         let (release_tx, release_rx) = mpsc::channel();
         let mut operation = Box::pin(with_timeout_budget::<Smol, _, _>(
             budget,
-            move |deadline: Deadline| {
+            move |deadline: Deadline, _: &AtomicBool| {
                 started_tx.send(deadline.end()).unwrap();
                 release_rx.recv().unwrap();
                 Ok(deadline.remaining())
@@ -1065,7 +1114,10 @@ mod executor_tests {
     fn cancellation_skips_queued_operation() {
         let (guard, work) = blocking_operation(|| panic!("cancelled work must not run"));
         drop(guard);
-        assert!(matches!(work(), Err(Error::SpawnFailed(_))));
+        assert!(matches!(
+            work(),
+            Err(Error::SpawnFailed(SpawnFailure::TaskCancelled))
+        ));
     }
 
     #[test]
@@ -1092,29 +1144,47 @@ mod executor_tests {
         let mut context = Context::from_waker(Waker::noop());
         assert!(matches!(
             operation.as_mut().poll(&mut context),
-            Poll::Ready(Err(Error::SpawnFailed(_)))
+            Poll::Ready(Err(Error::SpawnFailed(SpawnFailure::NoRuntime)))
         ));
     }
 
     #[cfg(feature = "tokio")]
     #[test]
-    fn tokio_converts_blocking_panic() {
+    fn tokio_resumes_blocking_panic() {
         let runtime = ::tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let result = runtime.block_on(Tokio::spawn_blocking(Token, || panic!("test panic")));
-        assert!(
-            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("test panic"))
-        );
+        let panic = std::panic::catch_unwind(|| {
+            runtime.block_on(Tokio::spawn_blocking(Token, || panic!("test panic")))
+        })
+        .unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"test panic"));
     }
 
     #[cfg(feature = "smol")]
     #[test]
-    fn smol_converts_blocking_panic() {
-        let result = ::smol::block_on(Smol::spawn_blocking(Token, || panic!("test panic")));
-        assert!(
-            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("test panic"))
-        );
+    fn smol_resumes_blocking_panic() {
+        let panic = std::panic::catch_unwind(|| {
+            ::smol::block_on(Smol::spawn_blocking(Token, || panic!("test panic")))
+        })
+        .unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"test panic"));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn cancelled_tokio_task_reports_a_typed_reason() {
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let task = ::tokio::spawn(std::future::pending::<()>());
+            task.abort();
+            assert!(matches!(
+                tokio_join_error(task.await.unwrap_err()),
+                Error::SpawnFailed(SpawnFailure::TaskCancelled)
+            ));
+        });
     }
 
     #[cfg(feature = "tokio")]
@@ -1184,9 +1254,9 @@ mod receiver_tests {
         }
     }
 
-    /// Lending the receiver added no field: the auto traits are those the
-    /// type had before. It is not `UnwindSafe`, because its shared
-    /// [`Receiver`] is deliberately not `RefUnwindSafe`.
+    /// Lending the receiver adds no field and preserves its auto traits.
+    /// Receiver and both runtime-specific AsyncReceiver types are UnwindSafe
+    /// and RefUnwindSafe, as tests/public_auto_traits.rs asserts.
     #[test]
     fn async_receivers_keep_their_auto_traits() {
         fn shared<T: Send + Sync + Clone + 'static>() {}
@@ -1532,3 +1602,6 @@ mod receiver_tests {
 
 #[cfg(test)]
 mod scoped_tests;
+
+#[cfg(test)]
+mod source_name_cancellation_sdk_tests;

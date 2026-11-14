@@ -26,11 +26,15 @@
 //!
 //! 1. the directory of the selected NDI runtime library, where the SDK installs it;
 //! 2. the directory containing the running executable;
-//! 3. the directory named by the `NDI_RUNTIME_DIR_V6` environment variable;
+//! 3. the absolute directory named by `NDI_RUNTIME_DIR_V6`; relative values
+//!    are recorded as refused locations and never searched;
 //! 4. the platform loader's own search for the library name.
 //!
-//! When nothing is usable, [`Error::RuntimeLoadFailed`] names every location
-//! tried and the operating system's reason for each. Like the NDI runtime, a
+//! When nothing is usable, [`Error::RuntimeLoadFailed`] carries a
+//! [`crate::LoadFailure`] for [`crate::LibraryKind::File`], with each attempted
+//! location, origin and typed refusal. `loaded_any()` reports whether any
+//! native code loaded before being refused. `Display` retains the diagnostic
+//! text for each attempt, including the operating system's reason. Like the NDI runtime, a
 //! loaded File library stays selected and loaded for the life of the process.
 //!
 //! On Linux, macOS and Android the 6.4.0.2 File library imports the NDI runtime's entry
@@ -59,11 +63,8 @@
 //! probes recordings, and recording. A library is selected when it provides
 //! at least one family completely. [`FileApi::status`] reports each family,
 //! and an operation that needs a family the selected library lacks fails with
-//! [`Error::UnsupportedCapability`] for
-//! [`RuntimeFeature::File`](crate::capabilities::RuntimeFeature::File), naming
-//! the entry point the library does not export. The runtime's own
-//! [`Capabilities`](crate::capabilities::Capabilities) do not know what the
-//! File library provides.
+//! [`Error::FileFamilyUnavailable`], naming the family and the first entry
+//! point the library does not export.
 //!
 //! # Finishing a recording
 //!
@@ -185,9 +186,8 @@ use out_param::OutParam;
 ///
 /// [`FileApi::status`] reports whether the selected library provides one, and
 /// an operation that needs a family the library lacks fails with
-/// [`Error::UnsupportedCapability`] for
-/// [`RuntimeFeature::File`](crate::capabilities::RuntimeFeature::File) and
-/// that family.
+/// [`Error::FileFamilyUnavailable`], naming that family and its first missing
+/// entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum FileFamily {
@@ -242,8 +242,9 @@ impl FileRuntimeOptions {
     ///
     /// No other location is tried, so a failure to load it is reported rather
     /// than hidden by a fallback. A relative path is rejected by
-    /// [`FileApi::open`], as is any path on a target that links the SDK
-    /// statically.
+    /// [`FileApi::open`] with [`Error::InvalidInput`] on every target, before
+    /// selection. A target that links the SDK statically refuses an absolute
+    /// path with [`Error::RuntimeConflict`].
     #[must_use]
     pub fn library_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.library_path = Some(path.into());
@@ -287,10 +288,13 @@ impl FileApi {
     /// # Errors
     ///
     /// * [`Error::RuntimeLoadFailed`] when no usable File library can be
-    ///   loaded. This is retryable, and the rest of the crate keeps working.
+    ///   loaded. Its [`crate::LoadFailure`] records typed attempts and whether
+    ///   any native code loaded before being refused. This is retryable, and
+    ///   the rest of the crate keeps working.
     /// * [`Error::RuntimeConflict`] when the selected NDI runtime is not one
     ///   the File library can accompany, or `options` names a library other
-    ///   than the one already selected.
+    ///   than the one already selected. [`crate::SelectionConflict`] identifies
+    ///   the cause; `detail` retains the diagnostic context.
     /// * [`Error::InvalidInput`] when `options` names a relative path.
     pub fn open(ndi: &Ndi, options: &FileRuntimeOptions) -> Result<Self> {
         let runtime = sys::select_file(ndi.info(), ndi.api(), options.library_path.as_deref())?;
@@ -315,7 +319,7 @@ impl FileApi {
     /// [`SymbolUnavailable`](crate::capabilities::CapabilityUnavailable::SymbolUnavailable)
     /// when it does not export one of the family's entry points. Every
     /// operation that needs the family then fails with
-    /// [`Error::UnsupportedCapability`], and keeps failing: the library stays
+    /// [`Error::FileFamilyUnavailable`], and keeps failing: the library stays
     /// selected for the life of the process.
     pub fn status(&self, family: FileFamily) -> CapabilityStatus {
         self.runtime.status(family)
@@ -337,7 +341,7 @@ impl FileApi {
     /// [`Error::InvalidInput`] when the path is empty or is not UTF-8,
     /// [`Error::InvalidCString`] when it contains a NUL, [`Error::Io`] when a
     /// relative path cannot be resolved because the current directory is
-    /// unavailable, and [`Error::UnsupportedCapability`] when the library
+    /// unavailable, and [`Error::FileFamilyUnavailable`] when the library
     /// does not provide [`FileFamily::Playback`].
     pub fn probe(&self, path: impl AsRef<Path>) -> Result<FileInfo> {
         let playback = self.table::<sys::FilePlayback>()?;
@@ -367,7 +371,7 @@ impl FileApi {
     /// [`Error::InvalidInput`] when the player's name is empty, and
     /// [`Error::InvalidCString`] when its name or groups contain a NUL.
     /// [`Error::NativeOperationFailed`] when the SDK cannot create the player
-    /// and [`Error::UnsupportedCapability`] when the library does not provide
+    /// and [`Error::FileFamilyUnavailable`] when the library does not provide
     /// [`FileFamily::Playback`].
     pub fn create_player(&self, options: &PlayerOptions) -> Result<FilePlayer> {
         FilePlayer::create(self.clone(), options)
@@ -388,7 +392,7 @@ impl FileApi {
     /// format-change rollover switched on or a nonzero rollover size.
     /// [`Error::InvalidCString`] when the filename pattern contains a NUL.
     /// [`Error::NativeOperationFailed`] when the SDK cannot create the
-    /// recorder and [`Error::UnsupportedCapability`] when the library does not
+    /// recorder and [`Error::FileFamilyUnavailable`] when the library does not
     /// provide [`FileFamily::Recording`].
     pub fn create_recorder(&self, options: &RecorderOptions) -> Result<FileRecorder> {
         FileRecorder::create(self.clone(), options)

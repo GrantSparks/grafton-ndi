@@ -19,7 +19,8 @@ is included, so enabling `file-io` alone does not generate bindings.
 Open it with `FileApi::open(&ndi, &FileRuntimeOptions::default())`. On targets
 that load libraries dynamically, discovery tries the selected runtime's
 directory, the executable's directory, `NDI_RUNTIME_DIR_V6`, then the platform
-loader. `FileRuntimeOptions::library_path` selects one absolute file without
+loader. A relative `NDI_RUNTIME_DIR_V6` is recorded as refused and never
+searched. `FileRuntimeOptions::library_path` selects one absolute file without
 fallback. A successful selection lasts for the process; a later conflicting
 selection returns `RuntimeConflict`. Use trusted library locations, including
 their dependencies, as described in [runtime selection](setup.md#selecting-a-runtime).
@@ -28,7 +29,7 @@ their dependencies, as described in [runtime selection](setup.md#selecting-a-run
 
 Check `FileApi::status` or `supports` for `FileFamily::Playback` and
 `FileFamily::Recording`. Missing family symbols produce
-`Error::UnsupportedCapability`; loading the core runtime does not establish
+`Error::FileFamilyUnavailable`; loading the core runtime does not establish
 File availability. See the [File API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/index.html)
 for loading errors and the full family contract.
 
@@ -111,6 +112,13 @@ seconds by default), but cannot report the outcome. Use explicit finishing when
 the result matters. See [`FileRecorder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorder.html)
 for state transitions, error conditions and recovery.
 
+If another async clone calls `close` while `finish` or `wait_finished` runs,
+the wait uses the earlier of its own deadline and `drop_wait` measured from
+the close's submission. It reports `Closed` or `Indeterminate` if the session
+settles, or `InvalidState(Closed)` if that budget ends first. `TimedOut` would
+suggest another wait, which a closed handle cannot perform. Destruction does
+not start a second finalization wait after the running wait spends its budget.
+
 ## Limits of the NDI 6.4 File library
 
 `Closed` confirms the SDK's closure events. It does not establish that every
@@ -146,13 +154,23 @@ recording report. Configure queue limits with `AsyncFileOptions` and handle
 Await `finish`, inspect its report, then await `close` to shut down all clones
 without blocking the executor. **Dropping the last clone blocks** until its
 worker exits; `drop_wait` does not bound native stop or destruction calls.
+When an executor callback drops the last clone on a File owner, timer or probe
+thread, it requests shutdown without waiting. This lets those threads keep
+delivering notifications; await `close` when cleanup must have completed.
 See [`AsyncFileRecorder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.AsyncFileRecorder.html)
 for cancellation, queue and shutdown contracts.
 
 ## Errors
 
+Library selection reports `RuntimeLoadFailed(failure)` with
+`failure.library() == LibraryKind::File` and typed search attempts. Inspect
+`LoadRefusal` and `failure.loaded_any()` before treating a load failure as an
+uninstalled library. `RuntimeConflict { kind, detail }` distinguishes a
+`FileNeedsAdvancedRuntime` conflict from a different selected library, linked
+implementation or foreign runtime in the global symbol scope.
+
 File operations use the crate's `Error`. Distinguish unavailable libraries or
-families (`RuntimeLoadFailed`, `UnsupportedCapability`), conflicting selections
+families (`RuntimeLoadFailed`, `FileFamilyUnavailable`), conflicting selections
 (`RuntimeConflict`), invalid arguments or state, queue saturation (`QueueFull`),
 native failures and filesystem errors. Method rustdoc describes which errors
 leave an existing session running and which reports require recovery.

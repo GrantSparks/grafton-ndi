@@ -1,0 +1,8 @@
+error[E0515]: cannot return value referencing function parameter `receiver`
+ --> tests/ui/advanced/fail/allocated_packet_ref_outlives_receiver.rs:4:5
+  |
+4 |     receiver.capture_ref(Duration::ZERO).unwrap().unwrap()
+  |     --------^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |     |
+  |     returns a value referencing data owned by the current function
+  |     `receiver` is borrowed here

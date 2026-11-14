@@ -15,7 +15,9 @@
 use std::{env, time::Duration};
 
 use grafton_ndi::{
-    advanced::{AllocationBuffer, AllocationRequest, AllocatorLimits, AllocatorService},
+    advanced::{
+        AllocationBuffer, AllocationDecline, AllocationRequest, AllocatorLimits, AllocatorService,
+    },
     Error, Ndi, Receiver, ReceiverOptions, RuntimeOptions, SdkEdition,
 };
 
@@ -60,15 +62,20 @@ fn main() -> Result<(), Error> {
             .video()
             .capture_ref(Duration::from_secs(1))?
         {
-            let usage = service.usage();
-            println!(
-                "{}x{} frame; the SDK holds {} buffers, {} bytes",
-                frame.width(),
-                frame.height(),
-                usage.retained_allocations(),
-                usage.retained_bytes()
-            );
+            println!("{}x{} frame", frame.width(), frame.height());
         }
+        // Show declines even if every frame was dropped, so a stalled stream
+        // can be distinguished from an exhausted byte budget or a policy error.
+        let usage = service.usage();
+        println!(
+            "SDK holds {} buffers, {} bytes; declined {} ({} byte limit, {} policy errors, {} policy panics)",
+            usage.retained_allocations(),
+            usage.retained_bytes(),
+            usage.declined_allocations(),
+            usage.declined(AllocationDecline::ByteLimit),
+            usage.declined(AllocationDecline::PolicyError),
+            usage.declined(AllocationDecline::PolicyPanic),
+        );
     }
 
     // Back to the SDK's own memory; the receiver is ordinary again.

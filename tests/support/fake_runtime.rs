@@ -12,17 +12,26 @@
 //!   `GRAFTON_FAKE_NDI_LOG`, and the optional sender-metadata, routing and
 //!   advertiser functions are exported. Registrations log the flags they were
 //!   given, and a receiver's input-group name is read only when its
-//!   registration ends;
+//!   registration ends. `GRAFTON_FAKE_VALIDATE_VIDEO_COPY=1` makes ordinary
+//!   async sends retain and check each frame's first pixel until synchronization;
 //! * `fake_discovery` — export the sender and receiver listener functions over
 //!   a fixed membership whose identifiers and text are partly not UTF-8, and
 //!   log every identifier passed back, byte for byte. An event batch holds
 //!   `GRAFTON_FAKE_EVENT_COUNT` events (two by default), or reports a null
 //!   pointer with a positive count with `GRAFTON_FAKE_NULL_EVENT_BATCH=1`.
+//!   `GRAFTON_FAKE_DISCOVERY_MALFORMED` omits one sender, receiver or event
+//!   through an over-limit string or null nested array with a positive count.
 //!   `GRAFTON_FAKE_DISCOVERY_ARRAY=groups|streams|commands` supplies a nested
 //!   snapshot array whose native storage fits but whose owned copy does not;
 //! * `fake_advanced` — also export the Advanced SDK entry points;
 //! * `fake_finder` — return the bounded-resource Finder fixtures in
 //!   `fake_finder.rs`, selected by `GRAFTON_FAKE_FINDER_CASE`;
+//! * `fake_changes` — consumable Finder and Advanced keyframe changes, with
+//!   explicit source announcements and one native wake per change;
+//! * `fake_tally` — poll/wait share a consumable tally change on each sender;
+
+//! * `fake_capability_descriptors` — log synchronous sends, receiver settings
+//!   and Advanced AV sync descriptors after their capability checks;
 //! * `fake_capture` — script native media/notification delivery with
 //!   `GRAFTON_FAKE_CAPTURE_SCRIPT`; only active rows/channels are initialized;
 //! * `fake_receiver_controls` — clocked capture, stream controls and KVM log
@@ -163,6 +172,24 @@ export! {
     }
 }
 
+// A bounded no-change wait used to observe async source-query cancellation.
+#[cfg(fake_source_name)]
+export! {
+    fn NDIlib_recv_get_source_name(_p_instance: NDIlib_recv_instance_t, name: *mut *const c_char, timeout_in_ms: u32) -> bool {
+        log(&format!("source-name:{timeout_in_ms}"));
+        let delay = std::env::var("GRAFTON_FAKE_SOURCE_NAME_DELAY_MS")
+            .unwrap_or_default().parse::<u64>().unwrap_or(0);
+        std::thread::sleep(std::time::Duration::from_millis(delay.min(timeout_in_ms.into())));
+        unsafe { name.write(std::ptr::null()) };
+        false
+    }
+    fn NDIlib_recv_free_string(_p_instance: NDIlib_recv_instance_t, name: *const c_char) {
+        if !name.is_null() {
+            unsafe { drop(CString::from_raw(name.cast_mut())) };
+        }
+    }
+}
+
 // Record native connection requests so tests can compare the remembered target
 // with what actually crossed the FFI boundary, including concurrent requests.
 export! {
@@ -218,10 +245,7 @@ stub! {
     fn NDIlib_recv_ptz_exposure_auto(p_instance: NDIlib_recv_instance_t) -> bool;
     fn NDIlib_recv_ptz_exposure_manual(p_instance: NDIlib_recv_instance_t, exposure_level: f32) -> bool;
     fn NDIlib_recv_ptz_exposure_manual_v2(p_instance: NDIlib_recv_instance_t, iris: f32, gain: f32, shutter_speed: f32) -> bool;
-    fn NDIlib_send_send_video_v2(p_instance: NDIlib_send_instance_t, p_video_data: *const NDIlib_video_frame_v2_t);
-    fn NDIlib_send_send_audio_v3(p_instance: NDIlib_send_instance_t, p_audio_data: *const NDIlib_audio_frame_v3_t);
     fn NDIlib_send_send_metadata(p_instance: NDIlib_send_instance_t, p_metadata: *const NDIlib_metadata_frame_t);
-    fn NDIlib_send_get_tally(p_instance: NDIlib_send_instance_t, p_tally: *mut NDIlib_tally_t, timeout_in_ms: u32) -> bool;
     fn NDIlib_send_get_no_connections(p_instance: NDIlib_send_instance_t, timeout_in_ms: u32) -> ::std::os::raw::c_int;
     fn NDIlib_send_clear_connection_metadata(p_instance: NDIlib_send_instance_t);
     fn NDIlib_send_add_connection_metadata(p_instance: NDIlib_send_instance_t, p_metadata: *const NDIlib_metadata_frame_t);
@@ -229,7 +253,23 @@ stub! {
 
 }
 
-#[cfg(not(fake_receiver_controls))]
+#[cfg(not(fake_capability_descriptors))]
+stub! {
+    fn NDIlib_send_send_video_v2(p_instance: NDIlib_send_instance_t, p_video_data: *const NDIlib_video_frame_v2_t);
+}
+
+export! {
+    fn NDIlib_send_send_audio_v3(_p_instance: NDIlib_send_instance_t, _p_audio_data: *const NDIlib_audio_frame_v3_t) {
+        log("sender-audio");
+    }
+}
+
+#[cfg(not(fake_tally))]
+stub! {
+    fn NDIlib_send_get_tally(p_instance: NDIlib_send_instance_t, p_tally: *mut NDIlib_tally_t, timeout_in_ms: u32) -> bool;
+}
+
+#[cfg(not(any(fake_receiver_controls, fake_tally)))]
 stub! {
     fn NDIlib_recv_set_tally(p_instance: NDIlib_recv_instance_t, p_tally: *const NDIlib_tally_t) -> bool;
 }
@@ -278,11 +318,21 @@ mod objects {
         pub(super) opaque: *mut c_void,
         pub(super) completion: Option<Completion>,
         pending: Vec<NDIlib_video_frame_v2_t>,
+        copied: Option<(NDIlib_video_frame_v2_t, u8)>,
     }
 
     impl Sender {
+        /// Read the previous copy before the native synchronization returns.
+        unsafe fn release_copy(&mut self) {
+            if let Some((frame, expected)) = self.copied.take() {
+                assert_eq!(unsafe { frame.p_data.read_volatile() }, expected);
+                log(&format!("sender-copy-released={expected}"));
+            }
+        }
+
         /// Report every retained frame as complete, most recent first.
         unsafe fn complete(&mut self) {
+            unsafe { self.release_copy() };
             let Some(completion) = self.completion else {
                 return;
             };
@@ -325,6 +375,11 @@ mod objects {
     export! {
         fn NDIlib_recv_create_v3(_p_create_settings: *const NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t {
             log("receiver-create");
+            #[cfg(fake_capability_descriptors)]
+            {
+                let settings = unsafe { &*_p_create_settings };
+                log(&format!("receiver-settings:{}:{}", settings.color_format, settings.bandwidth));
+            }
             handle()
         }
 
@@ -335,18 +390,24 @@ mod objects {
 
         fn NDIlib_send_create(_p_create_settings: *const NDIlib_send_create_t) -> NDIlib_send_instance_t {
             log("sender-create");
-            Box::into_raw(Box::new(Sender {
+            let sender = Box::into_raw(Box::new(Sender {
                 opaque: std::ptr::null_mut(),
                 completion: None,
                 pending: Vec::new(),
+                copied: None,
             }))
-            .cast()
+            .cast();
+            #[cfg(fake_tally)]
+            super::tally::created(sender);
+            sender
         }
 
         fn NDIlib_send_destroy(p_instance: NDIlib_send_instance_t) {
             let mut sender = unsafe { Box::from_raw(p_instance.cast::<Sender>()) };
             log("sender-destroy-begin");
             unsafe { sender.complete() };
+            #[cfg(fake_tally)]
+            super::tally::destroyed(p_instance);
             log("sender-destroy");
         }
 
@@ -358,10 +419,23 @@ mod objects {
                 return;
             }
             log("sender-submit");
+            if sender.completion.is_none() && std::env::var_os("GRAFTON_FAKE_VALIDATE_VIDEO_COPY").is_some() {
+                unsafe { sender.release_copy() };
+                let frame = unsafe { *p_video_data };
+                let first = unsafe { frame.p_data.read_volatile() };
+                sender.copied = Some((frame, first));
+                log(&format!("sender-copy-submitted={first}"));
+                log("sender-submit-return");
+                return;
+            }
             let Some(completion) = sender.completion else {
                 return;
             };
-            if std::env::var_os("GRAFTON_FAKE_CALLBACK_MODE").is_some_and(|mode| mode == "immediate") {
+            let mode = std::env::var("GRAFTON_FAKE_CALLBACK_MODE").unwrap_or_default();
+            if mode == "immediate" || mode == "drain" {
+                if mode == "drain" {
+                    unsafe { sender.complete() };
+                }
                 log("sender-completion");
                 unsafe { completion(sender.opaque, p_video_data) };
                 // The submitting call must still own its header and pixels.
@@ -507,6 +581,20 @@ mod discovery {
     const INPUT_ID: &CStr = c"input-\xfd";
     const EVENT_VALUE: &CStr = c"<tally on=\"\xff\"/>";
 
+    fn malformed() -> String {
+        std::env::var("GRAFTON_FAKE_DISCOVERY_MALFORMED").unwrap_or_default()
+    }
+
+    /// Stable text with its terminator immediately beyond the string bound.
+    fn oversized_text() -> *const c_char {
+        static TEXT: std::sync::OnceLock<Box<[u8]>> = std::sync::OnceLock::new();
+        TEXT.get_or_init(|| {
+            let mut text = vec![b'x'; 4 * 1024 * 1024 + 1];
+            *text.last_mut().unwrap() = 0;
+            text.into_boxed_slice()
+        }).as_ptr().cast()
+    }
+
     /// The events most recently handed out, which stay allocated until freed.
     type Batch = Vec<NDIlib_listener_event>;
 
@@ -547,11 +635,20 @@ mod discovery {
         *batch = (0..count)
             .map(|index| {
                 if index % 2 == 0 {
-                    NDIlib_listener_event {
+                    let mut event = NDIlib_listener_event {
                         p_uuid: uuid.as_ptr(),
                         p_name: c"tally".as_ptr(),
                         p_value: EVENT_VALUE.as_ptr(),
+                    };
+                    if index == 0 {
+                        match malformed().as_str() {
+                            "event-id" => event.p_uuid = oversized_text(),
+                            "event-name" => event.p_name = oversized_text(),
+                            "event-value" => event.p_value = oversized_text(),
+                            _ => {}
+                        }
                     }
+                    event
                 } else {
                     NDIlib_listener_event {
                         p_uuid: ptr::null(),
@@ -583,7 +680,7 @@ mod discovery {
             } else {
                 Box::new([c"public".as_ptr(), SENDER_GROUP.as_ptr(), ptr::null()])
             };
-            let senders = [
+            let mut senders = [
                 NDIlib_sender_t {
                     p_uuid: SENDER_ID.as_ptr(),
                     p_name: SENDER_NAME.as_ptr(),
@@ -605,6 +702,19 @@ mod discovery {
                     events_subscribed: true,
                 },
             ];
+            match malformed().as_str() {
+                "sender-id" => senders[1].p_uuid = oversized_text(),
+                "sender-name" => senders[1].p_name = oversized_text(),
+                "sender-metadata" => senders[1].p_metadata = oversized_text(),
+                "sender-address" => senders[1].p_address = oversized_text(),
+                "sender-group" => {
+                    groups[2] = oversized_text();
+                    senders[1].p_groups = unsafe { groups.as_mut_ptr().add(2) };
+                    senders[1].num_groups = 1;
+                }
+                "groups-null" => senders[1].num_groups = 1,
+                _ => {}
+            }
             Box::into_raw(Box::new(SendListener { senders, _groups: groups, batch: Batch::new() })).cast()
         }
 
@@ -624,7 +734,7 @@ mod discovery {
         fn NDIlib_send_listener_get_senders(p_instance: NDIlib_send_listener_instance_t, p_num_senders: *mut u32) -> *const NDIlib_sender_t {
             let listener = unsafe { &*p_instance.cast::<SendListener>() };
             unsafe { *p_num_senders = listener.senders.len() as u32 };
-            listener.senders.as_ptr()
+            if malformed() == "senders-null" { ptr::null() } else { listener.senders.as_ptr() }
         }
 
         fn NDIlib_send_listener_wait_for_senders(_p_instance: NDIlib_send_listener_instance_t, _timeout_in_ms: u32) -> bool {
@@ -670,7 +780,7 @@ mod discovery {
                 NDIlib_receiver_command_e_NDIlib_receiver_command_connect,
                 NDIlib_receiver_command_e_NDIlib_receiver_command_none,
             ]) };
-            let receivers = [
+            let mut receivers = [
                 NDIlib_receiver_t {
                     p_uuid: RECEIVER_ID.as_ptr(),
                     p_name: RECEIVER_NAME.as_ptr(),
@@ -696,6 +806,16 @@ mod discovery {
                     events_subscribed: false,
                 },
             ];
+            match malformed().as_str() {
+                "receiver-id" => receivers[1].p_uuid = oversized_text(),
+                "receiver-name" => receivers[1].p_name = oversized_text(),
+                "receiver-input-id" => receivers[1].p_input_uuid = oversized_text(),
+                "receiver-input-name" => receivers[1].p_input_name = oversized_text(),
+                "receiver-address" => receivers[1].p_address = oversized_text(),
+                "streams-null" => receivers[1].num_streams = 1,
+                "commands-null" => receivers[1].num_commands = 1,
+                _ => {}
+            }
             Box::into_raw(Box::new(RecvListener { receivers, _streams: streams, _commands: commands, batch: Batch::new() })).cast()
         }
 
@@ -715,7 +835,7 @@ mod discovery {
         fn NDIlib_recv_listener_get_receivers(p_instance: NDIlib_recv_listener_instance_t, p_num_receivers: *mut u32) -> *const NDIlib_receiver_t {
             let listener = unsafe { &*p_instance.cast::<RecvListener>() };
             unsafe { *p_num_receivers = listener.receivers.len() as u32 };
-            listener.receivers.as_ptr()
+            if malformed() == "receivers-null" { ptr::null() } else { listener.receivers.as_ptr() }
         }
 
         fn NDIlib_recv_listener_wait_for_receivers(_p_instance: NDIlib_recv_listener_instance_t, _timeout_in_ms: u32) -> bool {
@@ -787,6 +907,47 @@ pub unsafe extern "C" fn NDIlib_send_set_video_async_completion(
     sender.completion = p_deallocator;
 }
 
+#[cfg(all(fake_advanced, fake_objects, not(fake_omit_scatter)))]
+#[repr(C)]
+pub struct FrameScatter {
+    pointers: *const *const u8,
+    sizes: *const i32,
+}
+
+#[cfg(all(fake_advanced, fake_objects, not(fake_omit_scatter)))]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_send_send_video_scatter_async(
+    instance: NDIlib_send_instance_t,
+    frame: *const NDIlib_video_frame_v2_t,
+    scatter: *const FrameScatter,
+) {
+    log("sender-scatter-submit");
+    let mut descriptor = unsafe { *frame };
+    let scatter = unsafe { &*scatter };
+    assert_eq!(descriptor.p_data.cast_const(), unsafe { *scatter.pointers });
+    assert_eq!(unsafe { descriptor.__bindgen_anon_1.data_size_in_bytes }, unsafe { *scatter.sizes });
+    if std::env::var_os("GRAFTON_FAKE_SCATTER_KEY").is_some() {
+        descriptor.p_data = descriptor.p_data.wrapping_add(1);
+    }
+    unsafe { objects::NDIlib_send_send_video_async_v2(instance, &descriptor) };
+}
+
+#[cfg(all(fake_advanced, fake_objects, not(fake_omit_scatter)))]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_send_send_video_scatter(
+    _instance: NDIlib_send_instance_t,
+    _frame: *const NDIlib_video_frame_v2_t,
+    _scatter: *const FrameScatter,
+) {}
+
+#[cfg(all(fake_advanced, fake_objects, not(fake_omit_scatter)))]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_send_send_audio_scatter(
+    _instance: NDIlib_send_instance_t,
+    _frame: *const NDIlib_audio_frame_v3_t,
+    _scatter: *const FrameScatter,
+) {}
+
 /// Export the Advanced entry points that create an object from its settings
 /// and a configuration. Each logs its call and creates nothing.
 #[cfg(fake_configured_creation)]
@@ -823,3 +984,15 @@ stub! {
 #[cfg(fake_finder)]
 #[path = "fake_finder.rs"]
 mod finder;
+
+#[cfg(fake_changes)]
+#[path = "fake_changes.rs"]
+mod changes;
+
+#[cfg(fake_tally)]
+#[path = "fake_tally.rs"]
+mod tally;
+
+#[cfg(fake_capability_descriptors)]
+#[path = "fake_capability_descriptors.rs"]
+mod capability_descriptors;

@@ -798,7 +798,7 @@ fn test_video_frame_to_raw_roundtrip_uncompressed() {
     assert_eq!(frame.line_stride_bytes(), 1920 * 4);
 
     // Convert to raw
-    let raw = frame.to_raw();
+    let raw = frame.as_test_raw();
 
     // Verify the C union has the correct field set
     unsafe {

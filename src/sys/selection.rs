@@ -5,7 +5,7 @@ use std::{
     thread::{self, ThreadId},
 };
 
-use crate::{Error, Result};
+use crate::{Error, Result, SelectionConflict};
 
 /// A value selected once for the process: a failed load can be retried, a
 /// successful one is permanent.
@@ -47,9 +47,10 @@ impl<T> Selection<T> {
             match *loading {
                 None => break,
                 Some(owner) if owner == current => {
-                    return Err(Error::RuntimeConflict(
-                        "native module loading re-entered NDI runtime selection".into(),
-                    ));
+                    return Err(Error::RuntimeConflict {
+                        kind: SelectionConflict::ReentrantSelection,
+                        detail: "native module loading re-entered NDI runtime selection".into(),
+                    });
                 }
                 Some(_) => {
                     loading = self
@@ -97,8 +98,8 @@ mod tests {
     fn a_failed_load_is_retryable_and_a_successful_one_is_permanent() {
         let selection = Selection::new();
         assert!(matches!(
-            selection.get_or_try_load(|| Err::<u32, _>(Error::RuntimeLoadFailed("missing".into()))),
-            Err(Error::RuntimeLoadFailed(_))
+            selection.get_or_try_load(|| Err::<u32, _>(Error::InvalidInput("missing".into()))),
+            Err(Error::InvalidInput(_))
         ));
         assert_eq!(*selection.get_or_try_load(|| Ok(1)).unwrap(), 1);
         assert_eq!(*selection.get_or_try_load(|| Ok(2)).unwrap(), 1);
@@ -126,7 +127,10 @@ mod tests {
         let outer = selection.get_or_try_load(|| {
             assert!(matches!(
                 selection.get_or_try_load(|| Ok(1)),
-                Err(Error::RuntimeConflict(_))
+                Err(Error::RuntimeConflict {
+                    kind: SelectionConflict::ReentrantSelection,
+                    ..
+                })
             ));
             Ok(2)
         });

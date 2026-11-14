@@ -143,7 +143,12 @@ impl V210Layout {
     /// # Errors
     ///
     /// [`Error::InvalidFrame`] when `len` is not exactly that frame's size.
-    fn p216_descriptor(self, data: *const u8, len: usize) -> Result<NDIlib_video_frame_v2_t> {
+    fn p216_descriptor(
+        self,
+        ndi: &Ndi,
+        data: *const u8,
+        len: usize,
+    ) -> Result<NDIlib_video_frame_v2_t> {
         // `with_line_stride_bytes` validated this layout for these dimensions.
         let p216 = ValidatedVideoLayout::new_uncompressed(
             PixelFormat::P216,
@@ -151,10 +156,10 @@ impl V210Layout {
             self.height,
             None,
         )?;
-        if len != p216.data_len_bytes {
+        if len != p216.data_len_bytes() {
             return Err(Error::InvalidFrame(format!(
                 "P216 buffer has {len} bytes, requires {}",
-                p216.data_len_bytes
+                p216.data_len_bytes()
             )));
         }
         // The utilities convert samples; the header only has to be valid.
@@ -164,7 +169,13 @@ impl V210Layout {
             scan_type: ScanType::Progressive,
             timecode: Timecode::SYNTHESIZE,
         };
-        Ok(sdk_video_frame(&p216, &header, data, ptr::null(), None))
+        Ok(sdk_video_frame(
+            crate::frames::SendableVideoLayout::new(p216, ndi)?,
+            &header,
+            data,
+            ptr::null(),
+            None,
+        ))
     }
 
     /// The SDK descriptor of this layout's V210 words at `data`: `p216`, the
@@ -197,6 +208,11 @@ pub struct VideoConverter {
 
 impl VideoConverter {
     /// Resolve both native utility functions from one initialized runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] when the runtime does not
+    /// provide both native V210/P216 conversion functions.
     pub fn new(ndi: &Ndi) -> Result<Self> {
         Ok(Self {
             conversion: ndi.table()?,
@@ -230,7 +246,7 @@ impl VideoConverter {
     /// `layout`'s dimensions, which may start at any address.
     fn unpack(&self, layout: V210Layout, source: &[u32], p216: &mut [u8]) -> Result<()> {
         layout.check_storage(source.len())?;
-        let mut output = layout.p216_descriptor(p216.as_mut_ptr(), p216.len())?;
+        let mut output = layout.p216_descriptor(&self._ndi, p216.as_mut_ptr(), p216.len())?;
         let input = layout.v210_descriptor(output, source.as_ptr());
         // SAFETY: `source` holds every word of the layout's rows and `p216`
         // exactly the P216 frame `output` describes, both initialized and
@@ -268,14 +284,21 @@ impl VideoConverter {
         destination: &mut [u32],
     ) -> Result<()> {
         layout.check_p216(source)?;
-        self.pack_descriptor(layout, source.video_descriptor(), destination)
+        self.pack_descriptor(
+            layout,
+            source.video_descriptor(crate::frames::SendableVideoLayout::new(
+                *source.layout(),
+                &self._ndi,
+            )?),
+            destination,
+        )
     }
 
     /// Pack `p216`, the samples of the packed P216 frame of `layout`'s
     /// dimensions, which may start at any address, into `destination`.
     #[cfg(test)]
     fn pack(&self, layout: V210Layout, p216: &[u8], destination: &mut [u32]) -> Result<()> {
-        let input = layout.p216_descriptor(p216.as_ptr(), p216.len())?;
+        let input = layout.p216_descriptor(&self._ndi, p216.as_ptr(), p216.len())?;
         self.pack_descriptor(layout, input, destination)
     }
 
@@ -555,7 +578,9 @@ mod tests {
                             .metadata(c"<p216/>")
                             .build()
                             .unwrap();
-                    let raw = borrowed.video_descriptor();
+                    let raw = borrowed.video_descriptor(
+                        crate::frames::SendableVideoLayout::for_test(*borrowed.layout()),
+                    );
                     // SAFETY: Both synthetic guards borrow storage and static
                     // metadata for this test, and neither callback frees them.
                     let receiver = unsafe {
@@ -586,7 +611,14 @@ mod tests {
                         .p216_to_v210(&owned, layout, &mut expected[1..])
                         .unwrap();
                     for source in [&borrowed as &dyn VideoSource, &receiver, &framesync] {
-                        assert_eq!(source.video_descriptor().p_data, raw.p_data);
+                        assert_eq!(
+                            source
+                                .video_descriptor(crate::frames::SendableVideoLayout::for_test(
+                                    *source.layout()
+                                ))
+                                .p_data,
+                            raw.p_data
+                        );
                         let mut destination = vec![0x9e37_79b9; layout.required_words() + 2];
                         let (result, allocations) = crate::test_alloc::allocation_count(|| {
                             converter.p216_to_v210(source, layout, &mut destination[1..])

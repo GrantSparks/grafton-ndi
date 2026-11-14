@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use grafton_ndi::{
     advanced::{AllocatedPacketReceiver, KvmReceiver, MouseButton, PacketAttached, PacketReceiver},
-    CaptureMode, MetadataFrame, MetadataMode, Receiver, ReceiverMode, Source, Tally, VideoMode,
+    CaptureMode, EventMode, MetadataFrame, MetadataMode, Receiver, ReceiverMode, Source, Tally, VideoMode,
 };
 
 fn drag_across_frames(receiver: &mut Receiver) {
@@ -73,6 +73,8 @@ fn audio<M: CaptureMode>(receiver: KvmReceiver<'_, M>) {
 
 fn metadata<M: MetadataMode>(receiver: KvmReceiver<'_, M>) {
     let _ = receiver.metadata().capture_ref(Duration::ZERO);
+}
+fn events<M: EventMode>(receiver: KvmReceiver<'_, M>) {
     let _ = receiver.poll_event(Duration::ZERO);
 }
 
@@ -95,7 +97,7 @@ fn switch(receiver: &mut Receiver, next: &Source) {
     drop(session);
     receiver.connect_to(next).unwrap();
     receiver.disconnect();
-    receiver.reconnect().unwrap();
+    receiver.reconnect();
     let mut session = receiver.kvm().unwrap();
     session.mouse_down(MouseButton::Left).unwrap();
     session.release_all().unwrap();
@@ -114,5 +116,6 @@ fn main() {
         video::<grafton_ndi::RawCapture>,
         audio::<grafton_ndi::RawCapture>,
         metadata::<grafton_ndi::RawCapture>,
+        events::<grafton_ndi::RawCapture>,
     );
 }

@@ -7,7 +7,7 @@
 //! A trait a type lacks is its documented design, stated beside the type:
 //! the File objects and FrameSync's frame references stay on their thread,
 //! the Discovery Server owners, a `Router`, `AvSync`, `Genlock` and its clocks
-//! are `Send` but not `Sync`, and `Error`, `Rejected` and an ordinary `Sender`
+//! are `Send` but not `Sync`, and `Error` and `Rejected`
 //! may hold application values that are not unwind safe. Gaining a trait is
 //! not a breaking change; list it here when a type gains one, and list a new
 //! public type with the traits it is meant to have.
@@ -91,6 +91,7 @@ fn crate_root_types_keep_their_auto_traits() {
         FormatCategory: Send, Sync, UnwindSafe, RefUnwindSafe;
         FourCc: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameRate: Send, Sync, UnwindSafe, RefUnwindSafe;
+        FrameMetadataStatus: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameSync: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameSyncAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameSyncAudioRef<'static>: UnwindSafe, RefUnwindSafe;
@@ -125,9 +126,10 @@ fn crate_root_types_keep_their_auto_traits() {
         RuntimeOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
         ScanType: Send, Sync, UnwindSafe, RefUnwindSafe;
         SdkTimestamp: Send, Sync, UnwindSafe, RefUnwindSafe;
-        Sender<RawSend>: Send, Sync;
+        Sender<RawSend>: Send, Sync, UnwindSafe, RefUnwindSafe;
         SenderOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
         SettingChange: Send, Sync, UnwindSafe, RefUnwindSafe;
+        SpawnFailure: Send, Sync, UnwindSafe, RefUnwindSafe;
         Source: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceAddress: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceCache: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -256,6 +258,7 @@ fn advanced_types_keep_their_auto_traits() {
         AllocatedPacketReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocatedReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocationBuffer: Send;
+        AllocationDecline: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocationFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocationRequest: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocatorLimits: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -269,9 +272,15 @@ fn advanced_types_keep_their_auto_traits() {
         AvSyncAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSyncOutcome: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSyncRequest: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AvSyncVideo<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         ClockSource: Send, Sync, UnwindSafe, RefUnwindSafe;
         CompletedVideo: Send, Sync, UnwindSafe, RefUnwindSafe;
         CompressedAudioFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
+        CompressedAudioRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        CompressedVideoRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        PacketItemRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ReceivedAudioRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ReceivedVideoRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         CompressedSender: Send, Sync, UnwindSafe, RefUnwindSafe;
         CompressedVideoFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         EnvelopeCodec: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -339,6 +348,7 @@ fn file_types_keep_their_auto_traits() {
         RecordingReport: Send, Sync, UnwindSafe, RefUnwindSafe;
         RecordingTarget: Send, Sync, UnwindSafe, RefUnwindSafe;
         RecordingTimecode: Send, Sync, UnwindSafe, RefUnwindSafe;
+        SessionTimecode: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceSpec: Send, Sync, UnwindSafe, RefUnwindSafe;
         StateError: Send, Sync, UnwindSafe, RefUnwindSafe;

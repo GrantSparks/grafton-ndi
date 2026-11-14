@@ -17,10 +17,41 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- Runtime selection conflicts carry `SelectionConflict` beside their diagnostic
+  text. `RuntimeLoadFailed` carries a boxed `LoadFailure` with typed candidate
+  locations, origins and refusals, including whether native code was loaded.
+- File-family refusals use `Error::FileFamilyUnavailable { family, detail }`.
+  `RuntimeFeature::File` and `CapabilityUnavailable::SeparateLibrary` are
+  removed; use `FileApi::status` or `supports` for File availability.
+- Runtime and File library selection require absolute explicit paths on every
+  target. Relative `NDI_RUNTIME_DIR_V6` directories are refused and skipped,
+  with the reason retained in load-failure diagnostics.
+- `send_video_async_copy` returns `Result<()>` and reuses released video and
+  metadata storage instead of returning the displaced frame. After warm-up,
+  repeated copies of one layout allocate nothing; `finish_video_async` returns
+  the final frame and releases the spare.
+- Remove `Sender::on_async_video_done` and `clear_async_video_done`. Observe
+  asynchronous video completion through frames returned by `send_video_async`
+  and `finish_video_async`. Ordinary senders now implement `UnwindSafe` and
+  `RefUnwindSafe`.
+- Received video and audio survive unreadable optional per-frame metadata.
+  `metadata_status()` reports why text was withheld; forwarding and owned
+  copies omit it. Standalone metadata capture remains strict.
+- FrameSync- and AvSync-attached receivers, including KVM views, no longer expose
+  event polling because native synchronization can consume status notifications.
+  `EventMode` separates this capability from typed metadata capture; query
+  capabilities, source names and connection state on attached receivers.
+- Async receiver callback and blocking-operation panics resume on the awaiting
+  task with their original payload after native frame cleanup. `SpawnFailed`
+  now carries `SpawnFailure`, distinguishing a missing runtime from cancellation.
 - `KvmSession::receiver()` returns a restricted `KvmReceiver<'_, M>` instead
   of `&Receiver<M>`. Compatible capture and shared controls remain available;
   connection changes require successful input release and session termination.
   The unrestricted accessor is removed across raw and attached KVM entry paths.
+- `AvSync::synchronize` takes an `AvSyncVideo`, which only a frame carrying
+  its sender's timestamp can become, because audio is matched to that
+  timestamp. Frames the application builds have none and are refused when the
+  `AvSyncVideo` is made. `queued_audio` replaces `synchronize(None, ..)`.
 - `NDI` becomes `Ndi`. Pixel formats, color formats and other enum variants use
   Rust casing. Options have private fields, chainable setters and `new`
   constructors in place of separate options builders.
@@ -59,7 +90,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   replaces the first-feed lookup and returns all matching feeds over the full
   discovery window. Entries remain stale until invalidated.
 - `connection_target()` replaces `Receiver::source()` and reports the latest
-  requested target. Disconnect retains it; reconnect retries it.
+  requested target. Disconnect retains it; synchronous `reconnect()` returns
+  `()` and retries the retained native target without allocating. Async
+  reconnect remains fallible for task submission.
 - Synchronous video sends return `Result<()>`; failed owned submissions return
   their input through `Rejected<T>`. `Sender::tally()` reports the current
   value; use `wait_for_tally_change` to wait for changes.
@@ -78,6 +111,17 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Added
 
+- `QueuedVideoFrame::Scatter` queues separate encoder blocks without joining
+  them and returns their original allocations after native completion.
+- Packet receivers, allocator-backed packet receivers and packet KVM sessions
+  support borrowed capture, including compressed payloads in application memory.
+  Borrowed packets can copy into reusable owned frames for relaying.
+
+- `QueuedSender::split` and `CompressedSender::split` lend video and audio
+  operations to separate scoped threads without an external lock.
+- `AllocationDecline` and process-wide custom receive allocation decline
+  counters in `AllocatorUsage`, distinguishing limits, invalid requests,
+  unavailable generations, policy errors/panics and refused buffers.
 - `Runtime::select`, runtime information and capability queries. Optional
   operations report availability by entry points, runtime edition, version
   and build declarations instead of assuming support from a version number.
@@ -120,6 +164,20 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Performance and correctness
 
+- Runtime-authorized layouts now guard caller video descriptors, including
+  owned AV-sync input. Older runtimes reject planar 4:4:4 video consistently
+  before native calls; receiver settings carry the same structural checks.
+- Dropped async receiver waits stop before their next bounded attempt, releasing
+  their receiver and blocking worker without waiting for the original timeout.
+  Source-name polling now uses the same bounded attempts.
+- Sender tally polls retain changes for the next waiter. Concurrent native
+  tally queries serialize within the wait budget, while polls return the
+  cached state without blocking.
+- Keyframe change waiters latch each active stream's demand before waking any
+  observer, so a keyframe sent by the first observer cannot erase another's report.
+- Concurrent Finder lookups and keyframe waiters share native change reports,
+  so one waiter cannot consume another waiter's notification. Native and
+  shared waits use the same deadline, including native waiter handoff.
 - [#140](https://github.com/GrantSparks/grafton-ndi/issues/140): enable runtime
   JPEG SIMD with scalar fallback and direct contiguous packed-RGB input;
   retry capture notifications immediately within bounded bursts; continue File
@@ -133,9 +191,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   caller padding/tail storage require explicit opt-in and initialized storage.
 - Frame and metadata copies reuse retained capacity. Advanced send queues
   account for retained payload and metadata capacity in their byte limits.
-- Finder and Discovery Server collections enforce count/byte budgets with
-  fallible allocation and typed resource-limit errors. Discovery strings have
-  bounded scans, and malformed native event batches are rejected.
+- Finder and Discovery Server collections share bounded copy accounting with
+  fallible allocation and typed resource-limit errors. Listeners omit entries
+  and events with over-limit strings, and entries with malformed nested arrays,
+  while retaining valid peers. Malformed top-level arrays are rejected.
 - Receiver drop percentages use the native received total, which includes
   native drops. Color metadata ignores XML processing instructions.
 - Recording preflight rejects existing exact filenames and normalizes paths;
@@ -183,6 +242,15 @@ A maintenance release retaining the 2.0 API, default features, build-time SDK
 linkage and Rust 1.88 baseline.
 
 ### Fixed
+
+- FrameSync audio reports no timestamp when the synchronizer supplies its
+  zero marker for unknown source timing, including in owned copies.
+
+- Video and audio copies retain metadata storage across frames without text,
+  avoiding allocations when per-frame metadata alternates in a reused buffer.
+
+- Sending a captured single-row video frame with a padded stride uses staging
+  so the SDK reads only initialized pixels and padding.
 
 - Unchanged Cargo builds no longer rebuild because bindgen tracked the
   generated wrapper header as an input (#121). Real SDK headers remain tracked.

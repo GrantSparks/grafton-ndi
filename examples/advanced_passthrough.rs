@@ -20,8 +20,8 @@ use std::{env, time::Duration};
 
 use grafton_ndi::{
     advanced::{
-        CompressedSender, PacketItem, PacketReceiver, PassthroughPreset, ReceivedAudio,
-        ReceivedVideo,
+        CompressedAudioFrame, CompressedSender, CompressedVideoFrame, PacketItemRef,
+        PacketReceiver, PassthroughPreset, ReceivedAudioRef, ReceivedVideoRef,
     },
     Error, Ndi, ReceiverOptions, RuntimeOptions, SdkEdition, SenderOptions, Tally,
 };
@@ -47,7 +47,7 @@ fn main() -> Result<(), Error> {
     };
     println!("Relaying {source}");
 
-    let mut receiver = PacketReceiver::new(
+    let receiver = PacketReceiver::new(
         &ndi,
         &ReceiverOptions::new(source).name("Passthrough Example"),
         // Every compressed format, video and audio, is passed through.
@@ -65,6 +65,8 @@ fn main() -> Result<(), Error> {
     )?;
 
     let (mut video, mut audio) = (0u32, 0u32);
+    let mut video_storage: Option<CompressedVideoFrame> = None;
+    let mut audio_storage: Option<CompressedAudioFrame> = None;
     for _ in 0..600 {
         // A viewer that has just connected cannot decode until it sees a keyframe.
         if sender.sender().keyframe_required(None)? {
@@ -76,31 +78,41 @@ fn main() -> Result<(), Error> {
                 println!("Viewer metadata not passed upstream: {error}");
             }
         }
-        match receiver.capture(Duration::from_secs(1))? {
+        match receiver.capture_ref(Duration::from_secs(1))? {
             // A packet the sender cannot pass on is refused with the reason,
             // and stays with the caller.
-            Some(PacketItem::Video(ReceivedVideo::Compressed(mut packet))) => {
-                match sender.send_video(&mut packet) {
+            Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(packet))) => {
+                // Sending needs mutable owned bytes because the SDK writes them.
+                // Reuse one copy per medium instead of allocating per capture.
+                match video_storage.as_mut() {
+                    Some(storage) => packet.copy_into(storage),
+                    None => video_storage = Some(packet.to_owned()),
+                }
+                match sender.send_video(video_storage.as_mut().unwrap()) {
                     Ok(()) => video += 1,
                     Err(error) => println!("Video packet not relayed: {error}"),
                 }
             }
-            Some(PacketItem::Audio(ReceivedAudio::Compressed(mut packet))) => {
-                match sender.send_audio(&mut packet) {
+            Some(PacketItemRef::Audio(ReceivedAudioRef::Compressed(packet))) => {
+                match audio_storage.as_mut() {
+                    Some(storage) => packet.copy_into(storage),
+                    None => audio_storage = Some(packet.to_owned()),
+                }
+                match sender.send_audio(audio_storage.as_mut().unwrap()) {
                     Ok(()) => audio += 1,
                     Err(error) => println!("Audio packet not relayed: {error}"),
                 }
             }
-            Some(PacketItem::Video(ReceivedVideo::Decoded(frame))) => println!(
+            Some(PacketItemRef::Video(ReceivedVideoRef::Decoded(frame))) => println!(
                 "The source sent {}x{} video in a format this preset decodes",
                 frame.width(),
                 frame.height()
             ),
-            Some(PacketItem::Audio(ReceivedAudio::Decoded(frame))) => println!(
+            Some(PacketItemRef::Audio(ReceivedAudioRef::Decoded(frame))) => println!(
                 "The source sent {} audio samples in a format this preset decodes",
                 frame.num_samples()
             ),
-            Some(PacketItem::Metadata(metadata)) => sender.sender().send_metadata(&metadata),
+            Some(PacketItemRef::Metadata(metadata)) => sender.sender().send_metadata(&metadata),
             None => println!("Waiting for frames..."),
             Some(_) => {}
         }

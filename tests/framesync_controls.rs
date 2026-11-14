@@ -71,6 +71,8 @@ fn exercise_kvm(library: std::path::PathBuf) {
     session.key_down(0xffe1).unwrap();
     session.mouse_down(MouseButton::Right).unwrap();
     session.touch(&[[0.25, 0.5]]).unwrap();
+    session.touch(&[]).unwrap();
+    session.touch(&[[0.25, 0.5]]).unwrap();
     std::env::set_var(
         "GRAFTON_FAKE_CAPTURE_SCRIPT",
         "kvm:video,audio,metadata,status,video",
@@ -105,7 +107,7 @@ fn exercise_kvm(library: std::path::PathBuf) {
     // Drop releases only the second session's key, before the disconnect.
     drop(session);
     receiver.disconnect();
-    receiver.reconnect().unwrap();
+    receiver.reconnect();
     drop(receiver);
 
     let log = fs::read_to_string(&log_path).unwrap();
@@ -154,6 +156,8 @@ fn exercise_kvm(library: std::path::PathBuf) {
             "key-down",
             "right-down",
             "touch",
+            "touch-up", // Empty updates use the documented lift.
+            "touch",
             "key-up",
             "right-up",
             "touch-up", // Refused releases.
@@ -166,6 +170,12 @@ fn exercise_kvm(library: std::path::PathBuf) {
             "receiver-connect",
             "receiver-connect",
         ],
+        "{log}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("touch:") && line.ends_with(":0")),
         "{log}"
     );
     assert_eq!(

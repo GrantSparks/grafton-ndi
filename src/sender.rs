@@ -5,7 +5,10 @@ use std::{
     fmt,
     marker::PhantomData,
     ptr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -13,7 +16,8 @@ use crate::{
     finder::Source,
     frames::{
         AudioSource, MetadataFrame, MetadataSource, MetadataText, PixelFormat, ScanType,
-        ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts, VideoSource,
+        SendableVideoLayout, ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts,
+        VideoSource,
     },
     pixels::{send_room, Pixels},
     receiver::Tally,
@@ -85,15 +89,38 @@ struct Inner {
     // The entry points of the runtime that created `instance`.
     core: &'static sys::Core,
     metadata_capture: parking_lot::Mutex<()>,
+    tally: TallyState,
+    #[cfg(ndi_has_advanced_keyframe_demand)]
+    keyframe_changes: crate::keyframe_changes::KeyframeChanges,
 }
 
-// A panic cannot leave this half-changed: its one lock guards `()`, and no
-// application code runs while it is held. The `parking_lot` lock does not
-// poison and so does not declare this itself, which would otherwise leave
-// even the Advanced senders, which hold no application callback, short of
-// `RefUnwindSafe`. An ordinary sender's completion handler still decides
-// that sender's unwind traits.
+// A panic cannot leave metadata capture or tally half-changed: their locks
+// guard native queries, and no application code runs while held. Those locks
+// do not poison or declare this themselves, which would otherwise leave
+// senders short of `RefUnwindSafe`. The change feed uses unwind-safe standard locks.
 impl std::panic::RefUnwindSafe for Inner {}
+
+/// Polling must preserve the SDK's consumable change report for a later wait.
+#[derive(Default)]
+struct TallyState {
+    query: parking_lot::Mutex<()>,
+    value: AtomicU8,
+    pending: AtomicBool,
+}
+
+impl TallyState {
+    fn current(&self) -> Tally {
+        let bits = self.value.load(Ordering::Acquire);
+        Tally::new(bits & 1 != 0, bits & 2 != 0)
+    }
+
+    fn remember(&self, tally: Tally) {
+        self.value.store(
+            u8::from(tally.on_program()) | (u8::from(tally.on_preview()) << 1),
+            Ordering::Release,
+        );
+    }
+}
 
 mod ownership {
     use super::*;
@@ -159,9 +186,7 @@ mod ownership {
 
     impl fmt::Debug for Shared {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("Shared")
-                .field("video_callback_set", &self.video.callback.is_some())
-                .finish_non_exhaustive()
+            f.debug_struct("Shared").finish_non_exhaustive()
         }
     }
 
@@ -275,8 +300,9 @@ impl AudioSendMode for QueueAttached {}
 /// itself, and it cannot be registered with an advertiser.
 ///
 /// A sender is `Send` and `Sync`. Its operations take `&self` and may run on
-/// several threads at once, except the asynchronous video submissions and the
-/// completion handler setters, which take `&mut self`.
+/// several threads at once, except asynchronous video submissions, which
+/// take `&mut self`. Tally polls preserve changes for a waiting thread;
+/// concurrent tally waits serialize and each change is consumed once.
 #[derive(Debug)]
 pub struct Sender<M: SenderMode = RawSend> {
     inner: Inner,
@@ -287,19 +313,15 @@ pub struct Sender<M: SenderMode = RawSend> {
     _mode: PhantomData<M>,
 }
 
-type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
-
 /// The video pipeline of a sender that sends uncompressed video: the frame
 /// the SDK may still be reading, or the one it last released, the copy a
-/// synchronous send makes of a frame it cannot send in place, and the
-/// completion handler.
+/// synchronous send makes of a frame it cannot send in place.
 ///
 /// [`Shared`] owns it beside the native sender and drops it first, so the
 /// pipeline drains the SDK while `sender` is still live.
 struct VideoPipeline {
     sender: SendHandle,
     state: Mutex<VideoState>,
-    callback: Option<AsyncCallback>,
 }
 
 /// What a sender's video operations share, behind one lock.
@@ -312,6 +334,9 @@ struct VideoState {
     /// read from here instead. Empty until such a frame is sent, then kept
     /// for the next one.
     staging: Pixels,
+    /// A released frame kept for the next asynchronous copy. This is never
+    /// the allocation the SDK is still reading from `in_flight`.
+    spare: Option<VideoFrame>,
 }
 
 impl VideoPipeline {
@@ -319,163 +344,129 @@ impl VideoPipeline {
         Self {
             sender,
             state: Mutex::new(VideoState::default()),
-            callback: None,
         }
     }
 
-    fn notify(&self, len: Option<usize>) {
-        if let (Some(len), Some(callback)) = (len, self.callback.as_ref()) {
-            callback(len);
-        }
-    }
-
-    /// Lock the video state, make one synchronizing SDK call through `call`,
-    /// which returns its result and the pixel-buffer length of the frame it
-    /// completed, then unlock and notify the completion handler.
-    ///
-    /// Every video operation follows this order, so the handler runs once the
-    /// state is consistent and outside the lock: it may panic or reenter the
-    /// sender without freeing a frame in flight or being notified twice.
-    /// Destruction follows it too, without the lock, in `Drop for
-    /// VideoPipeline`.
-    fn synchronize<R>(
-        &self,
-        call: impl FnOnce(&mut VideoState, SendHandle) -> (R, Option<usize>),
-    ) -> R {
-        let (result, completed) = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            call(&mut state, self.sender)
-        };
-        self.notify(completed);
-        result
+    /// Lock the video state and make one synchronizing SDK call through `call`.
+    fn synchronize<R>(&self, call: impl FnOnce(&mut VideoState, SendHandle) -> R) -> R {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        call(&mut state, self.sender)
     }
 
     /// Send `frame` synchronously, which also releases the frame in flight.
-    fn send(&self, frame: &(impl VideoSource + ?Sized)) {
+    fn send(&self, frame: &(impl VideoSource + ?Sized), authorized: SendableVideoLayout) {
         self.synchronize(|state, sender| {
             // The SDK reads the copy only during the send, under this lock.
-            let frame = PreparedVideo::new(frame, &mut state.staging);
+            let frame = PreparedVideo::authorized(frame, &mut state.staging, authorized);
             // A synchronous video send also releases the previous async frame,
             // which completes once the send has returned.
             let synchronized = state.in_flight.send(sender, frame);
-            ((), completed(&mut state.in_flight, synchronized))
+            state.in_flight.completed(synchronized);
         });
     }
 
     /// Hand a checked frame to the SDK and return the previous one, if any.
-    ///
-    /// If the handler panics, the synchronized previous frame is dropped and
-    /// the pipeline retains the new frame.
-    fn submit(&self, frame: VideoFrame) -> Option<VideoFrame> {
+    fn submit(&self, frame: VideoFrame, authorized: SendableVideoLayout) -> Option<VideoFrame> {
         self.synchronize(|state, sender| {
             // The pipeline owns the new frame before the SDK sees it. The
             // previous frame stays owned by `displaced` until the submission,
             // which synchronizes the SDK's access to it, has returned; only
             // the proof of that return completes it.
-            let (mut displaced, synchronized) = state.in_flight.submit(sender, frame);
-            let len = completed(&mut displaced, synchronized);
-            (displaced.take_retained(), len)
+            let (mut displaced, synchronized) = state.in_flight.submit(sender, frame, authorized);
+            displaced.completed(synchronized);
+            displaced.take_retained()
         })
+    }
+
+    /// Copy into released storage, then retain the displaced frame for reuse.
+    fn copy(&self, frame: &(impl VideoSource + ?Sized), authorized: SendableVideoLayout) {
+        self.synchronize(|state, sender| {
+            let owned = match state.spare.take() {
+                Some(mut spare) => {
+                    frame.copy_into_owned(&mut spare);
+                    spare
+                }
+                None => frame.owned_copy(),
+            };
+            let (mut displaced, synchronized) = state.in_flight.submit(sender, owned, authorized);
+            // Only the submission's return proves that the SDK has released
+            // the displaced storage. A later copy may refill it after this.
+            displaced.completed(synchronized);
+            state.spare = displaced.take_retained();
+        });
     }
 
     /// Wait for the SDK to release the frame in flight, which stays retained.
     fn flush(&self) {
-        self.synchronize(|state, sender| ((), drain(&mut state.in_flight, sender)));
+        self.synchronize(|state, sender| drain(&mut state.in_flight, sender));
     }
 
     /// Drain the SDK and take the retained frame.
     fn finish(&self) -> Option<VideoFrame> {
         self.synchronize(|state, sender| {
-            let len = drain(&mut state.in_flight, sender);
-            (state.in_flight.take_retained(), len)
+            drain(&mut state.in_flight, sender);
+            state.spare = None;
+            state.in_flight.take_retained()
         })
     }
 
-    /// End the pipeline without calling its completion handler: drain the
-    /// SDK, take the retained frame, and drop the handler.
-    ///
-    /// A frame that was still in flight is returned rather than notified, so
-    /// a handler that would panic cannot unwind out of the conversion and
-    /// lose what its caller is converting. Nothing is left in flight once
-    /// this returns.
+    /// End the pipeline: drain the SDK and take the retained frame.
     #[cfg(all(feature = "advanced", ndi_has_advanced_send_completion))]
     fn retire(mut self) -> Option<VideoFrame> {
-        self.callback = None;
         let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        // The notification `drain` claims has no handler left to run.
-        let _ = drain(&mut state.in_flight, self.sender);
+        drain(&mut state.in_flight, self.sender);
         state.in_flight.take_retained()
-        // Dropping the idle pipeline makes no SDK call and notifies nothing.
+        // Dropping the idle pipeline makes no SDK call.
     }
 }
 
 impl Drop for VideoPipeline {
-    /// The destruction variant of [`VideoPipeline::synchronize`]: dropping
-    /// holds the state exclusively, so it takes no lock, and it contains a
-    /// handler panic while the thread is already unwinding.
+    /// Drain the SDK while destruction holds the state exclusively.
     fn drop(&mut self) {
         // The native sender may outlive this pipeline when an advertiser
         // registration shares it, so the pipeline drains the SDK itself
         // rather than relying on the sender's destruction.
         let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        let len = drain(&mut state.in_flight, self.sender);
-        // A handler that panics here unwinds through the rest of the drop:
-        // `Shared` still releases the native sender, and the retained frame
-        // is freed after the SDK has released it.
-        if std::thread::panicking() {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.notify(len)));
-        } else {
-            self.notify(len);
-        }
+        drain(&mut state.in_flight, self.sender);
     }
 }
 
-impl in_flight::Lend for VideoFrame {
-    /// The frame's descriptor. It points into the frame's pixel allocation,
-    /// which holds the room the SDK reads after them, and its metadata
-    /// `CString`; moving the frame moves neither.
-    fn lend(&mut self) -> in_flight::Lent {
-        in_flight::Lent::Frame(self.to_raw())
-    }
-}
+// SAFETY: The descriptor borrows owned initialized pixels, scan-dependent SDK
+// tail, and terminated FrameMetadata. Moving the frame moves none of those
+// allocations, which InFlight keeps inaccessible until the SDK releases them.
+unsafe impl in_flight::Lend for VideoFrame {
+    type Authorization = SendableVideoLayout;
 
-/// Mark `state`'s frame in flight as released, with the proof that the SDK
-/// has synchronized it, and claim its notification: the pixel-buffer length
-/// to report.
-///
-/// The notification is claimed before any user code runs, so a handler that
-/// panics or reenters cannot be notified twice.
-fn completed(state: &mut InFlight<VideoFrame>, synchronized: Synchronized) -> Option<usize> {
-    state
-        .completed(synchronized)
-        .map(|frame| frame.data().len())
+    fn lend(&mut self, authorized: Self::Authorization) -> in_flight::Lent {
+        in_flight::Lent::Frame(self.to_raw(authorized))
+    }
 }
 
 /// Synchronize the SDK if it may still read `state`'s frame, then complete
 /// it: the release a flush, a finish and the pipeline's destruction share.
-fn drain(state: &mut InFlight<VideoFrame>, sender: SendHandle) -> Option<usize> {
+fn drain(state: &mut InFlight<VideoFrame>, sender: SendHandle) {
     if !state.is_in_flight() {
         // A retained frame was completed when the SDK released it.
-        return None;
+        return;
     }
     let synchronized = state.flush(sender);
-    completed(state, synchronized)
+    state.completed(synchronized);
 }
 
 /// Frames an asynchronous video send lends to the SDK, and the SDK calls that
 /// end the loan.
 ///
-/// `Processing.NDI.Send.h` lets the SDK keep reading a frame sent with
-/// `NDIlib_send_send_video_async_v2` until a synchronizing event: another
-/// asynchronous send, a synchronous send, an asynchronous send of a null
-/// frame, or destroying the sender. `Processing.NDI.Advanced.h` gives the
-/// scatter submission, `NDIlib_send_send_video_scatter_async`, the same
-/// rules. A [`CompressedSender`](crate::advanced::CompressedSender) keeps one
-/// frame per stream, program and preview, each until the next asynchronous
-/// send on that stream.
+/// `Processing.NDI.Send.h` lets the SDK keep reading an asynchronous frame
+/// until a later video send (asynchronous or synchronous, including a null
+/// synchronous frame) or sender destruction synchronizes it. The [NDI-Send]
+/// documentation additionally specifies the null asynchronous flush used here.
+/// `Processing.NDI.Advanced.h` gives scatter submission the same lifetime rules.
+/// A [`CompressedSender`](crate::advanced::CompressedSender) conservatively
+/// retains each stream's frame until a replacement on that stream returns,
+/// even when another stream's video send has already synchronized the SDK.
 ///
 /// [`InFlight`] holds one stream's lent frame. It hands the frame back only in
-/// exchange for [`Synchronized`], the proof that the SDK has returned from a
+/// exchange for [`in_flight::Synchronized`], the proof that the SDK has returned from a
 /// synchronizing call made after the frame was submitted, or [`Destroyed`],
 /// the proof that its native sender no longer exists. Both proofs have
 /// private fields, so the rest of the crate obtains one only from the
@@ -489,6 +480,8 @@ fn drain(state: &mut InFlight<VideoFrame>, sender: SendHandle) -> Option<usize> 
 /// releases the native sender, and a `CompressedSender` destroys its native
 /// sender before it drops its streams. An owner that is never dropped leaks
 /// its frames rather than freeing them.
+///
+/// [NDI-Send]: https://docs.ndi.video/all/developing-with-ndi/sdk/ndi-send
 pub(crate) mod in_flight {
     use std::mem;
 
@@ -501,9 +494,9 @@ pub(crate) mod in_flight {
 
     /// Proof that the SDK has returned from a call that synchronizes a
     /// stream's asynchronous video: an asynchronous or synchronous video
-    /// send, or a null flush. `Processing.NDI.Send.h` and the [NDI-Send]
-    /// documentation list these as synchronizing events: when one returns,
-    /// the SDK no longer reads the frame previously submitted asynchronously.
+    /// send, or a null flush. `Processing.NDI.Send.h` lists subsequent video
+    /// sends; [NDI-Send] additionally documents the null asynchronous flush.
+    /// When the call returns, the SDK no longer reads the previous frame.
     ///
     /// [`InFlight::completed`] consumes it, so a frame is released only after
     /// the call that ended the SDK's access to it.
@@ -524,13 +517,17 @@ pub(crate) mod in_flight {
 
     /// A frame an asynchronous video send can lend to the SDK.
     ///
+    /// # Safety
+    ///
     /// The descriptors [`lend`](Self::lend) returns point only into
     /// allocations the frame owns, which moving the frame does not move: the
     /// SDK goes on using them after the frame has moved into its slot, and
     /// the slot gives no access to a frame in flight.
-    pub(crate) trait Lend {
+    pub(crate) unsafe trait Lend {
         /// The descriptors that lend this frame to the SDK.
-        fn lend(&mut self) -> Lent;
+        type Authorization;
+
+        fn lend(&mut self, authorization: Self::Authorization) -> Lent;
     }
 
     /// What an asynchronous video send hands the SDK.
@@ -653,8 +650,13 @@ pub(crate) mod in_flight {
         /// Make `next` the frame in flight and lend it to the SDK. Returns
         /// the state it displaced, whose frame the SDK has released, with the
         /// proof of that release.
-        pub(crate) fn submit(&mut self, sender: SendHandle, mut next: T) -> (Self, Synchronized) {
-            let lent = next.lend();
+        pub(crate) fn submit(
+            &mut self,
+            sender: SendHandle,
+            mut next: T,
+            authorization: T::Authorization,
+        ) -> (Self, Synchronized) {
+            let lent = next.lend(authorization);
             // The slot owns the new frame before the SDK sees it. Moving the
             // frame does not move what `lent` points to (the contract of
             // `Lend`).
@@ -798,7 +800,7 @@ pub(crate) mod in_flight {
     }
 }
 
-use in_flight::{InFlight, Synchronized};
+use in_flight::InFlight;
 
 impl fmt::Debug for Inner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -842,7 +844,11 @@ pub struct BorrowedVideoFrame<'buf> {
     metadata: Option<MetadataText<'buf>>,
 }
 
-impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
+// SAFETY: Construction checks the initialized byte slice covers the validated
+// layout; its borrow also retains validated terminated metadata unchanged.
+// sends_in_place checks the initialized stride/tail extent before direct SDK
+// reads. The default descriptor never points outside those borrowed buffers.
+unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
     #[inline]
     fn layout(&self) -> &ValidatedVideoLayout {
         &self.layout
@@ -851,9 +857,6 @@ impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
     fn header(&self) -> &VideoHeader {
         &self.header
     }
-    /// `data` is exactly the storage the layout describes, as construction
-    /// checked, initialized like any slice, and borrowed unchanged for
-    /// `'buf`.
     #[inline]
     fn pixels(&self) -> *const u8 {
         self.data.as_ptr()
@@ -885,15 +888,28 @@ pub(crate) struct PreparedVideo<'a> {
 }
 
 impl<'a> PreparedVideo<'a> {
+    #[cfg(test)]
     fn new(frame: &'a (impl VideoParts + ?Sized), staging: &'a mut Pixels) -> Self {
+        Self::authorized(
+            frame,
+            staging,
+            SendableVideoLayout::for_test(*frame.layout()),
+        )
+    }
+
+    fn authorized(
+        frame: &'a (impl VideoParts + ?Sized),
+        staging: &'a mut Pixels,
+        authorized: SendableVideoLayout,
+    ) -> Self {
         let raw = if frame.can_send_direct() {
-            frame.video_descriptor()
+            frame.video_descriptor(authorized)
         } else {
-            let packed = frame.layout().packed();
-            let room = send_room(&packed, frame.header().scan_type);
-            frame.copy_active_pixels(staging, &packed, room);
+            let packed = authorized.packed();
+            let room = send_room(packed.layout(), frame.header().scan_type);
+            frame.copy_active_pixels(staging, packed.layout(), room);
             crate::frames::sdk_video_frame(
-                &packed,
+                packed,
                 frame.header(),
                 staging.as_ptr(),
                 frame
@@ -1002,12 +1018,14 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// metadata, and no timestamp. No reference to the source is retained.
     ///
     /// Its pixel buffer is reused when its capacity holds the packed frame
-    /// and its format's [room](PixelFormat::send_tail_room), and otherwise
+    /// and the SDK tail room required by its format and scan type, including
+    /// extra strides for interlaced UYVY/UYVA when needed. Otherwise it is
     /// replaced by one allocation of exactly that size. Its metadata string
     /// is reused when its capacity holds the new text and its terminator;
     /// otherwise it grows once. With sufficient pixel and metadata capacity,
     /// subsequent copies allocate nothing. The copy makes no SDK call and can
-    /// run on any thread.
+    /// run on any thread. Copies without metadata retain the destination's
+    /// text allocation for later frames.
     ///
     /// # Example
     ///
@@ -1015,8 +1033,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// [`Sender::send_video_async`] keeps the frame it is given until the next
     /// send, and returns the previous one, which the SDK has finished with:
     /// that frame is the destination of the next copy.
-    /// [`Sender::send_video_async_copy`] makes the same copy into a new frame
-    /// on every call instead.
+    /// [`Sender::send_video_async_copy`] keeps its own reusable frames for
+    /// this copy instead.
     ///
     /// ```no_run
     /// # use grafton_ndi::{BorrowedVideoFrame, Ndi, PixelFormat, Sender, SenderOptions, VideoFrame};
@@ -1130,7 +1148,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
 
     #[cfg(test)]
     fn to_raw(self) -> NDIlib_video_frame_v2_t {
-        self.video_descriptor()
+        self.video_descriptor(SendableVideoLayout::for_test(*self.layout()))
     }
 }
 
@@ -1289,12 +1307,12 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
             self.height,
             self.line_stride,
         )?;
-        let Some(data) = self.data.get(..layout.data_len_bytes) else {
+        let Some(data) = self.data.get(..layout.data_len_bytes()) else {
             return Err(Error::InvalidFrame(format!(
                 "Buffer too small for {:?}: got {} bytes, expected at least {}",
                 self.pixel_format,
                 self.data.len(),
-                layout.data_len_bytes,
+                layout.data_len_bytes(),
             )));
         };
         let metadata = self.metadata.map(MetadataText::from_cstr).transpose()?;
@@ -1375,6 +1393,9 @@ impl<M: SenderMode> Sender<M> {
                 instance,
                 core,
                 metadata_capture: parking_lot::Mutex::new(()),
+                tally: TallyState::default(),
+                #[cfg(ndi_has_advanced_keyframe_demand)]
+                keyframe_changes: crate::keyframe_changes::KeyframeChanges::default(),
             },
             native: NativeOwner::new(SenderResource {
                 instance,
@@ -1416,9 +1437,7 @@ impl Sender {
     ///
     /// The pipeline is retired: the SDK is drained, so nothing this sender
     /// submitted is in flight once the sender is in mode `T`, which has no
-    /// pipeline, and the completion handler is dropped without being called,
-    /// so a handler that would panic cannot lose the sender. Returns the
-    /// sender unchanged, with nothing synchronized,
+    /// pipeline. Returns the sender unchanged, with nothing synchronized,
     /// when an advertiser registration shares its native sender: the
     /// registration could keep it alive after the frames an Advanced sender
     /// lends the SDK are freed.
@@ -1470,9 +1489,8 @@ impl Sender {
     /// reuses one staging allocation. Captures with padded rows also stage,
     /// since their guard guarantees only active pixels are initialized. Packed
     /// captures needing no trailing room send in place. Owned
-    /// frames use their zeroed tail; a scan type requiring extra strides may
-    /// still need staging until the owned buffer has that room. To permit
-    /// direct sending from initialized caller padding
+    /// frames retain zeroed, scan-dependent tail room and always send in place.
+    /// To permit direct sending from initialized caller padding
     /// and trailing memory, explicitly use
     /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`];
     /// [`BorrowedVideoFrame::sends_in_place`] tells which a frame is.
@@ -1505,8 +1523,8 @@ impl Sender {
     /// # }
     /// ```
     pub fn send_video(&self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
-        self.require_video_format(frame.layout().pixel_format)?;
-        self.native.video.send(frame);
+        let authorized = self.require_video_layout(*frame.layout())?;
+        self.native.video.send(frame, authorized);
         Ok(())
     }
 
@@ -1514,14 +1532,14 @@ impl Sender {
     ///
     /// The sender takes ownership before calling the SDK. The next async send
     /// synchronizes the previous send and returns its owned frame for reuse.
-    /// The first send returns `None`. Owned and copied submissions share this
-    /// recovery behavior. Call [`Self::finish_video_async`] to recover the final frame.
+    /// The first send returns `None`. The returned frame may have been submitted
+    /// by ownership or copying. A copied submission instead retains the frame
+    /// it displaces for its next copy. Call [`Self::finish_video_async`] to
+    /// recover the final frame.
     ///
     /// Synchronous sends and explicit flushes complete the operation but retain
     /// the owned frame for recovery by the next async send or finish call.
     /// No SDK completion callback is registered, including with Advanced SDK.
-    /// If a Rust completion handler panics, the new frame remains retained and
-    /// the synchronized previous frame is dropped rather than returned.
     ///
     /// # Errors
     ///
@@ -1534,79 +1552,55 @@ impl Sender {
         &mut self,
         frame: VideoFrame,
     ) -> std::result::Result<Option<VideoFrame>, Rejected<VideoFrame>> {
-        if let Err(error) = self.require_video_format(frame.pixel_format()) {
-            return Err(Rejected::new(error, frame));
-        }
-        Ok(self.native.video.submit(frame))
+        let authorized = match self.require_video_layout(*frame.layout()) {
+            Ok(authorized) => authorized,
+            Err(error) => return Err(Rejected::new(error, frame)),
+        };
+        Ok(self.native.video.submit(frame, authorized))
     }
 
     /// Drain the SDK and return the final owned frame, if any.
     ///
     /// Frames submitted through either owned or copied sending are returned.
-    /// Repeated calls return `None` and do not repeat completion notifications.
-    /// If the completion handler panics, the completed frame is dropped instead
-    /// of returned.
+    /// Any spare storage retained for copying is released. Repeated calls
+    /// return `None`.
     pub fn finish_video_async(&mut self) -> Option<VideoFrame> {
         self.native.video.finish()
     }
 
     /// Copy borrowed pixels and metadata, then submit the owned copy asynchronously.
     ///
-    /// This uses the same pipeline as [`Self::send_video_async`], returning the
-    /// previous completed frame whether it was submitted by ownership or copying.
     /// The caller may immediately reuse or release the source buffer and metadata.
-    /// Recover the final copy with [`Self::finish_video_async`].
+    /// The sender keeps the previous completed frame as spare storage for its
+    /// next copy, whether that frame was submitted by ownership or copying.
+    /// Once both frames have enough pixel and metadata capacity, repeated
+    /// copies reuse their allocations. Larger layouts or longer metadata grow
+    /// each buffer as needed.
+    ///
+    /// Recover the final copy with [`Self::finish_video_async`], which also
+    /// releases the spare. Owned submissions through [`Self::send_video_async`]
+    /// still return the frame they displace.
     ///
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedCapability`] if this sender's runtime
     /// cannot send the frame's pixel format, checked before anything is
     /// copied. No pending send is changed on failure.
-    pub fn send_video_async_copy(
-        &mut self,
-        frame: &(impl VideoSource + ?Sized),
-    ) -> Result<Option<VideoFrame>> {
-        self.require_video_format(frame.layout().pixel_format)?;
-        let owned = frame.owned_copy();
-        Ok(self.native.video.submit(owned))
-    }
-
-    /// Replace the completion handler receiving the submitted pixel-buffer length.
-    ///
-    /// It runs on the calling thread after SDK synchronization, outside internal
-    /// locks, at most once per submitted frame. Completion is observed by the
-    /// next video send, flush, finish, or sender destruction. Owned and copied sends share
-    /// this handler. State is updated before invocation, so panic or reentry cannot
-    /// repeat a notification. If sender destruction runs during unwinding, a
-    /// handler panic is suppressed to avoid a second panic.
-    ///
-    /// Replaces the previous handler. The current handler observes completion of
-    /// a frame still in flight, including one submitted before registration.
-    /// Frames completed before registration are not notified retroactively.
-    ///
-    /// Converting the sender with the Advanced `QueuedSender::from_sender`
-    /// drops the handler without calling it: that conversion returns the
-    /// frame still in flight instead of notifying it.
-    pub fn on_async_video_done<F>(&mut self, handler: F)
-    where
-        F: Fn(usize) + Send + Sync + 'static,
-    {
-        self.native.video.callback = Some(Box::new(handler));
-    }
-
-    /// Remove the completion handler. Pending frame ownership is unchanged.
-    pub fn clear_async_video_done(&mut self) {
-        self.native.video.callback = None;
+    pub fn send_video_async_copy(&mut self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
+        let authorized = self.require_video_layout(*frame.layout())?;
+        self.native.video.copy(frame, authorized.packed());
+        Ok(())
     }
 
     /// Flush pending async video operations synchronously.
     ///
-    /// Sends a true NULL video frame pointer to the SDK, blocking until all
-    /// pending async video operations are complete.
+    /// When the SDK may still read a pending frame, sends a null video frame
+    /// pointer and blocks until that asynchronous operation completes. If no
+    /// frame is in flight, returns without calling the SDK.
     ///
     /// After this returns, the SDK has released the pending buffer. The sender
-    /// retains the frame; use [`Self::finish_video_async`] or the next async
-    /// submission to recover it without copying.
+    /// retains the frame; use [`Self::finish_video_async`] or an owned
+    /// submission through [`Self::send_video_async`] to recover it without copying.
     pub fn flush_async_blocking(&self) {
         self.native.video.flush();
     }
@@ -1672,6 +1666,14 @@ impl<M: SenderMode> Sender<M> {
         self.inner.instance.0
     }
 
+    /// All selectors consume the SDK's same one-shot report, including a
+    /// null selector beside a format-specific selector. Share the native wait
+    /// across them and filter the current demand at each caller.
+    #[cfg(ndi_has_advanced_keyframe_demand)]
+    pub(crate) fn keyframe_changes(&self) -> &crate::keyframe_changes::KeyframeChanges {
+        &self.inner.keyframe_changes
+    }
+
     /// The handle the asynchronous video slots of this sender's owner send
     /// through.
     #[cfg(feature = "advanced")]
@@ -1694,8 +1696,11 @@ impl<M: SenderMode> Sender<M> {
 
     /// Check that this sender's runtime can send `pixel_format`: the one
     /// check every video send makes before anything reaches the SDK.
-    pub(crate) fn require_video_format(&self, pixel_format: PixelFormat) -> Result<()> {
-        pixel_format.require_sendable(&self._ndi)
+    pub(crate) fn require_video_layout(
+        &self,
+        layout: ValidatedVideoLayout,
+    ) -> Result<SendableVideoLayout> {
+        SendableVideoLayout::new(layout, &self._ndi)
     }
 
     /// Capture metadata sent back by connected receivers.
@@ -1706,6 +1711,16 @@ impl<M: SenderMode> Sender<M> {
     /// 4 MiB, rather than assuming every positive native length is the exact
     /// UTF-8 byte count including its terminator. Invalid descriptor counts and
     /// invalid UTF-8 still return an error, and every captured frame is freed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] when the runtime lacks the
+    /// sender metadata capture functions, [`Error::InvalidInput`] when the
+    /// timeout exceeds [`crate::MAX_TIMEOUT`], [`Error::InvalidFrame`] for an
+    /// invalid metadata count, a positive count with null data, or a missing
+    /// bounded terminator,
+    /// [`Error::InvalidUtf8`] for non-UTF-8 text, and [`Error::CaptureFailed`]
+    /// when the SDK returns a frame type other than metadata or no frame.
     pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
         let metadata = self._ndi.table::<sys::SenderMetadata>()?;
         let deadline = Deadline::after(timeout)?;
@@ -1794,10 +1809,13 @@ impl<M: SenderMode> Sender<M> {
 
     /// The tally this sender currently reports.
     ///
-    /// Polls without waiting and returns the current state every time, whether
-    /// or not it has changed since the last query. Call
+    /// Polls without waiting and returns the most recent state the SDK reported
+    /// to this sender, whether or not it has changed since the last query. Call
     /// [`Self::wait_for_tally_change`] to block until it changes. Never fails
     /// and may be called from any thread.
+    /// While another thread waits, returns the cached state without a native
+    /// query. That state may lag the change until the waiter wakes. Polling
+    /// preserves a change for [`Self::wait_for_tally_change`] to report.
     ///
     /// # Examples
     ///
@@ -1814,7 +1832,16 @@ impl<M: SenderMode> Sender<M> {
     /// # }
     /// ```
     pub fn tally(&self) -> Tally {
-        self.get_tally(0).1
+        let state = &self.inner.tally;
+        let Some(_query) = state.query.try_lock() else {
+            return state.current();
+        };
+        let (changed, tally) = self.get_tally(0);
+        state.remember(tally);
+        if changed {
+            state.pending.store(true, Ordering::Release);
+        }
+        tally
     }
 
     /// Wait up to `timeout` for the tally to change.
@@ -1822,6 +1849,10 @@ impl<M: SenderMode> Sender<M> {
     /// Returns `Ok(Some(tally))` with the new state when the SDK reports a
     /// change, and `Ok(None)` when `timeout` elapses first. Use
     /// [`Self::tally`] to read the current state without waiting.
+    /// A change observed by polling is kept for the next wait. Changes
+    /// coalesce, and each report goes to one waiter, rather than broadcasting
+    /// to every waiter. Concurrent waits serialize their native queries;
+    /// contention spends the same timeout budget as the native wait.
     ///
     /// # Errors
     ///
@@ -1847,8 +1878,16 @@ impl<M: SenderMode> Sender<M> {
     /// # }
     /// ```
     pub fn wait_for_tally_change(&self, timeout: Duration) -> Result<Option<Tally>> {
-        let timeout_ms = to_ms_checked(timeout)?;
-        let (changed, tally) = self.get_tally(timeout_ms);
+        let deadline = Deadline::after(timeout)?;
+        let state = &self.inner.tally;
+        let Some(_query) = state.query.try_lock_until(deadline.end()) else {
+            return Ok(None);
+        };
+        if state.pending.swap(false, Ordering::AcqRel) {
+            return Ok(Some(state.current()));
+        }
+        let (changed, tally) = self.get_tally(deadline.remaining_ms());
+        state.remember(tally);
         Ok(changed.then_some(tally))
     }
 
@@ -1873,8 +1912,11 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Maximum time to wait for connection count.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    /// * `timeout` - Maximum wait for at least one connected receiver. A zero
+    ///   timeout returns the current count immediately. A nonzero timeout
+    ///   returns as soon as a receiver is connected, or returns zero when the
+    ///   wait expires, as specified by `Processing.NDI.Send.h`. Must not exceed
+    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
     ///
@@ -2143,7 +2185,6 @@ impl SenderOptions {
 mod tests {
     use super::*;
     use crate::RuntimeFeature;
-    use std::sync::Arc;
 
     #[test]
     fn captured_video_sending_uses_initialized_active_rows_and_preserves_descriptors() {
@@ -2202,7 +2243,7 @@ mod tests {
                     let stride = format.line_stride_bytes(4).unwrap() + padding;
                     let len = ValidatedVideoLayout::new_uncompressed(format, 4, 6, Some(stride))
                         .unwrap()
-                        .data_len_bytes;
+                        .data_len_bytes();
                     let initialized = vec![71; len];
                     let template = BorrowedVideoFrame::builder(&initialized, 4, 6, format)
                         .line_stride_bytes(stride)
@@ -2333,8 +2374,8 @@ mod tests {
             let Some(frame) = video.in_flight.frame() else {
                 panic!("missing owned frame")
             };
-            assert_eq!(frame.to_raw().p_data, pixels as *mut u8);
-            assert_eq!(frame.to_raw().p_metadata, metadata);
+            assert_eq!(frame.as_test_raw().p_data, pixels as *mut u8);
+            assert_eq!(frame.as_test_raw().p_metadata, metadata);
         }
         let second = test_owned_frame(22);
         let second_pixels = second.data().as_ptr();
@@ -2378,6 +2419,135 @@ mod tests {
     }
 
     #[test]
+    fn copied_async_sends_reuse_pixels_and_metadata_after_warmup() {
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
+        let pixels = vec![128; 16 * 16 * 4];
+        let source = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
+            .frame_rate(FrameRate::new(30, 1).unwrap())
+            .picture_aspect_ratio(1.25)
+            .timecode(Timecode::from_ticks(1234))
+            .metadata(c"<metadata/>")
+            .build()
+            .unwrap();
+        let shorter = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
+            .metadata(c"<short/>")
+            .build()
+            .unwrap();
+        sender.send_video_async_copy(&source).unwrap();
+        sender.send_video_async_copy(&source).unwrap();
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            for _ in 0..4 {
+                sender.send_video_async_copy(&shorter).unwrap();
+                sender.send_video_async_copy(&shorter).unwrap();
+                sender.send_video_async_copy(&source).unwrap();
+                sender.send_video_async_copy(&source).unwrap();
+            }
+        });
+        assert_eq!(allocations, 0);
+        let copy = sender.finish_video_async().unwrap();
+        assert_eq!(copy.data(), pixels);
+        assert_eq!(copy.frame_rate(), source.frame_rate());
+        assert_eq!(copy.picture_aspect_ratio(), 1.25);
+        assert_eq!(copy.timecode(), Timecode::from_ticks(1234));
+        assert_eq!(copy.metadata(), Some("<metadata/>"));
+        assert!(sender.native.video.state.lock().unwrap().spare.is_none());
+        assert!(sender.finish_video_async().is_none());
+    }
+
+    #[test]
+    fn copied_async_sends_reuse_metadata_across_absent_and_empty_frames() {
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
+        let pixels = vec![128; 16 * 16 * 4];
+        let absent = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
+            .build()
+            .unwrap();
+        let empty = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
+            .metadata(c"")
+            .build()
+            .unwrap();
+        let present = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
+            .metadata(c"<metadata/>")
+            .build()
+            .unwrap();
+        sender.send_video_async_copy(&present).unwrap();
+        sender.send_video_async_copy(&present).unwrap();
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            for _ in 0..4 {
+                for (source, expected) in [
+                    (&absent, None),
+                    (&empty, Some("")),
+                    (&present, Some("<metadata/>")),
+                ] {
+                    sender.send_video_async_copy(source).unwrap();
+                    let state = sender.native.video.state.lock().unwrap();
+                    assert_eq!(state.in_flight.frame().unwrap().metadata(), expected);
+                }
+            }
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(
+            sender.finish_video_async().unwrap().metadata(),
+            Some("<metadata/>")
+        );
+    }
+
+    #[test]
+    fn copied_async_storage_grows_once_per_buffer_then_reuses_capacity() {
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
+        let small_pixels = vec![128; 16 * 16 * 4];
+        let large_pixels = vec![128; 64 * 16 * 4];
+        let small = BorrowedVideoFrame::builder(&small_pixels, 16, 16, PixelFormat::Bgra)
+            .metadata(c"<a/>")
+            .build()
+            .unwrap();
+        let large = BorrowedVideoFrame::builder(&large_pixels, 64, 16, PixelFormat::Bgra)
+            .metadata(c"<a/>")
+            .build()
+            .unwrap();
+        let metadata = CString::new("x".repeat(256)).unwrap();
+        let longer = BorrowedVideoFrame::builder(&large_pixels, 64, 16, PixelFormat::Bgra)
+            .metadata(&metadata)
+            .build()
+            .unwrap();
+        sender.send_video_async_copy(&small).unwrap();
+        sender.send_video_async_copy(&small).unwrap();
+        // Each of the two reusable pixel buffers grows once, with no new
+        // metadata storage needed. No further growth is needed afterward.
+        for _ in 0..2 {
+            let ((), allocations) = crate::test_alloc::allocation_count(|| {
+                sender.send_video_async_copy(&large).unwrap();
+            });
+            assert_eq!(allocations, 1);
+        }
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            sender.send_video_async_copy(&large).unwrap();
+            sender.send_video_async_copy(&large).unwrap();
+        });
+        assert_eq!(allocations, 0);
+        // Longer metadata likewise grows each reusable metadata buffer once.
+        for _ in 0..2 {
+            let ((), allocations) = crate::test_alloc::allocation_count(|| {
+                sender.send_video_async_copy(&longer).unwrap();
+            });
+            assert_eq!(allocations, 1);
+        }
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            for _ in 0..4 {
+                sender.send_video_async_copy(&longer).unwrap();
+                sender.send_video_async_copy(&large).unwrap();
+            }
+        });
+        assert_eq!(allocations, 0);
+        sender.finish_video_async();
+    }
+
+    #[test]
     fn owned_video_preparation_preserves_storage_for_every_scan_type() {
         for format in PixelFormat::ALL {
             for height in [4, 6] {
@@ -2395,7 +2565,7 @@ mod tests {
                     });
                     assert_eq!(allocations, 0, "{format:?} {height} {scan:?}");
                     assert_eq!(raw.p_data.cast_const(), frame.data().as_ptr());
-                    assert_eq!(raw.p_metadata, frame.to_raw().p_metadata);
+                    assert_eq!(raw.p_metadata, frame.as_test_raw().p_metadata);
                     assert_eq!(raw.frame_format_type, scan.to_sdk());
                     assert!(staging.as_slice().is_empty());
                 }
@@ -2418,7 +2588,7 @@ mod tests {
                     let layout =
                         ValidatedVideoLayout::new_uncompressed(format, 18, 6, Some(stride))
                             .unwrap();
-                    let len = layout.data_len_bytes;
+                    let len = layout.data_len_bytes();
                     let room = send_room(&layout, scan);
                     let mut staging = Pixels::default();
                     let mut expected = None;
@@ -2746,7 +2916,10 @@ mod tests {
     fn synchronous_send_describes_an_owned_frame_as_the_frame_itself() {
         let owned = test_owned_frame(8);
         let mut staging = Pixels::default();
-        let (expected, lent) = (owned.to_raw(), PreparedVideo::new(&owned, &mut staging).raw);
+        let (expected, lent) = (
+            owned.as_test_raw(),
+            PreparedVideo::new(&owned, &mut staging).raw,
+        );
         assert_eq!(lent.p_data, expected.p_data);
         assert_eq!(lent.p_metadata, expected.p_metadata);
         // SAFETY: both descriptors are uncompressed, so the union holds the stride.
@@ -2778,28 +2951,21 @@ mod tests {
     }
 
     #[test]
-    fn mixed_sync_flush_and_copy_sends_notify_once_and_preserve_recovery() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let count = Arc::new(AtomicUsize::new(0));
-        let observed = count.clone();
+    fn mixed_sync_flush_and_copy_sends_preserve_recovery() {
         let Some(mut sender) = test_sender() else {
             return;
         };
-        sender.on_async_video_done(move |len| {
-            assert_eq!(len, 1024);
-            observed.fetch_add(1, Ordering::SeqCst);
-        });
         let frame = test_owned_frame(1);
         let pixels = frame.data().as_ptr();
         sender.send_video_async(frame).unwrap();
         sender.send_video(&test_owned_frame(9)).unwrap();
         sender.flush_async_blocking();
-        assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(sender.finish_video_async().unwrap().data().as_ptr(), pixels);
-        assert_eq!(count.load(Ordering::SeqCst), 1);
 
-        // A copied send recovers the previous owned frame after synchronization.
-        sender.send_video_async(test_owned_frame(2)).unwrap();
+        // A copied send retains the released owned frame for its next copy.
+        let owned = test_owned_frame(2);
+        let owned_pixels = owned.data().as_ptr();
+        sender.send_video_async(owned).unwrap();
         let data = vec![3; 1024];
         let metadata = CString::new("<copy/>").unwrap();
         {
@@ -2807,14 +2973,7 @@ mod tests {
                 .metadata(&metadata)
                 .build()
                 .unwrap();
-            assert_eq!(
-                sender
-                    .send_video_async_copy(&borrowed)
-                    .unwrap()
-                    .unwrap()
-                    .data()[0],
-                2
-            );
+            sender.send_video_async_copy(&borrowed).unwrap();
         }
         {
             let video = sender.native.video.state.lock().unwrap();
@@ -2823,6 +2982,9 @@ mod tests {
             };
             assert_ne!(copy.data().as_ptr(), data.as_ptr());
             assert_ne!(copy.metadata_cstr().unwrap().as_ptr(), metadata.as_ptr());
+            let spare = video.spare.as_ref().unwrap();
+            assert_eq!(spare.data().as_ptr(), owned_pixels);
+            assert_eq!(spare.data()[0], 2);
         }
         drop(data);
         drop(metadata);
@@ -2843,21 +3005,13 @@ mod tests {
         assert_eq!(copied.metadata(), Some("<copy/>"));
         sender.finish_video_async().unwrap();
         sender.flush_async_blocking();
-        assert_eq!(count.load(Ordering::SeqCst), 4);
     }
 
     #[test]
     fn every_synchronizing_call_completes_a_frame_once_and_recovery_keeps_its_identity() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let count = Arc::new(AtomicUsize::new(0));
-        let observed = count.clone();
         let Some(mut sender) = test_sender() else {
             return;
         };
-        sender.on_async_video_done(move |_| {
-            observed.fetch_add(1, Ordering::SeqCst);
-        });
-        let notified = || count.load(Ordering::SeqCst);
         let in_flight = |sender: &Sender| {
             sender
                 .native
@@ -2875,154 +3029,42 @@ mod tests {
         };
 
         // A synchronous send completes the frame in flight; the next
-        // submission returns that allocation without notifying it again.
+        // submission returns that original allocation.
         let (a, a_pixels) = frame(1);
         assert!(sender.send_video_async(a).unwrap().is_none());
         assert!(in_flight(&sender));
-        assert_eq!(notified(), 0);
         sender.send_video(&test_owned_frame(9)).unwrap();
         assert!(!in_flight(&sender));
-        assert_eq!(notified(), 1);
         let (b, b_pixels) = frame(2);
         let previous = sender.send_video_async(b).unwrap().unwrap();
         assert_eq!(previous.data().as_ptr(), a_pixels);
-        assert_eq!(notified(), 1);
 
         // A flush does the same, and a second flush finds nothing in flight.
         sender.flush_async_blocking();
         assert!(!in_flight(&sender));
         sender.flush_async_blocking();
-        assert_eq!(notified(), 2);
         let (c, c_pixels) = frame(3);
         let previous = sender.send_video_async(c).unwrap().unwrap();
         assert_eq!(previous.data().as_ptr(), b_pixels);
-        assert_eq!(notified(), 2);
 
         // A submission completes the in-flight frame it displaces.
         let (d, d_pixels) = frame(4);
         let previous = sender.send_video_async(d).unwrap().unwrap();
         assert_eq!(previous.data().as_ptr(), c_pixels);
         assert!(in_flight(&sender));
-        assert_eq!(notified(), 3);
 
-        // Finishing recovers a frame a synchronous send already completed
-        // without notifying it again.
+        // Finishing recovers a frame a synchronous send already completed.
         sender.send_video(&test_owned_frame(9)).unwrap();
-        assert_eq!(notified(), 4);
         assert_eq!(
             sender.finish_video_async().unwrap().data().as_ptr(),
             d_pixels
         );
         assert!(sender.finish_video_async().is_none());
-        assert_eq!(notified(), 4);
 
-        // Destroying a sender whose retained frame was already completed
-        // notifies nothing more.
+        // A sender can also be dropped after an explicit flush.
         sender.send_video_async(frame(5).0).unwrap();
         sender.flush_async_blocking();
-        assert_eq!(notified(), 5);
         drop(sender);
-        assert_eq!(notified(), 5);
-    }
-
-    #[test]
-    fn callback_panic_after_submission_keeps_new_owned_frame_recoverable() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let count = Arc::new(AtomicUsize::new(0));
-        let observed = count.clone();
-        let Some(mut sender) = test_sender() else {
-            return;
-        };
-        sender.on_async_video_done(move |_| {
-            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("intentional completion panic");
-            }
-        });
-        sender.send_video_async(test_owned_frame(1)).unwrap();
-        let second = test_owned_frame(2);
-        let pixels = second.data().as_ptr();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = sender.send_video_async(second);
-        }));
-        assert!(result.is_err());
-        assert_eq!(sender.finish_video_async().unwrap().data().as_ptr(), pixels);
-        assert_eq!(count.load(Ordering::SeqCst), 2);
-        assert!(sender.finish_video_async().is_none());
-    }
-
-    #[test]
-    fn completion_callback_can_reenter_shared_flush_without_deadlock() {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Weak,
-        };
-        let reference = Arc::new(Mutex::new(Weak::<Sender>::new()));
-        let callback_reference = reference.clone();
-        let count = Arc::new(AtomicUsize::new(0));
-        let observed = count.clone();
-        let Some(mut sender) = test_sender() else {
-            return;
-        };
-        sender.on_async_video_done(move |_| {
-            observed.fetch_add(1, Ordering::SeqCst);
-            let sender = callback_reference.lock().unwrap().upgrade().unwrap();
-            sender.flush_async_blocking();
-            sender.send_video(&test_owned_frame(7)).unwrap();
-        });
-        sender.send_video_async(test_owned_frame(5)).unwrap();
-        let sender = Arc::new(sender);
-        *reference.lock().unwrap() = Arc::downgrade(&sender);
-        std::thread::scope(|scope| {
-            for _ in 0..4 {
-                scope.spawn(|| sender.flush_async_blocking());
-            }
-        });
-        assert_eq!(count.load(Ordering::SeqCst), 1);
-        let mut sender = Arc::try_unwrap(sender).unwrap();
-        assert_eq!(sender.finish_video_async().unwrap().data()[0], 5);
-    }
-
-    #[test]
-    fn sender_drop_notifies_once_for_copy() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let count = Arc::new(AtomicUsize::new(0));
-        let observed = count.clone();
-        let Some(mut sender) = test_sender() else {
-            return;
-        };
-        sender.on_async_video_done(move |_| {
-            observed.fetch_add(1, Ordering::SeqCst);
-        });
-        let data = vec![0; 1024];
-        {
-            let frame = BorrowedVideoFrame::builder(&data, 16, 16, PixelFormat::Bgra)
-                .build()
-                .unwrap();
-            assert!(sender.send_video_async_copy(&frame).unwrap().is_none());
-        }
-        drop(data);
-        drop(sender);
-        assert_eq!(count.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn completion_handler_can_be_replaced_and_cleared() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let count = Arc::new(AtomicUsize::new(0));
-        let Some(mut sender) = test_sender() else {
-            return;
-        };
-        sender.on_async_video_done(|_| panic!("replaced handler must not run"));
-        let observed = count.clone();
-        sender.on_async_video_done(move |_| {
-            observed.fetch_add(1, Ordering::SeqCst);
-        });
-        sender.send_video_async(test_owned_frame(1)).unwrap();
-        sender.finish_video_async();
-        sender.clear_async_video_done();
-        sender.send_video_async(test_owned_frame(2)).unwrap();
-        sender.finish_video_async();
-        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3058,8 +3100,21 @@ mod tests {
             sender.send_video(&frame).unwrap();
             let previous = sender.send_video_async(frame).unwrap().unwrap();
             assert_eq!(previous.data()[0], 1);
-            let previous = sender.send_video_async_copy(&borrowed).unwrap().unwrap();
-            assert_eq!(previous.data().as_ptr(), pixels);
+            sender.send_video_async_copy(&borrowed).unwrap();
+            assert_eq!(
+                sender
+                    .native
+                    .video
+                    .state
+                    .lock()
+                    .unwrap()
+                    .spare
+                    .as_ref()
+                    .unwrap()
+                    .data()
+                    .as_ptr(),
+                pixels
+            );
         } else {
             let unsupported = |error: &Error| {
                 matches!(
@@ -3112,7 +3167,7 @@ mod tests {
                 let layout =
                     ValidatedVideoLayout::new_uncompressed(format, 4, 4, Some(stride)).unwrap();
                 // A longer buffer is accepted; the frame is its layout's extent.
-                let data = vec![19; layout.data_len_bytes + 3];
+                let data = vec![19; layout.data_len_bytes() + 3];
                 let metadata = c"<pixels>é</pixels>";
                 let rate = FrameRate::new(30000, 1001).unwrap();
                 let (borrowed, allocations) = crate::test_alloc::allocation_count(|| {
@@ -3127,7 +3182,7 @@ mod tests {
                         .unwrap();
                     for _ in 0..3 {
                         assert_eq!(frame.metadata(), Some("<pixels>é</pixels>"));
-                        assert_eq!(frame.data(), &data[..layout.data_len_bytes]);
+                        assert_eq!(frame.data(), &data[..layout.data_len_bytes()]);
                         assert_eq!(frame.pixel_format(), format);
                     }
                     frame
@@ -3149,10 +3204,10 @@ mod tests {
                     PreparedVideo::new(&owned, &mut staging).raw
                 });
                 assert_eq!(allocations, 0);
-                assert_eq!(raw.p_metadata, owned.to_raw().p_metadata);
-                assert_eq!(raw.p_data, owned.to_raw().p_data);
+                assert_eq!(raw.p_metadata, owned.as_test_raw().p_metadata);
+                assert_eq!(raw.p_data, owned.as_test_raw().p_data);
                 assert!(BorrowedVideoFrame::builder(
-                    &data[..layout.data_len_bytes - 1],
+                    &data[..layout.data_len_bytes() - 1],
                     4,
                     4,
                     format

@@ -1,0 +1,13 @@
+error[E0599]: the method `poll_event` exists for reference `&grafton_ndi::Receiver<AvSyncAttached>`, but its trait bounds were not satisfied
+ --> tests/ui/advanced/fail/av_sync_receiver_has_no_event_polling.rs:5:29
+  |
+5 |     let _ = sync.receiver().poll_event(Duration::ZERO);
+  |                             ^^^^^^^^^^ method cannot be called on `&grafton_ndi::Receiver<AvSyncAttached>` due to unsatisfied trait bounds
+  |
+ ::: src/receiver.rs
+  |
+  | pub enum AvSyncAttached {}
+  | ----------------------- doesn't satisfy `AvSyncAttached: EventMode`
+  |
+  = note: the following trait bounds were not satisfied:
+          `AvSyncAttached: EventMode`

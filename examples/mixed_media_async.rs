@@ -57,13 +57,13 @@ async fn analyze<R: grafton_ndi::asynchronous::AsyncRuntime>(
 }
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
-fn main() -> grafton_ndi::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     use grafton_ndi::{Error, Ndi, Receiver, ReceiverOptions, Source};
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     if arguments.len() != 1 || arguments[0].is_empty() {
-        return Err(Error::InvalidInput(
-            "usage: mixed_media_async \"HOST (Camera)\"".into(),
-        ));
+        return Err(
+            Error::InvalidInput("usage: mixed_media_async \"HOST (Camera)\"".into()).into(),
+        );
     }
     let ndi = Ndi::new()?;
     let receiver = Receiver::new(
@@ -72,17 +72,15 @@ fn main() -> grafton_ndi::Result<()> {
     )?;
     #[cfg(feature = "tokio")]
     {
-        let runtime = ::tokio::runtime::Builder::new_current_thread()
-            .build()
-            .map_err(|error| Error::SpawnFailed(error.to_string()))?;
-        runtime.block_on(analyze(
+        let runtime = ::tokio::runtime::Builder::new_current_thread().build()?;
+        Ok(runtime.block_on(analyze(
             grafton_ndi::asynchronous::tokio::AsyncReceiver::new(receiver),
-        ))
+        ))?)
     }
     #[cfg(all(feature = "smol", not(feature = "tokio")))]
-    ::smol::block_on(analyze(
+    Ok(::smol::block_on(analyze(
         grafton_ndi::asynchronous::smol::AsyncReceiver::new(receiver),
-    ))
+    ))?)
 }
 
 #[cfg(not(any(feature = "tokio", feature = "smol")))]

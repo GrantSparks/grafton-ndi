@@ -176,7 +176,7 @@ mod tests {
         let source = Source::new(frame);
         let reader = Reader::<P>::new(&source, YuvMatrix::Bt709, YuvRange::Limited, alpha);
         let mut downscaler = Downscaler::new(&reader, shift);
-        let rows = reduced(VideoParts::layout(frame).height as usize, shift);
+        let rows = reduced(VideoParts::layout(frame).height() as usize, shift);
         (0..rows)
             .map(|y| {
                 let mut row = Collect(Vec::new());

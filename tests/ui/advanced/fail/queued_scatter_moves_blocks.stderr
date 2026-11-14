@@ -1,0 +1,14 @@
+error[E0382]: borrow of moved value: `frame`
+ --> tests/ui/advanced/fail/queued_scatter_moves_blocks.rs:5:13
+  |
+3 | fn submit(queue: &mut QueuedSender, frame: ScatterVideoFrame) {
+  |                                     ----- move occurs because `frame` has type `ScatterVideoFrame`, which does not implement the `Copy` trait
+4 |     let _ = queue.try_submit(frame);
+  |                              ----- value moved here
+5 |     let _ = frame.blocks();
+  |             ^^^^^ value borrowed here after move
+  |
+help: consider cloning the value if the performance cost is acceptable
+  |
+4 |     let _ = queue.try_submit(frame.clone());
+  |                                   ++++++++

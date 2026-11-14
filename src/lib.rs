@@ -59,8 +59,11 @@
 )]
 
 mod capture;
+mod change_feed;
 mod color_info;
 mod error;
+#[cfg(any(ndi_has_advanced_keyframe_demand, all(test, feature = "advanced")))]
+mod keyframe_changes;
 mod media;
 mod pixels;
 mod rejected;
@@ -105,17 +108,18 @@ pub use {
     finder::{Finder, FinderOptions, Source, SourceAddress, SourceCache},
     frames::{
         AudioChannels, AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout,
-        AudioSource, BorrowedAudioFrame, BorrowedAudioFrameBuilder, FormatCategory, MetadataFrame,
-        MetadataFrameRef, MetadataSource, PixelFormat, PixelFormatInfo, ScanType, VideoFrame,
-        VideoFrameBuilder, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows, VideoSource,
+        AudioSource, BorrowedAudioFrame, BorrowedAudioFrameBuilder, FormatCategory,
+        FrameMetadataStatus, MetadataFrame, MetadataFrameRef, MetadataSource, PixelFormat,
+        PixelFormatInfo, ScanType, VideoFrame, VideoFrameBuilder, VideoFrameRef, VideoPlane,
+        VideoPlanes, VideoRows, VideoSource,
     },
     framesync::{
         AudioInputFormat, FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncCapture,
         FrameSyncVideoRef,
     },
     receiver::{
-        Capture, CaptureMode, ConnectionStats, FrameSyncAttached, MetadataMode, Ptz, RawCapture,
-        Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverEvent, ReceiverItem,
+        Capture, CaptureMode, ConnectionStats, EventMode, FrameSyncAttached, MetadataMode, Ptz,
+        RawCapture, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverEvent, ReceiverItem,
         ReceiverItemRef, ReceiverMode, ReceiverOptions, ReceiverStatus, SettingChange,
         SourceNameChange, Tally, VideoMode,
     },

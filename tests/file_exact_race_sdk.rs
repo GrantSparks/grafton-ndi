@@ -19,7 +19,7 @@ use grafton_ndi::{
         FileApi, FileNaming, FileRuntimeOptions, FinishStatus, RecorderEventKind, RecorderOptions,
         RecorderState, RecordingTarget, RecordingTimecode, SourceSpec,
     },
-    Error,
+    Error, SelectionConflict,
 };
 use std::{
     fs,
@@ -36,8 +36,15 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
     };
     let api = match FileApi::open(&ndi, &FileRuntimeOptions::new()) {
         Ok(api) => api,
-        Err(Error::RuntimeLoadFailed(reason) | Error::RuntimeConflict(reason)) => {
-            common::skip(common::Requirement::File, &reason);
+        Err(Error::RuntimeLoadFailed(reason)) if !reason.loaded_any() => {
+            common::skip(common::Requirement::File, &reason.to_string());
+            return;
+        }
+        Err(Error::RuntimeConflict {
+            kind: SelectionConflict::FileNeedsAdvancedRuntime,
+            detail,
+        }) => {
+            common::skip(common::Requirement::File, &detail);
             return;
         }
         Err(error) => panic!("{error}"),

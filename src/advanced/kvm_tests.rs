@@ -10,6 +10,7 @@ struct Calls {
     keys: Vec<i32>,
     releases: usize,
     touches: Vec<f32>,
+    touch_updates: usize,
     touch_finishes: usize,
     mouse_releases: usize,
     clipboard: String,
@@ -73,7 +74,10 @@ unsafe extern "C" fn touch(
     record(instance);
     // SAFETY: the wrapper lends `count` coordinate pairs for this call.
     let points = unsafe { std::slice::from_raw_parts(points, count as usize * 2) };
-    CALLS.with_borrow_mut(|calls| calls.touches = points.to_vec());
+    CALLS.with_borrow_mut(|calls| {
+        calls.touch_updates += 1;
+        calls.touches = points.to_vec();
+    });
     true
 }
 unsafe extern "C" fn finish_touch(instance: NDIlib_recv_instance_t) -> bool {
@@ -111,6 +115,45 @@ static TABLE: Kvm = Kvm {
     NDIlib_recv_kvm_send_keyboard_press: key,
     NDIlib_recv_kvm_send_keyboard_release: release,
 };
+
+#[test]
+fn empty_touch_finishes_and_failed_lifts_are_retried() {
+    let Some(ndi) = crate::test_support::ndi() else {
+        return;
+    };
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new(""))).unwrap();
+    for retry_on_drop in [false, true] {
+        CALLS.with_borrow_mut(|calls| *calls = Calls::default());
+        let mut session = KvmSession {
+            receiver: &receiver,
+            kvm: &TABLE,
+            keys: BTreeSet::new(),
+            buttons: BTreeSet::new(),
+            touching: false,
+        };
+        session.touch(&[]).unwrap();
+        assert!(!session.touching);
+        session.touch(&[[0.25, 0.5]]).unwrap();
+        CALLS.with_borrow_mut(|calls| calls.fail_touch_once = true);
+        assert!(matches!(
+            session.touch(&[]),
+            Err(Error::NativeOperationFailed {
+                operation: "NDIlib_recv_kvm_send_touch_finish"
+            })
+        ));
+        assert!(session.touching);
+        if !retry_on_drop {
+            session.release_all().unwrap();
+            assert!(!session.touching);
+        }
+        drop(session);
+        CALLS.with_borrow(|calls| {
+            assert_eq!(calls.touch_updates, 1);
+            assert_eq!(calls.touches, [0.25, 0.5]);
+            assert_eq!(calls.touch_finishes, 3);
+        });
+    }
+}
 
 #[test]
 fn rejected_releases_are_retained_and_drop_retries_only_the_inputs_still_pressed() {

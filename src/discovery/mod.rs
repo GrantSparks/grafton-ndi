@@ -84,9 +84,11 @@
 //! # Connecting
 //!
 //! Each object is created for a Discovery Server address: the one given in its
-//! options, or else the one in the NDI configuration. Creation fails only when
-//! there is no address or the SDK cannot parse it. It does not wait for the
-//! server, and a server that cannot be reached is not an error: the object
+//! options, or else the one in the NDI configuration. Creation can fail for
+//! an unavailable capability, a NUL byte in the endpoint, or an address the
+//! SDK cannot use; listeners also reject multiple endpoints. Each constructor
+//! lists its errors. Creation does not wait for the server, and a server that
+//! cannot be reached is not an error: the object
 //! keeps trying in the background for as long as it lives, and starts working
 //! within about ten seconds of the server appearing, as the 6.4.0.2 runtime
 //! tries again every ten seconds. A listener that connects only on such a
@@ -116,8 +118,11 @@
 //! Exceeding the aggregate copy budget returns
 //! [`Error::ResourceLimit`](crate::Error::ResourceLimit), identifying
 //! [`ResourceKind::DiscoveryServerCopyBytes`](crate::ResourceKind::DiscoveryServerCopyBytes),
-//! before reserving the offending output. Malformed descriptors, strings that
-//! exceed their individual bound, and allocation failures return
+//! before reserving the offending output. An entry or event with a string
+//! beyond its individual bound, or an entry with a malformed nested array,
+//! is omitted while the other entries are returned. Rejected string scans
+//! remain charged, so several malformed entries can still exhaust the budget.
+//! A malformed top-level array or allocation failure returns
 //! [`Error::UnexpectedSdkResult`](crate::Error::UnexpectedSdkResult). A rejected
 //! event batch is freed and its events are lost.
 //!

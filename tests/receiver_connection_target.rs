@@ -51,12 +51,14 @@ fn exercise_target() {
     let receiver = Receiver::new(&ndi, &ReceiverOptions::new(a.clone())).unwrap();
     let initial = receiver.connection_target();
     assert_eq!(initial, a);
+    let _: () = receiver.reconnect();
+    assert_eq!(receiver.connection_target(), a);
     receiver.connect_to(&b).unwrap();
     assert_eq!(receiver.connection_target(), b);
     assert_eq!(initial, a, "a snapshot does not change with the receiver");
     receiver.disconnect();
     assert_eq!(receiver.connection_target(), b);
-    receiver.reconnect().unwrap();
+    receiver.reconnect();
     assert_eq!(receiver.connection_target(), b);
     assert!(matches!(
         receiver.connect_to(&Source::new("bad\0name")),
@@ -71,7 +73,7 @@ fn exercise_target() {
             .filter_map(|line| line.strip_prefix("receiver-connect:").map(str::to_owned))
             .collect::<Vec<_>>()
     };
-    assert_eq!(requests(), ["B", "<disconnected>", "B"]);
+    assert_eq!(requests(), ["A", "B", "<disconnected>", "B"]);
 
     let start = Barrier::new(8);
     std::thread::scope(|scope| {
@@ -84,16 +86,16 @@ fn exercise_target() {
                     receiver
                         .connect_to(&Source::new(format!("{worker}/{request}")))
                         .unwrap();
-                    receiver.reconnect().unwrap();
+                    receiver.reconnect();
                 }
             });
         }
     });
     let concurrent = requests();
-    assert_eq!(concurrent.len(), 403);
+    assert_eq!(concurrent.len(), 404);
     // Each explicit target is unique. A reconnect can repeat only the current
     // target; a target reappearing after another would expose a stale retry.
-    let mut transitions = concurrent[3..].to_vec();
+    let mut transitions = concurrent[4..].to_vec();
     transitions.dedup();
     assert_eq!(
         transitions
@@ -109,6 +111,6 @@ fn exercise_target() {
     // Retrying after the contention must send exactly the retained target.
     let target = receiver.connection_target();
     receiver.disconnect();
-    receiver.reconnect().unwrap();
+    receiver.reconnect();
     assert_eq!(requests().last().unwrap(), target.name());
 }

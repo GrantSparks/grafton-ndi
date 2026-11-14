@@ -11,6 +11,102 @@ use runtime_fixture::FakeRuntime;
 use std::{fs, path::PathBuf, process::Command};
 
 #[test]
+fn relative_environment_directories_never_run_constructors() {
+    let trusted_name = if cfg!(any(feature = "advanced", feature = "file-io")) {
+        "libndi_advanced.so.6"
+    } else {
+        "libndi.so.6"
+    };
+    if let Ok(scenario) = std::env::var("GRAFTON_RELATIVE_TRUST_SCENARIO") {
+        let root = PathBuf::from(std::env::var_os("GRAFTON_TRUST_ROOT").unwrap());
+        let trusted = root.join("trusted").join(trusted_name);
+        let ndi = if scenario == "runtime" {
+            Ndi::new().unwrap()
+        } else {
+            Ndi::with_options(&RuntimeOptions::new().library_path(&trusted)).unwrap()
+        };
+        assert_eq!(ndi.info().library_path(), Some(trusted.as_path()));
+        #[cfg(feature = "file-io")]
+        if scenario == "file" {
+            use grafton_ndi::file::{FileApi, FileRuntimeOptions};
+            let file = FileApi::open(&ndi, &FileRuntimeOptions::new()).unwrap();
+            assert_eq!(
+                file.library_path(),
+                Some(root.join("loader/libndifile.so.6").as_path())
+            );
+        }
+        assert!(!root.join("marker").exists());
+        return;
+    }
+    for scenario in ["runtime", "file"] {
+        if scenario == "file" && !cfg!(feature = "file-io") {
+            continue;
+        }
+        let directory = FixtureDir::create("relative-loader-trust");
+        let root = directory.path();
+        for name in ["trusted", "executable", "relative", "loader"] {
+            fs::create_dir(root.join(name)).unwrap();
+        }
+        let trusted = root.join("trusted").join(trusted_name);
+        FakeRuntime {
+            cfgs: if cfg!(any(feature = "advanced", feature = "file-io")) {
+                vec!["fake_advanced"]
+            } else {
+                Vec::new()
+            },
+            version: Some("6.4.0.2"),
+            soname: Some(trusted_name),
+            ..Default::default()
+        }
+        .build(&trusted);
+        for name in ["libndi.so.6", "libndi_advanced.so.6", "libndifile.so.6"] {
+            let rejected = root.join("relative").join(name);
+            runtime_fixture::run(
+                runtime_fixture::rustc("rejected_constructor.rs", &rejected),
+                &rejected,
+            );
+        }
+        #[cfg(feature = "file-io")]
+        if scenario == "file" {
+            let output = root.join("loader/libndifile.so.6");
+            let mut rustc = runtime_fixture::rustc("fake_file_library.rs", &output);
+            rustc.arg(runtime_fixture::link_argument(trusted.as_os_str()));
+            runtime_fixture::run(rustc, &output);
+        }
+        let executable = root.join("executable/probe");
+        fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let output = Command::new(&executable)
+            .args([
+                "--exact",
+                "relative_environment_directories_never_run_constructors",
+                "--nocapture",
+            ])
+            .current_dir(root)
+            .env("GRAFTON_RELATIVE_TRUST_SCENARIO", scenario)
+            .env("GRAFTON_TRUST_ROOT", root)
+            .env("GRAFTON_REJECTED_CONSTRUCTOR_MARKER", root.join("marker"))
+            .env("NDI_RUNTIME_DIR_V6", "relative")
+            .env(
+                "LD_LIBRARY_PATH",
+                root.join(if scenario == "runtime" {
+                    "trusted"
+                } else {
+                    "loader"
+                }),
+            )
+            .env_remove("LD_PRELOAD")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{scenario}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn explicit_paths_avoid_rejected_search_candidates() {
     if let Ok(scenario) = std::env::var("GRAFTON_TRUST_SCENARIO") {
         let root = PathBuf::from(std::env::var_os("GRAFTON_TRUST_ROOT").unwrap());

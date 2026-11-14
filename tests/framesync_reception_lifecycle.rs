@@ -153,7 +153,7 @@ fn audio_reception_distinguishes_silent_input_from_starvation_and_recovers() {
             },
             "explicit disconnect was not observed",
         );
-        framesync.receiver().reconnect().unwrap();
+        framesync.receiver().reconnect();
         monitor.reset();
         wait_until(
             || framesync.receiver().connection_stats().is_connected(),

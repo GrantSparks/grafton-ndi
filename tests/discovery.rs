@@ -82,6 +82,9 @@ const VARIANTS: &[Variant] = &[
             "large_event_batches",
             "null_event_batch_with_a_count_is_refused",
             "nested_snapshot_arrays_include_owned_storage",
+            "malformed_membership_entries_are_omitted",
+            "malformed_events_are_omitted",
+            "null_snapshot_arrays_are_refused",
             "owners_move_between_threads",
             "routing",
         ],
@@ -624,6 +627,125 @@ fn child(scenario: &str) {
                     .len(),
                 2
             );
+        }
+        "malformed_membership_entries_are_omitted" => {
+            for malformed in [
+                "sender-id",
+                "sender-name",
+                "sender-metadata",
+                "sender-address",
+                "sender-group",
+                "groups-null",
+            ] {
+                std::env::set_var("GRAFTON_FAKE_DISCOVERY_MALFORMED", malformed);
+                let mut listener = SendListener::new(&ndi, &listeners).unwrap();
+                let snapshot = listener.snapshot().unwrap();
+                assert_eq!(snapshot.len(), 1, "{malformed}: {snapshot:?}");
+                assert_eq!(
+                    snapshot[0].id().unwrap().as_bytes(),
+                    SENDER_ID,
+                    "{malformed}"
+                );
+                assert_eq!(snapshot[0].groups(), ["public", "gro\u{fffd}up"]);
+            }
+            let mut requested = 0;
+            for malformed in [
+                "receiver-id",
+                "receiver-name",
+                "receiver-input-id",
+                "receiver-input-name",
+                "receiver-address",
+                "streams-null",
+                "commands-null",
+            ] {
+                std::env::set_var("GRAFTON_FAKE_DISCOVERY_MALFORMED", malformed);
+                let mut listener = RecvListener::new(&ndi, &listeners).unwrap();
+                let snapshot = listener.snapshot().unwrap();
+                assert_eq!(snapshot.len(), 1, "{malformed}: {snapshot:?}");
+                let survivor = snapshot[0].id().unwrap();
+                assert_eq!(survivor.as_bytes(), RECEIVER_ID, "{malformed}");
+                listener
+                    .request_connect(survivor, "STUDIO (Camera 2)")
+                    .unwrap();
+                listener.request_disconnect(survivor).unwrap();
+                requested += 2;
+                assert_eq!(log().matches("recv-listener-connect ").count(), requested);
+                let omitted = ReceiverId::new("receiver-fixed").unwrap();
+                for refused in [
+                    listener.request_connect(&omitted, "STUDIO (Camera 2)"),
+                    listener.request_disconnect(&omitted),
+                ] {
+                    assert!(
+                        matches!(
+                            refused,
+                            Err(Error::ReceiverRequestNotAccepted { advertised: false })
+                        ),
+                        "{malformed}: {refused:?}"
+                    );
+                }
+                assert_eq!(log().matches("recv-listener-connect ").count(), requested);
+            }
+            assert!(log().contains(&format!(
+                "recv-listener-connect {} {}\n",
+                hex(RECEIVER_ID),
+                hex(b"STUDIO (Camera 2)")
+            )));
+            std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
+        }
+        "malformed_events_are_omitted" => {
+            let mut senders = SendListener::new(&ndi, &listeners).unwrap();
+            let mut receivers = RecvListener::new(&ndi, &listeners).unwrap();
+            let wait = Duration::from_millis(5);
+            for (index, malformed) in ["event-id", "event-name", "event-value"]
+                .into_iter()
+                .enumerate()
+            {
+                std::env::set_var("GRAFTON_FAKE_DISCOVERY_MALFORMED", malformed);
+                let events = senders.capture_events(wait).unwrap();
+                assert_eq!(events.len(), 1, "{malformed}: {events:?}");
+                assert!(
+                    events[0].id().is_none()
+                        && events[0].name().is_none()
+                        && events[0].value().is_none()
+                );
+                let events = receivers.capture_events(wait).unwrap();
+                assert_eq!(events.len(), 1, "{malformed}: {events:?}");
+                assert!(
+                    events[0].id().is_none()
+                        && events[0].name().is_none()
+                        && events[0].value().is_none()
+                );
+                assert_eq!(
+                    log().matches("send-listener-free-events\n").count(),
+                    index + 1
+                );
+                assert_eq!(
+                    log().matches("recv-listener-free-events\n").count(),
+                    index + 1
+                );
+            }
+            std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
+            assert_eq!(senders.capture_events(wait).unwrap().len(), 2);
+            assert_eq!(receivers.capture_events(wait).unwrap().len(), 2);
+            assert_eq!(log().matches("send-listener-free-events\n").count(), 4);
+            assert_eq!(log().matches("recv-listener-free-events\n").count(), 4);
+        }
+        "null_snapshot_arrays_are_refused" => {
+            let mut senders = SendListener::new(&ndi, &listeners).unwrap();
+            let mut receivers = RecvListener::new(&ndi, &listeners).unwrap();
+            std::env::set_var("GRAFTON_FAKE_DISCOVERY_MALFORMED", "senders-null");
+            assert!(matches!(
+                senders.snapshot(),
+                Err(Error::UnexpectedSdkResult(_))
+            ));
+            std::env::set_var("GRAFTON_FAKE_DISCOVERY_MALFORMED", "receivers-null");
+            assert!(matches!(
+                receivers.snapshot(),
+                Err(Error::UnexpectedSdkResult(_))
+            ));
+            std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
+            assert_eq!(senders.snapshot().unwrap().len(), 2);
+            assert_eq!(receivers.snapshot().unwrap().len(), 2);
         }
         "owners_move_between_threads" => {
             let sender = Sender::new(&ndi, &SenderOptions::new("moved")).unwrap();

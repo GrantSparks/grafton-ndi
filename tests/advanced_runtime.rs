@@ -232,8 +232,8 @@ fn advanced_native_constructors_controls_and_queue() {
         RuntimeFeature::ReceiverDiscovery,
         RecvListener::new(&ndi, &listeners),
     );
-    // An attached receiver keeps every control, its events and its video and
-    // metadata capture.
+    // An attached receiver keeps every control and its video and metadata
+    // capture, while the synchronizer consumes its audio and notifications.
     let mut av = AvSync::new(receiver).unwrap();
     {
         let receiver = av.receiver();
@@ -241,10 +241,9 @@ fn advanced_native_constructors_controls_and_queue() {
         let _ = receiver.connection_stats();
         let _ = receiver.ptz().is_supported();
         receiver.request_keyframe().unwrap();
-        let _ = receiver.poll_event(Duration::ZERO).unwrap();
         let _ = receiver.metadata().capture(Duration::ZERO).unwrap();
         let _ = receiver.video().capture_ref(Duration::ZERO).unwrap();
-        receiver.reconnect().unwrap();
+        receiver.reconnect();
     }
     for change in [
         av.controls().set_stream_tier(StreamTier::Program).unwrap(),
@@ -261,7 +260,7 @@ fn advanced_native_constructors_controls_and_queue() {
     genlock.connect(None).unwrap();
     let _ = genlock.is_active();
     drop(genlock);
-    let mut packets = PacketReceiver::new(
+    let packets = PacketReceiver::new(
         &ndi,
         &ReceiverOptions::new(Source::new("")).config(config.clone()),
         PassthroughPreset::HevcWithAudio,
@@ -1601,6 +1600,91 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
     }
 }
 
+/// Waiting cannot admit a frame that exceeds the entire queue byte budget.
+#[test]
+fn a_queued_frame_larger_than_the_byte_limit_is_not_retryable() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut queue = QueuedSender::new(
+        &ndi,
+        &options("queue-byte-limit"),
+        QueueOptions::default().max_bytes(1 << 20),
+    )
+    .unwrap();
+    let frame = VideoFrame::builder()
+        .resolution(1920, 1080)
+        .build()
+        .unwrap();
+    let original = frame.data().as_ptr();
+    let refused = queue.try_submit(frame).unwrap_err();
+    assert!(matches!(refused.error(), Error::InvalidInput(_)));
+    let QueuedVideoFrame::Pixels(frame) = refused.into_inner() else {
+        panic!("the rejected frame changed type");
+    };
+    assert_eq!(frame.data().as_ptr(), original);
+    assert_eq!(queue.retained_frames(), 0);
+    assert!(queue.wait_completed(Duration::ZERO).unwrap().is_none());
+}
+
+/// Scatter completions return each original block allocation for reuse.
+#[test]
+fn queued_scatter_frames_return_their_original_blocks() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut queue =
+        QueuedSender::new(&ndi, &options("queued-scatter"), QueueOptions::default()).unwrap();
+    let mut receiver = packet_receiver(
+        &ndi,
+        &queue.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
+    connect(&mut receiver, "queued scatter receiver", |timecode| {
+        queue
+            .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
+            .unwrap();
+        queue.wait_completed(PATIENCE).unwrap().unwrap();
+    });
+    for number in 1..=6 {
+        let timecode = FIRST_TIMECODE + number;
+        let bytes = video_bytes(VideoCodec::H264, timecode, true);
+        let blocks = vec![
+            bytes[..44].to_vec(),
+            bytes[44..2000].to_vec(),
+            bytes[2000..].to_vec(),
+        ];
+        let pointers = blocks
+            .iter()
+            .map(|block| (block.as_ptr() as usize, block.capacity()))
+            .collect::<Vec<_>>();
+        let mut frame =
+            ScatterVideoFrame::new(video_format(VideoCodec::H264, StreamTier::Program), blocks)
+                .unwrap();
+        frame.set_timecode(Timecode::from_ticks(timecode));
+        let id = queue.try_submit(frame).unwrap();
+        let received = await_video(&mut receiver, timecode);
+        assert_same_packet(received.data(), &bytes, Some(EnvelopeCodec::H264));
+        let done = queue.wait_completed(PATIENCE).unwrap().unwrap();
+        assert_eq!(done.id(), id);
+        let QueuedVideoFrame::Scatter(frame) = done.into_frame() else {
+            panic!("scatter frame changed type")
+        };
+        let blocks = frame.into_blocks();
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| (block.as_ptr() as usize, block.capacity()))
+                .collect::<Vec<_>>(),
+            pointers
+        );
+    }
+    assert_eq!(queue.retained_frames(), 0);
+    assert!(!queue.completion_protocol_failed());
+}
+
 /// A frame a queue has sent comes back complete and can be queued again.
 #[test]
 fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {
@@ -1647,6 +1731,118 @@ fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {
     }
     assert_eq!(queue.retained_frames(), 0);
     assert!(!queue.completion_protocol_failed());
+}
+
+/// Split Advanced senders carry audio and video on independent native threads.
+#[test]
+fn advanced_senders_lend_audio_and_video_to_separate_threads() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    fn await_both(receiver: &mut PacketReceiver) {
+        let deadline = Instant::now() + PATIENCE;
+        let (mut video, mut audio) = (false, false);
+        while !(video && audio) {
+            match receiver.capture(SLICE).unwrap() {
+                Some(PacketItem::Video(_)) => video = true,
+                Some(PacketItem::Audio(_)) => audio = true,
+                _ => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "split media missing: video={video}, audio={audio}"
+            );
+        }
+    }
+    let _turn = sockets();
+    let mut queue = QueuedSender::new(
+        &ndi,
+        &options("split-queue").clock_video(true).clock_audio(true),
+        QueueOptions::default(),
+    )
+    .unwrap();
+    let mut receiver = packet_receiver(
+        &ndi,
+        &queue.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
+    connect(&mut receiver, "split queue", |timecode| {
+        queue
+            .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
+            .unwrap();
+        queue.wait_completed(PATIENCE).unwrap().unwrap();
+    });
+    let audio = AudioFrame::builder()
+        .num_channels(2)
+        .num_samples(480)
+        .sample_rate(48_000)
+        .build()
+        .unwrap();
+    {
+        let (mut video, sender) = queue.split();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                for number in 0..6 {
+                    video
+                        .try_submit(keyframe(
+                            VideoCodec::H264,
+                            StreamTier::Program,
+                            FIRST_TIMECODE + number,
+                        ))
+                        .unwrap();
+                    video.wait_completed(PATIENCE).unwrap().unwrap();
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..6 {
+                    sender.send_audio(&audio);
+                }
+            });
+        });
+    }
+    await_both(&mut receiver);
+    assert_eq!(queue.retained_frames(), 0);
+
+    let mut sender = CompressedSender::new(
+        &ndi,
+        &options("split-compressed")
+            .clock_video(true)
+            .clock_audio(true),
+    )
+    .unwrap();
+    let mut receiver = packet_receiver(
+        &ndi,
+        &sender.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
+    connect(&mut receiver, "split compressed", |timecode| {
+        let mut frame = keyframe(VideoCodec::H264, StreamTier::Program, timecode);
+        sender.send_video(&mut frame).unwrap();
+    });
+    {
+        let (mut video, mut audio) = sender.split();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                for number in 0..6 {
+                    let mut frame = keyframe(
+                        VideoCodec::H264,
+                        StreamTier::Program,
+                        FIRST_TIMECODE + number,
+                    );
+                    video.send_video(&mut frame).unwrap();
+                }
+            });
+            scope.spawn(move || {
+                for _ in 0..6 {
+                    let mut frame =
+                        CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64])
+                            .unwrap();
+                    audio.send_audio(&mut frame).unwrap();
+                }
+            });
+        });
+    }
+    await_both(&mut receiver);
 }
 
 /// A queue works on threads other than the one that created it: it submits
@@ -1753,7 +1949,7 @@ fn a_packet_receiver_moves_between_threads() {
     let receiver = std::thread::scope(|scope| {
         let capture = scope.spawn(|| {
             let _stop = StopOnDrop(&stop);
-            let mut receiver = receiver;
+            let receiver = receiver;
             let deadline = Instant::now() + PATIENCE;
             let mut verified = 0;
             while verified < 4 {
@@ -1926,6 +2122,54 @@ fn exchange_metadata<M: SenderMode>(ndi: &Ndi, sender: &Sender<M>, kind: &str) -
     receiver
 }
 
+#[test]
+fn kvm_empty_touch_and_cleanup_send_the_explicit_finish_message() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let sender = Sender::new(&ndi, &options("kvm-touch-finish")).unwrap();
+    let mut receiver = exchange_metadata(&ndi, &sender, "kvm-touch-finish");
+    // Drain incidental connection messages before comparing messages from
+    // the same connection. The native KVM encoding is deliberately opaque.
+    while sender.capture_metadata(Duration::ZERO).unwrap().is_some() {}
+    let next_kvm = || {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            assert!(Instant::now() < deadline, "KVM message was not delivered");
+            if let Some(frame) = sender.capture_metadata(SLICE).unwrap() {
+                if frame.data().starts_with("<ndi_kvm ") {
+                    return frame.data().to_owned();
+                }
+            }
+        }
+    };
+    let mut session = receiver.kvm().unwrap();
+    session.finish_touch().unwrap();
+    let finish = next_kvm();
+    // The SDK owns the opaque wire encoding. Some released Linux libraries
+    // leave bytes in the touch header uninitialized, even for consecutive
+    // explicit finish calls. Check delivery and payload length here;
+    // deterministic boundary tests assert the exact function called. Byte
+    // equality cannot establish equivalence on those native libraries.
+    session.finish_touch().unwrap();
+    let other_finish = next_kvm();
+    let assert_finish = |message: String| {
+        assert_eq!(message.len(), finish.len());
+        assert_eq!(other_finish.len(), finish.len());
+    };
+    session.touch(&[]).unwrap();
+    assert_finish(next_kvm());
+    session.touch(&[[0.25, 0.5]]).unwrap();
+    assert_ne!(next_kvm(), finish);
+    session.release_all().unwrap();
+    assert_finish(next_kvm());
+    session.touch(&[[0.25, 0.5]]).unwrap();
+    assert_ne!(next_kvm(), finish);
+    drop(session);
+    assert_finish(next_kvm());
+}
+
 /// The sender a `CompressedSender` or a `QueuedSender` lends exchanges
 /// metadata with its receivers as an ordinary one does, and a queued source
 /// carries uncompressed audio beside the video it queues.
@@ -1969,6 +2213,38 @@ fn wrapped_senders_exchange_metadata_and_audio_through_the_sender_they_lend() {
     assert_eq!(queue.retained_frames(), 0);
 }
 
+/// The common tally state belongs to every sender mode, including the
+/// restricted sender views lent by both Advanced sending owners.
+#[test]
+fn wrapped_sender_tally_polls_preserve_waiters_changes() {
+    fn check<M: SenderMode>(sender: &Sender<M>, receiver: &Receiver) {
+        for next in [Tally::new(true, false), Tally::new(false, true)] {
+            receiver.set_tally(next);
+            let end = Instant::now() + PATIENCE;
+            while sender.tally() != next {
+                assert!(
+                    Instant::now() < end,
+                    "wrapped sender did not observe {next:?}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(sender.wait_for_tally_change(SLICE).unwrap(), Some(next));
+            assert_eq!(sender.wait_for_tally_change(Duration::ZERO).unwrap(), None);
+        }
+    }
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let compressed = CompressedSender::new(&ndi, &options("tally-compressed")).unwrap();
+    let receiver = exchange_metadata(&ndi, compressed.sender(), "tally-compressed");
+    check(compressed.sender(), &receiver);
+    drop((receiver, compressed));
+    let queue = QueuedSender::new(&ndi, &options("tally-queue"), QueueOptions::default()).unwrap();
+    let receiver = exchange_metadata(&ndi, queue.sender(), "tally-queue");
+    check(queue.sender(), &receiver);
+}
+
 /// Sets a flag when it goes out of scope, so that a thread that runs until
 /// the flag is set also stops when the test fails.
 struct StopOnDrop<'a>(&'a AtomicBool);
@@ -1989,6 +2265,11 @@ enum Pass {
     Owned,
     /// No frame: it only paces the requests.
     Nothing,
+}
+
+/// A frame the runtime delivered, which carries its sender's timestamp.
+fn stamped<F: AvSyncFrame>(frame: &F) -> AvSyncVideo<'_> {
+    AvSyncVideo::new(frame).expect("a received frame carries its sender's timestamp")
 }
 
 /// Ask `sync` for audio, once for each video frame that arrives, until it has
@@ -2018,9 +2299,9 @@ fn synchronized_audio(
         };
         videos += 1;
         let outcome = match pass {
-            Pass::Captured => sync.synchronize(Some(&video), request),
-            Pass::Owned => sync.synchronize(Some(&video.to_owned()), request),
-            Pass::Nothing => sync.synchronize(None, request),
+            Pass::Captured => sync.synchronize(stamped(&video), request),
+            Pass::Owned => sync.synchronize(stamped(&video.to_owned()), request),
+            Pass::Nothing => sync.queued_audio(request),
         };
         match outcome.unwrap() {
             AvSyncOutcome::Audio {
@@ -2084,8 +2365,8 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
                 sender.send_metadata(&MetadataFrame::new("<avsync/>").unwrap());
             }
         });
-        // The lent receiver captures metadata and polls events on another
-        // thread while this one synchronizes.
+        // The lent receiver captures metadata on another thread while this
+        // one synchronizes.
         let (receiver, stopped) = (sync.receiver(), &stop);
         let metadata = scope.spawn(move || {
             let mut captured = 0;
@@ -2093,7 +2374,6 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
                 if receiver.metadata().capture_ref(SLICE).unwrap().is_some() {
                     captured += 1;
                 }
-                let _ = receiver.poll_event(Duration::ZERO).unwrap();
             }
             captured
         });
@@ -2161,7 +2441,7 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
             .unwrap()
             .expect("a frame within the wait");
         assert!(matches!(
-            sync.synchronize(Some(&frame), request).unwrap(),
+            sync.synchronize(stamped(&frame), request).unwrap(),
             AvSyncOutcome::FormatChanged {
                 sample_rate: 48_000,
                 num_channels: 2
@@ -2552,6 +2832,122 @@ fn h264_420_decodes_to_the_original_quadrants() {
     }
 }
 
+/// One request must reach every observer, including observers using a null
+/// stream selector beside observers naming the H.264 stream explicitly.
+#[test]
+fn concurrent_keyframe_waiters_observe_the_same_request() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("broadcast-keyframe")).unwrap();
+    let mut receiver = packet_receiver(
+        &ndi,
+        &sender.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
+    let format = VideoPacketFormat::new(VideoCodec::H264, 64, 64)
+        .unwrap()
+        .with_frame_rate(FrameRate::new(30, 1).unwrap());
+    let bitstream = include_bytes!("data/quadrants-420.h264");
+    let parameter_sets = parameter_sets(bitstream, |header| matches!(header & 0x1f, 1..=5));
+    let bytes =
+        PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, bitstream, parameter_sets).unwrap();
+    let mut frame = CompressedVideoFrame::new(format, bytes).unwrap();
+    connect(&mut receiver, "keyframe observer", |_| {
+        sender.send_video(&mut frame).unwrap();
+    });
+
+    for selectors in [
+        [None, None],
+        [Some(format), Some(format)],
+        [None, Some(format)],
+    ] {
+        for _ in 0..3 {
+            // The SDK can clear or reassert demand asynchronously while the
+            // receiver processes earlier frames. Establish actual readiness
+            // before starting the waiters instead of assuming send cleared it.
+            let ready_by = Instant::now() + PATIENCE;
+            loop {
+                sender.send_video(&mut frame).unwrap();
+                let received =
+                    matches!(receiver.capture(SLICE).unwrap(), Some(PacketItem::Video(_)));
+                let required = sender.sender().keyframe_required(None).unwrap();
+                if received && !required {
+                    break;
+                }
+                assert!(
+                    Instant::now() < ready_by,
+                    "keyframe preparation did not deliver video and clear demand for \
+                     {selectors:?} (demand={required}); {}; {}",
+                    link(receiver.receiver()),
+                    served(sender.sender()),
+                );
+            }
+            // Consume earlier update reports so only the explicit request
+            // should wake the concurrent waiters.
+            for selector in [None, Some(format)] {
+                while sender
+                    .sender()
+                    .wait_for_keyframe_change(Duration::ZERO, selector)
+                    .unwrap()
+                {}
+            }
+            let ready = std::sync::Barrier::new(3);
+            let (mut video, audio) = sender.split();
+            std::thread::scope(|scope| {
+                let sender = audio.sender();
+                let idle_stream = scope.spawn(|| {
+                    sender
+                        .wait_for_keyframe_change(
+                            Duration::from_millis(400),
+                            Some(format.with_tier(StreamTier::Preview)),
+                        )
+                        .unwrap()
+                });
+                let ready = &ready;
+                let frame = &mut frame;
+                let consumer = scope.spawn(move || {
+                    ready.wait();
+                    let changed = sender
+                        .wait_for_keyframe_change(Duration::from_secs(2), selectors[0])
+                        .unwrap();
+                    if changed {
+                        // Sending the requested keyframe may clear native demand
+                        // before another observer resumes. Its report stays latched.
+                        video.send_video(frame).unwrap();
+                    }
+                    changed
+                });
+                let follower = scope.spawn(move || {
+                    ready.wait();
+                    sender
+                        .wait_for_keyframe_change(Duration::from_secs(2), selectors[1])
+                        .unwrap()
+                });
+                ready.wait();
+                std::thread::sleep(Duration::from_millis(100));
+                let requested = Instant::now();
+                receiver.receiver().request_keyframe().unwrap();
+                for wait in [consumer, follower] {
+                    assert!(
+                        wait.join().unwrap(),
+                        "a keyframe waiter missed {selectors:?}"
+                    );
+                }
+                assert!(
+                    !idle_stream.join().unwrap(),
+                    "an idle preview stream observed program demand"
+                );
+                assert!(
+                    requested.elapsed() < Duration::from_secs(1),
+                    "a keyframe waiter returned late for {selectors:?}"
+                );
+            });
+        }
+    }
+}
+
 /// The Annex B units before the first slice of `bitstream`, start codes
 /// included: its parameter sets, which the SDK asks for both inline and in
 /// the envelope's extra data. `is_slice` tells a slice by its NAL header's
@@ -2746,7 +3142,7 @@ fn avsync_follows_source_format_changes_and_preserves_audio_samples() {
                 videos += 1;
                 of_format += usize::from(video.width() == width);
                 if let AvSyncOutcome::Audio { frame, .. } = sync
-                    .synchronize(Some(&video), AvSyncRequest::automatic())
+                    .synchronize(stamped(&video), AvSyncRequest::automatic())
                     .unwrap()
                 {
                     audio += 1;
@@ -2958,4 +3354,201 @@ fn a_genlock_moves_between_threads() {
             .join()
             .unwrap();
     });
+}
+
+/// A borrowed compressed packet stays in the exact application allocation
+/// granted to the native receiver, until its receive guard is released.
+#[test]
+fn borrowed_packet_payload_stays_in_external_allocator_memory() {
+    use std::{
+        alloc::{alloc_zeroed, dealloc, Layout},
+        ptr::NonNull,
+    };
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    struct Storage {
+        pointer: NonNull<u8>,
+        layout: Layout,
+        freed: Arc<AtomicBool>,
+    }
+    // SAFETY: Storage exclusively owns its aligned initialized allocation;
+    // transfer between SDK threads changes no pointer or storage extent.
+    unsafe impl Send for Storage {}
+    // SAFETY: alloc_zeroed provides 64-byte aligned initialized memory, the
+    // pointer/extent never change, and only the SDK accesses it before Drop.
+    unsafe impl ExternalAllocation for Storage {
+        fn pointer(&self) -> NonNull<u8> {
+            self.pointer
+        }
+        fn capacity(&self) -> usize {
+            self.layout.size()
+        }
+    }
+    impl Drop for Storage {
+        fn drop(&mut self) {
+            // SAFETY: this value owns the allocation made with this Layout,
+            // and the SDK has released its last lease before dropping it.
+            unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
+            self.freed.store(true, Ordering::Release);
+        }
+    }
+    let buffers = Arc::new(Mutex::new(Vec::new()));
+    let mut sender = CompressedSender::new(&ndi, &options("borrowed-external-packet")).unwrap();
+    let receiver = PacketReceiver::new(
+        &ndi,
+        &ReceiverOptions::new(loopback(&ndi, &sender.sender().source().unwrap())),
+        PassthroughPreset::ProtectedWithAudio,
+    )
+    .unwrap();
+    let service =
+        AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default()).unwrap();
+    let mut receiver = service.attach_packets(receiver).unwrap();
+    let grants = buffers.clone();
+    receiver
+        .set_video_allocator(move |request: AllocationRequest| {
+            let layout = Layout::from_size_align(request.minimum_bytes(), 64).unwrap();
+            // SAFETY: requests are positive bounded extents, with checked alignment.
+            let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).expect("test allocation");
+            let freed = Arc::new(AtomicBool::new(false));
+            grants
+                .lock()
+                .unwrap()
+                .push((pointer.as_ptr() as usize, layout.size(), freed.clone()));
+            AllocationBuffer::from_external(
+                request,
+                Storage {
+                    pointer,
+                    layout,
+                    freed,
+                },
+            )
+            .map_err(|error| error.into_error())
+        })
+        .unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    let held = loop {
+        assert!(
+            Instant::now() < deadline,
+            "no allocator-backed compressed packet: {}",
+            link(receiver.receiver())
+        );
+        let mut frame = keyframe(VideoCodec::H264, StreamTier::Program, FIRST_TIMECODE);
+        sender.send_video(&mut frame).unwrap();
+        if let Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(frame))) =
+            receiver.capture_ref(SLICE).unwrap()
+        {
+            break frame;
+        }
+    };
+    let pointer = held.data().as_ptr() as usize;
+    let length = held.data().len();
+    let freed = buffers
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|(start, capacity, freed)| {
+            (*start <= pointer && pointer + length <= start + capacity).then(|| freed.clone())
+        })
+        .expect("payload must be inside the application's granted allocation");
+    assert!(!freed.load(Ordering::Acquire));
+    assert!(service.usage().retained_allocations() > 0);
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        !freed.load(Ordering::Acquire),
+        "held reference keeps its allocation alive"
+    );
+    receiver.receiver().connection_stats();
+    drop(held);
+    let deadline = Instant::now() + PATIENCE;
+    while !freed.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "native packet lease outlived its dropped guard"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The exact buffer is now released, but Storage::drop sets its flag
+    // before the registry finishes bookkeeping, and the SDK may still own
+    // other queued buffers. Destroying the receiver drains those callbacks
+    // and prevents new grants before inspecting the process-wide counters.
+    drop(receiver);
+    drop(sender);
+    let usage = service.usage();
+    assert_eq!(
+        (
+            usage.retained_allocations(),
+            usage.retained_bytes(),
+            usage.generations(),
+            usage.active_generations(),
+        ),
+        (0, 0, 0, 0),
+        "an allocation or generation outlived its receiver: {usage:?}"
+    );
+}
+
+#[test]
+fn borrowed_packet_capture_decodes_formats_outside_its_preset() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    if !common::hx_decoder(&ndi, H264Decoder) {
+        return;
+    }
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("borrowed-decoded-fallback")).unwrap();
+    let receiver = PacketReceiver::new(
+        &ndi,
+        &ReceiverOptions::new(loopback(&ndi, &sender.sender().source().unwrap())),
+        PassthroughPreset::SpeedHq,
+    )
+    .unwrap();
+    let bitstream = include_bytes!("data/quadrants-420.h264");
+    let config = parameter_sets(bitstream, |header| matches!(header & 0x1f, 1..=5));
+    let format = VideoPacketFormat::new(VideoCodec::H264, 64, 64)
+        .unwrap()
+        .with_frame_rate(FrameRate::new(30, 1).unwrap());
+    let mut pts = 0;
+    let deadline = Instant::now() + PATIENCE;
+    let mut placeholders = 0;
+    loop {
+        let bytes =
+            PacketEnvelope::encode(EnvelopeCodec::H264, pts, pts, true, bitstream, config).unwrap();
+        let mut packet = CompressedVideoFrame::new(format, bytes).unwrap();
+        sender.send_video(&mut packet).unwrap();
+        pts += 3000;
+        match receiver.capture_ref(SLICE).unwrap() {
+            Some(PacketItemRef::Video(ReceivedVideoRef::Decoded(frame))) => {
+                if common::is_hx_placeholder((64, 64), (frame.width(), frame.height())) {
+                    placeholders += 1;
+                } else {
+                    assert_eq!((frame.width(), frame.height()), (64, 64));
+                    assert!(frame
+                        .planes()
+                        .flat_map(|plane| plane.rows())
+                        .flatten()
+                        .any(|&byte| byte != 0));
+                    assert_eq!(frame.to_owned().width(), 64);
+                    return;
+                }
+            }
+            Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(_))) => {
+                panic!("preset must decode H.264")
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            assert!(
+                placeholders > 0,
+                "no fallback video arrived: {}",
+                link(receiver.receiver())
+            );
+            common::skip(
+                H264Decoder,
+                "packet receiver delivered only the SDK decoder placeholder",
+            );
+            return;
+        }
+    }
 }

@@ -47,9 +47,9 @@ impl<'a> Source<'a> {
     pub(crate) fn new<F: VideoParts + ?Sized>(frame: &'a F) -> Self {
         let layout = frame.layout();
         Self {
-            width: layout.width as usize,
-            height: layout.height as usize,
-            format: layout.pixel_format,
+            width: layout.width() as usize,
+            height: layout.height() as usize,
+            format: layout.pixel_format(),
             planes: frame.plane_views(),
             metadata: frame.metadata_text().map(|text| text.as_str()),
         }

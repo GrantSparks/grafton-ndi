@@ -17,7 +17,7 @@ pub fn ndi() -> Option<Ndi> {
             assert_expected_identity(ndi.info());
             Some(ndi)
         }
-        Err(Error::RuntimeLoadFailed(reason)) => {
+        Err(Error::RuntimeLoadFailed(reason)) if !reason.loaded_any() => {
             skip(
                 Requirement::Runtime,
                 &format!("no NDI runtime could be loaded: {reason}"),

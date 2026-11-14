@@ -21,7 +21,7 @@ use std::{
 
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use super::{invalid_frame, sdk_quantity, AudioCodec, VideoCodec};
-use super::{invalid_input, PacketItem, PacketReceiver, ReceiverControls};
+use super::{invalid_input, PacketItem, PacketItemRef, PacketReceiver, ReceiverControls};
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use crate::sys::bindings::*;
 use crate::{
@@ -42,7 +42,8 @@ const MAX_ALLOCATION: usize = 256 * MIB;
 /// by policies that have since been replaced and buffers whose release is
 /// still in progress. Memory a policy allocates for its own bookkeeping is not
 /// counted. A request the limits do not admit is declined, and the SDK then
-/// drops that frame.
+/// drops that frame. [`AllocatorService::usage`] reports these declines through
+/// [`AllocatorUsage::declined`] and [`AllocatorUsage::declined_allocations`].
 ///
 /// The defaults are 256 generations, 1024 allocations, 1 GiB in total, 16
 /// concurrent calls and 64 MiB per allocation, which holds an 8-bit 4:2:2
@@ -275,7 +276,7 @@ impl AllocationRequest {
                         Error::InvalidFrame(reason) => invalid_input(reason),
                         other => other,
                     })?
-                    .data_len_bytes
+                    .data_len_bytes()
             }
             AllocationFormat::AudioPlanarF32 => {
                 if !stride.is_multiple_of(size_of::<f32>()) {
@@ -456,7 +457,9 @@ impl AllocationBuffer {
 ///
 /// The SDK calls the policy on its own threads, possibly several at once, and
 /// stalls video or audio while a call blocks. An error or a panic makes that
-/// one allocation fail; the SDK then drops the frame.
+/// one allocation fail; the SDK then drops the frame. Inspect
+/// [`AllocatorService::usage`] for process-wide [`AllocationDecline`] counts,
+/// including distinct policy-error and contained-panic counts.
 pub trait ReceiveAllocator: Send + Sync + 'static {
     /// Supply memory for one frame.
     ///
@@ -532,6 +535,15 @@ struct State {
     reserved_bytes: usize,
     calls: usize,
     reclaiming: usize,
+    declines: [u64; AllocationDecline::COUNT],
+}
+
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
+impl State {
+    fn decline(&mut self, reason: AllocationDecline) {
+        let count = &mut self.declines[reason.index()];
+        *count = count.saturating_add(1);
+    }
 }
 
 /// Every generation and lease in the process.
@@ -603,6 +615,39 @@ impl Registry {
         }
     }
 
+    fn usage(&self) -> AllocatorUsage {
+        let state = lock(&self.state);
+        AllocatorUsage {
+            generations: self.generations.load(Ordering::Acquire),
+            active_generations: state.active.len(),
+            retained_allocations: state.leases.len() + state.reclaiming,
+            retained_bytes: state.bytes,
+            calls: state.calls,
+            reclaiming: state.reclaiming,
+            declines: state.declines,
+        }
+    }
+
+    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+    fn decline(&self, reason: AllocationDecline) {
+        lock(&self.state).decline(reason);
+    }
+
+    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+    fn allocate_request(
+        &self,
+        token: usize,
+        request: Result<AllocationRequest>,
+    ) -> Option<(NonNull<u8>, i32)> {
+        match request {
+            Ok(request) => self.allocate(token, request),
+            Err(_) => {
+                self.decline(AllocationDecline::RequestNotRepresentable);
+                None
+            }
+        }
+    }
+
     /// Register `policy` as a new generation and return its token, or return
     /// the policy when the process has no room for another.
     fn register<P: ReceiveAllocator>(&self, policy: P) -> std::result::Result<usize, Rejected<P>> {
@@ -610,15 +655,19 @@ impl Registry {
             Ok(token) => token,
             Err(error) => return Err(Rejected::new(error, policy)),
         };
-        lock(&self.state).active.insert(
-            token,
-            Arc::new(Generation {
-                #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-                phase: Mutex::new(Phase::Active),
-                policy: ManuallyDrop::new(Arc::new(policy)),
-                count: self.generations.clone(),
-            }),
-        );
+        let generation = Arc::new(Generation {
+            #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+            phase: Mutex::new(Phase::Active),
+            policy: ManuallyDrop::new(Arc::new(policy)),
+            count: self.generations.clone(),
+        });
+        // Some platforms, including macOS, allocate a mutex's native state on
+        // its first lock. Initialize it on this registering thread, before the
+        // generation is published, so the first SDK callback allocates nothing
+        // when checking the phase or recording a policy decline.
+        #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+        drop(lock(&generation.phase));
+        lock(&self.state).active.insert(token, generation);
         Ok(token)
     }
 
@@ -657,10 +706,16 @@ impl Registry {
     fn allocate(&self, token: usize, mut request: AllocationRequest) -> Option<(NonNull<u8>, i32)> {
         let (generation, reservation) = {
             let mut s = lock(&self.state);
-            let generation = s.active.get(&token)?.clone();
-            if s.calls >= self.limits.max_concurrent_calls
-                || s.leases.len() + s.calls + s.reclaiming >= self.limits.max_allocations
-            {
+            let Some(generation) = s.active.get(&token).cloned() else {
+                s.decline(AllocationDecline::GenerationUnavailable);
+                return None;
+            };
+            if s.calls >= self.limits.max_concurrent_calls {
+                s.decline(AllocationDecline::ConcurrencyLimit);
+                return None;
+            }
+            if s.leases.len() + s.calls + s.reclaiming >= self.limits.max_allocations {
+                s.decline(AllocationDecline::AllocationCountLimit);
                 return None;
             }
             // Grant the call its buffer before user code runs, so that the
@@ -674,6 +729,7 @@ impl Registry {
                 .saturating_sub(s.reserved_bytes)
                 .min(self.limits.max_allocation_bytes);
             if granted < request.bytes {
+                s.decline(AllocationDecline::ByteLimit);
                 return None;
             }
             s.calls += 1;
@@ -686,13 +742,29 @@ impl Registry {
         };
         request.capacity_limit = reservation.bytes;
         if *lock(&generation.phase) != Phase::Active {
+            self.decline(AllocationDecline::GenerationUnavailable);
             return None;
         }
-        let allocation = catch_unwind(AssertUnwindSafe(|| generation.policy.allocate(request)))
-            .ok()?
-            .ok()?;
-        let pointer = allocation.storage.pointer();
-        let capacity = allocation.capacity();
+        // Storage accessors are application code too. A panic while checking a
+        // returned buffer must be counted just like a panic in the policy,
+        // before the outer native callback turns it into a refused request.
+        let (allocation, pointer, capacity) = match catch_unwind(AssertUnwindSafe(|| {
+            generation.policy.allocate(request).map(|allocation| {
+                let pointer = allocation.storage.pointer();
+                let capacity = allocation.capacity();
+                (allocation, pointer, capacity)
+            })
+        })) {
+            Ok(Ok(allocation)) => allocation,
+            Ok(Err(_)) => {
+                self.decline(AllocationDecline::PolicyError);
+                return None;
+            }
+            Err(_) => {
+                self.decline(AllocationDecline::PolicyPanic);
+                return None;
+            }
+        };
         let actual = allocation.request;
         if capacity > reservation.bytes
             || actual.format != request.format
@@ -702,18 +774,24 @@ impl Registry {
             || actual.bytes < request.bytes
             || capacity < actual.bytes
         {
+            self.decline(AllocationDecline::BufferRefused);
             return None;
         }
         // At most the capacity, which is at most MAX_ALLOCATION.
-        let stride = i32::try_from(actual.stride).ok()?;
+        let Ok(stride) = i32::try_from(actual.stride) else {
+            self.decline(AllocationDecline::BufferRefused);
+            return None;
+        };
         // Serialize publication against Closing. An admitted policy may have
         // blocked while replacement/destruction began; it must not publish late.
         let phase = lock(&generation.phase);
         if *phase != Phase::Active {
+            self.decline(AllocationDecline::GenerationUnavailable);
             return None;
         }
         let mut s = lock(&self.state);
         if s.leases.contains_key(&(token, pointer.as_ptr() as usize)) {
+            s.decline(AllocationDecline::BufferRefused);
             return None;
         }
         // The buffer takes the place of the grant that covered it.
@@ -792,7 +870,52 @@ pub struct AllocatorService {
     runtime: ProcessLifetimeRuntime,
 }
 
+/// Why a custom receive allocation was declined and the SDK dropped its frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AllocationDecline {
+    /// The SDK's format, dimensions or requested extent cannot be represented.
+    RequestNotRepresentable,
+    /// The policy generation is unknown, replaced, closing or retired.
+    GenerationUnavailable,
+    /// The process already has its maximum number of concurrent policy calls.
+    ConcurrencyLimit,
+    /// Retained allocations, calls and reclamations fill the allocation count limit.
+    AllocationCountLimit,
+    /// The remaining total or per-allocation byte grant cannot hold the request.
+    ByteLimit,
+    /// The application policy returned an error.
+    PolicyError,
+    /// The application policy or its buffer inspection panicked; the callback
+    /// contained the panic.
+    PolicyPanic,
+    /// The policy's buffer has an inconsistent size, layout, stride or live address.
+    BufferRefused,
+}
+
+impl AllocationDecline {
+    const COUNT: usize = 8;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::RequestNotRepresentable => 0,
+            Self::GenerationUnavailable => 1,
+            Self::ConcurrencyLimit => 2,
+            Self::AllocationCountLimit => 3,
+            Self::ByteLimit => 4,
+            Self::PolicyError => 5,
+            Self::PolicyPanic => 6,
+            Self::BufferRefused => 7,
+        }
+    }
+}
+
 /// A snapshot of custom allocation across the process.
+///
+/// Decline counters include all generations since the service was created,
+/// including retired policies. They saturate at `u64::MAX` and never reset.
+/// Each declined SDK request increments exactly one reason; successful
+/// allocations increment none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct AllocatorUsage {
     generations: usize,
@@ -801,9 +924,22 @@ pub struct AllocatorUsage {
     retained_bytes: usize,
     calls: usize,
     reclaiming: usize,
+    declines: [u64; AllocationDecline::COUNT],
 }
 
 impl AllocatorUsage {
+    /// All declined custom receive allocations across the process.
+    ///
+    /// The total saturates at `u64::MAX`.
+    pub fn declined_allocations(self) -> u64 {
+        self.declines.into_iter().fold(0, u64::saturating_add)
+    }
+
+    /// Declined custom receive allocations for one reason.
+    pub fn declined(self, reason: AllocationDecline) -> u64 {
+        self.declines[reason.index()]
+    }
+
     /// Policies that exist, including replaced ones whose allocations the SDK
     /// still holds. A policy whose destructor panicked stays counted.
     pub fn generations(self) -> usize {
@@ -854,18 +990,11 @@ impl AllocatorService {
         Ok(Self { runtime })
     }
 
-    /// What custom allocation currently holds across the process.
+    /// A consistent snapshot of retained storage, active calls and decline
+    /// counters across the process. Counter updates allocate no storage and
+    /// run under the same lock that accounts for retained allocations.
     pub fn usage(self) -> AllocatorUsage {
-        let registry = registry();
-        let state = lock(&registry.state);
-        AllocatorUsage {
-            generations: registry.generations.load(Ordering::Acquire),
-            active_generations: state.active.len(),
-            retained_allocations: state.leases.len() + state.reclaiming,
-            retained_bytes: state.bytes,
-            calls: state.calls,
-            reclaiming: state.reclaiming,
-        }
+        registry().usage()
     }
 
     /// Take a receiver so that its allocators can be set.
@@ -932,9 +1061,8 @@ impl AllocatorService {
 ///
 /// It is [`Send`] and [`Sync`], as the packet receiver and an
 /// [`AllocatedReceiver`] are: capturing, setting and resetting allocators,
-/// and dropping it can each happen on any thread. Capturing and changing an
-/// allocator take it mutably; a shared reference reaches only the receiver's
-/// controls.
+/// and dropping it can each happen on any thread. Captures borrow it immutably;
+/// changing allocators requires an exclusive borrow.
 pub struct AllocatedPacketReceiver {
     // Its Send and Sync are those of the allocation, which an
     // AllocatedReceiver shares. The SDK calls the policies on threads of its
@@ -954,8 +1082,19 @@ impl AllocatedPacketReceiver {
     /// # Errors
     ///
     /// As for [`PacketReceiver::capture`].
-    pub fn capture(&mut self, timeout: std::time::Duration) -> Result<Option<PacketItem>> {
+    pub fn capture(&self, timeout: std::time::Duration) -> Result<Option<PacketItem>> {
         PacketReceiver::capture_from(self.inner.receiver(), timeout)
+    }
+
+    /// Borrow a packet directly from SDK or application-provided storage.
+    /// A held item keeps its custom allocation charged until the SDK releases
+    /// it after the item is dropped. See [`PacketReceiver::capture_ref`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`PacketReceiver::capture_ref`].
+    pub fn capture_ref(&self, timeout: std::time::Duration) -> Result<Option<PacketItemRef<'_>>> {
+        PacketReceiver::capture_ref_from(self.inner.receiver(), timeout)
     }
 
     /// The receiver, for its controls; see [`PacketReceiver::receiver`].
@@ -1257,11 +1396,11 @@ fn video_request(frame: &NDIlib_video_frame_v2_t) -> Result<AllocationRequest> {
         .map_err(|_| invalid_frame("Unknown allocator video format"))?;
     let layout = ValidatedVideoLayout::from_sdk(pixel, frame.xres, frame.yres, 0)?;
     Ok(AllocationRequest {
-        bytes: layout.data_len_bytes,
-        stride: layout.line_stride_bytes,
+        bytes: layout.data_len_bytes(),
+        stride: layout.line_stride_bytes(),
         format: AllocationFormat::Video(pixel),
-        width: layout.width,
-        height: layout.height,
+        width: layout.width(),
+        height: layout.height(),
         capacity_limit: MAX_ALLOCATION,
     })
 }
@@ -1314,17 +1453,18 @@ unsafe extern "C" fn video_allocate(
     frame: *mut NDIlib_video_frame_v2_t,
 ) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
+        let Some(registry) = REGISTRY.get() else {
+            return false;
+        };
         // SAFETY: the SDK passes null or a descriptor it owns for this call.
         let Some(frame) = (unsafe { frame.as_mut() }) else {
+            registry.decline(AllocationDecline::RequestNotRepresentable);
             return false;
         };
         let request = video_request(frame);
         frame.p_data = std::ptr::null_mut();
         frame.__bindgen_anon_1.line_stride_in_bytes = 0;
-        let Some((pointer, stride)) = request
-            .ok()
-            .and_then(|request| REGISTRY.get()?.allocate(opaque as usize, request))
-        else {
+        let Some((pointer, stride)) = registry.allocate_request(opaque as usize, request) else {
             return false;
         };
         frame.p_data = pointer.as_ptr();
@@ -1341,17 +1481,18 @@ unsafe extern "C" fn audio_allocate(
     frame: *mut NDIlib_audio_frame_v3_t,
 ) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
+        let Some(registry) = REGISTRY.get() else {
+            return false;
+        };
         // SAFETY: the SDK passes null or a descriptor it owns for this call.
         let Some(frame) = (unsafe { frame.as_mut() }) else {
+            registry.decline(AllocationDecline::RequestNotRepresentable);
             return false;
         };
         let request = audio_request(frame);
         frame.p_data = std::ptr::null_mut();
         frame.__bindgen_anon_1.channel_stride_in_bytes = 0;
-        let Some((pointer, stride)) = request
-            .ok()
-            .and_then(|request| REGISTRY.get()?.allocate(opaque as usize, request))
-        else {
+        let Some((pointer, stride)) = registry.allocate_request(opaque as usize, request) else {
             return false;
         };
         frame.p_data = pointer.as_ptr();
@@ -1474,6 +1615,229 @@ mod tests {
 
     fn request() -> AllocationRequest {
         request_of(64)
+    }
+
+    #[test]
+    fn request_conversion_declines_count_once_without_calling_a_policy() {
+        let registry = Registry::new(limits());
+        let token = registry.register(AllocationBuffer::zeroed).unwrap();
+        let video = NDIlib_video_frame_v2_t {
+            FourCC: u32::MAX,
+            ..Default::default()
+        };
+        let audio = NDIlib_audio_frame_v3_t {
+            FourCC: u32::MAX,
+            ..Default::default()
+        };
+        assert!(registry
+            .allocate_request(token, video_request(&video))
+            .is_none());
+        assert!(registry
+            .allocate_request(token, audio_request(&audio))
+            .is_none());
+        let usage = registry.usage();
+        assert_eq!(
+            usage.declined(AllocationDecline::RequestNotRepresentable),
+            2
+        );
+        assert_eq!(usage.declined_allocations(), 2);
+        assert_eq!(usage.in_progress_allocations(), 0);
+        assert_eq!(usage.retained_allocations(), 0);
+        let (pointer, _) = registry.allocate(token, request()).unwrap();
+        assert_eq!(registry.usage().declined_allocations(), 2);
+        assert!(registry.free(token, pointer.as_ptr()));
+    }
+
+    #[test]
+    fn unavailable_generations_and_policy_errors_have_distinct_decline_counts() {
+        let registry = Registry::new(limits());
+        let token = registry
+            .register(|_: AllocationRequest| -> Result<AllocationBuffer> {
+                Err(Error::InvalidInput(String::new()))
+            })
+            .unwrap();
+        let (result, allocations) =
+            crate::test_alloc::allocation_count(|| registry.allocate(token, request()));
+        assert!(result.is_none());
+        assert_eq!(allocations, 0);
+        assert_eq!(registry.usage().declined(AllocationDecline::PolicyError), 1);
+        registry.closing(token);
+        assert!(registry.allocate(token, request()).is_none());
+        registry.retire(token);
+        assert!(registry.allocate(token, request()).is_none());
+        let usage = registry.usage();
+        assert_eq!(usage.declined(AllocationDecline::GenerationUnavailable), 2);
+        assert_eq!(usage.declined_allocations(), 3);
+        assert_eq!(usage.retained_bytes(), 0);
+        assert_eq!(usage.in_progress_allocations(), 0);
+    }
+
+    #[test]
+    fn panicking_external_buffer_inspection_counts_once_and_releases_storage() {
+        use std::cell::Cell;
+
+        struct InspectionPanics {
+            storage: OwnedStorage,
+            pointer_calls: Cell<usize>,
+            capacity_calls: Cell<usize>,
+            panic_in_pointer: bool,
+            drops: Arc<AtomicUsize>,
+        }
+        // SAFETY: OwnedStorage supplies initialized, aligned, writable memory
+        // with a stable pointer and capacity. This fixture panics on a later
+        // accessor call without ever changing either returned value. Its
+        // destructor is nonpanicking and releases the allocation exactly once.
+        unsafe impl ExternalAllocation for InspectionPanics {
+            fn pointer(&self) -> NonNull<u8> {
+                let calls = self.pointer_calls.replace(self.pointer_calls.get() + 1);
+                assert!(
+                    !self.panic_in_pointer || calls == 0,
+                    "buffer pointer inspection panicked"
+                );
+                self.storage.pointer()
+            }
+
+            fn capacity(&self) -> usize {
+                let calls = self.capacity_calls.replace(self.capacity_calls.get() + 1);
+                assert!(
+                    self.panic_in_pointer || calls == 0,
+                    "buffer capacity inspection panicked"
+                );
+                self.storage.capacity()
+            }
+        }
+        impl Drop for InspectionPanics {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        for panic_in_pointer in [true, false] {
+            let registry = Registry::new(limits());
+            let drops = Arc::new(AtomicUsize::new(0));
+            let token = registry
+                .register({
+                    let drops = drops.clone();
+                    move |request: AllocationRequest| {
+                        let storage = InspectionPanics {
+                            storage: OwnedStorage::zeroed(request.minimum_bytes())?,
+                            pointer_calls: Cell::new(0),
+                            capacity_calls: Cell::new(0),
+                            panic_in_pointer,
+                            drops: drops.clone(),
+                        };
+                        Ok(AllocationBuffer::from_external(request, storage)?)
+                    }
+                })
+                .unwrap();
+            let outcome = catch_unwind(AssertUnwindSafe(|| registry.allocate(token, request())));
+            assert!(
+                outcome.is_ok(),
+                "buffer inspection must remain inside panic containment"
+            );
+            assert!(outcome.unwrap().is_none());
+            let usage = registry.usage();
+            assert_eq!(usage.declined(AllocationDecline::PolicyPanic), 1);
+            assert_eq!(usage.declined_allocations(), 1);
+            assert_eq!(usage.retained_allocations(), 0);
+            assert_eq!(usage.retained_bytes(), 0);
+            assert_eq!(usage.in_progress_allocations(), 0);
+            assert_eq!(lock(&registry.state).reserved_bytes, 0);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn declined_budget_requests_allocate_nothing_and_stay_exact_under_contention() {
+        let registry = Registry::new(limits());
+        let token = registry.register(AllocationBuffer::zeroed).unwrap();
+        let oversized = request_of(128);
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            for _ in 0..32 {
+                assert!(registry.allocate(token, oversized).is_none());
+            }
+        });
+        assert_eq!(allocations, 0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..100 {
+                        assert!(registry.allocate(token, oversized).is_none());
+                        let usage = registry.usage();
+                        assert_eq!(
+                            usage.declined_allocations(),
+                            usage.declined(AllocationDecline::ByteLimit)
+                        );
+                        assert_eq!(usage.in_progress_allocations(), 0);
+                        assert_eq!(usage.retained_bytes(), 0);
+                    }
+                });
+            }
+        });
+        assert_eq!(registry.usage().declined(AllocationDecline::ByteLimit), 832);
+    }
+
+    #[test]
+    fn duplicate_live_addresses_are_declined_without_releasing_the_first_lease() {
+        struct RepeatedAddress(Arc<Mutex<OwnedStorage>>);
+        // SAFETY: this fixture never lets an SDK access the storage. It keeps
+        // initialized aligned memory alive and deliberately offers its stable
+        // address twice so the registry can refuse a second publication.
+        unsafe impl ExternalAllocation for RepeatedAddress {
+            fn pointer(&self) -> NonNull<u8> {
+                lock(&self.0).pointer()
+            }
+            fn capacity(&self) -> usize {
+                lock(&self.0).capacity()
+            }
+        }
+        let registry = Registry::new(limits());
+        let storage = Arc::new(Mutex::new(OwnedStorage::zeroed(64).unwrap()));
+        let token = registry
+            .register(move |request| {
+                Ok(AllocationBuffer::from_external(
+                    request,
+                    RepeatedAddress(storage.clone()),
+                )?)
+            })
+            .unwrap();
+        let (pointer, _) = registry.allocate(token, request()).unwrap();
+        assert!(registry.allocate(token, request()).is_none());
+        let usage = registry.usage();
+        assert_eq!(usage.declined(AllocationDecline::BufferRefused), 1);
+        assert_eq!(usage.declined_allocations(), 1);
+        assert_eq!(usage.retained_allocations(), 1);
+        assert_eq!(usage.retained_bytes(), 64);
+        assert_eq!(usage.in_progress_allocations(), 0);
+        assert!(registry.free(token, pointer.as_ptr()));
+        assert_eq!(registry.usage().retained_bytes(), 0);
+    }
+
+    #[test]
+    fn invalid_buffer_layout_and_stride_overflow_are_counted_once() {
+        for overflow in [false, true] {
+            let registry = Registry::new(limits());
+            let token = registry
+                .register(move |request| {
+                    let mut buffer = AllocationBuffer::zeroed(request)?;
+                    // Simulate a malformed policy result inside the fixture;
+                    // neither value can be published as a native descriptor.
+                    if overflow {
+                        buffer.request.stride = i32::MAX as usize + 1;
+                    } else {
+                        buffer.request.width += 1;
+                    }
+                    Ok(buffer)
+                })
+                .unwrap();
+            assert!(registry.allocate(token, request()).is_none());
+            let usage = registry.usage();
+            assert_eq!(usage.declined(AllocationDecline::BufferRefused), 1);
+            assert_eq!(usage.declined_allocations(), 1);
+            assert_eq!(usage.retained_allocations(), 0);
+            assert_eq!(usage.retained_bytes(), 0);
+            assert_eq!(usage.in_progress_allocations(), 0);
+        }
     }
 
     /// A policy that can be told apart from another of its type.
@@ -1636,6 +2000,9 @@ mod tests {
         );
         assert_eq!(in_progress, calls);
         assert!(one_more.is_none(), "a call beyond the limit was admitted");
+        let usage = registry.usage();
+        assert_eq!(usage.declined(AllocationDecline::ConcurrencyLimit), 1);
+        assert_eq!(usage.declined_allocations(), 1);
         assert_eq!(admitted.len(), calls);
         assert_eq!(*lock(&granted), vec![limits.max_allocation_bytes; calls]);
 
@@ -1688,6 +2055,8 @@ mod tests {
         assert!(registry.allocate(token, request_of(8)).is_none());
         assert_eq!(*lock(&granted), [64, 64, 64, 64, 32, 16]);
         assert_eq!(lock(&registry.state).bytes, 256);
+        assert_eq!(registry.usage().declined(AllocationDecline::ByteLimit), 3);
+        assert_eq!(registry.usage().declined_allocations(), 3);
 
         // Freeing returns exactly what the buffer took.
         assert!(registry.free(token, held[0].as_ptr()));
@@ -1709,6 +2078,11 @@ mod tests {
             })
             .unwrap();
         assert!(registry.allocate(token, request()).is_none());
+        assert_eq!(
+            registry.usage().declined(AllocationDecline::BufferRefused),
+            1
+        );
+        assert_eq!(registry.usage().declined_allocations(), 1);
         let state = lock(&registry.state);
         assert_eq!((state.calls, state.reserved_bytes, state.bytes), (0, 0, 0));
         assert!(state.leases.is_empty());
@@ -1930,6 +2304,13 @@ mod tests {
             worker.join().unwrap()
         });
         assert!(!published);
+        assert_eq!(
+            registry
+                .usage()
+                .declined(AllocationDecline::GenerationUnavailable),
+            1
+        );
+        assert_eq!(registry.usage().declined_allocations(), 1);
         assert_eq!(lock(&registry.state).bytes, 0);
         assert_eq!(registry.generations.load(Ordering::Acquire), 0);
     }
@@ -1942,6 +2323,12 @@ mod tests {
         let (a, _) = registry.allocate(first, request()).unwrap();
         let (b, _) = registry.allocate(second, request()).unwrap();
         assert!(registry.allocate(first, request()).is_none());
+        assert_eq!(
+            registry
+                .usage()
+                .declined(AllocationDecline::AllocationCountLimit),
+            1
+        );
         registry.retire(first);
         registry.retire(second);
         assert!(registry.free(first, a.as_ptr()));
@@ -1950,6 +2337,8 @@ mod tests {
             .register(|_| -> Result<AllocationBuffer> { panic!("policy") })
             .unwrap();
         assert!(registry.allocate(panic, request()).is_none());
+        assert_eq!(registry.usage().declined(AllocationDecline::PolicyPanic), 1);
+        assert_eq!(registry.usage().declined_allocations(), 2);
         assert_eq!(lock(&registry.state).calls, 0);
         assert_eq!(lock(&registry.state).reserved_bytes, 0);
         registry.retire(panic);

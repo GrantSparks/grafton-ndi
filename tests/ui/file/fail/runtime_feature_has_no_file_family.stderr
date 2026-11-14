@@ -1,0 +1,5 @@
+error[E0599]: no variant, associated function, or constant named `File` found for enum `RuntimeFeature` in the current scope
+ --> tests/ui/file/fail/runtime_feature_has_no_file_family.rs:4:29
+  |
+4 |     let _ = RuntimeFeature::File(FileFamily::Playback);
+  |                             ^^^^ variant, associated function, or constant not found in `RuntimeFeature`

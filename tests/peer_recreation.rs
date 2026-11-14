@@ -183,7 +183,7 @@ impl<'a> Run<'a> {
                 cycle.alone = Some(self.await_frame(&receiver, left));
             }
             if cycle.alone.is_none_or(|alone| alone.framed.is_none()) {
-                receiver.reconnect().unwrap();
+                receiver.reconnect();
                 cycle.reconnected = Some(self.await_frame(&receiver, GRACE));
             }
             cycle.stats = receiver.connection_stats();

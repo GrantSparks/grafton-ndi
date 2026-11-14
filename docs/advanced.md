@@ -44,8 +44,9 @@ the native handle or bypass its ownership rules. See the single
 
 ## Configuration
 
-Set an options value's `config(AdvancedConfig)` before its ordinary constructor
-when the SDK object needs JSON configuration. `AdvancedConfig::parse` checks a
+For objects with an options value, set `config(AdvancedConfig)` before their
+ordinary constructor. `Genlock::new` takes its optional configuration directly
+as an argument. `AdvancedConfig::parse` checks a
 JSON object of at most one MiB and preserves its text, including unknown
 properties. Property meanings come from the SDK. Debug output and parse errors
 hide the content; `expose_json()` deliberately reveals it, so avoid logging
@@ -53,7 +54,8 @@ credentials or network details it may contain.
 
 [`advanced_source_metadata`](../examples/advanced_source_metadata.rs) shows
 `Finder::sources_with_metadata`. Configuration is also supported by sender,
-receiver, router and Discovery Server options. `CompressedSender` and
+receiver, router and Discovery Server options, and directly by `Genlock::new`.
+`CompressedSender` and
 `PacketReceiver` use the configured entry point even when given no explicit
 configuration. Refer to their constructors for defaults.
 
@@ -67,16 +69,20 @@ decoded mixed media use the feature-free
 
 Construct a packet receiver with `ReceiverOptions` and a `PassthroughPreset`.
 A supported format named by the preset passes through compressed; other media
-can arrive decoded. `capture(timeout)` returns an owned
-`PacketItem::{Video, Audio, Metadata, Event}`. Notifications use the common
-`ReceiverEvent` model and are consumed once. `Ok(None)` means the wait budget
-expired, rather than proof that the source disconnected. Packet receivers
-cannot feed `FrameSync`.
+can arrive decoded. `capture_ref(timeout)` returns a borrowed
+`PacketItemRef::{Video, Audio, Metadata, Event}`; `capture(timeout)` makes the
+same capture and copies it into an owned `PacketItem`. Compressed references
+expose codec bytes without copying their payload or metadata. Their `to_owned`
+and `copy_into` methods make sendable owned packets; `copy_into` reuses buffers.
+Notifications use the common `ReceiverEvent` model and are consumed once.
+`Ok(None)` means the wait budget expired, rather than proof that the source
+disconnected. Packet receivers cannot feed `FrameSync`.
 
-Capture takes `&mut self`; shared controls remain available through
-`receiver()`. `controls()` reaches exclusive stream selection and KVM, and a
-packet KVM session captures through its own `capture()`. Neither route exposes
-raw receiver capture. See
+Both capture methods take `&self`; controls remain available through
+`receiver()` while a packet is borrowed. `controls()` reaches exclusive stream
+selection and KVM, and a packet KVM session also provides `capture_ref()`. Its
+result borrows the receiver, so inputs can be released while a packet is held.
+Neither route exposes raw receiver capture. See
 [`advanced_passthrough`](../examples/advanced_passthrough.rs) for receiving and
 relaying a source's compressed packets.
 
@@ -117,25 +123,39 @@ the SDK can still copy internally.
 The attached sender retains metadata, tally, connection and encoder controls,
 but offers no uncompressed sends and cannot be registered with a
 `SendAdvertiser`. This keeps the native sender from outliving pending storage.
+`CompressedSender::split()` lends video and audio views to separate scoped
+threads. Each view is `Send` and neither is `Sync` or `Clone`; the audio view's
+`sender()` provides metadata and controls while video is being submitted.
 
 ## Queued sending
 
-Use `QueuedSender` to submit multiple owned raw or compressed video frames
-without waiting for the previous frame's completion on each submission.
+Use `QueuedSender` to submit multiple owned raw, compressed or scatter video
+frames without waiting for the previous frame's completion on each submission.
 `QueueOptions` bounds retained frames and bytes, including completed frames not
 yet collected and spare payload/metadata capacity. Check defaults and exact
 accounting in [`QueueOptions`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.QueueOptions.html).
 
 `try_submit` returns a `SubmissionId` or the rejected frame. For `QueueFull`,
-collect completions and retry; inspect other errors before retrying.
+collect completions and retry. A frame whose retained allocation capacity
+alone exceeds `max_bytes` returns `InvalidInput`; waiting cannot make it fit.
+Inspect other errors before retrying.
 `try_take_completed` and `wait_completed` return reusable frames on the
-application thread. Submitting moves payload ownership but allocates a native
-descriptor. The queue's SDK completion callback runs no application code.
+application thread. Pass a `ScatterVideoFrame` directly to `try_submit` when
+the encoder supplies separate header, payload and parameter-set blocks; it
+returns as `QueuedVideoFrame::Scatter`, and `into_blocks()` recovers the original
+allocations. This requires scatter-send support as well as completion support.
+The byte budget counts block capacities, the owned block collection, both
+scatter arrays and metadata. Submitting allocates a native frame descriptor
+and, for scatter, one stable list descriptor. The SDK completion callback runs
+no application code.
 
 `from_sender` drains an ordinary sender's async pipeline and returns any held
 frame; it refuses advertised senders. The queue lends audio, metadata and
 shared controls through `sender()`, but reserves video sends. `QueuedSender` is
-`Send + Sync`; submission/collection require mutable access. **Drop waits
+`Send + Sync`; submission/collection require mutable access. `split()` lends
+an exclusive `QueuedVideo` view alongside the shared sender, so audio can run
+on its own scoped thread while video waits for completions. Neither split
+adds a lock or allocation to a send. **Drop waits
 without a timeout** for the SDK to finish with queued frames. Keep this blocking
 shutdown off an async executor. See
 [`advanced_queued_send`](../examples/advanced_queued_send.rs).
@@ -154,7 +174,29 @@ quickly. An error or contained panic declines the allocation. Replacing a policy
 keeps the old one alive until the SDK releases its outstanding buffers.
 Process-wide `AllocatorLimits` include those older allocations and are fixed by
 the first service; later services must request identical limits. Use `usage()`
-to inspect retained allocations.
+to inspect retained allocations and decline counters. `declined_allocations()`
+reports the process-wide total; `declined(AllocationDecline::ByteLimit)` and
+the other typed reasons distinguish exhausted budgets, invalid requests,
+unavailable generations, policy errors/panics and refused buffers. Counters
+never reset, include retired policies and saturate at `u64::MAX`. Each declined
+request increments one reason. Updates add no allocation, callback or logging
+on SDK threads.
+
+`AllocatorService::attach_packets` gives packet capture the same application
+buffers. Use `AllocatedPacketReceiver::capture_ref` to inspect those buffers
+in place; owned `capture` copies them. Keeping a packet reference retains its
+allocation and usage charge until the SDK releases that buffer after the
+reference is dropped. For example, after constructing `service` and `packets`:
+
+```rust,ignore
+let mut receiver = service.attach_packets(packets)?;
+receiver.set_video_allocator(|request| AllocationBuffer::zeroed(request))?;
+if let Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(packet))) =
+    receiver.capture_ref(Duration::from_secs(1))?
+{
+    inspect_codec_bytes(packet.data()); // Still in the policy's allocation.
+}
+```
 
 `AllocationBuffer::zeroed(request)` provides zeroed, 64-byte-aligned memory.
 Use `request.with_stride_bytes(stride)` for permitted line/channel padding.
@@ -173,8 +215,11 @@ explicit process-lifetime opt-in and padded-stride policy.
 
 `AvSync` matches audio to a captured video's timestamp. It owns the receiver
 and reserves audio capture; capture video through `sync.receiver()`, then pass
-the borrowed or owned video to `synchronize`. `AvSyncRequest::automatic()` lets
-the SDK choose audio shape. `AvSyncOutcome` distinguishes audio, no matching
+it to `synchronize` as an `AvSyncVideo`. `AvSyncVideo::new` accepts a borrowed
+capture or an owned copy of one, and returns `None` for a frame without its
+sender's timestamp, such as one the application built. `queued_audio` takes
+the queued audio without a frame. `AvSyncRequest::automatic()` lets the SDK
+choose audio shape. `AvSyncOutcome` distinguishes audio, no matching
 samples, format changes and absent audio; SDK internal failures return
 `Error::NativeOperationFailed`, unknown codes `Error::UnexpectedSdkResult`.
 These successful absence outcomes do not prove recent reception; use the
@@ -211,11 +256,13 @@ owners expose these controls through `controls()`; see the
 
 `Receiver::kvm()` creates an exclusive `KvmSession`; attached owners use
 `controls().kvm()`. A source must offer remote control. `session.receiver()`
-returns a restricted `KvmReceiver<'_, M>` for mode-permitted capture, events,
+returns a restricted `KvmReceiver<'_, M>` for mode-permitted capture, event polling,
 diagnostics, tally, PTZ, metadata and other shared controls while input stays
 held. Borrowed frames can coexist with mutable input calls. Use `split()`
 for simultaneous FrameSync/AVSync output and a session; packet sessions provide
-`capture()` directly.
+`capture()` directly. FrameSync and AvSync views retain metadata capture but
+have no event polling; use capability getters, source-name polling and connection
+queries.
 
 The session sends pointer, button, wheel, key, touch and explicit clipboard
 text; it never reads the local clipboard. Pointer/touch coordinates are

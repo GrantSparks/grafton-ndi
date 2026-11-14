@@ -13,7 +13,7 @@ NDI SDK. Two configurations need additional inputs:
 
 To run a dynamically loaded build, obtain an
 [NDI 6 runtime](https://ndi.video/for-developers/ndi-sdk/) and put its library
-beside the executable, or set `NDI_RUNTIME_DIR_V6` to its directory. For example:
+beside the executable, or set `NDI_RUNTIME_DIR_V6` to its absolute directory. For example:
 
 ```sh
 export NDI_RUNTIME_DIR_V6="/usr/share/NDI SDK for Linux/lib/x86_64-linux-gnu"
@@ -29,7 +29,8 @@ or run `cargo clean -p grafton-ndi` to trigger a rebuild.
 `Ndi::new()` selects and initializes a runtime. The dynamic loader tries:
 
 1. The executable's directory.
-2. `NDI_RUNTIME_DIR_V6`.
+2. An absolute `NDI_RUNTIME_DIR_V6`. Relative values are recorded as refused
+   locations and never searched; the platform loader search still runs.
 3. The platform loader's search path (`rpath`, `LD_LIBRARY_PATH`, `PATH` and system directories).
 
 At each location it tries both edition names unless you [request one](#sdk-editions).
@@ -95,8 +96,15 @@ Availability does not establish hardware support or license entitlement.
 Discovery Server advertisers and listeners require NDI 6.4 or later. Other
 operations may depend on exported entry points, version, edition and build
 headers. Query the selected runtime instead of inferring support from a version
-matrix. The separate File library has its own `FileApi::status` and `supports`;
-the core reports `SeparateLibrary` even when it is installed. See the [File guide](file-io.md).
+matrix. The separate File library reports its families through `FileApi::status`
+and `supports`; operations refuse a missing family with `FileFamilyUnavailable`. See the [File guide](file-io.md).
+
+Selection failures are structured. `RuntimeLoadFailed(failure)` exposes each
+attempt's location, `LoadOrigin`, and `LoadRefusal`; `failure.loaded_any()`
+distinguishes libraries that could not be opened from ones loaded and refused.
+`RuntimeConflict { kind, detail }` carries a `SelectionConflict` for a selected
+library mismatch, edition mismatch, linked implementation or other conflict.
+Use these fields for decisions and `Display` for diagnostics.
 
 ## Deploy an application
 
@@ -169,7 +177,9 @@ targets (including musl, BSD and Windows GNU) are outside configured coverage.
 Set `NDI_SDK_DIR` to an NDI SDK for Apple. The build selects its Standard or
 Advanced archive and validates its CPU slice, platform and deployment floor.
 With `file-io`, it selects the File archive when available. `library_path` is
-rejected with `RuntimeConflict`; selection loads no dynamic library.
+rejected with `RuntimeConflict` when absolute. Relative paths return
+`InvalidInput` before selection on every target; selection loads no dynamic
+library.
 
 Use the SDK's required deployment target or later. The CI script sets iOS/tvOS
 16.0 and visionOS 1.0 for its 6.4 archives. Explicit `IPHONEOS_DEPLOYMENT_TARGET`,

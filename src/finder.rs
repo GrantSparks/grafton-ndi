@@ -15,6 +15,7 @@ use std::{
 };
 
 use crate::{
+    change_feed::ChangeFeed,
     frames::copy_sdk_string,
     sys::{self, bindings::*},
     timeout::Deadline,
@@ -154,6 +155,8 @@ impl FinderOptions {
 ///
 /// `Finder` provides methods to discover and monitor NDI sources. It maintains
 /// a background thread that continuously updates the list of available sources.
+/// Concurrent lookups share native change reports: every waiting lookup is
+/// notified when the source list changes, then takes its own owned snapshot.
 ///
 /// # Examples
 ///
@@ -178,6 +181,7 @@ pub struct Finder {
     instance: NDIlib_find_instance_t,
     // SDK snapshots and their strings expire on the next snapshot call.
     sources_lock: Mutex<()>,
+    changes: ChangeFeed,
     _groups: Option<CString>,    // Hold ownership of CStrings
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
     #[cfg(feature = "advanced")]
@@ -212,13 +216,7 @@ pub(crate) unsafe fn snapshot_entry(
     }
     Ok(Some(Source {
         name: name.unwrap_or_default(),
-        address: copied_address.map(|address| {
-            if address.contains("://") {
-                SourceAddress::Url(address)
-            } else {
-                SourceAddress::Ip(address)
-            }
-        }),
+        address: copied_address.map(SourceAddress::from_sdk_text),
     }))
 }
 
@@ -292,6 +290,7 @@ impl Finder {
         Ok(Self {
             instance,
             sources_lock: Mutex::new(()),
+            changes: ChangeFeed::default(),
             _groups: groups,
             _extra_ips: extra_ips,
             #[cfg(feature = "advanced")]
@@ -358,6 +357,9 @@ impl Finder {
     ///
     /// This method blocks until the list of discovered sources changes or the
     /// timeout expires. Use this to efficiently monitor for source changes.
+    /// Concurrent waiters all observe a reported change. A zero timeout while
+    /// another thread waits only reads reports that thread has already
+    /// published; otherwise it makes one nonblocking native query.
     ///
     /// # Arguments
     ///
@@ -388,19 +390,20 @@ impl Finder {
     /// # }
     /// ```
     pub fn wait_for_sources(&self, timeout: Duration) -> Result<bool> {
-        Ok(self.wait_for_sources_ms(to_ms_checked(timeout)?))
+        let deadline = Deadline::after(timeout)?;
+        Ok(self.wait_for_sources_since(self.changes.generation(), deadline))
     }
 
-    /// [`Self::wait_for_sources`] with a timeout already in the SDK's
-    /// milliseconds.
-    fn wait_for_sources_ms(&self, timeout_ms: u32) -> bool {
+    /// Share one native report with every observer of the earlier generation.
+    fn wait_for_sources_since(&self, generation: u64, deadline: Deadline) -> bool {
         // SAFETY: the finder instance is live for this borrow.
-        unsafe {
-            self._ndi
-                .api()
-                .core
-                .NDIlib_find_wait_for_sources(self.instance, timeout_ms)
-        }
+        self.changes
+            .wait_since(generation, deadline, |timeout_ms| unsafe {
+                self._ndi
+                    .api()
+                    .core
+                    .NDIlib_find_wait_for_sources(self.instance, timeout_ms)
+            })
     }
 
     /// Returns the current list of discovered sources (snapshot).
@@ -514,6 +517,7 @@ impl Finder {
         // first snapshot already satisfies `accept`.
         let deadline = Deadline::after(timeout)?;
         loop {
+            let generation = self.changes.generation();
             let Some(sources) = self.current_sources_until(deadline)? else {
                 return Ok(None);
             };
@@ -526,7 +530,7 @@ impl Finder {
             // Block until the source list changes or the window ends; either
             // way the next iteration re-snapshots. The wait is rounded up, so
             // the last one lasts until the deadline rather than polling.
-            self.wait_for_sources_ms(deadline.remaining_ms());
+            self.wait_for_sources_since(generation, deadline);
         }
     }
 
@@ -669,7 +673,8 @@ unsafe impl std::marker::Send for Finder {}
 /// instance and invalidates its returned buffers on the next call. `sources_lock`
 /// serializes those calls through the complete deep copy into owned `Source`s.
 /// Waiting for source changes does not invalidate those buffers; destruction
-/// requires exclusive access through `Drop`.
+/// requires exclusive access through `Drop`. `changes` serializes native
+/// waits and broadcasts each report to concurrent Rust observers.
 unsafe impl std::marker::Sync for Finder {}
 
 fn accumulate_sources(
@@ -721,20 +726,7 @@ fn accumulate_sources(
                 budget::MAX_BYTES,
             ));
         }
-        let name = budget::copy_string(&source.name)?;
-        let address = source
-            .address
-            .as_ref()
-            .map(|a| -> Result<SourceAddress> {
-                let (SourceAddress::Ip(text) | SourceAddress::Url(text)) = a;
-                let text = budget::copy_string(text)?;
-                Ok(match a {
-                    SourceAddress::Ip(_) => SourceAddress::Ip(text),
-                    SourceAddress::Url(_) => SourceAddress::Url(text),
-                })
-            })
-            .transpose()?;
-        seen.insert(Source { name, address });
+        seen.insert(source.try_copy()?);
         discovered.push(source);
         *retained_bytes = bytes;
     }
@@ -884,17 +876,27 @@ impl HostKeyBuffer {
 
 /// Network address of an NDI source.
 ///
-/// NDI sources can be addressed via URL (for NDI HX sources) or IP address
-/// (for standard NDI sources).
+/// The SDK supplies one address string. A string containing `://` is classified
+/// as a URL; other strings use the IP variant. This classification does not
+/// establish the source's codec or whether it uses NDI|HX.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SourceAddress {
-    /// URL address (typically for NDI HX sources).
+    /// A URL address. SDK address strings containing `://` use this variant.
     Url(String),
-    /// IP address (for standard NDI sources).
+    /// A host or IP address, optionally with a port. SDK strings without
+    /// `://` use this variant.
     Ip(String),
 }
 
 impl SourceAddress {
+    fn from_sdk_text(address: String) -> Self {
+        if address.contains("://") {
+            Self::Url(address)
+        } else {
+            Self::Ip(address)
+        }
+    }
+
     /// Check whether this address has the exact host or IP.
     ///
     /// Hostnames compare without ASCII case or a final DNS dot. Invalid bare-host
@@ -1002,7 +1004,28 @@ pub(crate) struct RawSource {
 // it, as moving a `CString` does.
 unsafe impl Send for RawSource {}
 
+// SAFETY: a shared descriptor exposes only immutable pointers into the C strings
+// this value owns. Their buffers stay allocated for the shared borrow and no SDK
+// operation writes through them, so concurrent readers cannot race with mutation.
+unsafe impl Sync for RawSource {}
+
 impl Source {
+    /// Copy strings with exact reservations while preserving address variants.
+    fn try_copy(&self) -> Result<Self> {
+        let name = budget::copy_string(&self.name)?;
+        let address = self
+            .address
+            .as_ref()
+            .map(|address| -> Result<SourceAddress> {
+                Ok(match address {
+                    SourceAddress::Ip(text) => SourceAddress::Ip(budget::copy_string(text)?),
+                    SourceAddress::Url(text) => SourceAddress::Url(budget::copy_string(text)?),
+                })
+            })
+            .transpose()?;
+        Ok(Self { name, address })
+    }
+
     /// The source named `name`, without an address.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -1155,22 +1178,15 @@ impl Source {
         } else {
             // SAFETY: the caller keeps the address readable through its terminator.
             let address = unsafe { copy_sdk_string(address, operation) }?;
-            Some(if address.contains("://") {
-                SourceAddress::Url(address)
-            } else {
-                SourceAddress::Ip(address)
-            })
+            Some(SourceAddress::from_sdk_text(address))
         };
 
         Ok(Source { name, address })
     }
 
-    /// Convert to raw format for FFI use
-    ///
-    /// # Safety
-    ///
-    /// The returned RawSource struct uses #[repr(C)] to guarantee C-compatible layout
-    /// for safe FFI interop with the NDI SDK.
+    /// Copy the source's strings into owned C strings and build the native
+    /// descriptor that points into them. RawSource keeps those allocations
+    /// alive for every SDK call that borrows its descriptor.
     pub(crate) fn to_raw(&self) -> Result<RawSource> {
         let name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
 
@@ -1250,6 +1266,8 @@ impl Display for Source {
 /// The cache is `Send + Sync`. Discovery runs outside its mutex so unrelated
 /// lookups and invalidation remain available; SDK snapshots retain their normal
 /// per-finder serialization. Returned vectors own copies of the descriptors.
+/// Concurrent discovery waits share change reports through that finder, so
+/// one lookup cannot consume another lookup's notification.
 /// Dropping the cache destroys its native finder and releases its runtime
 /// handle synchronously on the dropping thread.
 ///
@@ -1402,18 +1420,7 @@ fn copy_sources(sources: &[Source]) -> Result<Vec<Source>> {
     copy.try_reserve_exact(sources.len())
         .map_err(|_| budget::allocation_failed())?;
     for source in sources {
-        let name = budget::copy_string(&source.name)?;
-        let address = source
-            .address
-            .as_ref()
-            .map(|address| -> Result<SourceAddress> {
-                Ok(match address {
-                    SourceAddress::Ip(text) => SourceAddress::Ip(budget::copy_string(text)?),
-                    SourceAddress::Url(text) => SourceAddress::Url(budget::copy_string(text)?),
-                })
-            })
-            .transpose()?;
-        copy.push(Source { name, address });
+        copy.push(source.try_copy()?);
     }
     Ok(copy)
 }

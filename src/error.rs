@@ -1,10 +1,30 @@
 //! The crate's one error type.
 
+mod loading;
+pub use loading::{
+    LibraryKind, LoadAttempt, LoadFailure, LoadOrigin, LoadRefusal, SelectionConflict,
+};
+
 use thiserror::Error;
 
 use std::{ffi::NulError, fmt};
 
 use crate::capabilities::{CapabilityUnavailable, RuntimeFeature};
+
+/// Why an async blocking operation could not run.
+///
+/// Panics are resumed on the awaiting task rather than reported as spawn
+/// failures. This discriminator does not depend on diagnostic text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum SpawnFailure {
+    /// The Tokio operation was polled outside a Tokio runtime.
+    #[error("no Tokio runtime is entered")]
+    NoRuntime,
+    /// The runtime cancelled the blocking task, or its abandoned closure never started.
+    #[error("the blocking task was cancelled")]
+    TaskCancelled,
+}
 
 /// Every error this crate reports, from the core API, the `advanced` module
 /// and the File API alike.
@@ -20,6 +40,11 @@ use crate::capabilities::{CapabilityUnavailable, RuntimeFeature};
 pub enum Error {
     /// No usable NDI library could be selected.
     ///
+    /// [`LoadFailure`] records the library, attempted locations, their origins
+    /// and typed [`LoadRefusal`] causes. [`LoadFailure::loaded_any`] distinguishes
+    /// code that loaded and was refused from locations that could not be opened.
+    /// `Display` retains the diagnostic text for every attempt.
+    ///
     /// * Selecting the NDI runtime ([`Runtime::select`] and every constructor
     ///   that selects one): no usable runtime library was found. The message
     ///   names every location tried and why each was rejected: the file was
@@ -31,12 +56,12 @@ pub enum Error {
     ///
     /// Nothing is selected, so the call can be repeated, for example once the
     /// library is installed. A selected File library that lacks the entry
-    /// points of one family is reported as [`Error::UnsupportedCapability`]
+    /// points of one family is reported as `Error::FileFamilyUnavailable`
     /// instead, by every operation that needs that family.
     ///
     /// [`Runtime::select`]: crate::Runtime::select
     #[error("Failed to load an NDI library: {0}")]
-    RuntimeLoadFailed(String),
+    RuntimeLoadFailed(LoadFailure),
 
     /// An operation needs a capability this build or the selected runtime
     /// does not provide.
@@ -45,13 +70,9 @@ pub enum Error {
     /// [`Capabilities::status`] reports for it, so a caller can branch on
     /// either without reading text. Every operation that needs the capability
     /// is refused this way before anything reaches the SDK, and
-    /// [`Ndi::require_feature`] reports the same error in advance. A family
-    /// of the NDI File library (`RuntimeFeature::File`) is refused by the File
-    /// API operations that need it, when the selected File library does not
-    /// export one of its entry points, and `file::FileApi::status` reports its
-    /// status in advance. The condition lasts for the life of the process:
-    /// the runtime and the File library are each selected once, and a build
-    /// that lacks a declaration has to be rebuilt, with the `advanced` feature
+    /// [`Ndi::require_feature`] reports the same error in advance. The
+    /// condition lasts for the life of the process: the runtime is selected
+    /// once, and a build that lacks a declaration has to be rebuilt, with the `advanced` feature
     /// and with `NDI_SDK_DIR` naming an NDI Advanced SDK whose headers declare
     /// it.
     ///
@@ -67,9 +88,8 @@ pub enum Error {
         feature: RuntimeFeature,
         /// Why it is unavailable.
         reason: CapabilityUnavailable,
-        /// The evidence: the entry point the runtime, or for a File family
-        /// the File library, lacks (for [`SymbolUnavailable`] and
-        /// [`WrongEdition`]), the version the runtime reports
+        /// The evidence: the entry point the runtime lacks (for
+        /// [`SymbolUnavailable`] and [`WrongEdition`]), the version the runtime reports
         /// against the version required (for [`RuntimeTooOld`] and
         /// [`RuntimeVersionUnknown`]), or the declaration this build lacks (for
         /// [`BuildAbiUnavailable`]).
@@ -86,8 +106,23 @@ pub enum Error {
         detail: String,
     },
 
-    /// The request cannot be met by the implementation already selected for
-    /// this process, which cannot be replaced.
+    /// The selected File library does not export every entry point of a
+    /// family an operation needs. `FileApi::status` reports the same family
+    /// unavailable; its status cannot change after selection.
+    #[cfg(feature = "file-io")]
+    #[error("NDI capability {} is unavailable: the selected library does not export a required function: {detail}", .family.name())]
+    FileFamilyUnavailable {
+        /// The family the operation needs.
+        family: crate::file::FileFamily,
+        /// The first entry point of the family the library does not export.
+        detail: String,
+    },
+
+    /// Runtime or File library selection conflicts with the process's native
+    /// libraries or a selection already in progress.
+    ///
+    /// `kind` identifies the [`SelectionConflict`] without parsing `detail`;
+    /// the latter preserves the diagnostic text.
     ///
     /// * The runtime options name a library file other than the selected one,
     ///   ask for the Advanced SDK when the selected runtime is not one, or
@@ -100,8 +135,13 @@ pub enum Error {
     ///   macOS and Android it needs the Advanced SDK runtime, and it is
     ///   refused while the process's global symbol scope holds an NDI runtime
     ///   other than the selected one, which it would bind to.
-    #[error("Conflicting NDI runtime selection: {0}")]
-    RuntimeConflict(String),
+    #[error("Conflicting NDI runtime selection: {detail}")]
+    RuntimeConflict {
+        /// The typed cause of the conflict.
+        kind: SelectionConflict,
+        /// Diagnostic context, retained for display and logging.
+        detail: String,
+    },
 
     /// The native SDK did not perform an operation.
     ///
@@ -155,9 +195,10 @@ pub enum Error {
 
     /// Text the SDK delivered is not UTF-8.
     ///
-    /// Reported for the metadata of a captured frame, a received metadata
-    /// frame, and the strings a receiver returns, such as its source's
-    /// web-control URL. Text a peer advertises through a Discovery Server is
+    /// Reported for standalone received metadata frames and strings a receiver
+    /// returns, such as its source's web-control URL. Unreadable per-frame
+    /// video/audio metadata is withheld without discarding the media; inspect
+    /// [`crate::FrameMetadataStatus`] instead. Text a peer advertises through a Discovery Server is
     /// decoded lossily instead.
     #[error("Invalid UTF-8 string in data: {0}")]
     InvalidUtf8(String),
@@ -179,13 +220,16 @@ pub enum Error {
     ///
     /// * A frame the SDK delivered (video, audio, metadata or a compressed
     ///   packet) fails validation: its dimensions, format, strides, sizes or
-    ///   pointers are inconsistent, or its metadata has no terminator within
-    ///   the limit.
+    ///   pointers are inconsistent, or a standalone metadata frame has no
+    ///   terminator within the limit.
     /// * A frame, packet or buffer being built, converted or sent does not
     ///   match its format: a buffer is too small, a dimension, stride or rate
     ///   is out of range, or a format cannot be used for the operation. This
     ///   includes a compressed frame the SDK would discard instead of
     ///   delivering it.
+    ///
+    /// Unreadable optional video/audio metadata is withheld instead of failing
+    /// capture; [`crate::FrameMetadataStatus`] reports its condition.
     ///
     /// A value that describes no one frame, such as a compressed video format
     /// or an allocation, AV sync, clock or remote-control value of the
@@ -216,8 +260,10 @@ pub enum Error {
     /// which queue and limit.
     ///
     /// * `advanced::QueuedSender::try_submit`, when the frame would take the
-    ///   queue past its frame limit ([`QueueLimit::Frames`]) or its byte limit
-    ///   ([`QueueLimit::Bytes`]). The frame comes back in the `Rejected`;
+    ///   queue past its frame limit ([`QueueLimit::Frames`]) or the retained
+    ///   frames leave insufficient byte capacity ([`QueueLimit::Bytes`]). A
+    ///   frame exceeding the entire byte limit gets [`Error::InvalidInput`].
+    ///   The frame comes back in the `Rejected`;
     ///   collect completed frames and submit it again.
     /// * An operation of an async File handle, when the handle's command
     ///   queue is full ([`QueueLimit::FileCommands`]). A request to stop is
@@ -297,29 +343,32 @@ pub enum Error {
         advertised: bool,
     },
 
-    /// An async blocking operation could not run or finish normally.
+    /// An async blocking operation could not run.
     ///
-    /// Covers a missing Tokio runtime context, task cancellation or join failure,
-    /// and a panic caught while executing a blocking operation. Dropping a future
-    /// discards its result; cancellation does not deliver an error to that caller.
+    /// [`SpawnFailure`] distinguishes a missing Tokio runtime context from a
+    /// cancelled blocking task. A panic in the operation or its callback is
+    /// resumed on the awaiting task with its original payload, after SDK frame
+    /// guards are released on the worker. Dropping the future discards its
+    /// result and any panic payload; it does not deliver an error to that caller.
     ///
     /// # Example
     ///
     /// ```
-    /// use grafton_ndi::Error;
-    ///
-    /// fn handle_error(err: Error) {
-    ///     match err {
-    ///         Error::SpawnFailed(reason) => {
-    ///             eprintln!("Async spawn failed: {}", reason);
-    ///             // Could retry or gracefully shutdown
+    /// use grafton_ndi::{Error, SpawnFailure};
+    /// fn handle_error(error: Error) {
+    ///     match error {
+    ///         Error::SpawnFailed(SpawnFailure::NoRuntime) => {
+    ///             eprintln!("Await this operation inside a Tokio runtime");
     ///         }
-    ///         e => eprintln!("Other error: {}", e),
+    ///         Error::SpawnFailed(SpawnFailure::TaskCancelled) => {
+    ///             eprintln!("The runtime cancelled the blocking task");
+    ///         }
+    ///         error => eprintln!("{error}"),
     ///     }
     /// }
     /// ```
-    #[error("Failed to spawn blocking task: {0}")]
-    SpawnFailed(String),
+    #[error("Could not run blocking task: {0}")]
+    SpawnFailed(SpawnFailure),
 
     /// A File API operation is not permitted in the current state of its
     /// recorder or async handle.
@@ -347,6 +396,13 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
+
+// The existing largest payload is NulError. Selection diagnostics must not
+// enlarge the error returned by hot capture/send paths (40 bytes on x86-64).
+const _: () = assert!(
+    std::mem::size_of::<Error>()
+        <= std::mem::size_of::<NulError>() + std::mem::align_of::<NulError>()
+);
 
 /// The resource budget exhausted by a discovery operation.
 ///
@@ -396,8 +452,9 @@ pub enum QueueLimit {
     /// An Advanced `QueuedSender` already holds as many frames as its
     /// `QueueOptions::max_frames` allows.
     Frames,
-    /// The frame would take an Advanced `QueuedSender` past its
-    /// `QueueOptions::max_bytes`.
+    /// The frames an Advanced `QueuedSender` retains leave too little room
+    /// within `QueueOptions::max_bytes` for this frame. The frame itself fits
+    /// the limit, so collecting completions makes room.
     Bytes,
     /// An async File handle already has as many commands waiting as its
     /// `AsyncFileOptions::command_capacity` allows, and, for a request to
@@ -438,8 +495,6 @@ impl fmt::Display for Unavailability<'_> {
             CapabilityUnavailable::SymbolUnavailable
             | CapabilityUnavailable::RuntimeTooOld
             | CapabilityUnavailable::RuntimeVersionUnknown => write!(f, "{reason}: {detail}"),
-            #[cfg(feature = "file-io")]
-            CapabilityUnavailable::SeparateLibrary => write!(f, "{reason}: {detail}"),
         }
     }
 }
@@ -467,6 +522,16 @@ mod tests {
         .to_string()
     }
 
+    #[cfg(feature = "file-io")]
+    #[test]
+    fn file_family_errors_name_the_family_and_missing_entry_point() {
+        let error = Error::FileFamilyUnavailable {
+            family: crate::file::FileFamily::Recording,
+            detail: "NDIlib_file_recorder_rollover".into(),
+        };
+        assert_eq!(error.to_string(), "NDI capability file recording is unavailable: the selected library does not export a required function: NDIlib_file_recorder_rollover");
+    }
+
     #[test]
     fn capability_errors_name_their_evidence_and_never_end_in_empty_punctuation() {
         use CapabilityUnavailable::*;
@@ -477,8 +542,6 @@ mod tests {
             SymbolUnavailable,
             BuildAbiUnavailable,
             WrongEdition,
-            #[cfg(feature = "file-io")]
-            SeparateLibrary,
         ] {
             assert_eq!(unsupported(reason, ""), format!("{prefix}{reason}"));
         }

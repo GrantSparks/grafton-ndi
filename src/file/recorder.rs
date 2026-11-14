@@ -206,7 +206,8 @@ impl RecordingReport {
 
 /// The outcome of waiting for a session to end.
 ///
-/// The recorder stays usable whatever the outcome.
+/// A synchronous recorder stays usable whatever the outcome. An async
+/// recorder can be closed by another clone while the wait is running.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum FinishStatus {
@@ -216,6 +217,8 @@ pub enum FinishStatus {
     /// recording ran until it was asked to stop or the SDK ended it sooner.
     Closed(RecordingReport),
     /// The wait ended first. Call [`FileRecorder::wait_finished`] to keep waiting.
+    /// An async wait interrupted by a close reports [`StateError::Closed`]
+    /// instead when closure cannot be established in its remaining budget.
     TimedOut(RecordingReport),
     /// The session ended, but its events do not show that every file was
     /// finalized. Waiting longer will not change this.
@@ -420,6 +423,10 @@ impl Ledger {
     /// outcome is final: confirmed when every opened file was closed, and
     /// indeterminate otherwise. A stop that is still being carried out leaves
     /// a file open, and the session keeps waiting for its closure.
+    /// Finality here relies on rollovers reporting the next file open before
+    /// the previous file closes: an empty ledger then cannot hide a pending
+    /// open. The SDK headers do not specify the order; the native test
+    /// `rollovers_open_the_next_file_before_closing_the_previous_file` pins it.
     fn drained(&mut self, native_recording: bool) {
         if native_recording || !self.session_open() {
             return;
@@ -508,6 +515,8 @@ pub struct FileRecorder {
     /// refuses to start another.
     native_stop_owed: bool,
     drop_wait: Duration,
+    /// An async shutdown's existing budget, shared with a running finish.
+    drop_deadline: Option<Deadline>,
     // Keeps the NDI runtime initialized.
     _api: FileApi,
     // Neither the NDI File Format API documentation nor
@@ -557,6 +566,7 @@ impl FileRecorder {
             records_media: options.tracks.contains(MediaTypes::VIDEO)
                 || options.tracks.contains(MediaTypes::AUDIO),
             drop_wait: options.drop_wait,
+            drop_deadline: None,
             accepted_source: Some(options.source.clone()),
             naming: resolved.naming,
             ledger: Ledger::idle(),
@@ -595,6 +605,9 @@ impl FileRecorder {
     ///
     /// The target is only read, so it stays with the caller whatever the
     /// outcome, for example to start again once a missing directory exists.
+    /// [`RecordingTimecode::GenerateFrom`] takes a validated
+    /// [`SessionTimecode`](super::SessionTimecode), so the native start always
+    /// receives an explicit timecode rather than the send synthesize sentinel.
     ///
     /// # Errors
     ///
@@ -607,10 +620,12 @@ impl FileRecorder {
     ///   does not exist or cannot be written to, or, with an exact file name,
     ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
     ///   that file exists. The SDK is not called.
-    /// * [`Error::NativeOperationFailed`] when the SDK cannot start the source or open
-    ///   the first file. It queues an open-failed event that says why, which
-    ///   [`poll_event`](Self::poll_event) returns; the event is counted in no
-    ///   session's report.
+    /// * [`Error::NativeOperationFailed`] when the SDK cannot start the source
+    ///   or open the first file. `Processing.NDI.Lib.File.Recorder.h` specifies
+    ///   an open-failed event for an output-file open failure; source-start
+    ///   failure need not queue one. [`poll_event`](Self::poll_event) can return
+    ///   that event, counted in no session's report. Retrying `start` discards
+    ///   queued events before asking the SDK to start again.
     pub fn start(&mut self, target: &RecordingTarget, timecode: RecordingTimecode) -> Result<u64> {
         if self.ledger.session_open() {
             return Err(Error::InvalidState(StateError::PreviousSessionOpen));
@@ -719,6 +734,9 @@ impl FileRecorder {
         let event = self.capture(wait_ms);
         self.ledger.dropped(self.dropped_event_count());
         let Some(event) = event.inspect_err(|_| self.ledger.uncertain = true)? else {
+            // This empty-capture/recording check relies on open-before-close
+            // rollover events, pinned by the native File test
+            // `rollovers_open_the_next_file_before_closing_the_previous_file`.
             self.ledger.drained(self.is_recording());
             if !self.ledger.session_open() {
                 // The session is over. When the SDK ended it itself, this is
@@ -830,6 +848,18 @@ impl FileRecorder {
     pub(super) fn wait_finished_from(
         &mut self,
         deadline: Deadline,
+        each: impl FnMut(Result<Option<RecorderEvent>>) -> bool,
+    ) -> Result<FinishStatus> {
+        self.wait_finished_with(deadline, |_, deadline| deadline, each)
+    }
+
+    /// The same wait, with a budget the async shutdown path can narrow before
+    /// each poll. Cancellation stays separate from shutdown and ends the wait
+    /// after the current poll, whose event is still delivered by `each`.
+    pub(super) fn wait_finished_with(
+        &mut self,
+        mut deadline: Deadline,
+        mut budget: impl FnMut(&mut Self, Deadline) -> Deadline,
         mut each: impl FnMut(Result<Option<RecorderEvent>>) -> bool,
     ) -> Result<FinishStatus> {
         if matches!(self.state(), RecorderState::Idle | RecorderState::Recording) {
@@ -838,6 +868,7 @@ impl FileRecorder {
         let mut interrupted = false;
         let mut late_polls = 0;
         loop {
+            deadline = budget(self, deadline);
             match self.state() {
                 RecorderState::Closed => return Ok(FinishStatus::Closed(self.report())),
                 RecorderState::Indeterminate => {
@@ -880,6 +911,31 @@ impl FileRecorder {
                 });
             }
         }
+    }
+
+    /// Reuse the close's deadline for both an active finish and destruction.
+    pub(super) fn limit_shutdown_wait(
+        &mut self,
+        deadline: Deadline,
+        requested: Instant,
+    ) -> Deadline {
+        let deadline = deadline.within_at(requested, self.drop_wait);
+        self.drop_deadline = Some(deadline);
+        deadline
+    }
+
+    pub(super) fn bound_shutdown_wait(&mut self, requested: Instant) {
+        if self.drop_deadline.is_none() {
+            self.drop_deadline = Deadline::starting(requested, self.drop_wait).ok();
+            if self.drop_deadline.is_none() {
+                // An unrepresentable deadline cannot provide a bounded wait.
+                self.drop_wait = Duration::ZERO;
+            }
+        }
+    }
+
+    pub(super) fn shutdown_wait_spent(&mut self) {
+        self.drop_wait = Duration::ZERO;
     }
 
     /// Stop and destroy the recorder at once, without waiting for the SDK to
@@ -1142,7 +1198,11 @@ impl Drop for FileRecorder {
                 // cannot fail: the session is stopping and `drop_wait` was
                 // checked when the recorder was created, and a malformed
                 // event does not end it.
-                let _ = self.wait_finished(self.drop_wait);
+                if let Some(deadline) = self.drop_deadline {
+                    let _ = self.wait_finished_from(deadline, |_| false);
+                } else {
+                    let _ = self.wait_finished(self.drop_wait);
+                }
             }
         }
         // SAFETY: the recorder is live and is destroyed exactly once, on the
@@ -1213,8 +1273,11 @@ mod tests {
 
     #[test]
     fn a_rollover_reports_the_next_file_open_before_the_previous_one_closed() {
-        // The order the SDK emits: the new file's rollover, then the old
-        // file's close.
+        // Finality in `drained` and `poll_event_ms` relies on this observed
+        // SDK order. The native File test
+        // `rollovers_open_the_next_file_before_closing_the_previous_file`
+        // pins it for explicit, source-switch and size rollovers, with and
+        // without proxy recording.
         let mut ledger = session();
         ledger.observe(Started, path("first.mkv"));
         ledger.observe(Rollover, path("second.mkv"));

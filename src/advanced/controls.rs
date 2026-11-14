@@ -265,6 +265,15 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// Returns whether a change was signalled; call
     /// [`keyframe_required`](Self::keyframe_required) for the new state.
+    /// Concurrent waiters share one native update report. A format-specific
+    /// waiter reports the update when the shared sample observes demand for
+    /// that stream; otherwise it keeps waiting within the same timeout. Demand is sampled
+    /// once per active stream selector before any observer is woken, so a send
+    /// made by the first observer cannot erase another observer's report.
+    /// These are coalesced invalidations, not a per-stream event history:
+    /// pending demand can be reported again, or a concurrent send can clear it
+    /// before the shared sample. A zero timeout beside another native waiter
+    /// only reads reports that waiter has already published.
     ///
     /// # Errors
     ///
@@ -279,14 +288,26 @@ impl<M: SenderMode> Sender<M> {
     ) -> Result<bool> {
         let table = self.runtime().table::<KeyframeDemand>()?;
         native!(KeyframeDemand, table => {
-            let timeout = crate::to_ms_checked(_timeout)?;
-            let format = _format.map(VideoPacketFormat::raw);
-            // SAFETY: the sender instance is live for this borrow.
-            Ok(unsafe {
-                table.NDIlib_send_wait_for_keyframe_request(
-                    self.native_instance(), timeout, stream(format.as_ref()),
-                )
-            })
+            let deadline = crate::timeout::Deadline::after(_timeout)?;
+            Ok(self.keyframe_changes().wait(
+                _format,
+                deadline,
+                |timeout| {
+                    // SAFETY: the sender lives for the wait. A null selector
+                    // observes all updates without competing native selectors.
+                    unsafe { table.NDIlib_send_wait_for_keyframe_request(
+                        self.native_instance(), timeout, std::ptr::null(),
+                    ) }
+                },
+                |format| {
+                    let format = format.raw();
+                    // SAFETY: this non-consuming query reads only the live
+                    // sender and the descriptor, which lasts through the call.
+                    unsafe { table.NDIlib_send_is_keyframe_required(
+                        self.native_instance(), &format,
+                    ) }
+                },
+            ))
         })
     }
 }

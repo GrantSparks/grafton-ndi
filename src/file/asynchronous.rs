@@ -5,6 +5,9 @@
 //! need no player, share one thread for the whole process. The deadlines of
 //! event futures are kept by one timer thread for the whole process, so that a
 //! command that blocks its owner thread cannot make a wait overrun.
+//! Executor callbacks on these File threads may drop handles. Such a last-handle
+//! drop requests shutdown without joining another File thread, so notifications
+//! cannot stall behind cleanup or deadlock one another.
 
 use super::types::resolve_path;
 use super::{
@@ -15,6 +18,7 @@ use super::{
 };
 use crate::{timeout::Deadline, Error, MetadataSource, QueueLimit, Result, Source, Timecode};
 use std::{
+    cell::Cell,
     collections::{BTreeMap, VecDeque},
     future::Future,
     panic::{catch_unwind, AssertUnwindSafe},
@@ -38,6 +42,23 @@ const MAX_CAPACITY: usize = 4096;
 
 /// How many probes may wait for the thread that runs them.
 const PROBE_CAPACITY: usize = 64;
+
+thread_local! {
+    /// Joining an owner here can stall the shared timer/probe worker, or form
+    /// a cycle with another owner whose executor callbacks release handles.
+    #[cfg_attr(
+        target_os = "android",
+        allow(
+            clippy::missing_const_for_thread_local,
+            reason = "Clippy 1.100 re-lints the Android OS-backed TLS expansion despite this const initializer"
+        )
+    )]
+    static FILE_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+fn mark_file_thread() {
+    FILE_THREAD.set(true);
+}
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(PoisonError::into_inner)
@@ -121,10 +142,78 @@ impl AsyncFileOptions {
     }
 }
 
+/// Executor state kept under a response or event queue's lock. Registration
+/// clones outside that lock and rechecks readiness after the clone, which can
+/// itself reenter File handles. Retired state is always handled after unlocking.
+#[derive(Default)]
+struct WakerSlot(Option<Waker>);
+
+enum WakerPoll<'a, T> {
+    Ready(T, Option<Waker>),
+    /// `None` defers creating an event waiter until its incoming waker has
+    /// been cloned. Its token/deadline reservation belongs to the queue.
+    Pending(Option<&'a mut WakerSlot>),
+}
+
+impl WakerSlot {
+    /// `check` runs under the state lock. It observes readiness before lending
+    /// the slot, and may install an empty slot only when `register` is true.
+    /// No caller has to reproduce the unlock/clone/recheck protocol.
+    fn poll<S, T>(
+        state: &Mutex<S>,
+        waker: &Waker,
+        mut check: impl for<'a> FnMut(&'a mut S, bool) -> WakerPoll<'a, T>,
+    ) -> Option<T> {
+        let mut incoming = None;
+        let (ready, retired) = loop {
+            let mut state = lock(state);
+            match check(&mut state, incoming.is_some()) {
+                WakerPoll::Ready(value, retired) => break (Some(value), retired),
+                WakerPoll::Pending(slot) => {
+                    if let Some(slot) = slot {
+                        if slot
+                            .0
+                            .as_ref()
+                            .is_some_and(|stored| stored.will_wake(waker))
+                        {
+                            break (None, None);
+                        }
+                        if let Some(waker) = incoming.take() {
+                            break (None, slot.0.replace(waker));
+                        }
+                    }
+                }
+            }
+            drop(state);
+            incoming = Some(waker.clone());
+        };
+        Self::discard(retired);
+        Self::discard(incoming);
+        ready
+    }
+
+    fn take(&mut self) -> Option<Waker> {
+        self.0.take()
+    }
+
+    /// Notify after committing state and releasing internal locks. An
+    /// executor panic must not stop an owner or skip other shutdown replies.
+    fn wake(waker: Option<Waker>) {
+        if let Some(waker) = waker {
+            let _ = catch_unwind(AssertUnwindSafe(|| waker.wake()));
+        }
+    }
+
+    /// Release executor state outside internal locks, including on unwind.
+    fn discard(waker: Option<Waker>) {
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(waker)));
+    }
+}
+
 struct Response<T> {
     value: Option<Result<T>>,
     completed: bool,
-    waker: Option<Waker>,
+    waker: WakerSlot,
 }
 
 /// The result of a command sent to a player's or recorder's thread.
@@ -167,6 +256,8 @@ struct Response<T> {
 /// instead. Once the thread has failed, the operation it was running, every
 /// operation queued behind it and every later one report
 /// [`StateError::OwnerFailed`], never [`StateError::Closed`].
+/// A finish or wait already running can also report `Closed` when a concurrent
+/// close ends its finalization budget without a settled session outcome.
 ///
 /// # Panics
 ///
@@ -197,30 +288,13 @@ impl<T> Future for FileOperation<T> {
         let this = self.get_mut();
         assert!(!this.consumed, "a completed FileOperation was polled again");
         this.start();
-        let mut incoming = None;
-        let (value, retired) = loop {
-            let mut response = lock(&this.response);
+        let value = WakerSlot::poll(&this.response, cx.waker(), |response, _| {
             if let Some(value) = response.value.take() {
-                break (Some(value), response.waker.take());
+                WakerPoll::Ready(value, response.waker.take())
+            } else {
+                WakerPoll::Pending(Some(&mut response.waker))
             }
-            if response
-                .waker
-                .as_ref()
-                .is_some_and(|waker| waker.will_wake(cx.waker()))
-            {
-                break (None, None);
-            }
-            if let Some(waker) = incoming.take() {
-                break (None, response.waker.replace(waker));
-            }
-            // Cloning and dropping a Waker both run executor code. Recheck
-            // readiness after cloning outside the lock, so a concurrent reply
-            // cannot be missed. Ready/same-waker polls need no clone.
-            drop(response);
-            incoming = Some(cx.waker().clone());
-        };
-        discard_waker(retired);
-        discard_waker(incoming);
+        });
         if let Some(value) = value {
             this.consumed = true;
             Poll::Ready(value)
@@ -237,7 +311,7 @@ impl<T> Drop for FileOperation<T> {
         // pruned under Control::closing. Remove executor state before releasing
         // our response ownership, and run its destructor without either lock.
         let waker = lock(&self.response).waker.take();
-        discard_waker(waker);
+        WakerSlot::discard(waker);
     }
 }
 
@@ -255,7 +329,7 @@ fn operation<T>() -> (Reply<T>, FileOperation<T>) {
     let response = Arc::new(Mutex::new(Response {
         value: None,
         completed: false,
-        waker: None,
+        waker: WakerSlot::default(),
     }));
     let cancelled = Arc::new(AtomicBool::new(false));
     (
@@ -274,20 +348,6 @@ fn operation<T>() -> (Reply<T>, FileOperation<T>) {
     )
 }
 
-/// Notify a consumer after committing state and releasing internal locks.
-/// A waker runs executor code: its panic must not stop a native owner, skip
-/// other replies during shutdown, or escape a reply's destructor on unwind.
-fn wake_waiter(waker: Option<Waker>) {
-    if let Some(waker) = waker {
-        let _ = catch_unwind(AssertUnwindSafe(|| waker.wake()));
-    }
-}
-
-/// Release executor state outside internal locks, including during unwinding.
-fn discard_waker(waker: Option<Waker>) {
-    let _ = catch_unwind(AssertUnwindSafe(|| drop(waker)));
-}
-
 fn deliver<T>(response: &Mutex<Response<T>>, value: Result<T>, replace: bool) {
     let wake = {
         let mut response = lock(response);
@@ -298,7 +358,7 @@ fn deliver<T>(response: &Mutex<Response<T>>, value: Result<T>, replace: bool) {
         response.completed = true;
         response.waker.take()
     };
-    wake_waiter(wake);
+    WakerSlot::wake(wake);
 }
 
 /// The error for an operation that did not run because its owner thread is
@@ -334,7 +394,7 @@ impl<T> FileOperation<T> {
             response: Arc::new(Mutex::new(Response {
                 value: None,
                 completed: false,
-                waker: None,
+                waker: WakerSlot::default(),
             })),
             cancelled: Arc::new(AtomicBool::new(false)),
             consumed: false,
@@ -481,6 +541,7 @@ impl DeadlineTimer {
 
     /// The timer thread: end each registered wait once its deadline passes.
     fn run(&self) {
+        mark_file_thread();
         let mut state = lock(&self.state);
         loop {
             let now = Instant::now();
@@ -528,7 +589,7 @@ struct EventWaiter {
     deadline: Instant,
     // Taken on notification, then rearmed by polling. The token still reserves
     // the one waiter while its task is scheduled; bursts need only one wake.
-    waker: Option<Waker>,
+    waker: WakerSlot,
 }
 
 struct Events<E> {
@@ -565,7 +626,7 @@ impl<E> EventQueue<E> {
             events.queue.push_back(value);
             events.waiter.as_mut().and_then(|w| w.waker.take())
         };
-        wake_waiter(wake);
+        WakerSlot::wake(wake);
     }
 
     /// End every wait: nothing more will be pushed. Idempotent. `failed`
@@ -576,9 +637,9 @@ impl<E> EventQueue<E> {
             let mut events = lock(&self.0);
             events.closed = true;
             events.failed |= failed;
-            events.waiter.take().and_then(|w| w.waker)
+            events.waiter.take().and_then(|mut w| w.waker.take())
         };
-        wake_waiter(wake);
+        WakerSlot::wake(wake);
     }
 }
 
@@ -609,7 +670,7 @@ impl<E: Send> Expire for EventQueue<E> {
                 .filter(|w| w.token.ptr_eq(token) && w.deadline <= now)
                 .and_then(|w| w.waker.take())
         };
-        wake_waiter(wake);
+        WakerSlot::wake(wake);
     }
 }
 
@@ -626,6 +687,8 @@ impl<E: Send> Expire for EventQueue<E> {
 /// thread failed; that happens as soon as the handle's thread stops taking
 /// events, before the native object is destroyed. Dropping the
 /// future does not stop events from being pumped.
+/// Executor callbacks run on File threads; a handle's last clone dropped
+/// there requests shutdown without waiting for native cleanup.
 ///
 /// # Errors
 ///
@@ -673,7 +736,7 @@ impl<E> FileEventFuture<E> {
             .as_ref()
             .is_some_and(|w| w.token.ptr_eq(&token))
         {
-            events.waiter.take().and_then(|w| w.waker)
+            events.waiter.take().and_then(|mut w| w.waker.take())
         } else {
             None
         }
@@ -699,18 +762,13 @@ impl<E> Future for FileEventFuture<E> {
             },
         };
         let token = Arc::downgrade(&this.token);
-        let mut incoming = None;
-        let (ready, retired) = loop {
-            let mut events = lock(&this.events.0);
+        let ready = WakerSlot::poll(&this.events.0, cx.waker(), |events, register| {
             if events
                 .waiter
                 .as_ref()
                 .is_some_and(|w| w.token.strong_count() != 0 && !w.token.ptr_eq(&token))
             {
-                break (
-                    Some(Err(Error::InvalidState(StateError::WaiterPending))),
-                    None,
-                );
+                return WakerPoll::Ready(Err(Error::InvalidState(StateError::WaiterPending)), None);
             }
             let ready = if let Some(event) = events.queue.pop_front() {
                 Some(event.map(Some))
@@ -721,32 +779,23 @@ impl<E> Future for FileEventFuture<E> {
             } else {
                 None
             };
-            if ready.is_some() {
-                break (ready, events.waiter.take().and_then(|w| w.waker));
+            if let Some(value) = ready {
+                return WakerPoll::Ready(
+                    value,
+                    events.waiter.take().and_then(|mut w| w.waker.take()),
+                );
             }
-            if events
-                .waiter
-                .as_ref()
-                .and_then(|w| w.waker.as_ref())
-                .is_some_and(|waker| waker.will_wake(cx.waker()))
-            {
-                break (None, None);
-            }
-            if let Some(waker) = incoming.take() {
-                let retired = events.waiter.replace(EventWaiter {
+            if register {
+                let waiter = events.waiter.get_or_insert_with(|| EventWaiter {
                     token: Weak::clone(&token),
                     deadline: deadline.end(),
-                    waker: Some(waker),
+                    waker: WakerSlot::default(),
                 });
-                break (None, retired.and_then(|w| w.waker));
+                waiter.token = Weak::clone(&token);
+                waiter.deadline = deadline.end();
             }
-            // The clone may reenter the queue or race delivery, closure or a
-            // competing waiter. Recheck all of those before registering it.
-            drop(events);
-            incoming = Some(cx.waker().clone());
-        };
-        discard_waker(retired);
-        discard_waker(incoming);
+            WakerPoll::Pending(events.waiter.as_mut().map(|waiter| &mut waiter.waker))
+        });
         if let Some(value) = ready {
             return this.complete(value);
         }
@@ -757,7 +806,7 @@ impl<E> Future for FileEventFuture<E> {
             match TIMER.register(deadline.end(), Weak::clone(&this.expiry), token) {
                 Ok(key) => this.timer = Some(key),
                 Err(error) => {
-                    discard_waker(this.release_waiter());
+                    WakerSlot::discard(this.release_waiter());
                     return this.complete(Err(Error::Io(error)));
                 }
             }
@@ -772,7 +821,7 @@ impl<E> Drop for FileEventFuture<E> {
         if let Some(key) = self.timer.take() {
             TIMER.cancel(key);
         }
-        discard_waker(waker);
+        WakerSlot::discard(waker);
     }
 }
 
@@ -787,6 +836,8 @@ struct Closing {
 
 struct Control {
     shutdown: AtomicBool,
+    /// The first close or last-handle drop starts the one finalization budget.
+    shutdown_at: Mutex<Option<Instant>>,
     /// The owner thread has failed. Set before the thread's command queue is
     /// dropped, so a command left in it can tell.
     failed: AtomicBool,
@@ -797,6 +848,7 @@ impl Control {
     fn new() -> Self {
         Self {
             shutdown: AtomicBool::new(false),
+            shutdown_at: Mutex::new(None),
             failed: AtomicBool::new(false),
             closing: Mutex::new(Closing {
                 complete: false,
@@ -831,8 +883,26 @@ impl Control {
                 .retain(|reply| !reply.cancelled.load(Ordering::Acquire));
             closing.replies.push(reply);
         }
-        self.shutdown.store(true, Ordering::Release);
+        self.request_shutdown();
         future
+    }
+
+    /// Record the first shutdown request before publishing it. Return whether
+    /// shutdown had already been requested, as last-handle drops need to know.
+    fn request_shutdown(&self) -> bool {
+        let mut at = lock(&self.shutdown_at);
+        let requested = at.is_some();
+        at.get_or_insert_with(Instant::now);
+        self.shutdown.store(true, Ordering::Release);
+        requested
+    }
+
+    fn shutdown_requested_at(&self) -> Option<Instant> {
+        if self.shutdown.load(Ordering::Acquire) {
+            *lock(&self.shutdown_at)
+        } else {
+            None
+        }
     }
 
     fn failed(&self) -> bool {
@@ -865,6 +935,7 @@ struct OperationContext {
 }
 
 impl OperationContext {
+    #[cfg(test)]
     fn interrupted(&self) -> bool {
         self.cancelled.load(Ordering::Acquire) || self.control.shutdown.load(Ordering::Acquire)
     }
@@ -877,6 +948,9 @@ trait Owner: 'static {
 
     /// Take the next native event without waiting.
     fn poll_native(&mut self) -> Result<Option<Self::Event>>;
+
+    /// Bound destruction-time cleanup by the original shutdown request.
+    fn shutdown(&mut self, _requested: Instant) {}
 }
 
 impl Owner for FilePlayer {
@@ -890,6 +964,10 @@ impl Owner for FileRecorder {
     type Event = RecorderEvent;
     fn poll_native(&mut self) -> Result<Option<Self::Event>> {
         self.poll_event(Duration::ZERO)
+    }
+
+    fn shutdown(&mut self, requested: Instant) {
+        self.bound_shutdown_wait(requested);
     }
 }
 
@@ -986,13 +1064,14 @@ impl<H: Owner> Drop for Worker<H> {
         // nothing else, so it waits here: when it returns, the owner thread
         // has destroyed the native object, and a recorder has had its file
         // finalized first.
-        let closing = self.control.shutdown.swap(true, Ordering::AcqRel);
+        let closing = self.control.request_shutdown();
         let Some(thread) = lock(&self.thread).take() else {
             return;
         };
-        // The owner thread drops the last handle itself when the caller gave
-        // up on a command that carried it; it cannot wait for itself.
-        if !closing && thread.thread().id() != thread::current().id() {
+        // A File thread may release this last handle through an executor's
+        // waker callback. It must not stall the timer/probe thread or join
+        // an owner that could join it back while releasing another handle.
+        if !closing && !FILE_THREAD.get() {
             // A panic on the owner thread was already reported to its commands.
             let _ = thread.join();
         }
@@ -1128,6 +1207,7 @@ fn spawn_owner_now<H: Owner, T: Send + 'static>(
     let thread_control = Arc::clone(&control);
     let thread_events = Arc::clone(&events);
     let spawned = thread::Builder::new().name(name.into()).spawn(move || {
+        mark_file_thread();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             if ready.cancelled.load(Ordering::Acquire) {
                 return;
@@ -1141,6 +1221,9 @@ fn spawn_owner_now<H: Owner, T: Send + 'static>(
             };
             ready.complete(Ok(wrap(thread_worker)));
             run_owner(&mut owner, &receiver, &thread_control, &thread_events);
+            if let Some(requested) = thread_control.shutdown_requested_at() {
+                owner.shutdown(requested);
+            }
             // No event is pumped from here on, so waits for one end now
             // rather than after the destruction below, which for a recorder
             // can take its whole drop wait.
@@ -1292,6 +1375,7 @@ impl ProbeQueue {
                 thread::Builder::new()
                     .name("ndi-file-probe".into())
                     .spawn(move || {
+                        mark_file_thread();
                         for job in jobs {
                             // A probe that panics fails alone: its reply,
                             // dropped while unwinding, reports a failed owner.
@@ -1326,6 +1410,9 @@ impl ProbeQueue {
 /// returns, the source is gone. A caller that must not block, such as a task
 /// on an async executor, awaits [`close`](Self::close) instead, which does the
 /// same without blocking; dropping the clones afterwards does not block.
+/// A last-clone drop performed by an executor callback on a File owner, timer
+/// or probe thread requests shutdown without waiting, so those threads can
+/// keep delivering notifications. Await `close` to observe cleanup completing.
 #[derive(Clone)]
 pub struct AsyncFilePlayer {
     worker: Arc<Worker<FilePlayer>>,
@@ -1515,6 +1602,9 @@ impl AsyncFilePlayer {
 /// be reported. A caller that must not block, such as a task on an async
 /// executor, awaits [`close`](Self::close) instead, which does the same
 /// without blocking; dropping the clones afterwards does not block.
+/// A last-clone drop performed by an executor callback on a File owner, timer
+/// or probe thread requests shutdown without waiting for finalization or
+/// destruction. Await `close` to observe cleanup completing.
 #[derive(Clone)]
 pub struct AsyncFileRecorder {
     worker: Arc<Worker<FileRecorder>>,
@@ -1546,7 +1636,8 @@ impl AsyncFileRecorder {
             |worker| Self { worker },
         )
     }
-    /// Start a session; see [`FileRecorder::start`].
+    /// Start a session; see [`FileRecorder::start`]. Generated starts carry a
+    /// [`SessionTimecode`](super::SessionTimecode), validated before queuing.
     pub fn start(
         &self,
         target: &RecordingTarget,
@@ -1568,6 +1659,12 @@ impl AsyncFileRecorder {
     /// the wait but not the stop: the recorder keeps stopping and its events
     /// keep being pumped, and
     /// [`wait_finished`](Self::wait_finished) can pick the wait up again.
+    /// If another clone closes the recorder during the wait, the remaining
+    /// budget is narrowed to [`RecorderOptions::drop_wait`] from that close's
+    /// submission, or this wait's deadline if earlier. Closure established in
+    /// that time is reported normally; an unsettled session reports
+    /// [`StateError::Closed`] instead of [`FinishStatus::TimedOut`], because
+    /// the recorder is being destroyed and cannot be waited on again.
     ///
     /// Events taken during the wait go to [`next_event`](Self::next_event)
     /// as the recorder's thread delivers any other, a malformed one as
@@ -1584,7 +1681,8 @@ impl AsyncFileRecorder {
     /// [`FileRecorder::wait_finished`].
     ///
     /// Events taken during the wait are delivered as by
-    /// [`finish`](Self::finish).
+    /// [`finish`](Self::finish). A concurrent close narrows the wait and can
+    /// return [`StateError::Closed`] on the same terms as `finish`.
     ///
     /// # Errors
     ///
@@ -1613,13 +1711,33 @@ impl AsyncFileRecorder {
                         if stop {
                             recorder.request_stop();
                         }
-                        recorder.wait_finished_from(deadline, |polled| {
-                            // As the pump delivers them: a malformed event as its error.
-                            if let Some(event) = polled.transpose() {
-                                events.push(event);
-                            }
-                            context.interrupted()
-                        })
+                        let outcome = recorder.wait_finished_with(
+                            deadline,
+                            |recorder, deadline| {
+                                if let Some(requested) = context.control.shutdown_requested_at() {
+                                    recorder.limit_shutdown_wait(deadline, requested)
+                                } else {
+                                    deadline
+                                }
+                            },
+                            |polled| {
+                                // As the pump delivers them: a malformed event as its error.
+                                if let Some(event) = polled.transpose() {
+                                    events.push(event);
+                                }
+                                context.cancelled.load(Ordering::Acquire)
+                            },
+                        )?;
+                        if matches!(outcome, FinishStatus::TimedOut(_))
+                            && context.control.shutdown.load(Ordering::Acquire)
+                            && !context.cancelled.load(Ordering::Acquire)
+                        {
+                            // The active wait has spent the finalization budget;
+                            // destruction must not start a second one.
+                            recorder.shutdown_wait_spent();
+                            return Err(Error::InvalidState(StateError::Closed));
+                        }
+                        Ok(outcome)
                     },
                 )
             },
@@ -1696,7 +1814,10 @@ impl AsyncFileRecorder {
     /// every clone of this handle.
     ///
     /// A session that is still open is stopped and given up to
-    /// [`RecorderOptions::drop_wait`] to finalize its file. The future
+    /// [`RecorderOptions::drop_wait`] from this close's submission to finalize
+    /// its file, including time spent in an in-flight finish or wait. A finish
+    /// already running uses the earlier of that budget and its own deadline;
+    /// destruction does not start another wait after it expires. The future
     /// completes when the SDK has destroyed the recorder, and does not say
     /// whether the file was finalized: await [`finish`](Self::finish) first to
     /// learn that. Nothing blocks the calling thread. Once submitted by polling
@@ -1718,6 +1839,9 @@ impl AsyncFileRecorder {
 
 #[cfg(test)]
 mod waker_tests;
+
+#[cfg(test)]
+mod native_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1755,7 +1879,7 @@ mod tests {
         (Waker::from(Arc::new(PanickingWake(called))), calls)
     }
 
-    fn block_on<F: Future>(future: F) -> F::Output {
+    pub(super) fn block_on<F: Future>(future: F) -> F::Output {
         let signal = Arc::new(Signal(Mutex::new(false), Condvar::new()));
         let waker = Waker::from(Arc::clone(&signal));
         let mut future = std::pin::pin!(future);
@@ -2400,14 +2524,23 @@ mod tests {
         closing: Closing,
         options: AsyncFileOptions,
     ) -> (Arc<mock::Recorder>, AsyncFileRecorder) {
+        mock_recorder_with_drop_wait(closing, options, Duration::from_secs(5))
+    }
+
+    fn mock_recorder_with_drop_wait(
+        closing: Closing,
+        options: AsyncFileOptions,
+        drop_wait: Duration,
+    ) -> (Arc<mock::Recorder>, AsyncFileRecorder) {
         let device = mock::Recorder::new(closing);
         let installed = Arc::clone(&device);
         let recorder = block_on(spawn_owner(
             "file-test-recorder",
             move || {
                 installed.install();
-                mock::recorder_api()
-                    .create_recorder(&RecorderOptions::new(SourceSpec::new("mock source")?))
+                mock::recorder_api().create_recorder(
+                    &RecorderOptions::new(SourceSpec::new("mock source")?).drop_wait(drop_wait),
+                )
             },
             options,
             |worker| AsyncFileRecorder { worker },
@@ -2565,6 +2698,193 @@ mod tests {
             assert!(Instant::now() < deadline, "the recorder was never stopped");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn await_wait(device: &mock::Recorder, previous: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while device.waits.load(Ordering::Acquire) <= previous {
+            assert!(
+                Instant::now() < deadline,
+                "the recorder never entered its wait"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn finish_and_wait_report_closure_when_another_clone_closes_within_the_shared_budget() {
+        for stop in [true, false] {
+            let (device, recorder) = mock_recorder_with_drop_wait(
+                Closing::WhenTold,
+                AsyncFileOptions::new(),
+                Duration::from_secs(2),
+            );
+            if !stop {
+                block_on(recorder.request_stop()).unwrap();
+            }
+            let previous = device.waits.load(Ordering::Acquire);
+            let finishing = if stop {
+                recorder.finish(Duration::from_secs(30))
+            } else {
+                recorder.wait_finished(Duration::from_secs(30))
+            }
+            .submit();
+            await_wait(&device, previous);
+            let other = recorder.clone();
+            let closed = other.close().submit();
+            // The original interruption path returned TimedOut within one
+            // 25 ms poll. Keep closure withheld past that point.
+            thread::sleep(Duration::from_millis(80));
+            assert!(!lock(&finishing.response).completed);
+            device.close();
+            let outcome = block_on(finishing).unwrap();
+            assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+            block_on(closed).unwrap();
+            assert!(device.closed_before_destroy.load(Ordering::Acquire));
+            assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+            assert!(matches!(
+                block_on(recorder.wait_finished(Duration::ZERO)),
+                Err(Error::InvalidState(StateError::Closed))
+            ));
+        }
+    }
+
+    #[test]
+    fn close_spends_one_drop_wait_and_reports_closed_instead_of_a_false_timeout() {
+        struct ObserveFinish {
+            device: Arc<mock::Recorder>,
+            replied: Sender<(usize, Instant)>,
+        }
+
+        impl Wake for ObserveFinish {
+            fn wake(self: Arc<Self>) {
+                // Reply completion calls this on the owner, before it can
+                // proceed to destruction. Caller scheduling cannot move the
+                // observation past a mistakenly restarted cleanup wait.
+                let _ = self
+                    .replied
+                    .send((self.device.waits.load(Ordering::Acquire), Instant::now()));
+            }
+        }
+
+        let budget = Duration::from_millis(160);
+        let (device, recorder) =
+            mock_recorder_with_drop_wait(Closing::WhenTold, AsyncFileOptions::new(), budget);
+        let mut finishing = Box::pin(recorder.finish(Duration::from_secs(30)).submit());
+        await_wait(&device, 0);
+        let (replied, reply) = mpsc::channel();
+        let waker = Waker::from(Arc::new(ObserveFinish {
+            device: Arc::clone(&device),
+            replied,
+        }));
+        assert!(finishing
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        let closed = recorder.close().submit();
+        let requested = recorder.worker.control.shutdown_requested_at().unwrap();
+        let (waits_at_reply, replied_at) = reply.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            block_on(finishing),
+            Err(Error::InvalidState(StateError::Closed))
+        ));
+        block_on(closed).unwrap();
+        let elapsed = replied_at.duration_since(requested);
+        assert!(
+            elapsed >= budget,
+            "shutdown skipped its finalization wait: {elapsed:?}"
+        );
+        assert_eq!(
+            device.waits.load(Ordering::Acquire),
+            waits_at_reply,
+            "destruction started another native event wait after the finish reply"
+        );
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        assert!(!device.closed_before_destroy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn an_in_flight_finish_still_reports_indeterminate_closure_and_delivers_events_during_close() {
+        let (device, recorder) = mock_recorder(Closing::WhenTold);
+        let finishing = recorder.finish(Duration::from_secs(30)).submit();
+        await_wait(&device, 0);
+        let closing = recorder.close().submit();
+        device.dropped_events.store(1, Ordering::Release);
+        device.close();
+        let outcome = block_on(finishing).unwrap();
+        assert!(
+            matches!(outcome, FinishStatus::Indeterminate(_)),
+            "{outcome:?}"
+        );
+        block_on(closing).unwrap();
+        // The one-slot queue retains the closure taken during the finish.
+        let event = block_on(recorder.next_event(Duration::ZERO))
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.kind(), RecorderEventKind::FileClosed);
+    }
+
+    #[test]
+    fn an_in_flight_finish_keeps_its_earlier_deadline_when_a_clone_closes() {
+        let (device, recorder) = mock_recorder_with_drop_wait(
+            Closing::WhenTold,
+            AsyncFileOptions::new(),
+            Duration::from_secs(2),
+        );
+        let finishing = recorder.finish(Duration::from_millis(120)).submit();
+        await_wait(&device, 0);
+        let began = Instant::now();
+        let closed = recorder.close().submit();
+        assert!(matches!(
+            block_on(finishing),
+            Err(Error::InvalidState(StateError::Closed))
+        ));
+        block_on(closed).unwrap();
+        assert!(
+            began.elapsed() < Duration::from_millis(500),
+            "close extended the finish's deadline"
+        );
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn dropping_the_last_handle_during_a_finish_reports_the_closure_it_waits_for() {
+        let (device, recorder) = mock_recorder_with_drop_wait(
+            Closing::After(Duration::from_millis(120)),
+            AsyncFileOptions::new(),
+            Duration::from_secs(2),
+        );
+        let finishing = recorder.finish(Duration::from_secs(30)).submit();
+        await_wait(&device, 0);
+        let (dropped, drop_done) = mpsc::channel();
+        let dropping = thread::spawn(move || {
+            drop(recorder);
+            dropped.send(()).unwrap();
+        });
+        let outcome = block_on(finishing).unwrap();
+        assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+        drop_done.recv_timeout(Duration::from_secs(1)).unwrap();
+        dropping.join().unwrap();
+        assert!(device.closed_before_destroy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancelling_a_finish_still_releases_its_wait_before_close_waits_for_finalization() {
+        let (device, recorder) = mock_recorder_with_drop_wait(
+            Closing::WhenTold,
+            AsyncFileOptions::new(),
+            Duration::from_secs(2),
+        );
+        let finishing = recorder.finish(Duration::from_secs(30)).submit();
+        await_wait(&device, 0);
+        drop(finishing);
+        // A following command proves cancellation ended the long wait.
+        assert_eq!(block_on(recorder.state()).unwrap(), RecorderState::Stopping);
+        let closed = recorder.close().submit();
+        assert!(!lock(&closed.response).completed);
+        device.close();
+        block_on(closed).unwrap();
+        assert!(device.closed_before_destroy.load(Ordering::Acquire));
     }
 
     #[test]

@@ -736,15 +736,37 @@ impl FrameExtras {
     ///
     /// # Safety
     ///
-    /// `metadata` is null or a readable NUL-terminated string.
+    /// `metadata` is null or readable through its first NUL or the metadata cap.
+    #[cfg(test)]
     unsafe fn received(timecode: i64, timestamp: i64, metadata: *const c_char) -> Result<Self> {
         Ok(Self {
             timecode: Timecode::from_ticks(timecode),
             timestamp: SdkTimestamp::from_sdk(timestamp),
             // SAFETY: forwarded to the caller's obligation.
-            metadata: unsafe { crate::frames::validate_frame_metadata(metadata)? }
+            metadata: unsafe { crate::frames::FrameMetadataState::scan(metadata).text(metadata) }
                 .map(|text| FrameMetadata::copy_from(text, None)),
         })
+    }
+
+    /// Reuse storage while copying already validated borrowed extras.
+    fn copy_received(
+        &mut self,
+        timecode: Timecode,
+        timestamp: Option<SdkTimestamp>,
+        text: Option<crate::frames::MetadataText<'_>>,
+    ) {
+        match text {
+            Some(text) => {
+                self.metadata = Some(FrameMetadata::copy_from(text, self.metadata.take()))
+            }
+            None => {
+                if let Some(storage) = &mut self.metadata {
+                    storage.clear();
+                }
+            }
+        }
+        self.timecode = timecode;
+        self.timestamp = timestamp;
     }
 
     /// The timecode.
@@ -759,7 +781,10 @@ impl FrameExtras {
 
     /// The metadata text, if any.
     pub(crate) fn metadata(&self) -> Option<&str> {
-        self.metadata.as_ref().map(FrameMetadata::as_str)
+        self.metadata
+            .as_ref()
+            .and_then(FrameMetadata::optional_text)
+            .map(crate::frames::MetadataText::as_str)
     }
 
     pub(crate) fn set_timecode(&mut self, timecode: Timecode) {
@@ -810,7 +835,7 @@ macro_rules! frame_extras_accessors {
             self.extras.set_timecode(timecode);
         }
 
-        /// The per-frame metadata, if any.
+        /// The per-frame metadata, if any. Unreadable received text is omitted.
         pub fn metadata(&self) -> Option<&str> {
             self.extras.metadata()
         }
@@ -1312,17 +1337,7 @@ impl CompressedAudioFrame {
 
     /// The checks that hold for received frames as well.
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.bytes.is_empty() || self.bytes.len() > MAX_PACKET_BYTES {
-            return Err(invalid_frame("Invalid compressed audio size"));
-        }
-        if self.codec != AudioCodec::Aac {
-            return Ok(());
-        }
-        let packet = PacketEnvelope::parse(&self.bytes)?;
-        if packet.codec() != Some(EnvelopeCodec::Aac) || packet.data().is_empty() {
-            return Err(invalid_frame("Invalid AAC packet envelope"));
-        }
-        Ok(())
+        validate_received_audio(self.codec, &self.bytes)
     }
 
     /// A native descriptor that lends this frame's bytes and metadata to the
@@ -1337,6 +1352,23 @@ impl CompressedAudioFrame {
         raw
     }
 }
+
+fn validate_received_audio(codec: AudioCodec, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() || bytes.len() > MAX_PACKET_BYTES {
+        return Err(invalid_frame("Invalid compressed audio size"));
+    }
+    if codec == AudioCodec::Aac {
+        let packet = PacketEnvelope::parse(bytes)?;
+        if packet.codec() != Some(EnvelopeCodec::Aac) || packet.data().is_empty() {
+            return Err(invalid_frame("Invalid AAC packet envelope"));
+        }
+    }
+    Ok(())
+}
+
+#[path = "packets/borrowed.rs"]
+mod borrowed;
+pub use borrowed::{CompressedAudioRef, CompressedVideoRef};
 
 /// The bytes of a compressed native frame.
 ///
@@ -1359,21 +1391,16 @@ unsafe fn packet_bytes<'a>(data: *const u8, size: i32) -> Result<&'a [u8]> {
 ///
 /// `raw` describes a compressed frame: its union holds the data size, its data
 /// pointer is readable for that size, and its metadata pointer is null or a
-/// NUL-terminated string.
+/// readable string through its first NUL or the metadata cap.
+#[cfg(test)]
 pub(crate) unsafe fn copy_video_packet(
     raw: &NDIlib_video_frame_v2_t,
 ) -> Result<CompressedVideoFrame> {
-    let format = VideoPacketFormat::from_sdk(raw)?;
-    // SAFETY: a compressed frame's union holds its size, and the caller
-    // guarantees the buffer is readable for it.
-    let bytes = unsafe { packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
-    validate_video_packet(format, bytes, Use::Receive)?;
-    Ok(CompressedVideoFrame {
-        format,
-        bytes: AliasableVec::new(bytes.to_vec()),
-        // SAFETY: forwarded to the caller's obligation.
-        extras: unsafe { FrameExtras::received(raw.timecode, raw.timestamp, raw.p_metadata)? },
-    })
+    // SAFETY: the test caller retains raw's storage, and the synthetic guard
+    // borrows it until the copy completes; its release callback frees nothing.
+    let guard =
+        unsafe { crate::capture::Guard::with_test_free(std::ptr::null_mut(), *raw, |_, _| {}) };
+    CompressedVideoRef::new(guard).map(|frame| frame.to_owned())
 }
 
 /// Copy a compressed audio frame the SDK delivered.
@@ -1381,25 +1408,14 @@ pub(crate) unsafe fn copy_video_packet(
 /// # Safety
 ///
 /// As for [`copy_video_packet`].
+#[cfg(test)]
 pub(crate) unsafe fn copy_audio_packet(
     raw: &NDIlib_audio_frame_v3_t,
 ) -> Result<CompressedAudioFrame> {
-    let (codec, protected) = AudioCodec::from_outer(raw.FourCC)
-        .ok_or_else(|| invalid_frame("Unknown compressed audio FourCC"))?;
-    let parameters = AudioParameters::from_sdk(raw)?;
-    // SAFETY: a compressed frame's union holds its size, and the caller
-    // guarantees the buffer is readable for it.
-    let bytes = unsafe { packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
-    let frame = CompressedAudioFrame {
-        codec,
-        protected,
-        bytes: AliasableVec::new(bytes.to_vec()),
-        parameters,
-        // SAFETY: forwarded to the caller's obligation.
-        extras: unsafe { FrameExtras::received(raw.timecode, raw.timestamp, raw.p_metadata)? },
-    };
-    frame.validate()?;
-    Ok(frame)
+    // SAFETY: as for the video fixture above.
+    let guard =
+        unsafe { crate::capture::Guard::with_test_free(std::ptr::null_mut(), *raw, |_, _| {}) };
+    CompressedAudioRef::new(guard).map(|frame| frame.to_owned())
 }
 
 // The values above are the NDI wire format, which the data types in this file
@@ -1864,7 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn received_metadata_preserves_presence_and_rejects_invalid_utf8() {
+    fn received_metadata_preserves_presence_and_omits_unreadable_text() {
         // SAFETY: all non-null pointers below name live terminated byte strings.
         unsafe {
             let absent = FrameExtras::received(123, 456, std::ptr::null()).unwrap();
@@ -1878,10 +1894,15 @@ mod tests {
                 assert_eq!(extras.timecode().ticks(), 123);
                 assert_eq!(extras.timestamp().unwrap().ticks(), 456);
             }
-            assert!(matches!(
-                FrameExtras::received(123, 456, c"\xff".as_ptr()),
-                Err(Error::InvalidUtf8(_))
-            ));
+            let unterminated = vec![b'x'; crate::frames::MAX_METADATA_BYTES];
+            for pointer in [c"\xff".as_ptr(), unterminated.as_ptr().cast()] {
+                let (extras, allocations) = crate::test_alloc::allocation_count(|| {
+                    FrameExtras::received(123, 456, pointer).unwrap()
+                });
+                assert_eq!(allocations, 0);
+                assert_eq!(extras.metadata(), None);
+                assert!(extras.to_sdk().2.is_null());
+            }
         }
     }
 

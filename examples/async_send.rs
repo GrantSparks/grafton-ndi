@@ -5,8 +5,6 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let ndi = Ndi::new()?;
     let options = SenderOptions::new("AsyncExample").clock_video(true);
     let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
-    // Notifications run when this wrapper observes completion at a send/finish boundary.
-    sender.on_async_video_done(|len| println!("Completed {len} bytes"));
     let first = VideoFrame::builder().resolution(1920, 1080).build()?;
     let mut next = VideoFrame::builder().resolution(1920, 1080).build()?;
     assert!(sender.send_video_async(first)?.is_none());

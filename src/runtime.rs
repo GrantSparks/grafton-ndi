@@ -70,7 +70,8 @@
 //! library in this order is selected:
 //!
 //! 1. the directory containing the running executable;
-//! 2. the directory named by the `NDI_RUNTIME_DIR_V6` environment variable;
+//! 2. the absolute directory named by `NDI_RUNTIME_DIR_V6`; relative values
+//!    are recorded as refused locations and never searched;
 //! 3. the platform loader's own search for the library name (`rpath`,
 //!    `LD_LIBRARY_PATH`, `PATH` and the system library directories).
 //!
@@ -87,8 +88,12 @@
 //! that loads but is rejected because it lacks a required entry point or is
 //! not the requested edition, is recorded and the search moves on. When
 //! nothing is usable,
-//! [`Error::RuntimeLoadFailed`] names every location tried and the reason for
-//! each, including the operating system's own.
+//! [`Error::RuntimeLoadFailed`] carries [`crate::LoadFailure`] with every
+//! location, [`crate::LoadOrigin`] and typed [`crate::LoadRefusal`]. Its
+//! `loaded_any()` distinguishes code that loaded and was refused from locations
+//! that could not be opened; `Display` retains the diagnostic text, including
+//! the operating system's own. [`Error::RuntimeConflict`] carries a
+//! [`crate::SelectionConflict`] beside its diagnostic context.
 //!
 //! One limit applies to a library that loads but is rejected: it stays loaded,
 //! because a native library can never be unloaded safely. If the platform
@@ -172,7 +177,9 @@ impl RuntimeOptions {
     ///
     /// No other location is tried, so a failure to load it is reported rather
     /// than hidden by a fallback. A statically linked target has no library to
-    /// load and rejects an explicit path.
+    /// load and rejects an absolute path with [`Error::RuntimeConflict`].
+    /// A relative path returns [`Error::InvalidInput`] on every target,
+    /// before an implementation is selected.
     #[must_use]
     pub fn library_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.library_path = Some(path.into());
@@ -251,11 +258,14 @@ impl Runtime {
     ///
     /// * [`Error::RuntimeLoadFailed`] when no usable library is found. Nothing
     ///   is selected and the call can be repeated, with other options if
-    ///   wanted. The message names every location tried and the reason for
-    ///   each.
+    ///   wanted. The [`crate::LoadFailure`] records each attempted location,
+    ///   its origin, typed refusal and whether native code loaded.
     /// * [`Error::RuntimeConflict`] when an implementation is already selected
     ///   and does not meet `options`: they name a different library file, or
     ///   ask for the Advanced SDK when the selected implementation is not one.
+    ///   Also returned for an explicit path on a linked target, or when native
+    ///   loading re-enters selection on the same thread before selection finishes.
+    ///   [`crate::SelectionConflict`] identifies the cause.
     /// * [`Error::InvalidInput`] when `options` name a relative
     ///   library path.
     ///
@@ -266,7 +276,9 @@ impl Runtime {
     ///
     /// match Runtime::select(&RuntimeOptions::default()) {
     ///     Ok(runtime) => println!("selected {:?}", runtime.info().library_path()),
-    ///     Err(Error::RuntimeLoadFailed(tried)) => eprintln!("NDI is not installed: {tried}"),
+    ///     Err(Error::RuntimeLoadFailed(failure)) if !failure.loaded_any() => {
+    ///         eprintln!("no runtime could be opened: {failure}");
+    ///     }
     ///     Err(error) => eprintln!("{error}"),
     /// }
     /// ```
@@ -679,7 +691,9 @@ impl Ndi {
     /// # Errors
     ///
     /// Returns [`Error::RuntimeLoadFailed`] if no usable runtime library is
-    /// found in the [search order](crate::runtime#where-the-runtime-is-loaded-from),
+    /// found in the [search order](crate::runtime#where-the-runtime-is-loaded-from).
+    /// Its [`crate::LoadFailure`] distinguishes code that loaded and was refused
+    /// from locations that could not be opened. Returns
     /// [`Error::UnsupportedCpu`] if the runtime does not start because this
     /// CPU cannot run it, and [`Error::InitializationFailed`] if it does not
     /// start for another reason or the count of handles is exhausted.
@@ -707,7 +721,8 @@ impl Ndi {
     /// Returns the errors of those two steps. A failed selection or start can
     /// be retried; once selection has succeeded, every later call uses the
     /// selected runtime and reports [`Error::RuntimeConflict`] for options it
-    /// does not meet.
+    /// does not meet, with a typed [`crate::SelectionConflict`]. A
+    /// [`crate::LoadFailure`] retains the structured attempts when loading fails.
     ///
     /// # Examples
     ///

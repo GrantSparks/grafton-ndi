@@ -20,6 +20,8 @@ and extra IPs your application needs. Choose discovery by purpose:
   inspecting their addresses too.
 
 Selection and enumeration include snapshot-lock waits in their timeout budget.
+Concurrent waits on the same finder share each reported change, so every
+lookup can inspect the updated list promptly.
 A zero timeout makes one non-waiting attempt, which can miss a busy snapshot
 lock. Native snapshot work, copying and caller predicates can finish after the
 budget. `current_sources()` uses ordinary blocking serialization. Discovery
@@ -108,7 +110,7 @@ Choose the send method by storage ownership:
 | --- | --- | --- |
 | Owned or borrowed media | `send_video`, `send_audio`, `send_metadata` | When the synchronous call returns |
 | Owned video | `send_video_async` | When a later call returns the completed frame |
-| Borrowed video | `send_video_async_copy` | Input is copied before submission |
+| Borrowed video | `send_video_async_copy` | Input is copied into reusable sender storage before submission |
 
 The SDK's asynchronous send pipeline is separate from Rust futures and may
 block while synchronizing. Reuse two owned frames and recover the final one
@@ -130,12 +132,24 @@ metadata with `set_metadata` and `clear_metadata`; invalid replacement text
 preserves the old value. [`media_buffers`](../examples/media_buffers.rs) shows
 buffer reuse, borrowed planar audio and checked native video conversion.
 
+Optional per-frame metadata does not prevent reception of valid video or
+samples. `metadata()` returns `None` when that text is not UTF-8 or has no
+terminator within the 4 MiB cap; `metadata_status()` distinguishes these
+conditions from absent text. The borrowed frame keeps this status without
+allocation. Forwarding omits unreadable text, and owned copies retain only
+valid metadata, so their status becomes `Absent`. Standalone metadata frames
+remain strict because their text is the entire payload.
+
 ## Use FrameSync
 
 Use `FrameSync` when output follows an application clock such as a playback
 callback or render loop. `FrameSync::new(receiver)` takes ownership, returning
 the receiver in `Rejected` on failure. It reserves raw video and audio capture;
-`receiver()` still provides metadata, events and shared controls.
+`receiver()` still provides metadata and shared controls. Native synchronization
+can consume status notifications, so attached receivers have no event polling.
+Query `ptz().is_supported()`, `web_control_url()` or KVM support for capabilities,
+`poll_source_name_change()` for the source, and `is_connected()` or
+`connection_stats()` for connection state.
 `into_receiver()` restores ordinary capture.
 
 At each output tick, use `capture_video_ref(scan_type)` or
@@ -150,7 +164,9 @@ source change; querying it and capturing are separate operations.
 borrowed output directly into reusable interleaved PCM. Its software timer is
 a demonstration; a playback device supplies its own cadence. FrameSync may
 insert silence or repeat video when input is unavailable. Successful clocked
-output therefore does not establish recent reception.
+output therefore does not establish recent reception. FrameSync audio without
+an SDK source timestamp reports `None`; output without a source timecode carries
+`Timecode::SYNTHESIZE`. The missing timestamp alone does not identify silence.
 
 With `advanced`, `controls()` reaches exclusive stream/tier controls and KVM.
 `split()` separates clocked capture from those controls so held remote input
@@ -169,8 +185,8 @@ rustdoc:
 | Owner | Media path | Receiver capture retained |
 | --- | --- | --- |
 | `Receiver` | Typed or combined capture | Video, audio, metadata and events |
-| `FrameSync` | Clocked video/audio | Metadata and events |
-| `advanced::AvSync` | Video-timestamp-matched audio | Video, metadata and events |
+| `FrameSync` | Clocked video/audio | Metadata |
+| `advanced::AvSync` | Video-timestamp-matched audio | Video and metadata |
 | `advanced::PacketReceiver` | Owned packets, decoded media and events | None |
 | `advanced::AllocatedReceiver` | Typed or combined capture | Video, audio, metadata and events |
 | `advanced::AllocatedPacketReceiver` | Owned packets, decoded media and events | None |
@@ -223,15 +239,19 @@ Enable `tokio` or `smol` and wrap the receiver in the corresponding
 `asynchronous::<runtime>::AsyncReceiver`. It runs blocking SDK work on workers.
 Capture/event timeouts start at the future's first poll and include queue and
 receiver-lock waits; processing can finish after that wait budget. Dropping a
-future skips work only before its cancellation gate. Started work can consume
-a frame/event or execute a callback even after its result is discarded.
+future skips queued work and stops a started wait before its next attempt.
+The attempt already in flight can still consume a frame/event and execute its
+callback; each native wait lasts at most 100 ms.
 
 Use typed `capture_with(timeout, callback)` or mixed
 `capture_any_with(timeout, callback)` for immediate inspection. A synchronous
 callback borrows validated media on the capturing worker; only its
 `Send + 'static` result crosses back to the task. The callback and its captures
 must also be `Send + 'static`. It runs only for a delivered value. A panic
-becomes `Error::SpawnFailed` and the SDK guard is freed on that worker.
+is resumed on the awaiting task with its original payload, after the SDK guard
+is freed on that worker. An abandoned future discards its panic payload.
+`Error::SpawnFailed(SpawnFailure)` distinguishes a missing Tokio runtime from a
+cancelled blocking task.
 
 Keep callbacks bounded: they hold an SDK buffer and occupy a worker. The wait
 timeout does not bound callback duration or cancel its side effects. Scoped

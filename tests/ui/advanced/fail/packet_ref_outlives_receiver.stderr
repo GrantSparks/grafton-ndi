@@ -1,0 +1,8 @@
+error[E0515]: cannot return value referencing local variable `receiver`
+  --> tests/ui/advanced/fail/packet_ref_outlives_receiver.rs:14:5
+   |
+14 |     receiver.capture_ref(Duration::ZERO).unwrap().unwrap()
+   |     --------^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |     |
+   |     returns a value referencing data owned by the current function
+   |     `receiver` is borrowed here

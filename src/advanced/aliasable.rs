@@ -122,6 +122,16 @@ impl<T> AliasableVec<T> {
     }
 }
 
+impl AliasableVec<u8> {
+    /// Refill a released frame's byte allocation, growing only when needed.
+    pub(crate) fn copy_from_slice(&mut self, bytes: &[u8]) {
+        let mut storage = std::mem::replace(self, Self::new(Vec::new())).into_vec();
+        storage.clear();
+        storage.extend_from_slice(bytes);
+        *self = Self::new(storage);
+    }
+}
+
 impl<T> Deref for AliasableVec<T> {
     type Target = [T];
 

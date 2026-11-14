@@ -1,0 +1,17 @@
+error[E0515]: cannot return value referencing function parameter `owner`
+ --> tests/ui/advanced/fail/split_sender_views_cannot_escape.rs:4:5
+  |
+4 |     owner.split().0
+  |     -----^^^^^^^^^^
+  |     |
+  |     returns a value referencing data owned by the current function
+  |     `owner` is borrowed here
+
+error[E0515]: cannot return value referencing function parameter `owner`
+ --> tests/ui/advanced/fail/split_sender_views_cannot_escape.rs:8:5
+  |
+8 |     owner.split().1
+  |     -----^^^^^^^^^^
+  |     |
+  |     returns a value referencing data owned by the current function
+  |     `owner` is borrowed here

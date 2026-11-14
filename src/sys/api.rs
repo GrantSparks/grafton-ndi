@@ -17,7 +17,7 @@ use crate::{
     capabilities::{
         Capabilities, CapabilityStatus, CapabilityUnavailable, RuntimeFeature, RuntimeInfo,
     },
-    Error, Result,
+    Error, LoadRefusal, Result,
 };
 
 native_table! {
@@ -123,6 +123,22 @@ pub(crate) trait Table: Sized + 'static {
     fn within(evidence: Evidence<'_>) -> Result<&'_ Self>;
 }
 
+// Version-only enum values have no entry points of their own. These private
+// proofs use the same gate as tables, so descriptor builders cannot bypass it.
+macro_rules! version_gates {
+    ($($gate:ident),+ $(,)?) => {$(
+        pub(crate) struct $gate(());
+        impl Table for $gate {
+            fn within(evidence: Evidence<'_>) -> Result<&'_ Self> {
+                evidence.require(RuntimeFeature::$gate)?;
+                static PROOF: $gate = $gate(());
+                Ok(&PROOF)
+            }
+        }
+    )+};
+}
+version_gates!(Planar444Video, ReceiveBest444, ReceiveVideoOnly);
+
 /// What the gate of an optional capability decides from: the tables resolved
 /// from one implementation, its identity, and the capabilities derived from
 /// them.
@@ -201,12 +217,9 @@ macro_rules! optional_tables {
             ///
             /// Fails when a [`Core`] entry point is missing or any entry point
             /// resolves outside the selected implementation.
-            pub(crate) fn load(resolver: &dyn Resolver) -> Result<Self> {
+            pub(crate) fn load(resolver: &dyn Resolver) -> std::result::Result<Self, LoadRefusal> {
                 let core = Core::load(resolver)?.map_err(|symbol| {
-                    Error::RuntimeLoadFailed(format!(
-                        "it does not export the required entry point {}",
-                        symbol.to_string_lossy()
-                    ))
+                    LoadRefusal::MissingEntryPoint { symbol: symbol.to_string_lossy().into_owned(), required: true, detail: None }
                 })?;
                 Ok(Self {
                     core,
@@ -448,9 +461,6 @@ impl<'a> Evidence<'a> {
             | CapabilityUnavailable::BuildAbiUnavailable => self
                 .missing(evidence)
                 .map(|symbol| symbol.to_string_lossy().into_owned()),
-            // The runtime holds no evidence about the File library.
-            #[cfg(feature = "file-io")]
-            CapabilityUnavailable::SeparateLibrary => None,
         };
         Error::UnsupportedCapability {
             feature,

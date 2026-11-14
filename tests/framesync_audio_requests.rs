@@ -17,6 +17,56 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[test]
+fn live_framesync_audio_retains_a_source_timestamp() {
+    let Some(ndi) = common::ndi() else { return };
+    let sender = Sender::new(
+        &ndi,
+        &SenderOptions::new(common::unique_name("FrameSync source timestamp")).clock_audio(true),
+    )
+    .unwrap();
+    let source = common::loopback_source(&ndi, &sender).unwrap();
+    let sync = FrameSync::new(Receiver::new(&ndi, &ReceiverOptions::new(source)).unwrap()).unwrap();
+    let running = std::sync::atomic::AtomicBool::new(true);
+    struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let input = AudioFrame::builder()
+                .num_channels(2)
+                .num_samples(480)
+                .build()
+                .unwrap();
+            while running.load(Ordering::Acquire) {
+                sender.send_audio(&input);
+            }
+        });
+        let _stop = Stop(&running);
+        let request = FrameSyncAudioRequest::capture_at(48_000, 2, 480).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let frame = sync.capture_audio_ref(request).unwrap();
+            if let Some(timestamp) = frame.timestamp() {
+                assert_ne!(timestamp.ticks(), 0);
+                let mut copy = frame.to_owned();
+                assert_eq!(copy.timestamp(), Some(timestamp));
+                frame.copy_into(&mut copy);
+                assert_eq!(copy.timestamp(), Some(timestamp));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "live audio supplied no source timestamp"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+}
+
 fn wait_for_channels(fs: &FrameSync, channels: u32) -> grafton_ndi::AudioInputFormat {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {

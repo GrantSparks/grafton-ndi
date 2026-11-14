@@ -1,5 +1,5 @@
 use grafton_ndi::{
-    advanced::{AllocatedReceiver, AvSync, AvSyncRequest, MouseButton},
+    advanced::{AllocatedReceiver, AvSync, AvSyncRequest, AvSyncVideo, MouseButton},
     FrameSync, FrameSyncAudioRequest, MediaTypes, Result, ScanType, StreamTier, Tally,
 };
 
@@ -24,7 +24,7 @@ fn framesync(sync: &mut FrameSync) -> Result<()> {
     session.release_all()?;
     drop((video, audio, metadata));
     drop(session);
-    sync.receiver().reconnect()?;
+    sync.receiver().reconnect();
     let _ = sync.controls().kvm()?;
     Ok(())
 }
@@ -33,17 +33,20 @@ fn avsync(sync: &mut AvSync) -> Result<()> {
     let (capture, controls) = sync.split();
     let mut session = controls.kvm()?;
     session.mouse_down(MouseButton::Left)?;
+    let metadata = session.receiver().metadata().capture_ref(std::time::Duration::ZERO)?;
     let video = session
         .receiver()
         .video()
         .capture_ref(std::time::Duration::ZERO)?;
     if let Some(video) = &video {
-        let _ = capture.synchronize(Some(video), AvSyncRequest::automatic())?;
+        if let Some(stamped) = AvSyncVideo::new(video) {
+            let _ = capture.synchronize(stamped, AvSyncRequest::automatic())?;
+        }
     }
     session.release_all()?;
-    drop(video);
+    drop((video, metadata));
     drop(session);
-    sync.receiver().reconnect()?;
+    sync.receiver().reconnect();
     let _ = sync.controls().kvm()?;
     Ok(())
 }
@@ -59,7 +62,7 @@ fn allocated(receiver: &mut AllocatedReceiver) -> Result<()> {
     session.release_all()?;
     drop(frame);
     drop(session);
-    receiver.receiver().reconnect()?;
+    receiver.receiver().reconnect();
     let _ = receiver.controls().kvm()?;
     Ok(())
 }

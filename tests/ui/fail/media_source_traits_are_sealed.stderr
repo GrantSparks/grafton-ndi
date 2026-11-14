@@ -12,16 +12,16 @@ help: the trait `frames::VideoParts` is not implemented for `Unchecked`
 help: the following other types implement trait `frames::VideoParts`
  --> src/frames.rs
   |
-  | impl VideoParts for VideoFrame {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `VideoFrame`
+  | unsafe impl VideoParts for VideoFrame {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `VideoFrame`
 ...
-  | impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoParts for VideoRef<'_, S> {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `frames::borrowed::VideoRef<'_, S>`
+  | unsafe impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoParts for VideoRef<'_, S> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `frames::borrowed::VideoRef<'_, S>`
   |
  ::: src/sender.rs
   |
-  | impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `BorrowedVideoFrame<'_>`
+  | unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `BorrowedVideoFrame<'_>`
 note: required by a bound in `VideoSource`
  --> src/frames.rs
   |
@@ -48,14 +48,14 @@ help: the trait `frames::AudioParts` is not implemented for `Unchecked`
 help: the following other types implement trait `frames::AudioParts`
  --> src/frames.rs
   |
-  | impl AudioParts for BorrowedAudioFrame<'_> {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `BorrowedAudioFrame<'_>`
+  | unsafe impl AudioParts for BorrowedAudioFrame<'_> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `BorrowedAudioFrame<'_>`
 ...
-  | impl AudioParts for AudioFrame {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `AudioFrame`
+  | unsafe impl AudioParts for AudioFrame {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `AudioFrame`
 ...
-  | impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioParts for AudioRef<'_, S> {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `frames::borrowed::AudioRef<'_, S>`
+  | unsafe impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioParts for AudioRef<'_, S> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `frames::borrowed::AudioRef<'_, S>`
 note: required by a bound in `AudioSource`
  --> src/frames.rs
   |

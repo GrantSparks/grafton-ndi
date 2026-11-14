@@ -71,7 +71,9 @@ fn main() -> Result<(), Error> {
         // The frame stays borrowed from the receiver while input is sent.
         let frame = capture.capture_video_ref(ScanType::Progressive)?;
         let audio = capture.capture_audio_ref(audio_request)?;
-        let _event = receiving.poll_event(Duration::ZERO)?;
+        if !receiving.is_connected() {
+            println!("Source disconnected");
+        }
         if let Some(frame) = &frame {
             println!("Frame {}x{} while dragging", frame.width(), frame.height());
         }
