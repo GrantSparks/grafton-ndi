@@ -20,6 +20,12 @@ pub enum SelectionConflict {
     /// The selected runtime is Standard, but the File library needs Advanced.
     FileNeedsAdvancedRuntime,
     /// The process's global symbol scope contains another NDI runtime.
+    ///
+    /// On dynamically loaded, non-Apple ELF targets, an explicit runtime path
+    /// must identify that same module. The File library also refuses a global
+    /// runtime other than the selected core. Both checks run before opening
+    /// the candidate. Select the runtime named in the diagnostic, or stop
+    /// linking or preloading the other runtime.
     ForeignRuntimeInScope,
 }
 
@@ -125,6 +131,16 @@ pub enum LoadRefusal {
     },
     /// The File library's imports bind to a runtime other than the selected one.
     BoundToAnotherRuntime,
+    /// Another NDI runtime in the global symbol scope would capture this
+    /// candidate's native calls. The candidate was not opened.
+    ///
+    /// Applies to dynamically loaded, non-Apple ELF targets. Select the module
+    /// named here, or stop linking or preloading it. An explicit runtime path
+    /// instead reports [`SelectionConflict::ForeignRuntimeInScope`].
+    ForeignRuntimeInScope {
+        /// The module defining `NDIlib_version` in the global symbol scope.
+        module: PathBuf,
+    },
     /// `NDI_RUNTIME_DIR_V6` names a relative directory, which is never searched.
     RelativeRuntimeDirectory,
 }
@@ -151,6 +167,8 @@ impl fmt::Display for LoadRefusal {
                 "the platform loader returned {}, which is already loaded and was rejected ({refusal}); no other library of that name can be found by name in this process, so remove or fix that file or pass an explicit library path", path.display()),
             Self::NoCompleteFileFamily { first_missing } => write!(f, "it provides no family of NDI File entry points (it does not export {first_missing})"),
             Self::BoundToAnotherRuntime => f.write_str("it is bound to an NDI runtime other than the selected one"),
+            Self::ForeignRuntimeInScope { module } => write!(f,
+                "the process's global symbol scope already holds another NDI runtime ({}); select that runtime or stop linking or preloading it", module.display()),
             Self::RelativeRuntimeDirectory => f.write_str("the runtime directory must be absolute"),
         }
     }
@@ -326,6 +344,7 @@ mod tests {
             (LoadRefusal::AlreadyRefused { path: "rejected.so".into(), refusal: Box::new(LoadRefusal::EditionNotMet) }, "the platform loader returned rejected.so, which is already loaded and was rejected (it does not export the Advanced SDK entry points); no other library of that name can be found by name in this process, so remove or fix that file or pass an explicit library path"),
             (LoadRefusal::NoCompleteFileFamily { first_missing: "NDIlib_file_player_create".into() }, "it provides no family of NDI File entry points (it does not export NDIlib_file_player_create)"),
             (LoadRefusal::BoundToAnotherRuntime, "it is bound to an NDI runtime other than the selected one"),
+            (LoadRefusal::ForeignRuntimeInScope { module: "preloaded.so".into() }, "the process's global symbol scope already holds another NDI runtime (preloaded.so); select that runtime or stop linking or preloading it"),
             (LoadRefusal::RelativeRuntimeDirectory, "the runtime directory must be absolute"),
         ];
         for (refusal, expected) in cases {

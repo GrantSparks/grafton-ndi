@@ -171,7 +171,12 @@ const SCENARIOS: &[Scenario] = &[
     scenario("library_whose_dependency_is_another_runtime_is_refused"),
     Scenario {
         preloaded: Some(&UNNAMED),
-        ..scenario("another_runtime_in_the_global_scope_is_refused_before_anything_is_opened")
+        ..scenario("a_preloaded_foreign_runtime_is_refused_during_core_selection")
+    },
+    scenario("another_runtime_in_the_global_scope_is_refused_before_anything_is_opened"),
+    Scenario {
+        preloaded: Some(&PAIRED),
+        ..scenario("the_preloaded_selected_runtime_can_load_its_file_library")
     },
     scenario("failure_names_every_location"),
     scenario("incomplete_family_is_unavailable_alone"),
@@ -193,7 +198,8 @@ fn file_library_loader_contract() {
             .env("GRAFTON_FILE_LOADER_CHILD", scenario.name)
             .env("GRAFTON_FILE_LOADER_FIXTURES", directory.path())
             .env_remove("NDI_RUNTIME_DIR_V6")
-            .env_remove("LD_LIBRARY_PATH");
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD");
         if let Some(runtime_directory) = scenario.runtime_directory {
             command.env(
                 "NDI_RUNTIME_DIR_V6",
@@ -356,14 +362,47 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert_eq!(bound_runtime(&api), UNNAMED.build);
         }
         "another_runtime_in_the_global_scope_is_refused_before_anything_is_opened" => {
-            // Another runtime was loaded with the program, under a name the
-            // File library does not ask for. The library's own dependency is
-            // the selected runtime, but the platform loader binds its imports
-            // from the global scope first: to the other runtime.
             let ndi = select(fixtures, &PAIRED);
+            // Introduce the foreign global runtime after core selection, so
+            // this still exercises the File guard independently of the core
+            // guard. Its different name avoids matching PAIRED's SONAME.
+            // SAFETY: this trusted fixture has no callbacks or background
+            // work; the raw handle keeps it loaded until the child exits.
+            unsafe {
+                libloading::os::unix::Library::open(
+                    Some(fixtures.core(&UNNAMED)),
+                    libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_GLOBAL,
+                )
+                .unwrap()
+                .into_raw();
+            }
             let reason = conflicting(FileApi::open(&ndi, &defaults));
             assert_eq!(reason, SelectionConflict::ForeignRuntimeInScope);
             assert!(!is_loaded(FILE_LIBRARY));
+            let reason = conflicting(FileApi::open(
+                &ndi,
+                &explicit(fixtures.file(PAIRED.directory)),
+            ));
+            assert_eq!(reason, SelectionConflict::ForeignRuntimeInScope);
+            assert!(!is_loaded(FILE_LIBRARY));
+        }
+        "a_preloaded_foreign_runtime_is_refused_during_core_selection" => {
+            let selected = fixtures.core(&PAIRED);
+            match Ndi::with_options(&RuntimeOptions::new().library_path(&selected)) {
+                Err(Error::RuntimeConflict { kind, detail }) => {
+                    assert_eq!(kind, SelectionConflict::ForeignRuntimeInScope);
+                    assert!(detail.contains(selected.to_str().unwrap()));
+                    assert!(detail.contains(fixtures.core(&UNNAMED).to_str().unwrap()));
+                }
+                other => panic!("expected core selection to refuse the preload: {other:?}"),
+            }
+            assert!(!is_loaded(selected.to_str().unwrap()));
+            assert!(!is_loaded(FILE_LIBRARY));
+        }
+        "the_preloaded_selected_runtime_can_load_its_file_library" => {
+            let ndi = select(fixtures, &PAIRED);
+            let api = FileApi::open(&ndi, &defaults).unwrap();
+            assert_eq!(bound_runtime(&api), PAIRED.build);
         }
         "failure_names_every_location" => {
             // No File library can bind to this runtime, so the outcome does
