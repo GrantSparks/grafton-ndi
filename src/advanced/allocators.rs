@@ -507,7 +507,7 @@ impl<F: Fn(AllocationRequest) -> Result<AllocationBuffer> + Send + Sync + 'stati
 
 /// One registered policy.
 struct Generation {
-    policy: ManuallyDrop<Arc<dyn ReceiveAllocator>>,
+    policy: ManuallyDrop<Box<dyn ReceiveAllocator>>,
     count: Arc<AtomicUsize>,
 }
 
@@ -704,7 +704,7 @@ impl Registry {
             Err(error) => return Err(Rejected::new(error, policy)),
         };
         let generation = Arc::new(Generation {
-            policy: ManuallyDrop::new(Arc::new(policy)),
+            policy: ManuallyDrop::new(Box::new(policy)),
             count: self.generations.clone(),
         });
         lock(&self.state).active.insert(token, generation);
@@ -928,22 +928,31 @@ pub enum AllocationDecline {
     BufferRefused,
 }
 
-impl AllocationDecline {
-    const COUNT: usize = 8;
-
-    const fn index(self) -> usize {
-        match self {
-            Self::RequestNotRepresentable => 0,
-            Self::GenerationUnavailable => 1,
-            Self::ConcurrencyLimit => 2,
-            Self::AllocationCountLimit => 3,
-            Self::ByteLimit => 4,
-            Self::PolicyError => 5,
-            Self::PolicyPanic => 6,
-            Self::BufferRefused => 7,
+// Missing reasons make index() non-exhaustive; duplicates are unreachable
+// patterns. The count and the test list therefore cannot drift from indexing.
+macro_rules! allocation_declines {
+    ($($reason:ident),+ $(,)?) => {
+        impl AllocationDecline {
+            const COUNT: usize = [$(Self::$reason),+].len();
+            #[cfg(test)]
+            const ALL: [Self; Self::COUNT] = [$(Self::$reason),+];
+            const fn index(self) -> usize {
+                enum Index { $($reason),+ }
+                match self { $(Self::$reason => Index::$reason as usize),+ }
+            }
         }
-    }
+    };
 }
+allocation_declines!(
+    RequestNotRepresentable,
+    GenerationUnavailable,
+    ConcurrencyLimit,
+    AllocationCountLimit,
+    ByteLimit,
+    PolicyError,
+    PolicyPanic,
+    BufferRefused,
+);
 
 /// A snapshot of custom allocation across the process.
 ///
@@ -1590,6 +1599,47 @@ mod tests {
     use super::*;
     use crate::Error;
     use crate::StreamTier;
+    #[test]
+    fn every_decline_reason_has_one_counter() {
+        let registry = Registry::new(limits()).unwrap();
+        for reason in AllocationDecline::ALL {
+            registry.decline(reason);
+        }
+        let usage = registry.usage();
+        assert_eq!(
+            usage.declined_allocations(),
+            AllocationDecline::COUNT as u64
+        );
+        for reason in AllocationDecline::ALL {
+            assert_eq!(usage.declined(reason), 1);
+        }
+    }
+
+    #[test]
+    fn panicking_policy_destruction_keeps_its_generation_budget_charged() {
+        struct Panics;
+        impl ReceiveAllocator for Panics {
+            fn allocate(&self, request: AllocationRequest) -> Result<AllocationBuffer> {
+                AllocationBuffer::zeroed(request)
+            }
+        }
+        impl Drop for Panics {
+            fn drop(&mut self) {
+                panic!("contained policy destructor");
+            }
+        }
+        let registry = Registry::new(limits()).unwrap();
+        let earlier = registry.register(Panics).unwrap();
+        let replacement = registry.register(AllocationBuffer::zeroed).unwrap();
+        let mut slot = Some(earlier);
+        install_with(&registry, &mut slot, Some(replacement), || {});
+        assert_eq!(registry.usage().active_generations(), 1);
+        assert_eq!(registry.usage().generations(), 2);
+        registry.closing(replacement);
+        assert_eq!(registry.usage().active_generations(), 0);
+        assert_eq!(registry.usage().generations(), 1);
+    }
+
     #[test]
     fn native_allocation_formats_preserve_protection_and_decoded_formats() {
         use crate::advanced::packets::PROTECTED;
