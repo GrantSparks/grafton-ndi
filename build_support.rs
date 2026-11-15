@@ -19,6 +19,14 @@ const UMBRELLA_HEADER: &str = "Processing.NDI.Lib.h";
 /// The licence grant carried by every header that may be redistributed.
 pub const MIT_GRANT: &str = "Permission is hereby granted, free of charge";
 
+/// Clang's target spelling when it differs from Rust's.
+pub fn clang_target(target: &str) -> &str {
+    match target {
+        "aarch64-apple-visionos" => "aarch64-apple-xros",
+        _ => target,
+    }
+}
+
 /// Header file names classified by whether their declarations may be redistributed.
 pub struct Headers {
     pub licensed: Vec<String>,

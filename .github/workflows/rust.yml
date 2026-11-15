@@ -321,7 +321,10 @@ jobs:
       # Only the Advanced headers and the bindings check run bindgen.
       - name: Linux libclang
         if: runner.os == 'Linux' && (contains(matrix.package, 'advanced') || matrix.bindings)
-        run: sudo apt-get install --yes --no-install-recommends libclang-dev
+        run: |
+          # The bindings check includes visionOS, whose Clang triple is xros.
+          sudo apt-get install --yes --no-install-recommends libclang-19-dev
+          echo 'LIBCLANG_PATH=/usr/lib/llvm-19/lib' >> "$GITHUB_ENV"
       - name: 32-bit Linux linker and runtime dependencies
         if: matrix.target == 'i686-unknown-linux-gnu'
         run: |
