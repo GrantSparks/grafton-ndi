@@ -1497,6 +1497,11 @@ impl<M: ReceiverMode> Receiver<M> {
     /// source-rediscovery round trip — and the discovery race — that
     /// tearing down and rebuilding the receiver would incur.
     ///
+    /// This requests the last local target again. If a Discovery Server client
+    /// remotely changed this receiver's source, reconnecting replaces that
+    /// remote routing with the local target. Observe remote changes through
+    /// [`Self::poll_source_name_change`].
+    ///
     /// Observe native connection state with [`Self::is_connected`] and
     /// progress of the expected media with [`Self::connection_stats`]. A
     /// reconnect alone does not establish that new media has arrived.
@@ -1531,12 +1536,13 @@ impl<M: ReceiverMode> Receiver<M> {
         self.core.connect_raw(Some(&target.raw), &gate);
     }
 
-    /// An owned snapshot of the latest requested connection target.
+    /// An owned snapshot of the latest locally requested connection target.
     ///
     /// Initially the source specified in [`ReceiverOptions`], updated by each
     /// successful [`Self::connect_to`]. [`Self::disconnect`] retains it, and
-    /// [`Self::reconnect`] requests it again. This is the requested target;
-    /// observe actual connection changes with [`Self::poll_source_name_change`].
+    /// [`Self::reconnect`] requests it again. A Discovery Server client's remote
+    /// connection change does not update this local target. Observe actual
+    /// connection changes with [`Self::poll_source_name_change`].
     /// The snapshot clones the source's name and address. It never waits for
     /// captures or queued connection changes; a concurrent `connect_to` holds
     /// the target lock only while replacing the value after its request returns.

@@ -241,6 +241,11 @@ returns its owned snapshot. `disconnect()` retains it and `reconnect()` retries
 it. Success means the request was issued; observe connection state and media
 progress separately.
 
+The connection target is the last local request. A Discovery Server client's
+remote source change is observed through `poll_source_name_change()` and does
+not update `connection_target()`. Calling `reconnect()` requests the local
+target again, replacing any remote routing.
+
 ## Integrate with async runtimes
 
 Enable `tokio` or `smol` and wrap the receiver in the corresponding
