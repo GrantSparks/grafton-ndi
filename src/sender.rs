@@ -336,7 +336,8 @@ impl CompressedAudioSendMode for QueueAttached {}
 /// itself, and it cannot be registered with an advertiser.
 ///
 /// A sender is `Send` and `Sync`. Its operations take `&self` and may run on
-/// several threads at once, except asynchronous video submissions, which
+/// several threads at once, except the asynchronous video operations,
+/// `send_video_async`, `send_video_async_copy` and `finish_video_async`, which
 /// take `&mut self`. Tally polls preserve changes for a waiting thread;
 /// concurrent tally waits serialize and each change is consumed once.
 #[derive(Debug)]

@@ -558,14 +558,15 @@ unsafe impl Lend for PendingVideo {
     }
 }
 
+#[derive(Default)]
 /// The frame most recently submitted asynchronously on each stream.
 ///
 /// `Processing.NDI.Send.h` makes subsequent video sends synchronizing calls
 /// for the sender, across streams. The crate conservatively retains one frame
-/// per stream until the replacement on that same stream returns, or the native
-/// sender is destroyed. A synchronizing send on another stream can end the
-/// native loan earlier without releasing this retained storage to the caller.
-#[derive(Default)]
+/// per stream until the replacement on that same stream returns, finishing
+/// reclaims it, or the native sender is destroyed. A synchronizing send on
+/// another stream can end the native loan earlier without releasing this
+/// retained storage to the caller.
 pub(crate) struct PendingStreams {
     program: InFlight<PendingVideo>,
     preview: InFlight<PendingVideo>,
@@ -631,10 +632,13 @@ impl Loans for PendingStreams {
 
 /// A sender of compressed video and audio.
 ///
-/// The program and preview streams are independent: each asynchronous send
-/// keeps its frame until the next asynchronous send on the same stream, which
-/// returns the earlier frame for reuse. Which streams a codec needs, and how
-/// they must relate, is defined by the NDI Advanced SDK documentation.
+/// Each stream keeps the frame of its last asynchronous send until the next
+/// asynchronous send on that stream returns it, or finishing or closing
+/// reclaims it. The SDK has one asynchronous send outstanding per sender, so
+/// a send on either stream may wait for the SDK to finish with the other
+/// stream's frame. The crate still returns each frame through its own stream.
+/// Which streams a codec needs, and how they must relate, is defined by the
+/// NDI Advanced SDK documentation.
 ///
 /// The native sender is owned exclusively by this value.
 /// [`sender`](Self::sender) lends it in the [`CompressedAttached`] mode, which
