@@ -15,7 +15,7 @@ use std::ffi::c_void;
 
 use super::{
     send::PendingVideo,
-    send_slots::{DescriptorLease, DescriptorSlots},
+    send_slots::{DescriptorLease, DescriptorSlots, Released, SlotIdentity, SlotKey},
     CompressedVideoFrame, ScatterVideoFrame, SubmittedVideo,
 };
 use crate::{
@@ -318,12 +318,38 @@ struct Entry {
 }
 
 impl Entry {
-    fn into_completed(self) -> CompletedVideo {
-        CompletedVideo {
-            id: self.id,
-            frame: self.frame.into_frame(),
-        }
+    fn release(self, proof: Released<'_>) -> (CompletedVideo, SlotKey) {
+        // Rejecting a foreign proof must leak this entry's native pointees,
+        // rather than free a frame whose real loan may still be active.
+        let this = std::mem::ManuallyDrop::new(self);
+        this.slot.validate_release(&proof);
+        let Self {
+            id, slot, frame, ..
+        } = std::mem::ManuallyDrop::into_inner(this);
+        // Consuming packet storage releases its scatter view before its slot
+        // key can reenter admission. No frame or list is still native-borrowed.
+        let completed = CompletedVideo {
+            id,
+            frame: frame.into_frame(),
+        };
+        (completed, slot.release(proof))
     }
+}
+
+/// Minted only when the SDK identifies the exact in-flight entry as complete.
+/// Its private identity prevents another entry's completion from returning a key.
+pub(super) struct Completion {
+    slot: SlotIdentity,
+}
+impl Completion {
+    pub(super) fn identity(&self) -> SlotIdentity {
+        self.slot
+    }
+}
+
+struct ReadyEntry {
+    entry: Entry,
+    completion: Completion,
 }
 
 const _: () = {
@@ -343,13 +369,13 @@ struct State {
     // The frames the SDK may still read, by the address of their data.
     in_flight: HashMap<usize, Entry>,
     // The frames the SDK has finished with, in the order it reported them.
-    ready: VecDeque<Entry>,
+    ready: VecDeque<ReadyEntry>,
     bytes: usize,
     next: u64,
     options: QueueOptions,
     sender: Option<usize>,
     slots: std::sync::Arc<DescriptorSlots>,
-    free: Vec<usize>,
+    free: Vec<SlotKey>,
     // A fallibly reserved submission-thread workspace for rebuilding a map
     // whose deletion tombstones have consumed its insertion capacity.
     rehash: Vec<(usize, Entry)>,
@@ -390,25 +416,23 @@ impl State {
             ));
         };
         debug_assert_eq!(self.free.len() + self.retained(), self.options.frames);
-        let index = *self
+        let key = self
             .free
-            .last()
+            .pop()
             .expect("admission leaves a descriptor slot free");
-        // SAFETY: free contains only unclaimed slots or slots returned after
-        // collection/destruction ended their old native loans. The state lock
-        // and exclusive video view serialize admission and reclamation.
-        let mut slot = unsafe { self.slots.claim(index) };
+        let mut slot = self.slots.claim(key);
+        if let Some(sender) = self.sender {
+            slot.bind_sender(sender);
+        }
         let mut frame = frame.retain(&mut slot);
-        // A mismatched pixel proof fails here, before free/bytes/next/maps
-        // change. An unused prepared slot has never been exposed to the SDK.
+        // Frame-bound authorization makes descriptor construction infallible;
+        // no key is removed until all admission rejection checks have passed.
         let lent = frame.lend(());
         let pointer = slot.header(*lent.descriptor());
         let key = lent.descriptor().p_data as usize;
         if self.in_flight.capacity() == self.in_flight.len() {
             self.rebuild_index();
         }
-        let claimed = self.free.pop();
-        debug_assert_eq!(claimed, Some(index));
         let id = SubmissionId(self.next);
         self.next = next;
         self.bytes = total;
@@ -447,28 +471,28 @@ impl State {
     /// Release every retained entry only after native destruction. Both
     /// explicit close and implicit drop use this path, so even an unmatched
     /// completion cannot release a frame while the SDK might still use it.
-    fn release_retained(&mut self, destroyed: &Destroyed, mut release: impl FnMut(Entry)) {
+    fn release_retained(&mut self, destroyed: &Destroyed, mut release: impl FnMut(CompletedVideo)) {
         if let Some(sender) = self.sender {
             destroyed.assert_sender(sender);
         }
-        for entry in self.ready.drain(..) {
-            let index = entry.slot.index();
-            release(entry);
-            self.free.push(index);
+        for ready in self.ready.drain(..) {
+            let (completed, key) = ready.entry.release(Released::Destroyed(destroyed));
+            release(completed);
+            self.free.push(key);
         }
         for (_, entry) in self.in_flight.drain() {
-            let index = entry.slot.index();
-            release(entry);
-            self.free.push(index);
+            let (completed, key) = entry.release(Released::Destroyed(destroyed));
+            release(completed);
+            self.free.push(key);
         }
-        debug_assert_eq!(self.free.len(), self.options.frames);
+        assert_eq!(self.free.len(), self.options.frames);
         self.bytes = 0;
     }
 
     fn take_retained(&mut self, destroyed: &Destroyed) -> Vec<CompletedVideo> {
         let mut completed = Vec::with_capacity(self.retained());
         let ready = self.ready.len();
-        self.release_retained(destroyed, |entry| completed.push(entry.into_completed()));
+        self.release_retained(destroyed, |entry| completed.push(entry));
         // The ready prefix already records completion order. Sorting only the
         // unmatched suffix needs no allocation beyond the returned vector.
         completed[ready..].sort_unstable_by_key(|entry| entry.id.get());
@@ -500,11 +524,7 @@ impl CallbackState {
         rehash
             .try_reserve_exact(options.frames)
             .map_err(unavailable)?;
-        let slots = DescriptorSlots::new(options.frames)?;
-        let mut free = Vec::new();
-        free.try_reserve_exact(options.frames)
-            .map_err(unavailable)?;
-        free.extend((0..options.frames).rev());
+        let (slots, free) = DescriptorSlots::new(options.frames)?;
         let state = Box::new(Self {
             max_bytes: options.bytes,
             state: Mutex::new(State {
@@ -568,7 +588,12 @@ impl CallbackState {
             in_flight, ready, ..
         } = &mut *state;
         match in_flight.remove(&address) {
-            Some(entry) => ready.push_back(entry),
+            Some(entry) => {
+                let completion = Completion {
+                    slot: entry.slot.identity(),
+                };
+                ready.push_back(ReadyEntry { entry, completion });
+            }
             // No frame in flight has this data: the SDK named a frame twice,
             // or one it was never given.
             None => self.protocol_error.store(true, Ordering::Release),
@@ -1001,11 +1026,10 @@ impl QueuedVideo<'_> {
 }
 
 fn take_completed(state: &mut State) -> Option<CompletedVideo> {
-    let entry = state.ready.pop_front()?;
+    let ReadyEntry { entry, completion } = state.ready.pop_front()?;
     state.bytes -= entry.bytes;
-    let index = entry.slot.index();
-    let completed = entry.into_completed();
-    state.free.push(index);
+    let (completed, key) = entry.release(Released::Completed(completion));
+    state.free.push(key);
     Some(completed)
 }
 
@@ -1033,6 +1057,61 @@ mod tests {
         let (result, allocations) = crate::test_alloc::allocation_count(|| video.try_submit(frame));
         result.unwrap();
         assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn completion_proof_reclaims_only_its_own_descriptor_key() {
+        // A callback token is one-use authority, including when a slot's key
+        // is subsequently recycled for a different native loan.
+        trait AmbiguousIfClone<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        impl<T: Clone> AmbiguousIfClone<u8> for T {}
+        let _ = <Completion as AmbiguousIfClone<_>>::check;
+        let callback = CallbackState::new(QueueOptions::default().max_frames(2)).unwrap();
+        let mut submitted = Vec::new();
+        for _ in 0..2 {
+            let frame = VideoFrame::builder().resolution(2, 2).build().unwrap();
+            let bytes = frame.retained_bytes();
+            let admitted = callback
+                .state
+                .lock()
+                .unwrap()
+                .admit(
+                    QueuedVideoFrame::from(frame).authorize_for_test(None),
+                    bytes,
+                )
+                .unwrap();
+            submitted.push(admitted.lent.descriptor().p_data as usize);
+        }
+        callback.complete(submitted[0]);
+        {
+            let mut state = callback.state.lock().unwrap();
+            let ReadyEntry { entry, completion } = state.ready.pop_front().unwrap();
+            let other = &state.in_flight[&submitted[1]];
+            let proof = Released::Completed(completion);
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                other.slot.validate_release(&proof);
+            }));
+            assert!(
+                refused.is_err(),
+                "a different slot's proof cannot reclaim this key"
+            );
+            state.bytes -= entry.bytes;
+            let ((completed, key), allocations) =
+                crate::test_alloc::allocation_count(|| entry.release(proof));
+            assert_eq!(allocations, 0);
+            drop(completed);
+            state.free.push(key);
+            assert_eq!(state.free.len(), 1);
+        }
+        callback.complete(submitted[1]);
+        let mut state = callback.state.lock().unwrap();
+        let (_, allocations) = crate::test_alloc::allocation_count(|| take_completed(&mut state));
+        assert_eq!(allocations, 0);
+        assert_eq!(state.free.len(), state.options.frames);
+        assert_eq!(state.bytes, 0);
     }
 
     #[test]

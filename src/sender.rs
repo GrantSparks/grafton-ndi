@@ -756,9 +756,28 @@ pub(crate) mod in_flight {
         /// Release the frame `synchronized` proves the SDK has finished with,
         /// and take it, or the frame already retained.
         #[cfg(feature = "advanced")]
-        pub(crate) fn release(mut self, synchronized: Synchronized) -> Option<T> {
-            let _ = self.completed(synchronized);
-            self.take_retained()
+        #[cfg(test)]
+        pub(crate) fn release(self, synchronized: Synchronized) -> Option<T> {
+            self.release_with(synchronized, |frame, _| frame)
+        }
+
+        /// Consume a synchronization proof while releasing both a frame and
+        /// any descriptor keys it owns through the same proven operation.
+        #[cfg(feature = "advanced")]
+        pub(crate) fn release_with<R>(
+            mut self,
+            synchronized: Synchronized,
+            release: impl FnOnce(T, &Synchronized) -> R,
+        ) -> Option<R> {
+            if let Some(sender) = self.1 {
+                synchronized.assert_sender(sender);
+            }
+            match mem::take(&mut self.0) {
+                State::Idle => None,
+                State::Retained(frame) | State::InFlight(frame) => {
+                    Some(release(frame, &synchronized))
+                }
+            }
         }
 
         /// Remove the retained frame, leaving the slot idle. A frame in
