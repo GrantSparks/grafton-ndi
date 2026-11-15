@@ -7,7 +7,7 @@ use super::*;
 // Positive control: the actual acquisition path and snapshot kernel agree.
 fn a_finder_issued_guard_is_accepted(finder: &Finder) -> Result<Vec<Source>> {
     finder
-        .lock_snapshots(None)
+        .lock_snapshots(None, crate::timeout::NeverStop)
         .unwrap()
         .snapshot(&finder._ndi.api().core)
 }
