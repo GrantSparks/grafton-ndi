@@ -96,6 +96,7 @@ use std::{
 
 use crate::{
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
+    receiver::ConnectionTarget,
     timeout::Deadline,
     ConnectionStats, Error, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef, Result, Source,
     SourceNameChange, SpawnFailure,
@@ -590,6 +591,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// terminate; and [`Error::SpawnFailed`] for a missing runtime context or
     /// cancelled blocking task.
     ///
+    /// Input and capability errors are reported before work is submitted.
+    ///
     /// # Cancellation
     ///
     /// Dropping the future skips queued work and stops a started wait before
@@ -600,11 +603,15 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
         &self,
         timeout: Duration,
     ) -> Result<Option<SourceNameChange>> {
+        let deadline = Deadline::after(timeout)?;
+        let (source_name, strings) = self.inner.core.source_name_tables()?;
         let receiver = Arc::clone(&self.inner);
-        with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-            receiver.core.poll_source_name_change_until(deadline, stop)
+        R::spawn_stoppable(private::Token, move |stop| {
+            receiver
+                .core
+                .poll_source_name_change_with(source_name, strings, deadline, stop)
         })
-        .await
+        .await?
     }
 
     /// Whether the underlying receiver currently has at least one active
@@ -637,14 +644,15 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// continue while the SDK applies it. Success means the request was
     /// issued, not that the source is available; watch
     /// [`Self::poll_source_name_change`] or [`Self::connection_stats`].
-    /// `source` is copied, so that the blocking task can own it.
+    /// `source` is validated and converted once, on the calling task when
+    /// the future is first polled, so the blocking task owns its checked target.
     ///
     /// # Errors
     ///
     /// The errors of [`Receiver::connect_to`]: [`Error::InvalidCString`] when
     /// the source's name or address contains a NUL byte; and
     /// [`Error::SpawnFailed`] for a missing runtime context or
-    /// cancelled blocking task.
+    /// cancelled blocking task. Input errors are reported before work is submitted.
     ///
     /// # Cancellation
     ///
@@ -653,9 +661,9 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// connection change continues, including waiting for earlier connection changes,
     /// and may take effect after this future is dropped.
     pub async fn connect_to(&self, source: &Source) -> Result<()> {
+        let target = ConnectionTarget::new(source)?;
         let receiver = Arc::clone(&self.inner);
-        let source = source.clone();
-        R::spawn_blocking(private::Token, move || receiver.connect_to(&source)).await?
+        R::spawn_blocking(private::Token, move || receiver.connect_target(target)).await
     }
 
     /// Disconnect the underlying receiver from its source, retaining the
@@ -1144,6 +1152,27 @@ mod executor_tests {
 
     #[cfg(feature = "tokio")]
     #[test]
+    fn invalid_connect_is_rejected_before_entering_a_runtime() {
+        use std::task::{Context, Poll, Waker};
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = AsyncReceiver::<Tokio>::new(
+            Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new(""))).unwrap(),
+        );
+        let source = Source::new("NUL\0name");
+        let mut connect = std::pin::pin!(receiver.connect_to(&source));
+        assert!(matches!(
+            connect
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(Error::InvalidCString(_)))
+        ));
+        assert_eq!(receiver.receiver().connection_target(), Source::new(""));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
     fn tokio_resumes_blocking_panic() {
         let runtime = ::tokio::runtime::Builder::new_current_thread()
             .build()
@@ -1451,6 +1480,46 @@ mod receiver_tests {
                 blocker.await.unwrap();
                 assert_eq!(worker_capture_calls().await, 0);
             });
+        }
+
+        #[test]
+        fn async_connect_allocates_only_preparation_and_dispatch() {
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = unconnected::<Tokio>(&ndi);
+            let runtime = runtime();
+            runtime.block_on(receiver.reconnect()).unwrap();
+            for source in [
+                Source::new("allocation target"),
+                Source::new("allocation target")
+                    .with_address(crate::SourceAddress::new("192.0.2.1:5960")),
+            ] {
+                runtime.block_on(receiver.connect_to(&source)).unwrap();
+                let (result, synchronous) =
+                    crate::test_alloc::allocation_count(|| receiver.receiver().connect_to(&source));
+                result.unwrap();
+                let (result, dispatch) =
+                    crate::test_alloc::allocation_count(|| runtime.block_on(receiver.reconnect()));
+                result.unwrap();
+                let (result, asynchronous) = crate::test_alloc::allocation_count(|| {
+                    runtime.block_on(receiver.connect_to(&source))
+                });
+                result.unwrap();
+                assert_eq!(asynchronous, synchronous + dispatch, "source {source:?}");
+            }
+            let invalid = Source::new("NUL\0target");
+            let (synchronous, sync_allocations) =
+                crate::test_alloc::allocation_count(|| receiver.receiver().connect_to(&invalid));
+            let (asynchronous, async_allocations) = crate::test_alloc::allocation_count(|| {
+                runtime.block_on(receiver.connect_to(&invalid))
+            });
+            assert!(matches!(synchronous, Err(Error::InvalidCString(_))));
+            assert!(matches!(asynchronous, Err(Error::InvalidCString(_))));
+            assert_eq!(
+                async_allocations, sync_allocations,
+                "refused input must not dispatch work"
+            );
         }
 
         #[test]

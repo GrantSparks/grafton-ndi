@@ -925,11 +925,20 @@ impl<M: ReceiverMode + std::panic::UnwindSafe> std::panic::UnwindSafe for Receiv
 
 /// A requested target and the native descriptor already validated for it.
 /// Replaced as one value under the target lock, so neither half can be stale.
-struct ConnectionTarget {
+pub(crate) struct ConnectionTarget {
     source: Source,
     // Keep both the descriptor and its strings at stable addresses until a
     // replacement request returns, or the native receiver is destroyed.
     raw: Box<RawSource>,
+}
+
+impl ConnectionTarget {
+    pub(crate) fn new(source: &Source) -> Result<Self> {
+        Ok(Self {
+            source: source.clone(),
+            raw: Box::new(source.to_raw()?),
+        })
+    }
 }
 
 /// Only a receiver's connection lock can issue this permit.
@@ -1391,12 +1400,13 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Invalid input leaves the target unchanged. Existing FrameSync ownership
     /// remains.
     pub fn connect_to(&self, source: &Source) -> Result<()> {
-        let next = ConnectionTarget {
-            source: source.clone(),
-            raw: Box::new(source.to_raw()?),
-        };
-        self.core.lock_connection().connect(next);
+        self.connect_target(ConnectionTarget::new(source)?);
         Ok(())
+    }
+
+    /// Apply an input already validated on the synchronous or async caller.
+    pub(crate) fn connect_target(&self, target: ConnectionTarget) {
+        self.core.lock_connection().connect(target);
     }
 
     /// Disconnect while retaining the target for [`Self::reconnect`].
@@ -1934,15 +1944,19 @@ impl ReceiverCore {
         stop: impl Stop,
     ) -> Result<Option<SourceNameChange>> {
         // The query comes with the function that releases what it returns.
-        let (source_name, strings) = self
-            ._ndi
-            .table::<(sys::ReceiverSourceName, sys::ReceiverStrings)>()?;
+        let (source_name, strings) = self.source_name_tables()?;
         self.poll_source_name_change_with(source_name, strings, deadline, stop)
+    }
+
+    pub(crate) fn source_name_tables(
+        &self,
+    ) -> Result<&'static (sys::ReceiverSourceName, sys::ReceiverStrings)> {
+        self._ndi.table()
     }
 
     /// [`Self::poll_source_name_change_until`] through the given tables, so
     /// that a test can substitute the SDK functions.
-    fn poll_source_name_change_with(
+    pub(crate) fn poll_source_name_change_with(
         &self,
         source_name: &sys::ReceiverSourceName,
         strings: &sys::ReceiverStrings,
