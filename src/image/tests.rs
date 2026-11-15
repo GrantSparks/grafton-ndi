@@ -2593,6 +2593,49 @@ fn workspace_resources() {
     }
 }
 
+/// Separates output Vec growth from codec allocations. Run on the reference
+/// before changing output reservation, then on the candidate with the same inputs.
+#[test]
+#[ignore = "manual output growth, allocation and peak heap measurement"]
+fn workspace_output_growth_resources() {
+    use crate::test_alloc::{allocation_count, peak_bytes};
+    use std::{io::Write, time::Instant};
+    #[derive(Default)]
+    struct Output {
+        bytes: Vec<u8>,
+        growths: usize,
+    }
+    impl Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let capacity = self.bytes.capacity();
+            self.bytes.extend_from_slice(bytes);
+            self.growths += usize::from(self.bytes.capacity() != capacity);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    for (width, height) in [(1920, 1080), (3840, 2160)] {
+        let rgba = content_rgba("photographic", width, height, None);
+        let frame = padded(PixelFormat::Bgra, width as u32, height as u32, &rgba, 16);
+        for format in [ImageFormat::Png, ImageFormat::Jpeg(85), ImageFormat::WebpLossless] {
+            for reduction in [Downscale::Off, Downscale::Eighth] {
+                let options = options(format).png_compression(PngCompression::Fast).downscale(reduction);
+                let mut workspace = crate::ImageWorkspace::new();
+                let expected = workspace.encode(&frame, &options).unwrap();
+                let mut output = Output::default();
+                workspace.encode_to(&frame, &options, &mut output).unwrap();
+                assert_eq!(output.bytes, expected);
+                let retained = workspace.retained_bytes();
+                let start = Instant::now();
+                let ((image, allocations), peak) = peak_bytes(|| allocation_count(|| workspace.encode(&frame, &options).unwrap()));
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(image, expected);
+                eprintln!("output-growth,{width},{height},{format:?},{reduction:?},{},{},{},{allocations},{peak},{retained},{elapsed:.3}", image.len(), output.growths, output.bytes.capacity());
+            }
+        }
+    }
+}
+
 /// Measure image settings and resource use on local hardware;
 /// see `docs/image-encoding-performance.md` for interpretation:
 ///
