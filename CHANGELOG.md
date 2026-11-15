@@ -17,6 +17,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- `Finder::watch` replaces `Finder::wait_for_sources`. Keep one `SourceWatch`
+  per consumer and take snapshots and wait through that cursor, so concurrent
+  lookups cannot hide reports between a snapshot and its next wait.
 - Runtime selection conflicts carry `SelectionConflict` beside their diagnostic
   text. `RuntimeLoadFailed` carries a boxed `LoadFailure` with typed candidate
   locations, origins and refusals, including whether native code was loaded.
@@ -117,6 +120,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Added
 
+- `PictureAspectRatio` validates finite, nonnegative display ratios, including
+  the SDK's square-pixel request. Existing `f32` convenience setters remain.
 - `QueuedSender::close` returns every retained frame with its submission id,
   including frames left after a native completion-protocol failure. Explicit
   and implicit teardown release storage only after native destruction.
@@ -173,6 +178,13 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Performance and correctness
 
+- Every image encode into a writer flushes on success and preserves the first
+  writer error, including final JPEG and WebP writes from an owned `BufWriter`.
+- Custom receive buffers use the same stride validation as their requests.
+  Compressed buffers must match the requested payload size exactly; valid
+  uncompressed padding remains supported.
+- Synchronizer resources retain their receiver, source and configuration
+  dependencies through native destruction.
 - Queued sending reserves stable frame and scatter descriptors at construction.
   Accepted submissions allocate nothing; `QueueFull` refusals allocate only
   their returned `Rejected` value. Completion and collection remain allocation
