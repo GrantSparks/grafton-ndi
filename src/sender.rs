@@ -85,12 +85,6 @@ pub(crate) struct SendHandle<'a> {
     _owner: PhantomData<&'a SenderResource>,
 }
 
-impl SendHandle<'_> {
-    pub(crate) fn identity(self) -> usize {
-        self.instance.0 as usize
-    }
-}
-
 /// The handle of a sender, and the lock that pairs a metadata capture with
 /// its free.
 struct Inner {
@@ -500,16 +494,11 @@ pub(crate) mod in_flight {
     ///
     /// [NDI-Send]: https://docs.ndi.video/all/developing-with-ndi/sdk/ndi-send
     #[must_use = "the proof releases the frame the SDK synchronized"]
-    pub(crate) struct Synchronized(usize);
-
-    impl Synchronized {
-        pub(crate) fn assert_sender(&self, sender: usize) {
-            assert_eq!(
-                self.0, sender,
-                "synchronization proof belongs to another sender"
-            );
-        }
+    pub(crate) struct Synchronized {
+        _private: (),
     }
+
+    const _: () = assert!(std::mem::size_of::<Synchronized>() == 0);
 
     /// Proof that a native sender has been destroyed, which ends the SDK's
     /// access to every frame it was lent, on every stream.
@@ -519,22 +508,16 @@ pub(crate) mod in_flight {
     /// slots.
     #[cfg(feature = "advanced")]
     #[must_use = "the proof releases the frames of the destroyed sender"]
-    pub(crate) struct Destroyed(usize);
+    pub(crate) struct Destroyed {
+        _private: (),
+    }
 
     #[cfg(feature = "advanced")]
-    impl Destroyed {
-        pub(crate) fn assert_sender(&self, sender: usize) {
-            assert_eq!(
-                self.0, sender,
-                "destruction proof belongs to another sender"
-            );
-        }
-    }
+    const _: () = assert!(std::mem::size_of::<Destroyed>() == 0);
 
     /// The loan storage attached to one exclusive native sender.
     #[cfg(feature = "advanced")]
     pub(crate) trait Loans {
-        fn bind_sender(&mut self, sender: usize);
         fn release(self, destroyed: &Destroyed);
     }
 
@@ -556,8 +539,7 @@ pub(crate) mod in_flight {
     where
         M: super::SenderMode + super::mode_sealed::Sealed<Native = Exclusive>,
     {
-        pub(crate) fn new(sender: super::Sender<M>, mut loans: L) -> Self {
-            loans.bind_sender(sender.native_instance() as usize);
+        pub(crate) fn new(sender: super::Sender<M>, loans: L) -> Self {
             Self {
                 sender: mem::ManuallyDrop::new(sender),
                 loans: mem::ManuallyDrop::new(loans),
@@ -738,7 +720,7 @@ pub(crate) mod in_flight {
     /// [`Self::into_released`], which takes the proof that the sender was
     /// destroyed. Only a retained frame can be taken out. The state is
     /// private to this module, so no other code can reach a frame in flight.
-    pub(crate) struct InFlight<T>(State<T>, Option<usize>);
+    pub(crate) struct InFlight<T>(State<T>);
 
     #[derive(Default)]
     enum State<T> {
@@ -753,19 +735,11 @@ pub(crate) mod in_flight {
 
     impl<T> Default for InFlight<T> {
         fn default() -> Self {
-            Self(State::Idle, None)
+            Self(State::Idle)
         }
     }
 
     impl<T> InFlight<T> {
-        #[cfg(feature = "advanced")]
-        pub(crate) fn bind_sender(&mut self, sender: usize) {
-            if let Some(current) = self.1 {
-                assert_eq!(current, sender, "loan belongs to another sender");
-            }
-            self.1 = Some(sender);
-        }
-
         pub(crate) fn is_in_flight(&self) -> bool {
             matches!(self.0, State::InFlight(_))
         }
@@ -776,10 +750,7 @@ pub(crate) mod in_flight {
         /// `_synchronized` proves that the SDK has returned from a
         /// synchronizing call on this slot's stream made after the frame was
         /// submitted.
-        pub(crate) fn completed(&mut self, synchronized: Synchronized) -> Option<&T> {
-            if let Some(sender) = self.1 {
-                synchronized.assert_sender(sender);
-            }
+        pub(crate) fn completed(&mut self, _synchronized: Synchronized) -> Option<&T> {
             match mem::take(&mut self.0) {
                 State::InFlight(frame) => {
                     self.0 = State::Retained(frame);
@@ -808,9 +779,6 @@ pub(crate) mod in_flight {
             synchronized: Synchronized,
             release: impl FnOnce(T, &Synchronized) -> R,
         ) -> Option<R> {
-            if let Some(sender) = self.1 {
-                synchronized.assert_sender(sender);
-            }
             match mem::take(&mut self.0) {
                 State::Idle => None,
                 State::Retained(frame) | State::InFlight(frame) => {
@@ -834,10 +802,7 @@ pub(crate) mod in_flight {
         /// The frame, whatever its state, once the native sender it was lent
         /// to has been destroyed.
         #[cfg(feature = "advanced")]
-        pub(crate) fn into_released(mut self, destroyed: &Destroyed) -> Option<T> {
-            if let Some(sender) = self.1 {
-                destroyed.assert_sender(sender);
-            }
+        pub(crate) fn into_released(mut self, _destroyed: &Destroyed) -> Option<T> {
             match mem::take(&mut self.0) {
                 State::Idle => None,
                 State::Retained(frame) | State::InFlight(frame) => Some(frame),
@@ -889,17 +854,13 @@ pub(crate) mod in_flight {
             // The slot owns the new frame before the SDK sees it. Moving the
             // frame does not move what `lent` points to (the contract of
             // `Lend`).
-            if let Some(current) = self.1 {
-                assert_eq!(current, sender.identity(), "loan belongs to another sender");
-            }
-            self.1 = Some(sender.identity());
-            let displaced = Self(mem::replace(&mut self.0, State::InFlight(next)), self.1);
+            let displaced = Self(mem::replace(&mut self.0, State::InFlight(next)));
             // SAFETY: the slot owns the new payload and stable scatter list;
             // this call-scoped header stays readable through submission. The
             // displaced frame remains owned across this call and is returned
             // only with the synchronization proof produced after it returns.
             unsafe { lent.submit(sender, lent.descriptor()) };
-            (displaced, Synchronized(sender.identity()))
+            (displaced, Synchronized { _private: () })
         }
     }
 
@@ -908,9 +869,6 @@ pub(crate) mod in_flight {
         /// NULL frame pointer, the SDK's documented request to drain the
         /// asynchronous buffer.
         pub(crate) fn flush(&mut self, sender: SendHandle<'_>) -> Synchronized {
-            if let Some(owner) = self.1 {
-                assert_eq!(owner, sender.identity(), "loan belongs to another sender");
-            }
             // SAFETY: `sender` is the live sender whose stream this slot
             // holds, and a null frame pointer is the SDK's documented request
             // to drain the async buffer.
@@ -919,7 +877,7 @@ pub(crate) mod in_flight {
                     .core
                     .NDIlib_send_send_video_async_v2(sender.instance.0, async_flush_frame_ptr())
             };
-            Synchronized(sender.identity())
+            Synchronized { _private: () }
         }
 
         /// Send `frame` synchronously. When this returns, the SDK has
@@ -929,9 +887,6 @@ pub(crate) mod in_flight {
             sender: SendHandle<'_>,
             frame: PreparedVideo<'_>,
         ) -> Synchronized {
-            if let Some(owner) = self.1 {
-                assert_eq!(owner, sender.identity(), "loan belongs to another sender");
-            }
             let raw = frame.raw;
             // SAFETY: `sender` is the live sender whose stream this slot
             // holds. `raw` points into pixels and metadata that `frame`
@@ -945,7 +900,7 @@ pub(crate) mod in_flight {
                     .core
                     .NDIlib_send_send_video_v2(sender.instance.0, &raw)
             };
-            Synchronized(sender.identity())
+            Synchronized { _private: () }
         }
     }
 
@@ -965,10 +920,9 @@ pub(crate) mod in_flight {
             native: Exclusive(resource),
             ..
         } = sender;
-        let identity = resource.instance.0 as usize;
         // The only owner: dropping it calls `NDIlib_send_destroy`.
         drop(resource);
-        Destroyed(identity)
+        Destroyed { _private: () }
     }
 
     #[cfg(test)]
@@ -988,7 +942,7 @@ pub(crate) mod in_flight {
                 }
             }
             let drops = Arc::new(AtomicUsize::new(0));
-            let slot = InFlight(State::InFlight(Counted(Arc::clone(&drops))), Some(1));
+            let slot = InFlight(State::InFlight(Counted(Arc::clone(&drops))));
             let result = std::panic::catch_unwind(|| drop(slot));
             assert_eq!(result.is_err(), cfg!(debug_assertions));
             assert_eq!(
@@ -998,36 +952,16 @@ pub(crate) mod in_flight {
             );
         }
 
-        #[cfg(feature = "advanced")]
-        #[test]
-        fn a_destruction_proof_cannot_release_another_senders_loan() {
-            let slot = InFlight(State::InFlight(1u8), Some(1));
-            let result = std::panic::catch_unwind(|| slot.into_released(&Destroyed(2)));
-            assert!(result.is_err());
-        }
-
-        #[test]
-        fn a_foreign_synchronization_proof_keeps_the_loan_in_flight() {
-            let mut slot = InFlight(State::InFlight(7u8), Some(1));
-            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = slot.completed(Synchronized(2));
-            }));
-            assert!(refused.is_err());
-            assert!(slot.is_in_flight());
-            assert_eq!(slot.completed(Synchronized(1)), Some(&7));
-            assert_eq!(slot.take_retained(), Some(7));
-        }
-
         /// A frame in flight comes out of its slot only with a proof, and is
         /// completed only once.
         #[test]
         fn a_slot_releases_its_frame_only_with_proof() {
-            let mut slot = InFlight(State::InFlight(1u8), Some(1));
+            let mut slot = InFlight(State::InFlight(1u8));
             assert!(slot.take_retained().is_none());
             assert!(slot.is_in_flight());
-            assert_eq!(slot.completed(Synchronized(1)), Some(&1));
+            assert_eq!(slot.completed(Synchronized { _private: () }), Some(&1));
             assert!(!slot.is_in_flight());
-            assert_eq!(slot.completed(Synchronized(1)), None);
+            assert_eq!(slot.completed(Synchronized { _private: () }), None);
             assert_eq!(slot.take_retained(), Some(1));
             assert!(slot.take_retained().is_none());
             assert!(slot.frame().is_none());
@@ -1036,12 +970,12 @@ pub(crate) mod in_flight {
         #[cfg(feature = "advanced")]
         #[test]
         fn a_displaced_or_destroyed_slot_hands_back_what_it_held() {
-            let release = |state| InFlight(state, Some(1)).release(Synchronized(1));
+            let release = |state| InFlight(state).release(Synchronized { _private: () });
             assert_eq!(release(State::InFlight(1u8)), Some(1));
             assert_eq!(release(State::Retained(2)), Some(2));
             assert_eq!(release(State::Idle), None);
-            let destroyed = Destroyed(1);
-            let unsent = |state| InFlight(state, Some(1)).into_released(&destroyed);
+            let destroyed = Destroyed { _private: () };
+            let unsent = |state| InFlight(state).into_released(&destroyed);
             assert_eq!(unsent(State::InFlight(3u8)), Some(3));
             assert_eq!(unsent(State::Retained(4)), Some(4));
             assert_eq!(unsent(State::Idle), None);

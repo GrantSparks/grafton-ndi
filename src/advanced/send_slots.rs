@@ -47,7 +47,6 @@ impl SlotKey {
     pub(super) fn claim(self) -> DescriptorLease {
         DescriptorLease {
             key: self,
-            sender: None,
             header_written: false,
             #[cfg(ndi_has_advanced_scatter_send)]
             scatter_written: false,
@@ -64,17 +63,12 @@ pub(super) enum Released<'a> {
 }
 
 impl Released<'_> {
-    fn validate(&self, sender: Option<usize>) {
+    /// Consume the authority supplied by the owning synchronization operation.
+    fn consume(self) {
         match self {
-            Self::Completed(_) => {}
-            Self::Synchronized(proof) => {
-                proof.assert_sender(sender.expect("a compressed loan is bound to its sender"))
-            }
-            Self::Destroyed(proof) => {
-                if let Some(sender) = sender {
-                    proof.assert_sender(sender);
-                }
-            }
+            Self::Completed(_completion) => {}
+            Self::Synchronized(_synchronized) => {}
+            Self::Destroyed(_destroyed) => {}
         }
     }
 }
@@ -112,29 +106,15 @@ impl DescriptorSlots {
 /// A dropped lease loses its key; unwinding cannot make a live slot reusable.
 pub(super) struct DescriptorLease {
     key: SlotKey,
-    sender: Option<usize>,
     header_written: bool,
     #[cfg(ndi_has_advanced_scatter_send)]
     scatter_written: bool,
 }
 
 impl DescriptorLease {
-    pub(super) fn bind_sender(&mut self, sender: usize) {
-        if let Some(current) = self.sender {
-            assert_eq!(current, sender, "descriptor loan belongs to another sender");
-        }
-        self.sender = Some(sender);
-    }
-
-    pub(super) fn validate_release(&self, proof: &Released<'_>) {
-        proof.validate(self.sender);
-    }
-
     pub(super) fn release(self, proof: Released<'_>) -> SlotKey {
-        // A rejected proof must retain native pointees rather than free them.
-        let this = std::mem::ManuallyDrop::new(self);
-        this.validate_release(&proof);
-        std::mem::ManuallyDrop::into_inner(this).key
+        proof.consume();
+        self.key
     }
 
     pub(super) fn header(
@@ -171,7 +151,6 @@ impl DescriptorLease {
             owner: Arc::clone(&self.key.owner),
             index: self.key.index,
             key: None,
-            sender: self.sender,
         }
     }
 
@@ -192,7 +171,6 @@ pub(super) struct ScatterLease {
     owner: Arc<DescriptorSlots>,
     index: usize,
     key: Option<SlotKey>,
-    sender: Option<usize>,
 }
 
 #[cfg(ndi_has_advanced_scatter_send)]
@@ -208,16 +186,9 @@ impl ScatterLease {
         self.key.is_some()
     }
 
-    pub(super) fn validate_release(&self, proof: &Released<'_>) {
-        if self.key.is_some() {
-            proof.validate(self.sender);
-        }
-    }
-
     pub(super) fn release(self, proof: Released<'_>) -> Option<SlotKey> {
-        let this = std::mem::ManuallyDrop::new(self);
-        this.validate_release(&proof);
-        std::mem::ManuallyDrop::into_inner(this).key
+        proof.consume();
+        self.key
     }
 }
 
@@ -225,12 +196,19 @@ impl ScatterLease {
 mod tests {
     use super::*;
 
-    /// Compile the actual storage module, with only unrelated SDK proof types
-    /// stubbed. The accepted fixture rules out missing imports/privacy as the
-    /// reason the two ownership fixtures fail.
+    /// Compile the actual storage module and release-proof declarations.
+    /// The accepted fixture rules out unrelated imports or privacy failures;
+    /// rejected fixtures pin move-only keys and owner-private proof constructors.
     #[test]
     fn slot_keys_cannot_be_reused_or_cloned() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let proof_declaration = |name: &str| {
+            let source = include_str!("../sender.rs");
+            let marker = format!("pub(crate) struct {name} {{");
+            let start = source.find(&marker).unwrap();
+            let declaration = &source[start..];
+            &declaration[..declaration.find("\n    }").unwrap() + 6]
+        };
         let prelude = format!(
             r#"
 #![allow(dead_code, unused_imports, non_camel_case_types, non_snake_case, non_upper_case_globals)]
@@ -239,10 +217,8 @@ use std::sync::Arc;
 pub(crate) mod bindings;
 mod sys {{ pub(crate) use crate::bindings; }}
 mod sender {{ pub mod in_flight {{
-    pub struct Synchronized;
-    pub struct Destroyed;
-    impl Synchronized {{ pub fn assert_sender(&self, _: usize) {{ unimplemented!() }} }}
-    impl Destroyed {{ pub fn assert_sender(&self, _: usize) {{ unimplemented!() }} }}
+    {synchronized}
+    {destroyed}
 }} }}
 mod queued {{
     {completion}
@@ -255,6 +231,8 @@ mod send_slots;
             bindings = root.join("src/sys/bindings.rs"),
             aliasable = root.join("src/advanced/aliasable.rs"),
             slots = root.join("src/advanced/send_slots.rs"),
+            synchronized = proof_declaration("Synchronized"),
+            destroyed = proof_declaration("Destroyed"),
             completion = {
                 let source = include_str!("queued.rs");
                 let start = source.find("pub(super) struct Completion {").unwrap();
@@ -278,6 +256,8 @@ mod send_slots;
             ),
             ("moved", moved.to_owned(), Some("E0382")),
             ("cloned", cloned.to_owned(), Some("E0599")),
+            ("synchronized_private", include_str!("../../tests/ui/internal/fail/synchronization_requires_its_owner.rs").to_owned(), Some("E0451")),
+            ("destroyed_private", include_str!("../../tests/ui/internal/fail/destruction_requires_its_owner.rs").to_owned(), Some("E0451")),
             ("completion_private", include_str!("../../tests/ui/internal/fail/completion_requires_its_queue.rs").to_owned(), Some("E0451")),
             ("foreign_storage", include_str!("../../tests/ui/internal/fail/descriptor_slot_key_cannot_claim_other_storage.rs").to_owned(), Some("E0599")),
         ] {

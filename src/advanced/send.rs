@@ -550,12 +550,7 @@ impl PendingVideo {
         self,
         _proof: super::send_slots::Released<'_>,
     ) -> (SubmittedVideo, Option<super::send_slots::SlotKey>) {
-        let this = std::mem::ManuallyDrop::new(self);
-        #[cfg(ndi_has_advanced_scatter_send)]
-        if let Self::Scatter { list, .. } = &*this {
-            list.validate_release(&_proof);
-        }
-        match std::mem::ManuallyDrop::into_inner(this) {
+        match self {
             Self::Contiguous(frame) => (SubmittedVideo::Contiguous(frame), None),
             #[cfg(ndi_has_advanced_scatter_send)]
             Self::Scatter { frame, list, .. } => {
@@ -643,8 +638,7 @@ impl PendingStreams {
             .next
             .take()
             .expect("a stream keeps one alternate scatter key");
-        let mut slot = key.claim();
-        slot.bind_sender(sender.identity());
+        let slot = key.claim();
         let list = slot.into_scatter(frame.storage.descriptor(table));
         let pending = PendingVideo::Scatter { frame, list, table };
         #[cfg(test)]
@@ -716,11 +710,6 @@ impl PendingStreams {
 }
 
 impl Loans for PendingStreams {
-    fn bind_sender(&mut self, sender: usize) {
-        self.program.bind_sender(sender);
-        self.preview.bind_sender(sender);
-    }
-
     fn release(self, destroyed: &Destroyed) {
         drop(self.into_reclaimed(destroyed));
     }
