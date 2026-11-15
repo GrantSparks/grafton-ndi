@@ -744,8 +744,10 @@ impl VideoHeader {
 /// storage that [`layout`](Self::layout) describes, with every active row
 /// initialized and unchanged while `self` is borrowed. Row padding need not
 /// be initialized. Metadata text must remain a bounded NUL-terminated UTF-8
-/// string for the borrow. An overridden `can_send_direct` additionally guarantees
-/// initialization of the SDK's entire read, including padding and tail room.
+/// string for the borrow. An [`Initialized::Storage`] report guarantees every
+/// byte of the layout's storage, padding included, is initialized. Its
+/// `room_after` bytes after the last active pixel are also initialized and
+/// readable in that same allocation; final-row padding counts towards them.
 /// Copying, views and descriptors are non-overridable helpers.
 pub(crate) unsafe trait VideoParts {
     /// The validated layout of the frame's pixels.
@@ -763,12 +765,22 @@ pub(crate) unsafe trait VideoParts {
     /// The time the sender submitted the frame, when it is known.
     fn sdk_timestamp(&self) -> Option<SdkTimestamp>;
 
-    /// Whether the SDK's complete synchronous read is known to be initialized.
+    /// Which bytes the storage's owner guarantees are initialized.
     /// Capture guarantees only active pixels, never padding or trailing room.
-    fn can_send_direct(&self) -> bool {
-        self.layout().payload_len_bytes == self.layout().data_len_bytes
-            && crate::pixels::send_room(self.layout(), self.header().scan_type) == 0
+    fn initialized(&self) -> Initialized {
+        Initialized::ActiveRows
     }
+}
+
+/// The initialized extent reported by a validated video storage owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Initialized {
+    /// Only the active rows are known initialized.
+    ActiveRows,
+    /// All layout storage is initialized, including padding, and `room_after`
+    /// initialized bytes follow the last active pixel in the same allocation.
+    /// The final row's padding is part of that room.
+    Storage { room_after: usize },
 }
 
 // SAFETY: a reference forwards every accessor and keeps its original owner
@@ -789,13 +801,25 @@ unsafe impl<T: VideoParts + ?Sized> VideoParts for &T {
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
         (**self).sdk_timestamp()
     }
-    fn can_send_direct(&self) -> bool {
-        (**self).can_send_direct()
+    fn initialized(&self) -> Initialized {
+        (**self).initialized()
     }
 }
 
 /// Shared operations whose blanket implementation prevents per-frame overrides.
 pub(crate) trait VideoPartsExt: VideoParts {
+    /// Whether one complete SDK read fits the owner's initialized extent.
+    fn can_send_direct(&self) -> bool {
+        let layout = self.layout();
+        let room = crate::pixels::send_room(layout, self.header().scan_type);
+        match self.initialized() {
+            Initialized::Storage { room_after } => room_after >= room,
+            Initialized::ActiveRows => {
+                layout.payload_len_bytes == layout.data_len_bytes && room == 0
+            }
+        }
+    }
+
     /// Keep the metadata's status beside its text for a lazy color read.
     fn color_metadata(&self) -> crate::color_info::Metadata<'_> {
         crate::color_info::Metadata::new(self.frame_metadata())
@@ -937,8 +961,10 @@ unsafe impl VideoParts for PackedVideo<'_> {
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
         self.timestamp
     }
-    fn can_send_direct(&self) -> bool {
-        true
+    fn initialized(&self) -> Initialized {
+        Initialized::Storage {
+            room_after: self.pixels.room(),
+        }
     }
 }
 
@@ -1537,7 +1563,8 @@ pub struct VideoFrame {
 
 // SAFETY: Pixels owns and initializes the validated layout and scan-dependent
 // SDK tail. OwnedFrameMetadata owns bounded terminated text. Immutable borrows keep
-// both allocations unchanged; can_send_direct includes all SDK-readable room.
+// both allocations unchanged. Its initialized report comes from Pixels'
+// tracked room, including every byte after its tightly packed active pixels.
 unsafe impl VideoParts for VideoFrame {
     #[inline]
     fn layout(&self) -> &ValidatedVideoLayout {
@@ -1560,10 +1587,10 @@ unsafe impl VideoParts for VideoFrame {
         self.timestamp
     }
 
-    fn can_send_direct(&self) -> bool {
-        // Every construction and mutation preserves the complete initialized
-        // SDK read extent, including the current scan type's extra rows.
-        true
+    fn initialized(&self) -> Initialized {
+        Initialized::Storage {
+            room_after: self.data.room(),
+        }
     }
 }
 
@@ -1707,7 +1734,14 @@ impl VideoFrame {
     /// the SDK to read, including any scan-dependent extra rows.
     #[cfg(test)]
     pub(crate) fn tail_room(&self) -> usize {
-        self.data.tail_room()
+        self.data.room()
+    }
+
+    /// Deliberately omit the owned-send room to exercise loan-boundary repair.
+    #[cfg(test)]
+    pub(crate) fn without_send_room_for_test(mut self) -> Self {
+        self.data = Pixels::adopt(self.data.as_slice().to_vec(), 0);
+        self
     }
 
     /// Replace the owned frame data while preserving the validated layout.
@@ -3494,6 +3528,20 @@ impl<'a, F: VideoParts + ?Sized> Sendable<&'a F> {
     /// Borrowed gates return their typed refusal without allocating recovery storage.
     pub(crate) fn borrowed(frame: &'a F, ndi: &crate::Ndi) -> Result<Self> {
         Self::checked(frame, ndi).map_err(|(error, _)| error)
+    }
+}
+
+impl Sendable<VideoFrame> {
+    /// Establish this owned loan's complete initialized read extent before
+    /// constructing the descriptor. Already sufficient room requires only the
+    /// comparison in `reserve_room` and never grows the allocation.
+    pub(crate) fn owned_video_descriptor(&mut self) -> NDIlib_video_frame_v2_t {
+        let frame = &mut self.frame;
+        frame.data.reserve_room(crate::pixels::send_room(
+            &frame.layout,
+            frame.header.scan_type,
+        ));
+        self.video_descriptor()
     }
 }
 
@@ -9723,7 +9771,7 @@ mod tests {
                         - format.buffer_len(18, height).unwrap();
                     let holds_room = |frame: &VideoFrame, label: &str| {
                         assert_eq!(frame.tail_room(), room, "{format:?} {label}");
-                        assert_eq!(frame.data.room(), vec![0; room], "{format:?} {label}");
+                        assert_eq!(frame.data.room_bytes(), vec![0; room], "{format:?} {label}");
                         assert!(VideoSource::sends_in_place(frame), "{format:?} {label}");
                     };
 
@@ -9832,7 +9880,11 @@ mod tests {
                 let raw = frame.as_test_raw();
                 assert_eq!(raw.p_data.cast_const(), frame.data().as_ptr());
                 assert_eq!(frame.tail_room(), needed, "{format:?} {scan:?}");
-                assert_eq!(frame.data.room(), vec![0; needed], "{format:?} {scan:?}");
+                assert_eq!(
+                    frame.data.room_bytes(),
+                    vec![0; needed],
+                    "{format:?} {scan:?}"
+                );
                 assert_eq!(frame.data(), vec![7; len], "{format:?} {scan:?}");
                 assert!(VideoSource::sends_in_place(&frame));
                 // Repeating this scan type and every already-covered type
@@ -9862,7 +9914,7 @@ mod tests {
             });
             assert_eq!(allocations, 0);
             assert_eq!(frame.data().as_ptr(), address);
-            assert!(frame.data.room().iter().all(|&byte| byte == 0));
+            assert!(frame.data.room_bytes().iter().all(|&byte| byte == 0));
         }
     }
 
@@ -9915,7 +9967,7 @@ mod tests {
             } = expected;
             assert_eq!(data.len(), layout.data_len_bytes);
             let room = crate::pixels::send_room(layout, header.scan_type);
-            assert_eq!(data.room(), vec![0; room]);
+            assert_eq!(data.room_bytes(), vec![0; room]);
             assert_eq!(format!("{layout:?}"), format!("{expected_layout:?}"));
             assert_eq!(format!("{header:?}"), format!("{expected_header:?}"));
             assert_eq!(data.as_slice(), expected_data.as_slice());

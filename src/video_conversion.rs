@@ -250,6 +250,9 @@ unsafe impl VideoParts for P216Output<'_> {
     fn sdk_timestamp(&self) -> Option<crate::SdkTimestamp> {
         None
     }
+    fn initialized(&self) -> crate::frames::Initialized {
+        crate::frames::Initialized::Storage { room_after: 0 }
+    }
 }
 
 /// Native V210/P216 conversion helpers retained with their selected runtime.
@@ -390,6 +393,19 @@ impl VideoConverter {
 mod tests {
     use super::*;
     use crate::Timecode;
+
+    #[test]
+    fn p216_output_reports_initialized_storage_without_extra_room() {
+        let layout =
+            ValidatedVideoLayout::new_uncompressed(PixelFormat::P216, 12, 4, None).unwrap();
+        let mut bytes = vec![0; layout.data_len_bytes()];
+        let output = P216Output::new(layout, &mut bytes).unwrap();
+        assert_eq!(
+            output.initialized(),
+            crate::frames::Initialized::Storage { room_after: 0 }
+        );
+        assert!(crate::frames::VideoPartsExt::can_send_direct(&output));
+    }
 
     #[test]
     fn p216_conversion_descriptor_fits_its_borrowed_storage() {

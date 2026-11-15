@@ -186,15 +186,14 @@ impl Pixels {
     }
 
     /// The number of zero bytes that follow the pixels.
-    #[cfg(test)]
-    pub(crate) fn tail_room(&self) -> usize {
+    pub(crate) fn room(&self) -> usize {
         self.tail
     }
 
     /// The bytes after the pixels, read from the allocation as the SDK reads
     /// them.
     #[cfg(test)]
-    pub(crate) fn room(&self) -> &[u8] {
+    pub(crate) fn room_bytes(&self) -> &[u8] {
         assert!(self.capacity() >= self.len() + self.tail);
         // SAFETY: `tail` bytes after the pixels are inside the allocation
         // and initialized, by `seal`, and nothing writes them while `self`
@@ -231,14 +230,11 @@ mod tests {
         let (pixels, allocations) = crate::test_alloc::allocation_count(|| Pixels::zeroed(100, 64));
         assert_eq!(allocations, 1);
         assert_eq!(pixels.as_slice(), [0; 100]);
-        assert_eq!((pixels.capacity(), pixels.tail_room()), (164, 64));
-        assert_eq!(pixels.room(), [0; 64]);
+        assert_eq!((pixels.capacity(), pixels.room()), (164, 64));
+        assert_eq!(pixels.room_bytes(), [0; 64]);
 
         let exact = Pixels::zeroed(100, 0);
-        assert_eq!(
-            (exact.len(), exact.capacity(), exact.tail_room()),
-            (100, 100, 0)
-        );
+        assert_eq!((exact.len(), exact.capacity(), exact.room()), (100, 100, 0));
     }
 
     #[test]
@@ -254,7 +250,7 @@ mod tests {
         assert_eq!(allocations, 0);
         assert_eq!(pixels.as_ptr(), address);
         assert_eq!(pixels.as_slice(), [7; 100]);
-        assert_eq!(pixels.room(), [0; 64]);
+        assert_eq!(pixels.room_bytes(), [0; 64]);
 
         // Without a need for room an exact vector is untouched.
         let exact = vec![7; 100];
@@ -269,8 +265,8 @@ mod tests {
         let exact = vec![7; 100];
         let pixels = Pixels::adopt(exact, 64);
         assert_eq!(pixels.as_slice(), [7; 100]);
-        assert_eq!((pixels.capacity(), pixels.tail_room()), (164, 64));
-        assert_eq!(pixels.room(), [0; 64]);
+        assert_eq!((pixels.capacity(), pixels.room()), (164, 64));
+        assert_eq!(pixels.room_bytes(), [0; 64]);
     }
 
     #[test]
@@ -281,7 +277,7 @@ mod tests {
         }));
         assert!(result.is_err());
         assert_eq!(pixels.len(), 8);
-        assert_eq!(pixels.room(), [0; 64]);
+        assert_eq!(pixels.room_bytes(), [0; 64]);
     }
 
     #[test]
@@ -297,7 +293,7 @@ mod tests {
             assert_eq!(pixels.as_ptr(), address);
             assert_eq!(pixels.as_slice(), vec![value; len]);
             // The room is zero even where an earlier, longer fill wrote.
-            assert_eq!(pixels.room(), vec![0; tail]);
+            assert_eq!(pixels.room_bytes(), vec![0; tail]);
         }
     }
 
@@ -309,14 +305,14 @@ mod tests {
         });
         assert_eq!(allocations, 1);
         assert_eq!((pixels.len(), pixels.capacity()), (101, 165));
-        assert_eq!(pixels.room(), [0; 64]);
+        assert_eq!(pixels.room_bytes(), [0; 64]);
 
         // Storage that never allocated is filled the same way.
         let mut empty = Pixels::default();
-        assert_eq!((empty.capacity(), empty.tail_room()), (0, 0));
+        assert_eq!((empty.capacity(), empty.room()), (0, 0));
         empty.fill(8, 64, |bytes| bytes.extend_from_slice(&[6; 8]));
         assert_eq!((empty.as_slice(), empty.capacity()), (&[6; 8][..], 72));
-        assert_eq!(empty.room(), [0; 64]);
+        assert_eq!(empty.room_bytes(), [0; 64]);
     }
 
     #[test]
@@ -327,8 +323,8 @@ mod tests {
         assert_eq!(allocations, 1);
         assert_ne!(copy.as_ptr(), pixels.as_ptr());
         assert_eq!(copy.as_slice(), [3; 100]);
-        assert_eq!((copy.capacity(), copy.tail_room()), (164, 64));
-        assert_eq!(copy.room(), [0; 64]);
+        assert_eq!((copy.capacity(), copy.room()), (164, 64));
+        assert_eq!(copy.room_bytes(), [0; 64]);
     }
     #[test]
     fn a_short_refill_restores_the_previous_initialized_length_for_both_media() {
@@ -357,6 +353,6 @@ mod tests {
         assert!(failed.is_err());
         assert_eq!(pixels.len(), 8);
         assert_eq!(pixels.tail_room(), 64);
-        assert_eq!(pixels.room(), [0; 64]);
+        assert_eq!(pixels.room_bytes(), [0; 64]);
     }
 }

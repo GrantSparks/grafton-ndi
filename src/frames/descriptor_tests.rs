@@ -87,6 +87,7 @@ struct ValidatedVideoLayout { payload_len_bytes: usize, data_len_bytes: usize }
 struct VideoHeader { scan_type: () }
 struct FrameMetadataRef<'a>(std::marker::PhantomData<&'a ()>);
 struct SdkTimestamp;
+enum Initialized { ActiveRows, Storage { room_after: usize } }
 mod pixels { pub fn send_room(_: &super::ValidatedVideoLayout, _: ()) -> usize { 0 } }
 "#;
     let directory = std::env::temp_dir().join(format!(
@@ -119,6 +120,7 @@ mod pixels { pub fn send_room(_: &super::ValidatedVideoLayout, _: ()) -> usize {
         "copy_into_owned",
         "copy_active_pixels",
         "video_descriptor",
+        "can_send_direct",
     ] {
         let path = directory.join(format!("{helper}.rs"));
         std::fs::write(
@@ -228,6 +230,7 @@ struct ValidatedAudioLayout;
 struct FrameMetadataRef<'a>(std::marker::PhantomData<&'a ()>);
 struct MetadataText<'a>(std::marker::PhantomData<&'a ()>);
 struct SdkTimestamp;
+enum Initialized { ActiveRows, Storage { room_after: usize } }
 struct Timecode;
 "#;
         let directory =
@@ -314,7 +317,7 @@ fn a_failed_copy_check_leaves_the_destination_consistent() {
         destination.data().len(),
         destination.layout.data_len_bytes()
     );
-    assert!(destination.data.room().iter().all(|&byte| byte == 0));
+    assert!(destination.data.room_bytes().iter().all(|&byte| byte == 0));
     assert_eq!(
         destination.to_owned().data().len(),
         destination.data().len()
@@ -425,7 +428,7 @@ fn a_video_accessor_panic_leaves_the_reused_destination_whole() {
         destination.data().len(),
         destination.layout.data_len_bytes()
     );
-    assert!(destination.data.room().iter().all(|&byte| byte == 0));
+    assert!(destination.data.room_bytes().iter().all(|&byte| byte == 0));
     assert_eq!(
         destination.to_owned().data().len(),
         destination.data().len()

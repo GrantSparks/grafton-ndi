@@ -267,7 +267,8 @@ impl QueuedStorage {
 }
 
 // SAFETY: Pixels owns initialized payload, terminated metadata and its matching
-// format proof. Packet delegates to PendingVideo, which owns its payload and
+// format proof; its owned loan reserves the complete scan-dependent SDK room
+// at descriptor construction. Packet delegates to PendingVideo, which owns its payload and
 // metadata and initializes its own stable scatter list before lending it. The
 // completion key points into its retained, nonempty first block. Moving this
 // value moves none of its allocations; Entry excludes access until completion

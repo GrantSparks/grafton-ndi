@@ -1,5 +1,8 @@
 //! NDI sending functionality for video, audio, and metadata.
 
+#[cfg(test)]
+use crate::pixels::send_room;
+
 use std::{
     ffi::{CStr, CString},
     fmt,
@@ -17,17 +20,15 @@ use crate::{
     frames::{AudioPartsExt, MetadataPartsExt},
     frames::{
         AudioSource, FrameMetadataRef, MetadataFrame, MetadataSource, MetadataText, PixelFormat,
-        ScanType, Sendable, ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts, VideoSource,
+        ScanType, Sendable, ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts,
+        VideoPartsExt, VideoSource,
     },
-    pixels::{send_room, Pixels},
+    pixels::Pixels,
     receiver::Tally,
     sys::{self, bindings::*},
     timeout::Deadline,
     to_ms_checked, Error, FrameRate, Ndi, PictureAspectRatio, Rejected, Result, Timecode,
 };
-
-#[cfg(test)]
-use crate::frames::VideoPartsExt;
 
 #[cfg(not(target_has_atomic = "ptr"))]
 compile_error!(
@@ -454,13 +455,14 @@ impl Drop for VideoPipeline {
 }
 
 // SAFETY: The descriptor uses this frame's own validated geometry and borrows
-// its owned initialized pixels, scan-dependent SDK
-// tail, and terminated FrameMetadata. Moving the frame moves none of those
+// its owned initialized pixels and terminated FrameMetadata.
+// owned_video_descriptor reserves the scan-dependent SDK room before lending.
+// Moving the frame moves none of those
 // allocations, which InFlight keeps inaccessible until the SDK releases them.
 unsafe impl in_flight::Lend for Sendable<VideoFrame> {
     type Authorization = ();
     fn lend(&mut self, (): ()) -> in_flight::Lent {
-        in_flight::Lent::Frame(self.video_descriptor())
+        in_flight::Lent::Frame(self.owned_video_descriptor())
     }
 }
 
@@ -1250,8 +1252,9 @@ pub struct BorrowedVideoFrame<'buf> {
 
 // SAFETY: Construction checks the initialized byte slice covers the validated
 // layout; its borrow also retains validated terminated metadata unchanged.
-// sends_in_place checks the initialized stride/tail extent before direct SDK
-// reads. The default descriptor never points outside those borrowed buffers.
+// Its initialized report vouches for all storage padding and, only after the
+// caller opts in, the known room after the last pixel. Direct SDK reads are
+// decided by the common rule over that quantity.
 unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
     #[inline]
     fn layout(&self) -> &ValidatedVideoLayout {
@@ -1276,8 +1279,14 @@ unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
         None
     }
 
-    fn can_send_direct(&self) -> bool {
-        self.sends_in_place()
+    fn initialized(&self) -> crate::frames::Initialized {
+        crate::frames::Initialized::Storage {
+            room_after: if self.allow_padding_and_tail {
+                self.tail_room
+            } else {
+                0
+            },
+        }
     }
 }
 
@@ -1509,8 +1518,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// ```
     #[must_use]
     pub fn sends_in_place(&self) -> bool {
-        let room = send_room(&self.layout, self.header.scan_type());
-        room == 0 || (self.allow_padding_and_tail && self.tail_room >= room)
+        self.can_send_direct()
     }
 
     /// Return this frame with `timecode`.
@@ -2589,6 +2597,105 @@ mod tests {
     use crate::RuntimeFeature;
 
     #[test]
+    fn initialized_extents_preserve_direct_sending_for_every_format_and_scan() {
+        use crate::frames::Initialized;
+        for format in PixelFormat::ALL {
+            for scan in ScanType::ALL {
+                for height in [4, 6] {
+                    let owned = VideoFrame::builder()
+                        .resolution(18, height)
+                        .pixel_format(format)
+                        .scan_type(scan)
+                        .build()
+                        .unwrap();
+                    assert!(owned.can_send_direct(), "owned {format:?} {scan:?}");
+                    assert_eq!(
+                        owned.initialized(),
+                        Initialized::Storage {
+                            room_after: owned.tail_room()
+                        }
+                    );
+                    assert_eq!(
+                        <&VideoFrame as VideoParts>::initialized(&&owned),
+                        owned.initialized()
+                    );
+                    for padding in [0, 8] {
+                        let stride = format.line_stride_bytes(18).unwrap() + padding;
+                        let layout = ValidatedVideoLayout::new_uncompressed(
+                            format,
+                            18,
+                            height,
+                            Some(stride),
+                        )
+                        .unwrap();
+                        let room = send_room(&layout, scan);
+                        for extra in [0, room] {
+                            let bytes = vec![0; layout.data_len_bytes() + extra];
+                            for allow in [false, true] {
+                                let borrowed =
+                                    BorrowedVideoFrame::builder(&bytes, 18, height, format)
+                                        .line_stride_bytes(stride)
+                                        .scan_type(scan)
+                                        .allow_send_from_padding_and_tail(allow)
+                                        .build()
+                                        .unwrap();
+                                let expected = room == 0
+                                    || (allow && layout.trailing_padding() + extra >= room);
+                                assert_eq!(borrowed.sends_in_place(), expected,
+                                    "{format:?} {scan:?} height={height} padding={padding} extra={extra} allow={allow}");
+                                assert_eq!(VideoSource::sends_in_place(&borrowed), expected);
+                                assert_eq!(
+                                    <&BorrowedVideoFrame<'_> as VideoParts>::initialized(
+                                        &&borrowed
+                                    ),
+                                    borrowed.initialized()
+                                );
+                                let mut storage = Pixels::default();
+                                let packed = borrowed.copy_active_pixels(&mut storage);
+                                assert!(packed.can_send_direct(), "staging {format:?} {scan:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_owned_extent_stages_synchronous_sends_and_is_repaired_before_lending() {
+        use crate::frames::descriptor_tests::assert_extent;
+        if PixelFormat::Uyvy.send_tail_room() == 0 {
+            return;
+        }
+        let frame = VideoFrame::builder()
+            .resolution(18, 6)
+            .pixel_format(PixelFormat::Uyvy)
+            .scan_type(ScanType::Interlaced)
+            .data(vec![128; 18 * 6 * 2])
+            .build()
+            .unwrap()
+            .without_send_room_for_test();
+        assert_eq!(frame.tail_room(), 0);
+        assert!(!VideoSource::sends_in_place(&frame));
+        let mut staging = Pixels::default();
+        let raw = PreparedVideo::new(&frame, &mut staging).raw;
+        assert_ne!(raw.p_data.cast_const(), frame.data().as_ptr());
+        assert_extent(&raw, staging.as_ptr(), staging.len() + staging.room());
+        let mut owned = Sendable::for_test(frame);
+        let lent = in_flight::Lend::lend(&mut owned, ());
+        assert!(owned.frame().can_send_direct());
+        assert_eq!(
+            owned.tail_room(),
+            send_room(owned.layout(), owned.header().scan_type())
+        );
+        assert_extent(
+            lent.descriptor(),
+            owned.data().as_ptr(),
+            owned.data().len() + owned.tail_room(),
+        );
+    }
+
+    #[test]
     fn captured_video_sending_uses_initialized_active_rows_and_preserves_descriptors() {
         use crate::capture::{FrameSyncVideoFree, Guard, VideoKind};
         use crate::frames::VideoRef;
@@ -2625,9 +2732,9 @@ mod tests {
                 assert_eq!(raw.p_data, staging.as_ptr().cast_mut());
                 assert_ne!(raw.p_data, original.p_data);
                 assert_eq!(staging.as_slice(), expected.data());
-                assert!(staging.room().iter().all(|&byte| byte == 0));
+                assert!(staging.room_bytes().iter().all(|&byte| byte == 0));
                 assert_eq!(
-                    staging.tail_room(),
+                    staging.room(),
                     send_room(&source.layout().packed(), source.header().scan_type())
                 );
             }
@@ -2698,6 +2805,14 @@ mod tests {
                     .unwrap();
                     let eligible = padding == 0 && send_room(receiver.layout(), scan) == 0;
                     assert_eq!(
+                        receiver.initialized(),
+                        crate::frames::Initialized::ActiveRows
+                    );
+                    assert_eq!(
+                        framesync.initialized(),
+                        crate::frames::Initialized::ActiveRows
+                    );
+                    assert_eq!(
                         receiver.sends_in_place(),
                         eligible,
                         "{format:?} {scan:?} padding={padding}"
@@ -2745,7 +2860,7 @@ mod tests {
             let prepared = PreparedVideo::authorized(Sendable::for_test(&captured), &mut staging);
             let raw = prepared.raw;
             assert_ne!(raw.p_data.cast_const(), storage.as_ptr());
-            assert_extent(&raw, staging.as_ptr(), staging.len() + staging.tail_room());
+            assert_extent(&raw, staging.as_ptr(), staging.len() + staging.room());
             // This is the packed copy submitted by send_video_async_copy;
             // its authorization is still that of the padded source.
             let mut owned = Sendable::for_test(&frame).copied(None);
@@ -3110,8 +3225,8 @@ mod tests {
                                 } else {
                                     expected = Some(staging.as_slice().to_vec());
                                 }
-                                assert_eq!(staging.tail_room(), send_room(&layout.packed(), scan));
-                                assert!(staging.room().iter().all(|&byte| byte == 0));
+                                assert_eq!(staging.room(), send_room(&layout.packed(), scan));
+                                assert!(staging.room_bytes().iter().all(|&byte| byte == 0));
                                 let address = staging.as_ptr();
                                 let ((), allocations) = crate::test_alloc::allocation_count(|| {
                                     let _ = PreparedVideo::new(&frame, &mut staging);
@@ -3246,7 +3361,7 @@ mod tests {
         assert_eq!(raw.p_data, staging.as_ptr().cast_mut());
         assert_ne!(raw.p_data, original.p_data);
         assert_eq!(staging.as_slice(), frame.to_owned().data());
-        assert_eq!(staging.room(), [0; 64]);
+        assert_eq!(staging.room_bytes(), [0; 64]);
         assert_eq!(staging.capacity(), 144 + 64);
         // Everything but the pixel pointer describes the caller's frame.
         // SAFETY: both descriptors are uncompressed, so the union holds the stride.
@@ -3320,7 +3435,7 @@ mod tests {
             (
                 state.staging.as_ptr(),
                 state.staging.as_slice().to_vec(),
-                state.staging.room().to_vec(),
+                state.staging.room_bytes().to_vec(),
             )
         };
         assert!(staging(&sender).1.is_empty());
