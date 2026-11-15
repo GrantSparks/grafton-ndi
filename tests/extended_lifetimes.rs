@@ -485,7 +485,7 @@ fn child(case: &str) {
                     .unwrap()
                     .with_tier(tier);
                 let frame = CompressedVideoFrame::new(format, vec![value; 16]).unwrap();
-                assert!(sender.send_video_async(frame).unwrap().is_none());
+                assert!(sender.send_video_async(frame).is_none());
             }
             let reclaimed = sender.finish_video_async();
             let events = log();
@@ -508,7 +508,7 @@ fn child(case: &str) {
                     panic!("contiguous frame");
                 };
                 assert_eq!(frame.data()[0], value);
-                assert!(sender.send_video_async(frame).unwrap().is_none());
+                assert!(sender.send_video_async(frame).is_none());
             }
             drop(sender);
             assert!(position(&log(), "sender-flush") < position(&log(), "sender-destroy-begin"));

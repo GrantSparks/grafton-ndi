@@ -947,9 +947,7 @@ fn compressed_finish_keeps_the_source_and_returns_frames_that_can_be_sent_again(
             receiver,
             &format!("the {tier:?} drain receiver"),
             |timecode| {
-                sender
-                    .send_video(&mut keyframe(VideoCodec::H264, tier, timecode))
-                    .unwrap();
+                sender.send_video(&mut keyframe(VideoCodec::H264, tier, timecode));
             },
         );
     }
@@ -970,7 +968,7 @@ fn compressed_finish_keeps_the_source_and_returns_frames_that_can_be_sent_again(
         let preview_timecode = FIRST_TIMECODE + 2 + pass * 10;
         program_frame.set_timecode(Timecode::from_ticks(program_timecode));
         preview_frame.set_timecode(Timecode::from_ticks(preview_timecode));
-        assert!(sender.send_video_async(program_frame).unwrap().is_none());
+        assert!(sender.send_video_async(program_frame).is_none());
         assert!(sender
             .send_scatter_video_async(preview_frame)
             .unwrap()

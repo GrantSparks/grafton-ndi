@@ -352,7 +352,7 @@ mod tests {
         }));
         assert!(failed.is_err());
         assert_eq!(pixels.len(), 8);
-        assert_eq!(pixels.tail_room(), 64);
+        assert_eq!(pixels.room(), 64);
         assert_eq!(pixels.room_bytes(), [0; 64]);
     }
 }

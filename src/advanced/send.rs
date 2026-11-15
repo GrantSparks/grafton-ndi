@@ -1518,7 +1518,7 @@ mod tests {
                     } else {
                         let frame = CompressedVideoFrame::new(format, vec![1; 16]).unwrap();
                         let pointer = frame.data().as_ptr();
-                        assert!(sender.send_video_async(frame).unwrap().is_none());
+                        assert!(sender.send_video_async(frame).is_none());
                         pointer
                     });
                 }
