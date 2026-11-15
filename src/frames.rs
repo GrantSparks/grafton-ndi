@@ -1214,8 +1214,9 @@ macro_rules! video_accessors {
             /// any writer, so a program that takes snapshots on a timer can
             /// reuse one output buffer. A file or socket should be wrapped in
             /// a [`BufWriter`](std::io::BufWriter): the codecs write in small
-            /// pieces. Lossy WebP buffers its complete encoded image before
-            /// writing it; other codecs write as they encode.
+            /// pieces. Both WebP formats buffer their complete encoded image
+            /// before writing it; PNG and JPEG write as they encode. Success
+            /// means every byte was written and `out` was flushed.
             ///
             /// # Errors
             ///

@@ -22,7 +22,10 @@ pub use options::{
     SampleDepth, YuvRange,
 };
 
-use std::{io::Write, marker::PhantomData};
+use std::{
+    io::{self, Write},
+    marker::PhantomData,
+};
 
 use self::{
     color::Sample,
@@ -104,9 +107,11 @@ impl ImageWorkspace {
     }
 
     /// Encode into a writer, reusing conversion scratch. A cleared `Vec<u8>`
-    /// also reuses output capacity. Lossy WebP buffers its complete result
-    /// before writing; other codecs write incrementally. Validation happens
-    /// before writing; a codec/writer failure may leave partial output.
+    /// also reuses output capacity. Both WebP formats buffer their complete
+    /// encoded result before writing; PNG and JPEG write incrementally.
+    /// Success means every byte was written and the writer was flushed.
+    /// Validation happens before writing; a codec/writer failure may leave
+    /// partial output.
     ///
     /// ```
     /// use grafton_ndi::{ImageWorkspace, ImageOptions, ImageFormat, PixelFormat, VideoFrame};
@@ -167,7 +172,8 @@ fn write_image(
     out: &mut dyn Write,
     workspace: &mut ImageWorkspace,
 ) -> Result<()> {
-    match plan.codec {
+    let mut out = KeepError { out, error: None };
+    let result = match plan.codec {
         Codec::Png {
             depth: SampleDepth::Sixteen,
             compression,
@@ -178,7 +184,7 @@ fn write_image(
                 plan.channels(),
                 compression,
                 cicp,
-                out,
+                &mut out,
                 &mut workspace.row,
             )
         }),
@@ -190,12 +196,12 @@ fn write_image(
                 plan.channels(),
                 compression,
                 cicp,
-                out,
+                &mut out,
                 &mut workspace.row,
             ),
-            Codec::Jpeg { quality } => jpeg::encode(pixels, quality, out),
+            Codec::Jpeg { quality } => jpeg::encode(pixels, quality, &mut out),
             Codec::WebpLossless => {
-                webp::encode_lossless(pixels, plan.channels(), out, &mut workspace.image)
+                webp::encode_lossless(pixels, plan.channels(), &mut out, &mut workspace.image)
             }
             Codec::WebpLossy {
                 quality,
@@ -207,6 +213,39 @@ fn write_image(
                 out.write_all(&image).map_err(Error::Io)
             }
         }),
+    };
+    let result = result.and_then(|()| out.flush().map_err(Error::Io));
+    match out.error {
+        Some(error) => Err(Error::Io(error)),
+        None => result,
+    }
+}
+
+/// Preserve the first writer failure even when a codec replaces it with text.
+struct KeepError<'w> {
+    out: &'w mut dyn Write,
+    error: Option<io::Error>,
+}
+
+impl KeepError<'_> {
+    fn keep(&mut self, error: io::Error) -> io::Error {
+        // `write_all` retries interruptions; they do not end the encode.
+        if error.kind() == io::ErrorKind::Interrupted {
+            return error;
+        }
+        let copy = io::Error::new(error.kind(), error.to_string());
+        self.error.get_or_insert(error);
+        copy
+    }
+}
+
+impl Write for KeepError<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.out.write(buf).map_err(|error| self.keep(error))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush().map_err(|error| self.keep(error))
     }
 }
 

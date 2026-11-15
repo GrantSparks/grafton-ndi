@@ -152,7 +152,7 @@ impl ImageFormat {
 /// WebP encodes from one buffer, so it holds the whole converted
 /// image, unless full-size contiguous RGBA can be borrowed with alpha kept.
 /// Lossless WebP uses three channels with alpha discarded; lossy WebP
-/// uses four with opaque alpha. Lossy WebP also buffers the complete encoded
+/// uses four with opaque alpha. Both WebP formats buffer the complete encoded
 /// image before writing it. Codec state and encoded output take memory besides.
 /// Each concurrent encode owns its own buffers, so worker and queue limits
 /// matter alongside compressed image size.
@@ -172,7 +172,7 @@ impl ImageFormat {
 /// | A PQ or HLG frame with [`HdrPolicy::Refuse`] | [`Error::InvalidFrame`] |
 /// | Unreadable `ndi_color_info` with [`ColorPolicy::Sdk`] | [`Error::InvalidFrame`] |
 /// | An image wider or taller than JPEG's 65,535, lossless WebP's 16,384 or lossy WebP's 16,383 pixels | [`Error::InvalidFrame`] |
-/// | The writer given to `encode_image_to` fails | [`Error::Io`] |
+/// | Writing or flushing the writer given to `encode_image_to` fails | [`Error::Io`] |
 /// | The codec fails for another reason | [`Error::InvalidFrame`] |
 ///
 /// `ImageOptions` holds settings only, no buffers, so one value serves any

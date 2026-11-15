@@ -35,7 +35,7 @@ For repeated snapshots, `ImageWorkspace::new()` provides `encode(&frame,
 scratch across calls, including WebP's whole converted image, PNG rows and
 downscale sums. `retained_bytes()` reports wrapper capacity; `release()` frees
 it. Use a separate workspace for each concurrent worker. Codec allocations
-and the encoded result are separate; lossy WebP still buffers its output.
+and the encoded result are separate; both WebP formats buffer their output.
 
 Encoding is synchronous CPU work. Keep it on a blocking worker in async
 applications, with an owned frame if the worker outlives the capture borrow.
@@ -119,7 +119,7 @@ selection; a `snapshot_preset` receiver already requests the preview stream.
 ## Cost and memory
 
 PNG and JPEG convert rows incrementally. WebP may need a complete converted
-image; lossy WebP also buffers its complete encoded output, even when using
+image; both WebP formats also buffer their complete encoded output, even when using
 `encode_image_to`. Codec state and output add memory beyond conversion storage.
 See [buffering and concurrency](image-encoding-performance.md#whole-image-buffering-and-concurrency)
 for application planning.
@@ -128,8 +128,9 @@ for application planning.
 
 Inspect the method's `Result`: invalid quality, effort or depth settings return
 `InvalidInput`; malformed color descriptions, HDR refusal, excessive dimensions
-or codec failures return `InvalidFrame`; writer failures retain their `Io`
-error. The [API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/struct.ImageOptions.html#errors)
+or codec failures return `InvalidFrame`; write and flush failures retain their
+original `Io` error. A successful writer encode has written every byte and
+flushed the writer. The [API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/struct.ImageOptions.html#errors)
 lists the complete option rules.
 
 ## Thumbnails from a recording

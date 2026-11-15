@@ -1775,6 +1775,60 @@ impl std::io::Write for Recorder {
 }
 
 #[test]
+fn every_writer_encode_reports_final_flush_and_buffered_write_failures() {
+    struct FlushFails;
+    impl std::io::Write for FlushFails {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                DiskFull,
+            ))
+        }
+    }
+
+    let frame = VideoFrame::builder()
+        .resolution(2, 2)
+        .pixel_format(PixelFormat::Rgba)
+        .data(vec![127; 16])
+        .build()
+        .unwrap();
+    let mut workspace = crate::ImageWorkspace::new();
+    for options in [
+        options(ImageFormat::Png),
+        options(ImageFormat::Png).depth(SampleDepth::Sixteen),
+        options(ImageFormat::Jpeg(85)),
+        options(ImageFormat::WebpLossless),
+        options(ImageFormat::WebpLossy(75)),
+    ] {
+        let assert_error = |result: crate::Result<()>| match result {
+            Err(Error::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{options:?}");
+                assert!(error.get_ref().is_some_and(|inner| inner.is::<DiskFull>()));
+            }
+            result => panic!("{options:?}: expected the original writer error, got {result:?}"),
+        };
+        assert_error(frame.encode_image_to(&options, FlushFails));
+        assert_error(workspace.encode_to(&frame, &options, FlushFails));
+
+        // Every byte stays buffered until the encode's final flush. Dropping
+        // this writer by value used to discard the sink's failure for JPEG/WebP.
+        assert!(frame.encode_image(&options).unwrap().len() < 8192);
+        let buffered = || {
+            std::io::BufWriter::new(Recorder {
+                written: 0,
+                fail_after: Some(0),
+            })
+        };
+        assert_error(frame.encode_image_to(&options, buffered()));
+        assert_error(workspace.encode_to(&frame, &options, buffered()));
+    }
+}
+
+#[test]
 fn conflicting_options_are_refused_before_anything_is_written() {
     let frame = random_codes(PixelFormat::P216, 4, 2, 1).frame(None);
     let cases = [
