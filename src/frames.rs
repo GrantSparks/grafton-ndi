@@ -4172,10 +4172,13 @@ impl ValidatedAudioLayout {
             return None;
         }
 
-        let start = channel.checked_mul(self.channel_stride_samples)?;
-        let end = start.checked_add(self.no_samples)?;
-
-        (end <= self.sample_count).then_some(start..end)
+        // checked_audio_extent proved the last channel's offset plus its
+        // samples fits usize and sample_count; every earlier channel fits too.
+        // packed() preserves that proof when removing inter-channel padding.
+        let start = channel * self.channel_stride_samples;
+        let end = start + self.no_samples;
+        debug_assert!(end <= self.sample_count);
+        Some(start..end)
     }
 
     /// One channel's samples of the frame stored at `data`, or `None` for an
@@ -4187,7 +4190,8 @@ impl ValidatedAudioLayout {
     /// every channel's samples initialized and immutable for `'a`.
     unsafe fn channel<'a>(self, data: *const f32, channel: usize) -> Option<&'a [f32]> {
         let range = self.channel_range(channel)?;
-        // SAFETY: only this channel's initialized sample region is borrowed.
+        // SAFETY: checked_audio_extent and packed() prove every channel's
+        // range fits the initialized storage the caller keeps borrowed.
         Some(unsafe { slice::from_raw_parts(data.add(range.start), self.no_samples) })
     }
 
@@ -5869,6 +5873,58 @@ mod tests {
             ..raw
         };
         assert!(validate_audio_layout(&zero_stride).is_err());
+    }
+
+    #[test]
+    fn validated_audio_channel_ranges_match_a_wide_oracle_near_the_storage_limit() {
+        let limit = MAX_AUDIO_BYTES / size_of::<f32>();
+        let mut checked = 0;
+        for channels in [1u32, 2, 3, 4, 16, 64] {
+            let edge = limit / channels as usize;
+            for samples in [
+                1,
+                2,
+                edge.saturating_sub(1),
+                edge,
+                edge + 1,
+                limit,
+                limit + 1,
+            ] {
+                let minimum = samples * size_of::<f32>();
+                for stride in [
+                    4,
+                    minimum.saturating_sub(4),
+                    minimum,
+                    minimum + 4,
+                    (limit / 2) * 4,
+                    limit * 4,
+                    usize::MAX - 3,
+                ] {
+                    let Ok(layout) = ValidatedAudioLayout::new_uncompressed(
+                        AudioFormat::Fltp,
+                        48_000,
+                        channels,
+                        samples as u32,
+                        Some(stride),
+                    ) else {
+                        continue;
+                    };
+                    for layout in [layout, layout.packed()] {
+                        checked += 1;
+                        for channel in 0..channels as usize {
+                            let start = channel as i128 * layout.channel_stride_samples as i128;
+                            let end = start + samples as i128;
+                            let actual = layout.channel_range(channel).unwrap();
+                            assert_eq!((actual.start as i128, actual.end as i128), (start, end));
+                            assert!(end <= layout.sample_count as i128);
+                        }
+                        assert_eq!(layout.channel_range(channels as usize), None);
+                        assert_eq!(layout.channel_range(usize::MAX), None);
+                    }
+                }
+            }
+        }
+        assert!(checked > 0);
     }
 
     #[test]
