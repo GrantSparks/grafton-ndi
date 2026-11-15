@@ -2711,15 +2711,37 @@ mod tests {
 
     #[test]
     fn a_deferred_file_operation_cannot_return_another_deferral() {
-        // Compile the actual private constructor signature, rather than a
-        // second handwritten contract, against a nested-deferred fixture.
+        // Compile the actual lifecycle declarations and constructor body.
+        // Only unrelated shared response data and the error type are stubbed;
+        // an alias or changed constructor cannot drift from this contract.
+        fn declaration<'a>(source: &'a str, marker: &str) -> &'a str {
+            let body = &source[source.find(marker).unwrap()..];
+            let mut depth = 0;
+            for (index, byte) in body.bytes().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &body[..=index];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unterminated declaration: {marker}")
+        }
         let source = include_str!("asynchronous.rs");
-        let method = &source[source.find("fn deferred(start:").unwrap()..];
-        let signature = &method[..method.find('{').unwrap()];
+        let live = declaration(source, "enum Live<T> {");
+        let stage = declaration(source, "enum Stage<T> {");
+        let future = declaration(source, "pub struct FileOperation<T> {");
+        let constructor = declaration(source, "fn deferred(start:");
         let definitions = format!(
-            "#![allow(dead_code)]\nstruct FileOperation<T>(std::marker::PhantomData<T>);\n\
-             enum Live<T> {{ Immediate(Result<T, ()>) }}\n\
-             impl<T> FileOperation<T> {{ {signature} {{ unimplemented!() }} }}\n"
+            "#![allow(dead_code)]\nuse std::sync::{{Arc, Mutex}};\n\
+             type Result<T> = std::result::Result<T, ()>;\n\
+             struct Shared<T>(std::marker::PhantomData<T>);\n\
+             {live}\n{stage}\n{future}\n\
+             impl<T> FileOperation<T> {{ {constructor} }}\n"
         );
         let fixture =
             include_str!("../../tests/ui/internal/fail/file_operation_cannot_defer_again.rs");
