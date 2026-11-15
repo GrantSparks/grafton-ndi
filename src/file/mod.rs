@@ -352,6 +352,8 @@ impl FileApi {
     /// relative path cannot be resolved because the current directory is
     /// unavailable, and [`Error::FileFamilyUnavailable`] when the library
     /// does not provide [`FileFamily::Playback`].
+    /// [`Error::UnexpectedSdkResult`] when the library's file information
+    /// does not match this crate's structure layout.
     pub fn probe(&self, path: impl AsRef<Path>) -> Result<FileInfo> {
         let playback = self.table::<sys::FilePlayback>()?;
         let path = types::path_string(path.as_ref())?;

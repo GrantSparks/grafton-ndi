@@ -466,8 +466,10 @@ impl RecorderOptions {
     /// recorder dropped with a session still open therefore requests the stop
     /// and waits up to `wait` for that event before it is destroyed. The wait
     /// ends as soon as the file is closed, so the limit only matters when the
-    /// SDK does not report closure. `Duration::ZERO` destroys at once, like
-    /// [`FileRecorder::abandon`](super::FileRecorder::abandon).
+    /// SDK does not report closure. `Duration::ZERO` waits for no future events:
+    /// the stop is requested and a bounded nonblocking drain takes queued
+    /// events before destruction. [`FileRecorder::abandon`](super::FileRecorder::abandon)
+    /// takes no events.
     ///
     /// A wait longer than [`crate::MAX_TIMEOUT`] is refused with
     /// [`Error::InvalidInput`] when the recorder is created.
