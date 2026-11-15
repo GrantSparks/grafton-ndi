@@ -1037,7 +1037,9 @@ impl FileRecorder {
             .ledger
             .session_number()
             .checked_add(1)
-            .ok_or_else(|| Error::InvalidInput(crate::InputDefect::SessionCounterExhausted))?;
+            .ok_or(Error::InvalidInput(
+                crate::InputDefect::SessionCounterExhausted,
+            ))?;
         let dropped = self.dropped_event_count();
         let prefix = target.prefix.as_ptr();
         // SAFETY: the recorder is live, and `prefix` points into `target`,
@@ -1393,10 +1395,9 @@ impl FileRecorder {
     ///
     /// The errors of [`FileApi::create_recorder`].
     pub fn reset(&mut self, options: &RecorderOptions) -> Result<RecordingReport> {
-        let generation = self
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidInput(crate::InputDefect::RecorderGenerationExhausted))?;
+        let generation = self.generation.checked_add(1).ok_or(Error::InvalidInput(
+            crate::InputDefect::RecorderGenerationExhausted,
+        ))?;
         let mut replacement = Self::create(self._api.clone(), options)?;
         replacement.generation = generation;
         replacement.ledger = Ledger::inheriting(self.report());

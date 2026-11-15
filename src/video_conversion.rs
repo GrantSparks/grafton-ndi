@@ -38,7 +38,7 @@ impl V210Layout {
     pub fn new(width: u32, height: u32) -> Result<Self> {
         let stride = Self::active_words_checked(width)?
             .checked_mul(4)
-            .ok_or_else(|| Error::InvalidFrame(crate::FrameDefect::V210RowOverflow))?;
+            .ok_or(Error::InvalidFrame(crate::FrameDefect::V210RowOverflow))?;
         Self::with_line_stride_bytes(width, height, stride)
     }
 
@@ -59,7 +59,7 @@ impl V210Layout {
         let bytes = stride_bytes
             .checked_mul(height as usize)
             .filter(|bytes| *bytes <= MAX_VIDEO_BYTES)
-            .ok_or_else(|| Error::InvalidFrame(crate::FrameDefect::V210Storage))?;
+            .ok_or(Error::InvalidFrame(crate::FrameDefect::V210Storage))?;
         Ok(Self {
             width,
             height,
@@ -74,7 +74,7 @@ impl V210Layout {
         }
         (width as usize / 6)
             .checked_mul(4)
-            .ok_or_else(|| Error::InvalidFrame(crate::FrameDefect::V210RowOverflow))
+            .ok_or(Error::InvalidFrame(crate::FrameDefect::V210RowOverflow))
     }
 
     /// Pixel width, always a multiple of six.

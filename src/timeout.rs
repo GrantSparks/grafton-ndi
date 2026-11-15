@@ -29,8 +29,9 @@ pub(crate) fn sdk_millis(wait: Duration) -> Option<u32> {
 /// [`sdk_millis`], failing with [`Error::InvalidInput`] for a wait
 /// that exceeds [`MAX_TIMEOUT`].
 pub(crate) fn to_ms_checked(wait: Duration) -> Result<u32> {
-    sdk_millis(wait)
-        .ok_or_else(|| Error::InvalidInput(crate::InputDefect::TimeoutTooLong { requested: wait }))
+    sdk_millis(wait).ok_or(Error::InvalidInput(crate::InputDefect::TimeoutTooLong {
+        requested: wait,
+    }))
 }
 
 /// One call's wait budget: when it ends.
@@ -61,7 +62,7 @@ impl Deadline {
     /// As for [`Self::after`].
     pub(crate) fn starting(start: Instant, timeout: Duration) -> Result<Self> {
         to_ms_checked(timeout)?;
-        let end = start.checked_add(timeout).ok_or_else(|| {
+        let end = start.checked_add(timeout).ok_or({
             Error::InvalidInput(crate::InputDefect::TimeoutInstantOverflow { requested: timeout })
         })?;
         Ok(Self { end })

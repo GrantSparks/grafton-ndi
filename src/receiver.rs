@@ -81,9 +81,7 @@ impl RecvStringGuard<'_> {
         let bytes = unsafe {
             crate::frames::bounded_sdk_text(self.pointer, crate::frames::MAX_METADATA_BYTES)
         }
-        .ok_or_else(|| {
-            Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedReceiverText)
-        })?;
+        .ok_or({ Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedReceiverText) })?;
         Ok(Some(bytes))
     }
 
@@ -93,7 +91,7 @@ impl RecvStringGuard<'_> {
             .map(|bytes| {
                 std::str::from_utf8(bytes)
                     .map(str::to_owned)
-                    .map_err(|error| Error::InvalidUtf8(error))
+                    .map_err(Error::InvalidUtf8)
             })
             .transpose()
     }
@@ -134,7 +132,7 @@ fn receiver_delay(millis: i32) -> Result<Duration> {
         .ok()
         .filter(|millis| *millis <= MAX_RECEIVE_DELAY_MILLIS)
         .map(|millis| Duration::from_millis(millis.into()))
-        .ok_or_else(|| {
+        .ok_or({
             Error::UnexpectedSdkResult(crate::SdkResultDefect::InvalidReceiveDelay { millis })
         })
 }
@@ -146,7 +144,7 @@ fn receiver_delay_millis(delay: Duration) -> Result<i32> {
     timeout::sdk_millis(delay)
         .filter(|millis| *millis <= MAX_RECEIVE_DELAY_MILLIS)
         .and_then(|millis| i32::try_from(millis).ok())
-        .ok_or_else(|| {
+        .ok_or({
             Error::InvalidInput(crate::InputDefect::ReceiveDelayTooLong { requested: delay })
         })
 }

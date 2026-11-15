@@ -706,7 +706,7 @@ impl NamePattern {
         let file = self.first_file(target)?;
         let longest_bytes = file
             .to_str()
-            .ok_or_else(|| {
+            .ok_or({
                 Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
                     what: "recording file path",
                 })
@@ -814,7 +814,9 @@ pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<(PathBuf, 
     }
     let text = path
         .to_str()
-        .ok_or_else(|| Error::InvalidInput(crate::InputDefect::PathNotUtf8 { what }))?;
+        .ok_or(Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
+            what,
+        }))?;
     // Windows path resolution rejects NULs as an I/O error. Keep the SDK
     // string error consistent with absolute paths and the other platforms.
     if text.contains('\0') {
@@ -829,7 +831,9 @@ pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<(PathBuf, 
     };
     let text = absolute
         .to_str()
-        .ok_or_else(|| Error::InvalidInput(crate::InputDefect::PathNotUtf8 { what }))?;
+        .ok_or(Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
+            what,
+        }))?;
     let text = cstring(text, what, false)?;
     Ok((absolute, text))
 }
@@ -1570,7 +1574,7 @@ impl SourceFormat {
         let count = usize::try_from(raw.video_track_count).map_err(|_| {
             Error::UnexpectedSdkResult(crate::SdkResultDefect::FileTrackCountOverflow)
         })?;
-        let tracks = raw.video_tracks.get(..count).ok_or_else(|| {
+        let tracks = raw.video_tracks.get(..count).ok_or({
             Error::UnexpectedSdkResult(crate::SdkResultDefect::FileTrackCount {
                 count: raw.video_track_count,
                 capacity: raw.video_tracks.len(),

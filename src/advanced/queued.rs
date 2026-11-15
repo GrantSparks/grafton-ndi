@@ -204,7 +204,7 @@ impl QueuedVideoFrame {
         self.authorize_with(
             |frame| Ok(Sendable::for_test(frame)),
             || {
-                scatter.ok_or_else(|| Error::UnsupportedCapability {
+                scatter.ok_or(Error::UnsupportedCapability {
                     feature: crate::RuntimeFeature::ScatterSend,
                     refusal: crate::CapabilityRefusal::SymbolUnavailable(
                         c"NDIlib_send_send_video_scatter",

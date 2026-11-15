@@ -286,7 +286,9 @@ fn packed_len(width: usize, height: usize, channels: usize) -> Result<usize> {
     width
         .checked_mul(height)
         .and_then(|n| n.checked_mul(channels))
-        .ok_or_else(|| Error::InvalidFrame(crate::FrameDefect::ImageScratchOverflow))
+        .ok_or(Error::InvalidFrame(
+            crate::FrameDefect::ImageScratchOverflow,
+        ))
 }
 
 /// Encode `source` as a base64 data URL, allocated at its exact final
@@ -367,10 +369,12 @@ impl ImageShape {
     }
 
     fn buffered(self) -> Result<BufferedImageShape> {
-        let image_bytes = self
-            .row_bytes
-            .checked_mul(self.height as usize)
-            .ok_or_else(|| Error::InvalidFrame(crate::FrameDefect::ImageScratchOverflow))?;
+        let image_bytes =
+            self.row_bytes
+                .checked_mul(self.height as usize)
+                .ok_or(Error::InvalidFrame(
+                    crate::FrameDefect::ImageScratchOverflow,
+                ))?;
         Ok(BufferedImageShape {
             rows: self,
             image_bytes,

@@ -403,6 +403,12 @@ fn quoted(text: &[u8]) -> String {
     }
 }
 
+impl std::fmt::Display for TransferFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,11 +686,5 @@ mod tests {
             let text: String = text.into_iter().collect();
             let _ = read(&text);
         }
-    }
-}
-
-impl std::fmt::Display for TransferFunction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
     }
 }

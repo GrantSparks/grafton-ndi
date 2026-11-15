@@ -1526,7 +1526,7 @@ impl CachedSources {
         mut copy: impl FnMut(&[Source]) -> Result<Vec<Source>>,
     ) -> Result<Vec<Source>> {
         let query = HostQuery::parse(host)
-            .ok_or_else(|| Error::InvalidInput(crate::InputDefect::InvalidHostQuery))?;
+            .ok_or(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))?;
         to_ms_checked(timeout)?;
         let key = HostKeyBuffer::new(query);
         let (snapshot, generation) = {

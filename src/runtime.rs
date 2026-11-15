@@ -585,7 +585,7 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
 
                 Phase::Running => {
                     // Runtime is already initialized, just increment refcount
-                    guard.refcount = guard.refcount.checked_add(1).ok_or_else(|| {
+                    guard.refcount = guard.refcount.checked_add(1).ok_or({
                         Error::InitializationFailed(
                             crate::InitializationFailure::HandleCountExhausted,
                         )

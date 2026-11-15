@@ -233,7 +233,7 @@ impl TryFrom<FourCc> for PixelFormat {
     /// [`Error::InvalidFrame`] when it names no uncompressed pixel format
     /// this crate supports.
     fn try_from(fourcc: FourCc) -> Result<Self> {
-        Self::from_fourcc(fourcc).ok_or_else(|| {
+        Self::from_fourcc(fourcc).ok_or({
             Error::InvalidFrame(crate::FrameDefect::UnknownPixelFormat { fourcc: fourcc.0 })
         })
     }

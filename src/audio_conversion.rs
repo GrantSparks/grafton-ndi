@@ -61,7 +61,7 @@ impl AudioShape {
             .filter(|&channels| channels > 0 && len.is_multiple_of(channels))
             .and_then(|channels| u32::try_from(len / channels).ok())
             .filter(|&samples| samples > 0)
-            .ok_or_else(|| {
+            .ok_or({
                 Error::InvalidFrame(crate::FrameDefect::InterleavedAudioLength {
                     actual: len,
                     channels: num_channels,

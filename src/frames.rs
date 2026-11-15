@@ -291,7 +291,9 @@ impl PixelFormat {
         layout
             .data_len_bytes
             .checked_add(crate::pixels::send_room(&layout, scan_type))
-            .ok_or_else(|| Error::InvalidFrame(crate::FrameDefect::VideoAllocationOverflow))
+            .ok_or(Error::InvalidFrame(
+                crate::FrameDefect::VideoAllocationOverflow,
+            ))
     }
 
     /// Get compile-time format properties.
@@ -642,7 +644,7 @@ impl VideoHeader {
     pub(crate) fn from_sdk(raw: &NDIlib_video_frame_v2_t) -> Result<Self> {
         let frame_rate = FrameRate::from_sdk(raw.frame_rate_N, raw.frame_rate_D)?;
         let picture_aspect_ratio = PictureAspectRatio::from_sdk(raw.picture_aspect_ratio)?;
-        let scan_type = ScanType::from_sdk(raw.frame_format_type).ok_or_else(|| {
+        let scan_type = ScanType::from_sdk(raw.frame_format_type).ok_or({
             Error::InvalidFrame(crate::FrameDefect::UnknownScanType {
                 code: raw.frame_format_type,
             })
@@ -2294,7 +2296,7 @@ impl<'buf> BorrowedAudioFrameBuilder<'buf> {
         )?;
         // The slice supplies alignment; the layout's extent establishes that
         // every active channel is initialized and borrowed for 'buf.
-        let data = self.data.get(..layout.sample_count).ok_or_else(|| {
+        let data = self.data.get(..layout.sample_count).ok_or({
             Error::InvalidFrame(crate::FrameDefect::AudioBufferTooSmall {
                 actual: self.data.len(),
                 minimum: layout.sample_count,
@@ -3179,7 +3181,7 @@ impl<'a> MetadataText<'a> {
     pub(crate) fn from_cstr(metadata: &'a CStr) -> Result<Self> {
         let with_nul = metadata.to_bytes_with_nul();
         validate_metadata_len_with_nul(with_nul.len())?;
-        let with_nul = str::from_utf8(with_nul).map_err(|e| Error::InvalidUtf8(e))?;
+        let with_nul = str::from_utf8(with_nul).map_err(Error::InvalidUtf8)?;
         Ok(Self { with_nul })
     }
 
@@ -3256,7 +3258,7 @@ pub(crate) unsafe fn validate_metadata_layout(
     }
 
     // The bytes end in their only NUL and are within the cap.
-    let with_nul = str::from_utf8(bytes).map_err(|err| Error::InvalidUtf8(err))?;
+    let with_nul = str::from_utf8(bytes).map_err(Error::InvalidUtf8)?;
     Ok(Some(MetadataText { with_nul }))
 }
 
@@ -3486,10 +3488,9 @@ impl TerminatedText {
     }
 
     fn validate_and_terminate(text: &mut String) -> Result<()> {
-        let len_with_nul = text
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidFrame(crate::FrameDefect::MetadataLengthOverflow))?;
+        let len_with_nul = text.len().checked_add(1).ok_or(Error::InvalidFrame(
+            crate::FrameDefect::MetadataLengthOverflow,
+        ))?;
         validate_metadata_len_with_nul(len_with_nul)?;
         if text.as_bytes().contains(&0) {
             return Err(Error::InvalidCString(
@@ -3673,7 +3674,7 @@ pub(crate) unsafe fn validate_frame_metadata<'a>(
     // live and unchanged for `'a`; `u8` needs no alignment.
     let bytes = unsafe { slice::from_raw_parts(p_metadata.cast::<u8>(), payload.len() + 1) };
     // The bytes end in their only NUL, found below the cap.
-    let with_nul = str::from_utf8(bytes).map_err(|err| Error::InvalidUtf8(err))?;
+    let with_nul = str::from_utf8(bytes).map_err(Error::InvalidUtf8)?;
     Ok(Some(MetadataText { with_nul }))
 }
 
@@ -3719,7 +3720,7 @@ pub(crate) unsafe fn copy_sdk_string(
     operation: &'static str,
 ) -> Result<String> {
     // SAFETY: forwarded to the caller's obligation.
-    let bytes = unsafe { bounded_sdk_text(text, MAX_SDK_STRING_BYTES) }.ok_or_else(|| {
+    let bytes = unsafe { bounded_sdk_text(text, MAX_SDK_STRING_BYTES) }.ok_or({
         Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedText { operation })
     })?;
     Ok(String::from_utf8_lossy(bytes).into_owned())
