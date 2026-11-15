@@ -488,21 +488,21 @@ impl Finder {
         if instance.is_null() {
             return Err(Error::NativeOperationFailed { operation });
         }
-        let changes = ChangeFeed::default();
-        // Some standard-library mutexes allocate their native backing on the
-        // first lock. Initialize it during successful construction, so even
-        // the first watch can read its generation without allocating.
-        let _ = changes.generation();
-        Ok(Self {
+        let finder = Self {
             instance: FindInstance(instance),
             sources_lock: parking_lot::Mutex::new(FindInstance(instance)),
-            changes,
+            changes: ChangeFeed::default(),
             _groups: groups,
             _extra_ips: extra_ips,
             #[cfg(feature = "advanced")]
             _config: config,
             _ndi: ndi.clone(),
-        })
+        };
+        // Some standard-library mutexes allocate their native backing on the
+        // first lock. Initialize before exposure, while Finder already owns
+        // the native instance so Drop also cleans it up if initialization panics.
+        let _ = finder.changes.generation();
+        Ok(finder)
     }
 
     /// Copy one snapshot through the entry point's shared lifetime contract.
