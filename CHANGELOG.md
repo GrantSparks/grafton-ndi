@@ -20,6 +20,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - `CompressedSender::finish_video_async` and its split video view drain both
   asynchronous streams and return their frames while keeping the source live.
 
+- Queued senders support AAC and Opus through shared
+  `send_compressed_audio` and `send_scatter_audio` operations, alongside their
+  existing uncompressed audio sends.
+
 ### Breaking changes
 
 - Owned received compressed packets use `ReceivedVideoPacket` and

@@ -132,7 +132,7 @@ pub use {
 };
 
 #[cfg(feature = "advanced")]
-pub use sender::{CompressedAttached, QueueAttached};
+pub use sender::{CompressedAttached, CompressedAudioSendMode, QueueAttached};
 
 pub use color_info::{ColorInfo, ColorPrimaries, TransferFunction, YuvMatrix};
 pub use media::{FourCc, FrameRate, MediaTypes, PictureAspectRatio, StreamTier};

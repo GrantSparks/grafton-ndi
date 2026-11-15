@@ -837,6 +837,8 @@ impl QueuedSender {
     /// The sender this queue sends through, for the operations that do not
     /// send video: [`source`](Sender::source),
     /// [`send_audio`](Sender::send_audio),
+    /// [`send_compressed_audio`](Sender::send_compressed_audio),
+    /// [`send_scatter_audio`](Sender::send_scatter_audio),
     /// [`send_metadata`](Sender::send_metadata) and
     /// [`capture_metadata`](Sender::capture_metadata),
     /// [`tally`](Sender::tally), [`connection_count`](Sender::connection_count),
@@ -849,8 +851,8 @@ impl QueuedSender {
         self.lending.sender()
     }
 
-    /// Lend video submission and completion collection separately from audio,
-    /// metadata and controls. The halves can be moved to separate scoped
+    /// Lend video submission and completion collection separately from
+    /// uncompressed or compressed audio, metadata and controls. The halves can be moved to separate scoped
     /// threads; dropping them restores access to this owner.
     ///
     /// Only the video half submits video, and it is neither `Sync` nor `Clone`.

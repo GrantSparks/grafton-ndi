@@ -1198,6 +1198,81 @@ impl AudioCandidate {
     }
 }
 
+/// Queued H.264 sources retain AAC and Opus as compressed audio through the
+/// shared sender, for both contiguous and scatter audio storage.
+#[test]
+fn queued_compressed_sources_deliver_aac_and_opus() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut queue = QueuedSender::new(
+        &ndi,
+        &options("queued-compressed-audio"),
+        QueueOptions::default(),
+    )
+    .unwrap();
+    let mut receiver = packet_receiver(
+        &ndi,
+        &queue.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
+    connect(
+        &mut receiver,
+        "queued compressed audio receiver",
+        |timecode| {
+            queue
+                .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
+                .unwrap();
+            queue.wait_completed(PATIENCE).unwrap().unwrap();
+        },
+    );
+    let mut timecode = FIRST_TIMECODE;
+    for (codec, samples) in [(AudioCodec::Aac, 1024), (AudioCodec::Opus, 960)] {
+        for scatter in [false, true] {
+            timecode += 1;
+            let bytes = audio_bytes(codec, 48_000, 2, timecode);
+            queue
+                .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
+                .unwrap();
+            let (_video, audio) = queue.split();
+            if scatter {
+                let cuts = if codec == AudioCodec::Aac {
+                    vec![44]
+                } else {
+                    vec![1]
+                };
+                let mut frame =
+                    ScatterAudioFrame::new(codec, 48_000, 2, samples, split(&bytes, &cuts))
+                        .unwrap();
+                frame.set_timecode(Timecode::from_ticks(timecode));
+                audio.send_scatter_audio(&mut frame).unwrap();
+            } else {
+                let mut frame =
+                    CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes.clone()).unwrap();
+                frame.set_timecode(Timecode::from_ticks(timecode));
+                audio.send_compressed_audio(&mut frame);
+            }
+            let received = await_audio(&mut receiver, timecode);
+            assert_eq!(
+                (
+                    received.codec(),
+                    received.sample_rate(),
+                    received.num_channels(),
+                    received.num_samples()
+                ),
+                (codec, 48_000, 2, samples)
+            );
+            assert_same_packet(
+                received.data(),
+                &bytes,
+                (codec == AudioCodec::Aac).then_some(EnvelopeCodec::Aac),
+            );
+            queue.wait_completed(PATIENCE).unwrap().unwrap();
+        }
+    }
+}
+
 /// The SDK takes any compressed audio frame and silently discards the ones
 /// it does not accept. Of a grid of frames, sensible and not, every one the
 /// wrapper admits arrives exactly as it was sent, from one buffer and from

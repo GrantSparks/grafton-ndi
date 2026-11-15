@@ -16,7 +16,8 @@ use crate::{
         advanced::{native, ScatterSend},
         bindings::*,
     },
-    CompressedAttached, Ndi, Rejected, Result, Sender, SenderOptions, StreamTier,
+    CompressedAttached, CompressedAudioSendMode, Ndi, Rejected, Result, Sender, SenderOptions,
+    StreamTier,
 };
 
 #[cfg(any(test, ndi_has_advanced_scatter_send))]
@@ -931,10 +932,6 @@ impl CompressedVideo<'_> {
 }
 
 impl CompressedAudio<'_> {
-    fn instance(&self) -> NDIlib_send_instance_t {
-        self.sender.native_instance()
-    }
-
     /// The shared metadata, source, tally, connection and encoder controls.
     pub fn sender(&self) -> &Sender<CompressedAttached> {
         self.sender
@@ -942,14 +939,7 @@ impl CompressedAudio<'_> {
 
     /// See [`CompressedSender::send_audio`].
     pub fn send_audio(&mut self, frame: &mut CompressedAudioFrame) {
-        let descriptor = frame.raw();
-        // SAFETY: the sender is live, and the descriptor lends `frame`, which
-        // is borrowed exclusively for longer than this synchronous call.
-        unsafe {
-            self.sender
-                .core()
-                .NDIlib_send_send_audio_v3(self.instance(), &descriptor)
-        };
+        self.sender.send_compressed_audio(frame);
     }
 
     /// See [`CompressedSender::send_scatter_audio`].
@@ -957,15 +947,42 @@ impl CompressedAudio<'_> {
     /// # Errors
     ///
     /// As for [`CompressedSender::send_scatter_audio`].
-    pub fn send_scatter_audio(&mut self, _frame: &mut ScatterAudioFrame) -> Result<()> {
-        let table = self.sender.runtime().table::<ScatterSend>()?;
+    pub fn send_scatter_audio(&mut self, frame: &mut ScatterAudioFrame) -> Result<()> {
+        self.sender.send_scatter_audio(frame)
+    }
+}
+
+impl<M: CompressedAudioSendMode> Sender<M> {
+    /// Send a compressed audio frame synchronously, alongside the owner's
+    /// video. The frame is borrowed exclusively because the SDK writes to its
+    /// envelope. The compressed or queued mode proves runtime availability;
+    /// the frame's type proves send admission.
+    pub fn send_compressed_audio(&self, frame: &mut CompressedAudioFrame) {
+        let descriptor = frame.raw();
+        // SAFETY: this live Advanced sender lends the exclusively borrowed
+        // frame for the whole synchronous call, after which the SDK releases it.
+        unsafe {
+            self.core()
+                .NDIlib_send_send_audio_v3(self.native_instance(), &descriptor)
+        };
+    }
+
+    /// Send compressed audio held in separate blocks synchronously.
+    /// The frame remains exclusively borrowed through native release.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::UnsupportedCapability`] when scatter sending is
+    /// unavailable in the selected runtime or build headers.
+    pub fn send_scatter_audio(&self, _frame: &mut ScatterAudioFrame) -> Result<()> {
+        let table = self.runtime().table::<ScatterSend>()?;
         native!(ScatterSend, table => {
             let descriptor = _frame.descriptor();
             let scatter = _frame.storage.descriptor();
-            // SAFETY: the sender is live, and both descriptors lend `frame`, which
-            // is borrowed exclusively for longer than this synchronous call.
+            // SAFETY: both descriptors point only into this exclusively
+            // borrowed frame, retained until the synchronous call returns.
             unsafe {
-                table.NDIlib_send_send_audio_scatter(self.instance(), &descriptor, scatter)
+                table.NDIlib_send_send_audio_scatter(self.native_instance(), &descriptor, scatter)
             };
             Ok(())
         })
@@ -999,6 +1016,26 @@ mod tests {
         assert_eq!(allocations, 0);
         let ((), allocations) =
             crate::test_alloc::allocation_count(|| audio.send_audio(&mut frame));
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn queued_compressed_audio_send_adds_no_allocation() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let queue = super::super::QueuedSender::new(
+            &ndi,
+            &SenderOptions::new(crate::test_support::unique_name("queued-compressed-audio"))
+                .clock_audio(false),
+            super::super::QueueOptions::default(),
+        )
+        .unwrap();
+        let mut frame =
+            CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64]).unwrap();
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            queue.sender().send_compressed_audio(&mut frame)
+        });
         assert_eq!(allocations, 0);
     }
 

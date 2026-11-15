@@ -271,6 +271,11 @@ pub trait SenderMode: mode_sealed::Sealed + Send + Sync {}
 /// [`Sender::send_audio`]: [`RawSend`] and the queued mode.
 pub trait AudioSendMode: SenderMode {}
 
+/// Sealed sender modes that send compressed audio: the compressed and queued
+/// modes. Both require an Advanced runtime at construction.
+#[cfg(feature = "advanced")]
+pub trait CompressedAudioSendMode: SenderMode {}
+
 /// Ordinary sender mode: uncompressed video, including the owned asynchronous
 /// pipeline, audio and metadata. Only a sender in this mode can be registered
 /// with a [`SendAdvertiser`](crate::discovery::SendAdvertiser).
@@ -286,7 +291,7 @@ pub enum CompressedAttached {}
 
 /// Sender mode held exclusively by
 /// [`QueuedSender`](crate::advanced::QueuedSender), which sends the video
-/// itself. It sends uncompressed audio.
+/// itself. It sends uncompressed and compressed audio.
 #[cfg(feature = "advanced")]
 #[derive(Debug)]
 pub enum QueueAttached {}
@@ -303,6 +308,8 @@ impl mode_sealed::Sealed for CompressedAttached {
 #[cfg(feature = "advanced")]
 impl SenderMode for CompressedAttached {}
 #[cfg(feature = "advanced")]
+impl CompressedAudioSendMode for CompressedAttached {}
+#[cfg(feature = "advanced")]
 impl mode_sealed::Sealed for QueueAttached {
     type Native = Exclusive;
 }
@@ -310,6 +317,8 @@ impl mode_sealed::Sealed for QueueAttached {
 impl SenderMode for QueueAttached {}
 #[cfg(feature = "advanced")]
 impl AudioSendMode for QueueAttached {}
+#[cfg(feature = "advanced")]
+impl CompressedAudioSendMode for QueueAttached {}
 
 /// An NDI source that sends video, audio and metadata.
 ///

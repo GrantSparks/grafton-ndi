@@ -166,7 +166,13 @@ The SDK completion callback runs no application code.
 
 `from_sender` drains an ordinary sender's async pipeline and returns any held
 frame; it refuses advertised senders. The queue lends audio, metadata and
-shared controls through `sender()`, but reserves video sends. `QueuedSender` is
+shared controls through `sender()`, but reserves video sends. Use
+`send_compressed_audio(&mut frame)` for AAC or Opus, or `send_scatter_audio`
+for audio held in blocks; uncompressed `send_audio` remains available. These
+same methods are available on the shared sender returned by `split()`, so
+queued compressed video can carry compressed audio on a separate scoped
+thread. Audio and video formats are selected independently; the native
+transport test covers compressed video with AAC and Opus. `QueuedSender` is
 `Send + Sync`; submission/collection require mutable access. `split()` lends
 an exclusive `QueuedVideo` view alongside the shared sender, so audio can run
 on its own scoped thread while video waits for completions. Neither split
