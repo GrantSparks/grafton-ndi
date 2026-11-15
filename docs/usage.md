@@ -142,7 +142,7 @@ Borrowing a frame avoids an intermediate owned copy but does not guarantee an
 in-place video send: padded captures and formats needing SDK tail room use
 reusable staging. `frame.sends_in_place()` reports the selected path.
 
-Concrete frames expose the same accessors as their source traits, including
+Concrete video and audio frames expose the same accessors as their source traits, including
 `copy_into`, `timestamp` and video `sends_in_place`, without importing a trait.
 `data()` always means active bytes or samples: owned frames return their packed
 slice; borrowed frames return `None` when padding separates active rows or
