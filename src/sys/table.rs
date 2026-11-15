@@ -47,6 +47,7 @@ impl PartialEq<&CStr> for NativeFunction {
 pub(crate) struct Named<'a, T>(pub(in crate::sys) &'a T);
 
 /// One native result together with the entry point that produced it.
+#[derive(Clone, Copy)]
 pub(crate) struct Called<R> {
     pub(in crate::sys) value: R,
     pub(in crate::sys) function: NativeFunction,
@@ -56,6 +57,10 @@ pub(crate) struct Called<R> {
 impl<R> Called<R> {
     pub(crate) fn function(&self) -> NativeFunction {
         self.function
+    }
+
+    pub(crate) fn value(&self) -> &R {
+        &self.value
     }
 
     pub(crate) fn into_value(self) -> R {
@@ -75,12 +80,7 @@ impl<R> Called<R> {
 
     pub(crate) fn failed(&self) -> crate::Error {
         crate::Error::NativeOperationFailed {
-            // Transitional mapping until all public operation fields use NativeFunction.
-            operation: self
-                .function
-                .name()
-                .to_str()
-                .expect("native table symbols are ASCII"),
+            operation: self.function,
         }
     }
 }
@@ -210,6 +210,7 @@ macro_rules! native_table {
                 ///
                 /// The caller upholds the SDK's contract for this function.
                 #[inline]
+                #[allow(dead_code)]
                 pub(crate) unsafe fn $name(&self, $($argument: $type),*) $(-> $return)? {
                     // SAFETY: forwarded to the caller's obligations above.
                     unsafe { (self.$name)($($argument),*) }
@@ -243,6 +244,15 @@ macro_rules! native_table {
 }
 
 pub(crate) use native_table;
+
+/// Construct a synthetic native result for tests of SDK-output policies.
+#[cfg(test)]
+pub(crate) fn for_test<R>(value: R, name: &'static CStr) -> Called<R> {
+    Called {
+        value,
+        function: NativeFunction::new(name),
+    }
+}
 
 /// A provider for unit tests that exports the names a predicate accepts. The
 /// addresses it returns are placeholders and must never be called.

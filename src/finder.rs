@@ -464,16 +464,14 @@ impl Finder {
             Self::create(
                 ndi,
                 options,
-                "NDIlib_find_create_v2",
                 #[cfg(feature = "advanced")]
                 None,
-                |core, raw| core.NDIlib_find_create_v2(raw),
+                |core, raw| core.named().NDIlib_find_create_v2(raw),
             )
         }
     }
 
-    /// The one creation path: create a finder through `create`, the entry
-    /// point `operation`, which is handed the core table and the native
+    /// The one creation path: create a finder through `create`, which is handed the core table and the native
     /// settings for `settings`, and keep `config` for as long as the finder
     /// lives.
     ///
@@ -484,9 +482,11 @@ impl Finder {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         settings: &FinderOptions,
-        operation: &'static str,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
-        create: impl FnOnce(&'static sys::Core, &NDIlib_find_create_t) -> NDIlib_find_instance_t,
+        create: impl FnOnce(
+            &'static sys::Core,
+            &NDIlib_find_create_t,
+        ) -> sys::table::Called<NDIlib_find_instance_t>,
     ) -> Result<Self> {
         let groups = settings.groups.as_deref().map(CString::new).transpose()?;
         let extra_ips = settings
@@ -501,10 +501,9 @@ impl Finder {
                 p_groups: groups.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
                 p_extra_ips: extra_ips.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
             },
-        );
-        if instance.is_null() {
-            return Err(Error::NativeOperationFailed { operation });
-        }
+        )
+        .created()?
+        .as_ptr();
         let finder = Self {
             instance: FindInstance(instance),
             sources_lock: parking_lot::Mutex::new(FindInstance(instance)),
@@ -1279,10 +1278,10 @@ impl Source {
     /// non-null string pointers must remain readable through their NUL
     /// terminators, or for 4 MiB, until copying finishes.
     pub(crate) unsafe fn try_from_raw(
-        source_ptr: *const NDIlib_source_t,
-        operation: &'static str,
+        source: sys::table::Called<*const NDIlib_source_t>,
     ) -> Result<Self> {
-        let failed = || Error::NativeOperationFailed { operation };
+        let failed = || source.failed();
+        let source_ptr = *source.value();
         if source_ptr.is_null() {
             return Err(failed());
         }
@@ -1295,7 +1294,7 @@ impl Source {
         // pointers to this strict policy, which reports malformed SDK text.
         unsafe {
             decode_source(name, address, |pointer| {
-                copy_sdk_string(pointer, operation).map(Some)
+                copy_sdk_string(source.map(|_| pointer)).map(Some)
             })
         }?
         .ok_or_else(failed)
@@ -1639,6 +1638,14 @@ impl CachedSources {
 
 #[cfg(test)]
 mod tests {
+    unsafe fn source_from_raw(
+        source: *const NDIlib_source_t,
+        function: &'static std::ffi::CStr,
+    ) -> Result<Source> {
+        // SAFETY: forwarded to the test caller's live-descriptor obligation.
+        unsafe { Source::try_from_raw(sys::table::for_test(source, function)) }
+    }
+
     use super::*;
 
     #[test]
@@ -2219,7 +2226,7 @@ mod tests {
             let raw = configured.to_raw().unwrap();
             // SAFETY: RawSource lends its descriptor while retaining both C
             // strings for this synchronous owned copy.
-            let discovered = unsafe { Source::try_from_raw(raw.as_raw(), "test") }.unwrap();
+            let discovered = unsafe { source_from_raw(raw.as_raw(), c"test") }.unwrap();
             assert_eq!(configured, discovered);
             assert_eq!(hash(&configured), hash(&discovered));
             let address = discovered.address().unwrap();
@@ -2387,12 +2394,11 @@ mod tests {
     #[test]
     fn test_try_from_raw_null_pointer() {
         // A null descriptor is a failure of the function that returned it.
-        let result = unsafe { Source::try_from_raw(ptr::null(), "NDIlib_send_get_source_name") };
+        let result = unsafe { source_from_raw(ptr::null(), c"NDIlib_send_get_source_name") };
         assert!(matches!(
             result,
             Err(Error::NativeOperationFailed {
-                operation: "NDIlib_send_get_source_name"
-            })
+                operation}) if operation.name() == c"NDIlib_send_get_source_name"
         ));
     }
 
@@ -2489,7 +2495,7 @@ mod tests {
             let (snapshot, single) = unsafe {
                 (
                     snapshot_entry(&raw, &mut SnapshotBudget::new()),
-                    Source::try_from_raw(&raw, "test source query"),
+                    source_from_raw(&raw, c"test source query"),
                 )
             };
             match expected {
@@ -2503,8 +2509,7 @@ mod tests {
                         matches!(
                             &single,
                             Err(Error::NativeOperationFailed {
-                                operation: "test source query"
-                            })
+                                operation}) if operation.name() == c"test source query"
                         ),
                         "{label}: {single:?}"
                     );
@@ -2539,21 +2544,22 @@ mod tests {
 
         // SAFETY: every descriptor points to live NUL-terminated strings.
         unsafe {
-            let fits = Source::try_from_raw(&descriptor(&longest, ptr::null()), "test").unwrap();
+            let fits = source_from_raw(&descriptor(&longest, ptr::null()), c"test").unwrap();
             assert_eq!(fits.name().len(), MAX_SDK_STRING_BYTES - 1);
             for raw in [
                 descriptor(&too_long, address.as_ptr()),
                 descriptor(c"Camera".to_bytes_with_nul(), too_long.as_ptr().cast()),
             ] {
                 let Err(Error::UnexpectedSdkResult(reason)) =
-                    Source::try_from_raw(&raw, "NDIlib_send_get_source_name")
+                    source_from_raw(&raw, c"NDIlib_send_get_source_name")
                 else {
                     panic!("a string longer than the limit must be refused");
                 };
                 assert_eq!(
                     reason,
                     crate::SdkResultDefect::UnterminatedText {
-                        operation: "NDIlib_send_get_source_name"
+                        operation: sys::table::for_test((), c"NDIlib_send_get_source_name")
+                            .function()
                     }
                 );
             }
@@ -2622,12 +2628,11 @@ mod tests {
             },
         };
 
-        let result = unsafe { Source::try_from_raw(&source, "NDIlib_find_get_current_sources") };
+        let result = unsafe { source_from_raw(&source, c"NDIlib_find_get_current_sources") };
         assert!(matches!(
             result,
             Err(Error::NativeOperationFailed {
-                operation: "NDIlib_find_get_current_sources"
-            })
+                operation}) if operation.name() == c"NDIlib_find_get_current_sources"
         ));
     }
 
@@ -2640,7 +2645,7 @@ mod tests {
                 p_url_address: url.as_ptr(),
             },
         };
-        let source = unsafe { Source::try_from_raw(&raw, "test") }.unwrap();
+        let source = unsafe { source_from_raw(&raw, c"test") }.unwrap();
         assert!(source.name().is_empty());
         assert!(
             matches!(source.address(), Some(address) if address.is_url() && address.as_str() == "ndi://127.0.0.1:5960")
@@ -2662,7 +2667,7 @@ mod tests {
             },
         };
 
-        let result = unsafe { Source::try_from_raw(&source, "test") };
+        let result = unsafe { source_from_raw(&source, c"test") };
         assert!(result.is_ok());
 
         let source = result.unwrap();
@@ -2685,7 +2690,7 @@ mod tests {
             },
         };
 
-        let result = unsafe { Source::try_from_raw(&source, "test") };
+        let result = unsafe { source_from_raw(&source, c"test") };
         assert!(result.is_ok());
 
         let source = result.unwrap();
@@ -2707,7 +2712,7 @@ mod tests {
             },
         };
 
-        let result = unsafe { Source::try_from_raw(&source, "test") };
+        let result = unsafe { source_from_raw(&source, c"test") };
         assert!(result.is_ok());
 
         let source = result.unwrap();

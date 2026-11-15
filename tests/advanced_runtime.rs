@@ -142,14 +142,12 @@ fn advanced_native_constructors_controls_and_queue() {
         assert!(matches!(
             session.mouse_down(MouseButton::Left),
             Err(Error::NativeOperationFailed {
-                operation: "NDIlib_recv_kvm_send_left_mouse_click"
-            })
+                operation}) if operation.name() == c"NDIlib_recv_kvm_send_left_mouse_click"
         ));
         assert!(matches!(
             session.key_down(0xff0d),
             Err(Error::NativeOperationFailed {
-                operation: "NDIlib_recv_kvm_send_keyboard_press"
-            })
+                operation}) if operation.name() == c"NDIlib_recv_kvm_send_keyboard_press"
         ));
         assert!(matches!(
             session.move_pointer(0.5, 1.5),

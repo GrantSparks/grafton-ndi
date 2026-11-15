@@ -288,13 +288,7 @@ macro_rules! ptz_command {
     ($ptz:expr, $func:ident $(, $arg:expr)*) => {{
         // SAFETY: the receiver instance is live for the handle's borrow, and
         // every argument is a plain value.
-        if unsafe { $ptz.core.sdk().$func($ptz.core.instance.0 $(, $arg)*) } {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: stringify!($func),
-            })
-        }
+        unsafe { $ptz.core.sdk().named().$func($ptz.core.instance.0 $(, $arg)*) }.performed()
     }};
 }
 
@@ -1095,16 +1089,15 @@ impl Receiver {
             Self::create(
                 ndi,
                 options,
-                "NDIlib_recv_create_v3",
                 #[cfg(feature = "advanced")]
                 None,
-                |core, raw| core.NDIlib_recv_create_v3(raw),
+                |core, raw| core.named().NDIlib_recv_create_v3(raw),
             )
         }
     }
 
     /// The one creation path: check `options` against the runtime, create a
-    /// receiver through `create`, the entry point `operation`, which is
+    /// receiver through `create`, which is
     /// handed the core table and the native settings for `options`, and keep
     /// `config` for as long as the native receiver lives.
     ///
@@ -1115,9 +1108,11 @@ impl Receiver {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         options: &ReceiverOptions,
-        operation: &'static str,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
-        create: impl FnOnce(&'static sys::Core, &NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t,
+        create: impl FnOnce(
+            &'static sys::Core,
+            &NDIlib_recv_create_v3_t,
+        ) -> sys::table::Called<NDIlib_recv_instance_t>,
     ) -> Result<Self> {
         let RawRecvCreateV3 {
             _source,
@@ -1126,10 +1121,7 @@ impl Receiver {
         } = options.to_raw(ndi)?;
         // SAFETY: the core keeps every string these settings point to until
         // after native destruction, including the target and receiver name.
-        let instance = create(&ndi.api().core, &raw);
-        if instance.is_null() {
-            return Err(Error::NativeOperationFailed { operation });
-        }
+        let instance = create(&ndi.api().core, &raw).created()?.as_ptr();
         Ok(Self {
             core: Arc::new(ReceiverCore {
                 instance: RecvInstance(instance),

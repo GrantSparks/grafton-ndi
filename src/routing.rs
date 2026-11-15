@@ -175,16 +175,14 @@ impl Router {
             Self::create(
                 ndi,
                 options,
-                "NDIlib_routing_create",
                 #[cfg(feature = "advanced")]
                 None,
-                |routing, settings| routing.NDIlib_routing_create(settings),
+                |routing, settings| routing.named().NDIlib_routing_create(settings),
             )
         }
     }
 
-    /// The one creation path: create a router through `create`, the entry
-    /// point `operation`, which is handed the routing table and the native
+    /// The one creation path: create a router through `create`, which is handed the routing table and the native
     /// settings for `options`, and keep `config` for as long as the router
     /// lives.
     ///
@@ -195,12 +193,11 @@ impl Router {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         options: &RouterOptions,
-        operation: &'static str,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
             &'static sys::Routing,
             &NDIlib_routing_create_t,
-        ) -> NDIlib_routing_instance_t,
+        ) -> sys::table::Called<NDIlib_routing_instance_t>,
     ) -> Result<Self> {
         // A router with a configuration gets here only once its own
         // capability, which requires routing, has been allowed, so it is
@@ -214,10 +211,9 @@ impl Router {
                 p_ndi_name: name.as_ptr(),
                 p_groups: groups.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
             },
-        );
-        if instance.is_null() {
-            return Err(Error::NativeOperationFailed { operation });
-        }
+        )
+        .created()?
+        .as_ptr();
         Ok(Self {
             instance: RoutingInstance(instance),
             routing,
@@ -257,10 +253,12 @@ impl Router {
         // SAFETY: the boxed descriptor and its strings stay owned by this
         // router until a later request has returned, or native destruction.
         // Both previous descriptors remain owned throughout this call.
-        if unsafe {
+        let changed = unsafe {
             self.routing
+                .named()
                 .NDIlib_routing_change(self.instance.0, raw.as_raw())
-        } {
+        };
+        if *changed.value() {
             self.route = Some(raw);
             self.refused_route = None;
             Ok(())
@@ -268,9 +266,7 @@ impl Router {
             // A refusal preserves the effective route. No SDK text says what
             // it retained from this request, so keep that descriptor too.
             self.refused_route = Some(raw);
-            Err(Error::NativeOperationFailed {
-                operation: "routing change",
-            })
+            Err(changed.failed())
         }
     }
     /// Stop routing to any source. Receivers stay connected to the router.
@@ -280,14 +276,13 @@ impl Router {
     /// Returns [`Error::NativeOperationFailed`] when the SDK rejects the change.
     pub fn clear(&mut self) -> Result<()> {
         // SAFETY: the router instance is live for this borrow.
-        if unsafe { self.routing.NDIlib_routing_clear(self.instance.0) } {
+        let cleared = unsafe { self.routing.named().NDIlib_routing_clear(self.instance.0) };
+        if *cleared.value() {
             self.route = None;
             self.refused_route = None;
             Ok(())
         } else {
-            Err(Error::NativeOperationFailed {
-                operation: "routing clear",
-            })
+            Err(cleared.failed())
         }
     }
     /// Count the receivers connected to this router.
@@ -306,12 +301,13 @@ impl Router {
         // SAFETY: the router instance is live for this borrow.
         let count = unsafe {
             self.routing
+                .named()
                 .NDIlib_routing_get_no_connections(self.instance.0, timeout)
         };
-        u32::try_from(count).map_err(|_| {
+        u32::try_from(*count.value()).map_err(|_| {
             Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
-                operation: "NDIlib_routing_get_no_connections",
-                value: count,
+                operation: count.function(),
+                value: *count.value(),
             })
         })
     }
@@ -329,8 +325,9 @@ impl Router {
         // valid until the router is destroyed, after this copy completes.
         unsafe {
             Source::try_from_raw(
-                self.routing.NDIlib_routing_get_source_name(self.instance.0),
-                "NDIlib_routing_get_source_name",
+                self.routing
+                    .named()
+                    .NDIlib_routing_get_source_name(self.instance.0),
             )
         }
     }

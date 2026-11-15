@@ -59,7 +59,7 @@ pub(crate) trait Configurable: Sized {
     type Instance;
 
     /// Run the object's creation path with `create` as its entry point, which
-    /// a creation error names as `operation`, and keep `config` for as long
+    /// retains its function name, and keep `config` for as long
     /// as the object lives.
     ///
     /// # Safety
@@ -69,13 +69,12 @@ pub(crate) trait Configurable: Sized {
     unsafe fn create_with(
         ndi: &Ndi,
         options: &Self::Options,
-        operation: &'static str,
         config: AdvancedConfig,
-        create: impl FnOnce(&Self::Settings) -> Self::Instance,
+        create: impl FnOnce(&Self::Settings) -> crate::sys::table::Called<Self::Instance>,
     ) -> Result<Self>;
 
     /// Create the object with `config` through `create`, the entry point
-    /// `operation` of table `C` that takes the settings and a configuration.
+    /// of table `C` that takes the settings and a configuration.
     ///
     /// The table is taken first, so a runtime or a build without that entry
     /// point is refused with
@@ -89,9 +88,12 @@ pub(crate) trait Configurable: Sized {
     unsafe fn configured<C: Table>(
         ndi: &Ndi,
         options: &Self::Options,
-        operation: &'static str,
         config: &AdvancedConfig,
-        create: impl FnOnce(&'static C, &Self::Settings, *const c_char) -> Self::Instance,
+        create: impl FnOnce(
+            &'static C,
+            &Self::Settings,
+            *const c_char,
+        ) -> crate::sys::table::Called<Self::Instance>,
     ) -> Result<Self> {
         let table = ndi.table::<C>()?;
         let text = config.as_ptr();
@@ -103,7 +105,7 @@ pub(crate) trait Configurable: Sized {
         // it, whether it copies the text or keeps the pointer. What `create`
         // returns is the caller's obligation.
         unsafe {
-            Self::create_with(ndi, options, operation, config.clone(), |settings| {
+            Self::create_with(ndi, options, config.clone(), |settings| {
                 create(table, settings, text)
             })
         }
@@ -126,13 +128,12 @@ macro_rules! configurable {
             unsafe fn create_with(
                 ndi: &Ndi,
                 options: &$Options,
-                operation: &'static str,
-                config: AdvancedConfig,
-                create: impl FnOnce(&$Settings) -> $Instance,
+                        config: AdvancedConfig,
+                create: impl FnOnce(&$Settings) -> crate::sys::table::Called<$Instance>,
             ) -> Result<Self> {
                 // SAFETY: forwarded to the caller's obligation.
                 unsafe {
-                    Self::create(ndi, options, operation, Some(config), |_, settings| {
+                    Self::create(ndi, options, Some(config), |_, settings| {
                         create(settings)
                     })
                 }
@@ -155,10 +156,9 @@ macro_rules! configurable {
                     Self::configured(
                         ndi,
                         options,
-                        stringify!($create),
                         config,
                         |table: &'static $Table, _settings, _text| {
-                            native!($Table, table => table.$create(_settings, _text))
+                            native!($Table, table => table.named().$create(_settings, _text))
                         },
                     )
                 }

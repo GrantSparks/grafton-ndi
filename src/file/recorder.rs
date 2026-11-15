@@ -942,10 +942,8 @@ impl FileRecorder {
         };
         // SAFETY: `settings` and the strings it points to, owned by `options`
         // and `resolved`, are valid for the call.
-        let handle = NonNull::new(unsafe { recording.NDIlib_file_recorder_create(&settings) })
-            .ok_or(Error::NativeOperationFailed {
-                operation: "recorder creation",
-            })?;
+        let handle =
+            unsafe { recording.named().NDIlib_file_recorder_create(&settings) }.created()?;
         Ok(Self {
             recording,
             handle,
@@ -1058,21 +1056,19 @@ impl FileRecorder {
             match timecode {
                 RecordingTimecode::Preserve => self
                     .recording
+                    .named()
                     .NDIlib_file_recorder_start(self.handle.as_ptr(), prefix),
-                RecordingTimecode::GenerateFrom(start) => {
-                    self.recording.NDIlib_file_recorder_start_with_timecode(
+                RecordingTimecode::GenerateFrom(start) => self
+                    .recording
+                    .named()
+                    .NDIlib_file_recorder_start_with_timecode(
                         self.handle.as_ptr(),
                         prefix,
                         start.ticks(),
-                    )
-                }
+                    ),
             }
         };
-        if !accepted {
-            return Err(Error::NativeOperationFailed {
-                operation: "recorder start",
-            });
-        }
+        accepted.performed()?;
         self.ledger = Ledger::session(
             session,
             dropped,
@@ -1444,17 +1440,12 @@ impl FileRecorder {
         // to, owned by `source`, are valid for the call.
         let accepted = unsafe {
             self.recording
+                .named()
                 .NDIlib_file_recorder_set_source(self.handle.as_ptr(), &raw)
         };
         // Kept only once accepted: the copy is what the recorder retains.
-        self.accepted_source = accepted.then(|| source.clone());
-        if accepted {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: "recorder source change",
-            })
-        }
+        self.accepted_source = accepted.value().then(|| source.clone());
+        accepted.performed()
     }
 
     /// The source the SDK accepted last: the one given at creation, or by the
@@ -1519,15 +1510,10 @@ impl FileRecorder {
         // which the caller lends for longer than the call. The SDK copies it.
         let accepted = unsafe {
             self.recording
+                .named()
                 .NDIlib_file_recorder_rollover(self.handle.as_ptr(), target.prefix.as_ptr())
         };
-        if accepted {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: "recorder rollover",
-            })
-        }
+        accepted.performed()
     }
 
     /// Write a metadata frame into the recording at its current position.
@@ -1557,15 +1543,10 @@ impl FileRecorder {
         // nor writes through `p_data`.
         let injected = unsafe {
             self.recording
+                .named()
                 .NDIlib_file_recorder_inject_metadata(self.handle.as_ptr(), &frame)
         };
-        if injected {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: "metadata injection",
-            })
-        }
+        injected.performed()
     }
 
     /// The recorder's running counters, when the SDK has any.

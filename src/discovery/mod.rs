@@ -223,14 +223,12 @@ trait ServerApi: crate::sys::Table + Sync {
     const SINGLE_ENDPOINT: bool;
     #[cfg(feature = "advanced")]
     type Configured: crate::sys::Table;
-    #[cfg(feature = "advanced")]
-    const CONFIGURED: &'static str;
 
     fn settings(url: *const std::ffi::c_char) -> Self::Settings;
     /// # Safety
     /// Settings point to a null URL or a terminated string kept alive through
     /// native destruction. The result is null or a fresh, exclusively owned object.
-    unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance;
+    unsafe fn create(&self, settings: &Self::Settings) -> sys::table::Called<Self::Instance>;
     /// # Safety
     /// As for `create`; configuration is terminated and also remains live
     /// through destruction, and `table` belongs to the same runtime.
@@ -239,7 +237,7 @@ trait ServerApi: crate::sys::Table + Sync {
         table: &'static Self::Configured,
         settings: *const Self::Settings,
         config: *const std::ffi::c_char,
-    ) -> Self::Instance;
+    ) -> sys::table::Called<Self::Instance>;
     /// # Safety
     /// The instance was created through this table, remains live, and is never
     /// used after this call. No native call on the instance overlaps destruction.
@@ -268,24 +266,22 @@ macro_rules! server_api {
             const SINGLE_ENDPOINT: bool = $single;
             #[cfg(feature = "advanced")]
             type Configured = crate::sys::advanced::$Configured;
-            #[cfg(feature = "advanced")]
-            const CONFIGURED: &'static str = stringify!($configured);
             fn settings(url: *const std::ffi::c_char) -> Self::Settings {
                 $Settings { p_url_address: url }
             }
-            unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance {
+            unsafe fn create(&self, settings: &Self::Settings) -> sys::table::Called<Self::Instance> {
                 // SAFETY: forwarded to the caller's lifecycle contract.
-                $Handle(unsafe { self.$create(settings) })
+                unsafe { self.named().$create(settings) }.map($Handle)
             }
             #[cfg(feature = "advanced")]
             unsafe fn create_configured(
                 table: &'static Self::Configured,
                 _settings: *const Self::Settings,
                 _config: *const std::ffi::c_char,
-            ) -> Self::Instance {
+            ) -> sys::table::Called<Self::Instance> {
                 crate::sys::advanced::native!($Configured, table => {
                     // SAFETY: forwarded to the caller's lifecycle contract.
-                    $Handle(unsafe { table.$configured(_settings, _config) })
+                    unsafe { table.named().$configured(_settings, _config) }.map($Handle)
                 })
             }
             unsafe fn destroy(&self, instance: Self::Instance) {
@@ -366,7 +362,6 @@ impl<A: ServerApi> ServerObject<A> {
                 Self::configured(
                     ndi,
                     options,
-                    A::CONFIGURED,
                     config,
                     |table: &'static A::Configured, settings, text| {
                         A::create_configured(table, settings, text)
@@ -392,7 +387,7 @@ impl<A: ServerApi> ServerObject<A> {
         ndi: &crate::Ndi,
         options: &A::Options,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
-        create: impl FnOnce(&'static A, &A::Settings) -> A::Instance,
+        create: impl FnOnce(&'static A, &A::Settings) -> sys::table::Called<A::Instance>,
     ) -> crate::Result<Self> {
         // Configured gates run first and include this table's own capability.
         let api = ndi.table::<A>()?;
@@ -404,7 +399,7 @@ impl<A: ServerApi> ServerObject<A> {
         }
         let url = server.map(std::ffi::CString::new).transpose()?;
         let settings = A::settings(url.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()));
-        let instance = create(api, &settings);
+        let instance = create(api, &settings).into_value();
         if instance.is_null() {
             return Err(not_created(A::OBJECT, server));
         }
@@ -440,9 +435,8 @@ impl<A: ServerApi> crate::advanced::Configurable for ServerObject<A> {
     unsafe fn create_with(
         ndi: &crate::Ndi,
         options: &Self::Options,
-        _operation: &'static str,
         config: crate::advanced::AdvancedConfig,
-        create: impl FnOnce(&Self::Settings) -> Self::Instance,
+        create: impl FnOnce(&Self::Settings) -> sys::table::Called<Self::Instance>,
     ) -> crate::Result<Self> {
         // SAFETY: forwarded to the caller's fresh-instance obligation.
         unsafe { Self::create(ndi, options, Some(config), |_, settings| create(settings)) }

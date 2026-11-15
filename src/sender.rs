@@ -1706,16 +1706,14 @@ impl<M: SenderMode> Sender<M> {
             Self::create(
                 ndi,
                 options,
-                "NDIlib_send_create",
                 #[cfg(feature = "advanced")]
                 None,
-                |core, raw| core.NDIlib_send_create(raw),
+                |core, raw| core.named().NDIlib_send_create(raw),
             )
         }
     }
 
-    /// The one creation path: create a sender through `create`, the entry
-    /// point `operation`, which is handed the core table and the native
+    /// The one creation path: create a sender through `create`, which is handed the core table and the native
     /// settings for `options`, and keep `config` for as long as the native
     /// sender lives. The new sender is owned as its mode owns one.
     ///
@@ -1726,9 +1724,11 @@ impl<M: SenderMode> Sender<M> {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         options: &SenderOptions,
-        operation: &'static str,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
-        create: impl FnOnce(&'static sys::Core, &NDIlib_send_create_t) -> NDIlib_send_instance_t,
+        create: impl FnOnce(
+            &'static sys::Core,
+            &NDIlib_send_create_t,
+        ) -> sys::table::Called<NDIlib_send_instance_t>,
     ) -> Result<Self> {
         let name = CString::new(options.name.as_str())?;
         let groups = options.groups.as_deref().map(CString::new).transpose()?;
@@ -1741,10 +1741,9 @@ impl<M: SenderMode> Sender<M> {
                 clock_video: options.clock_video,
                 clock_audio: options.clock_audio,
             },
-        );
-        if instance.is_null() {
-            return Err(Error::NativeOperationFailed { operation });
-        }
+        )
+        .created()?
+        .as_ptr();
         let instance = SendInstance(instance);
         Ok(Self {
             inner: Inner {
@@ -2091,8 +2090,12 @@ impl<M: SenderMode> Sender<M> {
         let remaining = deadline.remaining_ms();
         // SAFETY: the sender instance is live for this borrow and `raw` is
         // writable storage for one metadata descriptor.
-        let kind =
-            unsafe { metadata.NDIlib_send_capture(self.inner.instance.0, &mut raw, remaining) };
+        let called = unsafe {
+            metadata
+                .named()
+                .NDIlib_send_capture(self.inner.instance.0, &mut raw, remaining)
+        };
+        let kind = *called.value();
         if kind == NDIlib_frame_type_e_NDIlib_frame_type_metadata {
             /// Frees one frame that `NDIlib_send_capture` filled, through the
             /// sender and the runtime table that filled it, when dropped.
@@ -2143,7 +2146,7 @@ impl<M: SenderMode> Sender<M> {
         } else {
             Err(Error::UnexpectedSdkResult(
                 crate::SdkResultDefect::UnexpectedFrameType {
-                    operation: "sender metadata capture",
+                    operation: called.function(),
                     kind,
                 },
             ))
@@ -2309,13 +2312,14 @@ impl<M: SenderMode> Sender<M> {
         let count = unsafe {
             self.inner
                 .core
+                .named()
                 .NDIlib_send_get_no_connections(self.inner.instance.0, timeout_ms)
         };
 
-        u32::try_from(count).map_err(|_| {
+        u32::try_from(*count.value()).map_err(|_| {
             Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
-                operation: "NDIlib_send_get_no_connections",
-                value: count,
+                operation: count.function(),
+                value: *count.value(),
             })
         })
     }
@@ -2409,11 +2413,12 @@ impl<M: SenderMode> Sender<M> {
         let source_ptr = unsafe {
             self.inner
                 .core
+                .named()
                 .NDIlib_send_get_source_name(self.inner.instance.0)
         };
         // SAFETY: the SDK sender owns this live descriptor and its strings
         // through the synchronous copy performed here.
-        unsafe { Source::try_from_raw(source_ptr, "NDIlib_send_get_source_name") }
+        unsafe { Source::try_from_raw(source_ptr) }
     }
 }
 

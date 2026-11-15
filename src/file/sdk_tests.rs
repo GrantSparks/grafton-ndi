@@ -1292,8 +1292,9 @@ fn the_library_copies_every_string_a_player_gives_it() {
     // until the player is destroyed.
     let source = unsafe {
         crate::Source::try_from_raw(
-            playback.NDIlib_file_player_get_advertised_source(handle),
-            "NDIlib_file_player_get_advertised_source",
+            playback
+                .named()
+                .NDIlib_file_player_get_advertised_source(handle),
         )
     }
     .unwrap();

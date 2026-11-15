@@ -621,24 +621,21 @@ impl FrameSync {
         // successful creation transfers both resources into the ordered owners.
         let core = &receiver.core._ndi.api().core;
         Self::new_with(receiver, |instance| unsafe {
-            core.NDIlib_framesync_create(instance)
+            core.named().NDIlib_framesync_create(instance)
         })
     }
 
     fn new_with(
         receiver: Receiver,
-        create: impl FnOnce(NDIlib_recv_instance_t) -> NDIlib_framesync_instance_t,
+        create: impl FnOnce(
+            NDIlib_recv_instance_t,
+        ) -> crate::sys::table::Called<NDIlib_framesync_instance_t>,
     ) -> std::result::Result<Self, Rejected<Receiver>> {
-        let instance = create(receiver.core.instance.0);
-        if instance.is_null() {
+        let instance = match create(receiver.core.instance.0).created() {
+            Ok(instance) => instance.as_ptr(),
             // The untouched raw receiver goes back to the caller.
-            return Err(Rejected::new(
-                Error::NativeOperationFailed {
-                    operation: "NDIlib_framesync_create",
-                },
-                receiver,
-            ));
-        }
+            Err(error) => return Err(Rejected::new(error, receiver)),
+        };
         let resource = FrameSyncResource {
             instance: FrameSyncInstance(instance),
             receiver: Arc::clone(&receiver.core),
@@ -1175,15 +1172,16 @@ mod tests {
             let receiver =
                 Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
             drop(ndi);
-            let rejected = match FrameSync::new_with(receiver, |_| ptr::null_mut()) {
+            let rejected = match FrameSync::new_with(receiver, |_| {
+                crate::sys::table::for_test(ptr::null_mut(), c"NDIlib_framesync_create")
+            }) {
                 Err(rejected) => rejected,
                 Ok(_) => panic!("a null instance must be rejected"),
             };
             assert!(matches!(
                 rejected.error(),
                 Error::NativeOperationFailed {
-                    operation: "NDIlib_framesync_create"
-                }
+                    operation} if operation.name() == c"NDIlib_framesync_create"
             ));
             // The receiver comes back usable, and is dropped exactly once.
             let receiver = rejected.into_inner();

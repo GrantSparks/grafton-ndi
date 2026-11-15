@@ -139,8 +139,7 @@ pub enum Error {
     /// genlock instance, or a File player or recorder) or returns a source
     /// descriptor; or an internal-error status from AV synchronization.
     /// A source descriptor with neither a name nor an address is
-    /// reported the same way. `operation` names the SDK function or the File
-    /// API operation. A Discovery Server advertiser or listener the SDK does
+    /// reported the same way. `operation` names the SDK function. A Discovery Server advertiser or listener the SDK does
     /// not create is reported as [`Error::InvalidInput`] instead, because the
     /// SDK refuses only the address it was given.
     ///
@@ -148,8 +147,8 @@ pub enum Error {
     /// an event.
     #[error("The NDI SDK did not perform {operation}")]
     NativeOperationFailed {
-        /// The SDK function, or the File API operation, that failed.
-        operation: &'static str,
+        /// The SDK function that failed.
+        operation: crate::NativeFunction,
     },
 
     /// NDI runtime initialization failed, with its [`InitializationFailure`].
@@ -605,8 +604,8 @@ mod full_diagnostic_tests {
         for (error, expected) in [
             (Error::InvalidFrame(FrameDefect::Layout(crate::LayoutDefect::AudioRate(0.into()))), "Invalid frame data: Invalid sample rate: 0"),
             (Error::InvalidInput(InputDefect::RelativeLibraryPath), "Invalid input: an explicit NDI library path must be absolute"),
-            (Error::UnexpectedSdkResult(SdkResultDefect::NegativeCount {operation:"NDIlib_send_get_no_connections",value:-1}), "Unexpected NDI SDK result: NDIlib_send_get_no_connections returned a negative count: -1"),
-            (Error::UnexpectedSdkResult(SdkResultDefect::UnexpectedFrameType {operation:"sender metadata capture",kind:17}), "Failed to capture frame: sender metadata capture returned 17"),
+            (Error::UnexpectedSdkResult(SdkResultDefect::NegativeCount {operation: crate::sys::table::for_test((), c"NDIlib_send_get_no_connections").function(),value:-1}), "Unexpected NDI SDK result: NDIlib_send_get_no_connections returned a negative count: -1"),
+            (Error::UnexpectedSdkResult(SdkResultDefect::UnexpectedFrameType {operation: crate::sys::table::for_test((), c"NDIlib_send_capture").function(),kind:17}), "Failed to capture frame: NDIlib_send_capture returned 17"),
             (Error::ConnectionLost, "Failed to capture frame: the SDK returned an error frame: the connection was lost"),
             (Error::InitializationFailed(InitializationFailure::NotStarted), "Failed to initialize the NDI runtime: NDIlib_initialize returned false on a CPU the runtime reports as supported"),
             (Error::InitializationFailed(InitializationFailure::HandleCountExhausted), "Failed to initialize the NDI runtime: NDI runtime reference count exhausted"),

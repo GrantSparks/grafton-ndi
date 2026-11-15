@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     sys::{self, bindings::*},
-    Error, Result, Source, Timecode,
+    Result, Source, Timecode,
 };
 
 /// An NDI source that plays recordings.
@@ -62,11 +62,7 @@ impl FilePlayer {
                 .map_or(std::ptr::null(), |groups| groups.as_ptr()),
         };
         // SAFETY: `settings` and the strings it points to are valid for the call.
-        let handle = NonNull::new(unsafe { playback.NDIlib_file_player_create(&settings) }).ok_or(
-            Error::NativeOperationFailed {
-                operation: "player creation",
-            },
-        )?;
+        let handle = unsafe { playback.named().NDIlib_file_player_create(&settings) }.created()?;
         Ok(Self {
             playback,
             handle,
@@ -97,15 +93,10 @@ impl FilePlayer {
         // that outlives the call.
         let started = unsafe {
             self.playback
+                .named()
                 .NDIlib_file_player_start(self.handle.as_ptr(), path.as_ptr())
         };
-        if started {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: "player start",
-            })
-        }
+        started.performed()
     }
 
     /// Stop the current file. The source stays advertised.
@@ -195,15 +186,10 @@ impl FilePlayer {
         // SAFETY: the player is live for this borrow.
         let sought = unsafe {
             self.playback
+                .named()
                 .NDIlib_file_player_seek_to_time(self.handle.as_ptr(), position.ticks())
         };
-        if sought {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: "time seek",
-            })
-        }
+        sought.performed()
     }
 
     /// Seek to a frame index.
@@ -218,15 +204,10 @@ impl FilePlayer {
         // SAFETY: the player is live for this borrow.
         let sought = unsafe {
             self.playback
+                .named()
                 .NDIlib_file_player_seek_to_frame(self.handle.as_ptr(), frame)
         };
-        if sought {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: "frame seek",
-            })
-        }
+        sought.performed()
     }
 
     /// Pause or resume the current file. Has no effect when no file is open.
@@ -349,8 +330,8 @@ impl FilePlayer {
         unsafe {
             Source::try_from_raw(
                 self.playback
+                    .named()
                     .NDIlib_file_player_get_advertised_source(self.handle.as_ptr()),
-                "NDIlib_file_player_get_advertised_source",
             )
         }
     }

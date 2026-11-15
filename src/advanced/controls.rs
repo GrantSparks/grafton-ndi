@@ -99,7 +99,8 @@ impl<'a, M: ReceiverMode> ReceiverControls<'a, M> {
 /// describes as a size, a bit rate or a quality: a negative value breaks that
 /// contract.
 #[cfg(any(ndi_has_advanced_encoder_guidance, ndi_has_advanced_quality_planning))]
-fn guidance(value: i32, operation: &'static str) -> Result<u32> {
+fn guidance(called: crate::sys::table::Called<i32>) -> Result<u32> {
+    let (value, operation) = called.into_parts();
     u32::try_from(value).map_err(|_| {
         crate::Error::UnexpectedSdkResult(crate::SdkResultDefect::InvalidGuidance {
             operation,
@@ -160,9 +161,9 @@ impl<M: SenderMode> Sender<M> {
             let format = _format.raw();
             // SAFETY: the sender instance is live for this borrow.
             let value = unsafe {
-                table.NDIlib_send_get_target_frame_size(self.native_instance(), &format)
+                table.named().NDIlib_send_get_target_frame_size(self.native_instance(), &format)
             };
-            guidance(value, "NDIlib_send_get_target_frame_size")
+            guidance(value)
         })
     }
 
@@ -179,9 +180,9 @@ impl<M: SenderMode> Sender<M> {
             let format = _format.raw();
             // SAFETY: the sender instance is live for this borrow.
             let value = unsafe {
-                table.NDIlib_send_get_target_bit_rate(self.native_instance(), &format)
+                table.named().NDIlib_send_get_target_bit_rate(self.native_instance(), &format)
             };
-            guidance(value, "NDIlib_send_get_target_bit_rate")
+            guidance(value)
         })
     }
 
@@ -201,8 +202,8 @@ impl<M: SenderMode> Sender<M> {
             require_speedhq(_format)?;
             let format = _format.raw();
             // SAFETY: the sender instance is live for this borrow.
-            let value = unsafe { table.NDIlib_send_get_q_factor(self.native_instance(), &format) };
-            guidance(value, "NDIlib_send_get_q_factor")
+            let value = unsafe { table.named().NDIlib_send_get_q_factor(self.native_instance(), &format) };
+            guidance(value)
         })
     }
 
@@ -226,14 +227,14 @@ impl<M: SenderMode> Sender<M> {
             // SAFETY: the sender instance is live for this borrow and `short_dc`
             // is writable storage for the flag.
             let value = unsafe {
-                table.NDIlib_send_get_q_factor_v2(
+                table.named().NDIlib_send_get_q_factor_v2(
                     self.native_instance(),
                     &format,
                     _supports_new_format,
                     &mut short_dc,
                 )
             };
-            let value = guidance(value, "NDIlib_send_get_q_factor_v2")?;
+            let value = guidance(value)?;
             // A value of 100 or more permits the newer format; the quality is
             // then the value less 100.
             let (quality, new_format) = match value.checked_sub(100) {

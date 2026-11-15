@@ -232,9 +232,7 @@ macro_rules! conversions {
             };
             // SAFETY: Both typed buffers cover the validated dimensions, do not
             // alias, and remain live throughout this synchronous conversion.
-            if !unsafe { self.audio.$to(&source, &mut destination) } {
-                return Err(Error::NativeOperationFailed { operation: stringify!($to_method) });
-            }
+            unsafe { self.audio.named().$to(&source, &mut destination) }.performed()?;
             Ok(shape.0.sample_count())
         }
 
@@ -257,9 +255,7 @@ macro_rules! conversions {
             raw.p_data = destination.data_mut().as_mut_ptr().cast();
             // SAFETY: Source and destination have matching checked dimensions;
             // the exclusively borrowed output is initialized and correctly aligned.
-            if !unsafe { self.audio.$from(&source, &mut raw) } {
-                return Err(Error::NativeOperationFailed { operation: stringify!($into_method) });
-            }
+            unsafe { self.audio.named().$from(&source, &mut raw) }.performed()?;
             Ok(())
         }
     };

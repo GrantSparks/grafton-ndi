@@ -179,7 +179,9 @@ pub use types::*;
 
 use std::path::{Path, PathBuf};
 
-use crate::{capabilities::CapabilityStatus, sys, Error, Ndi, Result};
+#[cfg(test)]
+use crate::Error;
+use crate::{capabilities::CapabilityStatus, sys, Ndi, Result};
 #[cfg(test)]
 use out_param::OutParam;
 
@@ -348,13 +350,14 @@ impl FileApi {
     pub fn probe(&self, path: impl AsRef<Path>) -> Result<FileInfo> {
         let playback = self.table::<sys::FilePlayback>()?;
         let path = types::path_string(path.as_ref())?;
-        let info = out_param::checked_fill(|info| {
+        let info = out_param::required_fill(|info| {
             // SAFETY: `path` is a NUL-terminated string that outlives the
             // call; the helper keeps guarded info storage writable through it.
-            unsafe { playback.NDIlib_file_player_probe_file(path.as_ptr(), info) }
-        })?
-        .ok_or(Error::NativeOperationFailed {
-            operation: "file probe",
+            unsafe {
+                playback
+                    .named()
+                    .NDIlib_file_player_probe_file(path.as_ptr(), info)
+            }
         })?;
         FileInfo::from_sdk(&info)
     }

@@ -235,8 +235,7 @@ fn a_failed_reset_keeps_the_old_recorder_and_its_finalization_pending() {
             SourceSpec::new("replacement").unwrap()
         )),
         Err(Error::NativeOperationFailed {
-            operation: "recorder creation"
-        })
+            operation}) if operation.name() == c"NDIlib_file_recorder_create"
     ));
     assert_eq!(old.destroys.load(Ordering::Acquire), 0);
     assert_eq!(recorder.state(), RecorderState::Stopping);
@@ -1203,8 +1202,7 @@ fn values_a_refused_call_was_given_stay_with_the_caller_to_pass_again() {
     assert!(matches!(
         recorder.reset(&options),
         Err(Error::NativeOperationFailed {
-            operation: "recorder creation"
-        })
+            operation}) if operation.name() == c"NDIlib_file_recorder_create"
     ));
     replacement.refuse_creation.store(false, Ordering::Release);
     replacement.install();

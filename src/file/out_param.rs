@@ -74,6 +74,17 @@ pub(super) fn checked_fill<T: Copy + Default>(
     Ok(available.then_some(value))
 }
 
+/// Fill required guarded storage, preserving the native entry-point failure.
+pub(super) fn required_fill<T: Copy + Default>(
+    call: impl FnOnce(*mut T) -> crate::sys::table::Called<bool>,
+) -> Result<T> {
+    let mut out = OutParam::<T>::new();
+    let called = call(out.as_mut_ptr());
+    let value = out.read()?;
+    called.performed()?;
+    Ok(value)
+}
+
 /// Capture a raw event without decoding its payload. Recorder callers must
 /// observe it in the session ledger before any fallible payload conversion.
 ///

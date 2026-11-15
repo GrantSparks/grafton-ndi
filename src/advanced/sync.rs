@@ -368,15 +368,10 @@ impl AvSync {
         native!(AvSync, table => {
             // SAFETY: the receiver instance is live, and this value keeps it
             // alive for longer than the synchronizer.
-            let handle = unsafe { table.NDIlib_avsync_create(receiver.core.instance.0) };
-            if handle.is_null() {
-                return Err(Rejected::new(
-                    Error::NativeOperationFailed {
-                        operation: "NDIlib_avsync_create",
-                    },
-                    receiver,
-                ));
-            }
+            let handle = match unsafe { table.named().NDIlib_avsync_create(receiver.core.instance.0) }.created() {
+                Ok(handle) => handle.as_ptr(),
+                Err(error) => return Err(Rejected::new(error, receiver)),
+            };
             Ok(Self {
                 resource: AvResource { handle: AvSyncInstance(handle), table, receiver: Arc::clone(&receiver.core) },
                 receiver: receiver.into_mode(),
@@ -619,13 +614,13 @@ impl<'a> AvSyncCapture<'a> {
                 // and FrameSync beside local connection changes; remote SDK
                 // connection requests likewise cannot be serialized by Rust.
                 let code = unsafe {
-                    table.NDIlib_avsync_synchronize(
+                    table.named().NDIlib_avsync_synchronize(
                         handle.0,
                         video.as_ref().map_or(ptr::null(), |video| video),
                         &mut audio,
                     )
                 };
-                match code {
+                code.map(|code| match code {
                     crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_success => Synchronized::Matched,
                     crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_success_num_samples_not_matched => {
                         Synchronized::Adjusted
@@ -643,13 +638,13 @@ impl<'a> AvSyncCapture<'a> {
                         Synchronized::InternalError
                     }
                     other => Synchronized::Unknown(other),
-                }
+                })
             };
             let instance = AvSyncAudioInstance::Native { handle: handle.0, table };
             // SAFETY: the synchronizer and runtime remain borrowed through
             // the result; its guard returns this descriptor exactly once.
             let guard = unsafe { Guard::new(&self.resource.receiver._ndi, instance, audio) };
-            unsafe { outcome(status, guard) }
+            unsafe { outcome_with_call(status, guard) }
         })
     }
 }
@@ -661,13 +656,13 @@ impl<'a> AvSyncCapture<'a> {
 /// For the two successful statuses, `audio` is a frame descriptor whose data
 /// and metadata pointers are null or valid for the layout it describes.
 #[cfg(any(test, ndi_has_advanced_av_sync))]
-unsafe fn outcome<'a>(
-    status: Synchronized,
+unsafe fn outcome_with_call<'a>(
+    called: crate::sys::table::Called<Synchronized>,
     audio: Guard<'a, AvSyncAudioFree>,
 ) -> Result<AvSyncOutcomeRef<'a>> {
-    Ok(match status {
+    Ok(match *called.value() {
         Synchronized::Matched | Synchronized::Adjusted => {
-            let samples_adjusted = status == Synchronized::Adjusted;
+            let samples_adjusted = *called.value() == Synchronized::Adjusted;
             // SAFETY: forwarded to the caller; the guard retains the native
             // descriptor and every buffer throughout validation and borrowing.
             match unsafe { ValidatedAudio::returned_audio(audio)? } {
@@ -701,19 +696,31 @@ unsafe fn outcome<'a>(
             }
         }
         Synchronized::InternalError => {
-            return Err(Error::NativeOperationFailed {
-                operation: "NDIlib_avsync_synchronize",
-            });
+            return Err(called.failed());
         }
         Synchronized::Unknown(code) => {
             return Err(Error::UnexpectedSdkResult(
                 crate::SdkResultDefect::UnknownStatus {
-                    operation: "NDIlib_avsync_synchronize",
+                    operation: called.function(),
                     code,
                 },
             ));
         }
     })
+}
+
+#[cfg(test)]
+unsafe fn outcome<'a>(
+    status: Synchronized,
+    audio: Guard<'a, AvSyncAudioFree>,
+) -> Result<AvSyncOutcomeRef<'a>> {
+    // SAFETY: forwarded to the caller's delivered-frame contract.
+    unsafe {
+        outcome_with_call(
+            crate::sys::table::for_test(status, c"NDIlib_avsync_synchronize"),
+            audio,
+        )
+    }
 }
 
 mod video_sealed {
@@ -980,16 +987,11 @@ impl Genlock {
             // SAFETY: the source descriptor and the configuration point to
             // strings that this value keeps alive for as long as the genlock.
             let handle = unsafe {
-                table.NDIlib_genlock_create(
+                table.named().NDIlib_genlock_create(
                     source.as_ref().map_or(ptr::null(), |source| source.as_raw()),
                     _config.map_or(ptr::null(), AdvancedConfig::as_ptr),
                 )
-            };
-            if handle.is_null() {
-                return Err(Error::NativeOperationFailed {
-                    operation: "NDIlib_genlock_create",
-                });
-            }
+            }.created()?.as_ptr();
             Ok(Self {
                 resource: GenResource {
                     handle: GenlockInstance(handle),
@@ -1226,8 +1228,7 @@ mod tests {
         assert!(matches!(
             unsafe { inspect(Synchronized::InternalError, &audio) },
             Err(Error::NativeOperationFailed {
-                operation: "NDIlib_avsync_synchronize"
-            })
+                operation}) if operation.name() == c"NDIlib_avsync_synchronize"
         ));
         for code in [-99, 99] {
             // SAFETY: an unknown status never reads a buffer.
@@ -1638,8 +1639,12 @@ mod tests {
         let AvResource { handle, table, .. } = &sync.resource;
         let mut raw = AvSyncRequest::automatic().raw();
         raw.timestamp = 12345;
-        let status = unsafe { table.NDIlib_avsync_synchronize(handle.0, ptr::null(), &mut raw) };
-        assert_eq!(status, crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_no_audio_stream_received);
+        let status = unsafe {
+            table
+                .named()
+                .NDIlib_avsync_synchronize(handle.0, ptr::null(), &mut raw)
+        };
+        assert_eq!(status.into_value(), crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_no_audio_stream_received);
         assert_eq!(raw.timestamp, 0);
         let guard = unsafe {
             Guard::<AvSyncAudioFree>::new(

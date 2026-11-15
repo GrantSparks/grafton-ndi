@@ -942,19 +942,14 @@ impl RecvListener {
         // UUIDs and matched commands unchanged until this inspection finishes.
         unsafe { require_receiver_connect(receivers, id, &mut budget)? };
         // SAFETY: the listener instance is live and both strings outlive the call.
-        if unsafe {
-            self.inner.0.api.NDIlib_recv_listener_send_connect(
+        unsafe {
+            self.inner.0.api.named().NDIlib_recv_listener_send_connect(
                 self.inner.0.instance().0,
                 id.as_c_str().as_ptr(),
                 source.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
             )
-        } {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: "remote receiver connection request",
-            })
         }
+        .performed()
     }
 }
 

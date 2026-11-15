@@ -3218,9 +3218,9 @@ pub(crate) const MAX_SDK_STRING_BYTES: usize = 4 * 1024 * 1024;
 /// `text` must be non-null and readable byte-by-byte until either its first
 /// NUL or [`MAX_SDK_STRING_BYTES`] bytes have been read.
 pub(crate) unsafe fn copy_sdk_string(
-    text: *const c_char,
-    operation: &'static str,
+    text: crate::sys::table::Called<*const c_char>,
 ) -> Result<String> {
+    let (text, operation) = text.into_parts();
     // SAFETY: forwarded to the caller's obligation.
     let bytes = unsafe { bounded_sdk_text(text, MAX_SDK_STRING_BYTES) }.ok_or({
         Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedText { operation })

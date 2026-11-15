@@ -922,7 +922,7 @@ pub enum SdkResultDefect {
     #[error("{operation} returned a negative count: {value}")]
     NegativeCount {
         /// The operation.
-        operation: &'static str,
+        operation: crate::NativeFunction,
         /// The value.
         value: i32,
     },
@@ -930,7 +930,7 @@ pub enum SdkResultDefect {
     #[error("{operation} returned a string longer than the 4 MiB one string may be")]
     UnterminatedText {
         /// The operation.
-        operation: &'static str,
+        operation: crate::NativeFunction,
     },
     /// SDK string is missing a NUL terminator within {MAX_METADATA_BYTES} bytes.
     #[error("SDK string is missing a NUL terminator within {MAX_METADATA_BYTES} bytes")]
@@ -975,7 +975,7 @@ pub enum SdkResultDefect {
     #[error("{operation} returned {value}")]
     InvalidGuidance {
         /// The operation.
-        operation: &'static str,
+        operation: crate::NativeFunction,
         /// The value.
         value: i32,
     },
@@ -991,7 +991,7 @@ pub enum SdkResultDefect {
     #[error("{operation} returned unknown status {code}")]
     UnknownStatus {
         /// The operation.
-        operation: &'static str,
+        operation: crate::NativeFunction,
         /// The code.
         code: i32,
     },
@@ -999,7 +999,7 @@ pub enum SdkResultDefect {
     #[error("{operation} returned {kind}")]
     UnexpectedFrameType {
         /// The operation.
-        operation: &'static str,
+        operation: crate::NativeFunction,
         /// The kind.
         kind: u32,
     },

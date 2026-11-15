@@ -707,8 +707,7 @@ fn child(case: &str) {
             assert!(matches!(
                 rejected.error(),
                 Error::NativeOperationFailed {
-                    operation: "unregister sender"
-                }
+                    operation} if operation.name() == c"NDIlib_send_advertiser_del_sender"
             ));
             assert!(!log().contains("sender-destroy\n"));
             std::env::remove_var("GRAFTON_FAKE_ADVERTISER_REMOVE");
@@ -728,8 +727,7 @@ fn child(case: &str) {
             assert!(matches!(
                 rejected.error(),
                 Error::NativeOperationFailed {
-                    operation: "unregister receiver"
-                }
+                    operation} if operation.name() == c"NDIlib_recv_advertiser_del_receiver"
             ));
             assert!(!log().contains("receiver-destroy\n"));
             std::env::remove_var("GRAFTON_FAKE_ADVERTISER_REMOVE");
