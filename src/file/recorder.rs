@@ -228,83 +228,89 @@ enum CleanupBudget {
     Skip,
     Spent,
     For(Duration),
-    Until(Deadline),
 }
 
 impl CleanupBudget {
-    fn begin(&mut self, requested: Instant) -> Option<Deadline> {
-        if let Self::For(wait) = *self {
-            *self = Deadline::starting(requested, wait).map_or(Self::Skip, Self::Until);
-        }
+    fn begin(&mut self, requested: Instant) -> DrainBudget {
         match std::mem::replace(self, Self::Spent) {
-            Self::Until(deadline) => Some(deadline),
-            Self::Skip | Self::Spent | Self::For(_) => None,
+            Self::For(wait) => {
+                Deadline::starting(requested, wait).map_or(DrainBudget::Spent, DrainBudget::new)
+            }
+            Self::Skip | Self::Spent => DrainBudget::Spent,
         }
     }
 }
 
 /// A wait's deadline and its one bounded drain after expiry.
 /// Reading expiry once per step keeps the native poll and settlement in agreement.
-pub(super) struct DrainBudget {
-    deadline: Option<Deadline>,
-    late_polls: usize,
-    spent: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DrainStep {
-    Wait(u32),
-    Late,
+pub(super) enum DrainBudget {
+    Ahead(Deadline),
+    Late { polls: usize },
     Spent,
 }
 
 impl DrainBudget {
     fn new(deadline: Deadline) -> Self {
-        Self {
-            deadline: Some(deadline),
-            late_polls: 0,
-            spent: false,
-        }
+        Self::Ahead(deadline)
     }
 
     fn late() -> Self {
-        Self {
-            deadline: None,
-            late_polls: 0,
-            spent: false,
-        }
+        Self::Late { polls: 0 }
     }
 
-    fn next(&mut self, step: Duration) -> DrainStep {
-        self.next_at(step, Instant::now())
+    fn poll(&mut self, step: Duration, poll: impl FnOnce(u32) -> bool) -> Pumped {
+        self.poll_at(step, Instant::now(), poll)
     }
 
-    fn next_at(&mut self, step: Duration, at: Instant) -> DrainStep {
-        if self.spent {
-            return DrainStep::Spent;
+    /// The poll and its result belong to the same step: only this operation
+    /// can spend the budget, whether the late phase is empty or reaches its limit.
+    fn poll_at(&mut self, step: Duration, at: Instant, poll: impl FnOnce(u32) -> bool) -> Pumped {
+        if matches!(self, Self::Ahead(deadline) if deadline.end() <= at) {
+            *self = Self::late();
         }
-        match self.deadline.filter(|deadline| deadline.end() > at) {
-            Some(deadline) => DrainStep::Wait(
+        let (wait, late) = match self {
+            Self::Ahead(deadline) => (
                 crate::timeout::sdk_millis(deadline.remaining_at(at).min(step))
                     .expect("a drain step is within the validated deadline"),
+                false,
             ),
-            None if self.late_polls < STALE_EVENT_LIMIT => {
-                self.late_polls += 1;
-                DrainStep::Late
+            Self::Late { .. } => (0, true),
+            Self::Spent => return Pumped::Exhausted,
+        };
+        let empty = poll(wait);
+        if let Self::Late { polls } = self {
+            *polls += 1;
+            if empty || *polls == STALE_EVENT_LIMIT {
+                *self = Self::Spent;
             }
-            None => {
-                self.spent = true;
-                DrainStep::Spent
-            }
+        }
+        if empty {
+            Pumped::Empty { late }
+        } else {
+            Pumped::Took { late }
         }
     }
 }
 
 /// Evidence from one poll, or from exhausting its bounded final drain.
-#[derive(Clone, Copy)]
-struct Pumped {
-    expired: bool,
-    drained: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pumped {
+    Took { late: bool },
+    Empty { late: bool },
+    Exhausted,
+}
+
+impl Pumped {
+    fn expired(self) -> bool {
+        !matches!(
+            self,
+            Self::Took { late: false } | Self::Empty { late: false }
+        )
+    }
+
+    fn drain_over(self) -> bool {
+        !matches!(self, Self::Took { .. })
+    }
 }
 
 /// One fixed settlement batch. Reply callbacks cannot advance its clock.
@@ -421,13 +427,16 @@ impl<R: FinishReply> FinishWaiters<R> {
             // empty after expiry. Every newly due batch gets its own drain.
             let mut budget = DrainBudget::late();
             loop {
-                if let Some(cleanup) = cleanup.as_deref_mut() {
-                    if cleanup.next(Duration::ZERO) == DrainStep::Spent {
-                        break;
-                    }
-                }
-                let polled = recorder.pump(&mut budget, Duration::ZERO, sink);
-                if polled.drained {
+                let polled = if let Some(cleanup) = cleanup.as_deref_mut() {
+                    // The local late phase and the final cleanup both account
+                    // for this poll. An exhausted cleanup makes no native call.
+                    budget.poll(Duration::ZERO, |_| {
+                        recorder.pump(cleanup, Duration::ZERO, sink).drain_over()
+                    })
+                } else {
+                    recorder.pump(&mut budget, Duration::ZERO, sink)
+                };
+                if polled.drain_over() {
                     break;
                 }
             }
@@ -1076,13 +1085,15 @@ impl FileRecorder {
     /// session is attributed to the next one.
     fn discard_stale_events(&mut self, sink: &mut impl FnMut(Result<RecorderEvent>)) -> Result<()> {
         let mut budget = DrainBudget::late();
-        for _ in 0..STALE_EVENT_LIMIT {
-            let polled = self.pump(&mut budget, Duration::ZERO, sink);
-            if polled.drained {
-                return Ok(());
+        loop {
+            match self.pump(&mut budget, Duration::ZERO, sink) {
+                Pumped::Empty { .. } => return Ok(()),
+                Pumped::Exhausted => {
+                    return Err(Error::InvalidState(StateError::EarlierSessionEvents));
+                }
+                Pumped::Took { .. } => {}
             }
         }
-        Err(Error::InvalidState(StateError::EarlierSessionEvents))
     }
 
     /// Ask the SDK to stop the session. Idempotent.
@@ -1280,7 +1291,7 @@ impl FileRecorder {
     }
 
     /// Start cleanup once, retaining an async close's original submission time.
-    pub(super) fn begin_cleanup(&mut self, requested: Instant) -> Option<Deadline> {
+    pub(super) fn begin_cleanup(&mut self, requested: Instant) -> DrainBudget {
         self.cleanup.begin(requested)
     }
 
@@ -1295,26 +1306,14 @@ impl FileRecorder {
         step: Duration,
         sink: &mut impl FnMut(Result<RecorderEvent>),
     ) -> Pumped {
-        let next = budget.next(step);
-        let (wait, expired) = match next {
-            DrainStep::Wait(wait) => (wait, false),
-            DrainStep::Late => (0, true),
-            DrainStep::Spent => {
-                return Pumped {
-                    expired: true,
-                    drained: true,
-                }
+        budget.poll(step, |wait| {
+            let polled = self.poll_event_ms(wait);
+            let empty = matches!(polled, Ok(None));
+            if let Some(event) = polled.transpose() {
+                sink(event);
             }
-        };
-        let polled = self.poll_event_ms(wait);
-        let drained = matches!(polled, Ok(None));
-        if let Some(event) = polled.transpose() {
-            sink(event);
-        }
-        if expired && drained {
-            budget.spent = true;
-        }
-        Pumped { expired, drained }
+            empty
+        })
     }
 
     /// Drop and async close share the same cleanup driver, including the
@@ -1327,47 +1326,27 @@ impl FileRecorder {
         sink: &mut impl FnMut(Result<RecorderEvent>),
         closing: impl Fn() -> bool,
     ) {
-        let deadline = self.begin_cleanup(requested);
+        let mut budget = self.begin_cleanup(requested);
         self.request_stop();
-        let mut budget = deadline.map_or_else(
-            || DrainBudget {
-                deadline: None,
-                late_polls: 0,
-                spent: true,
-            },
-            DrainBudget::new,
-        );
         waiters.retain();
         while self.cleanup_pending() || !waiters.is_empty() {
             let polled = self.pump(&mut budget, waiters.wait_timeout(tick), sink);
             let drained = waiters.settle_at(
                 self,
                 Settlement {
-                    drained: polled.drained,
-                    cleanup_expired: polled.expired,
+                    drained: polled.drain_over(),
+                    cleanup_expired: polled.expired(),
                     at: Instant::now(),
                 },
                 sink,
                 &closing,
                 Some(&mut budget),
             );
-            if polled.expired && drained {
+            if polled.expired() && drained {
                 break;
             }
         }
-        // No new polls after this budget was spent. Resolve anything still
-        // pending as a timeout (or Closed for an async close).
-        let session = self.session_id();
-        for waiter in waiters.waiters.drain(..) {
-            let outcome = if waiter.session != session || closing() {
-                Err(Error::InvalidState(StateError::Closed))
-            } else {
-                Ok(self
-                    .settle_wait(true, true)
-                    .expect("a completed drain settles"))
-            };
-            waiter.reply.complete(outcome);
-        }
+        debug_assert!(waiters.is_empty(), "a completed drain settles every waiter");
     }
 
     /// Stop and destroy the recorder at once, without waiting for the SDK to
@@ -1675,16 +1654,61 @@ mod tests {
         let at = Instant::now();
         let deadline = Deadline::starting(at, Duration::from_millis(7)).unwrap();
         let mut budget = DrainBudget::new(deadline);
-        assert_eq!(budget.next_at(FINISH_POLL, at), DrainStep::Wait(7));
-        assert_eq!(budget.next_at(SETTLE_POLL, at), DrainStep::Wait(1));
+        for (step, expected) in [(FINISH_POLL, 7), (SETTLE_POLL, 1)] {
+            assert_eq!(
+                budget.poll_at(step, at, |wait| {
+                    assert_eq!(wait, expected);
+                    false
+                }),
+                Pumped::Took { late: false }
+            );
+        }
         for _ in 0..STALE_EVENT_LIMIT {
-            assert_eq!(budget.next_at(FINISH_POLL, deadline.end()), DrainStep::Late);
+            assert_eq!(
+                budget.poll_at(FINISH_POLL, deadline.end(), |wait| {
+                    assert_eq!(wait, 0);
+                    false
+                }),
+                Pumped::Took { late: true }
+            );
         }
         assert_eq!(
-            budget.next_at(FINISH_POLL, deadline.end()),
-            DrainStep::Spent
+            budget.poll_at(FINISH_POLL, deadline.end(), |_| panic!(
+                "spent budget polled"
+            )),
+            Pumped::Exhausted
         );
-        assert_eq!(budget.next_at(FINISH_POLL, at), DrainStep::Spent);
+        assert_eq!(
+            budget.poll_at(FINISH_POLL, at, |_| panic!("spent budget polled")),
+            Pumped::Exhausted
+        );
+    }
+
+    #[test]
+    fn an_empty_late_poll_spends_the_budget_and_a_spent_budget_never_captures() {
+        let mut budget = DrainBudget::late();
+        assert_eq!(
+            budget.poll(Duration::ZERO, |_| true),
+            Pumped::Empty { late: true }
+        );
+        let device = super::super::mock::Recorder::new(super::super::mock::Closing::Never);
+        device.install();
+        let mut recorder = super::super::mock::recorder_api()
+            .create_recorder(&super::super::RecorderOptions::new(
+                super::super::SourceSpec::new("spent budget").unwrap(),
+            ))
+            .unwrap();
+        let before = device.captures.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(
+            recorder.pump(&mut budget, FINISH_POLL, &mut |_| panic!(
+                "spent budget emitted"
+            )),
+            Pumped::Exhausted
+        );
+        assert_eq!(
+            device.captures.load(std::sync::atomic::Ordering::Acquire),
+            before
+        );
     }
 
     #[test]

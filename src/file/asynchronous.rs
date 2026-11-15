@@ -3419,6 +3419,47 @@ mod tests {
     }
 
     #[test]
+    fn readable_stale_events_require_an_empty_poll_before_either_start_path() {
+        for asynchronous in [false, true] {
+            for stale in [255, 300] {
+                let device = mock::Recorder::new(Closing::AtStop);
+                device.install();
+                let recorder = mock::recorder_api()
+                    .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
+                    .unwrap();
+                let target =
+                    RecordingTarget::new(std::env::temp_dir().join("mock-readable-stale-events"))
+                        .unwrap();
+                for _ in 0..stale {
+                    device.push(mock::OPEN_FAILED, "earlier.mkv");
+                }
+                let mut owner = RecorderOwner::new(recorder);
+                let result = if asynchronous {
+                    owner.start_notifying(
+                        &target,
+                        RecordingTimecode::Preserve,
+                        &EventQueue::new(16),
+                    )
+                } else {
+                    owner.recorder.start(&target, RecordingTimecode::Preserve)
+                };
+                if stale == 255 {
+                    assert!(result.is_ok());
+                    assert_eq!(device.starts.load(Ordering::Acquire), 1);
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(Error::InvalidState(StateError::EarlierSessionEvents))
+                    ));
+                    assert_eq!(device.starts.load(Ordering::Acquire), 0);
+                }
+                assert_eq!(device.captures.load(Ordering::Acquire), 256);
+                owner.recorder.abandon();
+            }
+        }
+    }
+
+    #[test]
     fn unreadable_stale_captures_refuse_both_start_paths_at_the_same_limit() {
         for asynchronous in [false, true] {
             let device = mock::Recorder::new(Closing::AtStop);
