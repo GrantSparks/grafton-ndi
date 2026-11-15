@@ -70,12 +70,21 @@ impl<'a> Source<'a> {
 /// needs its own workspace. Codec state and encoded output are not retained;
 /// lossy WebP still allocates its complete encoded result in the backend.
 /// Eligible RGBA input is borrowed without populating conversion scratch.
+/// Remembers the last successful output size for matching format settings,
+/// retaining no output memory; [`release`](Self::release) resets that hint.
 #[derive(Debug, Default)]
 pub struct ImageWorkspace {
     row: Vec<u8>,
     image: Vec<u8>,
     sums8: Vec<[u32; 4]>,
     sums16: Vec<[u64; 4]>,
+    output_hint: Option<OutputHint>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputHint {
+    format: ImageFormat,
+    length: usize,
 }
 
 impl ImageWorkspace {
@@ -154,9 +163,47 @@ impl ImageWorkspace {
                 webp::encode_lossy(pixels, shape, quality, effort, sharp_yuv, &mut self.image)
             });
         }
-        let mut image = Vec::new();
+        let shape = plan.shape();
+        // A sudden reduction must not reserve a previous large image's output.
+        // This is only a hint; larger encoded results can grow normally.
+        let cap = shape
+            .row_bytes
+            .saturating_mul(shape.height as usize)
+            .saturating_mul(2)
+            .saturating_add(1024);
+        let hint = self
+            .output_hint
+            .filter(|hint| hint.format == options.format)
+            .map_or(0, |hint| hint.length.min(cap));
+        let mut image = OutputBuffer {
+            bytes: Vec::new(),
+            hint,
+        };
         write_image(plan, &mut image, self)?;
-        Ok(image)
+        self.output_hint = Some(OutputHint {
+            format: options.format,
+            length: image.bytes.len(),
+        });
+        Ok(image.bytes)
+    }
+}
+
+/// Reserve at the first write, rather than before running the codec. Lossless
+/// WebP builds its complete frame before writing; delaying the output allocation
+/// avoids adding it to that backend's transient compression working set.
+struct OutputBuffer {
+    bytes: Vec<u8>,
+    hint: usize,
+}
+impl Write for OutputBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if !bytes.is_empty() && self.hint != 0 {
+            self.bytes.reserve_exact(std::mem::take(&mut self.hint));
+        }
+        self.bytes.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -603,7 +650,6 @@ impl<'a> Plan<'a> {
         })
     }
 
-    #[cfg(test)]
     fn shape(&self) -> ImageShape {
         match self.codec {
             Codec::Png { shape, .. } => shape,

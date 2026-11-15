@@ -36,6 +36,9 @@ scratch across calls, including WebP's whole converted image, PNG rows and
 downscale sums. `retained_bytes()` reports wrapper capacity; `release()` frees
 it. Use a separate workspace for each concurrent worker. Codec allocations
 and the encoded result are separate; both WebP formats buffer their output.
+`encode` remembers the last successful encoded length for matching format settings
+and uses a hint bounded by the next image's size. It retains no output buffer;
+`release()` also resets the hint. `encode_to` leaves output allocation to its writer.
 
 Encoding is synchronous CPU work. Keep it on a blocking worker in async
 applications, with an owned frame if the worker outlives the capture borrow.

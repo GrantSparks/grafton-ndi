@@ -3060,3 +3060,47 @@ fn square_pixel_encodes_stay_identical_and_extreme_aspects_remain_positive() {
         assert!(density.x > 0 && density.y > 0);
     }
 }
+
+#[test]
+fn warm_workspace_allocates_output_once_without_retaining_it() {
+    use crate::test_alloc::allocation_count;
+    let frame = VideoFrame::builder()
+        .resolution(64, 36)
+        .pixel_format(PixelFormat::Bgra)
+        .data(any_frame_bytes(PixelFormat::Bgra, 64, 36, 41))
+        .build()
+        .unwrap();
+    for format in [
+        ImageFormat::Png,
+        ImageFormat::Jpeg(85),
+        ImageFormat::WebpLossless,
+    ] {
+        let options = options(format);
+        let mut workspace = crate::ImageWorkspace::new();
+        let expected = workspace.encode(&frame, &options).unwrap();
+        let retained = workspace.retained_bytes();
+        let mut reused = Vec::with_capacity(expected.len());
+        let ((), codec_allocations) =
+            allocation_count(|| workspace.encode_to(&frame, &options, &mut reused).unwrap());
+        for _ in 0..3 {
+            let (output, allocations) =
+                allocation_count(|| workspace.encode(&frame, &options).unwrap());
+            assert_eq!(output, expected);
+            assert_eq!(output.capacity(), output.len());
+            assert_eq!(
+                allocations,
+                codec_allocations + 1,
+                "{format:?}: exactly one allocation beyond codec state"
+            );
+            assert_eq!(workspace.retained_bytes(), retained);
+        }
+        // Old output size cannot force a large allocation for a tiny next frame.
+        let small = VideoFrame::builder().resolution(2, 2).build().unwrap();
+        let small_output = workspace.encode(&small, &options).unwrap();
+        assert_eq!(small_output, small.encode_image(&options).unwrap());
+        assert!(small_output.capacity() <= 2 * 2 * 4 * 2 + 1024);
+        workspace.release();
+        assert!(workspace.output_hint.is_none());
+        assert_eq!(workspace.retained_bytes(), 0);
+    }
+}
