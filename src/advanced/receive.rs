@@ -707,27 +707,20 @@ mod tests {
     #[test]
     fn packet_receivers_validate_the_color_format_the_sdk_is_given() {
         use crate::{
-            capabilities::{Capabilities, RuntimeFeature, SdkEdition, SdkVersion},
-            sys::{advanced::AdvancedApi, table::ExportsWhere, Api, Evidence},
+            capabilities::{RuntimeFeature, SdkEdition, SdkVersion},
+            sys::{table::ExportsWhere, Resolved},
             ReceiverColorFormat, Source,
         };
 
         // An Advanced 6.3.2 runtime that exports every function the crate
         // knows, gated as the loader gates the runtime it selects.
         let exports = ExportsWhere(|_: &str| true);
-        let (mut api, mut advanced) = (
-            Api::load(&exports).unwrap(),
-            AdvancedApi::load(&exports).unwrap(),
+        let gates = Resolved::load(&exports).unwrap().seal(
+            SdkVersion::parse("NDI SDK TEST 6.3.2.0"),
+            SdkEdition::Advanced,
         );
-        let version = SdkVersion::parse("NDI SDK TEST 6.3.2.0");
-        let capabilities = Capabilities::detect(&api, &advanced, version, SdkEdition::Advanced);
-        api.apply_capabilities(&capabilities);
-        advanced.apply_capabilities(&capabilities);
-        let runtime = Evidence {
-            api: &api,
-            advanced: &advanced,
-            capabilities: &capabilities,
-        };
+        let runtime = gates.evidence();
+        let capabilities = gates.capabilities();
         let too_old = |result: Result<crate::receiver::ValidatedReceiveOptions<'_>>,
                        wanted: RuntimeFeature| {
             assert!(

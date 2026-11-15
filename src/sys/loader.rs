@@ -6,9 +6,13 @@
 
 use std::{ffi::CStr, path::Path};
 
-use super::{api::Api, selection::Selection, table::Resolver};
+use super::{
+    api::{Gates, Resolved},
+    selection::Selection,
+    table::Resolver,
+};
 use crate::{
-    capabilities::{Capabilities, RuntimeInfo, SdkEdition, SdkVersion},
+    capabilities::{RuntimeInfo, SdkEdition, SdkVersion},
     frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
     runtime::RuntimeOptions,
     Error, LoadRefusal, Result, SelectionFailure,
@@ -22,12 +26,8 @@ const ADVANCED_RECEIVER: &CStr = c"NDIlib_recv_create_v4";
 
 /// The implementation selected for this process.
 pub(crate) struct Runtime {
-    pub(crate) api: Api,
-    /// The Advanced tables, handed out by their `Table::of`.
-    #[cfg(feature = "advanced")]
-    pub(crate) advanced: super::advanced::AdvancedApi,
+    pub(crate) gates: Gates,
     pub(crate) info: RuntimeInfo,
-    pub(crate) capabilities: Capabilities,
     provider: Provider,
 }
 
@@ -121,9 +121,7 @@ impl Runtime {
         provider: Provider,
         requested: SdkEdition,
     ) -> std::result::Result<Self, LoadRefusal> {
-        let mut api = Api::load(&provider)?;
-        #[cfg(feature = "advanced")]
-        let mut advanced_tables = super::advanced::AdvancedApi::load(&provider)?;
+        let resolved = Resolved::load(&provider)?;
         let advanced = AdvancedEntryPoints::detect(&provider)?;
         let edition = provider.edition(advanced);
         if !meets(requested, edition) {
@@ -131,7 +129,7 @@ impl Runtime {
         }
         // SAFETY: NDIlib_version takes no arguments and may be called before
         // initialization; it returns a static NUL-terminated string or null.
-        let version = unsafe { api.core.NDIlib_version() };
+        let version = unsafe { resolved.core().NDIlib_version() };
         if version.is_null() {
             return Err(LoadRefusal::UnreadableVersion {
                 detail: "NDIlib_version returned no version text".into(),
@@ -165,18 +163,8 @@ impl Runtime {
             raw_version,
             version,
         };
-        #[cfg(feature = "advanced")]
-        let capabilities = Capabilities::detect(&api, &advanced_tables, version, edition);
-        #[cfg(not(feature = "advanced"))]
-        let capabilities = Capabilities::detect(&api, version, edition);
-        api.apply_capabilities(&capabilities);
-        #[cfg(feature = "advanced")]
-        advanced_tables.apply_capabilities(&capabilities);
         Ok(Self {
-            capabilities,
-            api,
-            #[cfg(feature = "advanced")]
-            advanced: advanced_tables,
+            gates: resolved.seal(version, edition),
             info,
             provider,
         })

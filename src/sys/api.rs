@@ -15,7 +15,7 @@ use super::{
     table::{native_table, Resolver},
 };
 use crate::{
-    capabilities::{Capabilities, CapabilityRefusal, RuntimeFeature},
+    capabilities::{Capabilities, CapabilityRefusal, RuntimeFeature, SdkEdition, SdkVersion},
     Error, LoadRefusal, Result,
 };
 
@@ -149,15 +149,79 @@ version_gates!(Planar444Video, ReceiveBest444, ReceiveVideoOnly);
 /// them.
 #[derive(Clone, Copy)]
 pub(crate) struct Evidence<'a> {
-    pub(crate) api: &'a Api,
+    pub(in crate::sys) api: &'a Api,
     #[cfg(feature = "advanced")]
-    pub(crate) advanced: &'a super::advanced::AdvancedApi,
-    pub(crate) capabilities: &'a Capabilities,
+    pub(in crate::sys) advanced: &'a super::advanced::AdvancedApi,
+    pub(in crate::sys) capabilities: &'a Capabilities,
 }
 
-/// The tables of an optional capability, or the first entry point the
-/// selected implementation lacks.
-struct Optional<T>(std::result::Result<T, CapabilityRefusal>);
+/// Resolution evidence, which cannot hand out optional tables.
+pub(crate) struct Resolved {
+    api: ResolvedApi,
+    #[cfg(feature = "advanced")]
+    advanced: super::advanced::ResolvedAdvancedApi,
+}
+
+impl Resolved {
+    /// Resolve all core and optional entry points from one implementation.
+    pub(crate) fn load(resolver: &dyn Resolver) -> std::result::Result<Self, LoadRefusal> {
+        Ok(Self {
+            api: Api::load(resolver)?,
+            #[cfg(feature = "advanced")]
+            advanced: super::advanced::AdvancedApi::load(resolver)?,
+        })
+    }
+
+    /// Required entry points, available before version and edition detection.
+    pub(crate) fn core(&self) -> &Core {
+        &self.api.core
+    }
+
+    /// Consume resolution evidence and construct every immutable capability gate.
+    pub(crate) fn seal(self, version: Option<SdkVersion>, edition: SdkEdition) -> Gates {
+        let capabilities = Capabilities::detect(
+            &self.api,
+            #[cfg(feature = "advanced")]
+            &self.advanced,
+            version,
+            edition,
+        );
+        Gates {
+            api: self.api.seal(&capabilities),
+            #[cfg(feature = "advanced")]
+            advanced: self.advanced.seal(&capabilities),
+            capabilities,
+        }
+    }
+}
+
+/// Tables constructed under their one recorded capability decision.
+pub(crate) struct Gates {
+    api: Api,
+    #[cfg(feature = "advanced")]
+    advanced: super::advanced::AdvancedApi,
+    capabilities: Capabilities,
+}
+
+impl Gates {
+    pub(crate) fn api(&self) -> &Api {
+        &self.api
+    }
+
+    pub(crate) fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
+    }
+
+    /// The only constructor of gate evidence.
+    pub(crate) fn evidence(&self) -> Evidence<'_> {
+        Evidence {
+            api: &self.api,
+            #[cfg(feature = "advanced")]
+            advanced: &self.advanced,
+            capabilities: &self.capabilities,
+        }
+    }
+}
 
 /// What a capability's field of [`Api`] holds, and how it is resolved: its
 /// table, together with a support table when its entry points need one.
@@ -203,15 +267,21 @@ macro_rules! optional_tables {
 
             impl Table for slot!(type $Table $($Support)?) {
                 fn within(evidence: Evidence<'_>) -> Result<&'_ Self> {
-                    evidence.capability(RuntimeFeature::$feature, &evidence.api.$field.0)
+                    evidence.capability(RuntimeFeature::$feature, &evidence.api.$field)
                 }
             }
         )+
 
-        /// Every table resolved from one implementation.
+        /// Every table sealed with its recorded capability decision.
         pub(crate) struct Api {
             pub(crate) core: Core,
-            $($field: Optional<slot!(type $Table $($Support)?)>,)+
+            $($field: std::result::Result<slot!(type $Table $($Support)?), CapabilityRefusal>,)+
+        }
+
+        /// Resolution-only slots: no version or edition decision and no evidence.
+        pub(crate) struct ResolvedApi {
+            core: Core,
+            $($field: std::result::Result<slot!(type $Table $($Support)?), CapabilityRefusal>,)+
         }
 
         impl Api {
@@ -228,22 +298,24 @@ macro_rules! optional_tables {
             ///
             /// Fails when a [`Core`] entry point is missing or any entry point
             /// resolves outside the selected implementation.
-            pub(crate) fn load(resolver: &dyn Resolver) -> std::result::Result<Self, LoadRefusal> {
+            pub(in crate::sys) fn load(resolver: &dyn Resolver) -> std::result::Result<ResolvedApi, LoadRefusal> {
                 let core = Core::load(resolver)?.map_err(|symbol| {
                     LoadRefusal::MissingEntryPoint { symbol: symbol.to_string_lossy().into_owned(), required: true, detail: None }
                 })?;
-                Ok(Self {
+                Ok(ResolvedApi {
                     core,
-                    $($field: Optional(slot!(load resolver $Table $($Support)?).map_err(CapabilityRefusal::SymbolUnavailable)),)+
+                    $($field: slot!(load resolver $Table $($Support)?).map_err(CapabilityRefusal::SymbolUnavailable),)+
                 })
             }
+        }
 
-            /// Seal each resolved table with the decision computed from all
-            /// tables, the runtime version and edition. Tables never re-gate.
-            pub(crate) fn apply_capabilities(&mut self, capabilities: &Capabilities) {
-                $(if let Err(refusal) = capabilities.decision(RuntimeFeature::$feature) {
-                    self.$field.0 = Err(refusal);
-                })+
+        impl ResolvedApi {
+            /// Construct each table only under its final recorded decision.
+            fn seal(self, capabilities: &Capabilities) -> Api {
+                Api {
+                    core: self.core,
+                    $($field: capabilities.decision(RuntimeFeature::$feature).and(self.$field),)+
+                }
             }
 
             /// The first entry point behind `feature` that the implementation
@@ -272,7 +344,7 @@ macro_rules! optional_tables {
                     }
                 };
                 match feature {
-                    $(RuntimeFeature::$feature => self.$field.0.as_ref().err().copied(),)+
+                    $(RuntimeFeature::$feature => self.$field.as_ref().err().copied(),)+
                     _ => None,
                 }
             }
@@ -398,12 +470,7 @@ optional_tables! {
 impl Runtime {
     /// What the gates of this implementation's capabilities decide from.
     pub(crate) fn evidence(&self) -> Evidence<'_> {
-        Evidence {
-            api: &self.api,
-            #[cfg(feature = "advanced")]
-            advanced: &self.advanced,
-            capabilities: &self.capabilities,
-        }
+        self.gates.evidence()
     }
 
     /// Reject a capability the selected implementation cannot provide.
@@ -438,25 +505,11 @@ impl<'a> Evidence<'a> {
 
 #[cfg(test)]
 pub(crate) fn with_test_evidence<T>(version: &str, run: impl FnOnce(Evidence<'_>) -> T) -> T {
-    use crate::capabilities::{SdkEdition, SdkVersion};
     let exports = super::table::ExportsWhere(|_: &str| true);
-    let mut api = Api::load(&exports).unwrap();
-    #[cfg(feature = "advanced")]
-    let mut advanced = super::advanced::AdvancedApi::load(&exports).unwrap();
-    let version = SdkVersion::parse(version);
-    #[cfg(feature = "advanced")]
-    let capabilities = Capabilities::detect(&api, &advanced, version, SdkEdition::Advanced);
-    #[cfg(not(feature = "advanced"))]
-    let capabilities = Capabilities::detect(&api, version, SdkEdition::Advanced);
-    api.apply_capabilities(&capabilities);
-    #[cfg(feature = "advanced")]
-    advanced.apply_capabilities(&capabilities);
-    run(Evidence {
-        api: &api,
-        #[cfg(feature = "advanced")]
-        advanced: &advanced,
-        capabilities: &capabilities,
-    })
+    let gates = Resolved::load(&exports)
+        .unwrap()
+        .seal(SdkVersion::parse(version), SdkEdition::Advanced);
+    run(gates.evidence())
 }
 
 #[cfg(test)]

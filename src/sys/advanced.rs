@@ -103,18 +103,47 @@ macro_rules! advanced_tables {
             $($field: std::result::Result<$Table, CapabilityRefusal>,)+
         }
 
+        /// Resolution refusals only; these slots cannot produce gate evidence.
+        pub(crate) struct ResolvedAdvancedApi {
+            $($field: std::result::Result<$Table, CapabilityRefusal>,)+
+        }
+
+        // Every Advanced capability owns exactly one table, in every build.
+        // Missing and duplicate registry entries are selection-time defects
+        // rejected here, rather than panics while detecting capabilities.
+        const _: () = {
+            let mut index = 0;
+            while index < RuntimeFeature::UNIT.len() {
+                let feature = RuntimeFeature::UNIT[index];
+                let counts = [$(matches!(feature, RuntimeFeature::$feature) as usize),+];
+                let mut table = 0;
+                let mut count = 0;
+                while table < counts.len() {
+                    count += counts[table];
+                    table += 1;
+                }
+                assert!(
+                    count == feature.is_advanced() as usize,
+                    "every Advanced capability must have exactly one Advanced table"
+                );
+                index += 1;
+            }
+        };
+
         impl AdvancedApi {
-            pub(crate) fn load(resolver: &dyn Resolver) -> std::result::Result<Self, LoadRefusal> {
-                Ok(Self { $($field: $Table::load(resolver)?.map_err(|symbol| {
+            pub(in crate::sys) fn load(resolver: &dyn Resolver) -> std::result::Result<ResolvedAdvancedApi, LoadRefusal> {
+                Ok(ResolvedAdvancedApi { $($field: $Table::load(resolver)?.map_err(|symbol| {
                     declared! { $Table { CapabilityRefusal::SymbolUnavailable(symbol) } else { CapabilityRefusal::BuildAbiUnavailable(symbol) } }
                 }),)+ })
             }
+        }
 
-            /// Retain the exact detected decision in every table slot.
-            pub(crate) fn apply_capabilities(&mut self, capabilities: &Capabilities) {
-                $(if let Err(refusal) = capabilities.decision(RuntimeFeature::$feature) {
-                    self.$field = Err(refusal);
-                })+
+        impl ResolvedAdvancedApi {
+            /// Construct each table only under its final recorded decision.
+            pub(in crate::sys) fn seal(self, capabilities: &Capabilities) -> AdvancedApi {
+                AdvancedApi {
+                    $($field: capabilities.decision(RuntimeFeature::$feature).and(self.$field),)+
+                }
             }
 
             /// The first function of the table gated by `feature` that did not
@@ -129,12 +158,14 @@ macro_rules! advanced_tables {
                 }
             }
 
-            /// Whether this build declares the table `feature` gates.
-            /// `false` for a feature without a table in this registry.
-            pub(crate) fn declares(feature: RuntimeFeature) -> bool {
+            /// The declaration decision, before edition and symbol decisions.
+            /// Non-Advanced features require no declarations from this registry.
+            pub(crate) fn declarations(feature: RuntimeFeature) -> std::result::Result<(), CapabilityRefusal> {
                 match feature {
-                    $(RuntimeFeature::$feature => declared! { $Table { true } else { false } },)+
-                    _ => false,
+                    $(RuntimeFeature::$feature => declared! { $Table { Ok(()) } else {
+                        Err(CapabilityRefusal::BuildAbiUnavailable($Table::UNDECLARED))
+                    } },)+
+                    _ => Ok(()),
                 }
             }
         }

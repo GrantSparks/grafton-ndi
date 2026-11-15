@@ -8,9 +8,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::sys::Api;
+use crate::sys::ResolvedApi;
 #[cfg(feature = "advanced")]
-use crate::{advanced::PassthroughPreset, sys::advanced::AdvancedApi};
+use crate::{advanced::PassthroughPreset, sys::advanced::ResolvedAdvancedApi};
 
 /// NDI 6.4.0: the first runtime with the planar 4:4:4 formats and newer
 /// receiver modes, and the first whose Discovery Server advertisers and
@@ -570,19 +570,37 @@ impl CapabilityStatus {
 // The registry names the missing declaration even in builds whose public API
 // omits Advanced wrappers. No ABI types from those headers are needed here.
 #[cfg(not(feature = "advanced"))]
-fn absent_advanced_abi(feature: RuntimeFeature) -> Option<&'static CStr> {
+fn absent_advanced_abi(feature: RuntimeFeature) -> std::result::Result<(), CapabilityRefusal> {
     macro_rules! advanced_tables {
         ($( $(#[$meta:meta])* struct $Table:ident in $field:ident: $Feature:ident {
             fn $first:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)?;
             $($rest:tt)*
-        })+) => {
+        })+) => {{
+            const _: () = {
+                let mut index = 0;
+                while index < RuntimeFeature::UNIT.len() {
+                    let feature = RuntimeFeature::UNIT[index];
+                    let counts = [$(matches!(feature, RuntimeFeature::$Feature) as usize),+];
+                    let mut table = 0;
+                    let mut count = 0;
+                    while table < counts.len() {
+                        count += counts[table];
+                        table += 1;
+                    }
+                    assert!(
+                        count == feature.is_advanced() as usize,
+                        "every Advanced capability must have exactly one Advanced table"
+                    );
+                    index += 1;
+                }
+            };
             match feature {
-                $(RuntimeFeature::$Feature => Some(crate::sys::table::symbol_name(
+                $(RuntimeFeature::$Feature => Err(CapabilityRefusal::BuildAbiUnavailable(crate::sys::table::symbol_name(
                     concat!(stringify!($first), "\0"),
-                )),)+
-                _ => None,
+                ))),)+
+                _ => Ok(()),
             }
-        };
+        }};
     }
     include!("sys/advanced_tables.rs")
 }
@@ -609,8 +627,8 @@ impl fmt::Debug for Capabilities {
 impl Capabilities {
     /// Decide each capability once, preserving its first refusal and evidence.
     pub(crate) fn detect(
-        api: &Api,
-        #[cfg(feature = "advanced")] advanced: &AdvancedApi,
+        api: &ResolvedApi,
+        #[cfg(feature = "advanced")] advanced: &ResolvedAdvancedApi,
         version: Option<SdkVersion>,
         edition: SdkEdition,
     ) -> Self {
@@ -625,17 +643,15 @@ impl Capabilities {
                 return api.missing(feature).map_or_else(|| versioned(feature), Err);
             }
             #[cfg(feature = "advanced")]
-            let (declared, missing) = (AdvancedApi::declares(feature), advanced.missing(feature));
+            let missing = {
+                ResolvedAdvancedApi::declarations(feature)?;
+                advanced.missing(feature)
+            };
             #[cfg(not(feature = "advanced"))]
-            let (declared, missing) = (
-                false,
-                absent_advanced_abi(feature).map(CapabilityRefusal::BuildAbiUnavailable),
-            );
-            if !declared {
-                // Missing declarations are recorded by the same table registry
-                // that declares the feature, including a build without wrappers.
-                return Err(missing.expect("an undeclared Advanced table names its missing ABI"));
-            }
+            let missing = {
+                absent_advanced_abi(feature)?;
+                None
+            };
             if edition != SdkEdition::Advanced {
                 return Err(CapabilityRefusal::WrongEdition(missing.and_then(
                     |refusal| match refusal {
@@ -708,15 +724,12 @@ impl Capabilities {
 mod tests {
     use super::*;
     use crate::{
-        sys::{Evidence, Table},
+        sys::{Api, Evidence, Gates, Resolved, Table},
         Error,
     };
 
     struct Fixture {
-        api: Api,
-        #[cfg(feature = "advanced")]
-        advanced: AdvancedApi,
-        capabilities: Capabilities,
+        gates: Gates,
     }
 
     impl Fixture {
@@ -726,32 +739,14 @@ mod tests {
             edition: SdkEdition,
         ) -> Self {
             let resolver = crate::sys::table::ExportsWhere(exported);
-            let mut api = Api::load(&resolver).unwrap();
-            #[cfg(feature = "advanced")]
-            let mut advanced = AdvancedApi::load(&resolver).unwrap();
             let version = version.map(|text| SdkVersion::parse(text).unwrap());
-            #[cfg(feature = "advanced")]
-            let capabilities = Capabilities::detect(&api, &advanced, version, edition);
-            #[cfg(not(feature = "advanced"))]
-            let capabilities = Capabilities::detect(&api, version, edition);
-            api.apply_capabilities(&capabilities);
-            #[cfg(feature = "advanced")]
-            advanced.apply_capabilities(&capabilities);
             Self {
-                api,
-                #[cfg(feature = "advanced")]
-                advanced,
-                capabilities,
+                gates: Resolved::load(&resolver).unwrap().seal(version, edition),
             }
         }
 
         fn evidence(&self) -> Evidence<'_> {
-            Evidence {
-                api: &self.api,
-                #[cfg(feature = "advanced")]
-                advanced: &self.advanced,
-                capabilities: &self.capabilities,
-            }
+            self.gates.evidence()
         }
     }
 
@@ -871,7 +866,8 @@ mod tests {
                 let evidence = fixture.evidence();
                 for feature in every_feature() {
                     let expected = fixture
-                        .capabilities
+                        .gates
+                        .capabilities()
                         .decision(feature)
                         .map_err(|refusal| (feature, refusal));
                     assert_eq!(
@@ -880,7 +876,7 @@ mod tests {
                         "{feature:?} {version:?} {edition:?} {missing:?}"
                     );
                     assert_eq!(
-                        fixture.capabilities.status(feature),
+                        fixture.gates.capabilities().status(feature),
                         CapabilityStatus::from_decision(expected.map_err(|(_, refusal)| refusal))
                     );
                     if let Err((_, refusal)) = expected {
@@ -933,6 +929,33 @@ mod tests {
     }
 
     #[test]
+    fn discovery_tables_are_refused_where_exported_before_6_4() {
+        let old = Fixture::new(|_| true, Some("6.3.2.0"), SdkEdition::Standard);
+        let current = Fixture::new(|_| true, Some("6.4.0.2"), SdkEdition::Standard);
+        let mut checked = 0;
+        for &(feature, _, gate) in Api::GATES {
+            if matches!(
+                feature,
+                RuntimeFeature::SenderAdvertising
+                    | RuntimeFeature::ReceiverAdvertising
+                    | RuntimeFeature::SenderDiscovery
+                    | RuntimeFeature::ReceiverDiscovery
+            ) {
+                checked += 1;
+                let expected = Err((
+                    feature,
+                    CapabilityRefusal::RuntimeTooOld { required: &NDI_6_4 },
+                ));
+                assert_eq!(refusal(gate(old.evidence())), expected);
+                assert_eq!(refusal(old.evidence().require(feature)), expected);
+                assert_eq!(refusal(gate(current.evidence())), Ok(()));
+                assert_eq!(refusal(current.evidence().require(feature)), Ok(()));
+            }
+        }
+        assert_eq!(checked, 4);
+    }
+
+    #[test]
     fn core_gates_record_symbols_before_versions_and_copy_required_evidence() {
         let old = Fixture::new(|_| true, Some("6.3.2.0"), SdkEdition::Standard);
         let unknown = Fixture::new(|_| true, None, SdkEdition::Standard);
@@ -942,14 +965,14 @@ mod tests {
             .filter(|feature| feature.minimum_version().is_some())
         {
             assert_eq!(
-                old.capabilities.decision(feature),
+                old.gates.capabilities().decision(feature),
                 Err(CapabilityRefusal::RuntimeTooOld { required: &NDI_6_4 })
             );
             assert_eq!(
-                unknown.capabilities.decision(feature),
+                unknown.gates.capabilities().decision(feature),
                 Err(CapabilityRefusal::RuntimeVersionUnknown { required: &NDI_6_4 })
             );
-            assert!(current.capabilities.supports(feature));
+            assert!(current.gates.capabilities().supports(feature));
         }
         for &(feature, symbols, _) in Api::GATES {
             let missing = symbols[0];
@@ -959,7 +982,7 @@ mod tests {
                 SdkEdition::Standard,
             );
             assert_eq!(
-                fixture.capabilities.decision(feature),
+                fixture.gates.capabilities().decision(feature),
                 Err(CapabilityRefusal::SymbolUnavailable(missing))
             );
         }
@@ -973,7 +996,7 @@ mod tests {
                 SdkEdition::Standard,
             );
             assert_eq!(
-                fixture.capabilities.decision(feature),
+                fixture.gates.capabilities().decision(feature),
                 Err(CapabilityRefusal::SymbolUnavailable(
                     c"NDIlib_recv_free_string"
                 ))
@@ -992,8 +1015,8 @@ mod tests {
                     Some("6.4.0.2"),
                     edition,
                 );
-                let result = fixture.capabilities.decision(feature);
-                if AdvancedApi::declares(feature) {
+                let result = fixture.gates.capabilities().decision(feature);
+                if ResolvedAdvancedApi::declarations(feature).is_ok() {
                     assert_eq!(
                         result,
                         Err(if edition == SdkEdition::Standard {
@@ -1014,10 +1037,10 @@ mod tests {
                     Some("6.3.2.0"),
                     SdkEdition::Advanced,
                 );
-                if AdvancedApi::declares(feature) {
+                if ResolvedAdvancedApi::declarations(feature).is_ok() {
                     assert_eq!(
-                        fixture.capabilities.decision(feature),
-                        fixture.capabilities.decision(required)
+                        fixture.gates.capabilities().decision(feature),
+                        fixture.gates.capabilities().decision(required)
                     );
                 }
 
@@ -1031,8 +1054,12 @@ mod tests {
                     Some("6.1.1.0"),
                     SdkEdition::Advanced,
                 );
-                assert!(both_refused.capabilities.decision(required).is_err());
-                if AdvancedApi::declares(feature) {
+                assert!(both_refused
+                    .gates
+                    .capabilities()
+                    .decision(required)
+                    .is_err());
+                if ResolvedAdvancedApi::declarations(feature).is_ok() {
                     assert_eq!(
                         refusal(both_refused.evidence().require(feature)),
                         Err((feature, CapabilityRefusal::SymbolUnavailable(missing)))
@@ -1051,12 +1078,14 @@ mod tests {
                     .map_err(CapabilityRefusal::BuildAbiUnavailable)
                     .and_then(|_| {
                         fixture
-                            .capabilities
+                            .gates
+                            .capabilities()
                             .decision(RuntimeFeature::AdvancedReceiverConfiguration)
                     });
                 assert_eq!(
                     fixture
-                        .capabilities
+                        .gates
+                        .capabilities()
                         .decision(RuntimeFeature::Passthrough(preset)),
                     expected
                 );
@@ -1073,10 +1102,8 @@ mod tests {
             .filter(|feature| feature.is_advanced())
         {
             assert_eq!(
-                fixture.capabilities.decision(feature),
-                Err(CapabilityRefusal::BuildAbiUnavailable(
-                    absent_advanced_abi(feature).unwrap()
-                ))
+                fixture.gates.capabilities().decision(feature),
+                absent_advanced_abi(feature)
             );
         }
     }
@@ -1105,7 +1132,7 @@ mod tests {
                     let mut refused = 0;
                     for &feature in &features {
                         refused += usize::from(evidence.require(feature).is_err());
-                        let _ = fixture.capabilities.status(feature);
+                        let _ = fixture.gates.capabilities().status(feature);
                     }
                     for &(_, _, gate) in Api::GATES {
                         let _ = gate(evidence);
