@@ -211,10 +211,34 @@ impl WakerSlot {
     }
 }
 
-struct Response<T> {
-    value: Option<Result<T>>,
-    completed: bool,
-    waker: WakerSlot,
+/// Shared state exists only after an operation has been admitted.
+struct Shared<T> {
+    cancelled: AtomicBool,
+    slot: Mutex<Slot<T>>,
+}
+
+enum Slot<T> {
+    Pending(WakerSlot),
+    Ready(Result<T>),
+    Taken,
+}
+
+/// A started operation cannot contain another deferral.
+enum Live<T> {
+    Waiting(Arc<Shared<T>>),
+    Immediate(Result<T>),
+}
+
+impl<T> Live<T> {
+    fn failed(error: Error) -> Self {
+        Self::Immediate(Err(error))
+    }
+}
+
+enum Stage<T> {
+    Deferred(Box<dyn FnOnce() -> Live<T> + Send + 'static>),
+    Live(Live<T>),
+    Done,
 }
 
 /// The result of a command sent to a player's or recorder's thread.
@@ -265,19 +289,26 @@ struct Response<T> {
 /// Polling again after completion panics.
 #[must_use = "futures do nothing until polled or explicitly submitted"]
 pub struct FileOperation<T> {
-    // Mutex preserves the future's Sync and unwind-safety contracts while the
-    // one-shot submission closure itself needs only Send.
-    deferred: Mutex<Option<Box<dyn FnOnce() -> Self + Send + 'static>>>,
-    response: Arc<Mutex<Response<T>>>,
-    cancelled: Arc<AtomicBool>,
-    consumed: bool,
+    // The closure and immediate result need only Send; the mutex preserves
+    // Sync and unwind safety without exposing pinned access to either.
+    stage: Mutex<Stage<T>>,
 }
+
+// No field is structurally pinned or lent through a pinned reference.
+impl<T> Unpin for FileOperation<T> {}
 
 impl<T> std::fmt::Debug for FileOperation<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stage = lock(&self.stage);
+        let submitted = !matches!(*stage, Stage::Deferred(_));
+        let completed = match &*stage {
+            Stage::Deferred(_) => false,
+            Stage::Live(Live::Waiting(shared)) => !matches!(*lock(&shared.slot), Slot::Pending(_)),
+            Stage::Live(Live::Immediate(_)) | Stage::Done => true,
+        };
         f.debug_struct("FileOperation")
-            .field("submitted", &lock(&self.deferred).is_none())
-            .field("completed", &lock(&self.response).completed)
+            .field("submitted", &submitted)
+            .field("completed", &completed)
             .finish_non_exhaustive()
     }
 }
@@ -287,17 +318,33 @@ impl<T> Future for FileOperation<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        assert!(!this.consumed, "a completed FileOperation was polled again");
         this.start();
-        let value = WakerSlot::poll(&this.response, cx.waker(), |response, _| {
-            if let Some(value) = response.value.take() {
-                WakerPoll::Ready(value, response.waker.take())
-            } else {
-                WakerPoll::Pending(Some(&mut response.waker))
+        let stage = this.stage.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let value = match stage {
+            Stage::Live(Live::Waiting(shared)) => {
+                WakerSlot::poll(&shared.slot, cx.waker(), |slot, _| match slot {
+                    Slot::Pending(waker) => WakerPoll::Pending(Some(waker)),
+                    Slot::Ready(_) => {
+                        let Slot::Ready(value) = std::mem::replace(slot, Slot::Taken) else {
+                            unreachable!()
+                        };
+                        WakerPoll::Ready(value, None)
+                    }
+                    Slot::Taken => unreachable!("a response is taken only by its operation"),
+                })
             }
-        });
+            Stage::Live(Live::Immediate(_)) => {
+                let Stage::Live(Live::Immediate(value)) = std::mem::replace(stage, Stage::Done)
+                else {
+                    unreachable!()
+                };
+                Some(value)
+            }
+            Stage::Done => panic!("a completed FileOperation was polled again"),
+            Stage::Deferred(_) => unreachable!("start resolves the one deferral"),
+        };
         if let Some(value) = value {
-            this.consumed = true;
+            *stage = Stage::Done;
             Poll::Ready(value)
         } else {
             Poll::Pending
@@ -307,57 +354,50 @@ impl<T> Future for FileOperation<T> {
 
 impl<T> Drop for FileOperation<T> {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Release);
-        // A queued reply may outlive this future, including a cancelled close
-        // pruned under Control::closing. Remove executor state before releasing
-        // our response ownership, and run its destructor without either lock.
-        let waker = lock(&self.response).waker.take();
-        WakerSlot::discard(waker);
+        let stage = self.stage.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if let Stage::Live(Live::Waiting(shared)) = stage {
+            shared.cancelled.store(true, Ordering::Release);
+            // A queued reply may outlive cancellation. Release executor state
+            // outside the shared lock before releasing our shared ownership.
+            let waker = match &mut *lock(&shared.slot) {
+                Slot::Pending(waker) => waker.take(),
+                Slot::Ready(_) | Slot::Taken => None,
+            };
+            WakerSlot::discard(waker);
+        }
     }
 }
 
 struct Reply<T> {
-    response: Arc<Mutex<Response<T>>>,
-    cancelled: Arc<AtomicBool>,
-    delivered: bool,
-    /// The owner thread's control, for a command sent to it. A command that is
-    /// dropped without a result reports a failed owner if the thread has
-    /// failed.
+    shared: Arc<Shared<T>>,
+    /// A command dropped without a result reports a failed owner if its
+    /// thread failed, rather than reporting an ordinary close.
     owner: Option<Arc<Control>>,
 }
 
-fn operation<T>() -> (Reply<T>, FileOperation<T>) {
-    let response = Arc::new(Mutex::new(Response {
-        value: None,
-        completed: false,
-        waker: WakerSlot::default(),
-    }));
-    let cancelled = Arc::new(AtomicBool::new(false));
+fn operation<T>() -> (Reply<T>, Live<T>) {
+    let shared = Arc::new(Shared {
+        cancelled: AtomicBool::new(false),
+        slot: Mutex::new(Slot::Pending(WakerSlot::default())),
+    });
     (
         Reply {
-            response: Arc::clone(&response),
-            cancelled: Arc::clone(&cancelled),
-            delivered: false,
+            shared: Arc::clone(&shared),
             owner: None,
         },
-        FileOperation {
-            deferred: Mutex::new(None),
-            response,
-            cancelled,
-            consumed: false,
-        },
+        Live::Waiting(shared),
     )
 }
 
-fn deliver<T>(response: &Mutex<Response<T>>, value: Result<T>, replace: bool) {
+fn deliver<T>(shared: &Shared<T>, value: Result<T>) {
     let wake = {
-        let mut response = lock(response);
-        if response.completed && !replace {
+        let mut slot = lock(&shared.slot);
+        let Slot::Pending(waker) = &mut *slot else {
             return;
-        }
-        response.value = Some(value);
-        response.completed = true;
-        response.waker.take()
+        };
+        let wake = waker.take();
+        *slot = Slot::Ready(value);
+        wake
     };
     WakerSlot::wake(wake);
 }
@@ -389,59 +429,55 @@ impl<T> FileOperation<T> {
         self
     }
 
-    fn deferred(start: impl FnOnce() -> Self + Send + 'static) -> Self {
+    fn deferred(start: impl FnOnce() -> Live<T> + Send + 'static) -> Self {
         Self {
-            deferred: Mutex::new(Some(Box::new(start))),
-            response: Arc::new(Mutex::new(Response {
-                value: None,
-                completed: false,
-                waker: WakerSlot::default(),
-            })),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            consumed: false,
+            stage: Mutex::new(Stage::Deferred(Box::new(start))),
+        }
+    }
+
+    #[cfg(test)]
+    fn live(live: Live<T>) -> Self {
+        Self {
+            stage: Mutex::new(Stage::Live(live)),
         }
     }
 
     fn start(&mut self) {
-        loop {
-            let start = lock(&self.deferred).take();
-            let Some(start) = start else { break };
-            // The old value is an unsubmitted placeholder. Its cancellation
-            // flag is independent of the submitted operation's flag.
-            *self = start();
+        let stage = self.stage.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if matches!(stage, Stage::Deferred(_)) {
+            let Stage::Deferred(start) = std::mem::replace(stage, Stage::Done) else {
+                unreachable!()
+            };
+            *stage = Stage::Live(start());
         }
     }
 
-    fn failed(error: Error) -> Self {
-        let (reply, future) = operation();
-        reply.complete(Err(error));
-        future
-    }
-
-    // Only used before the future is returned to the caller. A rejected job's
-    // Reply destructor may already have supplied a generic stopped error.
-    fn immediate_failure(&self, error: Error) {
-        deliver(&self.response, Err(error), true);
+    #[cfg(test)]
+    fn is_completed(&self) -> bool {
+        match &*lock(&self.stage) {
+            Stage::Deferred(_) => false,
+            Stage::Live(Live::Waiting(shared)) => !matches!(*lock(&shared.slot), Slot::Pending(_)),
+            Stage::Live(Live::Immediate(_)) | Stage::Done => true,
+        }
     }
 }
 
 impl<T> Reply<T> {
-    fn complete(mut self, value: Result<T>) {
-        self.delivered = true;
-        if !self.cancelled.load(Ordering::Acquire) {
-            deliver(&self.response, value, false);
+    fn complete(self, value: Result<T>) {
+        if !self.shared.cancelled.load(Ordering::Acquire) {
+            deliver(&self.shared, value);
         }
     }
 }
 
 impl<T> Drop for Reply<T> {
     fn drop(&mut self) {
-        if !self.delivered && !self.cancelled.load(Ordering::Acquire) {
-            // Unwinding means the owner thread is failing right now, before
-            // it can record that; a command left in the queue sees the record.
+        if !self.shared.cancelled.load(Ordering::Acquire) {
+            // The slot alone records whether completion was delivered. A
+            // destructor can supply the fallback only while it is Pending.
             let failed =
                 std::thread::panicking() || self.owner.as_ref().is_some_and(|owner| owner.failed());
-            deliver(&self.response, Err(stopped(failed)), false);
+            deliver(&self.shared, Err(stopped(failed)));
         }
     }
 }
@@ -656,7 +692,7 @@ impl<E: Send + 'static> EventQueue<E> {
             budget,
             deadline: None,
             timer: None,
-            consumed: false,
+            taken: false,
         }
     }
 }
@@ -714,13 +750,13 @@ pub struct FileEventFuture<E> {
     deadline: Option<Deadline>,
     /// This wait's registration with the deadline timer, while it has one.
     timer: Option<TimerKey>,
-    consumed: bool,
+    taken: bool,
 }
 
 impl<E> FileEventFuture<E> {
     /// Complete with `value`, giving up the timer registration.
     fn complete(&mut self, value: Result<Option<E>>) -> Poll<Result<Option<E>>> {
-        self.consumed = true;
+        self.taken = true;
         if let Some(key) = self.timer.take() {
             TIMER.cancel(key);
         }
@@ -749,10 +785,7 @@ impl<E> Future for FileEventFuture<E> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        assert!(
-            !this.consumed,
-            "a completed FileEventFuture was polled again"
-        );
+        assert!(!this.taken, "a completed FileEventFuture was polled again");
         // The wait starts at the first poll, which is also where a timeout
         // out of range is reported, before anything else.
         let deadline = match this.deadline {
@@ -867,7 +900,7 @@ impl Control {
         FileOperation::deferred(move || control.request_close_now())
     }
 
-    fn request_close_now(&self) -> FileOperation<()> {
+    fn request_close_now(&self) -> Live<()> {
         let (reply, future) = operation();
         {
             let mut closing = lock(&self.closing);
@@ -881,7 +914,7 @@ impl Control {
             }
             closing
                 .replies
-                .retain(|reply| !reply.cancelled.load(Ordering::Acquire));
+                .retain(|reply| !reply.shared.cancelled.load(Ordering::Acquire));
             closing.replies.push(reply);
         }
         self.request_shutdown();
@@ -977,7 +1010,7 @@ struct RecorderOwner {
 
 impl FinishReply for Reply<FinishStatus> {
     fn cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.shared.cancelled.load(Ordering::Acquire)
     }
     fn complete(self, result: Result<FinishStatus>) {
         Reply::complete(self, result);
@@ -1321,14 +1354,14 @@ impl<H: Owner> Worker<H> {
             // A dead owner takes precedence over argument validation, exactly
             // as a command submitted directly to it does.
             if control.failed() {
-                return FileOperation::failed(stopped(true));
+                return Live::failed(stopped(true));
             }
             if control.shutdown.load(Ordering::Acquire) {
-                return FileOperation::failed(stopped(false));
+                return Live::failed(stopped(false));
             }
             let work = match prepare() {
                 Ok(work) => work,
-                Err(error) => return FileOperation::failed(error),
+                Err(error) => return Live::failed(error),
             };
             Self::submit_now(&sender, &admission, &control, stop, work)
         })
@@ -1340,30 +1373,30 @@ impl<H: Owner> Worker<H> {
         control: &Arc<Control>,
         stop: bool,
         work: impl FnOnce(&mut H, Reply<T>) + Send + 'static,
-    ) -> FileOperation<T> {
+    ) -> Live<T> {
         if control.failed() {
-            return FileOperation::failed(stopped(true));
+            return Live::failed(stopped(true));
         }
         if control.shutdown.load(Ordering::Acquire) {
-            return FileOperation::failed(stopped(false));
+            return Live::failed(stopped(false));
         }
         let place = match admission.admit(stop) {
             Ok(place) => place,
-            Err(error) => return FileOperation::failed(error),
+            Err(error) => return Live::failed(error),
         };
         let (mut reply, future) = operation();
         reply.owner = Some(Arc::clone(control));
-        let cancelled = Arc::clone(&reply.cancelled);
+        let shared = Arc::clone(&reply.shared);
         let job: Job<H> = Box::new(move |owner| {
             // The command leaves the queue as it starts.
             drop(place);
-            if !stop && cancelled.load(Ordering::Acquire) {
+            if !stop && shared.cancelled.load(Ordering::Acquire) {
                 return;
             }
             work(owner, reply);
         });
         if sender.send(job).is_err() {
-            future.immediate_failure(stopped(control.failed()));
+            return Live::failed(stopped(control.failed()));
         }
         future
     }
@@ -1443,10 +1476,10 @@ fn spawn_owner_now<H: Owner, T: Send + 'static>(
     create: impl FnOnce() -> Result<H> + Send + 'static,
     options: AsyncFileOptions,
     wrap: impl FnOnce(Arc<Worker<H>>) -> T + Send + 'static,
-) -> FileOperation<T> {
+) -> Live<T> {
     let options = match options.validate() {
         Ok(options) => options,
-        Err(error) => return FileOperation::failed(error),
+        Err(error) => return Live::failed(error),
     };
     let (sender, receiver) = mpsc::channel();
     let control = Arc::new(Control::new());
@@ -1465,7 +1498,7 @@ fn spawn_owner_now<H: Owner, T: Send + 'static>(
     let spawned = thread::Builder::new().name(name.into()).spawn(move || {
         mark_file_thread();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            if ready.cancelled.load(Ordering::Acquire) {
+            if ready.shared.cancelled.load(Ordering::Acquire) {
                 return;
             }
             let mut owner = match create() {
@@ -1499,9 +1532,9 @@ fn spawn_owner_now<H: Owner, T: Send + 'static>(
     match spawned {
         Ok(thread) => *lock(&worker.thread) = Some(thread),
         Err(error) => {
-            future.immediate_failure(Error::Io(error));
             events.close(true);
             control.completed(true);
+            return Live::failed(Error::Io(error));
         }
     }
     future
@@ -1599,21 +1632,21 @@ impl ProbeQueue {
     }
 
     /// Probe `path` with `api` once the probes queued before it have run.
-    fn probe(&self, api: &FileApi, path: &Path) -> FileOperation<FileInfo> {
+    fn probe(&self, api: &FileApi, path: &Path) -> Live<FileInfo> {
         // Resolve at submission, before the probe waits in its queue.
         let path = match resolve_path(path, "file path") {
             Ok((path, _)) => path,
-            Err(error) => return FileOperation::failed(error),
+            Err(error) => return Live::failed(error),
         };
         let api = api.clone();
         let (reply, future) = operation();
         let job: ProbeJob = Box::new(move || {
-            if !reply.cancelled.load(Ordering::Acquire) {
+            if !reply.shared.cancelled.load(Ordering::Acquire) {
                 reply.complete(api.probe(path));
             }
         });
         if let Err(error) = self.submit(job) {
-            future.immediate_failure(error);
+            return Live::failed(error);
         }
         future
     }
@@ -2619,6 +2652,78 @@ mod tests {
     }
 
     #[test]
+    fn command_submission_allocates_only_its_live_state_and_job() {
+        let (worker, dropped) =
+            local_worker_with_options(AsyncFileOptions::new().command_capacity(1));
+        // Warm the channel before holding its owner, so its lazy block
+        // allocation is not counted as an operation allocation.
+        block_on(worker.call(|_| Ok(()))).unwrap();
+        let (blocker, release) = block_owner(&worker);
+        let (accepted, allocations) =
+            crate::test_alloc::allocation_count(|| worker.call(|owner| Ok(owner.counter)).submit());
+        assert_eq!(allocations, 3, "deferral, shared response and job");
+        let refused = worker.call(|_| Ok(()));
+        let (refused, allocations) = crate::test_alloc::allocation_count(|| refused.submit());
+        assert_eq!(allocations, 0, "a full queue creates no live response");
+        assert!(matches!(
+            block_on(refused),
+            Err(Error::QueueFull(QueueLimit::FileCommands))
+        ));
+        release.send(()).unwrap();
+        block_on(blocker).unwrap();
+        block_on(accepted).unwrap();
+        drop(worker);
+        dropped.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn a_deferred_file_operation_cannot_return_another_deferral() {
+        // Compile the actual private constructor signature, rather than a
+        // second handwritten contract, against a nested-deferred fixture.
+        let source = include_str!("asynchronous.rs");
+        let method = &source[source.find("fn deferred(start:").unwrap()..];
+        let signature = &method[..method.find('{').unwrap()];
+        let definitions = format!(
+            "#![allow(dead_code)]\nstruct FileOperation<T>(std::marker::PhantomData<T>);\n\
+             enum Live<T> {{ Immediate(Result<T, ()>) }}\n\
+             impl<T> FileOperation<T> {{ {signature} {{ unimplemented!() }} }}\n"
+        );
+        let fixture =
+            include_str!("../../tests/ui/internal/fail/file_operation_cannot_defer_again.rs");
+        let directory = std::env::temp_dir().join(format!(
+            "grafton-file-operation-contract-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        for (name, body, succeeds) in [
+            (
+                "live",
+                "fn main() { let _ = FileOperation::<()>::deferred(|| Live::Immediate(Ok(()))); }",
+                true,
+            ),
+            ("nested", fixture, false),
+        ] {
+            let path = directory.join(format!("{name}.rs"));
+            std::fs::write(&path, format!("{definitions}\n{body}")).unwrap();
+            let output = std::process::Command::new("rustc")
+                .args(["--edition=2021", "--emit=metadata", "--out-dir"])
+                .arg(&directory)
+                .arg(path)
+                .output()
+                .unwrap();
+            let error = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(output.status.success(), succeeds, "{name}: {error}");
+            if !succeeds {
+                assert!(
+                    error.contains("E0308") && error.contains("Live<()>"),
+                    "{error}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn bounded_queue_rejects_excess_work_without_executing_it() {
         let options = AsyncFileOptions::new().command_capacity(1);
         let (worker, dropped) = local_worker_with_options(options);
@@ -2959,6 +3064,7 @@ mod tests {
             .unwrap();
         let mut owner = RecorderOwner::new(recorder);
         let (reply, finishing) = operation();
+        let finishing = FileOperation::live(finishing);
         owner.finish(
             Deadline::after(Duration::from_secs(2)).unwrap(),
             true,
@@ -2984,7 +3090,7 @@ mod tests {
                 }))
             },
         );
-        assert!(!lock(&finishing.response).completed);
+        assert!(!finishing.is_completed());
         assert_eq!(device.waits.load(Ordering::Acquire), 0);
         drop(finishing);
         owner.recorder.abandon();
@@ -3000,7 +3106,7 @@ mod tests {
         for command in commands {
             block_on(command).unwrap();
         }
-        assert!(!lock(&finishing.response).completed);
+        assert!(!finishing.is_completed());
         assert_eq!(device.waits.load(Ordering::Acquire), 0);
         drop(finishing);
         block_on(recorder.close()).unwrap();
@@ -3117,6 +3223,7 @@ mod tests {
         }
         let mut owner = RecorderOwner::new(recorder);
         let (reply, finishing) = operation();
+        let finishing = FileOperation::live(finishing);
         owner.finish(
             Deadline::after(Duration::from_secs(30)).unwrap(),
             true,
@@ -3181,6 +3288,7 @@ mod tests {
         }
         let mut owner = RecorderOwner::new(recorder);
         let (reply, finishing) = operation();
+        let finishing = FileOperation::live(finishing);
         owner.finish(Deadline::after(Duration::ZERO).unwrap(), true, reply);
         owner.settle_at(
             false,
@@ -3195,7 +3303,7 @@ mod tests {
         ));
         assert!(
             owner.poll_native().unwrap().is_some(),
-            "the final drain consumed the whole backlog"
+            "the final drain taken the whole backlog"
         );
         owner.recorder.abandon();
     }
@@ -3221,6 +3329,7 @@ mod tests {
         recorder.poll_event(Duration::ZERO).unwrap();
         let mut owner = RecorderOwner::new(recorder);
         let (reply, finishing) = operation();
+        let finishing = FileOperation::live(finishing);
         owner.finish(deadline, true, reply);
         (device, owner, finishing)
     }
@@ -3251,6 +3360,7 @@ mod tests {
         recorder.poll_event(Duration::ZERO).unwrap();
         let mut owner = RecorderOwner::new(recorder);
         let (reply, finishing) = operation();
+        let finishing = FileOperation::live(finishing);
         owner.finish(
             Deadline::after(Duration::from_secs(30)).unwrap(),
             true,
@@ -3328,7 +3438,7 @@ mod tests {
             false,
             Instant::now(),
         );
-        assert!(!lock(&finishing.response).completed);
+        assert!(!finishing.is_completed());
         device.close();
         while owner.poll_native().unwrap().is_some() {}
         owner.settle_at(
@@ -3390,6 +3500,7 @@ mod tests {
             .poll(&mut Context::from_waker(&waker))
             .is_pending());
         let (reply, later) = operation();
+        let later = FileOperation::live(later);
         owner.finish(later_deadline, false, reply);
         let events = EventQueue::new(16);
         let control = Control::new();
@@ -3399,7 +3510,7 @@ mod tests {
             FinishStatus::TimedOut(_)
         ));
         assert!(
-            !lock(&later.response).completed,
+            !later.is_completed(),
             "the later waiter reused the earlier drain"
         );
         // Simulate the first reply's callback taking the owner past the
@@ -3466,7 +3577,7 @@ mod tests {
         .unwrap();
         let options = RecorderOptions::new(SourceSpec::new("replacement").unwrap());
         assert!(block_on(recorder.reset(&options)).is_err());
-        assert!(!lock(&finishing.response).completed);
+        assert!(!finishing.is_completed());
         replacement.refuse_creation.store(false, Ordering::Release);
         let installed = Arc::clone(&replacement);
         block_on(recorder.worker.call(move |_| {
@@ -3545,7 +3656,7 @@ mod tests {
             // The original interruption path returned TimedOut within one
             // 25 ms poll. Keep closure withheld past that point.
             thread::sleep(Duration::from_millis(80));
-            assert!(!lock(&finishing.response).completed);
+            assert!(!finishing.is_completed());
             device.close();
             let outcome = block_on(finishing).unwrap();
             assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
@@ -3782,7 +3893,7 @@ mod tests {
         // A following command proves cancellation ended the long wait.
         assert_eq!(block_on(recorder.state()).unwrap(), RecorderState::Stopping);
         let closed = recorder.close().submit();
-        assert!(!lock(&closed.response).completed);
+        assert!(!closed.is_completed());
         device.close();
         block_on(closed).unwrap();
         assert!(device.closed_before_destroy.load(Ordering::Acquire));
@@ -4153,16 +4264,18 @@ mod tests {
     fn probes_run_one_at_a_time_and_a_full_queue_refuses_more() {
         let api = gated_api();
         let queue = ProbeQueue::new(2);
-        let running = queue.probe(&api, Path::new("running.mkv"));
+        let running = FileOperation::live(queue.probe(&api, Path::new("running.mkv")));
         let deadline = Instant::now() + Duration::from_secs(5);
         while PROBES_BEGUN.load(Ordering::Acquire) == 0 {
             assert!(Instant::now() < deadline, "the first probe never began");
             thread::sleep(Duration::from_millis(1));
         }
         // Two wait behind the running one; a third does not fit.
-        let waiting = queue.probe(&api, Path::new("waiting.mkv"));
-        let cancelled = queue.probe(&api, Path::new("cancelled.mkv"));
-        let refused = block_on(queue.probe(&api, Path::new("refused.mkv")));
+        let waiting = FileOperation::live(queue.probe(&api, Path::new("waiting.mkv")));
+        let cancelled = FileOperation::live(queue.probe(&api, Path::new("cancelled.mkv")));
+        let refused = block_on(FileOperation::live(
+            queue.probe(&api, Path::new("refused.mkv")),
+        ));
         assert!(
             matches!(refused, Err(Error::QueueFull(QueueLimit::FileProbes))),
             "{refused:?}"
@@ -4182,7 +4295,9 @@ mod tests {
         }
         // The thread has room again once they have run.
         assert!(matches!(
-            block_on(queue.probe(&api, Path::new("later.mkv"))),
+            block_on(FileOperation::live(
+                queue.probe(&api, Path::new("later.mkv"))
+            )),
             Err(Error::NativeOperationFailed { .. })
         ));
         assert_eq!(PROBES_BEGUN.load(Ordering::Acquire), 3);
@@ -4192,6 +4307,7 @@ mod tests {
     fn a_probe_that_panics_fails_alone() {
         let queue = ProbeQueue::new(1);
         let (reply, failing) = operation::<FileInfo>();
+        let failing = FileOperation::live(failing);
         queue
             .submit(Box::new(move || {
                 let _unanswered = reply;
@@ -4201,7 +4317,9 @@ mod tests {
         owner_failed(block_on(failing));
         // The thread goes on with the next probe.
         assert!(matches!(
-            block_on(queue.probe(&mock::recorder_api(), Path::new("b.mkv"))),
+            block_on(FileOperation::live(
+                queue.probe(&mock::recorder_api(), Path::new("b.mkv"))
+            )),
             Err(Error::NativeOperationFailed { .. })
         ));
     }
@@ -4216,7 +4334,7 @@ mod tests {
         // It returned while the owner thread still waits for the file.
         assert_eq!(device.destroys.load(Ordering::Acquire), 0);
         assert!(
-            !lock(&closed.response).completed,
+            !closed.is_completed(),
             "the close completed before the file was reported closed"
         );
         await_stop(&device);
@@ -4336,7 +4454,7 @@ mod tests {
         for finishing in [recorder.finish(too_long), recorder.wait_finished(too_long)] {
             let finishing = finishing.submit();
             // Completed at submission: nothing was queued.
-            assert!(lock(&finishing.response).completed);
+            assert!(finishing.is_completed());
             let result = block_on(finishing);
             assert!(
                 matches!(&result, Err(Error::InvalidInput(reason)) if reason.contains("MAX_TIMEOUT")),
