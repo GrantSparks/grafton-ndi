@@ -20,10 +20,17 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - `Finder::watch` replaces `Finder::wait_for_sources`. Keep one `SourceWatch`
   per consumer and take snapshots and wait through that cursor, so concurrent
   lookups cannot hide reports between a snapshot and its next wait.
-- Runtime selection conflicts carry `SelectionConflict` beside their diagnostic
-  text. `RuntimeLoadFailed` carries a boxed `LoadFailure` with typed candidate
+- `SourceAddress::new(text)` replaces the `Url` and `Ip` variants. Equality and
+  hashing use address text; `is_url()` derives the classification from it.
+- Runtime selection conflicts carry a boxed `SelectionFailure` with a typed
+  cause, library kind and selected, requested and foreign-module paths.
+  `RuntimeLoadFailed` carries a boxed `LoadFailure` with typed candidate
   locations, origins and refusals, including whether native code was loaded.
-- File-family refusals use `Error::FileFamilyUnavailable { family, detail }`.
+- Capability statuses and `Error::UnsupportedCapability { feature, refusal }`
+  carry the same typed `CapabilityRefusal`. Its `reason()` returns the broad
+  category; its fields retain the missing symbol, declaration or required version.
+- File-family refusals use `Error::FileFamilyUnavailable { family, missing }`,
+  with the missing entry point as a static `CStr`.
   `RuntimeFeature::File` and `CapabilityUnavailable::SeparateLibrary` are
   removed; use `FileApi::status` or `supports` for File availability.
 - Runtime and File library selection require absolute explicit paths on every
@@ -41,8 +48,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   and `finish_video_async`. Ordinary senders now implement `UnwindSafe` and
   `RefUnwindSafe`.
 - Received video and audio survive unreadable optional per-frame metadata.
-  `metadata_status()` reports why text was withheld; forwarding and owned
-  copies omit it. Owned copies preserve the withheld status. Default image
+  `metadata_status()` reports why text was withheld; forwarding omits the text.
+  Owned copies preserve the withheld status, including compressed packet copies.
+  Default image
   encoding and `color_info()` refuse withheld video metadata; an explicit
   color-policy override permits encoding. Standalone metadata capture remains
   strict.
@@ -185,6 +193,16 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   uncompressed padding remains supported.
 - Synchronizer resources retain their receiver, source and configuration
   dependencies through native destruction.
+- Shared sender teardown ends native loans before releasing their storage.
+  Frame-bound video authorization and exclusive descriptor keys keep copying,
+  submission and reclamation tied to the frame and slot they describe.
+- Finder snapshots acquire their lifetime lock within the lookup deadline
+  without polling, and share one native snapshot contract.
+- Custom allocator bookkeeping is reserved before callbacks run; successful
+  crate-owned allocation allocates only the frame memory.
+- File recorder waits and cleanup share a bounded drain and settlement kernel.
+  Reset advances waiter identity, lifecycle states own their stop obligations,
+  and idle pumps avoid native status queries and report clones.
 - Queued sending reserves stable frame and scatter descriptors at construction.
   Accepted submissions allocate nothing; `QueueFull` refusals allocate only
   their returned `Rejected` value. Completion and collection remain allocation
