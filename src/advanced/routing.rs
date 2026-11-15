@@ -39,7 +39,6 @@ impl Router {
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.runtime().table::<RouterConnectionMetadata>()?;
         native!(RouterConnectionMetadata, table => {
-            use crate::frames::MetadataPartsExt;
             let router = self.native_instance();
             // SAFETY: the router is live for this borrow.
             unsafe { table.NDIlib_routing_clear_connection_metadata(router) };

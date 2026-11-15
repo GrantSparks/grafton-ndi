@@ -376,3 +376,58 @@ fn an_incomplete_packed_audio_fill_preserves_a_reused_destination_in_every_build
         destination.data().len()
     );
 }
+
+#[test]
+fn a_video_accessor_panic_leaves_the_reused_destination_whole() {
+    use std::{
+        cell::Cell,
+        panic::{catch_unwind, AssertUnwindSafe},
+    };
+    struct PanickingMetadata {
+        frame: VideoFrame,
+        reads: Cell<usize>,
+    }
+    // SAFETY: every successful accessor lends this owned frame's valid parts.
+    unsafe impl VideoParts for PanickingMetadata {
+        fn layout(&self) -> &ValidatedVideoLayout {
+            &self.frame.layout
+        }
+        fn header(&self) -> &VideoHeader {
+            &self.frame.header
+        }
+        fn pixels(&self) -> *const u8 {
+            self.frame.data.as_ptr()
+        }
+        fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+            let count = self.reads.get();
+            self.reads.set(count + 1);
+            assert_eq!(count, 0, "test accessor panic");
+            self.frame.metadata.view()
+        }
+        fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+            None
+        }
+    }
+    let build = |width| {
+        VideoFrame::builder()
+            .resolution(width, 4)
+            .pixel_format(PixelFormat::Uyvy)
+            .build()
+            .unwrap()
+    };
+    let source = PanickingMetadata {
+        frame: build(16),
+        reads: Cell::new(0),
+    };
+    let mut destination = build(32);
+    assert!(catch_unwind(AssertUnwindSafe(|| source.copy_into_owned(&mut destination))).is_err());
+    assert_eq!(
+        destination.data().len(),
+        destination.layout.data_len_bytes()
+    );
+    assert!(destination.data.room().iter().all(|&byte| byte == 0));
+    assert_eq!(
+        destination.to_owned().data().len(),
+        destination.data().len()
+    );
+}

@@ -809,7 +809,12 @@ pub(crate) trait VideoPartsExt: VideoParts {
     /// Fill packed rows and SDK tail room derived only from this frame.
     fn copy_active_pixels<'a>(&'a self, data: &'a mut Pixels) -> PackedVideo<'a> {
         let layout = self.layout().packed();
-        let room = crate::pixels::send_room(&layout, self.header().scan_type);
+        // Read every accessor before changing reused storage, so an accessor
+        // panic cannot leave the destination's old layout over a shorter copy.
+        let header = self.header();
+        let metadata = self.frame_metadata();
+        let timestamp = self.sdk_timestamp();
+        let room = crate::pixels::send_room(&layout, header.scan_type);
         data.fill(layout.data_len_bytes, room, |bytes| {
             for plane in self.plane_views() {
                 match plane.data() {
@@ -821,9 +826,9 @@ pub(crate) trait VideoPartsExt: VideoParts {
         PackedVideo {
             layout,
             pixels: data,
-            header: self.header(),
-            metadata: self.frame_metadata(),
-            timestamp: self.sdk_timestamp(),
+            header,
+            metadata,
+            timestamp,
         }
     }
 }
