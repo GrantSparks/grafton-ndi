@@ -41,7 +41,6 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
     let reported = Box::new(Completions(Mutex::new(Vec::with_capacity(33))));
     let mut frames = Vec::with_capacity(33);
     let mut expected = Vec::with_capacity(33);
-    let mut keys = super::super::send_slots::DescriptorSlots::allocate_keys(33).unwrap();
     let sender: Sender<CompressedAttached> = Sender::open(
         &ndi,
         &SenderOptions::new(crate::test_support::unique_name("scatter-completion-key"))
@@ -58,7 +57,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             Some(completed),
         );
     }
-    let mut submit =
+    let submit =
         |number: i64, frames: &mut Vec<PendingVideo>, expected: &mut Vec<(usize, i64, i32)>| {
             let bytes = PacketEnvelope::encode(
                 EnvelopeCodec::H264,
@@ -83,8 +82,10 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             frame.set_timecode(Timecode::from_ticks(number));
             let key = frame.storage.blocks[0].as_mut_ptr();
             let length = frame.storage.blocks[0].len() as i32;
-            let mut slot = keys.pop().unwrap().claim();
-            frames.push(PendingVideo::scatter_in(frame, scatter, &mut slot));
+            frames.push(PendingVideo::Scatter {
+                frame,
+                table: scatter,
+            });
             let Lent::Scatter {
                 frame,
                 scatter: list,

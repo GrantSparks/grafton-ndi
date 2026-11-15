@@ -17,14 +17,45 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- `BorrowedVideoFrame::data()` returns contiguous active bytes as `Option<&[u8]>`.
+  Use `storage()` for validated storage including row padding. Video and audio
+  inherent accessors and source traits share one implementation; owned frames
+  gain inherent `copy_into` and video `sends_in_place`, and borrowed video gains
+  `timestamp()` returning `None`.
+- Owned received compressed packets use `ReceivedVideoPacket` and
+  `ReceivedAudioPacket`. Checked conversions make sendable compressed frames
+  without copying their storage; contiguous compressed sends are infallible.
+
+- Compressed packet-envelope refusals use the same typed cause for contiguous,
+  scatter and received packets; codec mismatches use `PacketCodecMismatch`,
+  and empty AAC payloads use `EmptyCodecPayload`.
+
+- Scatter frames own their stable scatter lists. `CompressedSender::new`
+  no longer reserves descriptor slots or fails to reserve that storage;
+  scatter submission continues to allocate nothing.
+
+- Owned metadata constructors and setters return refused text in
+  `Rejected<String>`; owned frame builders expose metadata recovery accessors.
+
+- Native operation failures and SDK-result causes identify their entry point
+  with `NativeFunction`. Compare it with a C string or inspect `name()`; File
+  failures now name the actual SDK function, including timecoded starts.
+
+- Reject negative receiver statistics, status-event connection counts and
+  FrameSync audio queue depths with typed `NegativeCount` evidence. Numeric
+  getters now return `Result`; boolean connection predicates remain total.
+
 - `InvalidFrame`, `InvalidInput` and `UnexpectedSdkResult` carry typed
-  `FrameDefect`, `InputDefect` and `SdkResultDefect` causes. Receiver capture
+  `FrameDefect`, `InputDefect` and `SdkResultDefect` causes. Shared layout
+  refusals use one nested `LayoutDefect` in both frame and input causes. Receiver capture
   failures use `ConnectionLost`; initialization retains `InitializationFailure`
   and invalid UTF-8 retains `Utf8Error`. Load-refusal symbol names borrow static
   `CStr` values. Update matches as described in the migration guide.
 - Recorder start and rollover refuse output paths that cannot be reported
   exactly in native events (currently 4094 UTF-8 bytes), reserving at least
   20 digits per index token so later rollovers remain reportable.
+  Custom filename patterns also refuse indexes in directories, keeping every
+  rollover in the directory checked at preflight.
 
 - `Finder::watch` replaces `Finder::wait_for_sources`. Keep one `SourceWatch`
   per consumer and take snapshots and wait through that cursor, so concurrent
@@ -137,6 +168,19 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Added
 
+- `ExternalPool`, `PoolBlock` and unsafe `AllocationBuffer::from_pool` lend
+  preallocated receive buffers without boxing a handle on SDK threads.
+
+- `CompressedSender::finish_video_async` and its split video view drain both
+  asynchronous streams and return their frames while keeping the source live.
+
+- Queued senders support AAC and Opus through shared
+  `send_compressed_audio` and `send_scatter_audio` operations, alongside their
+  existing uncompressed audio sends.
+
+- Image encoding preserves non-square picture aspect in PNG pHYs and JPEG JFIF
+  relative density tags; square-pixel output is unchanged. WebP remains untagged.
+
 - `AvSync::synchronize_ref` and `queued_audio_ref` lend matched SDK audio
   through `AvSyncOutcomeRef` and `AvSyncAudioRef`. Send and convert it in place,
   retain it with `to_owned`, or reuse owned storage with `copy_into`; owned
@@ -166,6 +210,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Shared `VideoSource`, `AudioSource` and `MetadataSource` inputs for synchronous
   operations, reusable `copy_into` buffers, application-borrowed audio, frame
   plane/channel views and allocation-preserving owned-buffer recovery.
+- Tokio and smol `AsyncFinder`, `AsyncSourceCache` and owned `AsyncSourceWatch`
+  adapters. Dropped discovery waits release their workers between bounded native
+  attempts; synchronous discovery retains whole-budget waits.
 - Tokio and smol scoped capture callbacks that process borrowed media on the
   blocking worker and return a `Send + 'static` result. Owned and combined
   async capture share the deadline and cancellation rules of that path.
@@ -180,6 +227,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - The optional `file-io` feature: source recording, file playback, probing,
   thumbnails and executor-independent async handles. Recording reports expose
   finalization; async operations submit on first poll or through `submit()`.
+  Events and probe results survive an unreadable optional format;
+  `source_format()` returns its typed refusal while preserving the other fields.
   Submitted stop/finish/close operations retain their cancellation guarantees.
   The feature is independent of `advanced`; native library requirements are
   platform-specific. See [File API](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/file-io.md).
@@ -209,7 +258,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   only a queue that fails to drain refuses the next session.
 - Receive allocator replacement installs the new native callbacks before
   retiring the old policy, avoiding dropped frames while the setter runs or
-  the old policy's destructor blocks.
+  the old policy's destructor blocks. Pool-backed buffers avoid per-frame
+  handle boxing; arbitrary external handles remain boxed once per buffer.
 - Cancelling an async File creation whose handle has not reached the caller
   requests cleanup without joining its owner thread, even after delivery.
 - Audio and metadata frame implementations supply only validated accessors;

@@ -52,7 +52,7 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
                 other => panic!("{other:?}"),
             };
             assert!(log().contains(&format!("{medium}-data:{}", pointer as usize)));
-            packets.receiver().connection_stats();
+            packets.receiver().connection_stats().unwrap();
             drop(frame);
             assert_eq!(frees(medium), before + 1);
             std::env::set_var(

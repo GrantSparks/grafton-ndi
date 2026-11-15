@@ -1,4 +1,4 @@
-//! Async receivers for Tokio and smol.
+//! Async discovery and receivers for Tokio and smol.
 //!
 //! [`AsyncReceiver`] wraps the synchronous NDI receiver API for an async
 //! runtime, and its `video`, `audio` and `metadata` return an
@@ -11,6 +11,12 @@
 //! example `grafton_ndi::asynchronous::tokio::AsyncReceiver`. This module
 //! exists when either feature is enabled, and each runtime only with its own
 //! feature; the crate root does not re-export any of it.
+//!
+//! [`AsyncFinder`] owns a [`crate::Finder`] or [`crate::SourceCache`] for async
+//! selection and complete discovery windows. Its owned [`AsyncSourceWatch`]
+//! retains a consumer's generation across awaits without borrowing a finder.
+//! Runtime submodules also provide the `AsyncSourceCache` alias for cached
+//! discovery. Dropped lookups stop their workers using the same rule as receivers.
 //!
 //! The NDI SDK operations are synchronous and blocking. Tokio runs them through
 //! `tokio::task::spawn_blocking`; smol uses `smol::unblock`, keeping the work off
@@ -60,13 +66,15 @@
 //! ```no_run
 //! # #[cfg(feature = "tokio")]
 //! # {
-//! use grafton_ndi::{Ndi, ReceiverOptions, asynchronous::tokio::AsyncReceiver};
+//! use grafton_ndi::{Finder, FinderOptions, Ndi, ReceiverOptions,
+//!     asynchronous::tokio::{AsyncFinder, AsyncReceiver}};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), grafton_ndi::Error> {
 //!     let ndi = Ndi::new()?;
-//!     // ... obtain source from finder ...
-//!     # let source = grafton_ndi::Source::new("CAMERA (Program)");
+//!     let finder = AsyncFinder::new(Finder::new(&ndi, &FinderOptions::new())?);
+//!     let Some(source) = finder.find_source_by_name("CAMERA (Program)",
+//!         std::time::Duration::from_secs(5)).await? else { return Ok(()); };
 //!
 //!     let options = ReceiverOptions::snapshot_preset(source);
 //!     let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
@@ -96,10 +104,14 @@ use std::{
 
 use crate::{
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
+    receiver::ConnectionTarget,
     timeout::Deadline,
     ConnectionStats, Error, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef, Result, Source,
     SourceNameChange, SpawnFailure,
 };
+
+mod discovery;
+pub use discovery::{AsyncFinder, AsyncSourceWatch, Discovery};
 
 mod private {
     use std::{future::Future, sync::atomic::AtomicBool};
@@ -197,7 +209,8 @@ fn tokio_join_error(error: ::tokio::task::JoinError) -> Error {
 }
 
 /// An async runtime whose blocking thread pool runs the NDI operations of an
-/// [`AsyncReceiver`] and its [`AsyncCapture`] views: [`Tokio`] or [`Smol`].
+/// [`AsyncReceiver`], [`AsyncCapture`], [`AsyncFinder`] and [`AsyncSourceWatch`]:
+/// [`Tokio`] or [`Smol`].
 ///
 /// The trait is sealed and has no items of its own; it only selects the
 /// runtime.
@@ -276,9 +289,10 @@ impl private::Spawn for Smol {
 /// # Thread Safety
 ///
 /// The underlying [`Receiver`] is shared through an [`Arc`]. The SDK documents
-/// concurrent capture calls in `Processing.NDI.Recv.h`; the crate's capture
-/// guard serializes connection changes against them. Receiver queries with
-/// invalidatable SDK strings have their own query lock.
+/// concurrent capture calls in `Processing.NDI.Recv.h`. Local connection
+/// changes serialize with one another and may overlap captures, as described
+/// by [`Receiver::reconnect`]. Source-name waits serialize with one another;
+/// waiting for another poller counts against the caller's wait budget.
 ///
 /// # Events and controls
 ///
@@ -337,7 +351,16 @@ where
     F: FnOnce(Deadline, &AtomicBool) -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let deadline = Deadline::after(timeout)?;
+    with_deadline_budget::<R, _, _>(Deadline::after(timeout)?, operation).await
+}
+
+// Validated discovery inputs keep the deadline started before their conversion.
+async fn with_deadline_budget<R, F, T>(deadline: Deadline, operation: F) -> Result<T>
+where
+    R: AsyncRuntime,
+    F: FnOnce(Deadline, &AtomicBool) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
     R::spawn_stoppable(private::Token, move |stop| operation(deadline, stop)).await?
 }
 
@@ -457,9 +480,9 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// without these payload allocations and copies.
     ///
     /// The wait budget starts at first poll and includes blocking-pool queue
-    /// delay, receiver-lock contention and SDK waits. A spent or zero budget
-    /// makes one non-waiting attempt. Scheduling and copying can finish after
-    /// the budget. Events compete with all other event and combined consumers;
+    /// delay and SDK waits. A spent or zero budget makes one non-waiting
+    /// attempt. Scheduling and copying can finish after the budget.
+    /// Events compete with all other event and combined consumers;
     /// see [`Receiver::capture_any_ref`] for their coalescing contract.
     ///
     /// # Errors
@@ -481,10 +504,10 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// blocking worker, without copying its payload into an owned item.
     ///
     /// `process` synchronously borrows the validated [`ReceiverItemRef`]. It
-    /// runs once for a delivered item, after internal capture locks have been
-    /// released; timeouts and capture errors do not call it. The wrapper keeps
-    /// the native frame guard until the callback returns (or unwinds), then
-    /// frees it on the same worker. Only the returned `T` crosses the task
+    /// runs once for a delivered item; timeouts and capture errors do not
+    /// call it. The wrapper keeps the native frame guard until the callback
+    /// returns (or unwinds), then frees it on the same worker. Only the
+    /// returned `T` crosses the task
     /// boundary. Borrowed frames, planes, rows, channels and text cannot escape.
     /// Use an owned result, or explicitly call [`ReceiverItemRef::to_owned`],
     /// to retain data across awaits.
@@ -590,6 +613,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// terminate; and [`Error::SpawnFailed`] for a missing runtime context or
     /// cancelled blocking task.
     ///
+    /// Input and capability errors are reported before work is submitted.
+    ///
     /// # Cancellation
     ///
     /// Dropping the future skips queued work and stops a started wait before
@@ -600,11 +625,17 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
         &self,
         timeout: Duration,
     ) -> Result<Option<SourceNameChange>> {
+        let deadline = Deadline::after(timeout)?;
+        // The task owns copies of the immutable tables it validated, keeping
+        // its inputs independent of reference-lifetime inference on the MSRV.
+        let (source_name, strings) = *self.inner.core.source_name_tables()?;
         let receiver = Arc::clone(&self.inner);
-        with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-            receiver.core.poll_source_name_change_until(deadline, stop)
+        R::spawn_stoppable(private::Token, move |stop| {
+            receiver
+                .core
+                .poll_source_name_change_with(&source_name, &strings, deadline, stop)
         })
-        .await
+        .await?
     }
 
     /// Whether the underlying receiver currently has at least one active
@@ -624,7 +655,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// application expects; connection state and a video counter alone do
     /// not establish audio or metadata progress. See the
     /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
-    pub fn connection_stats(&self) -> ConnectionStats {
+    pub fn connection_stats(&self) -> Result<ConnectionStats> {
         self.inner.connection_stats()
     }
 
@@ -637,14 +668,15 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// continue while the SDK applies it. Success means the request was
     /// issued, not that the source is available; watch
     /// [`Self::poll_source_name_change`] or [`Self::connection_stats`].
-    /// `source` is copied, so that the blocking task can own it.
+    /// `source` is validated and converted once, on the calling task when
+    /// the future is first polled, so the blocking task owns its checked target.
     ///
     /// # Errors
     ///
     /// The errors of [`Receiver::connect_to`]: [`Error::InvalidCString`] when
     /// the source's name or address contains a NUL byte; and
     /// [`Error::SpawnFailed`] for a missing runtime context or
-    /// cancelled blocking task.
+    /// cancelled blocking task. Input errors are reported before work is submitted.
     ///
     /// # Cancellation
     ///
@@ -653,9 +685,9 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// connection change continues, including waiting for earlier connection changes,
     /// and may take effect after this future is dropped.
     pub async fn connect_to(&self, source: &Source) -> Result<()> {
+        let target = ConnectionTarget::new(source)?;
         let receiver = Arc::clone(&self.inner);
-        let source = source.clone();
-        R::spawn_blocking(private::Token, move || receiver.connect_to(&source)).await?
+        R::spawn_blocking(private::Token, move || receiver.connect_target(target)).await
     }
 
     /// Disconnect the underlying receiver from its source, retaining the
@@ -778,10 +810,10 @@ where
     /// Process a validated borrowed frame on the blocking worker without
     /// copying its payload into an owned frame.
     ///
-    /// `process` runs synchronously once for a delivered frame, after internal
-    /// capture locks have been released. Timeouts and capture errors do not
-    /// call it. The wrapper retains the guard throughout the callback and frees
-    /// it on that worker before returning `T`, including on callback panic.
+    /// `process` runs synchronously once for a delivered frame.
+    /// Timeouts and capture errors do not call it. The wrapper retains the
+    /// guard throughout the callback and frees it on that worker before
+    /// returning `T`, including on callback panic.
     /// Borrowed frames, planes, rows, channels and metadata text cannot escape.
     /// The callback, its captures and its result must be `Send + 'static`.
     /// Return a small summary for immediate inspection, or explicitly copy
@@ -875,6 +907,12 @@ pub mod tokio {
 
     /// An [`AsyncReceiver`](super::AsyncReceiver) on the Tokio runtime.
     pub type AsyncReceiver = super::AsyncReceiver<super::Tokio>;
+    /// Discovery on the Tokio runtime, owning a finder or source cache.
+    pub type AsyncFinder<D = crate::Finder> = super::AsyncFinder<super::Tokio, D>;
+    /// Cached discovery on the Tokio runtime.
+    pub type AsyncSourceCache = AsyncFinder<crate::SourceCache>;
+    /// An owned discovery cursor on the Tokio runtime.
+    pub type AsyncSourceWatch<D = crate::Finder> = super::AsyncSourceWatch<super::Tokio, D>;
     /// An [`AsyncCapture`](super::AsyncCapture) on the Tokio runtime.
     pub type AsyncCapture<'rx, K> = super::AsyncCapture<'rx, super::Tokio, K>;
 }
@@ -916,6 +954,12 @@ pub mod smol {
 
     /// An [`AsyncReceiver`](super::AsyncReceiver) on the smol runtime.
     pub type AsyncReceiver = super::AsyncReceiver<super::Smol>;
+    /// Discovery on the smol runtime, owning a finder or source cache.
+    pub type AsyncFinder<D = crate::Finder> = super::AsyncFinder<super::Smol, D>;
+    /// Cached discovery on the smol runtime.
+    pub type AsyncSourceCache = AsyncFinder<crate::SourceCache>;
+    /// An owned discovery cursor on the smol runtime.
+    pub type AsyncSourceWatch<D = crate::Finder> = super::AsyncSourceWatch<super::Smol, D>;
     /// An [`AsyncCapture`](super::AsyncCapture) on the smol runtime.
     pub type AsyncCapture<'rx, K> = super::AsyncCapture<'rx, super::Smol, K>;
 }
@@ -1140,6 +1184,27 @@ mod executor_tests {
             operation.as_mut().poll(&mut context),
             Poll::Ready(Err(Error::SpawnFailed(SpawnFailure::NoRuntime)))
         ));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn invalid_connect_is_rejected_before_entering_a_runtime() {
+        use std::task::{Context, Poll, Waker};
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = AsyncReceiver::<Tokio>::new(
+            Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new(""))).unwrap(),
+        );
+        let source = Source::new("NUL\0name");
+        let mut connect = std::pin::pin!(receiver.connect_to(&source));
+        assert!(matches!(
+            connect
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(Error::InvalidCString(_)))
+        ));
+        assert_eq!(receiver.receiver().connection_target(), Source::new(""));
     }
 
     #[cfg(feature = "tokio")]
@@ -1451,6 +1516,46 @@ mod receiver_tests {
                 blocker.await.unwrap();
                 assert_eq!(worker_capture_calls().await, 0);
             });
+        }
+
+        #[test]
+        fn async_connect_allocates_only_preparation_and_dispatch() {
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = unconnected::<Tokio>(&ndi);
+            let runtime = runtime();
+            runtime.block_on(receiver.reconnect()).unwrap();
+            for source in [
+                Source::new("allocation target"),
+                Source::new("allocation target")
+                    .with_address(crate::SourceAddress::new("192.0.2.1:5960")),
+            ] {
+                runtime.block_on(receiver.connect_to(&source)).unwrap();
+                let (result, synchronous) =
+                    crate::test_alloc::allocation_count(|| receiver.receiver().connect_to(&source));
+                result.unwrap();
+                let (result, dispatch) =
+                    crate::test_alloc::allocation_count(|| runtime.block_on(receiver.reconnect()));
+                result.unwrap();
+                let (result, asynchronous) = crate::test_alloc::allocation_count(|| {
+                    runtime.block_on(receiver.connect_to(&source))
+                });
+                result.unwrap();
+                assert_eq!(asynchronous, synchronous + dispatch, "source {source:?}");
+            }
+            let invalid = Source::new("NUL\0target");
+            let (synchronous, sync_allocations) =
+                crate::test_alloc::allocation_count(|| receiver.receiver().connect_to(&invalid));
+            let (asynchronous, async_allocations) = crate::test_alloc::allocation_count(|| {
+                runtime.block_on(receiver.connect_to(&invalid))
+            });
+            assert!(matches!(synchronous, Err(Error::InvalidCString(_))));
+            assert!(matches!(asynchronous, Err(Error::InvalidCString(_))));
+            assert_eq!(
+                async_allocations, sync_allocations,
+                "refused input must not dispatch work"
+            );
         }
 
         #[test]

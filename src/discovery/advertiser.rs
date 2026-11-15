@@ -174,7 +174,6 @@ trait AdvertiserApi: ServerApi {
     type Member: Send;
     type Advertisement;
     const MEMBER: &'static str;
-    const REGISTER: &'static str;
     fn same_member(a: &Self::Member, b: &Self::Member) -> bool;
     /// # Safety
     /// The advertiser and member are live; the member retains its native handle
@@ -184,17 +183,20 @@ trait AdvertiserApi: ServerApi {
         instance: Self::Instance,
         member: &Self::Member,
         options: &Self::Advertisement,
-    ) -> bool;
+    ) -> sys::table::Called<bool>;
     /// # Safety
     /// The advertiser and member are live and belong to this runtime.
-    unsafe fn remove(&self, instance: Self::Instance, member: &Self::Member) -> bool;
+    unsafe fn remove(
+        &self,
+        instance: Self::Instance,
+        member: &Self::Member,
+    ) -> sys::table::Called<bool>;
 }
 
 impl AdvertiserApi for sys::SenderAdvertising {
     type Member = Arc<SenderResource>;
     type Advertisement = SendAdvertisement;
     const MEMBER: &'static str = "sender";
-    const REGISTER: &'static str = "register sender";
     fn same_member(a: &Self::Member, b: &Self::Member) -> bool {
         Arc::ptr_eq(a, b)
     }
@@ -203,19 +205,26 @@ impl AdvertiserApi for sys::SenderAdvertising {
         instance: Self::Instance,
         member: &Self::Member,
         options: &Self::Advertisement,
-    ) -> bool {
+    ) -> sys::table::Called<bool> {
         // SAFETY: forwarded to the caller's live-owner obligation.
         unsafe {
-            self.NDIlib_send_advertiser_add_sender(
+            self.named().NDIlib_send_advertiser_add_sender(
                 instance.0,
                 member.instance(),
                 options.monitoring,
             )
         }
     }
-    unsafe fn remove(&self, instance: Self::Instance, member: &Self::Member) -> bool {
+    unsafe fn remove(
+        &self,
+        instance: Self::Instance,
+        member: &Self::Member,
+    ) -> sys::table::Called<bool> {
         // SAFETY: forwarded to the caller's live-owner obligation.
-        unsafe { self.NDIlib_send_advertiser_del_sender(instance.0, member.instance()) }
+        unsafe {
+            self.named()
+                .NDIlib_send_advertiser_del_sender(instance.0, member.instance())
+        }
     }
 }
 
@@ -229,7 +238,6 @@ impl AdvertiserApi for sys::ReceiverAdvertising {
     type Member = ReceiverMember;
     type Advertisement = RecvAdvertisement;
     const MEMBER: &'static str = "receiver";
-    const REGISTER: &'static str = "register receiver";
     fn same_member(a: &Self::Member, b: &Self::Member) -> bool {
         Arc::ptr_eq(&a.resource, &b.resource)
     }
@@ -238,10 +246,10 @@ impl AdvertiserApi for sys::ReceiverAdvertising {
         instance: Self::Instance,
         member: &Self::Member,
         options: &Self::Advertisement,
-    ) -> bool {
+    ) -> sys::table::Called<bool> {
         // SAFETY: forwarded to the caller's live-owner and retained-name obligation.
         unsafe {
-            self.NDIlib_recv_advertiser_add_receiver(
+            self.named().NDIlib_recv_advertiser_add_receiver(
                 instance.0,
                 member.resource.instance.0,
                 options.controlling,
@@ -253,9 +261,16 @@ impl AdvertiserApi for sys::ReceiverAdvertising {
             )
         }
     }
-    unsafe fn remove(&self, instance: Self::Instance, member: &Self::Member) -> bool {
+    unsafe fn remove(
+        &self,
+        instance: Self::Instance,
+        member: &Self::Member,
+    ) -> sys::table::Called<bool> {
         // SAFETY: forwarded to the caller's live-owner obligation.
-        unsafe { self.NDIlib_recv_advertiser_del_receiver(instance.0, member.resource.instance.0) }
+        unsafe {
+            self.named()
+                .NDIlib_recv_advertiser_del_receiver(instance.0, member.resource.instance.0)
+        }
     }
 }
 
@@ -303,15 +318,12 @@ impl<A: AdvertiserApi> Advertiser<A> {
         }
         // SAFETY: the member owns its native object and advertisement strings;
         // successful registration retains that value until the SDK releases it.
-        if !unsafe {
+        unsafe {
             self.server
                 .api
                 .add(self.server.instance(), &member, options)
-        } {
-            return Err(Error::NativeOperationFailed {
-                operation: A::REGISTER,
-            });
         }
+        .performed()?;
         Ok(self.retain(member))
     }
 
@@ -323,7 +335,7 @@ impl<A: AdvertiserApi> Advertiser<A> {
     }
 
     /// End the registration `id`, which the token `registration` names, as
-    /// the native `operation`.
+    /// its native removal operation.
     ///
     /// # Errors
     ///
@@ -332,12 +344,7 @@ impl<A: AdvertiserApi> Advertiser<A> {
     /// token is the only way to end that registration, and with
     /// [`Error::NativeOperationFailed`] when the SDK removes nothing because
     /// it does not know the registered object.
-    fn release<R>(
-        &mut self,
-        id: u64,
-        registration: R,
-        operation: &'static str,
-    ) -> std::result::Result<(), Rejected<R>> {
+    fn release<R>(&mut self, id: u64, registration: R) -> std::result::Result<(), Rejected<R>> {
         let Some(member) = self.members.get(&id) else {
             return Err(Rejected::new(
                 Error::InvalidInput(crate::InputDefect::ForeignRegistration),
@@ -345,11 +352,10 @@ impl<A: AdvertiserApi> Advertiser<A> {
             ));
         };
         // SAFETY: the advertiser is live for this borrow.
-        if !unsafe { self.server.api.remove(self.server.instance(), member) } {
-            return Err(Rejected::new(
-                Error::NativeOperationFailed { operation },
-                registration,
-            ));
+        if let Err(error) =
+            unsafe { self.server.api.remove(self.server.instance(), member) }.performed()
+        {
+            return Err(Rejected::new(error, registration));
         }
         // The SDK has forgotten the object, so it may be released.
         self.members.remove(&id);
@@ -554,8 +560,7 @@ impl SendAdvertiser {
         &mut self,
         registration: SendRegistration,
     ) -> std::result::Result<(), Rejected<SendRegistration>> {
-        self.inner
-            .release(registration.0, registration, "unregister sender")
+        self.inner.release(registration.0, registration)
     }
 }
 impl RecvAdvertiser {
@@ -637,7 +642,6 @@ impl RecvAdvertiser {
         &mut self,
         registration: RecvRegistration,
     ) -> std::result::Result<(), Rejected<RecvRegistration>> {
-        self.inner
-            .release(registration.0, registration, "unregister receiver")
+        self.inner.release(registration.0, registration)
     }
 }

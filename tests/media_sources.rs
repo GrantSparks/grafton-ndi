@@ -142,3 +142,65 @@ fn borrowed_audio_rejects_invalid_layouts_and_metadata_before_native_access() {
     assert_eq!(reset.metadata(), None);
     assert_eq!(reset.data(), Some(&data[..4]));
 }
+
+#[macro_use]
+#[path = "support/source_surface.rs"]
+mod surface;
+
+#[test]
+fn concrete_and_erased_video_accessors_agree_for_every_application_layout() {
+    for stride in [8, 12] {
+        let pixels = vec![128u8; stride * 2];
+        let borrowed = BorrowedVideoFrame::builder(&pixels, 2, 2, PixelFormat::Bgra)
+            .line_stride_bytes(stride)
+            .metadata(c"<frame/>")
+            .build()
+            .unwrap();
+        assert_eq!(borrowed.storage(), pixels);
+        assert_eq!(borrowed.data().is_some(), stride == 8);
+        video_source_surface!(&borrowed, borrowed.data(), VideoSource, VideoFrame);
+        let owned = borrowed.to_owned();
+        video_source_surface!(&owned, Some(owned.data()), VideoSource, VideoFrame);
+    }
+}
+
+#[test]
+fn concrete_and_erased_audio_accessors_agree_for_every_application_layout() {
+    for stride in [2, 3] {
+        let mut samples = vec![0.0; stride * 2];
+        samples[..2].copy_from_slice(&[1.0, 2.0]);
+        samples[stride..stride + 2].copy_from_slice(&[3.0, 4.0]);
+        let borrowed = BorrowedAudioFrame::builder(&samples, 96_000, 2, 2)
+            .channel_stride_bytes(stride * 4)
+            .metadata(c"<frame/>")
+            .build()
+            .unwrap();
+        assert_eq!(borrowed.data().is_some(), stride == 2);
+        audio_source_surface!(&borrowed, borrowed.data(), AudioSource, AudioFrame);
+        let owned = borrowed.to_owned();
+        audio_source_surface!(&owned, Some(owned.data()), AudioSource, AudioFrame);
+    }
+}
+
+#[test]
+fn one_padded_row_keeps_active_data_separate_from_storage_and_sdk_tail() {
+    let pixels = [128u8; 16];
+    let frame = BorrowedVideoFrame::builder(&pixels, 2, 1, PixelFormat::Bgra)
+        .line_stride_bytes(12)
+        .build()
+        .unwrap();
+    assert_eq!(frame.data(), Some(&pixels[..8]));
+    assert_eq!(frame.storage(), &pixels[..12]);
+    video_source_surface!(&frame, frame.data(), VideoSource, VideoFrame);
+
+    let stride = 8;
+    let pixels = vec![128u8; stride + PixelFormat::Uyvy.send_tail_room()];
+    let frame = BorrowedVideoFrame::builder(&pixels, 2, 1, PixelFormat::Uyvy)
+        .line_stride_bytes(stride)
+        .allow_send_from_padding_and_tail(true)
+        .build()
+        .unwrap();
+    assert_eq!(frame.storage(), &pixels[..stride]);
+    assert_eq!(frame.data(), Some(&pixels[..4]));
+    assert!(frame.sends_in_place());
+}

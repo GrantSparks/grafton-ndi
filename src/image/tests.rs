@@ -2201,14 +2201,14 @@ fn conversion_geometry_overflow_is_refused_before_output_or_row_access() {
     };
     assert!(matches!(
         invalid_frame(super::encode_to(source, &options, &mut output)),
-        crate::FrameDefect::AudioChannelOffset { .. }
-            | crate::FrameDefect::AudioSampleCount { .. }
-            | crate::FrameDefect::AudioByteSize(_)
-            | crate::FrameDefect::AudioBytes(_)
-            | crate::FrameDefect::VideoStrideOverflow { .. }
-            | crate::FrameDefect::VideoBufferOverflow
-            | crate::FrameDefect::VideoPayloadOverflow
-            | crate::FrameDefect::VideoBytes(_)
+        crate::FrameDefect::Layout(crate::LayoutDefect::AudioChannelOffset { .. })
+            | crate::FrameDefect::Layout(crate::LayoutDefect::AudioSampleCount { .. })
+            | crate::FrameDefect::Layout(crate::LayoutDefect::AudioByteSize(_))
+            | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
+            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoStrideOverflow { .. })
+            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
+            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoPayloadOverflow)
+            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
             | crate::FrameDefect::ImageScratchOverflow
             | crate::FrameDefect::ImageDimensionOverflow
     ));
@@ -2358,7 +2358,7 @@ fn warm_workspace_conversion_does_not_allocate() {
                     for codec in [ImageFormat::WebpLossless, ImageFormat::WebpLossy(75)] {
                         let options = options(codec).alpha(alpha).downscale(reduction);
                         let plan = Plan::new(&source, &options).unwrap();
-                        let shape = plan.shape.buffered().unwrap();
+                        let shape = plan.shape().buffered().unwrap();
                         let mut convert = || {
                             plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
                                 webp::image_with(pixels, shape, &mut workspace.image)?;
@@ -2461,8 +2461,9 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                                 (1, row_len, row_len)
                             );
                             let (_, allocations) = allocation_count(|| {
-                                (0..reduced.1)
-                                    .for_each(|y| pixels.pack_row(y, plan.shape.channels, &mut row))
+                                (0..reduced.1).for_each(|y| {
+                                    pixels.pack_row(y, plan.shape().channels, &mut row)
+                                })
                             });
                             assert_eq!(allocations, 0, "{format:?} {height} {options:?}");
                         } else {
@@ -2473,8 +2474,9 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                             let mut row = row_buffer::<u16>(reduced.0, channels);
                             assert_eq!(row.len(), row_len);
                             let (_, allocations) = allocation_count(|| {
-                                (0..reduced.1)
-                                    .for_each(|y| pixels.pack_row(y, plan.shape.channels, &mut row))
+                                (0..reduced.1).for_each(|y| {
+                                    pixels.pack_row(y, plan.shape().channels, &mut row)
+                                })
                             });
                             assert_eq!(allocations, 0, "{format:?} {height} {options:?}");
                         }
@@ -2491,7 +2493,7 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                         let mut pixels = plan.pixels::<u8>();
                         let ((image, allocations), peak) = peak_bytes(|| {
                             allocation_count(|| {
-                                webp::image(&mut pixels, plan.shape.buffered().unwrap())
+                                webp::image(&mut pixels, plan.shape().buffered().unwrap())
                             })
                         });
                         let len = reduced.0 * reduced.1 * channels;
@@ -2517,7 +2519,7 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                 let plan = Plan::new(&source, &options).unwrap();
                 let mut pixels = plan.pixels::<u8>();
                 let (width, height) = (pixels.width() as u16, pixels.height() as u16);
-                let mut cache = vec![0; plan.shape.row_bytes];
+                let mut cache = vec![0; plan.shape().row_bytes];
                 let rows = jpeg::Rows::new(&mut pixels, width, height, &mut cache);
                 let mut buffers = std::array::from_fn(|_| Vec::with_capacity(reduced.0));
                 let (_, allocations) = allocation_count(|| {
@@ -2588,6 +2590,58 @@ fn workspace_resources() {
                     eprintln!("workspace,{width},{height},{name},{warm},{sample},{elapsed:.6},{allocations},{peak},{retained_before},{},{},{},{rss_before},{}", workspace.retained_bytes(), frame.data().len(), image.len(), rss());
                     black_box(image);
                 }
+            }
+        }
+    }
+}
+
+/// Separates output Vec growth from codec allocations. Run on the reference
+/// before changing output reservation, then on the candidate with the same inputs.
+#[test]
+#[ignore = "manual output growth, allocation and peak heap measurement"]
+fn workspace_output_growth_resources() {
+    use crate::test_alloc::{allocation_count, peak_bytes};
+    use std::{io::Write, time::Instant};
+    #[derive(Default)]
+    struct Output {
+        bytes: Vec<u8>,
+        growths: usize,
+    }
+    impl Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let capacity = self.bytes.capacity();
+            self.bytes.extend_from_slice(bytes);
+            self.growths += usize::from(self.bytes.capacity() != capacity);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    for (width, height) in [(1920, 1080), (3840, 2160)] {
+        let rgba = content_rgba("photographic", width, height, None);
+        let frame = padded(PixelFormat::Bgra, width as u32, height as u32, &rgba, 16);
+        for format in [
+            ImageFormat::Png,
+            ImageFormat::Jpeg(85),
+            ImageFormat::WebpLossless,
+        ] {
+            for reduction in [Downscale::Off, Downscale::Eighth] {
+                let options = options(format)
+                    .png_compression(PngCompression::Fast)
+                    .downscale(reduction);
+                let mut workspace = crate::ImageWorkspace::new();
+                let expected = workspace.encode(&frame, &options).unwrap();
+                let mut output = Output::default();
+                workspace.encode_to(&frame, &options, &mut output).unwrap();
+                assert_eq!(output.bytes, expected);
+                let retained = workspace.retained_bytes();
+                let start = Instant::now();
+                let ((image, allocations), peak) =
+                    peak_bytes(|| allocation_count(|| workspace.encode(&frame, &options).unwrap()));
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(image, expected);
+                eprintln!("output-growth,{width},{height},{format:?},{reduction:?},{},{},{},{allocations},{peak},{retained},{elapsed:.3}", image.len(), output.growths, output.bytes.capacity());
             }
         }
     }
@@ -2871,4 +2925,209 @@ fn frame_from_rgba(format: PixelFormat, width: usize, height: usize, rgba: &[u8]
         Site::Alpha(_) => ((1u32 << bits) - 1) as u16,
     })
     .frame(None)
+}
+
+#[test]
+fn png_scratch_failure_precedes_every_output_byte() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::FAIL_SCRATCH_RESERVATION.with(|fail| fail.set(false));
+        }
+    }
+    for depth in [SampleDepth::Eight, SampleDepth::Sixteen] {
+        for hdr in [false, true] {
+            let frame = VideoFrame::builder()
+                .resolution(2, 2)
+                .pixel_format(PixelFormat::Bgra)
+                .metadata(if hdr {
+                    "<ndi_color_info primaries=\"bt_2020\" transfer=\"bt_2100_pq\"/>"
+                } else {
+                    ""
+                })
+                .build()
+                .unwrap();
+            let options = options(ImageFormat::Png)
+                .depth(depth)
+                .hdr(HdrPolicy::CodeValues);
+            let mut output = Vec::new();
+            let _reset = Reset;
+            super::FAIL_SCRATCH_RESERVATION.with(|fail| fail.set(true));
+            let error = crate::ImageWorkspace::new()
+                .encode_to(&frame, &options, &mut output)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::InvalidFrame(crate::FrameDefect::ImageScratchAllocation(_))
+            ));
+            assert!(output.is_empty(), "{depth:?} HDR={hdr}");
+        }
+    }
+}
+
+#[test]
+fn anamorphic_png_and_jpeg_tags_preserve_display_aspect() {
+    for (width, height) in [(720, 480), (18, 11)] {
+        for aspect in [4.0 / 3.0, 16.0 / 9.0] {
+            // Exercise direct packed RGB JPEG and incremental YUV JPEG.
+            for pixel_format in [PixelFormat::Rgba, PixelFormat::Uyvy] {
+                let frame = VideoFrame::builder()
+                    .resolution(width, height)
+                    .pixel_format(pixel_format)
+                    .picture_aspect_ratio(aspect)
+                    .build()
+                    .unwrap();
+                for reduction in [
+                    Downscale::Off,
+                    Downscale::Half,
+                    Downscale::Quarter,
+                    Downscale::Eighth,
+                ] {
+                    let shape = (
+                        super::reduced(width as usize, reduction.shift()),
+                        super::reduced(height as usize, reduction.shift()),
+                    );
+                    let expected = f64::from(aspect) * shape.1 as f64 / shape.0 as f64;
+                    let png = frame
+                        .encode_image(&options(ImageFormat::Png).downscale(reduction))
+                        .unwrap();
+                    let reader = ::png::Decoder::new(std::io::Cursor::new(&png))
+                        .read_info()
+                        .unwrap();
+                    let density = reader.info().pixel_dims.unwrap();
+                    assert_eq!(density.unit, ::png::Unit::Unspecified);
+                    let actual = f64::from(density.yppu) / f64::from(density.xppu);
+                    assert!(
+                        (actual / expected - 1.0).abs() < 0.001,
+                        "PNG {shape:?} {actual} {expected}"
+                    );
+                    let jpeg = frame
+                        .encode_image(&options(ImageFormat::Jpeg(85)).downscale(reduction))
+                        .unwrap();
+                    assert_eq!(&jpeg[6..11], b"JFIF\0");
+                    assert_eq!(jpeg[13], 0);
+                    let x = u16::from_be_bytes(jpeg[14..16].try_into().unwrap());
+                    let y = u16::from_be_bytes(jpeg[16..18].try_into().unwrap());
+                    let actual = f64::from(y) / f64::from(x);
+                    assert!(
+                        (actual / expected - 1.0).abs() < 0.001,
+                        "JPEG {shape:?} {actual} {expected}"
+                    );
+                    assert_eq!(decode_png(&png).width as usize, shape.0);
+                    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(jpeg));
+                    decoder.decode().unwrap();
+                    let info = decoder.info().unwrap();
+                    assert_eq!((usize::from(info.width), usize::from(info.height)), shape);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn square_pixel_encodes_stay_identical_and_extreme_aspects_remain_positive() {
+    for pixel_format in PixelFormat::ALL {
+        let base = VideoFrame::builder()
+            .resolution(18, 10)
+            .pixel_format(pixel_format)
+            .build()
+            .unwrap();
+        let mut explicit = base.clone();
+        explicit.set_picture_aspect_ratio(1.8).unwrap();
+        for reduction in [
+            Downscale::Off,
+            Downscale::Half,
+            Downscale::Quarter,
+            Downscale::Eighth,
+        ] {
+            for options in every_output() {
+                let options = options.downscale(reduction);
+                assert_eq!(
+                    base.encode_image(&options).unwrap(),
+                    explicit.encode_image(&options).unwrap()
+                );
+            }
+        }
+    }
+    for aspect in [f32::MIN_POSITIVE, f32::MAX] {
+        let frame = VideoFrame::builder()
+            .resolution(2, 2)
+            .picture_aspect_ratio(aspect)
+            .build()
+            .unwrap();
+        let source = Source::new(&frame);
+        let density = super::PixelDensity::for_source(&source, 1, 1).unwrap();
+        assert!(density.x > 0 && density.y > 0);
+    }
+}
+
+#[test]
+fn warm_workspace_allocates_output_once_without_retaining_it() {
+    use crate::test_alloc::allocation_count;
+    let frame = VideoFrame::builder()
+        .resolution(64, 36)
+        .pixel_format(PixelFormat::Bgra)
+        .data(any_frame_bytes(PixelFormat::Bgra, 64, 36, 41))
+        .build()
+        .unwrap();
+    for format in [
+        ImageFormat::Png,
+        ImageFormat::Jpeg(85),
+        ImageFormat::WebpLossless,
+    ] {
+        let options = options(format);
+        let mut workspace = crate::ImageWorkspace::new();
+        let expected = workspace.encode(&frame, &options).unwrap();
+        let retained = workspace.retained_bytes();
+        let mut reused = Vec::with_capacity(expected.len());
+        let ((), codec_allocations) =
+            allocation_count(|| workspace.encode_to(&frame, &options, &mut reused).unwrap());
+        for _ in 0..3 {
+            let (output, allocations) =
+                allocation_count(|| workspace.encode(&frame, &options).unwrap());
+            assert_eq!(output, expected);
+            assert_eq!(output.capacity(), output.len());
+            assert_eq!(
+                allocations,
+                codec_allocations + 1,
+                "{format:?}: exactly one allocation beyond codec state"
+            );
+            assert_eq!(workspace.retained_bytes(), retained);
+        }
+        // Old output size cannot force a large allocation for a tiny next frame.
+        let small = VideoFrame::builder().resolution(2, 2).build().unwrap();
+        let small_output = workspace.encode(&small, &options).unwrap();
+        assert_eq!(small_output, small.encode_image(&options).unwrap());
+        assert!(small_output.capacity() <= 2 * 2 * 4 * 2 + 1024);
+        workspace.release();
+        assert!(workspace.output_hint.is_none());
+        assert_eq!(workspace.retained_bytes(), 0);
+    }
+}
+
+#[test]
+fn reader_format_facts_match_the_frame_layout_for_every_format() {
+    for format in PixelFormat::ALL {
+        let frame = VideoFrame::builder()
+            .resolution(4, 2)
+            .pixel_format(format)
+            .build()
+            .unwrap();
+        let info = format.info();
+        let (expected_bits, expected_alpha) = if RGB_FORMATS.contains(&format) {
+            (8, matches!(format, PixelFormat::Bgra | PixelFormat::Rgba))
+        } else {
+            let sampling = sampling(format);
+            (sampling.bits, sampling.alpha)
+        };
+        assert_eq!(info.sample_width().bits(), expected_bits, "{format:?}");
+        assert_eq!(info.has_alpha(), expected_alpha, "{format:?}");
+        assert_eq!(info.plane_count(), frame.planes().len(), "{format:?}");
+        for keep in [false, true] {
+            let source = Source::new(&frame);
+            let reader =
+                super::Reader::<u8>::new(&source, YuvMatrix::Bt709, YuvRange::Limited, keep);
+            assert_eq!(reader.has_alpha(), keep && info.has_alpha(), "{format:?}");
+        }
+    }
 }

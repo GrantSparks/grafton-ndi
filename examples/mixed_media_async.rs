@@ -57,28 +57,48 @@ async fn analyze<R: grafton_ndi::asynchronous::AsyncRuntime>(
 }
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
+async fn discover_and_analyze<R: grafton_ndi::asynchronous::AsyncRuntime>(
+    ndi: &grafton_ndi::Ndi,
+    name: &str,
+) -> grafton_ndi::Result<()> {
+    use grafton_ndi::{
+        asynchronous::{AsyncFinder, AsyncReceiver},
+        Finder, FinderOptions, Receiver, ReceiverOptions,
+    };
+    let finder = AsyncFinder::<R>::new(Finder::new(ndi, &FinderOptions::new())?);
+    let Some(source) = finder
+        .find_source_by_name(name, std::time::Duration::from_secs(5))
+        .await?
+    else {
+        eprintln!("No source named {name:?} was found within five seconds.");
+        return Ok(());
+    };
+    let receiver = Receiver::new(ndi, &ReceiverOptions::new(source))?;
+    analyze(AsyncReceiver::<R>::new(receiver)).await
+}
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
+    use grafton_ndi::Ndi;
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     if arguments.len() != 1 || arguments[0].is_empty() {
         return Err("usage: mixed_media_async \"HOST (Camera)\"".into());
     }
     let ndi = Ndi::new()?;
-    let receiver = Receiver::new(
-        &ndi,
-        &ReceiverOptions::new(Source::new(arguments[0].clone())),
-    )?;
     #[cfg(feature = "tokio")]
     {
         let runtime = ::tokio::runtime::Builder::new_current_thread().build()?;
-        Ok(runtime.block_on(analyze(
-            grafton_ndi::asynchronous::tokio::AsyncReceiver::new(receiver),
-        ))?)
+        Ok(
+            runtime.block_on(discover_and_analyze::<grafton_ndi::asynchronous::Tokio>(
+                &ndi,
+                &arguments[0],
+            ))?,
+        )
     }
     #[cfg(all(feature = "smol", not(feature = "tokio")))]
-    Ok(::smol::block_on(analyze(
-        grafton_ndi::asynchronous::smol::AsyncReceiver::new(receiver),
-    ))?)
+    Ok(::smol::block_on(discover_and_analyze::<
+        grafton_ndi::asynchronous::Smol,
+    >(&ndi, &arguments[0]))?)
 }
 
 #[cfg(not(any(feature = "tokio", feature = "smol")))]

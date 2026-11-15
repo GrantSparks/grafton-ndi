@@ -79,7 +79,7 @@ fn link<M: ReceiverMode>(receiver: &Receiver<M>) -> String {
     format!(
         "the receiver of {:?} reports {:?}{}",
         receiver.connection_target(),
-        receiver.connection_stats(),
+        receiver.connection_stats().unwrap(),
         tcp_table(&receiver.connection_target())
     )
 }
@@ -142,14 +142,12 @@ fn advanced_native_constructors_controls_and_queue() {
         assert!(matches!(
             session.mouse_down(MouseButton::Left),
             Err(Error::NativeOperationFailed {
-                operation: "NDIlib_recv_kvm_send_left_mouse_click"
-            })
+                operation}) if operation.name() == c"NDIlib_recv_kvm_send_left_mouse_click"
         ));
         assert!(matches!(
             session.key_down(0xff0d),
             Err(Error::NativeOperationFailed {
-                operation: "NDIlib_recv_kvm_send_keyboard_press"
-            })
+                operation}) if operation.name() == c"NDIlib_recv_kvm_send_keyboard_press"
         ));
         assert!(matches!(
             session.move_pointer(0.5, 1.5),
@@ -175,7 +173,7 @@ fn advanced_native_constructors_controls_and_queue() {
         sender.quality_plan(h264, false),
         Err(Error::InvalidInput(_))
     ));
-    let router = grafton_ndi::routing::Router::new(
+    let mut router = grafton_ndi::routing::Router::new(
         &ndi,
         &grafton_ndi::routing::RouterOptions::new(format!(
             "grafton-local-{}-router",
@@ -238,7 +236,7 @@ fn advanced_native_constructors_controls_and_queue() {
     {
         let receiver = av.receiver();
         receiver.set_tally(Tally::new(true, false));
-        let _ = receiver.connection_stats();
+        let _ = receiver.connection_stats().unwrap();
         let _ = receiver.ptz().is_supported();
         receiver.request_keyframe().unwrap();
         let _ = receiver.metadata().capture(Duration::ZERO).unwrap();
@@ -709,7 +707,7 @@ const FIRST_TIMECODE: i64 = 1_000_000;
 
 /// The next compressed video frame, which must be the one sent with
 /// `timecode`: nothing else may arrive before it, twice, or out of order.
-fn await_video(receiver: &mut PacketReceiver, timecode: i64) -> CompressedVideoFrame {
+fn await_video(receiver: &mut PacketReceiver, timecode: i64) -> ReceivedVideoPacket {
     await_event(
         receiver,
         &format!("video frame {timecode}"),
@@ -733,7 +731,7 @@ fn await_video(receiver: &mut PacketReceiver, timecode: i64) -> CompressedVideoF
 }
 
 /// As [`await_video`], for audio.
-fn await_audio(receiver: &mut PacketReceiver, timecode: i64) -> CompressedAudioFrame {
+fn await_audio(receiver: &mut PacketReceiver, timecode: i64) -> ReceivedAudioPacket {
     await_event(
         receiver,
         &format!("audio frame {timecode}"),
@@ -929,6 +927,73 @@ enum Submission {
     ScatterAsync,
 }
 
+/// A sender-wide drain releases contiguous and scatter loans on both tiers,
+/// and the same source delivers the recovered storage when it is sent again.
+#[test]
+fn compressed_finish_keeps_the_source_and_returns_frames_that_can_be_sent_again() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("compressed-finish")).unwrap();
+    let source = sender.sender().source().unwrap();
+    let mut program = packet_receiver(&ndi, &source, ReceiverBandwidth::Highest);
+    let mut preview = packet_receiver(&ndi, &source, ReceiverBandwidth::Lowest);
+    for (receiver, tier) in [
+        (&mut program, StreamTier::Program),
+        (&mut preview, StreamTier::Preview),
+    ] {
+        connect(
+            receiver,
+            &format!("the {tier:?} drain receiver"),
+            |timecode| {
+                sender.send_video(&mut keyframe(VideoCodec::H264, tier, timecode));
+            },
+        );
+    }
+    let mut program_frame = keyframe(VideoCodec::H264, StreamTier::Program, FIRST_TIMECODE + 1);
+    let mut preview_frame = ScatterVideoFrame::new(
+        video_format(VideoCodec::H264, StreamTier::Preview),
+        split(
+            &video_bytes(VideoCodec::H264, FIRST_TIMECODE + 2, true),
+            &[44],
+        ),
+    )
+    .unwrap();
+    preview_frame.set_timecode(Timecode::from_ticks(FIRST_TIMECODE + 2));
+    let program_pointer = program_frame.data().as_ptr();
+    let preview_pointer = preview_frame.blocks().next().unwrap().as_ptr();
+    for pass in 0..2 {
+        let program_timecode = FIRST_TIMECODE + 1 + pass * 10;
+        let preview_timecode = FIRST_TIMECODE + 2 + pass * 10;
+        program_frame.set_timecode(Timecode::from_ticks(program_timecode));
+        preview_frame.set_timecode(Timecode::from_ticks(preview_timecode));
+        assert!(sender.send_video_async(program_frame).is_none());
+        assert!(sender
+            .send_scatter_video_async(preview_frame)
+            .unwrap()
+            .is_none());
+        let reclaimed = sender.finish_video_async();
+        let Some(SubmittedVideo::Contiguous(returned_program)) = reclaimed.program else {
+            panic!("the contiguous program frame is recovered");
+        };
+        let Some(SubmittedVideo::Scatter(returned_preview)) = reclaimed.preview else {
+            panic!("the scatter preview frame is recovered");
+        };
+        assert_eq!(returned_program.data().as_ptr(), program_pointer);
+        assert_eq!(
+            returned_preview.blocks().next().unwrap().as_ptr(),
+            preview_pointer
+        );
+        await_video(&mut program, program_timecode);
+        await_video(&mut preview, preview_timecode);
+        assert_eq!(sender.sender().source().unwrap().name(), source.name());
+        program_frame = returned_program;
+        preview_frame = returned_preview;
+    }
+    assert!(sender.close().program.is_none());
+}
+
 /// Every video codec, on both streams, protected and not, arrives exactly as
 /// it was sent, however it was submitted.
 #[test]
@@ -946,9 +1011,7 @@ fn compressed_video_arrives_as_sent_by_every_kind_of_send() {
         (&mut preview, StreamTier::Preview),
     ] {
         connect(receiver, &format!("the {tier:?} receiver"), |timecode| {
-            sender
-                .send_video(&mut keyframe(VideoCodec::H264, tier, timecode))
-                .unwrap();
+            sender.send_video(&mut keyframe(VideoCodec::H264, tier, timecode));
         });
     }
 
@@ -1011,12 +1074,11 @@ fn compressed_video_arrives_as_sent_by_every_kind_of_send() {
                 match submission {
                     Submission::Contiguous => {
                         let mut frame = contiguous();
-                        sender.send_video(&mut frame).unwrap();
+                        sender.send_video(&mut frame);
                         assert_same_packet(frame.data(), &bytes, codec.envelope_codec());
                     }
                     Submission::ContiguousAsync => {
-                        returned +=
-                            usize::from(sender.send_video_async(contiguous()).unwrap().is_some());
+                        returned += usize::from(sender.send_video_async(contiguous()).is_some());
                     }
                     Submission::Scatter => {
                         let mut frame = scatter();
@@ -1134,6 +1196,81 @@ impl AudioCandidate {
     }
 }
 
+/// Queued H.264 sources retain AAC and Opus as compressed audio through the
+/// shared sender, for both contiguous and scatter audio storage.
+#[test]
+fn queued_compressed_sources_deliver_aac_and_opus() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut queue = QueuedSender::new(
+        &ndi,
+        &options("queued-compressed-audio"),
+        QueueOptions::default(),
+    )
+    .unwrap();
+    let mut receiver = packet_receiver(
+        &ndi,
+        &queue.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
+    connect(
+        &mut receiver,
+        "queued compressed audio receiver",
+        |timecode| {
+            queue
+                .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
+                .unwrap();
+            queue.wait_completed(PATIENCE).unwrap().unwrap();
+        },
+    );
+    let mut timecode = FIRST_TIMECODE;
+    for (codec, samples) in [(AudioCodec::Aac, 1024), (AudioCodec::Opus, 960)] {
+        for scatter in [false, true] {
+            timecode += 1;
+            let bytes = audio_bytes(codec, 48_000, 2, timecode);
+            queue
+                .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
+                .unwrap();
+            let (_video, audio) = queue.split();
+            if scatter {
+                let cuts = if codec == AudioCodec::Aac {
+                    vec![44]
+                } else {
+                    vec![1]
+                };
+                let mut frame =
+                    ScatterAudioFrame::new(codec, 48_000, 2, samples, split(&bytes, &cuts))
+                        .unwrap();
+                frame.set_timecode(Timecode::from_ticks(timecode));
+                audio.send_scatter_audio(&mut frame).unwrap();
+            } else {
+                let mut frame =
+                    CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes.clone()).unwrap();
+                frame.set_timecode(Timecode::from_ticks(timecode));
+                audio.send_compressed_audio(&mut frame);
+            }
+            let received = await_audio(&mut receiver, timecode);
+            assert_eq!(
+                (
+                    received.codec(),
+                    received.sample_rate(),
+                    received.num_channels(),
+                    received.num_samples()
+                ),
+                (codec, 48_000, 2, samples)
+            );
+            assert_same_packet(
+                received.data(),
+                &bytes,
+                (codec == AudioCodec::Aac).then_some(EnvelopeCodec::Aac),
+            );
+            queue.wait_completed(PATIENCE).unwrap().unwrap();
+        }
+    }
+}
+
 /// The SDK takes any compressed audio frame and silently discards the ones
 /// it does not accept. Of a grid of frames, sensible and not, every one the
 /// wrapper admits arrives exactly as it was sent, from one buffer and from
@@ -1154,7 +1291,7 @@ fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
         let mut probe =
             CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64]).unwrap();
         probe.set_timecode(Timecode::from_ticks(timecode));
-        sender.send_audio(&mut probe).unwrap();
+        sender.send_audio(&mut probe);
     });
 
     let mut candidates = Vec::new();
@@ -1260,7 +1397,7 @@ fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
                 frame.set_timecode(Timecode::from_ticks(timecode));
                 frame.set_protected(protected);
                 frame.set_metadata(metadata.as_str()).unwrap();
-                sender.send_audio(&mut frame).unwrap();
+                sender.send_audio(&mut frame);
             }
             let received = await_audio(&mut receiver, timecode);
             assert_eq!(
@@ -1304,9 +1441,7 @@ fn every_video_frame_the_wrapper_admits_is_delivered() {
         (&mut preview, StreamTier::Preview),
     ] {
         connect(receiver, &format!("the {tier:?} receiver"), |timecode| {
-            sender
-                .send_video(&mut keyframe(VideoCodec::H264, tier, timecode))
-                .unwrap();
+            sender.send_video(&mut keyframe(VideoCodec::H264, tier, timecode));
         });
     }
 
@@ -1375,7 +1510,7 @@ fn every_video_frame_the_wrapper_admits_is_delivered() {
                 let sent = bytes(timecode);
                 let mut frame = CompressedVideoFrame::new(format, sent.clone()).unwrap();
                 frame.set_timecode(Timecode::from_ticks(timecode));
-                sender.send_video(&mut frame).unwrap();
+                sender.send_video(&mut frame);
                 let received = await_video(receiver, timecode);
                 assert_eq!(received.format(), delivered);
                 assert_same_packet(received.data(), &sent, codec.envelope_codec());
@@ -1422,13 +1557,11 @@ fn a_relay_delivers_every_packet_it_receives() {
         ("the downstream receiver", &mut relay, &mut downstream),
     ] {
         connect(receiver, what, |timecode| {
-            sender
-                .send_video(&mut keyframe(
-                    VideoCodec::H264,
-                    StreamTier::Program,
-                    timecode,
-                ))
-                .unwrap();
+            sender.send_video(&mut keyframe(
+                VideoCodec::H264,
+                StreamTier::Program,
+                timecode,
+            ));
         });
     }
 
@@ -1450,13 +1583,14 @@ fn a_relay_delivers_every_packet_it_receives() {
         let mut frame = CompressedVideoFrame::new(format, bytes.clone()).unwrap();
         frame.set_timecode(Timecode::from_ticks(timecode));
         frame.set_metadata("<relayed/>").unwrap();
-        origin.send_video(&mut frame).unwrap();
+        origin.send_video(&mut frame);
 
-        let mut received = await_video(&mut upstream, timecode);
+        let mut received =
+            CompressedVideoFrame::try_from(await_video(&mut upstream, timecode)).unwrap();
         if index % 2 == 0 {
-            relay.send_video(&mut received).unwrap();
+            relay.send_video(&mut received);
         } else {
-            relay.send_video_async(received).unwrap();
+            relay.send_video_async(received);
         }
         let relayed = await_video(&mut downstream, timecode);
         assert_eq!(relayed.format(), format);
@@ -1478,10 +1612,11 @@ fn a_relay_delivers_every_packet_it_receives() {
                 CompressedAudioFrame::new(codec, sample_rate, channels, samples, bytes.clone())
                     .unwrap();
             frame.set_timecode(Timecode::from_ticks(timecode));
-            origin.send_audio(&mut frame).unwrap();
+            origin.send_audio(&mut frame);
 
-            let mut received = await_audio(&mut upstream, timecode);
-            relay.send_audio(&mut received).unwrap();
+            let mut received =
+                CompressedAudioFrame::try_from(await_audio(&mut upstream, timecode)).unwrap();
+            relay.send_audio(&mut received);
             let relayed = await_audio(&mut downstream, timecode);
             assert_eq!(
                 (
@@ -1513,13 +1648,11 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
         ReceiverBandwidth::Highest,
     );
     connect(&mut receiver, "the receiver", |timecode| {
-        sender
-            .send_video(&mut keyframe(
-                VideoCodec::H264,
-                StreamTier::Program,
-                timecode,
-            ))
-            .unwrap();
+        sender.send_video(&mut keyframe(
+            VideoCodec::H264,
+            StreamTier::Program,
+            timecode,
+        ));
     });
     let format = video_format(VideoCodec::H264, StreamTier::Program);
     let h264 = Some(EnvelopeCodec::H264);
@@ -1532,13 +1665,15 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
     frame.set_timecode(Timecode::from_ticks(timecode));
     frame.set_metadata("<again/>").unwrap();
     for _ in 0..3 {
-        sender.send_video(&mut frame).unwrap();
+        sender.send_video(&mut frame);
         let received = await_video(&mut receiver, timecode);
         assert_same_packet(received.data(), &bytes, h264);
         assert_eq!(received.metadata(), Some("<again/>"));
         assert_same_packet(frame.data(), &bytes, h264);
         assert_eq!(frame.metadata(), Some("<again/>"));
-        frame.validate_for_send().unwrap();
+        ReceivedVideoPacket::from(frame.clone())
+            .validate_for_send()
+            .unwrap();
     }
 
     // One scatter frame, synchronously.
@@ -1565,7 +1700,7 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
     for round in 0..6 {
         let (timecode, bytes, frame) = &mut frames[round % 2];
         let frame = frame.take().expect("the frame came back from the sender");
-        let replaced = sender.send_video_async(frame).unwrap();
+        let replaced = sender.send_video_async(frame);
         assert_same_packet(await_video(&mut receiver, *timecode).data(), bytes, h264);
         match replaced {
             Some(SubmittedVideo::Contiguous(earlier)) => {
@@ -1587,7 +1722,7 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
             CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes.clone()).unwrap();
         frame.set_timecode(Timecode::from_ticks(timecode));
         for _ in 0..3 {
-            sender.send_audio(&mut frame).unwrap();
+            sender.send_audio(&mut frame);
             assert_same_packet(
                 await_audio(&mut receiver, timecode).data(),
                 &bytes,
@@ -1815,7 +1950,7 @@ fn advanced_senders_lend_audio_and_video_to_separate_threads() {
     );
     connect(&mut receiver, "split compressed", |timecode| {
         let mut frame = keyframe(VideoCodec::H264, StreamTier::Program, timecode);
-        sender.send_video(&mut frame).unwrap();
+        sender.send_video(&mut frame);
     });
     {
         let (mut video, mut audio) = sender.split();
@@ -1827,7 +1962,7 @@ fn advanced_senders_lend_audio_and_video_to_separate_threads() {
                         StreamTier::Program,
                         FIRST_TIMECODE + number,
                     );
-                    video.send_video(&mut frame).unwrap();
+                    video.send_video(&mut frame);
                 }
             });
             scope.spawn(move || {
@@ -1835,7 +1970,7 @@ fn advanced_senders_lend_audio_and_video_to_separate_threads() {
                     let mut frame =
                         CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64])
                             .unwrap();
-                    audio.send_audio(&mut frame).unwrap();
+                    audio.send_audio(&mut frame);
                 }
             });
         });
@@ -1949,7 +2084,7 @@ fn share_controls<M: grafton_ndi::ReceiverMode>(receiver: &Receiver<M>) {
             scope.spawn(|| {
                 for _ in 0..50 {
                     assert!(receiver.is_connected());
-                    assert!(receiver.connection_stats().connections() >= 1);
+                    assert!(receiver.connection_stats().unwrap().connections() >= 1);
                     receiver.set_tally(Tally::new(true, false));
                     let _ = receiver.poll_source_name_change(Duration::ZERO).unwrap();
                 }
@@ -2005,13 +2140,11 @@ fn a_packet_receiver_moves_between_threads() {
         });
         let mut timecode = FIRST_TIMECODE;
         while !stop.load(Ordering::Acquire) {
-            sender
-                .send_video(&mut keyframe(
-                    VideoCodec::H264,
-                    StreamTier::Program,
-                    timecode,
-                ))
-                .unwrap();
+            sender.send_video(&mut keyframe(
+                VideoCodec::H264,
+                StreamTier::Program,
+                timecode,
+            ));
             timecode += 1;
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -2331,7 +2464,32 @@ fn synchronized_audio(
         let outcome = match pass {
             Pass::Captured => sync.synchronize(stamped(&video), request),
             Pass::Owned => sync.synchronize(stamped(&video.to_owned()), request),
-            Pass::Nothing => sync.queued_audio(request),
+            Pass::Nothing => {
+                if request.num_samples().is_some() {
+                    // A captured video can arrive before its audio, and the
+                    // preceding synchronization can leave only a short tail.
+                    // Establish enough queued input before testing an exact
+                    // queued read, rather than depending on packet arrival.
+                    drop(sync.queued_audio(AvSyncRequest::automatic()).unwrap());
+                    let received = sync
+                        .receiver()
+                        .connection_stats()
+                        .unwrap()
+                        .audio_frames_received();
+                    while sync
+                        .receiver()
+                        .connection_stats()
+                        .unwrap()
+                        .audio_frames_received()
+                        .saturating_sub(received)
+                        < 2
+                    {
+                        assert!(Instant::now() < deadline, "audio did not reach the queue");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                sync.queued_audio(request)
+            }
         };
         match outcome.unwrap() {
             AvSyncOutcome::Audio {
@@ -2481,6 +2639,120 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
         assert!(metadata.join().unwrap() > 0, "no metadata was captured");
     });
     drop(sync.into_receiver());
+}
+
+/// A stated rate must work for non-stereo sources as well as stereo. The SDK
+/// headers mention channels in the format comparison, while the manual names
+/// only the rate; pin both synchronization entry paths against real peers.
+#[test]
+fn avsync_states_rates_for_non_stereo_sources() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    for (rate, channels, samples) in [(44_100, 1, 1470), (48_000, 4, 1600)] {
+        let sender = Sender::new(
+            &ndi,
+            &SenderOptions::new(common::unique_name("avsync-non-stereo"))
+                .clock_video(true)
+                .clock_audio(false),
+        )
+        .unwrap();
+        let receiver = Receiver::new(
+            &ndi,
+            &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap()),
+        )
+        .unwrap();
+        let sync = AvSync::new(receiver).unwrap();
+        let video = VideoFrame::builder()
+            .resolution(64, 32)
+            .frame_rate(FrameRate::new(30, 1).unwrap())
+            .build()
+            .unwrap();
+        let values: Vec<f32> = (0..channels)
+            .flat_map(|channel| std::iter::repeat_n((channel + 1) as f32 / 8.0, samples as usize))
+            .collect();
+        let audio = AudioFrame::builder()
+            .sample_rate(rate)
+            .num_channels(channels)
+            .num_samples(samples)
+            .data(values)
+            .build()
+            .unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let _stop = StopOnDrop(&stop);
+            scope.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    sender.send_video(&video).unwrap();
+                    sender.send_audio(&audio);
+                }
+            });
+            let requests = [
+                ("automatic", AvSyncRequest::automatic(), Pass::Captured),
+                (
+                    "stated rate and count",
+                    AvSyncRequest::new(Some(rate), Some(samples)).unwrap(),
+                    Pass::Captured,
+                ),
+                (
+                    "count only",
+                    AvSyncRequest::new(None, Some(samples)).unwrap(),
+                    Pass::Captured,
+                ),
+                (
+                    "queued stated rate",
+                    AvSyncRequest::new(Some(rate), Some(480)).unwrap(),
+                    Pass::Nothing,
+                ),
+            ];
+            for (label, request, pass) in requests {
+                let deadline = Instant::now() + PATIENCE;
+                loop {
+                    let returned = synchronized_audio(&sync, request, pass, 1);
+                    let (frame, adjusted) = &returned[0];
+                    assert_eq!(
+                        (frame.sample_rate(), frame.num_channels()),
+                        (rate, channels),
+                        "{label}"
+                    );
+                    if matches!(pass, Pass::Nothing) {
+                        assert_eq!((frame.num_samples(), *adjusted), (480, false));
+                    }
+                    // Initial audio may contain alignment silence. Wait for a
+                    // full source frame, then require every channel's value.
+                    if frame.channels().enumerate().all(|(channel, samples)| {
+                        !samples.is_empty()
+                            && samples
+                                .iter()
+                                .all(|sample| (*sample - (channel + 1) as f32 / 8.0).abs() < 0.001)
+                    }) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "{label} did not preserve {rate} Hz, {channels}-channel samples"
+                    );
+                }
+            }
+            let different_rate = if rate == 48_000 { 44_100 } else { 48_000 };
+            let video = sync
+                .receiver()
+                .video()
+                .capture(PATIENCE)
+                .unwrap()
+                .expect("a frame within the wait");
+            assert!(matches!(
+                sync.synchronize(
+                    stamped(&video),
+                    AvSyncRequest::new(Some(different_rate), Some(samples)).unwrap()
+                )
+                .unwrap(),
+                AvSyncOutcome::FormatChanged { sample_rate, num_channels }
+                    if sample_rate == rate && num_channels == channels
+            ));
+        });
+    }
 }
 
 /// A synchronizer works on threads other than the one that created it: it
@@ -2811,7 +3083,7 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
         )
         .unwrap();
         let mut packet = CompressedVideoFrame::new(format, bytes).unwrap();
-        sender.send_video(&mut packet).unwrap();
+        sender.send_video(&mut packet);
         pts += 3000;
     }) else {
         return;
@@ -2884,7 +3156,7 @@ fn h264_420_decodes_to_the_original_quadrants() {
         )
         .unwrap();
         let mut packet = CompressedVideoFrame::new(format, bytes).unwrap();
-        sender.send_video(&mut packet).unwrap();
+        sender.send_video(&mut packet);
         pts += 3000;
     }) else {
         return;
@@ -2937,7 +3209,7 @@ fn concurrent_keyframe_waiters_observe_the_same_request() {
         PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, bitstream, parameter_sets).unwrap();
     let mut frame = CompressedVideoFrame::new(format, bytes).unwrap();
     connect(&mut receiver, "keyframe observer", |_| {
-        sender.send_video(&mut frame).unwrap();
+        sender.send_video(&mut frame);
     });
 
     for selectors in [
@@ -2951,7 +3223,7 @@ fn concurrent_keyframe_waiters_observe_the_same_request() {
             // before starting the waiters instead of assuming send cleared it.
             let ready_by = Instant::now() + PATIENCE;
             loop {
-                sender.send_video(&mut frame).unwrap();
+                sender.send_video(&mut frame);
                 let received =
                     matches!(receiver.capture(SLICE).unwrap(), Some(PacketItem::Video(_)));
                 let required = sender.sender().keyframe_required(None).unwrap();
@@ -2997,7 +3269,7 @@ fn concurrent_keyframe_waiters_observe_the_same_request() {
                     if changed {
                         // Sending the requested keyframe may clear native demand
                         // before another observer resumes. Its report stays latched.
-                        video.send_video(frame).unwrap();
+                        video.send_video(frame);
                     }
                     changed
                 });
@@ -3517,7 +3789,7 @@ fn borrowed_packet_payload_stays_in_external_allocator_memory() {
             link(receiver.receiver())
         );
         let mut frame = keyframe(VideoCodec::H264, StreamTier::Program, FIRST_TIMECODE);
-        sender.send_video(&mut frame).unwrap();
+        sender.send_video(&mut frame);
         if let Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(frame))) =
             receiver.capture_ref(SLICE).unwrap()
         {
@@ -3541,7 +3813,7 @@ fn borrowed_packet_payload_stays_in_external_allocator_memory() {
         !freed.load(Ordering::Acquire),
         "held reference keeps its allocation alive"
     );
-    receiver.receiver().connection_stats();
+    receiver.receiver().connection_stats().unwrap();
     drop(held);
     let deadline = Instant::now() + PATIENCE;
     while !freed.load(Ordering::Acquire) {
@@ -3579,7 +3851,11 @@ fn borrowed_packet_capture_decodes_formats_outside_its_preset() {
         return;
     }
     let _turn = sockets();
-    let mut sender = CompressedSender::new(&ndi, &options("borrowed-decoded-fallback")).unwrap();
+    let sender = CompressedSender::new(
+        &ndi,
+        &options("borrowed-decoded-fallback").clock_video(true),
+    )
+    .unwrap();
     let receiver = PacketReceiver::new(
         &ndi,
         &ReceiverOptions::new(loopback(&ndi, &sender.sender().source().unwrap())),
@@ -3591,48 +3867,74 @@ fn borrowed_packet_capture_decodes_formats_outside_its_preset() {
     let format = VideoPacketFormat::new(VideoCodec::H264, 64, 64)
         .unwrap()
         .with_frame_rate(FrameRate::new(30, 1).unwrap());
-    let mut pts = 0;
-    let deadline = Instant::now() + PATIENCE;
-    let mut placeholders = 0;
-    loop {
-        let bytes =
-            PacketEnvelope::encode(EnvelopeCodec::H264, pts, pts, true, bitstream, config).unwrap();
-        let mut packet = CompressedVideoFrame::new(format, bytes).unwrap();
-        sender.send_video(&mut packet).unwrap();
-        pts += 3000;
-        match receiver.capture_ref(SLICE).unwrap() {
-            Some(PacketItemRef::Video(ReceivedVideoRef::Decoded(frame))) => {
-                if common::is_hx_placeholder((64, 64), (frame.width(), frame.height())) {
-                    placeholders += 1;
-                } else {
-                    assert_eq!((frame.width(), frame.height()), (64, 64));
-                    assert!(frame
-                        .planes()
-                        .flat_map(|plane| plane.rows())
-                        .flatten()
-                        .any(|&byte| byte != 0));
-                    assert_eq!(frame.to_owned().width(), 64);
-                    return;
-                }
-            }
-            Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(_))) => {
-                panic!("preset must decode H.264")
-            }
-            _ => {}
-        }
-        if Instant::now() >= deadline {
-            assert!(
-                placeholders > 0,
-                "no fallback video arrived: {}",
-                link(receiver.receiver())
-            );
-            common::skip(
-                H264Decoder,
-                "packet receiver delivered only the SDK decoder placeholder",
-            );
-            return;
+    // Decoding runs asynchronously. Keep a correctly paced source feeding it
+    // while capture waits, rather than making a declared 30fps source depend
+    // on 100ms receive timeouts or bursts of status/metadata notifications.
+    let stop = AtomicBool::new(false);
+    let submitted = AtomicUsize::new(0);
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
         }
     }
+    std::thread::scope(|scope| {
+        // This guard signals even when capture or an assertion unwinds, so
+        // the scope never waits for a producer whose stop flag was forgotten.
+        let _stop_on_exit = StopOnDrop(&stop);
+        scope.spawn(|| {
+            let mut sender = sender;
+            let mut pts = 0;
+            while !stop.load(Ordering::Acquire) {
+                let bytes =
+                    PacketEnvelope::encode(EnvelopeCodec::H264, pts, pts, true, bitstream, config)
+                        .unwrap();
+                let mut packet = CompressedVideoFrame::new(format, bytes).unwrap();
+                sender.send_video(&mut packet);
+                submitted.fetch_add(1, Ordering::Release);
+                pts += 3000;
+            }
+        });
+        let deadline = Instant::now() + PATIENCE;
+        let mut placeholders = 0;
+        let mut other_items = 0;
+        loop {
+            match receiver.capture_ref(SLICE).unwrap() {
+                Some(PacketItemRef::Video(ReceivedVideoRef::Decoded(frame))) => {
+                    if common::is_hx_placeholder((64, 64), (frame.width(), frame.height())) {
+                        placeholders += 1;
+                    } else {
+                        assert_eq!((frame.width(), frame.height()), (64, 64));
+                        assert!(frame
+                            .planes()
+                            .flat_map(|plane| plane.rows())
+                            .flatten()
+                            .any(|&byte| byte != 0));
+                        assert_eq!(frame.to_owned().width(), 64);
+                        return;
+                    }
+                }
+                Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(_))) => {
+                    panic!("preset must decode H.264")
+                }
+                Some(_) => other_items += 1,
+                None => {}
+            }
+            if Instant::now() >= deadline {
+                assert!(
+                    placeholders > 0,
+                    "no fallback video arrived after {} submitted frames and {other_items} other items: {}",
+                    submitted.load(Ordering::Acquire),
+                    link(receiver.receiver())
+                );
+                common::skip(
+                    H264Decoder,
+                    "packet receiver delivered only the SDK decoder placeholder",
+                );
+                return;
+            }
+        }
+    });
 }
 
 /// AV-sync loans keep separate native buffers across consecutive requests.
@@ -3743,4 +4045,204 @@ fn avsync_borrows_two_results_and_releases_them_out_of_order() {
         assert_eq!(first.channel_data(0), first_samples.channel_data(0));
         drop(first);
     });
+}
+
+#[test]
+fn router_connection_metadata_survives_the_registered_input() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let sender = Sender::new(&ndi, &options("router-metadata-source")).unwrap();
+    let mut router = grafton_ndi::routing::Router::new(
+        &ndi,
+        &grafton_ndi::routing::RouterOptions::new(common::unique_name("router metadata")),
+    )
+    .unwrap();
+    router
+        .change(&loopback(&ndi, &sender.source().unwrap()))
+        .unwrap();
+    let receiver = Receiver::new(
+        &ndi,
+        &ReceiverOptions::new(loopback(&ndi, &router.source().unwrap())),
+    )
+    .unwrap();
+    let frame = video();
+    // Routed media bypasses the router. Require the router itself to report
+    // a connected receiver as well as observing video: its metadata operation
+    // promises immediate delivery to receivers already connected to the router.
+    // Drain every slot throughout startup and delivery; retained-pointer
+    // fixtures separately cover reads on later connections, clear and destroy.
+    let connected_deadline = Instant::now() + PATIENCE;
+    let mut received_video = false;
+    loop {
+        sender.send_video(&frame).unwrap();
+        received_video |= matches!(
+            receiver.capture_any_ref(SLICE).unwrap(),
+            Some(grafton_ndi::ReceiverItemRef::Video(_))
+        );
+        let router_connections = router.connection_count(Duration::ZERO).unwrap();
+        if received_video && router_connections > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < connected_deadline,
+            "router not ready before registration: {router_connections} router connections, \
+             received video {received_video}; {}",
+            link(&receiver)
+        );
+    }
+    let text = "<router-registration/>";
+    router
+        .add_connection_metadata(
+            &MetadataFrame::new(text)
+                .unwrap()
+                .with_timecode(Timecode::from_ticks(22)),
+        )
+        .unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    let mut observed_metadata = Vec::new();
+    loop {
+        sender.send_video(&frame).unwrap();
+        if let Some(grafton_ndi::ReceiverItemRef::Metadata(metadata)) =
+            receiver.capture_any_ref(SLICE).unwrap()
+        {
+            if metadata.data() == text {
+                break;
+            }
+            if observed_metadata.len() < 4 {
+                observed_metadata.push((
+                    metadata.timecode(),
+                    metadata.data().len(),
+                    metadata.data().chars().take(256).collect::<String>(),
+                ));
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "router connection metadata was not delivered; router connections {:?}; \
+             observed metadata (timecode, full byte length, first 256 chars) {observed_metadata:?}; {}",
+            router.connection_count(Duration::ZERO),
+            link(&receiver)
+        );
+    }
+    router.clear_connection_metadata().unwrap();
+}
+
+/// Preallocated 1080p blocks are released exactly once after native capture
+/// and receiver teardown, even when callbacks run on other SDK threads.
+#[test]
+fn pool_backed_receive_releases_every_1080p_block() {
+    use std::{
+        alloc::{alloc_zeroed, dealloc, Layout},
+        ptr::NonNull,
+    };
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    struct Pool {
+        blocks: Vec<PoolBlock>,
+        free: Mutex<Vec<usize>>,
+        layout: Layout,
+        loans: AtomicUsize,
+        releases: AtomicUsize,
+    }
+    // SAFETY: each aligned zeroed allocation stays owned by the pool Arc.
+    // Removing a slot grants exclusive SDK access until release returns it.
+    unsafe impl ExternalPool for Pool {
+        unsafe fn release(&self, block: PoolBlock) {
+            assert_eq!(self.blocks[block.tag()], block);
+            self.releases.fetch_add(1, Ordering::AcqRel);
+            self.free.lock().unwrap().push(block.tag());
+        }
+    }
+    impl Drop for Pool {
+        fn drop(&mut self) {
+            assert_eq!(self.free.get_mut().unwrap().len(), self.blocks.len());
+            for block in &self.blocks {
+                // SAFETY: the last pool Arc is gone only after every SDK loan
+                // has released; each allocation is reclaimed once with its Layout.
+                unsafe { dealloc(block.pointer().as_ptr(), self.layout) };
+            }
+        }
+    }
+    let layout = Layout::from_size_align(1920 * 1080 * 2, 64).unwrap();
+    let blocks = (0..16)
+        .map(|tag| {
+            // SAFETY: the positive frame extent and 64-byte alignment are checked.
+            let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).expect("pool allocation");
+            PoolBlock::new(pointer, layout.size(), tag)
+        })
+        .collect();
+    let pool = Arc::new(Pool {
+        blocks,
+        free: Mutex::new((0..16).collect()),
+        layout,
+        loans: AtomicUsize::new(0),
+        releases: AtomicUsize::new(0),
+    });
+    let sender = Sender::new(&ndi, &options("pool-allocation")).unwrap();
+    let receiver = Receiver::new(
+        &ndi,
+        &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap())
+            .color_format(ReceiverColorFormat::UyvyBgra),
+    )
+    .unwrap();
+    let service =
+        AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default()).unwrap();
+    let mut receiver = service.attach(receiver).unwrap();
+    let policy_pool = pool.clone();
+    receiver
+        .set_video_allocator(move |request: AllocationRequest| {
+            let tag = policy_pool
+                .free
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or(Error::InvalidInput(
+                    grafton_ndi::InputDefect::AllocatorLeaseStorage,
+                ))?;
+            let block = policy_pool.blocks[tag];
+            // SAFETY: this slot was removed exclusively from the free list. The
+            // pool owns its initialized aligned memory until this loan is released.
+            match unsafe { AllocationBuffer::from_pool(request, &policy_pool, block) } {
+                Ok(buffer) => {
+                    policy_pool.loans.fetch_add(1, Ordering::AcqRel);
+                    Ok(buffer)
+                }
+                Err(rejected) => {
+                    policy_pool.free.lock().unwrap().push(tag);
+                    Err(rejected.into_error())
+                }
+            }
+        })
+        .unwrap();
+    let frame = VideoFrame::builder()
+        .resolution(1920, 1080)
+        .pixel_format(grafton_ndi::PixelFormat::Uyvy)
+        .build()
+        .unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no pool-backed native 1080p frame"
+        );
+        sender.send_video(&frame).unwrap();
+        if let Some(received) = receiver.receiver().video().capture(SLICE).unwrap() {
+            assert_eq!((received.width(), received.height()), (1920, 1080));
+            if pool.loans.load(Ordering::Acquire) > 0 {
+                break;
+            }
+        }
+    }
+    drop(receiver);
+    drop(sender);
+    assert!(pool.loans.load(Ordering::Acquire) > 0);
+    assert_eq!(
+        pool.loans.load(Ordering::Acquire),
+        pool.releases.load(Ordering::Acquire)
+    );
+    assert_eq!(pool.free.lock().unwrap().len(), pool.blocks.len());
 }

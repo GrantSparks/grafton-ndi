@@ -21,12 +21,12 @@ use super::{
     bindings::*,
     selection::Selection,
     table::{native_table, Resolver},
-    Api,
+    Runtime,
 };
 #[cfg(ndi_link_static)]
 use crate::LoadFailure;
 use crate::{
-    capabilities::{CapabilityRefusal, CapabilityStatus, RuntimeInfo},
+    capabilities::{CapabilityRefusal, CapabilityStatus},
     file::FileFamily,
     Error, LibraryKind, LoadRefusal, Result, SelectionFailure,
 };
@@ -186,7 +186,7 @@ static SELECTED: Selection<FileRuntime> = Selection::new(LibraryKind::File);
 /// Select the File library that accompanies the selected core runtime, or
 /// confirm that the one already pinned satisfies a request for `library_path`.
 ///
-/// `core` and `api` describe the selected core runtime.
+/// `runtime` owns the selected core implementation and its lifecycle.
 ///
 /// # Errors
 ///
@@ -195,12 +195,11 @@ static SELECTED: Selection<FileRuntime> = Selection::new(LibraryKind::File);
 /// pinned or the selected core runtime is one no File library can accompany,
 /// [`Error::InvalidInput`] for a relative `library_path`.
 pub(crate) fn select_file(
-    core: &RuntimeInfo,
-    api: &Api,
+    runtime: &Runtime,
     library_path: Option<&Path>,
 ) -> Result<&'static FileRuntime> {
     super::loader::validate_library_path(library_path)?;
-    let file = SELECTED.get_or_try_load(|| FileRuntime::load(core, api, library_path))?;
+    let file = SELECTED.get_or_try_load(|| FileRuntime::load(runtime, library_path))?;
     file.accepts(library_path)?;
     Ok(file)
 }
@@ -264,7 +263,8 @@ impl FileRuntime {
         Some(&self.path)
     }
 
-    fn load(core: &RuntimeInfo, api: &Api, explicit: Option<&Path>) -> Result<Self> {
+    fn load(runtime: &Runtime, explicit: Option<&Path>) -> Result<Self> {
+        let core = &runtime.info;
         // The 6.4.0.2 POSIX File library, including Standard SDK copies,
         // imports the core entry points from the Advanced runtime by name.
         // Opened beside a Standard core it would make
@@ -283,23 +283,23 @@ impl FileRuntime {
             names: &[Self::LIBRARY_NAME],
             anchor: Self::ANCHOR,
             #[cfg(all(unix, not(target_vendor = "apple")))]
-            selected_core: Some(api.core.NDIlib_version as *const std::ffi::c_void),
+            selected_core: Some(runtime.gates.api().core.NDIlib_version as *const std::ffi::c_void),
             description: "NDI File library",
         }
-        .open(|module| Self::describe(module, api))
+        .open(|module| Self::describe(module, runtime))
     }
 
     /// Resolve the tables of an opened File library.
     ///
     /// The error is the reason this library cannot be used.
-    fn describe(module: Module, api: &Api) -> std::result::Result<Self, LoadRefusal> {
+    fn describe(module: Module, runtime: &Runtime) -> std::result::Result<Self, LoadRefusal> {
         // A lookup through the library's handle shows which module the platform
         // loader bound its core imports to. That must be the selected core: a
         // second copy of the runtime would not share its initialization. The
         // Windows File library imports and exports no core entry point, so
         // there the lookup finds nothing and there is no binding to check.
         if let Some(bound) = module.binding(Self::CORE_ENTRY)? {
-            if bound.as_ptr() != api.core.NDIlib_initialize as *mut std::ffi::c_void {
+            if bound.as_ptr() != runtime.lifecycle.initialize_address().cast_mut() {
                 return Err(LoadRefusal::BoundToAnotherRuntime);
             }
         }
@@ -322,7 +322,7 @@ impl FileRuntime {
         None
     }
 
-    fn load(_core: &RuntimeInfo, _api: &Api, explicit: Option<&Path>) -> Result<Self> {
+    fn load(_runtime: &Runtime, explicit: Option<&Path>) -> Result<Self> {
         Self::reject_path(explicit)?;
         let families = Families::load(&Linked).map_err(|reason| {
             Error::RuntimeLoadFailed(LoadFailure::linked(

@@ -145,7 +145,10 @@ fn test_video_frame_zero_size_returns_error() {
         assert!(result.is_err());
         match result {
             Err(Error::InvalidFrame(msg)) => {
-                assert!(matches!(msg, crate::FrameDefect::VideoSdkStride(_)));
+                assert!(matches!(
+                    msg,
+                    crate::FrameDefect::Layout(crate::LayoutDefect::VideoSdkStride(_))
+                ));
             }
             _ => panic!("Expected InvalidFrame error"),
         }
@@ -625,8 +628,11 @@ fn test_tokio_async_receiver_methods_exist() {
 
             // Liveness / recovery primitives (Issue #997).
             let _: bool = async_receiver.is_connected();
-            let _stats = async_receiver.connection_stats();
-            let _: u64 = async_receiver.connection_stats().video_frames_received();
+            let _stats = async_receiver.connection_stats().unwrap();
+            let _: u64 = async_receiver
+                .connection_stats()
+                .unwrap()
+                .video_frames_received();
             let _: crate::Result<()> = async_receiver.reconnect().await;
         }
     };
@@ -701,8 +707,11 @@ fn test_smol_async_receiver_methods_exist() {
 
             // Liveness / recovery primitives (Issue #997).
             let _: bool = async_receiver.is_connected();
-            let _stats = async_receiver.connection_stats();
-            let _: u64 = async_receiver.connection_stats().video_frames_received();
+            let _stats = async_receiver.connection_stats().unwrap();
+            let _: u64 = async_receiver
+                .connection_stats()
+                .unwrap()
+                .video_frames_received();
             let _: crate::Result<()> = async_receiver.reconnect().await;
         }
     };

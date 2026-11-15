@@ -23,7 +23,7 @@ use crate::{
     change_feed::ChangeFeed,
     frames::copy_sdk_string,
     sys::{self, bindings::*},
-    timeout::Deadline,
+    timeout::{Deadline, NeverStop, Stop, POLL_INTERVAL},
     to_ms_checked, Error, Ndi, ResourceKind, Result,
 };
 
@@ -323,9 +323,9 @@ pub struct SourceWatch<'finder> {
 impl SourceWatch<'_> {
     /// Copy the currently known sources and record the generation before
     /// copying, preserving any report that arrives during the snapshot.
+    /// A failed snapshot leaves the cursor unchanged.
     pub fn current_sources(&mut self) -> Result<Vec<Source>> {
-        self.observed.set(self.finder.changes.generation());
-        self.finder.current_sources()
+        self.snapshot(Finder::current_sources, |_| true)
     }
 
     /// Wait for a report newer than this consumer's last snapshot or wait.
@@ -339,18 +339,39 @@ impl SourceWatch<'_> {
     ///
     /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
     pub fn wait_for_change(&mut self, timeout: Duration) -> Result<bool> {
-        Ok(self.wait_until(Deadline::after(timeout)?))
+        Ok(self.wait_until(Deadline::after(timeout)?, NeverStop))
     }
 
-    fn current_sources_until(&mut self, deadline: Deadline) -> Result<Option<Vec<Source>>> {
-        self.observed.set(self.finder.changes.generation());
-        self.finder.current_sources_until(deadline)
+    fn current_sources_until(
+        &mut self,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Option<Vec<Source>>> {
+        self.snapshot(
+            |finder| finder.current_sources_until(deadline, stop),
+            Option::is_some,
+        )
     }
 
-    fn wait_until(&mut self, deadline: Deadline) -> bool {
+    // Capture the generation before copying, but acknowledge it only when the
+    // caller receives a snapshot. Reports during copying remain outstanding.
+    fn snapshot<T>(
+        &mut self,
+        snapshot: impl FnOnce(&Finder) -> Result<T>,
+        completed: impl FnOnce(&T) -> bool,
+    ) -> Result<T> {
+        let observed = self.finder.changes.generation();
+        let value = snapshot(self.finder)?;
+        if completed(&value) {
+            self.observed.set(observed);
+        }
+        Ok(value)
+    }
+
+    fn wait_until(&mut self, deadline: Deadline, stop: impl Stop) -> bool {
         if self
             .finder
-            .wait_for_sources_since(self.observed.get(), deadline)
+            .wait_for_sources_since(self.observed.get(), deadline, stop)
         {
             self.observed.set(self.finder.changes.generation());
             true
@@ -447,16 +468,14 @@ impl Finder {
             Self::create(
                 ndi,
                 options,
-                "NDIlib_find_create_v2",
                 #[cfg(feature = "advanced")]
                 None,
-                |core, raw| core.NDIlib_find_create_v2(raw),
+                |core, raw| core.named().NDIlib_find_create_v2(raw),
             )
         }
     }
 
-    /// The one creation path: create a finder through `create`, the entry
-    /// point `operation`, which is handed the core table and the native
+    /// The one creation path: create a finder through `create`, which is handed the core table and the native
     /// settings for `settings`, and keep `config` for as long as the finder
     /// lives.
     ///
@@ -467,9 +486,11 @@ impl Finder {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         settings: &FinderOptions,
-        operation: &'static str,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
-        create: impl FnOnce(&'static sys::Core, &NDIlib_find_create_t) -> NDIlib_find_instance_t,
+        create: impl FnOnce(
+            &'static sys::Core,
+            &NDIlib_find_create_t,
+        ) -> sys::table::Called<NDIlib_find_instance_t>,
     ) -> Result<Self> {
         let groups = settings.groups.as_deref().map(CString::new).transpose()?;
         let extra_ips = settings
@@ -484,10 +505,9 @@ impl Finder {
                 p_groups: groups.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
                 p_extra_ips: extra_ips.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
             },
-        );
-        if instance.is_null() {
-            return Err(Error::NativeOperationFailed { operation });
-        }
+        )
+        .created()?
+        .as_ptr();
         let finder = Self {
             instance: FindInstance(instance),
             sources_lock: parking_lot::Mutex::new(FindInstance(instance)),
@@ -509,17 +529,68 @@ impl Finder {
     /// The guard carries the handle it protects, so fetching cannot pair a
     /// different finder's instance with this lock.
     pub(crate) fn snapshot<S: FinderSnapshot>(&self, snapshot: &S) -> Result<Vec<S::Item>> {
-        self.lock_snapshots(None)
+        self.lock_snapshots(None, NeverStop)
             .expect("an unbounded snapshot lock acquisition succeeds")
             .snapshot(snapshot)
     }
 
-    fn lock_snapshots(&self, deadline: Option<Deadline>) -> Option<SnapshotGuard<'_>> {
-        let instance = match deadline {
-            Some(deadline) => self.sources_lock.try_lock_until(deadline.end())?,
-            None => self.sources_lock.lock(),
+    fn lock_snapshots<'finder, S: Stop>(
+        &'finder self,
+        deadline: Option<Deadline>,
+        stop: S,
+    ) -> Option<SnapshotGuard<'finder>> {
+        self.lock_snapshots_with(deadline, stop, |remaining| {
+            self.sources_lock.try_lock_for(remaining)
+        })
+    }
+
+    // The acquisition is injectable so cancellation can be tested exactly
+    // when a contended lock becomes available, without scheduler timing.
+    fn lock_snapshots_with<'finder, S: Stop>(
+        &'finder self,
+        deadline: Option<Deadline>,
+        stop: S,
+        mut acquire: impl FnMut(Duration) -> Option<parking_lot::MutexGuard<'finder, FindInstance>>,
+    ) -> Option<SnapshotGuard<'finder>> {
+        let instance = if S::CAN_STOP {
+            loop {
+                if stop.is_stopped() {
+                    return None;
+                }
+                let remaining =
+                    deadline.map_or(POLL_INTERVAL, |end| end.remaining().min(POLL_INTERVAL));
+                if let Some(instance) = acquire(remaining) {
+                    // Cancellation may arrive while the lock is waiting. Do
+                    // not start a new native snapshot after that wait succeeds.
+                    if stop.is_stopped() {
+                        return None;
+                    }
+                    break instance;
+                }
+                if deadline.is_some_and(Deadline::is_expired) {
+                    return None;
+                }
+            }
+        } else {
+            match deadline {
+                Some(deadline) => self.sources_lock.try_lock_until(deadline.end())?,
+                None => self.sources_lock.lock(),
+            }
         };
         Some(SnapshotGuard { instance })
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn generation(&self) -> u64 {
+        self.changes.generation()
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn current_sources_stoppable(&self, stop: impl Stop) -> Result<Vec<Source>> {
+        let guard = self
+            .lock_snapshots(None, stop)
+            .ok_or(Error::SpawnFailed(crate::SpawnFailure::TaskCancelled))?;
+        guard.snapshot(&self._ndi.api().core)
     }
 
     /// The runtime this finder was created through.
@@ -542,10 +613,15 @@ impl Finder {
     }
 
     /// Share one native report with every observer of the earlier generation.
-    fn wait_for_sources_since(&self, generation: u64, deadline: Deadline) -> bool {
+    pub(crate) fn wait_for_sources_since(
+        &self,
+        generation: u64,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> bool {
         // SAFETY: the finder instance is live for this borrow.
         self.changes
-            .wait_since(generation, deadline, |timeout_ms| unsafe {
+            .wait_since(generation, deadline, stop, |timeout_ms| unsafe {
                 self._ndi
                     .api()
                     .core
@@ -593,8 +669,12 @@ impl Finder {
     }
 
     /// The lookup's next snapshot, or none when contention exhausts its budget.
-    fn current_sources_until(&self, deadline: Deadline) -> Result<Option<Vec<Source>>> {
-        let Some(guard) = self.lock_snapshots(Some(deadline)) else {
+    fn current_sources_until(
+        &self,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Option<Vec<Source>>> {
+        let Some(guard) = self.lock_snapshots(Some(deadline), stop) else {
             return Ok(None);
         };
         guard.snapshot(&self._ndi.api().core).map(Some)
@@ -615,15 +695,16 @@ impl Finder {
     /// value.
     fn poll_until_deadline<T>(
         &self,
-        timeout: Duration,
+        deadline: Deadline,
+        stop: impl Stop,
         mut accept: impl FnMut(Vec<Source>) -> Result<Option<T>>,
     ) -> Result<Option<T>> {
-        // Validate up front so an over-long timeout is rejected even when the
-        // first snapshot already satisfies `accept`.
-        let deadline = Deadline::after(timeout)?;
         let mut watch = self.watch();
         loop {
-            let Some(sources) = watch.current_sources_until(deadline)? else {
+            if stop.is_stopped() {
+                return Ok(None);
+            }
+            let Some(sources) = watch.current_sources_until(deadline, stop)? else {
                 return Ok(None);
             };
             if let Some(selected) = accept(sources)? {
@@ -635,7 +716,7 @@ impl Finder {
             // Block until the source list changes or the window ends; either
             // way the next iteration re-snapshots. The wait is rounded up, so
             // the last one lasts until the deadline rather than polling.
-            watch.wait_until(deadline);
+            watch.wait_until(deadline, stop);
         }
     }
 
@@ -666,9 +747,18 @@ impl Finder {
     pub fn find_source(
         &self,
         timeout: Duration,
+        select: impl FnMut(&Source) -> bool,
+    ) -> Result<Option<Source>> {
+        self.find_source_until(Deadline::after(timeout)?, NeverStop, select)
+    }
+
+    pub(crate) fn find_source_until(
+        &self,
+        deadline: Deadline,
+        stop: impl Stop,
         mut select: impl FnMut(&Source) -> bool,
     ) -> Result<Option<Source>> {
-        self.poll_until_deadline(timeout, |sources| {
+        self.poll_until_deadline(deadline, stop, |sources| {
             Ok(sources.into_iter().find(|source| select(source)))
         })
     }
@@ -683,9 +773,7 @@ impl Finder {
     /// [`Error::InvalidInput`] before inspecting a snapshot.
     pub fn find_source_by_name(&self, name: &str, timeout: Duration) -> Result<Option<Source>> {
         to_ms_checked(timeout)?;
-        if name.is_empty() || name.contains('\0') {
-            return Err(Error::InvalidInput(crate::InputDefect::InvalidSourceName));
-        }
+        validate_source_name(name)?;
         self.find_source(timeout, |source| source.name() == name)
     }
 
@@ -744,11 +832,19 @@ impl Finder {
     /// # }
     /// ```
     pub fn find_sources(&self, timeout: Duration) -> Result<Vec<Source>> {
+        self.find_sources_until(Deadline::after(timeout)?, NeverStop)
+    }
+
+    pub(crate) fn find_sources_until(
+        &self,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Vec<Source>> {
         // Preserve first-observed order and deduplicate by complete descriptor.
         let mut seen = HashSet::new();
         let mut discovered = Vec::new();
         let mut retained_bytes = 0;
-        self.poll_until_deadline(timeout, |sources| {
+        self.poll_until_deadline(deadline, stop, |sources| {
             accumulate_sources(&mut discovered, &mut seen, &mut retained_bytes, sources)?;
             Ok(None::<()>)
         })?;
@@ -767,6 +863,21 @@ const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Finder>();
 };
+
+pub(crate) fn validate_source_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('\0') {
+        Err(Error::InvalidInput(crate::InputDefect::InvalidSourceName))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+pub(crate) fn validate_host_query(host: &str) -> Result<()> {
+    HostQuery::parse(host)
+        .map(|_| ())
+        .ok_or(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))
+}
 
 fn accumulate_sources(
     discovered: &mut Vec<Source>,
@@ -970,8 +1081,8 @@ impl HostKeyBuffer {
             .expect("ASCII lowercase preserves a host key's UTF-8")
     }
 
-    fn into_owned(self) -> HostKey {
-        HostKey(self.as_str().to_owned())
+    fn into_owned(self) -> Result<HostKey> {
+        budget::copy_string(self.as_str()).map(HostKey)
     }
 }
 
@@ -1242,7 +1353,7 @@ impl Source {
             .map(|authority| authority.host)
     }
 
-    /// Copy a source descriptor that the SDK function `operation` returned
+    /// Copy a source descriptor that the SDK call `source` returned
     /// into owned strings after null checks, replacing bytes that are not
     /// UTF-8.
     ///
@@ -1251,21 +1362,21 @@ impl Source {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NativeOperationFailed`] naming `operation` when the
+    /// Returns [`Error::NativeOperationFailed`] naming the call's function when the
     /// descriptor is null, or names neither a source nor an address, and
     /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
     /// the 4 MiB one SDK string may be.
     ///
     /// # Safety
     ///
-    /// A non-null `source_ptr` must point to a live `NDIlib_source_t`. Its
+    /// The non-null pointer in `source` must point to a live `NDIlib_source_t`. Its
     /// non-null string pointers must remain readable through their NUL
     /// terminators, or for 4 MiB, until copying finishes.
     pub(crate) unsafe fn try_from_raw(
-        source_ptr: *const NDIlib_source_t,
-        operation: &'static str,
+        source: sys::table::Called<*const NDIlib_source_t>,
     ) -> Result<Self> {
-        let failed = || Error::NativeOperationFailed { operation };
+        let failed = || source.failed();
+        let source_ptr = *source.value();
         if source_ptr.is_null() {
             return Err(failed());
         }
@@ -1278,7 +1389,7 @@ impl Source {
         // pointers to this strict policy, which reports malformed SDK text.
         unsafe {
             decode_source(name, address, |pointer| {
-                copy_sdk_string(pointer, operation).map(Some)
+                copy_sdk_string(source.map(|_| pointer)).map(Some)
             })
         }?
         .ok_or_else(failed)
@@ -1341,7 +1452,8 @@ impl Display for Source {
 ///
 /// Entries remain until [`Self::invalidate`] or [`Self::clear`]; they can contain
 /// offline endpoints and omit feeds announced after the original window. Empty
-/// results are not cached. The accepted grammar is [`Source::matches_host`]'s.
+/// results are not cached. Results that cannot be stored are returned uncached.
+/// The accepted grammar is [`Source::matches_host`]'s.
 /// Equivalent hostname or machine-name ASCII case/final-dot and numeric IP
 /// spellings share an entry. Other spellings, including DNS aliases, remain
 /// distinct identities.
@@ -1457,20 +1569,48 @@ impl SourceCache {
     ///
     /// [`Error::InvalidInput`] for a query outside [`Source::matches_host`]'s
     /// grammar or a timeout above [`crate::MAX_TIMEOUT`], even on a cache hit;
-    /// discovery/resource errors propagate without filling an entry. IP hints must already be configured
-    /// on the finder; this method does not change its discovery scope.
+    /// discovery/resource errors propagate without filling an entry. A completed
+    /// result the cache cannot store is returned uncached. IP hints must already
+    /// be configured on the finder; this method does not change its scope.
     pub fn sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
         self.entries.sources_by_host_with(host, timeout, |query| {
-            let mut seen = HashSet::new();
-            let mut discovered = Vec::new();
-            let mut retained_bytes = 0;
-            self.finder().poll_until_deadline(timeout, |mut sources| {
+            self.discover_host_until(query, Deadline::after(timeout)?, NeverStop)
+        })
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn sources_by_host_until(
+        &self,
+        host: &str,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Vec<Source>> {
+        self.entries
+            .sources_by_host_with(host, deadline.remaining(), |query| {
+                self.discover_host_until(query, deadline, stop)
+            })
+    }
+
+    fn discover_host_until(
+        &self,
+        query: HostQuery<'_>,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Vec<Source>> {
+        let mut seen = HashSet::new();
+        let mut discovered = Vec::new();
+        let mut retained_bytes = 0;
+        self.finder()
+            .poll_until_deadline(deadline, stop, |mut sources| {
                 sources.retain(|source| source.matches_query(query));
                 accumulate_sources(&mut discovered, &mut seen, &mut retained_bytes, sources)?;
                 Ok(None::<()>)
             })?;
-            Ok(discovered)
-        })
+        if stop.is_stopped() {
+            // An abandoned miss has not observed the full cache window.
+            return Err(Error::SpawnFailed(crate::SpawnFailure::TaskCancelled));
+        }
+        Ok(discovered)
     }
 
     /// Remove a host's complete result set and suppress pending fills.
@@ -1558,23 +1698,31 @@ impl CachedSources {
             // The bounded, fallible deep copy happens outside the mutex.
             // Publication must still recheck both generation and key: another
             // discovery or invalidation may have completed during this copy.
-            let snapshot = Arc::new(copy(&sources)?);
-            let mut cache = self
-                .cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if generation.is_some()
-                && cache.generation == generation
-                && !cache.entries.contains_key(key.as_str())
-            {
-                cache
-                    .entries
-                    .try_reserve(1)
-                    .map_err(|_| budget::allocation_failed())?;
-                cache.entries.insert(key.into_owned(), snapshot);
-            }
+            let Ok(snapshot) = copy(&sources) else {
+                return Ok(sources);
+            };
+            let Ok(key) = key.into_owned() else {
+                return Ok(sources);
+            };
+            self.publish(generation, key, Arc::new(snapshot));
         }
         Ok(sources)
+    }
+
+    // Admission cannot change the caller's discovered result. Prepare copies
+    // outside the lock, then recheck ownership before reserving and inserting.
+    fn publish(&self, generation: Option<u64>, key: HostKey, snapshot: Arc<Vec<Source>>) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if generation.is_some()
+            && cache.generation == generation
+            && !cache.entries.contains_key(key.0.as_str())
+            && cache.entries.try_reserve(1).is_ok()
+        {
+            cache.entries.insert(key, snapshot);
+        }
     }
 
     fn invalidate(&self, host: &str) {
@@ -1612,6 +1760,14 @@ impl CachedSources {
 
 #[cfg(test)]
 mod tests {
+    unsafe fn source_from_raw(
+        source: *const NDIlib_source_t,
+        function: &'static std::ffi::CStr,
+    ) -> Result<Source> {
+        // SAFETY: forwarded to the test caller's live-descriptor obligation.
+        unsafe { Source::try_from_raw(sys::table::for_test(source, function)) }
+    }
+
     use super::*;
 
     #[test]
@@ -1669,6 +1825,148 @@ mod tests {
     }
 
     #[test]
+    fn publication_failure_returns_discovery_but_hit_failure_is_reported() {
+        let cache = CachedSources::default();
+        let sources = vec![Source::new("camera (Program)")];
+        for invalidate in [false, true] {
+            let result = cache
+                .sources_by_host_with_copy(
+                    "camera",
+                    Duration::ZERO,
+                    |_| Ok(sources.clone()),
+                    |_| {
+                        if invalidate {
+                            cache.invalidate("camera");
+                        }
+                        Err(budget::allocation_failed())
+                    },
+                )
+                .unwrap();
+            assert_eq!(result, sources);
+            assert!(cache.is_empty());
+        }
+        cache
+            .sources_by_host_with("camera", Duration::ZERO, |_| Ok(sources.clone()))
+            .unwrap();
+        let result = cache.sources_by_host_with_copy(
+            "camera",
+            Duration::ZERO,
+            |_| panic!("a hit must not run discovery"),
+            |_| Err(budget::allocation_failed()),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::UnexpectedSdkResult(
+                crate::SdkResultDefect::DiscoveryAllocation
+            ))
+        ));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn successful_cache_publication_keeps_its_allocation_count() {
+        let cache = CachedSources::default();
+        // Apple pthread mutexes allocate their native storage on the first
+        // lock. Initialize it before measuring publication into the empty map.
+        assert!(cache.is_empty());
+        let sources = vec![Source::new("camera (Program)")];
+        let (result, allocations) = crate::test_alloc::allocation_count(|| {
+            cache.sources_by_host_with("camera", Duration::ZERO, |_| Ok(sources))
+        });
+        assert_eq!(result.unwrap().len(), 1);
+        // One vector, its name, the Arc header, host key and map storage.
+        assert_eq!(allocations, 5);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    #[test]
+    fn cancellation_during_successful_snapshot_lock_acquisition_skips_the_snapshot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let finder = Finder::new(&ndi, &FinderOptions::new()).unwrap();
+        for deadline in [None, Some(Deadline::after(Duration::from_secs(3)).unwrap())] {
+            let stop = AtomicBool::new(false);
+            let mut held = Some(finder.sources_lock.lock());
+            let mut acquired = false;
+            let result = finder.lock_snapshots_with(deadline, &stop, |remaining| {
+                assert!(!stop.load(Ordering::Acquire));
+                assert!(remaining > Duration::ZERO && remaining <= POLL_INTERVAL);
+                // Model cancellation arriving while the acquisition waits,
+                // followed by the current holder releasing within this slice.
+                stop.store(true, Ordering::Release);
+                drop(held.take());
+                let instance = finder.sources_lock.try_lock_for(remaining);
+                acquired = instance.is_some();
+                instance
+            });
+            assert!(
+                acquired,
+                "the cancelled wait must exercise a successful acquisition"
+            );
+            assert!(
+                result.is_none(),
+                "cancellation must withhold the native snapshot guard"
+            );
+            assert!(
+                finder.sources_lock.try_lock().is_some(),
+                "the cancelled acquisition must release its lock"
+            );
+        }
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    #[test]
+    fn cancelled_snapshot_lock_wait_finishes_without_entering_the_sdk() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        const WATCHDOG: Duration = Duration::from_secs(5);
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let finder = Finder::new(&ndi, &FinderOptions::new()).unwrap();
+        let held = finder.sources_lock.lock();
+        let stop = AtomicBool::new(false);
+        let (ready, waiting) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        std::thread::scope(|scope| {
+            // Keep cleanup inside the scope, so even a failed assertion drops
+            // the held lock before scope waits for a blocked worker to finish.
+            let held = held;
+            let finder = &finder;
+            let stop = &stop;
+            let worker = scope.spawn(move || {
+                let mut ready = Some(ready);
+                let stopped = finder
+                    .lock_snapshots_with(None, stop, |remaining| {
+                        assert!(remaining > Duration::ZERO && remaining <= POLL_INTERVAL);
+                        if let Some(ready) = ready.take() {
+                            ready.send(()).unwrap();
+                        }
+                        finder.sources_lock.try_lock_for(remaining)
+                    })
+                    .is_none();
+                let _ = finished.send(stopped);
+            });
+            waiting.recv_timeout(WATCHDOG).unwrap();
+            stop.store(true, Ordering::Release);
+            // Completion must precede unlocking; the watchdog permits shared
+            // CI scheduling delays, not an unbounded snapshot-lock wait.
+            let result = completion.recv_timeout(WATCHDOG);
+            drop(held);
+            worker.join().unwrap();
+            assert!(
+                result.expect("cancelled snapshot wait did not finish while the lock was held"),
+                "cancellation must withhold the native snapshot permission"
+            );
+        });
+    }
+
+    #[test]
     fn the_first_watch_after_finder_creation_allocates_nothing() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
@@ -1697,7 +1995,9 @@ mod tests {
     }
 
     fn host_key(host: &str) -> HostKey {
-        HostKeyBuffer::new(HostQuery::parse(host).unwrap()).into_owned()
+        HostKeyBuffer::new(HostQuery::parse(host).unwrap())
+            .into_owned()
+            .unwrap()
     }
 
     #[test]
@@ -2138,7 +2438,7 @@ mod tests {
             let raw = configured.to_raw().unwrap();
             // SAFETY: RawSource lends its descriptor while retaining both C
             // strings for this synchronous owned copy.
-            let discovered = unsafe { Source::try_from_raw(raw.as_raw(), "test") }.unwrap();
+            let discovered = unsafe { source_from_raw(raw.as_raw(), c"test") }.unwrap();
             assert_eq!(configured, discovered);
             assert_eq!(hash(&configured), hash(&discovered));
             let address = discovered.address().unwrap();
@@ -2186,7 +2486,9 @@ mod tests {
     fn cache_validates_timeout_before_returning_cached_source() {
         let cache = CachedSources::default();
         cache.cache.lock().unwrap().entries.insert(
-            HostKeyBuffer::new(HostQuery::parse("camera").unwrap()).into_owned(),
+            HostKeyBuffer::new(HostQuery::parse("camera").unwrap())
+                .into_owned()
+                .unwrap(),
             Arc::new(vec![Source::new("camera")]),
         );
         for host in ["camera", "not_cached"] {
@@ -2304,12 +2606,11 @@ mod tests {
     #[test]
     fn test_try_from_raw_null_pointer() {
         // A null descriptor is a failure of the function that returned it.
-        let result = unsafe { Source::try_from_raw(ptr::null(), "NDIlib_send_get_source_name") };
+        let result = unsafe { source_from_raw(ptr::null(), c"NDIlib_send_get_source_name") };
         assert!(matches!(
             result,
             Err(Error::NativeOperationFailed {
-                operation: "NDIlib_send_get_source_name"
-            })
+                operation}) if operation.name() == c"NDIlib_send_get_source_name"
         ));
     }
 
@@ -2406,7 +2707,7 @@ mod tests {
             let (snapshot, single) = unsafe {
                 (
                     snapshot_entry(&raw, &mut SnapshotBudget::new()),
-                    Source::try_from_raw(&raw, "test source query"),
+                    source_from_raw(&raw, c"test source query"),
                 )
             };
             match expected {
@@ -2420,8 +2721,7 @@ mod tests {
                         matches!(
                             &single,
                             Err(Error::NativeOperationFailed {
-                                operation: "test source query"
-                            })
+                                operation}) if operation.name() == c"test source query"
                         ),
                         "{label}: {single:?}"
                     );
@@ -2456,21 +2756,22 @@ mod tests {
 
         // SAFETY: every descriptor points to live NUL-terminated strings.
         unsafe {
-            let fits = Source::try_from_raw(&descriptor(&longest, ptr::null()), "test").unwrap();
+            let fits = source_from_raw(&descriptor(&longest, ptr::null()), c"test").unwrap();
             assert_eq!(fits.name().len(), MAX_SDK_STRING_BYTES - 1);
             for raw in [
                 descriptor(&too_long, address.as_ptr()),
                 descriptor(c"Camera".to_bytes_with_nul(), too_long.as_ptr().cast()),
             ] {
                 let Err(Error::UnexpectedSdkResult(reason)) =
-                    Source::try_from_raw(&raw, "NDIlib_send_get_source_name")
+                    source_from_raw(&raw, c"NDIlib_send_get_source_name")
                 else {
                     panic!("a string longer than the limit must be refused");
                 };
                 assert_eq!(
                     reason,
                     crate::SdkResultDefect::UnterminatedText {
-                        operation: "NDIlib_send_get_source_name"
+                        operation: sys::table::for_test((), c"NDIlib_send_get_source_name")
+                            .function()
                     }
                 );
             }
@@ -2539,12 +2840,11 @@ mod tests {
             },
         };
 
-        let result = unsafe { Source::try_from_raw(&source, "NDIlib_find_get_current_sources") };
+        let result = unsafe { source_from_raw(&source, c"NDIlib_find_get_current_sources") };
         assert!(matches!(
             result,
             Err(Error::NativeOperationFailed {
-                operation: "NDIlib_find_get_current_sources"
-            })
+                operation}) if operation.name() == c"NDIlib_find_get_current_sources"
         ));
     }
 
@@ -2557,7 +2857,7 @@ mod tests {
                 p_url_address: url.as_ptr(),
             },
         };
-        let source = unsafe { Source::try_from_raw(&raw, "test") }.unwrap();
+        let source = unsafe { source_from_raw(&raw, c"test") }.unwrap();
         assert!(source.name().is_empty());
         assert!(
             matches!(source.address(), Some(address) if address.is_url() && address.as_str() == "ndi://127.0.0.1:5960")
@@ -2579,7 +2879,7 @@ mod tests {
             },
         };
 
-        let result = unsafe { Source::try_from_raw(&source, "test") };
+        let result = unsafe { source_from_raw(&source, c"test") };
         assert!(result.is_ok());
 
         let source = result.unwrap();
@@ -2602,7 +2902,7 @@ mod tests {
             },
         };
 
-        let result = unsafe { Source::try_from_raw(&source, "test") };
+        let result = unsafe { source_from_raw(&source, c"test") };
         assert!(result.is_ok());
 
         let source = result.unwrap();
@@ -2624,7 +2924,7 @@ mod tests {
             },
         };
 
-        let result = unsafe { Source::try_from_raw(&source, "test") };
+        let result = unsafe { source_from_raw(&source, c"test") };
         assert!(result.is_ok());
 
         let source = result.unwrap();

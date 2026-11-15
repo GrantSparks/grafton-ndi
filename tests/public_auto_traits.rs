@@ -96,6 +96,7 @@ fn crate_root_types_keep_their_auto_traits() {
         FormatCategory: Send, Sync, UnwindSafe, RefUnwindSafe;
         FourCc: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameRate: Send, Sync, UnwindSafe, RefUnwindSafe;
+        LayoutDefect: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameMetadataStatus: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameSync: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameSyncAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -108,6 +109,7 @@ fn crate_root_types_keep_their_auto_traits() {
         MetadataFrameRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         MetadataKind: Send, Sync, UnwindSafe, RefUnwindSafe;
         Ndi: Send, Sync, UnwindSafe, RefUnwindSafe;
+        NativeFunction: Send, Sync, UnwindSafe, RefUnwindSafe;
         PixelFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         PixelFormatInfo: Send, Sync, UnwindSafe, RefUnwindSafe;
         ProcessLifetimeRuntime: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -192,22 +194,34 @@ fn image_encoding_types_keep_their_auto_traits() {
 #[cfg(feature = "tokio")]
 #[test]
 fn tokio_types_keep_their_auto_traits() {
-    use grafton_ndi::asynchronous::{AsyncReceiver, Tokio};
+    use grafton_ndi::asynchronous::{AsyncFinder, AsyncReceiver, AsyncSourceWatch, Tokio};
+    use grafton_ndi::SourceCache;
     has! {
         AsyncReceiver<Tokio>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AsyncFinder<Tokio>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AsyncFinder<Tokio, SourceCache>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AsyncSourceWatch<Tokio>: Send, UnwindSafe;
+        AsyncSourceWatch<Tokio, SourceCache>: Send, UnwindSafe;
         Tokio: Send, Sync, UnwindSafe, RefUnwindSafe;
     }
+    lacks! { AsyncSourceWatch<Tokio>: Sync; }
 }
 
 /// The public types of the `asynchronous` module with smol.
 #[cfg(feature = "smol")]
 #[test]
 fn smol_types_keep_their_auto_traits() {
-    use grafton_ndi::asynchronous::{AsyncReceiver, Smol};
+    use grafton_ndi::asynchronous::{AsyncFinder, AsyncReceiver, AsyncSourceWatch, Smol};
+    use grafton_ndi::SourceCache;
     has! {
         AsyncReceiver<Smol>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AsyncFinder<Smol>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AsyncFinder<Smol, SourceCache>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AsyncSourceWatch<Smol>: Send, UnwindSafe;
+        AsyncSourceWatch<Smol, SourceCache>: Send, UnwindSafe;
         Smol: Send, Sync, UnwindSafe, RefUnwindSafe;
     }
+    lacks! { AsyncSourceWatch<Smol>: Sync; }
 }
 
 /// The public types of the `discovery` module.
@@ -260,6 +274,7 @@ fn advanced_modes_types_keep_their_auto_traits() {
 fn advanced_types_keep_their_auto_traits() {
     use grafton_ndi::{advanced::*, RawCapture};
     has! {
+        PoolBlock: Send, Sync, UnwindSafe, RefUnwindSafe;
         AdvancedConfig: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocatedPacketReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocatedReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -310,7 +325,9 @@ fn advanced_types_keep_their_auto_traits() {
         QueuedSender: Send, Sync, UnwindSafe, RefUnwindSafe;
         QueuedVideoFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceivedAudio: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ReceivedAudioPacket: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceivedVideo: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ReceivedVideoPacket: Send, Sync, UnwindSafe, RefUnwindSafe;
         ScatterAudioFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         ScatterVideoFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         SubmissionId: Send, Sync, UnwindSafe, RefUnwindSafe;

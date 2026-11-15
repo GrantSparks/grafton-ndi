@@ -93,3 +93,27 @@ pub unsafe extern "C" fn NDIlib_genlock_wait_video(
 pub unsafe extern "C" fn NDIlib_genlock_wait_audio(
     _instance: *mut std::ffi::c_void, _frame: *const NDIlib_audio_frame_v3_t,
 ) -> bool { false }
+
+#[cfg(fake_advanced)]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_recv_set_video_allocator(
+    _receiver: NDIlib_recv_instance_t,
+    _opaque: *mut std::ffi::c_void,
+    allocate: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NDIlib_video_frame_v2_t) -> bool>,
+    free: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *const NDIlib_video_frame_v2_t) -> bool>,
+) {
+    assert_eq!(allocate.is_some(), free.is_some());
+    log(if allocate.is_some() { "video-allocator-install" } else { "video-allocator-reset" });
+}
+
+#[cfg(fake_advanced)]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_recv_set_audio_allocator(
+    _receiver: NDIlib_recv_instance_t,
+    _opaque: *mut std::ffi::c_void,
+    allocate: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NDIlib_audio_frame_v3_t) -> bool>,
+    free: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *const NDIlib_audio_frame_v3_t) -> bool>,
+) {
+    assert_eq!(allocate.is_some(), free.is_some());
+    log(if allocate.is_some() { "audio-allocator-install" } else { "audio-allocator-reset" });
+}

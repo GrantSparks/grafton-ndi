@@ -48,12 +48,13 @@ fn video_with_format<'a>(
     };
     // SAFETY: pixels contains every active row, remains borrowed for 'a,
     // and the synthetic free counts releases without touching that storage.
-    unsafe {
-        VideoKind::make_ref(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {
+
+    VideoKind::make_ref(unsafe {
+        Guard::with_test_free(ptr::null_mut(), raw, |_, _| {
             FREES.set(FREES.get() + 1);
-        }))
-        .unwrap()
-    }
+        })
+    })
+    .unwrap()
 }
 
 #[test]
@@ -159,12 +160,12 @@ fn strided_channels_and_text_have_no_processing_allocations() {
     };
     // SAFETY: the initialized channel samples and static metadata outlive the
     // guard. The synthetic free never touches independently owned storage.
-    let frame = unsafe {
-        AudioKind::make_ref(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {
+    let frame = AudioKind::make_ref(unsafe {
+        Guard::with_test_free(ptr::null_mut(), raw, |_, _| {
             FREES.set(FREES.get() + 1);
-        }))
-        .unwrap()
-    };
+        })
+    })
+    .unwrap();
     let oracle = frame.to_owned();
     let native = samples.as_ptr() as usize;
     let before = FREES.get();
@@ -199,12 +200,12 @@ fn strided_channels_and_text_have_no_processing_allocations() {
     };
     // SAFETY: static NUL-terminated text outlives the guard and is never freed
     // by the counting callback.
-    let frame = unsafe {
-        MetadataKind::make_ref(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {
+    let frame = MetadataKind::make_ref(unsafe {
+        Guard::with_test_free(ptr::null_mut(), raw, |_, _| {
             FREES.set(FREES.get() + 1);
-        }))
-        .unwrap()
-    };
+        })
+    })
+    .unwrap();
     let (length, allocations) = allocation_count(|| {
         process_captured(Some(ReceiverItemRef::Metadata(frame)), |item| {
             let ReceiverItemRef::Metadata(frame) = item else {
@@ -259,12 +260,12 @@ fn seeded_strided_channels_match_owned_oracle_without_allocations() {
         };
         // SAFETY: only active samples are initialized; the descriptor's strides
         // describe that live storage. Counting frees never touch the allocation.
-        let frame = unsafe {
-            AudioKind::make_ref(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {
+        let frame = AudioKind::make_ref(unsafe {
+            Guard::with_test_free(ptr::null_mut(), raw, |_, _| {
                 FREES.set(FREES.get() + 1);
-            }))
-            .unwrap()
-        };
+            })
+        })
+        .unwrap();
         let oracle = frame.to_owned();
         let before = FREES.get();
         let (sum, allocations) = allocation_count(|| {

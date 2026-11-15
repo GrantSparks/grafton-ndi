@@ -232,9 +232,7 @@ macro_rules! conversions {
             };
             // SAFETY: Both typed buffers cover the validated dimensions, do not
             // alias, and remain live throughout this synchronous conversion.
-            if !unsafe { self.audio.$to(&source, &mut destination) } {
-                return Err(Error::NativeOperationFailed { operation: stringify!($to_method) });
-            }
+            unsafe { self.audio.named().$to(&source, &mut destination) }.performed()?;
             Ok(shape.0.sample_count())
         }
 
@@ -257,9 +255,7 @@ macro_rules! conversions {
             raw.p_data = destination.data_mut().as_mut_ptr().cast();
             // SAFETY: Source and destination have matching checked dimensions;
             // the exclusively borrowed output is initialized and correctly aligned.
-            if !unsafe { self.audio.$from(&source, &mut raw) } {
-                return Err(Error::NativeOperationFailed { operation: stringify!($into_method) });
-            }
+            unsafe { self.audio.named().$from(&source, &mut raw) }.performed()?;
             Ok(())
         }
     };
@@ -595,6 +591,99 @@ mod tests {
         );
         assert_eq!(AudioReferenceLevel::SEND.db(), 0);
         assert_eq!(AudioReferenceLevel::RECEIVE_HEADROOM.db(), 20);
+    }
+
+    #[test]
+    fn native_conversion_refusals_name_the_entry_point_for_each_sample_type() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        macro_rules! stubs {
+            ($to:ident, $from:ident, $raw:ty) => {
+                unsafe extern "C" fn $to(_: *const NDIlib_audio_frame_v3_t, _: *mut $raw) -> bool {
+                    false
+                }
+                unsafe extern "C" fn $from(
+                    _: *const $raw,
+                    _: *mut NDIlib_audio_frame_v3_t,
+                ) -> bool {
+                    false
+                }
+            };
+        }
+        stubs!(to_i16, from_i16, NDIlib_audio_frame_interleaved_16s_t);
+        stubs!(to_i32, from_i32, NDIlib_audio_frame_interleaved_32s_t);
+        stubs!(to_f32, from_f32, NDIlib_audio_frame_interleaved_32f_t);
+        static TABLE: sys::InterleavedAudio = sys::InterleavedAudio {
+            NDIlib_util_audio_to_interleaved_16s_v3: to_i16,
+            NDIlib_util_audio_from_interleaved_16s_v3: from_i16,
+            NDIlib_util_audio_to_interleaved_32s_v3: to_i32,
+            NDIlib_util_audio_from_interleaved_32s_v3: from_i32,
+            NDIlib_util_audio_to_interleaved_32f_v3: to_f32,
+            NDIlib_util_audio_from_interleaved_32f_v3: from_f32,
+        };
+        let converter = AudioConverter {
+            _ndi: ndi,
+            audio: &TABLE,
+        };
+        let mut frame = AudioFrame::builder()
+            .sample_rate(48_000)
+            .num_channels(1)
+            .num_samples(1)
+            .build()
+            .unwrap();
+        let i16_input =
+            InterleavedAudioI16::new(48_000, 1, &[0], AudioReferenceLevel::SEND).unwrap();
+        let i32_input =
+            InterleavedAudioI32::new(48_000, 1, &[0], AudioReferenceLevel::SEND).unwrap();
+        let f32_input = InterleavedAudioF32::new(48_000, 1, &[0.0]).unwrap();
+        let cases = [
+            (
+                converter
+                    .to_interleaved_i16(&frame, &mut [0], AudioReferenceLevel::SEND)
+                    .map(|_| ()),
+                c"NDIlib_util_audio_to_interleaved_16s_v3",
+            ),
+            (
+                converter
+                    .to_interleaved_i32(&frame, &mut [0], AudioReferenceLevel::SEND)
+                    .map(|_| ()),
+                c"NDIlib_util_audio_to_interleaved_32s_v3",
+            ),
+            (
+                converter.to_interleaved_f32(&frame, &mut [0.0]).map(|_| ()),
+                c"NDIlib_util_audio_to_interleaved_32f_v3",
+            ),
+            (
+                converter.from_interleaved_i16(&i16_input).map(|_| ()),
+                c"NDIlib_util_audio_from_interleaved_16s_v3",
+            ),
+            (
+                converter.from_interleaved_i32(&i32_input).map(|_| ()),
+                c"NDIlib_util_audio_from_interleaved_32s_v3",
+            ),
+            (
+                converter.from_interleaved_f32(&f32_input).map(|_| ()),
+                c"NDIlib_util_audio_from_interleaved_32f_v3",
+            ),
+            (
+                converter.from_interleaved_i16_into(&i16_input, &mut frame),
+                c"NDIlib_util_audio_from_interleaved_16s_v3",
+            ),
+            (
+                converter.from_interleaved_i32_into(&i32_input, &mut frame),
+                c"NDIlib_util_audio_from_interleaved_32s_v3",
+            ),
+            (
+                converter.from_interleaved_f32_into(&f32_input, &mut frame),
+                c"NDIlib_util_audio_from_interleaved_32f_v3",
+            ),
+        ];
+        for (result, expected) in cases {
+            assert!(
+                matches!(result, Err(Error::NativeOperationFailed { operation }) if operation == expected)
+            );
+        }
     }
 
     #[test]

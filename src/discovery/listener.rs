@@ -558,8 +558,13 @@ impl<A: ListenerApi> Listener<A> {
     fn server_url(&self) -> Option<String> {
         // SAFETY: the listener instance is live for this borrow.
         let url = unsafe { self.0.api.server_url(self.0.instance()) };
-        // SAFETY: a non-null result is a NUL-terminated string the SDK keeps
-        // for the listener's lifetime, which this borrow is within.
+        // SAFETY: Processing.NDI.{Send,Recv}Listener.h only documents that the
+        // result may be null; it promises neither a lifetime nor a terminator.
+        // The bounded endpoint copy completes within this borrow, and this
+        // Send, !Sync owner prevents another listener call during that copy.
+        // We assume a non-null getter result stays readable through its first
+        // NUL or the SDK string bound for that interval. The real-server getter
+        // check in tests/discovery_server.rs exercises that SDK assumption.
         unsafe { endpoint(url) }
     }
     fn wait_for_changes(&mut self, timeout: Duration) -> Result<bool> {
@@ -937,19 +942,14 @@ impl RecvListener {
         // UUIDs and matched commands unchanged until this inspection finishes.
         unsafe { require_receiver_connect(receivers, id, &mut budget)? };
         // SAFETY: the listener instance is live and both strings outlive the call.
-        if unsafe {
-            self.inner.0.api.NDIlib_recv_listener_send_connect(
+        unsafe {
+            self.inner.0.api.named().NDIlib_recv_listener_send_connect(
                 self.inner.0.instance().0,
                 id.as_c_str().as_ptr(),
                 source.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
             )
-        } {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: "remote receiver connection request",
-            })
         }
+        .performed()
     }
 }
 

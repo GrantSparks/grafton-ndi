@@ -3,7 +3,7 @@ use std::time::Duration;
 fn common<M: ReceiverMode>(receiver: &Receiver<M>) {
     receiver.set_tally(Tally::new(false, true));
     let _ = receiver.ptz().is_supported();
-    let _ = receiver.connection_stats();
+    let _ = receiver.connection_stats().unwrap();
     let _ = receiver.connection_target();
     receiver.reconnect();
 }

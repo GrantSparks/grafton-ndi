@@ -1,7 +1,6 @@
 //! Recording an NDI source to disk, with explicit finalization.
 
 use std::{
-    ffi::CString,
     marker::PhantomData,
     ptr::NonNull,
     rc::Rc,
@@ -10,7 +9,7 @@ use std::{
 
 use super::{
     out_param,
-    types::{track_flags, NamePattern},
+    types::{track_flags, FileText, NamePattern, ResolvedRecorderOptions},
     EventText, FileApi, RecorderEvent, RecorderEventKind, RecorderOptions, RecorderStats,
     RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec, StateError,
 };
@@ -228,83 +227,89 @@ enum CleanupBudget {
     Skip,
     Spent,
     For(Duration),
-    Until(Deadline),
 }
 
 impl CleanupBudget {
-    fn begin(&mut self, requested: Instant) -> Option<Deadline> {
-        if let Self::For(wait) = *self {
-            *self = Deadline::starting(requested, wait).map_or(Self::Skip, Self::Until);
-        }
+    fn begin(&mut self, requested: Instant) -> DrainBudget {
         match std::mem::replace(self, Self::Spent) {
-            Self::Until(deadline) => Some(deadline),
-            Self::Skip | Self::Spent | Self::For(_) => None,
+            Self::For(wait) => {
+                Deadline::starting(requested, wait).map_or(DrainBudget::Spent, DrainBudget::new)
+            }
+            Self::Skip | Self::Spent => DrainBudget::Spent,
         }
     }
 }
 
 /// A wait's deadline and its one bounded drain after expiry.
 /// Reading expiry once per step keeps the native poll and settlement in agreement.
-pub(super) struct DrainBudget {
-    deadline: Option<Deadline>,
-    late_polls: usize,
-    spent: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DrainStep {
-    Wait(u32),
-    Late,
+pub(super) enum DrainBudget {
+    Ahead(Deadline),
+    Late { polls: usize },
     Spent,
 }
 
 impl DrainBudget {
     fn new(deadline: Deadline) -> Self {
-        Self {
-            deadline: Some(deadline),
-            late_polls: 0,
-            spent: false,
-        }
+        Self::Ahead(deadline)
     }
 
     fn late() -> Self {
-        Self {
-            deadline: None,
-            late_polls: 0,
-            spent: false,
-        }
+        Self::Late { polls: 0 }
     }
 
-    fn next(&mut self, step: Duration) -> DrainStep {
-        self.next_at(step, Instant::now())
+    fn poll(&mut self, step: Duration, poll: impl FnOnce(u32) -> bool) -> Pumped {
+        self.poll_at(step, Instant::now(), poll)
     }
 
-    fn next_at(&mut self, step: Duration, at: Instant) -> DrainStep {
-        if self.spent {
-            return DrainStep::Spent;
+    /// The poll and its result belong to the same step: only this operation
+    /// can spend the budget, whether the late phase is empty or reaches its limit.
+    fn poll_at(&mut self, step: Duration, at: Instant, poll: impl FnOnce(u32) -> bool) -> Pumped {
+        if matches!(self, Self::Ahead(deadline) if deadline.end() <= at) {
+            *self = Self::late();
         }
-        match self.deadline.filter(|deadline| deadline.end() > at) {
-            Some(deadline) => DrainStep::Wait(
+        let (wait, late) = match self {
+            Self::Ahead(deadline) => (
                 crate::timeout::sdk_millis(deadline.remaining_at(at).min(step))
                     .expect("a drain step is within the validated deadline"),
+                false,
             ),
-            None if self.late_polls < STALE_EVENT_LIMIT => {
-                self.late_polls += 1;
-                DrainStep::Late
+            Self::Late { .. } => (0, true),
+            Self::Spent => return Pumped::Exhausted,
+        };
+        let empty = poll(wait);
+        if let Self::Late { polls } = self {
+            *polls += 1;
+            if empty || *polls == STALE_EVENT_LIMIT {
+                *self = Self::Spent;
             }
-            None => {
-                self.spent = true;
-                DrainStep::Spent
-            }
+        }
+        if empty {
+            Pumped::Empty { late }
+        } else {
+            Pumped::Took { late }
         }
     }
 }
 
 /// Evidence from one poll, or from exhausting its bounded final drain.
-#[derive(Clone, Copy)]
-struct Pumped {
-    expired: bool,
-    drained: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pumped {
+    Took { late: bool },
+    Empty { late: bool },
+    Exhausted,
+}
+
+impl Pumped {
+    fn expired(self) -> bool {
+        !matches!(
+            self,
+            Self::Took { late: false } | Self::Empty { late: false }
+        )
+    }
+
+    fn drain_over(self) -> bool {
+        !matches!(self, Self::Took { .. })
+    }
 }
 
 /// One fixed settlement batch. Reply callbacks cannot advance its clock.
@@ -379,10 +384,12 @@ impl<R: FinishReply> FinishWaiters<R> {
     }
 
     pub(super) fn close(&mut self) {
+        self.fail(StateError::Closed);
+    }
+
+    pub(super) fn fail(&mut self, error: StateError) {
         for waiter in self.waiters.drain(..) {
-            waiter
-                .reply
-                .complete(Err(Error::InvalidState(StateError::Closed)));
+            waiter.reply.complete(Err(Error::InvalidState(error)));
         }
     }
 
@@ -421,13 +428,16 @@ impl<R: FinishReply> FinishWaiters<R> {
             // empty after expiry. Every newly due batch gets its own drain.
             let mut budget = DrainBudget::late();
             loop {
-                if let Some(cleanup) = cleanup.as_deref_mut() {
-                    if cleanup.next(Duration::ZERO) == DrainStep::Spent {
-                        break;
-                    }
-                }
-                let polled = recorder.pump(&mut budget, Duration::ZERO, sink);
-                if polled.drained {
+                let polled = if let Some(cleanup) = cleanup.as_deref_mut() {
+                    // The local late phase and the final cleanup both account
+                    // for this poll. An exhausted cleanup makes no native call.
+                    budget.poll(Duration::ZERO, |_| {
+                        recorder.pump(cleanup, Duration::ZERO, sink).drain_over()
+                    })
+                } else {
+                    recorder.pump(&mut budget, Duration::ZERO, sink)
+                };
+                if polled.drain_over() {
                     break;
                 }
             }
@@ -832,7 +842,7 @@ impl Ledger {
 
 fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
     let pointer =
-        |text: &Option<CString>| text.as_ref().map_or(std::ptr::null(), |text| text.as_ptr());
+        |text: &Option<FileText>| text.as_ref().map_or(std::ptr::null(), |text| text.as_ptr());
     NDIlib_file_recorder_source_t {
         p_ndi_name: pointer(&source.name),
         p_url_address: pointer(&source.url),
@@ -906,19 +916,49 @@ pub struct FileRecorder {
     _thread: PhantomData<Rc<()>>,
 }
 
-impl std::fmt::Debug for FileRecorder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FileRecorder")
-            .field("state", &self.ledger.state())
-            .field("session", &self.ledger.session_number())
-            .finish_non_exhaustive()
+/// Rust-only creation state: its validation and family check require no
+/// native object, so this value can move to an owner thread before creation.
+pub(super) struct PreparedRecorder {
+    api: FileApi,
+    recording: &'static sys::FileRecording,
+    options: CheckedRecorderOptions,
+}
+
+/// Every option needed for creation, retaining the one resolved naming proof.
+/// Reset can validate this before queueing without retaining another runtime.
+pub(super) struct CheckedRecorderOptions {
+    source: SourceSpec,
+    tracks: MediaTypes,
+    planar_audio: bool,
+    proxy: bool,
+    rollover_size: u64,
+    drop_wait: Duration,
+    resolved: ResolvedRecorderOptions,
+}
+
+impl CheckedRecorderOptions {
+    pub(super) fn new(options: &RecorderOptions) -> Result<Self> {
+        let resolved = options.resolve()?;
+        Ok(Self {
+            source: options.source.clone(),
+            tracks: options.tracks,
+            planar_audio: options.planar_audio,
+            proxy: options.proxy,
+            rollover_size: options.rollover_size,
+            drop_wait: options.drop_wait,
+            resolved,
+        })
     }
 }
 
-impl FileRecorder {
-    pub(super) fn create(api: FileApi, options: &RecorderOptions) -> Result<Self> {
-        let recording = api.table::<sys::FileRecording>()?;
-        let resolved = options.resolve()?;
+impl PreparedRecorder {
+    pub(super) fn create(self) -> Result<FileRecorder> {
+        let Self {
+            api,
+            recording,
+            options,
+        } = self;
+        let resolved = options.resolved;
         let settings = NDIlib_file_recorder_create_t {
             source_to_connect_to: raw_source(&options.source),
             track_flags: track_flags(options.tracks),
@@ -933,21 +973,44 @@ impl FileRecorder {
         };
         // SAFETY: `settings` and the strings it points to, owned by `options`
         // and `resolved`, are valid for the call.
-        let handle = NonNull::new(unsafe { recording.NDIlib_file_recorder_create(&settings) })
-            .ok_or(Error::NativeOperationFailed {
-                operation: "recorder creation",
-            })?;
-        Ok(Self {
+        let handle =
+            unsafe { recording.named().NDIlib_file_recorder_create(&settings) }.created()?;
+        Ok(FileRecorder {
             recording,
             handle,
             tracks: options.tracks,
             cleanup: CleanupBudget::For(options.drop_wait),
-            accepted_source: Some(options.source.clone()),
+            accepted_source: Some(options.source),
             naming: resolved.naming,
             ledger: Ledger::idle(),
             generation: 0,
             _api: api,
             _thread: PhantomData,
+        })
+    }
+}
+
+impl std::fmt::Debug for FileRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileRecorder")
+            .field("state", &self.ledger.state())
+            .field("session", &self.ledger.session_number())
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileRecorder {
+    pub(super) fn create(api: FileApi, options: &RecorderOptions) -> Result<Self> {
+        Self::prepare(api, options)?.create()
+    }
+
+    pub(super) fn prepare(api: FileApi, options: &RecorderOptions) -> Result<PreparedRecorder> {
+        let recording = api.table::<sys::FileRecording>()?;
+        let options = CheckedRecorderOptions::new(options)?;
+        Ok(PreparedRecorder {
+            api,
+            recording,
+            options,
         })
     }
 
@@ -1049,21 +1112,19 @@ impl FileRecorder {
             match timecode {
                 RecordingTimecode::Preserve => self
                     .recording
+                    .named()
                     .NDIlib_file_recorder_start(self.handle.as_ptr(), prefix),
-                RecordingTimecode::GenerateFrom(start) => {
-                    self.recording.NDIlib_file_recorder_start_with_timecode(
+                RecordingTimecode::GenerateFrom(start) => self
+                    .recording
+                    .named()
+                    .NDIlib_file_recorder_start_with_timecode(
                         self.handle.as_ptr(),
                         prefix,
                         start.ticks(),
-                    )
-                }
+                    ),
             }
         };
-        if !accepted {
-            return Err(Error::NativeOperationFailed {
-                operation: "recorder start",
-            });
-        }
+        accepted.performed()?;
         self.ledger = Ledger::session(
             session,
             dropped,
@@ -1076,13 +1137,15 @@ impl FileRecorder {
     /// session is attributed to the next one.
     fn discard_stale_events(&mut self, sink: &mut impl FnMut(Result<RecorderEvent>)) -> Result<()> {
         let mut budget = DrainBudget::late();
-        for _ in 0..STALE_EVENT_LIMIT {
-            let polled = self.pump(&mut budget, Duration::ZERO, sink);
-            if polled.drained {
-                return Ok(());
+        loop {
+            match self.pump(&mut budget, Duration::ZERO, sink) {
+                Pumped::Empty { .. } => return Ok(()),
+                Pumped::Exhausted => {
+                    return Err(Error::InvalidState(StateError::EarlierSessionEvents));
+                }
+                Pumped::Took { .. } => {}
             }
         }
-        Err(Error::InvalidState(StateError::EarlierSessionEvents))
     }
 
     /// Ask the SDK to stop the session. Idempotent.
@@ -1124,7 +1187,10 @@ impl FileRecorder {
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
-    /// and [`Error::UnexpectedSdkResult`] when the SDK's event is malformed.
+    /// and [`Error::UnexpectedSdkResult`] when the SDK's event does not match
+    /// this crate's structure layout or its returned event type. An unreadable
+    /// format is withheld through [`RecorderEvent::source_format`] while the
+    /// rest of the event is delivered.
     pub fn poll_event(&mut self, timeout: Duration) -> Result<Option<RecorderEvent>> {
         self.poll_event_ms(crate::to_ms_checked(timeout)?)
     }
@@ -1133,7 +1199,7 @@ impl FileRecorder {
     ///
     /// # Errors
     ///
-    /// [`Error::UnexpectedSdkResult`] when the SDK's event is malformed.
+    /// [`Error::UnexpectedSdkResult`] for a whole-event layout or type mismatch.
     fn poll_event_ms(&mut self, wait_ms: u32) -> Result<Option<RecorderEvent>> {
         let event = self.capture(wait_ms);
         if self.ledger.session_open() {
@@ -1158,7 +1224,7 @@ impl FileRecorder {
         }
         // Decoded after the ledger is updated, so that a malformed payload
         // cannot hide the event that closes a file.
-        Ok(Some(RecorderEvent::from_sdk(&event)?))
+        Ok(Some(RecorderEvent::from_sdk(&event)))
     }
 
     /// Take the next native event, or `None` when the queue stays empty for
@@ -1280,7 +1346,7 @@ impl FileRecorder {
     }
 
     /// Start cleanup once, retaining an async close's original submission time.
-    pub(super) fn begin_cleanup(&mut self, requested: Instant) -> Option<Deadline> {
+    pub(super) fn begin_cleanup(&mut self, requested: Instant) -> DrainBudget {
         self.cleanup.begin(requested)
     }
 
@@ -1295,26 +1361,14 @@ impl FileRecorder {
         step: Duration,
         sink: &mut impl FnMut(Result<RecorderEvent>),
     ) -> Pumped {
-        let next = budget.next(step);
-        let (wait, expired) = match next {
-            DrainStep::Wait(wait) => (wait, false),
-            DrainStep::Late => (0, true),
-            DrainStep::Spent => {
-                return Pumped {
-                    expired: true,
-                    drained: true,
-                }
+        budget.poll(step, |wait| {
+            let polled = self.poll_event_ms(wait);
+            let empty = matches!(polled, Ok(None));
+            if let Some(event) = polled.transpose() {
+                sink(event);
             }
-        };
-        let polled = self.poll_event_ms(wait);
-        let drained = matches!(polled, Ok(None));
-        if let Some(event) = polled.transpose() {
-            sink(event);
-        }
-        if expired && drained {
-            budget.spent = true;
-        }
-        Pumped { expired, drained }
+            empty
+        })
     }
 
     /// Drop and async close share the same cleanup driver, including the
@@ -1327,47 +1381,27 @@ impl FileRecorder {
         sink: &mut impl FnMut(Result<RecorderEvent>),
         closing: impl Fn() -> bool,
     ) {
-        let deadline = self.begin_cleanup(requested);
+        let mut budget = self.begin_cleanup(requested);
         self.request_stop();
-        let mut budget = deadline.map_or_else(
-            || DrainBudget {
-                deadline: None,
-                late_polls: 0,
-                spent: true,
-            },
-            DrainBudget::new,
-        );
         waiters.retain();
         while self.cleanup_pending() || !waiters.is_empty() {
             let polled = self.pump(&mut budget, waiters.wait_timeout(tick), sink);
             let drained = waiters.settle_at(
                 self,
                 Settlement {
-                    drained: polled.drained,
-                    cleanup_expired: polled.expired,
+                    drained: polled.drain_over(),
+                    cleanup_expired: polled.expired(),
                     at: Instant::now(),
                 },
                 sink,
                 &closing,
                 Some(&mut budget),
             );
-            if polled.expired && drained {
+            if polled.expired() && drained {
                 break;
             }
         }
-        // No new polls after this budget was spent. Resolve anything still
-        // pending as a timeout (or Closed for an async close).
-        let session = self.session_id();
-        for waiter in waiters.waiters.drain(..) {
-            let outcome = if waiter.session != session || closing() {
-                Err(Error::InvalidState(StateError::Closed))
-            } else {
-                Ok(self
-                    .settle_wait(true, true)
-                    .expect("a completed drain settles"))
-            };
-            waiter.reply.complete(outcome);
-        }
+        debug_assert!(waiters.is_empty(), "a completed drain settles every waiter");
     }
 
     /// Stop and destroy the recorder at once, without waiting for the SDK to
@@ -1396,10 +1430,31 @@ impl FileRecorder {
     ///
     /// The errors of [`FileApi::create_recorder`].
     pub fn reset(&mut self, options: &RecorderOptions) -> Result<RecordingReport> {
+        self.reset_with(|recorder| Self::create(recorder._api.clone(), options))
+    }
+
+    pub(super) fn reset_checked(
+        &mut self,
+        options: CheckedRecorderOptions,
+    ) -> Result<RecordingReport> {
+        self.reset_with(|recorder| {
+            PreparedRecorder {
+                api: recorder._api.clone(),
+                recording: recorder.recording,
+                options,
+            }
+            .create()
+        })
+    }
+
+    fn reset_with(
+        &mut self,
+        create: impl FnOnce(&Self) -> Result<Self>,
+    ) -> Result<RecordingReport> {
         let generation = self.generation.checked_add(1).ok_or(Error::InvalidInput(
             crate::InputDefect::RecorderGenerationExhausted,
         ))?;
-        let mut replacement = Self::create(self._api.clone(), options)?;
+        let mut replacement = create(self)?;
         replacement.generation = generation;
         replacement.ledger = Ledger::inheriting(self.report());
         Ok(std::mem::replace(self, replacement).abandon())
@@ -1465,17 +1520,12 @@ impl FileRecorder {
         // to, owned by `source`, are valid for the call.
         let accepted = unsafe {
             self.recording
+                .named()
                 .NDIlib_file_recorder_set_source(self.handle.as_ptr(), &raw)
         };
         // Kept only once accepted: the copy is what the recorder retains.
-        self.accepted_source = accepted.then(|| source.clone());
-        if accepted {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: "recorder source change",
-            })
-        }
+        self.accepted_source = accepted.value().then(|| source.clone());
+        accepted.performed()
     }
 
     /// The source the SDK accepted last: the one given at creation, or by the
@@ -1540,15 +1590,10 @@ impl FileRecorder {
         // which the caller lends for longer than the call. The SDK copies it.
         let accepted = unsafe {
             self.recording
+                .named()
                 .NDIlib_file_recorder_rollover(self.handle.as_ptr(), target.prefix.as_ptr())
         };
-        if accepted {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: "recorder rollover",
-            })
-        }
+        accepted.performed()
     }
 
     /// Write a metadata frame into the recording at its current position.
@@ -1578,15 +1623,10 @@ impl FileRecorder {
         // nor writes through `p_data`.
         let injected = unsafe {
             self.recording
+                .named()
                 .NDIlib_file_recorder_inject_metadata(self.handle.as_ptr(), &frame)
         };
-        if injected {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: "metadata injection",
-            })
-        }
+        injected.performed()
     }
 
     /// The recorder's running counters, when the SDK has any.
@@ -1623,7 +1663,7 @@ impl FileRecorder {
                     .NDIlib_file_recorder_get_source_format(self.handle.as_ptr(), format)
             }
         })?
-        .map(|format| SourceFormat::from_sdk(&format))
+        .map(|format| SourceFormat::from_sdk(&format).map_err(Error::UnexpectedSdkResult))
         .transpose()
     }
 }
@@ -1675,16 +1715,61 @@ mod tests {
         let at = Instant::now();
         let deadline = Deadline::starting(at, Duration::from_millis(7)).unwrap();
         let mut budget = DrainBudget::new(deadline);
-        assert_eq!(budget.next_at(FINISH_POLL, at), DrainStep::Wait(7));
-        assert_eq!(budget.next_at(SETTLE_POLL, at), DrainStep::Wait(1));
+        for (step, expected) in [(FINISH_POLL, 7), (SETTLE_POLL, 1)] {
+            assert_eq!(
+                budget.poll_at(step, at, |wait| {
+                    assert_eq!(wait, expected);
+                    false
+                }),
+                Pumped::Took { late: false }
+            );
+        }
         for _ in 0..STALE_EVENT_LIMIT {
-            assert_eq!(budget.next_at(FINISH_POLL, deadline.end()), DrainStep::Late);
+            assert_eq!(
+                budget.poll_at(FINISH_POLL, deadline.end(), |wait| {
+                    assert_eq!(wait, 0);
+                    false
+                }),
+                Pumped::Took { late: true }
+            );
         }
         assert_eq!(
-            budget.next_at(FINISH_POLL, deadline.end()),
-            DrainStep::Spent
+            budget.poll_at(FINISH_POLL, deadline.end(), |_| panic!(
+                "spent budget polled"
+            )),
+            Pumped::Exhausted
         );
-        assert_eq!(budget.next_at(FINISH_POLL, at), DrainStep::Spent);
+        assert_eq!(
+            budget.poll_at(FINISH_POLL, at, |_| panic!("spent budget polled")),
+            Pumped::Exhausted
+        );
+    }
+
+    #[test]
+    fn an_empty_late_poll_spends_the_budget_and_a_spent_budget_never_captures() {
+        let mut budget = DrainBudget::late();
+        assert_eq!(
+            budget.poll(Duration::ZERO, |_| true),
+            Pumped::Empty { late: true }
+        );
+        let device = super::super::mock::Recorder::new(super::super::mock::Closing::Never);
+        device.install();
+        let mut recorder = super::super::mock::recorder_api()
+            .create_recorder(&super::super::RecorderOptions::new(
+                super::super::SourceSpec::new("spent budget").unwrap(),
+            ))
+            .unwrap();
+        let before = device.captures.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(
+            recorder.pump(&mut budget, FINISH_POLL, &mut |_| panic!(
+                "spent budget emitted"
+            )),
+            Pumped::Exhausted
+        );
+        assert_eq!(
+            device.captures.load(std::sync::atomic::Ordering::Acquire),
+            before
+        );
     }
 
     #[test]

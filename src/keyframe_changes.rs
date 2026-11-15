@@ -5,7 +5,11 @@ use std::{
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
-use crate::{advanced::VideoPacketFormat, change_feed::ChangeFeed, timeout::Deadline};
+use crate::{
+    advanced::VideoPacketFormat,
+    change_feed::ChangeFeed,
+    timeout::{Deadline, NeverStop},
+};
 
 type SelectorKey = Option<u32>;
 
@@ -83,13 +87,15 @@ impl KeyframeChanges {
             if observer.changed() {
                 return true;
             }
-            let changed = self.changes.wait_since(generation, deadline, |timeout| {
-                if !native_wait(timeout) {
-                    return false;
-                }
-                self.publish(&mut required);
-                true
-            });
+            let changed = self
+                .changes
+                .wait_since(generation, deadline, NeverStop, |timeout| {
+                    if !native_wait(timeout) {
+                        return false;
+                    }
+                    self.publish(&mut required);
+                    true
+                });
             if observer.changed() {
                 return true;
             }

@@ -108,9 +108,44 @@ fn exercise_target() {
         requests().last().unwrap(),
         receiver.connection_target().name()
     );
+    #[cfg(feature = "tokio")]
+    {
+        let before = requests();
+        rejected_async_requests(
+            Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap(),
+        );
+        assert_eq!(
+            requests(),
+            before,
+            "refused async inputs issued native requests"
+        );
+    }
     // Retrying after the contention must send exactly the retained target.
     let target = receiver.connection_target();
     receiver.disconnect();
     receiver.reconnect();
     assert_eq!(requests().last().unwrap(), target.name());
+}
+
+#[cfg(feature = "tokio")]
+fn rejected_async_requests(receiver: Receiver) {
+    use grafton_ndi::asynchronous::{AsyncReceiver, Tokio};
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+        time::Duration,
+    };
+    let receiver = AsyncReceiver::<Tokio>::new(receiver);
+    let mut context = Context::from_waker(Waker::noop());
+    let source = Source::new("bad\0async source");
+    let mut connect = std::pin::pin!(receiver.connect_to(&source));
+    assert!(matches!(
+        connect.as_mut().poll(&mut context),
+        Poll::Ready(Err(Error::InvalidCString(_)))
+    ));
+    let mut change = std::pin::pin!(receiver.poll_source_name_change(Duration::ZERO));
+    assert!(matches!(
+        change.as_mut().poll(&mut context),
+        Poll::Ready(Err(Error::UnsupportedCapability { .. }))
+    ));
 }

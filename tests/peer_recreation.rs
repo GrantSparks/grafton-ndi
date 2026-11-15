@@ -165,7 +165,7 @@ impl<'a> Run<'a> {
             second: None,
             alone: None,
             reconnected: None,
-            stats: receiver.connection_stats(),
+            stats: receiver.connection_stats().unwrap(),
             sender_connections: String::new(),
             table: None,
         };
@@ -186,7 +186,7 @@ impl<'a> Run<'a> {
                 receiver.reconnect();
                 cycle.reconnected = Some(self.await_frame(&receiver, GRACE));
             }
-            cycle.stats = receiver.connection_stats();
+            cycle.stats = receiver.connection_stats().unwrap();
         }
         cycle.sender_connections = match self.sender.connection_count(Duration::ZERO) {
             Ok(count) => format!("sender connections {count}"),
@@ -203,7 +203,7 @@ impl<'a> Run<'a> {
         let mut outcome = Outcome::default();
         while since.elapsed() < limit {
             self.sender.send_video(&self.video).unwrap();
-            if outcome.counted.is_none() && receiver.connection_stats().connections() > 0 {
+            if outcome.counted.is_none() && receiver.connection_stats().unwrap().connections() > 0 {
                 outcome.counted = Some(since.elapsed());
             }
             if receiver.video().capture(SLICE).unwrap().is_some() {

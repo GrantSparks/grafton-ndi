@@ -9,7 +9,7 @@ use super::{
 };
 #[cfg(ndi_has_advanced_kvm)]
 use crate::sys::bindings::NDIlib_recv_instance_t;
-#[cfg(any(doc, test, ndi_has_advanced_kvm))]
+#[cfg(any(doc, test))]
 use crate::Error;
 use crate::{
     sys::advanced::{native, Kvm},
@@ -106,12 +106,7 @@ macro_rules! kvm_send {
         // SAFETY: the receiver instance is live for the session's shared
         // borrow, and every argument outlives this synchronous call. Like
         // PTZ controls, this call may overlap shared use of the receiver.
-        let sent = unsafe { $session.kvm.$func($session.instance() $(, $arg)*) };
-        if sent {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed { operation: stringify!($func) })
-        }
+        unsafe { $session.kvm.named().$func($session.instance() $(, $arg)*) }.performed()
     }};
 }
 

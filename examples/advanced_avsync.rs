@@ -52,7 +52,7 @@ fn main() -> Result<(), Error> {
     let mut retained_audio: Option<AudioFrame> = None;
     for _ in 0..120 {
         // Native synchronization consumes notifications; query current state.
-        let connections = sync.receiver().connection_stats().connections();
+        let connections = sync.receiver().connection_stats()?.connections();
         if previous_connections != Some(connections) {
             println!("{connections} connections");
             previous_connections = Some(connections);

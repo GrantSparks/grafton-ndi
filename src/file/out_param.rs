@@ -74,6 +74,17 @@ pub(super) fn checked_fill<T: Copy + Default>(
     Ok(available.then_some(value))
 }
 
+/// Fill required guarded storage, preserving the native entry-point failure.
+pub(super) fn required_fill<T: Copy + Default>(
+    call: impl FnOnce(*mut T) -> crate::sys::table::Called<bool>,
+) -> Result<T> {
+    let mut out = OutParam::<T>::new();
+    let called = call(out.as_mut_ptr());
+    let value = out.read()?;
+    called.performed()?;
+    Ok(value)
+}
+
 /// Capture a raw event without decoding its payload. Recorder callers must
 /// observe it in the session ledger before any fallible payload conversion.
 ///
@@ -106,6 +117,31 @@ pub(super) fn capture_event<T: Copy + Default, K: PartialEq>(
 mod tests {
     use super::*;
     use crate::sys::{self, bindings::*};
+
+    #[test]
+    fn required_fill_preserves_the_failure_but_checks_corruption_first() {
+        for corrupt in [false, true] {
+            let result = required_fill(|out: *mut u64| {
+                if corrupt {
+                    // SAFETY: the helper's guard contains this first byte past u64.
+                    unsafe { out.cast::<u8>().add(size_of::<u64>()).write(0) };
+                }
+                sys::table::for_test(false, c"NDIlib_file_player_probe_file")
+            });
+            if corrupt {
+                assert!(matches!(
+                    result,
+                    Err(Error::UnexpectedSdkResult(
+                        crate::SdkResultDefect::FileStructureTooLarge { .. }
+                    ))
+                ));
+            } else {
+                assert!(
+                    matches!(result, Err(Error::NativeOperationFailed { operation }) if operation == c"NDIlib_file_player_probe_file")
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_write_within_the_layout_is_returned() {

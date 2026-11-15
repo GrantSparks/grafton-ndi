@@ -97,11 +97,11 @@ fn cancelling_a_close_releases_executor_state_before_pruning_replies() {
     let control = Arc::new(Control::new());
     let weak = Arc::downgrade(&control);
     let (waker, released) = drop_probe(move || weak.upgrade().unwrap().closing.try_lock().is_ok());
-    let mut future = FileOperation::live(control.request_close_now());
+    let mut future = FileOperation::live(control.request_close_now(|| {}));
     assert!(poll(&mut future, &waker).is_pending());
     drop(waker);
     drop(future);
-    let _next = FileOperation::live(control.request_close_now());
+    let _next = FileOperation::live(control.request_close_now(|| {}));
     assert_released_unlocked(released);
 }
 
@@ -266,7 +266,7 @@ fn events_and_closure_during_waker_cloning_are_observed_by_the_same_poll() {
             let events = weak.upgrade().unwrap();
             assert!(events.0.try_lock().is_ok());
             if close {
-                events.close(false);
+                events.close(EventEnd::Stopped);
             } else {
                 events.push(Ok(7));
             }
@@ -348,7 +348,7 @@ fn expiration_and_close_wake_without_cloning_and_pending_polls_rearm() {
     assert_eq!(probe.wakes.load(Ordering::Relaxed), 1);
     assert!(poll(&mut future, &waker).is_pending());
     assert_eq!(probe.clones.load(Ordering::Relaxed), 2);
-    events.close(false);
+    events.close(EventEnd::Stopped);
     assert_eq!(probe.wakes.load(Ordering::Relaxed), 2);
     assert_eq!(probe.clones.load(Ordering::Relaxed), 2);
     assert!(matches!(
@@ -498,6 +498,6 @@ fn owners_whose_callbacks_release_each_others_last_handles_do_not_join_in_a_cycl
         .recv_timeout(Duration::from_secs(1))
         .unwrap();
     block_on(sending).unwrap();
-    block_on(first_control.request_close()).unwrap();
-    block_on(second_control.request_close()).unwrap();
+    block_on(first_control.request_close(|| {})).unwrap();
+    block_on(second_control.request_close(|| {})).unwrap();
 }

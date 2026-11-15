@@ -235,8 +235,7 @@ fn a_failed_reset_keeps_the_old_recorder_and_its_finalization_pending() {
             SourceSpec::new("replacement").unwrap()
         )),
         Err(Error::NativeOperationFailed {
-            operation: "recorder creation"
-        })
+            operation}) if operation.name() == c"NDIlib_file_recorder_create"
     ));
     assert_eq!(old.destroys.load(Ordering::Acquire), 0);
     assert_eq!(recorder.state(), RecorderState::Stopping);
@@ -275,14 +274,55 @@ fn a_malformed_close_event_still_closes_the_session() {
     let mut event = mock::recorder_event(FILE_CLOSED, TAKE);
     event.source_format_payload.video_track_count = 3;
     device.push_event(event);
-    while recorder
-        .poll_event(Duration::ZERO)
-        .is_ok_and(|event| event.is_some())
-    {}
+    let mut closed = None;
+    while let Some(event) = recorder.poll_event(Duration::ZERO).unwrap() {
+        if event.kind() == RecorderEventKind::FileClosed {
+            closed = Some(event);
+        }
+    }
+    let event = closed.expect("the format must not hide the close event");
+    assert_eq!(event.path().to_str().unwrap(), TAKE);
+    assert_eq!(
+        event.source_format(),
+        Err(crate::SdkResultDefect::FileTrackCount {
+            count: 3,
+            capacity: 2
+        })
+    );
     assert!(matches!(
         recorder.wait_finished(Duration::from_millis(50)).unwrap(),
         FinishStatus::Closed(_)
     ));
+}
+
+#[test]
+fn an_unreadable_player_format_preserves_its_ended_event_and_probe_information() {
+    let api = FileApi::with_tables(mock::playback_with_unreadable_formats(), mock::recording());
+    let mut player = api
+        .create_player(&PlayerOptions::new("mock player"))
+        .unwrap();
+    let event = player.poll_event(Duration::ZERO).unwrap().unwrap();
+    assert_eq!(event.kind(), PlayerEventKind::Ended);
+    assert_eq!(event.path().to_str().unwrap(), "p");
+    assert_eq!(event.first_pts().ticks(), 42);
+    assert_eq!(
+        event.source_format(),
+        Err(crate::SdkResultDefect::NegativeFormatCount {
+            what: "audio sample count",
+            value: -1
+        })
+    );
+    let info = api.probe("mock.mkv").unwrap();
+    assert_eq!(info.duration().value().ticks(), 123);
+    assert!(info.duration().is_final());
+    assert_eq!(info.track_count(), 4);
+    assert_eq!(
+        info.source_format(),
+        Err(crate::SdkResultDefect::FileTrackCount {
+            count: 3,
+            capacity: 2
+        })
+    );
 }
 
 #[test]
@@ -681,6 +721,30 @@ fn a_malformed_stale_event_is_consumed_before_the_native_start() {
         recorder.finish(Duration::from_secs(1)).unwrap(),
         FinishStatus::Closed(_)
     ));
+}
+
+#[test]
+fn refused_starts_name_the_actual_timecode_entry_point() {
+    for (timecode, expected) in [
+        (RecordingTimecode::Preserve, c"NDIlib_file_recorder_start"),
+        (
+            RecordingTimecode::GenerateFrom(
+                SessionTimecode::new(crate::Timecode::from_ticks(123)).unwrap(),
+            ),
+            c"NDIlib_file_recorder_start_with_timecode",
+        ),
+    ] {
+        let device = mock::Recorder::new(Closing::AtStop);
+        device.install();
+        let mut recorder = mock::recorder_api()
+            .create_recorder(&RecorderOptions::new(
+                SourceSpec::new("mock source").unwrap(),
+            ))
+            .unwrap();
+        device.fail_next_start.store(true, Ordering::Release);
+        assert!(matches!(recorder.start(&target("unopenable"), timecode),
+            Err(Error::NativeOperationFailed { operation }) if operation == expected));
+    }
 }
 
 #[test]
@@ -1203,8 +1267,7 @@ fn values_a_refused_call_was_given_stay_with_the_caller_to_pass_again() {
     assert!(matches!(
         recorder.reset(&options),
         Err(Error::NativeOperationFailed {
-            operation: "recorder creation"
-        })
+            operation}) if operation.name() == c"NDIlib_file_recorder_create"
     ));
     replacement.refuse_creation.store(false, Ordering::Release);
     replacement.install();

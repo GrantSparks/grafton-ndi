@@ -21,7 +21,7 @@ fn controls(receiver: &Receiver<AvSyncAttached>) {
     metadata(receiver);
     video(receiver);
     receiver.set_tally(Tally::new(true, false));
-    let _ = receiver.connection_stats();
+    let _ = receiver.connection_stats().unwrap();
     let _ = receiver.ptz().is_supported();
     let _ = receiver.request_keyframe();
     let _ = receiver.send_metadata(&MetadataFrame::new("<sync/>").unwrap());

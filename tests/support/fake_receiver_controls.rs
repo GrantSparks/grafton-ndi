@@ -75,7 +75,7 @@ export! {
             drop(unsafe { Box::from_raw(samples) });
         }
     }
-    fn NDIlib_framesync_audio_queue_depth(_instance: NDIlib_framesync_instance_t) -> i32 { 42 }
+    fn NDIlib_framesync_audio_queue_depth(_instance: NDIlib_framesync_instance_t) -> i32 { if negative_count() == "queue-depth" { -1 } else { 42 } }
 }
 
 // These functions are declared only by installed Advanced headers. The crate's

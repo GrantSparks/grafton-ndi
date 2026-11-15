@@ -111,6 +111,9 @@ fn native_resource_ownership() {
         "retained_concurrent_failover",
         "retained_routes",
         "retained_connection_targets",
+        "retained_receiver_name",
+        "retained_receiver_metadata",
+        "retained_registered_receiver_name",
         "sender_unregistered",
         "sender_copy_reuse",
         "sender_registration",
@@ -125,7 +128,9 @@ fn native_resource_ownership() {
     if cfg!(feature = "advanced") {
         scenarios.extend([
             "compressed_destroy",
+            "retained_router_metadata",
             "compressed_close",
+            "compressed_finish",
             "queue_immediate",
             "queue_backlog",
             "queue_split",
@@ -147,7 +152,10 @@ fn native_resource_ownership() {
                 "GRAFTON_OWNERSHIP_LIBRARY",
                 if case == "queue_scatter_unavailable" {
                     &missing_scatter
-                } else if case.starts_with("queue_") || case.starts_with("compressed_") {
+                } else if case.starts_with("queue_")
+                    || case.starts_with("compressed_")
+                    || case == "retained_router_metadata"
+                {
                     &advanced
                 } else {
                     &standard
@@ -199,7 +207,9 @@ fn native_resource_ownership() {
     fs::remove_dir_all(directory).unwrap();
 }
 fn child(case: &str) {
-    let advanced = case.starts_with("queue_") || case.starts_with("compressed_");
+    let advanced = case.starts_with("queue_")
+        || case.starts_with("compressed_")
+        || case == "retained_router_metadata";
     let path = PathBuf::from(std::env::var_os("GRAFTON_OWNERSHIP_LIBRARY").unwrap());
     let ndi = Ndi::with_options(&RuntimeOptions::default().library_path(path).edition(
         if advanced {
@@ -370,6 +380,139 @@ fn child(case: &str) {
                 ],
             );
         }
+        "retained_receiver_metadata" => {
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+            for index in 0..16 {
+                let frame = grafton_ndi::MetadataFrame::new(format!("<entry index='{index}'/>"))
+                    .unwrap()
+                    .with_timecode(grafton_ndi::Timecode::from_ticks(index));
+                receiver.add_connection_metadata(&frame).unwrap();
+            }
+            receiver
+                .connect_to(&Source::new("metadata target"))
+                .unwrap();
+            receiver.reconnect();
+            receiver.clear_connection_metadata().unwrap();
+            receiver
+                .add_connection_metadata(&grafton_ndi::MetadataFrame::new("<last/>").unwrap())
+                .unwrap();
+            drop(receiver);
+            let events = log();
+            for index in 0..16 {
+                let expected = format!(
+                    "retained-metadata:receiver:{}:{index}",
+                    hex(format!("<entry index='{index}'/>").as_bytes())
+                );
+                assert_eq!(events.lines().filter(|line| *line == expected).count(), 3);
+            }
+            assert!(events.contains(&format!("retained-metadata:receiver:{}:", hex(b"<last/>"))));
+        }
+        #[cfg(feature = "advanced")]
+        "retained_router_metadata" => {
+            let mut router = grafton_ndi::routing::Router::new(
+                &ndi,
+                &grafton_ndi::routing::RouterOptions::new("metadata router"),
+            )
+            .unwrap();
+            for index in 0..16 {
+                router
+                    .add_connection_metadata(
+                        &grafton_ndi::MetadataFrame::new(format!("<entry index='{index}'/>"))
+                            .unwrap()
+                            .with_timecode(grafton_ndi::Timecode::from_ticks(index)),
+                    )
+                    .unwrap();
+            }
+            router.change(&Source::new("metadata target")).unwrap();
+            router.clear_connection_metadata().unwrap();
+            router
+                .add_connection_metadata(&grafton_ndi::MetadataFrame::new("<last/>").unwrap())
+                .unwrap();
+            drop(router);
+            let events = log();
+            for index in 0..16 {
+                let expected = format!(
+                    "retained-metadata:router:{}:{index}",
+                    hex(format!("<entry index='{index}'/>").as_bytes())
+                );
+                assert_eq!(events.lines().filter(|line| *line == expected).count(), 2);
+            }
+            assert!(events.contains(&format!("retained-metadata:router:{}:", hex(b"<last/>"))));
+        }
+        "retained_receiver_name" | "retained_registered_receiver_name" => {
+            let name = "retained receiver creation name";
+            let options = ReceiverOptions::new(Source::new("")).name(name);
+            let receiver = Receiver::new(&ndi, &options).unwrap();
+            drop(options);
+            receiver.connect_to(&Source::new("named target")).unwrap();
+            receiver.reconnect();
+            if case == "retained_registered_receiver_name" {
+                let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
+                let _registration = advertiser
+                    .register(&receiver, RecvAdvertisement::default())
+                    .unwrap();
+                drop(receiver);
+                assert!(!log().contains("receiver-destroy\n"));
+                drop(advertiser);
+            } else {
+                drop(receiver);
+            }
+            let expected = format!("retained-receiver-name:{}", hex(name.as_bytes()));
+            let events = log();
+            let reads: Vec<_> = events
+                .lines()
+                .filter(|line| line.starts_with("retained-receiver-name:"))
+                .collect();
+            assert_eq!(
+                reads,
+                [expected.as_str(), expected.as_str(), expected.as_str()]
+            );
+        }
+        #[cfg(feature = "advanced")]
+        "compressed_finish" => {
+            use grafton_ndi::{
+                advanced::{
+                    CompressedSender, CompressedVideoFrame, SubmittedVideo, VideoCodec,
+                    VideoPacketFormat,
+                },
+                StreamTier,
+            };
+            std::env::set_var("GRAFTON_FAKE_VALIDATE_COMPRESSED_LOANS", "1");
+            let mut sender =
+                CompressedSender::new(&ndi, &SenderOptions::new("compressed-finish")).unwrap();
+            for (tier, value) in [(StreamTier::Program, 11), (StreamTier::Preview, 22)] {
+                let format = VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16)
+                    .unwrap()
+                    .with_tier(tier);
+                let frame = CompressedVideoFrame::new(format, vec![value; 16]).unwrap();
+                assert!(sender.send_video_async(frame).is_none());
+            }
+            let reclaimed = sender.finish_video_async();
+            let events = log();
+            assert_eq!(events.matches("sender-flush\n").count(), 1);
+            assert!(!events.contains("sender-destroy-begin\n"));
+            for value in [11, 22] {
+                assert!(
+                    position(&events, "sender-flush")
+                        < position(&events, &format!("sender-loan-released={value}"))
+                );
+            }
+            let empty = sender.split().0.finish_video_async();
+            assert!(empty.program.is_none() && empty.preview.is_none());
+            assert_eq!(log(), events, "an empty finish makes no native call");
+            for (frame, value) in [
+                (reclaimed.program.unwrap(), 11),
+                (reclaimed.preview.unwrap(), 22),
+            ] {
+                let SubmittedVideo::Contiguous(frame) = frame else {
+                    panic!("contiguous frame");
+                };
+                assert_eq!(frame.data()[0], value);
+                assert!(sender.send_video_async(frame).is_none());
+            }
+            drop(sender);
+            assert!(position(&log(), "sender-flush") < position(&log(), "sender-destroy-begin"));
+        }
         #[cfg(feature = "advanced")]
         "compressed_destroy" | "compressed_close" => {
             use grafton_ndi::{
@@ -384,7 +527,7 @@ fn child(case: &str) {
                     .unwrap()
                     .with_tier(tier);
                 let frame = CompressedVideoFrame::new(format, vec![value; 16]).unwrap();
-                assert!(sender.send_video_async(frame).unwrap().is_none());
+                assert!(sender.send_video_async(frame).is_none());
             }
             if case == "compressed_close" {
                 let reclaimed = sender.close();
@@ -610,8 +753,7 @@ fn child(case: &str) {
             assert!(matches!(
                 rejected.error(),
                 Error::NativeOperationFailed {
-                    operation: "unregister sender"
-                }
+                    operation} if operation.name() == c"NDIlib_send_advertiser_del_sender"
             ));
             assert!(!log().contains("sender-destroy\n"));
             std::env::remove_var("GRAFTON_FAKE_ADVERTISER_REMOVE");
@@ -631,8 +773,7 @@ fn child(case: &str) {
             assert!(matches!(
                 rejected.error(),
                 Error::NativeOperationFailed {
-                    operation: "unregister receiver"
-                }
+                    operation} if operation.name() == c"NDIlib_recv_advertiser_del_receiver"
             ));
             assert!(!log().contains("receiver-destroy\n"));
             std::env::remove_var("GRAFTON_FAKE_ADVERTISER_REMOVE");

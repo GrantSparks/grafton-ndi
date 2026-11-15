@@ -88,6 +88,7 @@ const VARIANTS: &[Variant] = &[
             "null_snapshot_arrays_are_refused",
             "owners_move_between_threads",
             "routing",
+            "native_failure_names",
         ],
     },
 ];
@@ -852,6 +853,81 @@ fn child(scenario: &str) {
             // receivers' owners.
             assert!(!events.contains("sender-destroy\n"));
             assert!(!events.contains("receiver-destroy\n"));
+        }
+
+        "native_failure_names" => {
+            let assert_name = |error: Error, expected: &std::ffi::CStr| {
+                assert!(
+                    matches!(error, Error::NativeOperationFailed { operation } if operation == expected)
+                );
+            };
+            let mut router = Router::new(&ndi, &RouterOptions::new("refusal names")).unwrap();
+            std::env::set_var("GRAFTON_FAKE_ROUTING_CHANGE", "refuse");
+            assert_name(
+                router.change(&Source::new("target")).unwrap_err(),
+                c"NDIlib_routing_change",
+            );
+            std::env::remove_var("GRAFTON_FAKE_ROUTING_CHANGE");
+            std::env::set_var("GRAFTON_FAKE_ROUTING_CLEAR", "refuse");
+            assert_name(router.clear().unwrap_err(), c"NDIlib_routing_clear");
+            std::env::remove_var("GRAFTON_FAKE_ROUTING_CLEAR");
+
+            let sender = Sender::new(&ndi, &SenderOptions::new("refused registration")).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+            let mut send_advertiser = SendAdvertiser::new(&ndi, &advertisers).unwrap();
+            let mut recv_advertiser = RecvAdvertiser::new(&ndi, &advertisers).unwrap();
+            std::env::set_var("GRAFTON_FAKE_ADVERTISER_ADD", "refuse");
+            assert_name(
+                send_advertiser
+                    .register(&sender, SendAdvertisement::default())
+                    .unwrap_err(),
+                c"NDIlib_send_advertiser_add_sender",
+            );
+            assert_name(
+                recv_advertiser
+                    .register(&receiver, RecvAdvertisement::default())
+                    .unwrap_err(),
+                c"NDIlib_recv_advertiser_add_receiver",
+            );
+            std::env::remove_var("GRAFTON_FAKE_ADVERTISER_ADD");
+            let send_registration = send_advertiser
+                .register(&sender, SendAdvertisement::default())
+                .unwrap();
+            let recv_registration = recv_advertiser
+                .register(&receiver, RecvAdvertisement::default())
+                .unwrap();
+            std::env::set_var("GRAFTON_FAKE_ADVERTISER_REMOVE", "refuse");
+            for (rejected, expected) in [
+                (
+                    send_advertiser
+                        .unregister(send_registration)
+                        .map_err(|rejected| rejected.into_parts().0),
+                    c"NDIlib_send_advertiser_del_sender",
+                ),
+                (
+                    recv_advertiser
+                        .unregister(recv_registration)
+                        .map_err(|rejected| rejected.into_parts().0),
+                    c"NDIlib_recv_advertiser_del_receiver",
+                ),
+            ] {
+                assert_name(rejected.unwrap_err(), expected);
+            }
+            std::env::remove_var("GRAFTON_FAKE_ADVERTISER_REMOVE");
+
+            let mut listener = RecvListener::new(&ndi, &listeners).unwrap();
+            let snapshot = listener.snapshot().unwrap();
+            let receiver = snapshot[0].id().unwrap();
+            std::env::set_var("GRAFTON_FAKE_LISTENER_CONNECT", "refuse");
+            assert_name(
+                listener.request_connect(receiver, "target").unwrap_err(),
+                c"NDIlib_recv_listener_send_connect",
+            );
+            assert_name(
+                listener.request_disconnect(receiver).unwrap_err(),
+                c"NDIlib_recv_listener_send_connect",
+            );
+            std::env::remove_var("GRAFTON_FAKE_LISTENER_CONNECT");
         }
         "routing" => {
             let mut router =

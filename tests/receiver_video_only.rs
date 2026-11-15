@@ -91,8 +91,8 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
                  audio frames; the {bandwidth:?} receiver of {:?} reports {:?}, the ordinary \
                  one {:?}, and the sender counts {:?} connections{}",
                 receiver.connection_target(),
-                receiver.connection_stats(),
-                ordinary.connection_stats(),
+                receiver.connection_stats().unwrap(),
+                ordinary.connection_stats().unwrap(),
                 sender.connection_count(Duration::ZERO),
                 common::port_of(&receiver.connection_target())
                     .and_then(common::socket_table)

@@ -101,8 +101,9 @@ pub(crate) unsafe trait FrameFree: sealed::Sealed + 'static {
     ///
     /// - `instance` must be the instance that produced `frame`, created through
     ///   the runtime `core` belongs to.
-    /// - `frame` must have been populated by a successful capture for this
-    ///   strategy and not already freed.
+    /// - `frame` must belong to this strategy's capture/free family and not
+    ///   already have been freed. Empty request/result descriptors are allowed
+    ///   when that strategy's release explicitly accepts null storage.
     unsafe fn free(core: &sys::Core, instance: Self::Instance, frame: &mut Self::RawFrame);
 }
 
@@ -141,12 +142,8 @@ pub(crate) trait CaptureStrategy:
 
     /// Wrap a freshly captured frame guard in its borrowed view, validating any
     /// kind-specific invariants (e.g. FourCC) during construction.
-    ///
-    /// # Safety
-    ///
-    /// `guard` must own a frame that a receiver capture reported as
-    /// [`FRAME_TYPE`](Self::FRAME_TYPE).
-    unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>>
+    /// The guard carries the delivered storage contract for this frame kind.
+    fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>>
     where
         Self: CaptureKind;
 
@@ -184,7 +181,7 @@ impl CaptureStrategy for VideoKind {
         &mut slots.video
     }
 
-    unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
+    fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
         VideoFrameRef::new(guard)
     }
 
@@ -220,7 +217,7 @@ impl CaptureStrategy for AudioKind {
         &mut slots.audio
     }
 
-    unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
+    fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
         AudioFrameRef::new(guard)
     }
 
@@ -256,7 +253,7 @@ impl CaptureStrategy for MetadataKind {
         &mut slots.metadata
     }
 
-    unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
+    fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
         MetadataFrameRef::new(guard)
     }
 
@@ -378,8 +375,11 @@ unsafe impl FrameFree for AvSyncAudioFree {
 ///
 /// # Safety
 ///
-/// This struct stores raw FFI types and must only be created through the `unsafe fn new()`
-/// constructor, which requires the caller to guarantee validity of the instance and frame.
+/// Its unsafe constructors establish the delivered-frame invariant: every
+/// non-null pointer retains the initialized active storage and readable metadata
+/// described by the frame, unchanged until matching release. Empty descriptors
+/// may have null pointers. Only `new` and the test-only `with_test_free` create
+/// guards; safe borrowed views rely on this invariant.
 pub struct Guard<'owner, S: FrameFree> {
     instance: S::Instance,
     frame: S::RawFrame,
@@ -426,9 +426,16 @@ impl<'owner, S: FrameFree> Guard<'owner, S> {
     /// The caller must ensure that:
     /// - `instance` is a valid instance for the free strategy `S`, created
     ///   through `runtime`
-    /// - `frame` was populated by a successful capture for `S` and not yet freed
-    /// - the owning instance and captured allocation remain valid for all of
-    ///   `'owner`; callers must tie this lifetime to a borrow of that owner
+    /// - `frame` belongs to the matching capture/free family `S` and has not
+    ///   been freed. Until this guard releases it, every non-null pointer
+    ///   describes live storage valid for that descriptor: active pixel rows
+    ///   or channel samples are initialized, and metadata is readable through
+    ///   its first NUL or `MAX_METADATA_BYTES`. Standalone metadata with a
+    ///   positive declared length retains that complete readable extent;
+    ///   length zero uses the same bounded NUL rule. Padding need not be initialized.
+    /// - the owning instance and all described storage remain valid and
+    ///   unchanged for `'owner`; tie this lifetime to a borrow of that owner.
+    ///   Null request descriptors and empty synchronization results are valid.
     pub(crate) unsafe fn new(
         runtime: &'owner Ndi,
         instance: S::Instance,
@@ -447,7 +454,9 @@ impl<'owner, S: FrameFree> Guard<'owner, S> {
     ///
     /// # Safety
     ///
-    /// All buffers referenced by `frame` must remain valid for `'owner`.
+    /// The descriptor obeys the same delivered-frame storage invariant as
+    /// [`Self::new`]: every non-null pointer retains its described initialized
+    /// active extent and bounded metadata, unchanged for `'owner`.
     /// `free` must accept this synthetic instance and frame, including on
     /// validation failure or panic, without releasing independently owned data.
     /// It must also honor the strategy's threading guarantees: receiver guards
@@ -651,12 +660,12 @@ impl<'rx> Captured<'rx> {
     }
 }
 
-/// Capture a frame of kind `K` from the receiver `lock` holds the capture
-/// guard of, within what is left of the lock's attempt.
+/// Capture a frame of kind `K` from the receiver and within the remaining
+/// attempt identified by the [`CaptureLock`] proof `lock`.
 ///
 /// Gives `NDIlib_recv_capture_v3` the slot of kind `K` alone; any other
 /// result is classified by [`Notification::classify`]. The frame's guard
-/// borrows the receiver for `'rx`, as the lock does, and outlives the lock.
+/// borrows the receiver for `'rx`, as the proof does, and can outlive the proof.
 pub(crate) fn capture_raw<'rx, K: CaptureKind>(
     lock: &CaptureLock<'rx>,
 ) -> Result<CaptureResult<'rx, K>> {
@@ -730,8 +739,8 @@ pub(crate) enum Delivered<'rx, S: SlotSet> {
     Notification(Notification),
 }
 
-/// Capture with slot set `S` from the receiver `lock` holds the capture
-/// guard of, within what is left of the lock's attempt.
+/// Capture with slot set `S` from the receiver and within the remaining
+/// attempt identified by the [`CaptureLock`] proof `lock`.
 ///
 /// Any delivered media is wrapped in the guard of its kind, as
 /// [`capture_raw`] does for one kind; any other result is classified by
@@ -786,7 +795,7 @@ mod tests {
         drop(make_guard());
         assert_eq!(releases.load(Ordering::SeqCst), 1);
 
-        let rejected = unsafe { VideoFrameRef::new(make_guard()) };
+        let rejected = VideoFrameRef::new(make_guard());
         assert!(rejected.is_err());
         assert_eq!(releases.load(Ordering::SeqCst), 2);
         drop(rejected);

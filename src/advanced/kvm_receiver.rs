@@ -132,7 +132,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     }
 
     /// Query reception statistics; see [`Receiver::connection_stats`].
-    pub fn connection_stats(&self) -> ConnectionStats {
+    pub fn connection_stats(&self) -> Result<ConnectionStats> {
         self.receiver.connection_stats()
     }
 

@@ -10,6 +10,7 @@ fn main() {
         .build()
         .unwrap();
     let _: PixelFormat = frame.pixel_format();
-    let _: &[u8] = frame.data();
+    let _: &[u8] = frame.storage();
+    let _: Option<&[u8]> = frame.data();
     let _: grafton_ndi::VideoFrame = frame.to_owned();
 }

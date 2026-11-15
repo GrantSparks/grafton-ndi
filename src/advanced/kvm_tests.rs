@@ -138,8 +138,7 @@ fn empty_touch_finishes_and_failed_lifts_are_retried() {
         assert!(matches!(
             session.touch(&[]),
             Err(Error::NativeOperationFailed {
-                operation: "NDIlib_recv_kvm_send_touch_finish"
-            })
+                operation}) if operation.name() == c"NDIlib_recv_kvm_send_touch_finish"
         ));
         assert!(session.touching);
         if !retry_on_drop {
@@ -187,8 +186,7 @@ fn rejected_releases_are_retained_and_drop_retries_only_the_inputs_still_pressed
     assert!(matches!(
         session.release_all(),
         Err(Error::NativeOperationFailed {
-            operation: "NDIlib_recv_kvm_send_keyboard_release"
-        })
+            operation}) if operation.name() == c"NDIlib_recv_kvm_send_keyboard_release"
     ));
     assert_eq!(session.keys.len(), 1);
     assert!(session.buttons.is_empty());

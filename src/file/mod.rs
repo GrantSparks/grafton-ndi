@@ -179,7 +179,9 @@ pub use types::*;
 
 use std::path::{Path, PathBuf};
 
-use crate::{capabilities::CapabilityStatus, sys, Error, Ndi, Result};
+#[cfg(any(test, doc))]
+use crate::Error;
+use crate::{capabilities::CapabilityStatus, sys, Ndi, Result};
 #[cfg(test)]
 use out_param::OutParam;
 
@@ -299,7 +301,10 @@ impl FileApi {
     ///   the cause; `detail` retains the diagnostic context.
     /// * [`Error::InvalidInput`] when `options` names a relative path.
     pub fn open(ndi: &Ndi, options: &FileRuntimeOptions) -> Result<Self> {
-        let runtime = sys::select_file(ndi.info(), ndi.api(), options.library_path.as_deref())?;
+        let runtime = sys::select_file(
+            ndi.runtime().selected_runtime(),
+            options.library_path.as_deref(),
+        )?;
         Ok(Self {
             runtime,
             #[cfg(not(test))]
@@ -336,6 +341,8 @@ impl FileApi {
     /// Read a recording's duration and track layout.
     ///
     /// Nothing is played and no NDI source is advertised.
+    /// An unreadable format payload does not discard the other information;
+    /// [`FileInfo::source_format`] reports the typed cause instead.
     ///
     /// # Errors
     ///
@@ -345,18 +352,21 @@ impl FileApi {
     /// relative path cannot be resolved because the current directory is
     /// unavailable, and [`Error::FileFamilyUnavailable`] when the library
     /// does not provide [`FileFamily::Playback`].
+    /// [`Error::UnexpectedSdkResult`] when the library's file information
+    /// does not match this crate's structure layout.
     pub fn probe(&self, path: impl AsRef<Path>) -> Result<FileInfo> {
         let playback = self.table::<sys::FilePlayback>()?;
         let path = types::path_string(path.as_ref())?;
-        let info = out_param::checked_fill(|info| {
+        let info = out_param::required_fill(|info| {
             // SAFETY: `path` is a NUL-terminated string that outlives the
             // call; the helper keeps guarded info storage writable through it.
-            unsafe { playback.NDIlib_file_player_probe_file(path.as_ptr(), info) }
-        })?
-        .ok_or(Error::NativeOperationFailed {
-            operation: "file probe",
+            unsafe {
+                playback
+                    .named()
+                    .NDIlib_file_player_probe_file(path.as_ptr(), info)
+            }
         })?;
-        FileInfo::from_sdk(&info)
+        Ok(FileInfo::from_sdk(&info))
     }
 
     /// Create a player and advertise its NDI source.

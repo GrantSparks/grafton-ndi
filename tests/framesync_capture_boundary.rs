@@ -146,7 +146,7 @@ fn one_framesync_serves_captures_from_several_threads_at_once() {
                                 let _ = framesync.audio_input_format().unwrap();
                             }
                             _ => {
-                                let _ = framesync.audio_queue_depth();
+                                let _ = framesync.audio_queue_depth().unwrap();
                             }
                         }
                         calls += 1;

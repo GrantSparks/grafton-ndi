@@ -84,22 +84,30 @@ fn main() -> Result<(), Error> {
             Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(packet))) => {
                 // Sending needs mutable owned bytes because the SDK writes them.
                 // Reuse one copy per medium instead of allocating per capture.
-                match video_storage.as_mut() {
-                    Some(storage) => packet.copy_into(storage),
-                    None => video_storage = Some(packet.to_owned()),
-                }
-                match sender.send_video(video_storage.as_mut().unwrap()) {
-                    Ok(()) => video += 1,
+                let admitted = match video_storage.as_mut() {
+                    Some(storage) => packet.try_copy_into(storage),
+                    None => CompressedVideoFrame::try_from(&packet)
+                        .map(|frame| video_storage = Some(frame)),
+                };
+                match admitted {
+                    Ok(()) => {
+                        sender.send_video(video_storage.as_mut().unwrap());
+                        video += 1;
+                    }
                     Err(error) => println!("Video packet not relayed: {error}"),
                 }
             }
             Some(PacketItemRef::Audio(ReceivedAudioRef::Compressed(packet))) => {
-                match audio_storage.as_mut() {
-                    Some(storage) => packet.copy_into(storage),
-                    None => audio_storage = Some(packet.to_owned()),
-                }
-                match sender.send_audio(audio_storage.as_mut().unwrap()) {
-                    Ok(()) => audio += 1,
+                let admitted = match audio_storage.as_mut() {
+                    Some(storage) => packet.try_copy_into(storage),
+                    None => CompressedAudioFrame::try_from(&packet)
+                        .map(|frame| audio_storage = Some(frame)),
+                };
+                match admitted {
+                    Ok(()) => {
+                        sender.send_audio(audio_storage.as_mut().unwrap());
+                        audio += 1;
+                    }
                     Err(error) => println!("Audio packet not relayed: {error}"),
                 }
             }
@@ -117,7 +125,7 @@ fn main() -> Result<(), Error> {
             Some(_) => {}
         }
     }
-    let stats = receiver.receiver().connection_stats();
+    let stats = receiver.receiver().connection_stats()?;
     println!(
         "Relayed {video} video and {audio} audio packets; {} video frames dropped",
         stats.video_frames_dropped()

@@ -3,7 +3,9 @@
 
 use std::io::Write;
 
-use super::{color::Sample, options::PngCompression, Channels, ImageShape, Pixels};
+use super::{
+    color::Sample, options::PngCompression, Channels, ImageShape, PixelDensity, Pixels, SampleDepth,
+};
 use crate::{Error, Result};
 
 /// Encode `pixels` as a PNG of `channels` channels into `out`, with a `cICP`
@@ -16,24 +18,36 @@ pub(super) fn encode<P: Sample>(
     shape: ImageShape,
     compression: PngCompression,
     cicp: Option<[u8; 4]>,
+    density: Option<PixelDensity>,
     out: &mut dyn Write,
     row: &mut Vec<u8>,
 ) -> Result<()> {
+    // Complete wrapper storage preparation before the signature, IHDR or cICP.
+    // Eligible RGBA rows borrow the source and need no conversion storage.
+    if pixels.rgba_rows().is_none() {
+        super::resize_scratch(row, shape.row_bytes)?;
+    }
     let mut encoder = ::png::Encoder::new(out, shape.width, shape.height);
     encoder.set_color(match shape.channels {
         Channels::Rgba => ::png::ColorType::Rgba,
         Channels::Rgb => ::png::ColorType::Rgb,
     });
-    encoder.set_depth(if P::BYTES == 1 {
-        ::png::BitDepth::Eight
-    } else {
-        ::png::BitDepth::Sixteen
+    encoder.set_depth(match shape.depth {
+        SampleDepth::Eight => ::png::BitDepth::Eight,
+        SampleDepth::Sixteen => ::png::BitDepth::Sixteen,
     });
     encoder.set_compression(match compression {
         PngCompression::Fast => ::png::Compression::Fast,
         PngCompression::Balanced => ::png::Compression::Balanced,
         PngCompression::High => ::png::Compression::High,
     });
+    if let Some(density) = density {
+        encoder.set_pixel_dims(Some(::png::PixelDimensions {
+            xppu: density.x.into(),
+            yppu: density.y.into(),
+            unit: ::png::Unit::Unspecified,
+        }));
+    }
     let mut writer = encoder.write_header().map_err(png_error)?;
     if let Some(cicp) = cicp {
         // `png` reads `cICP` but does not write it, so the chunk is written
@@ -49,7 +63,6 @@ pub(super) fn encode<P: Sample>(
                 stream.write_all(row)?;
             }
         } else {
-            super::resize_scratch(row, shape.row_bytes)?;
             for y in 0..shape.height as usize {
                 pixels.pack_row(y, shape.channels, row);
                 stream.write_all(row)?;

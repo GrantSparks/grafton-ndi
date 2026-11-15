@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     monitor.reset();
                 }
-                let stats = framesync.receiver().connection_stats();
+                let stats = framesync.receiver().connection_stats()?;
                 let state = monitor.observe(
                     stats.is_connected(),
                     stats.audio_frames_received(),

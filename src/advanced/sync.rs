@@ -10,7 +10,7 @@ use crate::{
     finder::RawSource,
     frames::AudioRef,
     frames::MAX_AUDIO_BYTES,
-    receiver::{AvSyncAttached, ReceiverCore},
+    receiver::{AvSyncAttached, ReceiverCore, Released},
     sys::{
         advanced::{native, AvSync as AvSyncTable, Genlock as GenlockTable},
         bindings::*,
@@ -103,6 +103,10 @@ impl AvSyncRequest {
     fn raw(self) -> NDIlib_audio_frame_v3_t {
         // Lossless: construction keeps both at or below i32::MAX.
         let field = |value: Option<u32>| value.map_or(0, |value| value as i32);
+        // Keep the SDK's default channel field: it does not constrain the
+        // source's channels, even when a rate is stated. The native regression
+        // `avsync_states_rates_for_non_stereo_sources` pins this for mono and
+        // four-channel sources on Advanced 6.3.2 and 6.4.
         NDIlib_audio_frame_v3_t {
             sample_rate: field(self.sample_rate),
             no_samples: field(self.num_samples),
@@ -227,11 +231,7 @@ enum Synchronized {
 }
 
 /// A native synchronizer, destroyed when dropped.
-struct AvResource {
-    #[cfg_attr(
-        not(ndi_has_advanced_av_sync),
-        expect(dead_code, reason = "runtime authorizes native AV sync descriptors")
-    )]
+pub(crate) struct AvResource {
     receiver: Arc<ReceiverCore>,
     #[cfg(ndi_has_advanced_av_sync)]
     handle: AvSyncInstance,
@@ -257,6 +257,16 @@ const _: () = {
     const fn send<T: Send>() {}
     send::<AvResource>();
 };
+
+impl AvResource {
+    pub(crate) fn receiver_core(&self) -> &Arc<ReceiverCore> {
+        &self.receiver
+    }
+
+    fn release(self) -> Released<AvSyncAttached> {
+        Released::<AvSyncAttached>::release(self)
+    }
+}
 
 impl Drop for AvResource {
     fn drop(&mut self) {
@@ -364,18 +374,13 @@ impl AvSync {
         native!(AvSync, table => {
             // SAFETY: the receiver instance is live, and this value keeps it
             // alive for longer than the synchronizer.
-            let handle = unsafe { table.NDIlib_avsync_create(receiver.core.instance.0) };
-            if handle.is_null() {
-                return Err(Rejected::new(
-                    Error::NativeOperationFailed {
-                        operation: "NDIlib_avsync_create",
-                    },
-                    receiver,
-                ));
-            }
+            let handle = match unsafe { table.named().NDIlib_avsync_create(receiver.core.instance.0) }.created() {
+                Ok(handle) => handle.as_ptr(),
+                Err(error) => return Err(Rejected::new(error, receiver)),
+            };
             Ok(Self {
                 resource: AvResource { handle: AvSyncInstance(handle), table, receiver: Arc::clone(&receiver.core) },
-                receiver: receiver.into_mode(),
+                receiver: receiver.attach(),
                 _not_sync: NotSync(PhantomData),
             })
         })
@@ -442,8 +447,7 @@ impl AvSync {
         let Self {
             resource, receiver, ..
         } = self;
-        drop(resource);
-        receiver.into_mode()
+        receiver.detach(resource.release())
     }
 
     /// Fetch the audio that belongs to `video`.
@@ -497,7 +501,9 @@ impl AvSync {
     /// Fetch whatever audio is currently queued, matched to no video frame.
     ///
     /// With [`AvSyncRequest::automatic`] this takes all the queued audio;
-    /// with a sample count, that many samples. Otherwise as for
+    /// with a sample count, it requests that many samples. Inspect the returned
+    /// frame's sample count: a depleted queue can return a shorter tail even
+    /// when the SDK does not report `samples_adjusted`. Otherwise as for
     /// [`synchronize`](Self::synchronize).
     ///
     /// # Errors
@@ -615,13 +621,13 @@ impl<'a> AvSyncCapture<'a> {
                 // and FrameSync beside local connection changes; remote SDK
                 // connection requests likewise cannot be serialized by Rust.
                 let code = unsafe {
-                    table.NDIlib_avsync_synchronize(
+                    table.named().NDIlib_avsync_synchronize(
                         handle.0,
                         video.as_ref().map_or(ptr::null(), |video| video),
                         &mut audio,
                     )
                 };
-                match code {
+                code.map(|code| match code {
                     crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_success => Synchronized::Matched,
                     crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_success_num_samples_not_matched => {
                         Synchronized::Adjusted
@@ -639,34 +645,29 @@ impl<'a> AvSyncCapture<'a> {
                         Synchronized::InternalError
                     }
                     other => Synchronized::Unknown(other),
-                }
+                })
             };
             let instance = AvSyncAudioInstance::Native { handle: handle.0, table };
             // SAFETY: the synchronizer and runtime remain borrowed through
             // the result; its guard returns this descriptor exactly once.
             let guard = unsafe { Guard::new(&self.resource.receiver._ndi, instance, audio) };
-            unsafe { outcome(status, guard) }
+            outcome_with_call(status, guard)
         })
     }
 }
 
 /// Validate one synchronization while its guard owns every returned buffer.
-///
-/// # Safety
-///
-/// For the two successful statuses, `audio` is a frame descriptor whose data
-/// and metadata pointers are null or valid for the layout it describes.
+/// The guard retains every non-null sample or metadata extent, including
+/// empty request descriptors returned for statuses without audio.
 #[cfg(any(test, ndi_has_advanced_av_sync))]
-unsafe fn outcome<'a>(
-    status: Synchronized,
+fn outcome_with_call<'a>(
+    called: crate::sys::table::Called<Synchronized>,
     audio: Guard<'a, AvSyncAudioFree>,
 ) -> Result<AvSyncOutcomeRef<'a>> {
-    Ok(match status {
+    Ok(match *called.value() {
         Synchronized::Matched | Synchronized::Adjusted => {
-            let samples_adjusted = status == Synchronized::Adjusted;
-            // SAFETY: forwarded to the caller; the guard retains the native
-            // descriptor and every buffer throughout validation and borrowing.
-            match unsafe { ValidatedAudio::returned_audio(audio)? } {
+            let samples_adjusted = *called.value() == Synchronized::Adjusted;
+            match ValidatedAudio::returned_audio(audio)? {
                 // The format of an empty result is not reported.
                 ReturnedAudio::Empty(_) => AvSyncOutcomeRef::Empty { samples_adjusted },
                 ReturnedAudio::Samples(validated) => AvSyncOutcomeRef::Audio {
@@ -697,19 +698,28 @@ unsafe fn outcome<'a>(
             }
         }
         Synchronized::InternalError => {
-            return Err(Error::NativeOperationFailed {
-                operation: "NDIlib_avsync_synchronize",
-            });
+            return Err(called.failed());
         }
         Synchronized::Unknown(code) => {
             return Err(Error::UnexpectedSdkResult(
                 crate::SdkResultDefect::UnknownStatus {
-                    operation: "NDIlib_avsync_synchronize",
+                    operation: called.function(),
                     code,
                 },
             ));
         }
     })
+}
+
+#[cfg(test)]
+fn outcome<'a>(
+    status: Synchronized,
+    audio: Guard<'a, AvSyncAudioFree>,
+) -> Result<AvSyncOutcomeRef<'a>> {
+    outcome_with_call(
+        crate::sys::table::for_test(status, c"NDIlib_avsync_synchronize"),
+        audio,
+    )
 }
 
 mod video_sealed {
@@ -976,16 +986,11 @@ impl Genlock {
             // SAFETY: the source descriptor and the configuration point to
             // strings that this value keeps alive for as long as the genlock.
             let handle = unsafe {
-                table.NDIlib_genlock_create(
+                table.named().NDIlib_genlock_create(
                     source.as_ref().map_or(ptr::null(), |source| source.as_raw()),
                     _config.map_or(ptr::null(), AdvancedConfig::as_ptr),
                 )
-            };
-            if handle.is_null() {
-                return Err(Error::NativeOperationFailed {
-                    operation: "NDIlib_genlock_create",
-                });
-            }
+            }.created()?.as_ptr();
             Ok(Self {
                 resource: GenResource {
                     handle: GenlockInstance(handle),
@@ -1152,7 +1157,29 @@ mod tests {
                 |_, _| {},
             )
         };
-        unsafe { outcome(status, guard) }.map(|outcome| outcome.to_owned())
+        outcome(status, guard).map(|outcome| outcome.to_owned())
+    }
+
+    #[test]
+    fn recovery_destroys_avsync_before_raw_capture_is_available() {
+        use crate::receiver::lifecycle_test_events::{snapshot, track};
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let events = track(|| {
+            let receiver =
+                Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new(""))).unwrap();
+            let sync = AvSync::new(receiver).unwrap();
+            let receiver = sync.into_receiver();
+            assert_eq!(snapshot(), ["avsync"]);
+            assert!(receiver
+                .audio()
+                .capture(std::time::Duration::ZERO)
+                .unwrap()
+                .is_none());
+            drop(receiver);
+        });
+        assert_eq!(events, ["avsync", "receiver"]);
     }
 
     #[test]
@@ -1222,8 +1249,7 @@ mod tests {
         assert!(matches!(
             unsafe { inspect(Synchronized::InternalError, &audio) },
             Err(Error::NativeOperationFailed {
-                operation: "NDIlib_avsync_synchronize"
-            })
+                operation}) if operation.name() == c"NDIlib_avsync_synchronize"
         ));
         for code in [-99, 99] {
             // SAFETY: an unknown status never reads a buffer.
@@ -1289,12 +1315,14 @@ mod tests {
         let planar_float = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP;
         let automatic = AvSyncRequest::automatic().raw();
         assert_eq!(automatic.FourCC, planar_float);
+        assert_eq!(automatic.no_channels, 2);
         assert_eq!((automatic.no_samples, automatic.sample_rate), (0, 0));
         assert_eq!(automatic.timecode, NDIlib_send_timecode_synthesize);
         assert!(automatic.p_data.is_null() && automatic.p_metadata.is_null());
 
         let explicit = AvSyncRequest::new(Some(44_100), Some(1601)).unwrap().raw();
         assert_eq!(explicit.FourCC, planar_float);
+        assert_eq!(explicit.no_channels, 2);
         assert_eq!((explicit.no_samples, explicit.sample_rate), (1601, 44_100));
 
         // What the SDK returns for a successful request validates as audio.
@@ -1347,7 +1375,7 @@ mod tests {
         };
         // SAFETY: `pixels` holds every row the descriptor describes and stays
         // borrowed for as long as the frame; the synthetic free owns nothing.
-        unsafe { VideoKind::make_ref(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})) }
+        VideoKind::make_ref(unsafe { Guard::with_test_free(ptr::null_mut(), raw, |_, _| {}) })
             .unwrap()
     }
 
@@ -1420,9 +1448,9 @@ mod tests {
             raw.timestamp = 1234;
             // SAFETY: backing owns the descriptor's complete validated storage
             // throughout this synthetic capture and copy; no-op free owns nothing.
-            let captured = unsafe {
-                VideoKind::make_ref(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {}))
-            }
+            let captured = VideoKind::make_ref(unsafe {
+                Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})
+            })
             .unwrap();
             let owned = captured.to_owned();
             let video = AvSyncVideo::new(&owned).unwrap();
@@ -1513,7 +1541,7 @@ mod tests {
         ] {
             let before = released.get();
             let guard = test_guard(samples.audio_descriptor(), &released);
-            let result = unsafe { outcome(status, guard) };
+            let result = outcome(status, guard);
             if matches!(status, Synchronized::Matched | Synchronized::Adjusted) {
                 assert_eq!(released.get(), before);
             } else {
@@ -1524,9 +1552,7 @@ mod tests {
         }
         // A misaligned buffer is rejected before reading but still released.
         let before = released.get();
-        assert!(
-            unsafe { outcome(Synchronized::Matched, test_guard(descriptor(), &released)) }.is_err()
-        );
+        assert!(outcome(Synchronized::Matched, test_guard(descriptor(), &released)).is_err());
         assert_eq!(released.get(), before + 1);
         // Empty status may own metadata alone; that allocation is returned too.
         let raw = NDIlib_audio_frame_v3_t {
@@ -1535,7 +1561,7 @@ mod tests {
         };
         let before = released.get();
         assert!(matches!(
-            unsafe { outcome(Synchronized::Matched, test_guard(raw, &released)) }.unwrap(),
+            outcome(Synchronized::Matched, test_guard(raw, &released)).unwrap(),
             AvSyncOutcomeRef::Empty { .. }
         ));
         assert_eq!(released.get(), before + 1);
@@ -1571,12 +1597,10 @@ mod tests {
             .build()
             .unwrap();
         let released = Cell::new(0);
-        let result = unsafe {
-            outcome(
-                Synchronized::Matched,
-                test_guard(source.audio_descriptor(), &released),
-            )
-        }
+        let result = outcome(
+            Synchronized::Matched,
+            test_guard(source.audio_descriptor(), &released),
+        )
         .unwrap();
         let AvSyncOutcomeRef::Audio { frame, .. } = &result else {
             panic!("matched samples")
@@ -1602,8 +1626,7 @@ mod tests {
                 timestamp,
                 ..source.audio_descriptor()
             };
-            let result =
-                unsafe { outcome(Synchronized::Matched, test_guard(raw, &released)) }.unwrap();
+            let result = outcome(Synchronized::Matched, test_guard(raw, &released)).unwrap();
             let AvSyncOutcomeRef::Audio { frame, .. } = result else {
                 panic!("matched samples")
             };
@@ -1632,8 +1655,12 @@ mod tests {
         let AvResource { handle, table, .. } = &sync.resource;
         let mut raw = AvSyncRequest::automatic().raw();
         raw.timestamp = 12345;
-        let status = unsafe { table.NDIlib_avsync_synchronize(handle.0, ptr::null(), &mut raw) };
-        assert_eq!(status, crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_no_audio_stream_received);
+        let status = unsafe {
+            table
+                .named()
+                .NDIlib_avsync_synchronize(handle.0, ptr::null(), &mut raw)
+        };
+        assert_eq!(status.into_value(), crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_no_audio_stream_received);
         assert_eq!(raw.timestamp, 0);
         let guard = unsafe {
             Guard::<AvSyncAudioFree>::new(
@@ -1647,7 +1674,7 @@ mod tests {
         };
         assert_eq!(guard.audio_timestamp(raw.timestamp), None);
         assert!(matches!(
-            unsafe { outcome(Synchronized::NoAudioStream, guard) }.unwrap(),
+            outcome(Synchronized::NoAudioStream, guard).unwrap(),
             AvSyncOutcomeRef::NoAudioStream
         ));
     }

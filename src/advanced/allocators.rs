@@ -27,9 +27,11 @@ use crate::sys::bindings::*;
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use crate::{frames::ValidatedAudioLayout, AudioFormat};
 use crate::{
-    frames::ValidatedVideoLayout, receiver::PacketAttached, runtime::ProcessLifetimeRuntime,
-    sys::advanced::ReceiveAllocators, FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode,
-    Rejected, Result,
+    frames::ValidatedVideoLayout,
+    receiver::{PacketAttached, ReceiverCore},
+    runtime::ProcessLifetimeRuntime,
+    sys::advanced::ReceiveAllocators,
+    FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode, Rejected, Result,
 };
 #[cfg(ndi_has_advanced_receive_allocators)]
 use std::ffi::c_void;
@@ -274,7 +276,7 @@ impl AllocationRequest {
                     Some(stride),
                 )
                 // This is an input stride refusal, retaining the layout evidence.
-                .map_err(|cause| invalid_input(cause.into()))?
+                .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?
                 .data_len_bytes()
             }
             AllocationFormat::AudioPlanarF32 => {
@@ -329,6 +331,79 @@ pub unsafe trait ExternalAllocation: Send + 'static {
 
     /// The size of the memory in bytes.
     fn capacity(&self) -> usize;
+}
+
+/// An address, capacity and pool-defined slot tag, without ownership of memory.
+///
+/// Copying this descriptor grants no permission to access or lend its memory.
+/// Each successful [`AllocationBuffer::from_pool`] call establishes one exclusive
+/// loan, and requires the caller to uphold that constructor's safety contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolBlock {
+    pointer: NonNull<u8>,
+    capacity: usize,
+    tag: usize,
+}
+impl PoolBlock {
+    /// Describe a pool slot without accessing or lending its memory.
+    pub const fn new(pointer: NonNull<u8>, capacity: usize, tag: usize) -> Self {
+        Self {
+            pointer,
+            capacity,
+            tag,
+        }
+    }
+    /// The slot's address; this descriptor grants no access to it.
+    pub const fn pointer(self) -> NonNull<u8> {
+        self.pointer
+    }
+    /// The described capacity in bytes.
+    pub const fn capacity(self) -> usize {
+        self.capacity
+    }
+    /// The pool-defined slot identifier returned unchanged at release.
+    pub const fn tag(self) -> usize {
+        self.tag
+    }
+}
+// SAFETY: This is a copyable address descriptor, not a memory view or owning
+// handle. Moving/sharing it never dereferences the address; lending it to the
+// SDK requires from_pool's explicit unsafe per-loan validity/exclusivity proof.
+unsafe impl Send for PoolBlock {}
+// SAFETY: Sharing a descriptor grants no read/write/release operation on memory.
+unsafe impl Sync for PoolBlock {}
+
+/// A pool that reclaims exclusive blocks lent through [`AllocationBuffer::from_pool`].
+///
+/// # Safety
+///
+/// For each valid loan, the pool must keep its initialized, CPU-addressable,
+/// 64-byte-aligned memory stable and valid for the block's capacity until release,
+/// with no other access, remapping or reclamation. Release must not panic. It and
+/// the pool's last destructor may run on any SDK free thread, without registry locks.
+/// See [`ExternalAllocation`] for the equivalent arbitrary-handle contract.
+pub unsafe trait ExternalPool: Send + Sync + 'static {
+    /// Return a block after the SDK's exclusive access has ended.
+    ///
+    /// # Safety
+    ///
+    /// The block must name one unreleased loan from this pool. Its SDK access
+    /// must have ended, and this call must be the only release of that loan.
+    unsafe fn release(&self, block: PoolBlock);
+}
+
+struct PoolStorage {
+    pool: Arc<dyn ExternalPool>,
+    block: PoolBlock,
+}
+impl Drop for PoolStorage {
+    fn drop(&mut self) {
+        // SAFETY: from_pool's caller establishes one valid matching-pool loan.
+        // This storage is moved, never cloned, and dropped exactly once after
+        // SDK access ends or publication is refused. Registry reclamation runs
+        // outside its locks and contains a misbehaving pool's panic.
+        unsafe { self.pool.release(self.block) };
+    }
 }
 
 /// Zeroed memory from the global allocator.
@@ -399,6 +474,7 @@ pub struct AllocationBuffer {
 enum AllocationStorage {
     Owned(OwnedStorage),
     External(Box<dyn ExternalAllocation>),
+    Pool(PoolStorage),
 }
 
 impl AllocationStorage {
@@ -407,6 +483,7 @@ impl AllocationStorage {
         match self {
             Self::Owned(storage) => storage.pointer(),
             Self::External(storage) => storage.pointer(),
+            Self::Pool(storage) => storage.block.pointer,
         }
     }
 
@@ -414,6 +491,7 @@ impl AllocationStorage {
         match self {
             Self::Owned(storage) => storage.capacity(),
             Self::External(storage) => storage.capacity(),
+            Self::Pool(storage) => storage.block.capacity,
         }
     }
 }
@@ -433,7 +511,10 @@ impl AllocationBuffer {
         })
     }
 
-    /// Lend memory from the application's own pool.
+    /// Lend memory through an arbitrary application-owned handle.
+    ///
+    /// Boxes the handle once per buffer. For a pool whose block can be
+    /// described as plain data, [`from_pool`](Self::from_pool) avoids that allocation.
     ///
     /// # Errors
     ///
@@ -444,16 +525,7 @@ impl AllocationBuffer {
         request: AllocationRequest,
         storage: S,
     ) -> std::result::Result<Self, Rejected<S>> {
-        let capacity = storage.capacity();
-        let problem = if capacity < request.bytes {
-            Some(crate::InputDefect::ExternalAllocationTooSmall)
-        } else if capacity > request.capacity_limit {
-            Some(crate::InputDefect::ExternalAllocationTooLarge)
-        } else if !(storage.pointer().as_ptr() as usize).is_multiple_of(64) {
-            Some(crate::InputDefect::ExternalAllocationAlignment)
-        } else {
-            None
-        };
+        let problem = external_problem(request, storage.capacity(), || storage.pointer());
         match problem {
             Some(problem) => Err(Rejected::new(invalid_input(problem), storage)),
             None => Ok(Self {
@@ -464,9 +536,63 @@ impl AllocationBuffer {
         }
     }
 
+    /// Lend a plain pool block without allocating or calling pool accessors.
+    ///
+    /// Clones the pool's `Arc`; the buffer releases the block exactly once on
+    /// drop, including when registry publication refuses it. Constructor failure
+    /// returns the block in [`Rejected`] without releasing it.
+    ///
+    /// # Safety
+    ///
+    /// If validation succeeds, `block` must name an initialized, writable,
+    /// CPU-addressable allocation from `pool`, aligned to 64 bytes and valid
+    /// for its stated capacity. Until `pool.release(block)`, nothing else may
+    /// read, write, free or remap it, or lend another copy of this descriptor.
+    /// The block must remain valid even if the caller drops its own pool Arc.
+    /// A `PoolBlock` is Copy and can be forged; validation checks geometry only,
+    /// so this per-loan ownership obligation cannot be proved by a safe constructor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unchanged block with [`Error::InvalidInput`](crate::Error::InvalidInput)
+    /// for insufficient/excessive capacity or misalignment, as `from_external` does.
+    pub unsafe fn from_pool<P: ExternalPool>(
+        request: AllocationRequest,
+        pool: &Arc<P>,
+        block: PoolBlock,
+    ) -> std::result::Result<Self, Rejected<PoolBlock>> {
+        if let Some(problem) = external_problem(request, block.capacity, || block.pointer) {
+            return Err(Rejected::new(invalid_input(problem), block));
+        }
+        let pool: Arc<dyn ExternalPool> = pool.clone();
+        Ok(Self {
+            storage: AllocationStorage::Pool(PoolStorage { pool, block }),
+            #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+            request,
+        })
+    }
+
     /// The size of the memory in bytes.
     pub fn capacity(&self) -> usize {
         self.storage.capacity()
+    }
+}
+
+/// Shared validation preserves capacity-before-pointer inspection for arbitrary
+/// external handles. Pool storage supplies those same quantities as plain data.
+fn external_problem(
+    request: AllocationRequest,
+    capacity: usize,
+    pointer: impl FnOnce() -> NonNull<u8>,
+) -> Option<crate::InputDefect> {
+    if capacity < request.bytes {
+        Some(crate::InputDefect::ExternalAllocationTooSmall)
+    } else if capacity > request.capacity_limit {
+        Some(crate::InputDefect::ExternalAllocationTooLarge)
+    } else if !(pointer().as_ptr() as usize).is_multiple_of(64) {
+        Some(crate::InputDefect::ExternalAllocationAlignment)
+    } else {
+        None
     }
 }
 
@@ -507,7 +633,7 @@ impl<F: Fn(AllocationRequest) -> Result<AllocationBuffer> + Send + Sync + 'stati
 
 /// One registered policy.
 struct Generation {
-    policy: ManuallyDrop<Arc<dyn ReceiveAllocator>>,
+    policy: ManuallyDrop<Box<dyn ReceiveAllocator>>,
     count: Arc<AtomicUsize>,
 }
 
@@ -704,7 +830,7 @@ impl Registry {
             Err(error) => return Err(Rejected::new(error, policy)),
         };
         let generation = Arc::new(Generation {
-            policy: ManuallyDrop::new(Arc::new(policy)),
+            policy: ManuallyDrop::new(Box::new(policy)),
             count: self.generations.clone(),
         });
         lock(&self.state).active.insert(token, generation);
@@ -879,13 +1005,6 @@ impl Registry {
 
 static REGISTRY: OnceLock<Registry> = OnceLock::new();
 
-/// The registry, which exists once any [`AllocatorService`] has been created.
-fn registry() -> &'static Registry {
-    REGISTRY
-        .get()
-        .expect("an allocator service exists before anything uses the registry")
-}
-
 /// Permission to give receivers custom allocators.
 ///
 /// The SDK may call an allocator's free function long after the receiver's
@@ -901,6 +1020,7 @@ fn registry() -> &'static Registry {
 #[derive(Clone, Copy)]
 pub struct AllocatorService {
     runtime: ProcessLifetimeRuntime,
+    registry: &'static Registry,
 }
 
 /// Why a custom receive allocation was declined and the SDK dropped its frame.
@@ -928,22 +1048,31 @@ pub enum AllocationDecline {
     BufferRefused,
 }
 
-impl AllocationDecline {
-    const COUNT: usize = 8;
-
-    const fn index(self) -> usize {
-        match self {
-            Self::RequestNotRepresentable => 0,
-            Self::GenerationUnavailable => 1,
-            Self::ConcurrencyLimit => 2,
-            Self::AllocationCountLimit => 3,
-            Self::ByteLimit => 4,
-            Self::PolicyError => 5,
-            Self::PolicyPanic => 6,
-            Self::BufferRefused => 7,
+// Missing reasons make index() non-exhaustive; duplicates are unreachable
+// patterns. The count and the test list therefore cannot drift from indexing.
+macro_rules! allocation_declines {
+    ($($reason:ident),+ $(,)?) => {
+        impl AllocationDecline {
+            const COUNT: usize = [$(Self::$reason),+].len();
+            #[cfg(test)]
+            const ALL: [Self; Self::COUNT] = [$(Self::$reason),+];
+            const fn index(self) -> usize {
+                enum Index { $($reason),+ }
+                match self { $(Self::$reason => Index::$reason as usize),+ }
+            }
         }
-    }
+    };
 }
+allocation_declines!(
+    RequestNotRepresentable,
+    GenerationUnavailable,
+    ConcurrencyLimit,
+    AllocationCountLimit,
+    ByteLimit,
+    PolicyError,
+    PolicyPanic,
+    BufferRefused,
+);
 
 /// A snapshot of custom allocation across the process.
 ///
@@ -1022,8 +1151,8 @@ impl AllocatorService {
             None => {
                 // Reserve off the SDK's threads. If another caller initializes
                 // first, its limits win and the comparison below is unchanged.
-                let _ = REGISTRY.set(Registry::new(limits)?);
-                registry()
+                let candidate = Registry::new(limits)?;
+                REGISTRY.get_or_init(|| candidate)
             }
         };
         if registry.limits != limits {
@@ -1031,14 +1160,14 @@ impl AllocatorService {
                 crate::InputDefect::AllocatorLimitsDiffer,
             ));
         }
-        Ok(Self { runtime })
+        Ok(Self { runtime, registry })
     }
 
     /// A consistent snapshot of retained storage, active calls and decline
     /// counters across the process. Counter updates allocate no storage and
     /// run under the same lock that accounts for retained allocations.
     pub fn usage(self) -> AllocatorUsage {
-        registry().usage()
+        self.registry.usage()
     }
 
     /// Take a receiver so that its allocators can be set.
@@ -1078,13 +1207,16 @@ impl AllocatorService {
     ) -> std::result::Result<Allocation<M>, Rejected<Receiver<M>>> {
         match self.runtime.ndi().table::<ReceiveAllocators>() {
             Ok(table) => Ok(Allocation {
-                receiver: Some(receiver),
-                table,
-                #[cfg(ndi_has_advanced_receive_allocators)]
-                video_token: None,
-                #[cfg(ndi_has_advanced_receive_allocators)]
-                audio_token: None,
-                _service: self,
+                registration: Registration {
+                    core: receiver.core.clone(),
+                    table,
+                    #[cfg(ndi_has_advanced_receive_allocators)]
+                    video_token: None,
+                    #[cfg(ndi_has_advanced_receive_allocators)]
+                    audio_token: None,
+                    service: self,
+                },
+                receiver,
             }),
             Err(error) => Err(Rejected::new(error, receiver)),
         }
@@ -1097,9 +1229,9 @@ impl AllocatorService {
 /// receiver back. [`receiver`](Self::receiver) reaches the receiver's
 /// controls, as [`PacketReceiver::receiver`] does, and
 /// [`controls`](Self::controls) reaches exclusive stream controls and KVM.
-/// There is no `receiver_mut`: the allocators are installed on this
-/// receiver's native instance, so it is never lent out mutably, where it
-/// could be swapped for another packet receiver's.
+/// The receiver is lent mutably only inside `ReceiverControls`, which prevents
+/// replacement. Its allocator registration keeps its own reference to the
+/// original receiver core, so resetting always reaches that native instance.
 ///
 /// # Threading
 ///
@@ -1305,51 +1437,74 @@ impl AllocatedReceiver {
 /// allocations it still holds are then freed through the token-keyed registry,
 /// which outlives every receiver.
 struct Allocation<M: ReceiverMode> {
-    // `None` only once `into_receiver` has taken it.
-    receiver: Option<Receiver<M>>,
-    table: &'static ReceiveAllocators,
-    #[cfg(ndi_has_advanced_receive_allocators)]
-    video_token: Option<usize>,
-    #[cfg(ndi_has_advanced_receive_allocators)]
-    audio_token: Option<usize>,
-    // The promise that the runtime outlives every callback registered here.
-    _service: AllocatorService,
+    registration: Registration,
+    receiver: Receiver<M>,
 }
 
 impl<M: ReceiverMode> Allocation<M> {
     fn receiver(&self) -> &Receiver<M> {
-        self.receiver.as_ref().expect("receiver owned")
+        &self.receiver
     }
-
     fn receiver_mut(&mut self) -> &mut Receiver<M> {
-        self.receiver.as_mut().expect("receiver owned")
+        &mut self.receiver
     }
-
     fn set_allocator<P: ReceiveAllocator>(
         &mut self,
         stream: Stream,
         policy: P,
     ) -> std::result::Result<(), Rejected<P>> {
-        let token = registry().register(policy)?;
-        self.install(stream, Some(token));
+        let token = self.registration.service.registry.register(policy)?;
+        self.registration.install(stream, Some(token));
         Ok(())
     }
+    fn install(&mut self, stream: Stream, token: Option<usize>) {
+        self.registration.install(stream, token);
+    }
+    fn into_receiver(self) -> Receiver<M> {
+        let Self {
+            registration,
+            receiver,
+        } = self;
+        drop(registration);
+        receiver
+    }
+}
 
+/// Owns the exact receiver and runtime needed to uninstall both callback pairs.
+/// Its own Drop keeps reset before native destruction independent of field order.
+struct Registration {
+    #[cfg_attr(
+        not(ndi_has_advanced_receive_allocators),
+        expect(
+            dead_code,
+            reason = "the uninhabited table prevents registrations without declarations"
+        )
+    )]
+    core: Arc<ReceiverCore>,
+    table: &'static ReceiveAllocators,
+    #[cfg(ndi_has_advanced_receive_allocators)]
+    video_token: Option<usize>,
+    #[cfg(ndi_has_advanced_receive_allocators)]
+    audio_token: Option<usize>,
+    service: AllocatorService,
+}
+impl Registration {
     /// Register generation `token` (or the SDK's own allocator) for `stream`
     /// and retire the generation it replaces.
     #[cfg(ndi_has_advanced_receive_allocators)]
     fn install(&mut self, stream: Stream, token: Option<usize>) {
-        let instance = self.receiver().core.instance.0;
+        let instance = self.core.instance.0;
         let table = self.table;
         let slot = match stream {
             Stream::Video => &mut self.video_token,
             Stream::Audio => &mut self.audio_token,
         };
         let opaque = token.map_or(std::ptr::null_mut(), |token| token as *mut c_void);
-        // SAFETY: the receiver is live. The callbacks are functions of this
+        // SAFETY: the registration owns the original receiver core, so that native
+        // instance stays live through installation and reset. The callbacks are functions of this
         // program, which stays loaded, and the opaque value is a token they
         // look up, never a pointer they follow.
-        install_with(registry(), slot, token, || unsafe {
+        install_with(self.service.registry, slot, token, || unsafe {
             match stream {
                 Stream::Video => table.NDIlib_recv_set_video_allocator(
                     instance,
@@ -1373,25 +1528,11 @@ impl<M: ReceiverMode> Allocation<M> {
     fn install(&mut self, _: Stream, _: Option<usize>) {
         match *self.table {}
     }
-
-    /// Return to the SDK's own memory and give the receiver back.
-    fn into_receiver(mut self) -> Receiver<M> {
-        self.reset();
-        self.receiver.take().expect("receiver owned")
-    }
-
-    /// Return to the SDK's own memory for both streams.
-    fn reset(&mut self) {
+}
+impl Drop for Registration {
+    fn drop(&mut self) {
         self.install(Stream::Video, None);
         self.install(Stream::Audio, None);
-    }
-}
-
-impl<M: ReceiverMode> Drop for Allocation<M> {
-    fn drop(&mut self) {
-        if self.receiver.is_some() {
-            self.reset();
-        }
     }
 }
 
@@ -1590,6 +1731,262 @@ mod tests {
     use super::*;
     use crate::Error;
     use crate::StreamTier;
+    include!("allocators/cycle_cost_tests.rs");
+    /// Reusable initialized aligned blocks; the bounded free list grants one
+    /// exclusive slot per claim and returns it only after lease reclamation.
+    struct TestPool {
+        _storage: Mutex<Vec<OwnedStorage>>,
+        blocks: Vec<PoolBlock>,
+        free: Mutex<std::collections::VecDeque<usize>>,
+        releases: AtomicUsize,
+    }
+    impl TestPool {
+        fn new(count: usize, bytes: usize) -> Arc<Self> {
+            let storage = (0..count)
+                .map(|_| OwnedStorage::zeroed(bytes).unwrap())
+                .collect::<Vec<_>>();
+            let blocks = storage
+                .iter()
+                .enumerate()
+                .map(|(tag, storage)| PoolBlock::new(storage.pointer(), bytes, tag))
+                .collect();
+            let pool = Arc::new(Self {
+                _storage: Mutex::new(storage),
+                blocks,
+                free: Mutex::new((0..count).collect()),
+                releases: AtomicUsize::new(0),
+            });
+            // Apple pthread mutexes allocate on first lock. Pool setup belongs
+            // outside callback allocation counts and cycle measurements.
+            drop(lock(&pool.free));
+            pool
+        }
+        fn claim(&self) -> PoolBlock {
+            self.blocks[lock(&self.free)
+                .pop_front()
+                .expect("benchmark/test has enough exclusive slots")]
+        }
+        fn buffer(self: &Arc<Self>, request: AllocationRequest) -> Result<AllocationBuffer> {
+            let block = self.claim();
+            // SAFETY: claim removes one initialized aligned block from the free
+            // list; this Arc owns its storage until release returns that slot.
+            match unsafe { AllocationBuffer::from_pool(request, self, block) } {
+                Ok(buffer) => Ok(buffer),
+                Err(rejected) => {
+                    let (error, block) = rejected.into_parts();
+                    // SAFETY: refusal returned the same unpublished exclusive loan.
+                    unsafe { self.release(block) };
+                    Err(error)
+                }
+            }
+        }
+    }
+    // SAFETY: storage is owned by this pool, initialized and aligned. The free
+    // list grants exclusive slots, and storage stays live through each Arc loan.
+    unsafe impl ExternalPool for TestPool {
+        unsafe fn release(&self, block: PoolBlock) {
+            assert_eq!(self.blocks[block.tag], block);
+            let mut free = lock(&self.free);
+            assert!(!free.contains(&block.tag), "a block must be released once");
+            free.push_back(block.tag);
+            self.releases.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    struct PoolHandle {
+        pool: Arc<TestPool>,
+        block: PoolBlock,
+    }
+    // SAFETY: a handle owns one exclusively claimed TestPool slot until Drop.
+    unsafe impl ExternalAllocation for PoolHandle {
+        fn pointer(&self) -> NonNull<u8> {
+            self.block.pointer
+        }
+        fn capacity(&self) -> usize {
+            self.block.capacity
+        }
+    }
+    impl Drop for PoolHandle {
+        fn drop(&mut self) {
+            // SAFETY: this non-Clone handle owns the only release of its claim.
+            unsafe { self.pool.release(self.block) };
+        }
+    }
+
+    #[test]
+    fn pool_constructor_returns_refused_blocks_without_releasing_them() {
+        let pool = TestPool::new(1, 64);
+        let original = pool.claim();
+        let request = AllocationRequest {
+            capacity_limit: 64,
+            ..request()
+        };
+        for (block, expected) in [
+            (
+                PoolBlock::new(original.pointer, 63, original.tag),
+                crate::InputDefect::ExternalAllocationTooSmall,
+            ),
+            (
+                PoolBlock::new(original.pointer, 65, original.tag),
+                crate::InputDefect::ExternalAllocationTooLarge,
+            ),
+            (
+                PoolBlock::new(
+                    NonNull::new((original.pointer.as_ptr() as usize + 1) as *mut u8).unwrap(),
+                    64,
+                    original.tag,
+                ),
+                crate::InputDefect::ExternalAllocationAlignment,
+            ),
+        ] {
+            // SAFETY: these intentionally invalid descriptors all fail validation
+            // before a loan is accepted; none is accessed, published or released.
+            let rejected = unsafe { AllocationBuffer::from_pool(request, &pool, block) }
+                .err()
+                .expect("invalid block must be refused");
+            assert!(matches!(rejected.error(), Error::InvalidInput(actual) if actual == &expected));
+            assert_eq!(rejected.into_inner(), block);
+            assert_eq!(pool.releases.load(Ordering::Relaxed), 0);
+        }
+        // SAFETY: the original claim was never lent and is returned once.
+        unsafe { pool.release(original) };
+    }
+
+    #[test]
+    fn pool_policy_constructs_buffers_without_allocating_but_external_handles_box_once() {
+        for external in [false, true] {
+            let registry = Registry::new(limits()).unwrap();
+            let pool = TestPool::new(1, 64);
+            let policy_pool = pool.clone();
+            let token = registry
+                .register(move |request| {
+                    if external {
+                        let block = policy_pool.claim();
+                        Ok(AllocationBuffer::from_external(
+                            request,
+                            PoolHandle {
+                                pool: policy_pool.clone(),
+                                block,
+                            },
+                        )?)
+                    } else {
+                        policy_pool.buffer(request)
+                    }
+                })
+                .unwrap();
+            let (published, allocations) =
+                crate::test_alloc::allocation_count(|| registry.allocate(token, request()));
+            assert_eq!(allocations, usize::from(external));
+            let (pointer, _) = published.unwrap();
+            assert!(registry.free(token, pointer.as_ptr()));
+            assert_eq!(pool.releases.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn pool_blocks_are_released_once_when_publication_refuses_them() {
+        for retired in [false, true] {
+            let registry = Arc::new(Registry::new(limits()).unwrap());
+            let pool = TestPool::new(1, 64);
+            let policy_pool = pool.clone();
+            let weak_registry = Arc::downgrade(&registry);
+            let name = Arc::new(AtomicUsize::new(0));
+            let policy_name = name.clone();
+            let token = registry
+                .register(move |mut request: AllocationRequest| {
+                    if retired {
+                        weak_registry
+                            .upgrade()
+                            .unwrap()
+                            .closing(policy_name.load(Ordering::Relaxed));
+                    } else {
+                        request.width += 1;
+                    } // A buffer for a different layout.
+                    policy_pool.buffer(request)
+                })
+                .unwrap();
+            name.store(token, Ordering::Relaxed);
+            assert!(registry.allocate(token, request()).is_none());
+            assert_eq!(pool.releases.load(Ordering::Relaxed), 1);
+            assert_eq!(registry.usage().retained_allocations(), 0);
+            assert_eq!(
+                registry.usage().declined(if retired {
+                    AllocationDecline::GenerationUnavailable
+                } else {
+                    AllocationDecline::BufferRefused
+                }),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn panicking_pool_release_is_contained_and_keeps_bytes_charged() {
+        struct Panics(Arc<TestPool>);
+        // Intentionally violates the release no-panic rule to test containment.
+        unsafe impl ExternalPool for Panics {
+            unsafe fn release(&self, _: PoolBlock) {
+                panic!("contained pool release");
+            }
+        }
+        let pool = Arc::new(Panics(TestPool::new(1, 64)));
+        let policy_pool = pool.clone();
+        let registry = Registry::new(limits()).unwrap();
+        let token = registry
+            .register(move |request| {
+                let block = policy_pool.0.claim();
+                // SAFETY: the nested pool grants initialized stable exclusive memory;
+                // this test intentionally misbehaves only at release, after SDK use.
+                Ok(unsafe { AllocationBuffer::from_pool(request, &policy_pool, block) }?)
+            })
+            .unwrap();
+        let (pointer, _) = registry.allocate(token, request()).unwrap();
+        assert!(!registry.free(token, pointer.as_ptr()));
+        assert_eq!(registry.usage().retained_bytes(), 64);
+        assert_eq!(registry.usage().in_progress_reclamations(), 1);
+        assert_eq!(registry.usage().retained_allocations(), 1);
+    }
+
+    #[test]
+    fn every_decline_reason_has_one_counter() {
+        let registry = Registry::new(limits()).unwrap();
+        for reason in AllocationDecline::ALL {
+            registry.decline(reason);
+        }
+        let usage = registry.usage();
+        assert_eq!(
+            usage.declined_allocations(),
+            AllocationDecline::COUNT as u64
+        );
+        for reason in AllocationDecline::ALL {
+            assert_eq!(usage.declined(reason), 1);
+        }
+    }
+
+    #[test]
+    fn panicking_policy_destruction_keeps_its_generation_budget_charged() {
+        struct Panics;
+        impl ReceiveAllocator for Panics {
+            fn allocate(&self, request: AllocationRequest) -> Result<AllocationBuffer> {
+                AllocationBuffer::zeroed(request)
+            }
+        }
+        impl Drop for Panics {
+            fn drop(&mut self) {
+                panic!("contained policy destructor");
+            }
+        }
+        let registry = Registry::new(limits()).unwrap();
+        let earlier = registry.register(Panics).unwrap();
+        let replacement = registry.register(AllocationBuffer::zeroed).unwrap();
+        let mut slot = Some(earlier);
+        install_with(&registry, &mut slot, Some(replacement), || {});
+        assert_eq!(registry.usage().active_generations(), 1);
+        assert_eq!(registry.usage().generations(), 2);
+        registry.closing(replacement);
+        assert_eq!(registry.usage().active_generations(), 0);
+        assert_eq!(registry.usage().generations(), 1);
+    }
+
     #[test]
     fn native_allocation_formats_preserve_protection_and_decoded_formats() {
         use crate::advanced::packets::PROTECTED;
@@ -1918,7 +2315,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_churn_never_allocates_for_preboxed_external_storage() {
+    fn lease_churn_never_allocates_for_pool_storage() {
         let limit = 16;
         let changes = 1024;
         let registry = Registry::new(AllocatorLimits {
@@ -1927,21 +2324,12 @@ mod tests {
             ..limits()
         })
         .unwrap();
-        // Keeping every allocation alive before the measurement makes every
-        // subsequent address distinct, exercising removal tombstones rather
-        // than repeatedly inserting the same allocator-reused address.
-        let buffers = (0..limit + changes)
-            .map(|_| {
-                AllocationBuffer::from_external(
-                    request(),
-                    OwnedStorage::zeroed(request().minimum_bytes()).unwrap(),
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let buffers = Mutex::new(buffers);
+        // All backing storage exists before tracking. FIFO claims visit distinct
+        // addresses across churn, exercising the bounded map's tombstone rebuild.
+        let pool = TestPool::new(limit + changes, 64);
+        let policy_pool = pool.clone();
         let token = registry
-            .register(move |_| Ok(lock(&buffers).pop().unwrap()))
+            .register(move |request| policy_pool.buffer(request))
             .unwrap();
         let mut held = Vec::with_capacity(limit);
         for _ in 0..limit {
@@ -1959,6 +2347,7 @@ mod tests {
         for pointer in held {
             assert!(registry.free(token, pointer.as_ptr()));
         }
+        assert_eq!(pool.releases.load(Ordering::Relaxed), limit + changes);
     }
 
     #[test]
@@ -2703,10 +3092,15 @@ mod tests {
             input(planar.with_stride_bytes(15)),
             crate::InputDefect::AllocatorShortStride { .. }
         ));
-        assert!(matches!(
-            input(planar.with_stride_bytes(17)),
-            crate::InputDefect::VideoPlanar420 { .. }
-        ));
+        let crate::InputDefect::Layout(input_cause) = input(planar.with_stride_bytes(17)) else {
+            panic!("expected the shared layout cause")
+        };
+        let Err(Error::InvalidFrame(crate::FrameDefect::Layout(frame_cause))) =
+            PixelFormat::I420.send_buffer_len(16, 16, Some(17), crate::ScanType::Progressive)
+        else {
+            panic!("expected the same frame layout refusal")
+        };
+        assert_eq!(input_cause, frame_cause);
 
         let audio = request();
         assert!(matches!(

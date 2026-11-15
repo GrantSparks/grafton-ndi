@@ -81,7 +81,7 @@ fn non_widescreen_video_arrives_with_its_requested_display_geometry() -> grafton
                 assert!(
                     Instant::now() < deadline,
                     "aspect case {case}/{mode} was not received; last={last_received:?}, stats={:?}",
-                    receiver.connection_stats()
+                    receiver.connection_stats().unwrap()
                 );
             }
         }

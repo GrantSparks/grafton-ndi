@@ -55,7 +55,7 @@ fn controls<M: ReceiverMode>(receiver: KvmReceiver<'_, M>) {
     let _ = receiver.ptz().is_supported();
     let _ = receiver.is_connected();
     let _ = receiver.connection_target();
-    let _ = receiver.connection_stats();
+    let _ = receiver.connection_stats().unwrap();
     let _ = receiver.request_keyframe();
     let _ = receiver.set_video_delay(Duration::ZERO);
     let _ = receiver.video_delay();

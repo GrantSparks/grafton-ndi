@@ -73,7 +73,8 @@ can arrive decoded. `capture_ref(timeout)` returns a borrowed
 `PacketItemRef::{Video, Audio, Metadata, Event}`; `capture(timeout)` makes the
 same capture and copies it into an owned `PacketItem`. Compressed references
 expose codec bytes without copying their payload or metadata. Their `to_owned`
-and `copy_into` methods make sendable owned packets; `copy_into` reuses buffers.
+and `copy_into` methods make lossless `ReceivedVideoPacket` and
+`ReceivedAudioPacket` values; `copy_into` reuses buffers.
 Notifications use the common `ReceiverEvent` model and are consumed once.
 `Ok(None)` means the wait budget expired, rather than proof that the source
 disconnected. Packet receivers cannot feed `FrameSync`.
@@ -96,8 +97,14 @@ envelope; `parse` reads one. Opus and SpeedHQ use no envelope.
 
 Constructors validate layout and wrapper send constraints, **not codec
 bitstreams**. Supply valid encoded media and required codec configuration.
-Received envelopes can preserve unknown header fields that sending refuses;
-call `validate_for_send` before forwarding an arbitrary received packet.
+Received envelopes can preserve unknown header fields that sending refuses.
+Use `CompressedVideoFrame::try_from(packet)` or its audio equivalent to move
+received storage into a sendable frame; a refusal returns the original packet.
+Borrowed packets also convert through `TryFrom<&CompressedVideoRef>` and its
+audio equivalent, checking admission before copying. Their `try_copy_into`
+methods reuse an existing sendable frame and leave it unchanged on refusal.
+`validate_for_send` is available on the lossless received packet types for
+inspection; constructed compressed frames carry the sendability guarantee.
 Protection flags describe packet conventions and do not encrypt content.
 The [packet types](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.CompressedVideoFrame.html)
 and [envelope reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.PacketEnvelope.html)
@@ -113,10 +120,15 @@ joining payloads; `into_contiguous_copy` explicitly joins them.
 
 `CompressedSender` owns its sender. Synchronous video/audio and scatter sends
 borrow frames **mutably**, since the SDK can write their bytes during the call.
-The frame is reusable afterwards. Asynchronous video sends hold a frame until
+Contiguous video and audio sends return `()`; asynchronous contiguous video
+returns the displaced `Option<SubmittedVideo>`. Scatter sends retain their
+fallible runtime capability checks. The frame is reusable afterwards.
+Asynchronous video sends hold a frame until
 the next asynchronous send on the same program/preview stream returns it.
-Audio sends are synchronous. `close()` waits for pending SDK use and returns
-remaining video as `ReclaimedVideo`; reclamation does not confirm delivery.
+Audio sends are synchronous. `finish_video_async()` waits for pending SDK use
+and returns both streams' remaining video as `ReclaimedVideo`, keeping the
+source available for further sends. `close()` removes the source and also
+reclaims remaining video. Reclamation does not confirm delivery.
 Moving owned payloads into this wrapper makes no payload copy in the crate;
 the SDK can still copy internally.
 
@@ -145,16 +157,22 @@ the encoder supplies separate header, payload and parameter-set blocks; it
 returns as `QueuedVideoFrame::Scatter`, and `into_blocks()` recovers the original
 allocations. This requires scatter-send support as well as completion support.
 The byte budget counts block capacities, the owned block collection, both
-scatter arrays and metadata. Queue construction reserves stable native frame
-descriptors and, where supported, scatter-list descriptors for `max_frames`,
-plus bookkeeping scratch for allocation-free index rebuilds.
+scatter arrays, the frame-owned scatter list and metadata. Queue construction
+reserves stable native frame descriptors for `max_frames`, plus bookkeeping
+scratch for allocation-free index rebuilds.
 Accepted submissions, completion callbacks and completion collection allocate
 nothing. A `QueueFull` refusal allocates only the returned `Rejected` value.
 The SDK completion callback runs no application code.
 
 `from_sender` drains an ordinary sender's async pipeline and returns any held
 frame; it refuses advertised senders. The queue lends audio, metadata and
-shared controls through `sender()`, but reserves video sends. `QueuedSender` is
+shared controls through `sender()`, but reserves video sends. Use
+`send_compressed_audio(&mut frame)` for AAC or Opus, or `send_scatter_audio`
+for audio held in blocks; uncompressed `send_audio` remains available. These
+same methods are available on the shared sender returned by `split()`, so
+queued compressed video can carry compressed audio on a separate scoped
+thread. Audio and video formats are selected independently; the native
+transport test covers compressed video with AAC and Opus. `QueuedSender` is
 `Send + Sync`; submission/collection require mutable access. `split()` lends
 an exclusive `QueuedVideo` view alongside the shared sender, so audio can run
 on its own scoped thread while video waits for completions. Neither split
@@ -216,18 +234,87 @@ if let Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(packet))) =
 }
 ```
 
+See [`advanced_allocator`](../examples/advanced_allocator.rs) for allocator setup
+and [`advanced_passthrough`](../examples/advanced_passthrough.rs) for packet
+capture and forwarding.
+
 `AllocationBuffer::zeroed(request)` provides zeroed, 64-byte-aligned memory.
 Use `request.with_stride_bytes(stride)` for permitted line/channel padding.
-`AllocationBuffer::from_external` supports a custom pool only under the
-[`ExternalAllocation` unsafe contract](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/trait.ExternalAllocation.html):
-initialized CPU-accessible memory, stable address/capacity, required alignment
-and exclusive SDK access until release. Do not infer these guarantees from a
-buffer's size alone.
+`AllocationBuffer::from_external` supports arbitrary application-owned handles
+under the [`ExternalAllocation` unsafe contract](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/trait.ExternalAllocation.html).
+It boxes the handle once per buffer, on the thread that constructs it.
+
+A preallocated pool can avoid that allocation with
+`unsafe { AllocationBuffer::from_pool(request, &pool, block) }`. Its `Arc<P>`
+implements [`ExternalPool`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/trait.ExternalPool.html),
+and `PoolBlock::new(pointer, capacity, tag)` describes a pool slot. A successful
+construction clones only the Arc and reads the descriptor's plain data; it calls
+no application accessors. The pool's `unsafe release(block)` receives that same
+descriptor once the accepted buffer is dropped, including a publication refusal.
+A constructor refusal instead returns `Rejected<PoolBlock>` without releasing it;
+the caller still owns that claim and must return it to its pool.
+
+Both paths require initialized, writable, CPU-accessible memory with a stable
+address/capacity, at least 64-byte alignment, and exclusive SDK access until
+release. `PoolBlock` is a copyable descriptor, not an ownership token. Copies
+must never be lent concurrently or released twice. Its constructor cannot check
+those facts, so `from_pool` requires an unsafe per-loan proof that the block is
+valid, exclusively claimed, and belongs to that pool. `release` is also unsafe
+to prevent safe early release of a copied descriptor. Do not infer memory
+validity from address, capacity or alignment checks alone.
+
+Release and the pool's final destructor can run on any SDK free thread, outside
+the registry lock. Release must not panic. The registry contains a panic during
+reclamation and leaves that block's count and bytes charged, since cleanup may
+be incomplete.
 
 Recover the receiver with `into_receiver()` or `into_packet_receiver()`;
 outstanding SDK allocations still retain their policies. See
 [`advanced_allocator`](../examples/advanced_allocator.rs), including the
 explicit process-lifetime opt-in and padded-stride policy.
+
+### Pool cycle overhead, November 2026
+
+The ignored `custom_allocation_cycle_cost` harness compares buffers constructed
+inside the policy with `from_external` and `from_pool`, plus a preboxed reference.
+It ran 100,000 cycles per case for a 1920×1080 UYVY request, using sixteen aligned
+backing blocks allocated before timing. The same-thread case measures allocation
+through free; the other cases include an eight-entry bounded channel from one
+or four allocating threads to one freeing thread, and measure each allocation's
+start through completed release. Those patterns include queueing and registry
+contention, rather than isolating a function-call cost. The preboxed reference
+prepares its handle before each cycle's clock, excluding both pool claim and
+boxing; it establishes bookkeeping overhead, not an end-to-end policy cost.
+
+The host was Linux x86-64, Intel Xeon w7-2475X, Rust 1.100.0, locked dependencies
+and the default release profile. Concurrent development work shared the host;
+these are two runs' median and 99th-percentile nanoseconds, with no affinity or
+core isolation. Run-to-run variation is visible; they do not establish a general
+timing advantage. Unit tests
+separately establish zero allocations when a pool policy constructs its buffer
+inside the callback, versus one allocation for an arbitrary external handle.
+
+```sh
+cargo test --release --locked --features advanced --lib \
+  custom_allocation_cycle_cost -- --ignored --nocapture
+```
+
+| Path | Thread pattern | Median ns, runs 1 / 2 | p99 ns, runs 1 / 2 |
+| --- | --- | ---: | ---: |
+| External | same-thread | 241 / 308 | 281 / 360 |
+| External | one-to-one | 5660 / 6758 | 10711 / 11267 |
+| External | four-to-one | 20224 / 19561 | 49735 / 44490 |
+| Pool | same-thread | 222 / 288 | 500 / 342 |
+| Pool | one-to-one | 5125 / 4900 | 16406 / 11305 |
+| Pool | four-to-one | 19669 / 19793 | 44083 / 42089 |
+| Preboxed | same-thread | 210 / 209 | 248 / 268 |
+| Preboxed | one-to-one | 5581 / 5653 | 10484 / 10341 |
+| Preboxed | four-to-one | 19097 / 19945 | 45143 / 46074 |
+
+The allocation-free pool constructor avoids one global-allocator call and free
+per frame without changing registry locking. Its Arc still incurs reference
+count traffic. Measure representative callback/free concurrency before drawing
+latency or throughput conclusions.
 
 ## Synchronization
 

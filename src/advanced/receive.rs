@@ -5,9 +5,11 @@ use crate::capture::CaptureKind;
 use std::time::Duration;
 
 use super::{
-    AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedAudioRef, CompressedVideoFrame,
-    CompressedVideoRef, ReceiverControls, VideoCodec,
+    AdvancedConfig, AudioCodec, CompressedAudioRef, CompressedVideoRef, ReceivedAudioPacket,
+    ReceivedVideoPacket, ReceiverControls, VideoCodec,
 };
+#[cfg(test)]
+use super::{CompressedAudioFrame, CompressedVideoFrame};
 use crate::{
     capture::{AllSlots, AudioKind, CaptureStrategy, Guard, Media, MetadataKind, VideoKind},
     receiver::PacketAttached,
@@ -73,7 +75,7 @@ pub enum ReceivedVideo {
     /// A decoded frame.
     Decoded(VideoFrame),
     /// A codec packet, exactly as the source sent it.
-    Compressed(CompressedVideoFrame),
+    Compressed(ReceivedVideoPacket),
 }
 
 /// Audio from a [`PacketReceiver`]: a codec packet when the source's format is
@@ -84,7 +86,7 @@ pub enum ReceivedAudio {
     /// Decoded planar floating-point audio.
     Decoded(AudioFrame),
     /// A codec packet, exactly as the source sent it.
-    Compressed(CompressedAudioFrame),
+    Compressed(ReceivedAudioPacket),
 }
 
 /// What one [`PacketReceiver::capture`] call produced.
@@ -253,15 +255,14 @@ impl PacketReceiver {
         // preset's color format and fielded video; the strings they point to
         // belong to the creation path, which outlives the call.
         let receiver = unsafe {
-            <Receiver as super::Configurable>::configured(
+            <Receiver<PacketAttached> as super::Configurable>::configured(
                 ndi,
                 &options,
-                "NDIlib_recv_create_v4",
                 &config,
-                |table: &'static ReceiverConfiguration, _settings, _text| native!(ReceiverConfiguration, table => table.NDIlib_recv_create_v4(_settings, _text)),
+                |table: &'static ReceiverConfiguration, _settings, _text| native!(ReceiverConfiguration, table => table.named().NDIlib_recv_create_v4(_settings, _text)),
             )
         }?;
-        Ok(Self::from_receiver(receiver.into_mode()))
+        Ok(Self::from_receiver(receiver))
     }
 
     pub(crate) fn from_receiver(receiver: Receiver<PacketAttached>) -> Self {
@@ -344,7 +345,7 @@ impl PacketReceiver {
     ) -> Result<Option<PacketItemRef<'_>>> {
         receiver.capture_any_until_with::<AllSlots, _>(
             Deadline::after(timeout)?,
-            crate::receiver::NeverStop,
+            crate::timeout::NeverStop,
             PacketItemRef::Event,
             Self::capture_result_ref,
         )
@@ -391,9 +392,7 @@ fn video_ref_event(frame: Guard<'_, VideoKind>) -> Result<PacketItemRef<'_>> {
     let video = if VideoCodec::from_outer(frame.frame().FourCC).is_some() {
         ReceivedVideoRef::Compressed(CompressedVideoRef::new(frame)?)
     } else {
-        // SAFETY: this delivered guard owns the SDK's uncompressed frame;
-        // construction validates its descriptor while retaining its buffers.
-        ReceivedVideoRef::Decoded(unsafe { VideoKind::make_ref(frame)? })
+        ReceivedVideoRef::Decoded(VideoKind::make_ref(frame)?)
     };
     Ok(PacketItemRef::Video(video))
 }
@@ -402,18 +401,13 @@ fn audio_ref_event(frame: Guard<'_, AudioKind>) -> Result<PacketItemRef<'_>> {
     let audio = if AudioCodec::from_outer(frame.frame().FourCC).is_some() {
         ReceivedAudioRef::Compressed(CompressedAudioRef::new(frame)?)
     } else {
-        // SAFETY: as for decoded video, with this audio guard's sample storage.
-        ReceivedAudioRef::Decoded(unsafe { AudioKind::make_ref(frame)? })
+        ReceivedAudioRef::Decoded(AudioKind::make_ref(frame)?)
     };
     Ok(PacketItemRef::Audio(audio))
 }
 
 fn metadata_ref_event(frame: Guard<'_, MetadataKind>) -> Result<PacketItemRef<'_>> {
-    // SAFETY: the delivered guard retains this standalone metadata allocation
-    // while the validated reference borrows it.
-    Ok(PacketItemRef::Metadata(unsafe {
-        MetadataKind::make_ref(frame)?
-    }))
+    Ok(PacketItemRef::Metadata(MetadataKind::make_ref(frame)?))
 }
 
 #[cfg(test)]
@@ -453,7 +447,7 @@ mod tests {
         };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("")))
             .unwrap()
-            .into_mode();
+            .into_packet_for_test();
         let Some(PacketItem::Event(ReceiverEvent::StatusChanged(status))) =
             PacketReceiver::capture_result(
                 &receiver,
@@ -465,7 +459,7 @@ mod tests {
         };
         assert_eq!(
             status.connections(),
-            receiver.connection_stats().connections()
+            receiver.connection_stats().unwrap().connections()
         );
         for (notification, expected) in [
             (Notification::SourceChanged, ReceiverEvent::SourceChanged),
@@ -660,7 +654,7 @@ mod tests {
         let receiver: Receiver<PacketAttached> =
             Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("")))
                 .unwrap()
-                .into_mode();
+                .into_packet_for_test();
         native_capture_calls::take();
         assert!(matches!(
             PacketReceiver::capture_from(&receiver, Duration::MAX),

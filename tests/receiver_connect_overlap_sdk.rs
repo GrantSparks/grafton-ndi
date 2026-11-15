@@ -288,7 +288,7 @@ fn progress<M: ReceiverMode>(receiver: &Receiver<M>) {
 fn progress_after<M: ReceiverMode>(receiver: &Receiver<M>, before: u64) {
     let deadline = Instant::now() + PATIENCE;
     loop {
-        let received = receiver.connection_stats().video_frames_received();
+        let received = receiver.connection_stats().unwrap().video_frames_received();
         if received > 0 && received != before {
             return;
         }
@@ -296,7 +296,7 @@ fn progress_after<M: ReceiverMode>(receiver: &Receiver<M>, before: u64) {
             Instant::now() < deadline,
             "no progress after source change: {:?}; stats {:?}",
             receiver.connection_target(),
-            receiver.connection_stats()
+            receiver.connection_stats().unwrap()
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -307,7 +307,7 @@ fn storm<M: ReceiverMode>(receiver: &Receiver<M>, peers: &Peers, stopped: &Atomi
     let mut round = 0u64;
     while Instant::now() < deadline && !stopped.load(Ordering::Acquire) {
         for source in &peers.sources {
-            let before = receiver.connection_stats().video_frames_received();
+            let before = receiver.connection_stats().unwrap().video_frames_received();
             timed("connect_to", Duration::ZERO, || {
                 receiver.connect_to(source).unwrap()
             });
@@ -316,12 +316,12 @@ fn storm<M: ReceiverMode>(receiver: &Receiver<M>, peers: &Peers, stopped: &Atomi
         }
         timed("disconnect", Duration::ZERO, || receiver.disconnect());
         thread::sleep(Duration::from_millis(round % 21));
-        let before = receiver.connection_stats().video_frames_received();
+        let before = receiver.connection_stats().unwrap().video_frames_received();
         timed("reconnect", Duration::ZERO, || receiver.reconnect());
         progress_after(receiver, before);
         round += 1;
     }
-    let before = receiver.connection_stats().video_frames_received();
+    let before = receiver.connection_stats().unwrap().video_frames_received();
     receiver.connect_to(&peers.sources[0]).unwrap();
     progress_after(receiver, before);
     eprintln!("completed {round} connect/disconnect/reconnect rounds");
@@ -632,7 +632,7 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
                 }
             };
             for index in [0, 1, 0] {
-                let before = receiver.connection_stats().video_frames_received();
+                let before = receiver.connection_stats().unwrap().video_frames_received();
                 listener
                     .request_connect(&id, peers.sources[index].name())
                     .unwrap();

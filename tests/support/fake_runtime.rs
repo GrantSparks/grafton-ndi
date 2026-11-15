@@ -247,11 +247,44 @@ stub! {
 #[path = "fake_capture.rs"]
 mod capture;
 
+// Contract-breach modes let receive wrappers reject negative native counts.
+fn negative_count() -> String {
+    std::env::var("GRAFTON_FAKE_NEGATIVE_COUNT").unwrap_or_default()
+}
+
+export! {
+    fn NDIlib_recv_get_no_connections(_p_instance: NDIlib_recv_instance_t) -> ::std::os::raw::c_int {
+        if negative_count() == "connections" { -1 } else { 0 }
+    }
+    fn NDIlib_recv_get_performance(_p_instance: NDIlib_recv_instance_t, p_total: *mut NDIlib_recv_performance_t, p_dropped: *mut NDIlib_recv_performance_t) {
+        let selected = negative_count();
+        let mut total = NDIlib_recv_performance_t::default();
+        let mut dropped = NDIlib_recv_performance_t::default();
+        match selected.as_str() {
+            "received-video" => total.video_frames = i64::MIN,
+            "received-audio" => total.audio_frames = i64::MIN,
+            "received-metadata" => total.metadata_frames = i64::MIN,
+            "dropped-video" => dropped.video_frames = i64::MIN,
+            "dropped-audio" => dropped.audio_frames = i64::MIN,
+            "dropped-metadata" => dropped.metadata_frames = i64::MIN,
+            _ => {}
+        }
+        unsafe { *p_total = total; *p_dropped = dropped; }
+    }
+    fn NDIlib_recv_get_queue(_p_instance: NDIlib_recv_instance_t, p_total: *mut NDIlib_recv_queue_t) {
+        let mut queue = NDIlib_recv_queue_t::default();
+        match negative_count().as_str() {
+            "queued-video" => queue.video_frames = -1,
+            "queued-audio" => queue.audio_frames = -1,
+            "queued-metadata" => queue.metadata_frames = -1,
+            _ => {}
+        }
+        unsafe { *p_total = queue; }
+    }
+}
+
 stub! {
     fn NDIlib_recv_send_metadata(p_instance: NDIlib_recv_instance_t, p_metadata: *const NDIlib_metadata_frame_t) -> bool;
-    fn NDIlib_recv_get_performance(p_instance: NDIlib_recv_instance_t, p_total: *mut NDIlib_recv_performance_t, p_dropped: *mut NDIlib_recv_performance_t);
-    fn NDIlib_recv_get_queue(p_instance: NDIlib_recv_instance_t, p_total: *mut NDIlib_recv_queue_t);
-    fn NDIlib_recv_get_no_connections(p_instance: NDIlib_recv_instance_t) -> ::std::os::raw::c_int;
     fn NDIlib_recv_ptz_is_supported(p_instance: NDIlib_recv_instance_t) -> bool;
     fn NDIlib_recv_ptz_zoom(p_instance: NDIlib_recv_instance_t, zoom_value: f32) -> bool;
     fn NDIlib_recv_ptz_zoom_speed(p_instance: NDIlib_recv_instance_t, zoom_speed: f32) -> bool;
@@ -373,14 +406,39 @@ mod objects {
         }
     }
 
+    #[derive(Default)]
+    struct RetainedMetadata(Vec<*const NDIlib_metadata_frame_t>);
+
+    impl RetainedMetadata {
+        unsafe fn read(&self, kind: &str) {
+            if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_none() {
+                return;
+            }
+            for pointer in &self.0 {
+                let frame = unsafe { &**pointer };
+                log(&format!("retained-metadata:{kind}:{}:{}", unsafe { bytes(frame.p_data) }, frame.timecode));
+            }
+        }
+    }
+
     struct Receiver {
         source: RetainedSource,
+        name: *const c_char,
+        metadata: RetainedMetadata,
+    }
+
+    impl Receiver {
+        unsafe fn read_name(&self) {
+            if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_some() {
+                log(&format!("retained-receiver-name:{}", unsafe { bytes(self.name) }));
+            }
+        }
     }
 
     pub(super) unsafe fn connect_source(instance: NDIlib_recv_instance_t, source: *const NDIlib_source_t) {
         if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_some() {
             let receiver = unsafe { &mut *instance.cast::<Receiver>() };
-            unsafe { receiver.source.read("receiver") };
+            unsafe { receiver.source.read("receiver"); receiver.read_name(); receiver.metadata.read("receiver"); };
             receiver.source = RetainedSource(source);
         }
     }
@@ -435,6 +493,7 @@ mod objects {
         source: NDIlib_source_t,
         route: RetainedSource,
         refused: RetainedSource,
+        metadata: RetainedMetadata,
     }
 
     /// Allocate a distinct non-null handle of pointer type `T`.
@@ -460,13 +519,28 @@ mod objects {
                 let settings = unsafe { &*_p_create_settings };
                 log(&format!("receiver-settings:{}:{}", settings.color_format, settings.bandwidth));
             }
-            Box::into_raw(Box::new(Receiver { source: RetainedSource::default() })).cast()
+            Box::into_raw(Box::new(Receiver {
+                source: RetainedSource::default(),
+                name: unsafe { (*_p_create_settings).p_ndi_recv_name },
+                metadata: RetainedMetadata::default(),
+            })).cast()
         }
 
         fn NDIlib_recv_destroy(p_instance: NDIlib_recv_instance_t) {
             let receiver = unsafe { Box::from_raw(p_instance.cast::<Receiver>()) };
-            unsafe { receiver.source.read("receiver") };
+            unsafe { receiver.source.read("receiver"); receiver.read_name(); receiver.metadata.read("receiver"); };
             log("receiver-destroy");
+        }
+
+        fn NDIlib_recv_add_connection_metadata(p_instance: NDIlib_recv_instance_t, p_metadata: *const NDIlib_metadata_frame_t) {
+            let receiver = unsafe { &mut *p_instance.cast::<Receiver>() };
+            receiver.metadata.0.push(p_metadata);
+        }
+
+        fn NDIlib_recv_clear_connection_metadata(p_instance: NDIlib_recv_instance_t) {
+            let receiver = unsafe { &mut *p_instance.cast::<Receiver>() };
+            unsafe { receiver.metadata.read("receiver") };
+            receiver.metadata.0.clear();
         }
 
         fn NDIlib_send_create(_p_create_settings: *const NDIlib_send_create_t) -> NDIlib_send_instance_t {
@@ -578,7 +652,7 @@ mod objects {
 
         fn NDIlib_send_advertiser_add_sender(_p_instance: NDIlib_send_advertiser_instance_t, _p_sender: NDIlib_send_instance_t, allow_monitoring: bool) -> bool {
             log(&format!("send-advertiser-add monitoring={allow_monitoring}"));
-            true
+            !std::env::var_os("GRAFTON_FAKE_ADVERTISER_ADD").is_some_and(|mode| mode == "refuse")
         }
 
         fn NDIlib_send_advertiser_del_sender(_p_instance: NDIlib_send_advertiser_instance_t, _p_sender: NDIlib_send_instance_t) -> bool {
@@ -604,6 +678,7 @@ mod objects {
 
         fn NDIlib_recv_advertiser_add_receiver(p_instance: NDIlib_recv_advertiser_instance_t, p_receiver: NDIlib_recv_instance_t, allow_controlling: bool, allow_monitoring: bool, p_input_group_name: *const c_char) -> bool {
             log(&format!("recv-advertiser-add controlling={allow_controlling} monitoring={allow_monitoring}"));
+            if std::env::var_os("GRAFTON_FAKE_ADVERTISER_ADD").is_some_and(|mode| mode == "refuse") { return false; }
             let advertiser = unsafe { &mut *p_instance.cast::<RecvAdvertiser>() };
             advertiser.groups.push((p_receiver, p_input_group_name));
             true
@@ -635,13 +710,14 @@ mod objects {
                 source,
                 route: RetainedSource::default(),
                 refused: RetainedSource::default(),
+                metadata: RetainedMetadata::default(),
             })).cast()
         }
 
         fn NDIlib_routing_destroy(p_instance: NDIlib_routing_instance_t) {
             let router = unsafe { Box::from_raw(p_instance.cast::<Router>()) };
             unsafe { router.route.read("route") };
-            unsafe { router.refused.read("refused-route") };
+            unsafe { router.refused.read("refused-route"); router.metadata.read("router"); };
             log("router-destroy");
         }
 
@@ -649,6 +725,7 @@ mod objects {
             let name = unsafe { CStr::from_ptr((*p_source).p_ndi_name) };
             log(&format!("router-change {}", name.to_string_lossy()));
             let router = unsafe { &mut *p_instance.cast::<Router>() };
+            unsafe { router.metadata.read("router") };
             unsafe { router.route.read("route") };
             unsafe { router.refused.read("refused-route") };
             let refuse = std::env::var_os("GRAFTON_FAKE_ROUTING_CHANGE").is_some_and(|mode| mode == "refuse");
@@ -664,6 +741,7 @@ mod objects {
         }
 
         fn NDIlib_routing_clear(p_instance: NDIlib_routing_instance_t) -> bool {
+            if std::env::var_os("GRAFTON_FAKE_ROUTING_CLEAR").is_some_and(|mode| mode == "refuse") { return false; }
             let router = unsafe { &mut *p_instance.cast::<Router>() };
             unsafe { router.route.read("route") };
             unsafe { router.refused.read("refused-route") };
@@ -683,6 +761,21 @@ mod objects {
             &router.source
         }
     }
+    #[cfg(fake_advanced)]
+    #[no_mangle]
+    pub unsafe extern "C" fn NDIlib_routing_add_connection_metadata(p_instance: NDIlib_routing_instance_t, p_metadata: *const NDIlib_metadata_frame_t) {
+        let router = unsafe { &mut *p_instance.cast::<Router>() };
+        router.metadata.0.push(p_metadata);
+    }
+
+    #[cfg(fake_advanced)]
+    #[no_mangle]
+    pub unsafe extern "C" fn NDIlib_routing_clear_connection_metadata(p_instance: NDIlib_routing_instance_t) {
+        let router = unsafe { &mut *p_instance.cast::<Router>() };
+        unsafe { router.metadata.read("router") };
+        router.metadata.0.clear();
+    }
+
 }
 
 #[cfg(fake_discovery)]
@@ -1002,7 +1095,7 @@ mod discovery {
 
         fn NDIlib_recv_listener_send_connect(_p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char, p_source_name: *const c_char) -> bool {
             log(&format!("recv-listener-connect {} {}", unsafe { bytes(p_receiver_uuid) }, unsafe { bytes(p_source_name) }));
-            true
+            !std::env::var_os("GRAFTON_FAKE_LISTENER_CONNECT").is_some_and(|mode| mode == "refuse")
         }
     }
 }

@@ -30,6 +30,11 @@ impl<T> Selection<T> {
         }
     }
 
+    /// Observe a successful selection without loading or waiting.
+    pub(crate) fn get(&self) -> Option<&T> {
+        self.value.get()
+    }
+
     /// Return the selected value, running `load` when nothing is selected yet.
     ///
     /// Concurrent callers wait for the load in progress and then observe its
@@ -98,13 +103,16 @@ mod tests {
     #[test]
     fn a_failed_load_is_retryable_and_a_successful_one_is_permanent() {
         let selection = Selection::new(LibraryKind::Runtime);
+        assert_eq!(selection.get(), None);
         assert!(matches!(
             selection.get_or_try_load(|| Err::<u32, _>(Error::InvalidInput(
                 crate::InputDefect::RelativeLibraryPath
             ))),
             Err(Error::InvalidInput(_))
         ));
+        assert_eq!(selection.get(), None);
         assert_eq!(*selection.get_or_try_load(|| Ok(1)).unwrap(), 1);
+        assert_eq!(selection.get(), Some(&1));
         assert_eq!(*selection.get_or_try_load(|| Ok(2)).unwrap(), 1);
     }
 

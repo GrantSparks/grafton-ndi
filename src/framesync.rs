@@ -81,7 +81,7 @@ use crate::{
         validate_returned_audio, AudioFrame, AudioRef, ReturnedAudio, ScanType,
         ValidatedAudioLayout, VideoFrame, VideoRef,
     },
-    receiver::{FrameSyncAttached, Receiver, ReceiverCore},
+    receiver::{FrameSyncAttached, Receiver, ReceiverCore, Released},
     sys::bindings::*,
     Error, Rejected, Result,
 };
@@ -383,7 +383,7 @@ unsafe impl Send for FrameSyncInstance {}
 /// including when the receiver is accessed through [`FrameSync::receiver`].
 unsafe impl Sync for FrameSyncInstance {}
 
-struct FrameSyncResource {
+pub(crate) struct FrameSyncResource {
     instance: FrameSyncInstance,
     // Native destruction reads this receiver; ownership keeps it and its runtime live.
     receiver: Arc<ReceiverCore>,
@@ -430,8 +430,7 @@ impl<'a> FrameSyncCapture<'a> {
         let Some(guard) = self.resource.capture_video(scan_type) else {
             return Ok(None);
         };
-        // SAFETY: the guard owns the frame just returned by this live resource.
-        Ok(Some(unsafe { FrameSyncVideoRef::new(guard)? }))
+        Ok(Some(FrameSyncVideoRef::new(guard)?))
     }
 
     /// Capture owned resampled audio; see [`FrameSync::capture_audio`].
@@ -454,8 +453,7 @@ impl<'a> FrameSyncCapture<'a> {
         request: FrameSyncAudioRequest,
     ) -> Result<FrameSyncAudioRef<'a>> {
         let guard = self.resource.capture_audio(AudioCall::Samples(request));
-        // SAFETY: the guard owns the samples this live resource just returned.
-        unsafe { FrameSyncAudioRef::new(guard) }
+        FrameSyncAudioRef::new(guard)
     }
 
     /// Query the cached input audio format; see [`FrameSync::audio_input_format`].
@@ -471,7 +469,11 @@ impl<'a> FrameSyncCapture<'a> {
 
     /// The approximate queued sample count; see [`FrameSync::audio_queue_depth`].
     /// This makes one native query without allocating or waiting for input.
-    pub fn audio_queue_depth(&self) -> u32 {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnexpectedSdkResult`] when the native queue depth is negative.
+    pub fn audio_queue_depth(&self) -> Result<u32> {
         // SAFETY: the view borrows a live synchronizer for the call.
         let depth = unsafe {
             self.resource
@@ -479,9 +481,10 @@ impl<'a> FrameSyncCapture<'a> {
                 ._ndi
                 .api()
                 .core
+                .named()
                 .NDIlib_framesync_audio_queue_depth(self.resource.instance.0)
         };
-        u32::try_from(depth).unwrap_or(0)
+        crate::receiver::native_count(depth).map(|depth| depth as u32)
     }
 }
 
@@ -496,6 +499,15 @@ enum AudioCall {
 }
 
 impl FrameSyncResource {
+    pub(crate) fn receiver_core(&self) -> &Arc<ReceiverCore> {
+        &self.receiver
+    }
+
+    /// Destroy the synchronizer before issuing permission to restore raw capture.
+    fn release(self) -> Released<FrameSyncAttached> {
+        Released::<FrameSyncAttached>::release(self)
+    }
+
     /// Capture video for `scan_type`: the guard of the frame the SDK
     /// returned, or `None` for the documented all-zero "no video yet" state,
     /// which holds nothing to free. The one place a FrameSync video guard is
@@ -621,31 +633,28 @@ impl FrameSync {
         // successful creation transfers both resources into the ordered owners.
         let core = &receiver.core._ndi.api().core;
         Self::new_with(receiver, |instance| unsafe {
-            core.NDIlib_framesync_create(instance)
+            core.named().NDIlib_framesync_create(instance)
         })
     }
 
     fn new_with(
         receiver: Receiver,
-        create: impl FnOnce(NDIlib_recv_instance_t) -> NDIlib_framesync_instance_t,
+        create: impl FnOnce(
+            NDIlib_recv_instance_t,
+        ) -> crate::sys::table::Called<NDIlib_framesync_instance_t>,
     ) -> std::result::Result<Self, Rejected<Receiver>> {
-        let instance = create(receiver.core.instance.0);
-        if instance.is_null() {
+        let instance = match create(receiver.core.instance.0).created() {
+            Ok(instance) => instance.as_ptr(),
             // The untouched raw receiver goes back to the caller.
-            return Err(Rejected::new(
-                Error::NativeOperationFailed {
-                    operation: "NDIlib_framesync_create",
-                },
-                receiver,
-            ));
-        }
+            Err(error) => return Err(Rejected::new(error, receiver)),
+        };
         let resource = FrameSyncResource {
             instance: FrameSyncInstance(instance),
             receiver: Arc::clone(&receiver.core),
         };
         Ok(Self {
             resource,
-            receiver: receiver.into_mode(),
+            receiver: receiver.attach(),
         })
     }
 
@@ -731,8 +740,7 @@ impl FrameSync {
     /// continued use with raw capture or for creating a new FrameSync.
     pub fn into_receiver(self) -> Receiver {
         let Self { resource, receiver } = self;
-        drop(resource);
-        receiver.into_mode()
+        receiver.detach(resource.release())
     }
 
     /// Capture video with time-base correction, as an owned frame that can
@@ -1014,12 +1022,16 @@ impl FrameSync {
     /// let framesync = FrameSync::new(receiver)?;
     ///
     /// // Check available samples before capture
-    /// let available = framesync.audio_queue_depth();
+    /// let available = framesync.audio_queue_depth()?;
     /// println!("Audio samples available: {}", available);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn audio_queue_depth(&self) -> u32 {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnexpectedSdkResult`] when the native queue depth is negative.
+    pub fn audio_queue_depth(&self) -> Result<u32> {
         FrameSyncCapture {
             resource: &self.resource,
             _thread: std::marker::PhantomData,
@@ -1132,6 +1144,67 @@ mod tests {
     use std::ptr;
 
     #[test]
+    fn recovery_destroys_framesync_before_raw_capture_is_available() {
+        use crate::receiver::lifecycle_test_events::{snapshot, track};
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let events = track(|| {
+            let receiver =
+                Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
+            let sync = FrameSync::new(receiver).unwrap();
+            let receiver = sync.into_receiver();
+            assert_eq!(snapshot(), ["framesync"]);
+            assert!(receiver
+                .video()
+                .capture(std::time::Duration::ZERO)
+                .unwrap()
+                .is_none());
+            drop(receiver);
+        });
+        assert_eq!(events, ["framesync", "receiver"]);
+    }
+
+    #[test]
+    fn release_of_another_framesync_cannot_restore_raw_capture() {
+        use crate::receiver::lifecycle_test_events::{snapshot, track};
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let events = track(|| {
+            let make = || {
+                FrameSync::new(
+                    Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new("")))
+                        .unwrap(),
+                )
+                .unwrap()
+            };
+            let FrameSync {
+                resource: first_resource,
+                receiver: first_receiver,
+            } = make();
+            let FrameSync {
+                resource: second_resource,
+                receiver: second_receiver,
+            } = make();
+            let released = first_resource.release();
+            assert_eq!(snapshot(), ["framesync"]);
+            let mismatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                second_receiver.detach(released)
+            }));
+            assert!(mismatch.is_err(), "a foreign token restored raw capture");
+            assert_eq!(
+                snapshot(),
+                ["framesync"],
+                "the second synchronizer is still alive"
+            );
+            drop(second_resource);
+            drop(first_receiver);
+        });
+        assert_eq!(events, ["framesync", "framesync", "receiver", "receiver"]);
+    }
+
+    #[test]
     fn receiver_modes_preserve_resource_order_and_exactly_once_destruction() {
         use crate::receiver::lifecycle_test_events::track;
         let Some(runtime) = crate::test_support::ndi() else {
@@ -1175,15 +1248,16 @@ mod tests {
             let receiver =
                 Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
             drop(ndi);
-            let rejected = match FrameSync::new_with(receiver, |_| ptr::null_mut()) {
+            let rejected = match FrameSync::new_with(receiver, |_| {
+                crate::sys::table::for_test(ptr::null_mut(), c"NDIlib_framesync_create")
+            }) {
                 Err(rejected) => rejected,
                 Ok(_) => panic!("a null instance must be rejected"),
             };
             assert!(matches!(
                 rejected.error(),
                 Error::NativeOperationFailed {
-                    operation: "NDIlib_framesync_create"
-                }
+                    operation} if operation.name() == c"NDIlib_framesync_create"
             ));
             // The receiver comes back usable, and is dropped exactly once.
             let receiver = rejected.into_inner();
@@ -1401,7 +1475,7 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = unsafe { FrameSyncVideoRef::new(guard) }.expect("valid video frame");
+        let frame = FrameSyncVideoRef::new(guard).expect("valid video frame");
 
         assert_eq!(frame.metadata(), Some("framesync video"));
         assert_eq!(frame.data().unwrap().len(), expected_len);
@@ -1439,7 +1513,7 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = unsafe { FrameSyncVideoRef::new(guard) }.unwrap();
+        let frame = FrameSyncVideoRef::new(guard).unwrap();
         assert_eq!(frame.metadata(), None);
         assert_eq!(
             frame.metadata_status(),
@@ -1469,7 +1543,7 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let result = unsafe { FrameSyncVideoRef::new(guard) };
+        let result = FrameSyncVideoRef::new(guard);
         assert!(matches!(result, Err(Error::InvalidFrame(_))));
     }
 
@@ -1561,12 +1635,23 @@ mod tests {
             ..no_source
         };
         for raw in [no_source, format_only] {
+            let released = std::cell::Cell::new(0usize);
+            // SAFETY: both descriptors have null storage. The callback's
+            // synthetic instance retains this live release counter only.
             let guard = unsafe {
-                Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {})
+                Guard::<FrameSyncAudioFree>::with_test_free(
+                    ptr::from_ref(&released).cast_mut().cast(),
+                    raw,
+                    |instance, _| {
+                        let released = &*instance.cast::<std::cell::Cell<usize>>();
+                        released.set(released.get() + 1);
+                    },
+                )
             };
-            let result = unsafe { FrameSyncAudioRef::new(guard) };
+            let result = FrameSyncAudioRef::new(guard);
 
             assert!(matches!(result, Err(Error::InvalidFrame(_))));
+            assert_eq!(released.get(), 1, "empty input-format guard releases once");
         }
     }
 
@@ -1596,7 +1681,7 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = unsafe { FrameSyncAudioRef::new(guard) }.expect("strided audio frame");
+        let frame = FrameSyncAudioRef::new(guard).expect("strided audio frame");
 
         assert_eq!(frame.metadata(), Some("framesync audio"));
         assert!(frame.data().is_none());
@@ -1636,7 +1721,7 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = unsafe { FrameSyncAudioRef::new(guard) }.unwrap();
+        let frame = FrameSyncAudioRef::new(guard).unwrap();
         assert_eq!(frame.metadata(), None);
         assert_eq!(frame.metadata_status(), crate::FrameMetadataStatus::NotUtf8);
         assert_eq!(frame.to_owned().metadata(), None);

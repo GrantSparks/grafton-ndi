@@ -27,7 +27,7 @@
 use crate::{
     finder::RawSource,
     sys::{self, bindings::*},
-    to_ms_checked, Error, Ndi, Result, Source,
+    to_ms_checked, Ndi, Result, Source,
 };
 use std::{ffi::CString, fmt, ptr, time::Duration};
 
@@ -134,6 +134,15 @@ pub struct Router {
     route: Option<Box<RawSource>>,
     refused_route: Option<Box<RawSource>>,
     #[cfg(feature = "advanced")]
+    #[cfg_attr(
+        not(ndi_has_advanced_router_connection_metadata),
+        expect(
+            dead_code,
+            reason = "only native router metadata operations use this storage"
+        )
+    )]
+    pub(crate) connection_metadata: crate::connection_metadata::ConnectionMetadata,
+    #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
     _ndi: Ndi,
 }
@@ -156,11 +165,11 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnsupportedCapability`] when the selected runtime has no
+    /// Returns [`crate::Error::UnsupportedCapability`] when the selected runtime has no
     /// [routing support](crate::capabilities::RuntimeFeature::Routing), or the
     /// options carry an Advanced configuration that the runtime or this build
-    /// cannot take; [`Error::InvalidCString`] when the name or groups contain a
-    /// NUL byte; and [`Error::NativeOperationFailed`] when the SDK creates no
+    /// cannot take; [`crate::Error::InvalidCString`] when the name or groups contain a
+    /// NUL byte; and [`crate::Error::NativeOperationFailed`] when the SDK creates no
     /// source.
     pub fn new(ndi: &Ndi, options: &RouterOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
@@ -173,16 +182,14 @@ impl Router {
             Self::create(
                 ndi,
                 options,
-                "NDIlib_routing_create",
                 #[cfg(feature = "advanced")]
                 None,
-                |routing, settings| routing.NDIlib_routing_create(settings),
+                |routing, settings| routing.named().NDIlib_routing_create(settings),
             )
         }
     }
 
-    /// The one creation path: create a router through `create`, the entry
-    /// point `operation`, which is handed the routing table and the native
+    /// The one creation path: create a router through `create`, which is handed the routing table and the native
     /// settings for `options`, and keep `config` for as long as the router
     /// lives.
     ///
@@ -193,12 +200,11 @@ impl Router {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         options: &RouterOptions,
-        operation: &'static str,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
             &'static sys::Routing,
             &NDIlib_routing_create_t,
-        ) -> NDIlib_routing_instance_t,
+        ) -> sys::table::Called<NDIlib_routing_instance_t>,
     ) -> Result<Self> {
         // A router with a configuration gets here only once its own
         // capability, which requires routing, has been allowed, so it is
@@ -212,10 +218,9 @@ impl Router {
                 p_ndi_name: name.as_ptr(),
                 p_groups: groups.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
             },
-        );
-        if instance.is_null() {
-            return Err(Error::NativeOperationFailed { operation });
-        }
+        )
+        .created()?
+        .as_ptr();
         Ok(Self {
             instance: RoutingInstance(instance),
             routing,
@@ -223,6 +228,8 @@ impl Router {
             _groups: groups,
             route: None,
             refused_route: None,
+            #[cfg(feature = "advanced")]
+            connection_metadata: crate::connection_metadata::ConnectionMetadata::default(),
             #[cfg(feature = "advanced")]
             _config: config,
             _ndi: ndi.clone(),
@@ -245,18 +252,20 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCString`] when the source name or address
-    /// contains a NUL byte, and [`Error::NativeOperationFailed`] when the SDK
+    /// Returns [`crate::Error::InvalidCString`] when the source name or address
+    /// contains a NUL byte, and [`crate::Error::NativeOperationFailed`] when the SDK
     /// rejects the change.
     pub fn change(&mut self, source: &Source) -> Result<()> {
         let raw = Box::new(source.to_raw()?);
         // SAFETY: the boxed descriptor and its strings stay owned by this
         // router until a later request has returned, or native destruction.
         // Both previous descriptors remain owned throughout this call.
-        if unsafe {
+        let changed = unsafe {
             self.routing
+                .named()
                 .NDIlib_routing_change(self.instance.0, raw.as_raw())
-        } {
+        };
+        if *changed.value() {
             self.route = Some(raw);
             self.refused_route = None;
             Ok(())
@@ -264,26 +273,23 @@ impl Router {
             // A refusal preserves the effective route. No SDK text says what
             // it retained from this request, so keep that descriptor too.
             self.refused_route = Some(raw);
-            Err(Error::NativeOperationFailed {
-                operation: "routing change",
-            })
+            Err(changed.failed())
         }
     }
     /// Stop routing to any source. Receivers stay connected to the router.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NativeOperationFailed`] when the SDK rejects the change.
+    /// Returns [`crate::Error::NativeOperationFailed`] when the SDK rejects the change.
     pub fn clear(&mut self) -> Result<()> {
         // SAFETY: the router instance is live for this borrow.
-        if unsafe { self.routing.NDIlib_routing_clear(self.instance.0) } {
+        let cleared = unsafe { self.routing.named().NDIlib_routing_clear(self.instance.0) };
+        if *cleared.value() {
             self.route = None;
             self.refused_route = None;
             Ok(())
         } else {
-            Err(Error::NativeOperationFailed {
-                operation: "routing clear",
-            })
+            Err(cleared.failed())
         }
     }
     /// Count the receivers connected to this router.
@@ -294,39 +300,37 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidInput`] when `timeout` exceeds
-    /// [`crate::MAX_TIMEOUT`], and [`Error::UnexpectedSdkResult`] when the SDK
+    /// Returns [`crate::Error::InvalidInput`] when `timeout` exceeds
+    /// [`crate::MAX_TIMEOUT`], and [`crate::Error::UnexpectedSdkResult`] when the SDK
     /// reports a negative count.
     pub fn connection_count(&self, timeout: Duration) -> Result<u32> {
         let timeout = to_ms_checked(timeout)?;
         // SAFETY: the router instance is live for this borrow.
         let count = unsafe {
             self.routing
+                .named()
                 .NDIlib_routing_get_no_connections(self.instance.0, timeout)
         };
-        u32::try_from(count).map_err(|_| {
-            Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
-                operation: "NDIlib_routing_get_no_connections",
-                value: count,
-            })
-        })
+        // The SDK count is i32, so every nonnegative value fits u32.
+        crate::receiver::native_count(count).map(|count| count as u32)
     }
     /// The source descriptor this router is advertised under, which receivers
     /// connect to.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NativeOperationFailed`] when the SDK supplies no
+    /// Returns [`crate::Error::NativeOperationFailed`] when the SDK supplies no
     /// descriptor, or one that names neither a source nor an address, and
-    /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
+    /// [`crate::Error::UnexpectedSdkResult`] when its name or address is longer than
     /// the 4 MiB one SDK string may be.
     pub fn source(&self) -> Result<Source> {
         // SAFETY: the router is live, and the descriptor the SDK returns stays
         // valid until the router is destroyed, after this copy completes.
         unsafe {
             Source::try_from_raw(
-                self.routing.NDIlib_routing_get_source_name(self.instance.0),
-                "NDIlib_routing_get_source_name",
+                self.routing
+                    .named()
+                    .NDIlib_routing_get_source_name(self.instance.0),
             )
         }
     }

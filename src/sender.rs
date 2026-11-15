@@ -1,5 +1,8 @@
 //! NDI sending functionality for video, audio, and metadata.
 
+#[cfg(test)]
+use crate::pixels::send_room;
+
 use std::{
     ffi::{CStr, CString},
     fmt,
@@ -17,17 +20,15 @@ use crate::{
     frames::{AudioPartsExt, MetadataPartsExt},
     frames::{
         AudioSource, FrameMetadataRef, MetadataFrame, MetadataSource, MetadataText, PixelFormat,
-        ScanType, Sendable, ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts, VideoSource,
+        ScanType, Sendable, ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts,
+        VideoPartsExt, VideoSource,
     },
-    pixels::{send_room, Pixels},
+    pixels::Pixels,
     receiver::Tally,
     sys::{self, bindings::*},
     timeout::Deadline,
     to_ms_checked, Error, FrameRate, Ndi, PictureAspectRatio, Rejected, Result, Timecode,
 };
-
-#[cfg(test)]
-use crate::frames::VideoPartsExt;
 
 #[cfg(not(target_has_atomic = "ptr"))]
 compile_error!(
@@ -271,6 +272,11 @@ pub trait SenderMode: mode_sealed::Sealed + Send + Sync {}
 /// [`Sender::send_audio`]: [`RawSend`] and the queued mode.
 pub trait AudioSendMode: SenderMode {}
 
+/// Sealed sender modes that send compressed audio: the compressed and queued
+/// modes. Both require an Advanced runtime at construction.
+#[cfg(feature = "advanced")]
+pub trait CompressedAudioSendMode: SenderMode {}
+
 /// Ordinary sender mode: uncompressed video, including the owned asynchronous
 /// pipeline, audio and metadata. Only a sender in this mode can be registered
 /// with a [`SendAdvertiser`](crate::discovery::SendAdvertiser).
@@ -286,7 +292,7 @@ pub enum CompressedAttached {}
 
 /// Sender mode held exclusively by
 /// [`QueuedSender`](crate::advanced::QueuedSender), which sends the video
-/// itself. It sends uncompressed audio.
+/// itself. It sends uncompressed and compressed audio.
 #[cfg(feature = "advanced")]
 #[derive(Debug)]
 pub enum QueueAttached {}
@@ -303,6 +309,8 @@ impl mode_sealed::Sealed for CompressedAttached {
 #[cfg(feature = "advanced")]
 impl SenderMode for CompressedAttached {}
 #[cfg(feature = "advanced")]
+impl CompressedAudioSendMode for CompressedAttached {}
+#[cfg(feature = "advanced")]
 impl mode_sealed::Sealed for QueueAttached {
     type Native = Exclusive;
 }
@@ -310,6 +318,8 @@ impl mode_sealed::Sealed for QueueAttached {
 impl SenderMode for QueueAttached {}
 #[cfg(feature = "advanced")]
 impl AudioSendMode for QueueAttached {}
+#[cfg(feature = "advanced")]
+impl CompressedAudioSendMode for QueueAttached {}
 
 /// An NDI source that sends video, audio and metadata.
 ///
@@ -326,7 +336,8 @@ impl AudioSendMode for QueueAttached {}
 /// itself, and it cannot be registered with an advertiser.
 ///
 /// A sender is `Send` and `Sync`. Its operations take `&self` and may run on
-/// several threads at once, except asynchronous video submissions, which
+/// several threads at once, except the asynchronous video operations,
+/// `send_video_async`, `send_video_async_copy` and `finish_video_async`, which
 /// take `&mut self`. Tally polls preserve changes for a waiting thread;
 /// concurrent tally waits serialize and each change is consumed once.
 #[derive(Debug)]
@@ -379,6 +390,12 @@ impl VideoPipeline {
         call(&mut state, self.owner.handle())
     }
 
+    /// Exclusive callers already serialize the state through their borrow.
+    fn exclusive(&mut self) -> (&mut VideoState, SendHandle<'_>) {
+        let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+        (state, self.owner.handle())
+    }
+
     /// Send the checked frame synchronously, completing the previous loan.
     fn send(&self, frame: Sendable<&(impl VideoSource + ?Sized)>) -> Result<()> {
         self.synchronize(|state, sender| {
@@ -389,21 +406,19 @@ impl VideoPipeline {
         Ok(())
     }
 
-    fn submit(&self, frame: Sendable<VideoFrame>) -> Option<VideoFrame> {
-        self.synchronize(|state, sender| {
-            let (mut displaced, synchronized) = state.in_flight.submit(sender, frame, ());
-            displaced.completed(synchronized);
-            displaced.take_retained().map(Sendable::into_frame)
-        })
+    fn submit(&mut self, frame: Sendable<VideoFrame>) -> Option<VideoFrame> {
+        let (state, sender) = self.exclusive();
+        let (mut displaced, synchronized) = state.in_flight.submit(sender, frame, ());
+        displaced.completed(synchronized);
+        displaced.take_retained().map(Sendable::into_frame)
     }
 
-    fn copy(&self, frame: Sendable<&(impl VideoSource + ?Sized)>) {
-        self.synchronize(|state, sender| {
-            let owned = frame.copied(state.spare.take());
-            let (mut displaced, synchronized) = state.in_flight.submit(sender, owned, ());
-            displaced.completed(synchronized);
-            state.spare = displaced.take_retained().map(Sendable::into_frame);
-        });
+    fn copy(&mut self, frame: Sendable<&(impl VideoSource + ?Sized)>) {
+        let (state, sender) = self.exclusive();
+        let owned = frame.copied(state.spare.take());
+        let (mut displaced, synchronized) = state.in_flight.submit(sender, owned, ());
+        displaced.completed(synchronized);
+        state.spare = displaced.take_retained().map(Sendable::into_frame);
     }
 
     /// Wait for the SDK to release the frame in flight, which stays retained.
@@ -412,12 +427,11 @@ impl VideoPipeline {
     }
 
     /// Drain the SDK and take the retained frame.
-    fn finish(&self) -> Option<VideoFrame> {
-        self.synchronize(|state, sender| {
-            drain(&mut state.in_flight, sender);
-            state.spare = None;
-            state.in_flight.take_retained().map(Sendable::into_frame)
-        })
+    fn finish(&mut self) -> Option<VideoFrame> {
+        let (state, sender) = self.exclusive();
+        drain(&mut state.in_flight, sender);
+        state.spare = None;
+        state.in_flight.take_retained().map(Sendable::into_frame)
     }
 
     /// End the pipeline: drain the SDK and take the retained frame.
@@ -442,13 +456,14 @@ impl Drop for VideoPipeline {
 }
 
 // SAFETY: The descriptor uses this frame's own validated geometry and borrows
-// its owned initialized pixels, scan-dependent SDK
-// tail, and terminated FrameMetadata. Moving the frame moves none of those
+// its owned initialized pixels and terminated FrameMetadata.
+// owned_video_descriptor reserves the scan-dependent SDK room before lending.
+// Moving the frame moves none of those
 // allocations, which InFlight keeps inaccessible until the SDK releases them.
 unsafe impl in_flight::Lend for Sendable<VideoFrame> {
     type Authorization = ();
     fn lend(&mut self, (): ()) -> in_flight::Lent {
-        in_flight::Lent::Frame(self.video_descriptor())
+        in_flight::Lent::Frame(self.owned_video_descriptor())
     }
 }
 
@@ -622,20 +637,12 @@ pub(crate) mod in_flight {
 
     #[cfg(feature = "advanced")]
     impl<'a> LoanPair<'a, crate::CompressedAttached, &'a mut crate::advanced::PendingStreams> {
-        /// Validate and submit through the sender that owns these streams.
-        // Rejection returns the caller's complete owned frame without boxing.
-        #[allow(clippy::result_large_err)]
+        /// Submit a frame whose type already proves send admission.
         pub(crate) fn submit_pending(
             &mut self,
             frame: crate::advanced::CompressedVideoFrame,
-        ) -> std::result::Result<
-            Option<crate::advanced::SubmittedVideo>,
-            crate::Rejected<crate::advanced::CompressedVideoFrame>,
-        > {
-            if let Err(error) = frame.validate_for_send() {
-                return Err(crate::Rejected::new(error, frame));
-            }
-            Ok(self.submit_prepared(crate::advanced::PendingVideo::Contiguous(frame)))
+        ) -> Option<crate::advanced::SubmittedVideo> {
+            self.submit_prepared(crate::advanced::PendingVideo::Contiguous(frame))
         }
 
         // Rejection preserves every block of the caller's owned frame.
@@ -653,11 +660,10 @@ pub(crate) mod in_flight {
                 Err(error) => return Err(crate::Rejected::new(error, _frame)),
             };
             native!(ScatterSend, table => {
-                let tier = _frame.format().tier();
-                let next = self.loans.prepare_scatter(_frame, table);
-                let displaced = self.submit_prepared(next);
-                self.loans.advance_scatter(tier);
-                Ok(displaced)
+                Ok(self.submit_prepared(crate::advanced::PendingVideo::Scatter {
+                    frame: _frame,
+                    table,
+                }))
             })
         }
 
@@ -669,6 +675,19 @@ pub(crate) mod in_flight {
             let (displaced, synchronized) =
                 self.loans.slot(tier).submit(self.sender.handle(), next, ());
             self.loans.reclaim_displaced(tier, displaced, synchronized)
+        }
+
+        /// A null asynchronous flush synchronizes this sender's two streams
+        /// together. Keep its one proof inside this paired operation until
+        /// both slots are marked released, then recover their owned frames.
+        pub(crate) fn finish(&mut self) -> crate::advanced::ReclaimedVideo {
+            use crate::StreamTier::{Preview, Program};
+            if self.loans.slot(Program).is_in_flight() || self.loans.slot(Preview).is_in_flight() {
+                let synchronized = self.loans.slot(Program).flush(self.sender.handle());
+                let _ = self.loans.slot(Program).completed_with(&synchronized);
+                let _ = self.loans.slot(Preview).completed_with(&synchronized);
+            }
+            self.loans.take_retained()
         }
     }
 
@@ -838,6 +857,12 @@ pub(crate) mod in_flight {
         /// synchronizing call on this slot's stream made after the frame was
         /// submitted.
         pub(crate) fn completed(&mut self, _synchronized: Synchronized) -> Option<&T> {
+            self.completed_with(&_synchronized)
+        }
+
+        /// Only this module may share a sender-wide synchronization proof
+        /// across the slots belonging to the paired sender that minted it.
+        fn completed_with(&mut self, _synchronized: &Synchronized) -> Option<&T> {
             match mem::take(&mut self.0) {
                 State::InFlight(frame) => {
                     self.0 = State::Retained(frame);
@@ -951,7 +976,7 @@ pub(crate) mod in_flight {
         }
     }
 
-    impl InFlight<Sendable<VideoFrame>> {
+    impl<T> InFlight<T> {
         /// Wait for the SDK to release the frame in flight by passing a true
         /// NULL frame pointer, the SDK's documented request to drain the
         /// asynchronous buffer.
@@ -966,7 +991,9 @@ pub(crate) mod in_flight {
             };
             Synchronized { _private: () }
         }
+    }
 
+    impl InFlight<Sendable<VideoFrame>> {
         /// Send `frame` synchronously. When this returns, the SDK has
         /// finished reading `frame` and has released the frame in flight.
         pub(super) fn send(
@@ -1089,6 +1116,13 @@ pub(crate) mod in_flight {
                             "paired submission takes only its owner and fresh frame"
                         );
                     }
+                    if name == "LoanPair" && method_name == "finish" {
+                        assert_eq!(
+                            method.sig.inputs.len(),
+                            1,
+                            "paired finishing must derive its sender and slots from its owner"
+                        );
+                    }
                     if name == "LoanPair" && ["sender", "loans"].contains(&method_name.as_str()) {
                         let syn::ReturnType::Type(_, ty) = &method.sig.output else {
                             panic!("paired accessor must be immutable")
@@ -1109,14 +1143,14 @@ pub(crate) mod in_flight {
                         primitives.push((name.clone(), method_name.clone()));
                     }
                     if name == "LoanPair" && !matches!(method.vis, Visibility::Inherited) {
-                        assert!(["sender", "loans", "shared", "submit_pending", "submit_scatter", "try_submit_queued"].contains(&method_name.as_str()),
+                        assert!(["sender", "loans", "shared", "submit_pending", "submit_scatter", "finish", "try_submit_queued"].contains(&method_name.as_str()),
                             "new paired operation needs an ownership-contract review: {method_name}");
                         paired.push(method_name);
                     }
                 }
             }
             assert_eq!(primitives.len(), 4);
-            assert_eq!(paired.len(), 6);
+            assert_eq!(paired.len(), 7);
         }
 
         #[test]
@@ -1219,8 +1253,9 @@ pub struct BorrowedVideoFrame<'buf> {
 
 // SAFETY: Construction checks the initialized byte slice covers the validated
 // layout; its borrow also retains validated terminated metadata unchanged.
-// sends_in_place checks the initialized stride/tail extent before direct SDK
-// reads. The default descriptor never points outside those borrowed buffers.
+// Its initialized report vouches for all storage padding and, only after the
+// caller opts in, the known room after the last pixel. Direct SDK reads are
+// decided by the common rule over that quantity.
 unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
     #[inline]
     fn layout(&self) -> &ValidatedVideoLayout {
@@ -1245,12 +1280,16 @@ unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
         None
     }
 
-    fn can_send_direct(&self) -> bool {
-        self.sends_in_place()
+    fn initialized(&self) -> crate::frames::Initialized {
+        crate::frames::Initialized::Storage {
+            room_after: if self.allow_padding_and_tail {
+                self.tail_room
+            } else {
+                0
+            },
+        }
     }
 }
-
-impl VideoSource for BorrowedVideoFrame<'_> {}
 
 /// A descriptor borrowing either a proven direct input or initialized packed
 /// staging. Its lifetime keeps both input metadata and staging alive until the
@@ -1292,8 +1331,130 @@ crate::frames::video_accessors! {
     }
     plane {
         /// Its rows exclude the padding of the frame's line stride, which
-        /// [`Self::data`] includes, so the active pixels of a padded buffer
+        /// [`Self::storage`] includes, so the active pixels of a padded buffer
         /// can be read in place.
+    }
+    timestamp {
+        /// Application input has no SDK submission timestamp.
+    }
+    data(self -> Option<&[u8]>) {
+        /// Contiguous active pixels, or `None` when row or plane padding separates
+        /// them. Use [`Self::plane`] and [`Self::planes`] for padded active rows, or
+        /// [`Self::storage`] for the validated storage including row padding.
+    } { crate::frames::VideoPartsExt::active_data(self) }
+    to_owned(self) {
+        /// Copy this borrowed frame into a validated owned frame.
+        ///
+        /// Active pixels are copied into tightly packed planes; row padding is
+        /// skipped and the owned stride can shrink. Metadata is copied separately;
+        /// no reference to the source is retained. [`Self::copy_into`] makes the
+        /// same copy into an existing frame, reusing its allocations.
+        ///
+        /// The copy cannot fail: building the frame validated everything it
+        /// relies on, and the packed layout of a valid frame is valid.
+    } {
+        crate::frames::VideoPartsExt::owned_copy(self)
+    }
+    copy_into {
+        /// Copy this borrowed frame into `destination`, reusing its allocations.
+        ///
+        /// `destination` ends up exactly as [`Self::to_owned`] would have
+        /// returned it, whatever it held before: tightly packed active rows,
+        /// format, dimensions, frame rate, aspect ratio, scan type, timecode and
+        /// metadata, and no timestamp. No reference to the source is retained.
+        ///
+        /// Its pixel buffer is reused when its capacity holds the packed frame
+        /// and the SDK tail room required by its format and scan type, including
+        /// extra strides for interlaced UYVY/UYVA when needed. Otherwise it is
+        /// replaced by one allocation of exactly that size. Its metadata string
+        /// is reused when its capacity holds the new text and its terminator;
+        /// otherwise it grows once. With sufficient pixel and metadata capacity,
+        /// subsequent copies allocate nothing. The copy makes no SDK call and can
+        /// run on any thread. Copies without metadata retain the destination's
+        /// text allocation for later frames.
+        ///
+        /// # Example
+        ///
+        /// A copy-and-send loop that stops allocating once two frames exist.
+        /// [`Sender::send_video_async`] keeps the frame it is given until the next
+        /// send, and returns the previous one, which the SDK has finished with:
+        /// that frame is the destination of the next copy.
+        /// [`Sender::send_video_async_copy`] keeps its own reusable frames for
+        /// this copy instead.
+        ///
+        /// ```no_run
+        /// # use grafton_ndi::{BorrowedVideoFrame, Ndi, PixelFormat, Sender, SenderOptions, VideoFrame};
+        /// # fn main() -> Result<(), grafton_ndi::Error> {
+        /// # let ndi = Ndi::new()?;
+        /// let mut sender = Sender::new(&ndi, &SenderOptions::new("Copied"))?;
+        /// // 64 pixels per row, padded to a 512-byte stride.
+        /// let mut buffer = vec![0u8; 512 * 32];
+        /// let mut spare: Option<VideoFrame> = None;
+        /// for shade in 0..=255u8 {
+        ///     buffer.fill(shade); // the application draws into its own buffer
+        ///     let frame = BorrowedVideoFrame::builder(&buffer, 64, 32, PixelFormat::Bgra)
+        ///         .line_stride_bytes(512)
+        ///         .build()?;
+        ///     let owned = match spare.take() {
+        ///         Some(mut reused) => {
+        ///             frame.copy_into(&mut reused); // no allocation
+        ///             reused
+        ///         }
+        ///         None => frame.to_owned(), // the first two frames only
+        ///     };
+        ///     spare = sender.send_video_async(owned)?;
+        /// }
+        /// sender.finish_video_async();
+        /// # Ok(())
+        /// # }
+        /// ```
+    }
+    sends_in_place {
+        /// Whether [`Sender::send_video`] sends this frame from its buffer,
+        /// without copying its pixels.
+        ///
+        /// UYVY and UYVA frames are copied by default wherever
+        /// [`PixelFormat::send_tail_room`] is nonzero. Opting in with
+        /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`] allows
+        /// direct sending if enough room follows the last pixel. The last row's
+        /// padding, the bytes of the
+        /// buffer after the frame, and bytes vouched for with
+        /// [`BorrowedVideoFrameBuilder::readable_after`] all count towards the
+        /// room after that opt-in. An interlaced or single-field frame of those
+        /// formats whose height is not a multiple of four needs two line strides more.
+        ///
+        /// Where the SDK reads frames exactly, which is 64-bit ARM Linux, the
+        /// room is zero and every frame sends in place.
+        ///
+        /// # Example
+        ///
+        /// ```
+        /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat, VideoFrame};
+        /// # fn main() -> Result<(), grafton_ndi::Error> {
+        /// let uyvy = PixelFormat::Uyvy;
+        /// let room = uyvy.send_tail_room();
+        /// let exact = vec![0u8; 720 * 480 * 2];
+        /// let frame = BorrowedVideoFrame::builder(&exact, 720, 480, uyvy).build()?;
+        /// // Copied wherever the SDK needs room after the frame.
+        /// assert_eq!(frame.sends_in_place(), room == 0);
+        ///
+        /// let longer = vec![0u8; 720 * 480 * 2 + room];
+        /// let default = BorrowedVideoFrame::builder(&longer, 720, 480, uyvy).build()?;
+        /// assert_eq!(default.sends_in_place(), room == 0);
+        /// let in_place = BorrowedVideoFrame::builder(&longer, 720, 480, uyvy)
+        ///     .allow_send_from_padding_and_tail(true)
+        ///     .build()?;
+        /// assert!(in_place.sends_in_place());
+        /// assert_eq!(in_place.data().unwrap().len(), 720 * 480 * 2);
+        ///
+        /// let owned = VideoFrame::builder()
+        ///     .resolution(720, 480)
+        ///     .pixel_format(uyvy)
+        ///     .build()?;
+        /// assert!(owned.sends_in_place());
+        /// # Ok(())
+        /// # }
+        /// ```
     }
     images("", "\
  # use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
@@ -1309,7 +1470,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// Configure a checked borrowed frame over `data`.
     ///
     /// `data` may be longer than the frame: the frame is its start, and
-    /// [`Self::data`] never includes the rest. For UYVY/UYVA where the SDK
+    /// [`Self::storage`] never includes the rest. For UYVY/UYVA where the SDK
     /// needs tail room, the default send copies active rows only, even when
     /// `data` includes extra room. Direct sending requires an explicit
     /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`] opt-in.
@@ -1354,132 +1515,12 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         }
     }
 
-    /// Copy this borrowed frame into a validated owned frame.
-    ///
-    /// Active pixels are copied into tightly packed planes; row padding is
-    /// skipped and the owned stride can shrink. Metadata is copied separately;
-    /// no reference to the source is retained. [`Self::copy_into`] makes the
-    /// same copy into an existing frame, reusing its allocations.
-    ///
-    /// The copy cannot fail: building the frame validated everything it
-    /// relies on, and the packed layout of a valid frame is valid.
-    pub fn to_owned(&self) -> VideoFrame {
-        crate::frames::VideoPartsExt::owned_copy(self)
-    }
-
-    /// Copy this borrowed frame into `destination`, reusing its allocations.
-    ///
-    /// `destination` ends up exactly as [`Self::to_owned`] would have
-    /// returned it, whatever it held before: tightly packed active rows,
-    /// format, dimensions, frame rate, aspect ratio, scan type, timecode and
-    /// metadata, and no timestamp. No reference to the source is retained.
-    ///
-    /// Its pixel buffer is reused when its capacity holds the packed frame
-    /// and the SDK tail room required by its format and scan type, including
-    /// extra strides for interlaced UYVY/UYVA when needed. Otherwise it is
-    /// replaced by one allocation of exactly that size. Its metadata string
-    /// is reused when its capacity holds the new text and its terminator;
-    /// otherwise it grows once. With sufficient pixel and metadata capacity,
-    /// subsequent copies allocate nothing. The copy makes no SDK call and can
-    /// run on any thread. Copies without metadata retain the destination's
-    /// text allocation for later frames.
-    ///
-    /// # Example
-    ///
-    /// A copy-and-send loop that stops allocating once two frames exist.
-    /// [`Sender::send_video_async`] keeps the frame it is given until the next
-    /// send, and returns the previous one, which the SDK has finished with:
-    /// that frame is the destination of the next copy.
-    /// [`Sender::send_video_async_copy`] keeps its own reusable frames for
-    /// this copy instead.
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{BorrowedVideoFrame, Ndi, PixelFormat, Sender, SenderOptions, VideoFrame};
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = Ndi::new()?;
-    /// let mut sender = Sender::new(&ndi, &SenderOptions::new("Copied"))?;
-    /// // 64 pixels per row, padded to a 512-byte stride.
-    /// let mut buffer = vec![0u8; 512 * 32];
-    /// let mut spare: Option<VideoFrame> = None;
-    /// for shade in 0..=255u8 {
-    ///     buffer.fill(shade); // the application draws into its own buffer
-    ///     let frame = BorrowedVideoFrame::builder(&buffer, 64, 32, PixelFormat::Bgra)
-    ///         .line_stride_bytes(512)
-    ///         .build()?;
-    ///     let owned = match spare.take() {
-    ///         Some(mut reused) => {
-    ///             frame.copy_into(&mut reused); // no allocation
-    ///             reused
-    ///         }
-    ///         None => frame.to_owned(), // the first two frames only
-    ///     };
-    ///     spare = sender.send_video_async(owned)?;
-    /// }
-    /// sender.finish_video_async();
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn copy_into(&self, destination: &mut VideoFrame) {
-        crate::frames::VideoPartsExt::copy_into_owned(self, destination);
-    }
-
     /// Get the pixel data: exactly the frame's validated storage, including
     /// any row padding. Bytes of the source buffer beyond the frame are not
     /// part of it. [`Self::plane`] and [`Self::planes`] borrow the active
     /// rows alone.
-    pub fn data(&self) -> &[u8] {
+    pub fn storage(&self) -> &[u8] {
         self.data
-    }
-
-    /// Whether [`Sender::send_video`] sends this frame from its buffer,
-    /// without copying its pixels.
-    ///
-    /// UYVY and UYVA frames are copied by default wherever
-    /// [`PixelFormat::send_tail_room`] is nonzero. Opting in with
-    /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`] allows
-    /// direct sending if enough room follows the last pixel. The last row's
-    /// padding, the bytes of the
-    /// buffer after the frame, and bytes vouched for with
-    /// [`BorrowedVideoFrameBuilder::readable_after`] all count towards the
-    /// room after that opt-in. An interlaced or single-field frame of those
-    /// formats whose height is not a multiple of four needs two line strides more.
-    ///
-    /// Where the SDK reads frames exactly, which is 64-bit ARM Linux, the
-    /// room is zero and every frame sends in place.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat, VideoFrame};
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let uyvy = PixelFormat::Uyvy;
-    /// let room = uyvy.send_tail_room();
-    /// let exact = vec![0u8; 720 * 480 * 2];
-    /// let frame = BorrowedVideoFrame::builder(&exact, 720, 480, uyvy).build()?;
-    /// // Copied wherever the SDK needs room after the frame.
-    /// assert_eq!(frame.sends_in_place(), room == 0);
-    ///
-    /// let longer = vec![0u8; 720 * 480 * 2 + room];
-    /// let default = BorrowedVideoFrame::builder(&longer, 720, 480, uyvy).build()?;
-    /// assert_eq!(default.sends_in_place(), room == 0);
-    /// let in_place = BorrowedVideoFrame::builder(&longer, 720, 480, uyvy)
-    ///     .allow_send_from_padding_and_tail(true)
-    ///     .build()?;
-    /// assert!(in_place.sends_in_place());
-    /// assert_eq!(in_place.data().len(), 720 * 480 * 2);
-    ///
-    /// let owned = VideoFrame::builder()
-    ///     .resolution(720, 480)
-    ///     .pixel_format(uyvy)
-    ///     .build()?;
-    /// assert!(grafton_ndi::VideoSource::sends_in_place(&owned));
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[must_use]
-    pub fn sends_in_place(&self) -> bool {
-        let room = send_room(&self.layout, self.header.scan_type());
-        room == 0 || (self.allow_padding_and_tail && self.tail_room >= room)
     }
 
     /// Return this frame with `timecode`.
@@ -1706,16 +1747,14 @@ impl<M: SenderMode> Sender<M> {
             Self::create(
                 ndi,
                 options,
-                "NDIlib_send_create",
                 #[cfg(feature = "advanced")]
                 None,
-                |core, raw| core.NDIlib_send_create(raw),
+                |core, raw| core.named().NDIlib_send_create(raw),
             )
         }
     }
 
-    /// The one creation path: create a sender through `create`, the entry
-    /// point `operation`, which is handed the core table and the native
+    /// The one creation path: create a sender through `create`, which is handed the core table and the native
     /// settings for `options`, and keep `config` for as long as the native
     /// sender lives. The new sender is owned as its mode owns one.
     ///
@@ -1726,9 +1765,11 @@ impl<M: SenderMode> Sender<M> {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         options: &SenderOptions,
-        operation: &'static str,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
-        create: impl FnOnce(&'static sys::Core, &NDIlib_send_create_t) -> NDIlib_send_instance_t,
+        create: impl FnOnce(
+            &'static sys::Core,
+            &NDIlib_send_create_t,
+        ) -> sys::table::Called<NDIlib_send_instance_t>,
     ) -> Result<Self> {
         let name = CString::new(options.name.as_str())?;
         let groups = options.groups.as_deref().map(CString::new).transpose()?;
@@ -1741,10 +1782,9 @@ impl<M: SenderMode> Sender<M> {
                 clock_video: options.clock_video,
                 clock_audio: options.clock_audio,
             },
-        );
-        if instance.is_null() {
-            return Err(Error::NativeOperationFailed { operation });
-        }
+        )
+        .created()?
+        .as_ptr();
         let instance = SendInstance(instance);
         Ok(Self {
             inner: Inner {
@@ -2091,8 +2131,12 @@ impl<M: SenderMode> Sender<M> {
         let remaining = deadline.remaining_ms();
         // SAFETY: the sender instance is live for this borrow and `raw` is
         // writable storage for one metadata descriptor.
-        let kind =
-            unsafe { metadata.NDIlib_send_capture(self.inner.instance.0, &mut raw, remaining) };
+        let called = unsafe {
+            metadata
+                .named()
+                .NDIlib_send_capture(self.inner.instance.0, &mut raw, remaining)
+        };
+        let kind = *called.value();
         if kind == NDIlib_frame_type_e_NDIlib_frame_type_metadata {
             /// Frees one frame that `NDIlib_send_capture` filled, through the
             /// sender and the runtime table that filled it, when dropped.
@@ -2143,7 +2187,7 @@ impl<M: SenderMode> Sender<M> {
         } else {
             Err(Error::UnexpectedSdkResult(
                 crate::SdkResultDefect::UnexpectedFrameType {
-                    operation: "sender metadata capture",
+                    operation: called.function(),
                     kind,
                 },
             ))
@@ -2309,15 +2353,12 @@ impl<M: SenderMode> Sender<M> {
         let count = unsafe {
             self.inner
                 .core
+                .named()
                 .NDIlib_send_get_no_connections(self.inner.instance.0, timeout_ms)
         };
 
-        u32::try_from(count).map_err(|_| {
-            Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
-                operation: "NDIlib_send_get_no_connections",
-                value: count,
-            })
-        })
+        // The SDK count is i32, so every nonnegative value fits u32.
+        crate::receiver::native_count(count).map(|count| count as u32)
     }
 
     /// Remove all metadata registered for delivery to each new connection.
@@ -2409,11 +2450,12 @@ impl<M: SenderMode> Sender<M> {
         let source_ptr = unsafe {
             self.inner
                 .core
+                .named()
                 .NDIlib_send_get_source_name(self.inner.instance.0)
         };
         // SAFETY: the SDK sender owns this live descriptor and its strings
         // through the synchronous copy performed here.
-        unsafe { Source::try_from_raw(source_ptr, "NDIlib_send_get_source_name") }
+        unsafe { Source::try_from_raw(source_ptr) }
     }
 }
 
@@ -2553,6 +2595,105 @@ mod tests {
     use crate::RuntimeFeature;
 
     #[test]
+    fn initialized_extents_preserve_direct_sending_for_every_format_and_scan() {
+        use crate::frames::Initialized;
+        for format in PixelFormat::ALL {
+            for scan in ScanType::ALL {
+                for height in [4, 6] {
+                    let owned = VideoFrame::builder()
+                        .resolution(18, height)
+                        .pixel_format(format)
+                        .scan_type(scan)
+                        .build()
+                        .unwrap();
+                    assert!(owned.can_send_direct(), "owned {format:?} {scan:?}");
+                    assert_eq!(
+                        owned.initialized(),
+                        Initialized::Storage {
+                            room_after: owned.tail_room()
+                        }
+                    );
+                    assert_eq!(
+                        <&VideoFrame as VideoParts>::initialized(&&owned),
+                        owned.initialized()
+                    );
+                    for padding in [0, 8] {
+                        let stride = format.line_stride_bytes(18).unwrap() + padding;
+                        let layout = ValidatedVideoLayout::new_uncompressed(
+                            format,
+                            18,
+                            height,
+                            Some(stride),
+                        )
+                        .unwrap();
+                        let room = send_room(&layout, scan);
+                        for extra in [0, room] {
+                            let bytes = vec![0; layout.data_len_bytes() + extra];
+                            for allow in [false, true] {
+                                let borrowed =
+                                    BorrowedVideoFrame::builder(&bytes, 18, height, format)
+                                        .line_stride_bytes(stride)
+                                        .scan_type(scan)
+                                        .allow_send_from_padding_and_tail(allow)
+                                        .build()
+                                        .unwrap();
+                                let expected = room == 0
+                                    || (allow && layout.trailing_padding() + extra >= room);
+                                assert_eq!(borrowed.sends_in_place(), expected,
+                                    "{format:?} {scan:?} height={height} padding={padding} extra={extra} allow={allow}");
+                                assert_eq!(borrowed.sends_in_place(), expected);
+                                assert_eq!(
+                                    <&BorrowedVideoFrame<'_> as VideoParts>::initialized(
+                                        &&borrowed
+                                    ),
+                                    borrowed.initialized()
+                                );
+                                let mut storage = Pixels::default();
+                                let packed = borrowed.copy_active_pixels(&mut storage);
+                                assert!(packed.can_send_direct(), "staging {format:?} {scan:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_owned_extent_stages_synchronous_sends_and_is_repaired_before_lending() {
+        use crate::frames::descriptor_tests::assert_extent;
+        if PixelFormat::Uyvy.send_tail_room() == 0 {
+            return;
+        }
+        let frame = VideoFrame::builder()
+            .resolution(18, 6)
+            .pixel_format(PixelFormat::Uyvy)
+            .scan_type(ScanType::Interlaced)
+            .data(vec![128; 18 * 6 * 2])
+            .build()
+            .unwrap()
+            .without_send_room_for_test();
+        assert_eq!(frame.tail_room(), 0);
+        assert!(!frame.sends_in_place());
+        let mut staging = Pixels::default();
+        let raw = PreparedVideo::new(&frame, &mut staging).raw;
+        assert_ne!(raw.p_data.cast_const(), frame.data().as_ptr());
+        assert_extent(&raw, staging.as_ptr(), staging.len() + staging.room());
+        let mut owned = Sendable::for_test(frame);
+        let lent = in_flight::Lend::lend(&mut owned, ());
+        assert!(owned.frame().can_send_direct());
+        assert_eq!(
+            owned.tail_room(),
+            send_room(owned.layout(), owned.header().scan_type())
+        );
+        assert_extent(
+            lent.descriptor(),
+            owned.data().as_ptr(),
+            owned.data().len() + owned.tail_room(),
+        );
+    }
+
+    #[test]
     fn captured_video_sending_uses_initialized_active_rows_and_preserves_descriptors() {
         use crate::capture::{FrameSyncVideoFree, Guard, VideoKind};
         use crate::frames::VideoRef;
@@ -2589,9 +2730,9 @@ mod tests {
                 assert_eq!(raw.p_data, staging.as_ptr().cast_mut());
                 assert_ne!(raw.p_data, original.p_data);
                 assert_eq!(staging.as_slice(), expected.data());
-                assert!(staging.room().iter().all(|&byte| byte == 0));
+                assert!(staging.room_bytes().iter().all(|&byte| byte == 0));
                 assert_eq!(
-                    staging.tail_room(),
+                    staging.room(),
                     send_room(&source.layout().packed(), source.header().scan_type())
                 );
             }
@@ -2662,6 +2803,14 @@ mod tests {
                     .unwrap();
                     let eligible = padding == 0 && send_room(receiver.layout(), scan) == 0;
                     assert_eq!(
+                        receiver.initialized(),
+                        crate::frames::Initialized::ActiveRows
+                    );
+                    assert_eq!(
+                        framesync.initialized(),
+                        crate::frames::Initialized::ActiveRows
+                    );
+                    assert_eq!(
                         receiver.sends_in_place(),
                         eligible,
                         "{format:?} {scan:?} padding={padding}"
@@ -2709,7 +2858,7 @@ mod tests {
             let prepared = PreparedVideo::authorized(Sendable::for_test(&captured), &mut staging);
             let raw = prepared.raw;
             assert_ne!(raw.p_data.cast_const(), storage.as_ptr());
-            assert_extent(&raw, staging.as_ptr(), staging.len() + staging.tail_room());
+            assert_extent(&raw, staging.as_ptr(), staging.len() + staging.room());
             // This is the packed copy submitted by send_video_async_copy;
             // its authorization is still that of the padded source.
             let mut owned = Sendable::for_test(&frame).copied(None);
@@ -2906,6 +3055,9 @@ mod tests {
             .unwrap();
         sender.send_video_async_copy(&present).unwrap();
         sender.send_video_async_copy(&present).unwrap();
+        // Exclusive async sends do not lock the state. Warm this test's
+        // inspection lock, whose first use may allocate on some platforms.
+        drop(sender.native.video.state.lock().unwrap());
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
             for _ in 0..4 {
                 for (source, expected) in [
@@ -3074,8 +3226,8 @@ mod tests {
                                 } else {
                                     expected = Some(staging.as_slice().to_vec());
                                 }
-                                assert_eq!(staging.tail_room(), send_room(&layout.packed(), scan));
-                                assert!(staging.room().iter().all(|&byte| byte == 0));
+                                assert_eq!(staging.room(), send_room(&layout.packed(), scan));
+                                assert!(staging.room_bytes().iter().all(|&byte| byte == 0));
                                 let address = staging.as_ptr();
                                 let ((), allocations) = crate::test_alloc::allocation_count(|| {
                                     let _ = PreparedVideo::new(&frame, &mut staging);
@@ -3210,7 +3362,7 @@ mod tests {
         assert_eq!(raw.p_data, staging.as_ptr().cast_mut());
         assert_ne!(raw.p_data, original.p_data);
         assert_eq!(staging.as_slice(), frame.to_owned().data());
-        assert_eq!(staging.room(), [0; 64]);
+        assert_eq!(staging.room_bytes(), [0; 64]);
         assert_eq!(staging.capacity(), 144 + 64);
         // Everything but the pixel pointer describes the caller's frame.
         // SAFETY: both descriptors are uncompressed, so the union holds the stride.
@@ -3284,7 +3436,7 @@ mod tests {
             (
                 state.staging.as_ptr(),
                 state.staging.as_slice().to_vec(),
-                state.staging.room().to_vec(),
+                state.staging.room_bytes().to_vec(),
             )
         };
         assert!(staging(&sender).1.is_empty());
@@ -3613,7 +3765,7 @@ mod tests {
                         .unwrap();
                     for _ in 0..3 {
                         assert_eq!(frame.metadata(), Some("<pixels>é</pixels>"));
-                        assert_eq!(frame.data(), &data[..layout.data_len_bytes()]);
+                        assert_eq!(frame.storage(), &data[..layout.data_len_bytes()]);
                         assert_eq!(frame.pixel_format(), format);
                     }
                     frame
@@ -3768,7 +3920,7 @@ mod tests {
         // Buffer larger than needed should succeed
         let buffer = vec![0u8; 1920 * 1080 * 4 + 1000];
         let frame = borrowed(&buffer, 1920, 1080, PixelFormat::Bgra).unwrap();
-        assert_eq!(frame.data().len(), 1920 * 1080 * 4);
+        assert_eq!(frame.data().unwrap().len(), 1920 * 1080 * 4);
     }
 
     #[test]
@@ -3848,12 +4000,15 @@ mod tests {
         assert_eq!(frame.picture_aspect_ratio(), 0.0);
         assert_eq!(frame.scan_type(), ScanType::Progressive);
         assert_eq!(frame.timecode(), Timecode::SYNTHESIZE);
-        assert_eq!(frame.data().len(), buffer.len());
+        assert_eq!(frame.data().unwrap().len(), buffer.len());
         assert_eq!(frame.line_stride_bytes(), 1920 * 4);
         assert!(frame.metadata().is_none());
         // Copies share the borrow, and Debug summarizes rather than dumps pixels.
         let copy = frame;
-        assert_eq!(copy.data().as_ptr(), frame.data().as_ptr());
+        assert_eq!(
+            copy.data().unwrap().as_ptr(),
+            frame.data().unwrap().as_ptr()
+        );
         assert!(format!("{frame:?}").contains("data (bytes): 8294400"));
         assert_eq!(
             borrowed(&buffer, 1920, 1080, PixelFormat::Bgra)

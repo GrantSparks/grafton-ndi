@@ -12,6 +12,53 @@ use std::mem::MaybeUninit;
 
 use crate::{frames::ValidatedVideoLayout, ScanType};
 
+/// Refill reusable storage with exactly the checked layout's active elements.
+///
+/// A failed write restores its previous initialized length, then repairs any
+/// storage-specific invariant (the zero SDK tail for pixels). The write may
+/// append elements but must not shrink the allocation.
+pub(crate) fn refill<T: Copy>(
+    data: &mut Vec<T>,
+    expected_len: usize,
+    zero: T,
+    repair: impl FnMut(&mut Vec<T>),
+    write: impl FnOnce(&mut Vec<T>),
+) {
+    struct Restore<'a, T: Copy, F: FnMut(&mut Vec<T>)> {
+        data: &'a mut Vec<T>,
+        len: usize,
+        zero: T,
+        repair: F,
+        complete: bool,
+    }
+    impl<T: Copy, F: FnMut(&mut Vec<T>)> Drop for Restore<'_, T, F> {
+        fn drop(&mut self) {
+            if !self.complete {
+                // Appending cannot shrink capacity, so the previous length
+                // still fits even when the write or its exact-length check fails.
+                self.data.resize(self.len, self.zero);
+                (self.repair)(self.data);
+            }
+        }
+    }
+    let len = data.len();
+    let mut restore = Restore {
+        data,
+        len,
+        zero,
+        repair,
+        complete: false,
+    };
+    restore.data.clear();
+    write(restore.data);
+    assert_eq!(
+        restore.data.len(),
+        expected_len,
+        "packed copy must initialize its complete layout"
+    );
+    restore.complete = true;
+}
+
 /// The readable bytes the SDK needs after the last pixel of a frame of
 /// `layout` that it sends with `scan`.
 ///
@@ -88,37 +135,16 @@ impl Pixels {
             self.bytes.reserve_exact(len + tail);
             self.tail = 0;
         }
-        struct Restore<'a> {
-            pixels: &'a mut Pixels,
-            len: usize,
-            tail: usize,
-        }
-        impl Drop for Restore<'_> {
-            fn drop(&mut self) {
-                // Filling only appends; the previous length and room still
-                // fit. Reinitialize any samples the failed fill did not write.
-                self.pixels.bytes.resize(self.len, 0);
-                seal(&mut self.pixels.bytes, self.tail);
-                self.pixels.tail = self.tail;
-            }
-        }
-        let len_before = self.bytes.len();
-        let tail_before = self.tail;
-        let restore = Restore {
-            pixels: self,
-            len: len_before,
-            tail: tail_before,
-        };
-        restore.pixels.bytes.clear();
-        write(&mut restore.pixels.bytes);
-        assert_eq!(
-            restore.pixels.bytes.len(),
+        let previous_tail = self.tail;
+        refill(
+            &mut self.bytes,
             len,
-            "packed copy must initialize its complete layout"
+            0,
+            |bytes| seal(bytes, previous_tail),
+            write,
         );
-        seal(&mut restore.pixels.bytes, tail);
-        restore.pixels.tail = tail;
-        std::mem::forget(restore);
+        seal(&mut self.bytes, tail);
+        self.tail = tail;
     }
 
     /// Recover pixels without shrinking their allocation or exposing tail bytes.
@@ -160,15 +186,14 @@ impl Pixels {
     }
 
     /// The number of zero bytes that follow the pixels.
-    #[cfg(test)]
-    pub(crate) fn tail_room(&self) -> usize {
+    pub(crate) fn room(&self) -> usize {
         self.tail
     }
 
     /// The bytes after the pixels, read from the allocation as the SDK reads
     /// them.
     #[cfg(test)]
-    pub(crate) fn room(&self) -> &[u8] {
+    pub(crate) fn room_bytes(&self) -> &[u8] {
         assert!(self.capacity() >= self.len() + self.tail);
         // SAFETY: `tail` bytes after the pixels are inside the allocation
         // and initialized, by `seal`, and nothing writes them while `self`
@@ -205,14 +230,11 @@ mod tests {
         let (pixels, allocations) = crate::test_alloc::allocation_count(|| Pixels::zeroed(100, 64));
         assert_eq!(allocations, 1);
         assert_eq!(pixels.as_slice(), [0; 100]);
-        assert_eq!((pixels.capacity(), pixels.tail_room()), (164, 64));
-        assert_eq!(pixels.room(), [0; 64]);
+        assert_eq!((pixels.capacity(), pixels.room()), (164, 64));
+        assert_eq!(pixels.room_bytes(), [0; 64]);
 
         let exact = Pixels::zeroed(100, 0);
-        assert_eq!(
-            (exact.len(), exact.capacity(), exact.tail_room()),
-            (100, 100, 0)
-        );
+        assert_eq!((exact.len(), exact.capacity(), exact.room()), (100, 100, 0));
     }
 
     #[test]
@@ -228,7 +250,7 @@ mod tests {
         assert_eq!(allocations, 0);
         assert_eq!(pixels.as_ptr(), address);
         assert_eq!(pixels.as_slice(), [7; 100]);
-        assert_eq!(pixels.room(), [0; 64]);
+        assert_eq!(pixels.room_bytes(), [0; 64]);
 
         // Without a need for room an exact vector is untouched.
         let exact = vec![7; 100];
@@ -243,8 +265,8 @@ mod tests {
         let exact = vec![7; 100];
         let pixels = Pixels::adopt(exact, 64);
         assert_eq!(pixels.as_slice(), [7; 100]);
-        assert_eq!((pixels.capacity(), pixels.tail_room()), (164, 64));
-        assert_eq!(pixels.room(), [0; 64]);
+        assert_eq!((pixels.capacity(), pixels.room()), (164, 64));
+        assert_eq!(pixels.room_bytes(), [0; 64]);
     }
 
     #[test]
@@ -255,7 +277,7 @@ mod tests {
         }));
         assert!(result.is_err());
         assert_eq!(pixels.len(), 8);
-        assert_eq!(pixels.room(), [0; 64]);
+        assert_eq!(pixels.room_bytes(), [0; 64]);
     }
 
     #[test]
@@ -271,7 +293,7 @@ mod tests {
             assert_eq!(pixels.as_ptr(), address);
             assert_eq!(pixels.as_slice(), vec![value; len]);
             // The room is zero even where an earlier, longer fill wrote.
-            assert_eq!(pixels.room(), vec![0; tail]);
+            assert_eq!(pixels.room_bytes(), vec![0; tail]);
         }
     }
 
@@ -283,14 +305,14 @@ mod tests {
         });
         assert_eq!(allocations, 1);
         assert_eq!((pixels.len(), pixels.capacity()), (101, 165));
-        assert_eq!(pixels.room(), [0; 64]);
+        assert_eq!(pixels.room_bytes(), [0; 64]);
 
         // Storage that never allocated is filled the same way.
         let mut empty = Pixels::default();
-        assert_eq!((empty.capacity(), empty.tail_room()), (0, 0));
+        assert_eq!((empty.capacity(), empty.room()), (0, 0));
         empty.fill(8, 64, |bytes| bytes.extend_from_slice(&[6; 8]));
         assert_eq!((empty.as_slice(), empty.capacity()), (&[6; 8][..], 72));
-        assert_eq!(empty.room(), [0; 64]);
+        assert_eq!(empty.room_bytes(), [0; 64]);
     }
 
     #[test]
@@ -301,7 +323,36 @@ mod tests {
         assert_eq!(allocations, 1);
         assert_ne!(copy.as_ptr(), pixels.as_ptr());
         assert_eq!(copy.as_slice(), [3; 100]);
-        assert_eq!((copy.capacity(), copy.tail_room()), (164, 64));
-        assert_eq!(copy.room(), [0; 64]);
+        assert_eq!((copy.capacity(), copy.room()), (164, 64));
+        assert_eq!(copy.room_bytes(), [0; 64]);
+    }
+    #[test]
+    fn a_short_refill_restores_the_previous_initialized_length_for_both_media() {
+        fn check<T: Copy + PartialEq + std::fmt::Debug>(zero: T, value: T) {
+            let mut storage = vec![value; 8];
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                refill(&mut storage, 8, zero, |_| {}, |data| data.push(value));
+            }));
+            assert!(failed.is_err());
+            assert_eq!(storage.len(), 8);
+            assert_eq!(&storage[1..], &[zero; 7]);
+        }
+        check(0u8, 7);
+        check(0.0f32, 7.0);
+    }
+
+    #[test]
+    fn an_unwinding_fill_reseals_tail_bytes_the_write_overwrote() {
+        let mut pixels = Pixels::zeroed(8, 64);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pixels.fill(40, 32, |data| {
+                data.resize(30, 255);
+                panic!("interrupted copy");
+            });
+        }));
+        assert!(failed.is_err());
+        assert_eq!(pixels.len(), 8);
+        assert_eq!(pixels.room(), 64);
+        assert_eq!(pixels.room_bytes(), [0; 64]);
     }
 }

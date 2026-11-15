@@ -75,6 +75,8 @@ fn scatter_byte_budget_counts_capacities_arrays_and_metadata() {
         + metadata.capacity()
         + 2 * size_of::<super::super::aliasable::AliasableVec<u8>>()
         + 3 * (size_of::<*const u8>() + size_of::<i32>());
+    #[cfg(ndi_has_advanced_scatter_send)]
+    let expected = expected + size_of::<crate::sys::advanced::FrameScatter>();
     let mut frame = ScatterVideoFrame::new(
         super::super::VideoPacketFormat::new(super::super::VideoCodec::SpeedHq422, 16, 16).unwrap(),
         vec![first, second],
@@ -115,7 +117,7 @@ fn scatter_keys_and_concurrent_completions_preserve_allocations() {
         let admitted = admitted.unwrap();
         assert_eq!(
             allocations, 0,
-            "frame and scatter descriptors use reserved slots"
+            "the header uses a reserved slot and the frame owns its scatter list"
         );
         assert_eq!(admitted.lent.descriptor().p_data as usize, pointers[0]);
         assert_eq!(admitted.id.get(), number);

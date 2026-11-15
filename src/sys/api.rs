@@ -20,11 +20,17 @@ use crate::{
 };
 
 native_table! {
+    /// Initialization authority held only by the selected runtime's manager.
+    pub(crate) struct Lifecycle from crate::sys::declarations {
+        fn NDIlib_initialize() -> bool;
+        fn NDIlib_destroy();
+    }
+}
+
+native_table! {
     /// Entry points every supported NDI 6 runtime exports. A module that lacks any
     /// of them cannot be selected.
     pub(crate) struct Core from crate::sys::declarations {
-        fn NDIlib_initialize() -> bool;
-        fn NDIlib_destroy();
         fn NDIlib_version() -> *const ::std::os::raw::c_char;
         fn NDIlib_is_supported_CPU() -> bool;
         fn NDIlib_find_create_v2(p_create_settings: *const NDIlib_find_create_t) -> NDIlib_find_instance_t;
@@ -177,6 +183,11 @@ impl Resolved {
         &self.api.core
     }
 
+    /// The required start/stop table, before it is moved into its sole owner.
+    pub(in crate::sys) fn lifecycle(&self) -> Lifecycle {
+        self.api.lifecycle
+    }
+
     /// Consume resolution evidence and construct every immutable capability gate.
     pub(crate) fn seal(self, version: Option<SdkVersion>, edition: SdkEdition) -> Gates {
         let capabilities = Capabilities::detect(
@@ -280,6 +291,7 @@ macro_rules! optional_tables {
 
         /// Resolution-only slots: no version or edition decision and no evidence.
         pub(crate) struct ResolvedApi {
+            lifecycle: Lifecycle,
             core: Core,
             $($field: std::result::Result<slot!(type $Table $($Support)?), CapabilityRefusal>,)+
         }
@@ -299,10 +311,14 @@ macro_rules! optional_tables {
             /// Fails when a [`Core`] entry point is missing or any entry point
             /// resolves outside the selected implementation.
             pub(in crate::sys) fn load(resolver: &dyn Resolver) -> std::result::Result<ResolvedApi, LoadRefusal> {
+                let lifecycle = Lifecycle::load(resolver)?.map_err(|symbol| {
+                    LoadRefusal::MissingEntryPoint { symbol, required: true, detail: None }
+                })?;
                 let core = Core::load(resolver)?.map_err(|symbol| {
                     LoadRefusal::MissingEntryPoint { symbol, required: true, detail: None }
                 })?;
                 Ok(ResolvedApi {
+                    lifecycle,
                     core,
                     $($field: slot!(load resolver $Table $($Support)?).map_err(CapabilityRefusal::SymbolUnavailable),)+
                 })

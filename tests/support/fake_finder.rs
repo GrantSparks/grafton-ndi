@@ -145,6 +145,12 @@ export! {
     }
     fn NDIlib_find_get_current_sources(p_instance: NDIlib_find_instance_t, p_no_sources: *mut u32) -> *const NDIlib_source_t {
         log("finder-snapshot");
+        if std::env::var_os("GRAFTON_FAKE_FINDER_GATE").is_some_and(|directory| {
+            std::fs::remove_file(std::path::PathBuf::from(directory).join("fail-snapshot")).is_ok()
+        }) {
+            unsafe { *p_no_sources = 1 };
+            return std::ptr::null();
+        }
         deadline_gate("block", "entered", "release");
         let snapshot = unsafe { &mut *p_instance.cast::<Snapshot>() };
         snapshot.refresh();

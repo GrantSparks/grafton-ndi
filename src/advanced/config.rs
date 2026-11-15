@@ -1,4 +1,4 @@
-use std::{ffi::CString, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use crate::{Error, Result};
 
@@ -26,7 +26,7 @@ use crate::{Error, Result};
 /// # Ok::<(), grafton_ndi::Error>(())
 /// ```
 #[derive(Clone)]
-pub struct AdvancedConfig(Arc<CString>);
+pub struct AdvancedConfig(Arc<str>);
 
 impl AdvancedConfig {
     /// Accept a JSON object of at most one mebibyte.
@@ -58,30 +58,31 @@ impl AdvancedConfig {
                 crate::InputDefect::ConfigurationNotObject,
             ));
         }
-        let json = CString::new(json)
-            .map_err(|_| Error::InvalidInput(crate::InputDefect::ConfigurationNul))?;
-        Ok(Self(Arc::new(json)))
+        if json.contains('\0') {
+            return Err(Error::InvalidInput(crate::InputDefect::ConfigurationNul));
+        }
+        let mut terminated = String::with_capacity(json.len() + 1);
+        terminated.push_str(json);
+        terminated.push('\0');
+        Ok(Self(Arc::from(terminated)))
     }
 
     /// The JSON text exactly as it was given. It may contain vendor
     /// credentials or network details; the name is a reminder not to log it.
     pub fn expose_json(&self) -> &str {
-        // Construction accepts UTF-8 and CString never changes those bytes.
-        self.0.to_str().expect("validated configuration UTF-8")
+        &self.0[..self.0.len() - 1]
     }
 
     /// `config`, or the empty configuration `{}` without one: the
     /// configuration of an object whose only creation function takes one.
     pub(crate) fn or_empty(config: Option<&Self>) -> Self {
-        config
-            .cloned()
-            .unwrap_or_else(|| Self(Arc::new(c"{}".to_owned())))
+        config.cloned().unwrap_or_else(|| Self(Arc::from("{}\0")))
     }
 
     /// The text as a C string. Every clone shares this one buffer, which
     /// neither moves nor is freed while any clone of `self` lives.
     pub(crate) fn as_ptr(&self) -> *const std::ffi::c_char {
-        self.0.as_ptr()
+        self.0.as_ptr().cast()
     }
 }
 
@@ -105,6 +106,24 @@ mod tests {
         assert!(AdvancedConfig::parse_with_limit(input, 3).is_err());
         let error = AdvancedConfig::parse("{\"private-value\":").unwrap_err();
         assert!(!error.to_string().contains("private-value"));
+    }
+
+    #[test]
+    fn rust_and_native_views_share_the_exact_terminated_utf8() {
+        let input = " {\"label\":\"カメラ\",\"escaped\":\"\\u0000\"} ";
+        let config = AdvancedConfig::parse(input).unwrap();
+        let clone = config.clone();
+        assert_eq!(config.as_ptr(), clone.as_ptr());
+        // SAFETY: construction appends the sole NUL to the shared UTF-8 buffer.
+        let native = unsafe { std::ffi::CStr::from_ptr(config.as_ptr()) };
+        assert_eq!(native.to_str().unwrap(), input);
+        assert_eq!(native.to_bytes(), config.expose_json().as_bytes());
+        assert_eq!(config.expose_json().as_ptr(), config.as_ptr().cast());
+        // JSON validation retains precedence over the interior-NUL check.
+        assert!(matches!(
+            AdvancedConfig::parse("{\"label\":\"\0\"}"),
+            Err(Error::InvalidInput(crate::InputDefect::ConfigurationJson))
+        ));
     }
 
     #[test]

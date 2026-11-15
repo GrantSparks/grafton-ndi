@@ -60,6 +60,7 @@ const UNWRAPPED: &[(&str, &str)] = &[
 
 /// Every table of core entry points, by name.
 const TABLES: &[(&str, &[&CStr])] = &[
+    ("Lifecycle", Lifecycle::SYMBOLS),
     ("Core", Core::SYMBOLS),
     ("ReceiveDelay", ReceiveDelay::SYMBOLS),
     (

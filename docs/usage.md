@@ -55,6 +55,11 @@ policy for your service. IP hints belong on the finder; a lookup never changes
 its scope. See the compilable server-state example in
 [`SourceCache::new`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.SourceCache.html#method.new).
 
+For async service state, move that cache into
+`asynchronous::<runtime>::AsyncSourceCache::new(cache)`. Clones share its finder
+and cache; `cache()` lends it for invalidation and `finder()` for controls.
+Create one owned `watch()` cursor per async consumer and retain it across awaits.
+
 Queries accept IP addresses, DNS hostnames and NDI machine names, including
 spaces and underscores. Machine names compare only with the machine component
 of an SDK source label. The grammar is defined by
@@ -135,13 +140,23 @@ conversion also accepts borrowed audio and writes into caller-provided output;
 see [`NDIlib_Recv_Audio_16bpp`](../examples/NDIlib_Recv_Audio_16bpp.rs).
 Borrowing a frame avoids an intermediate owned copy but does not guarantee an
 in-place video send: padded captures and formats needing SDK tail room use
-reusable staging. `VideoSource::sends_in_place()` reports the selected path.
+reusable staging. `frame.sends_in_place()` reports the selected path.
+
+Concrete video and audio frames expose the same accessors as their source traits, including
+`copy_into`, `timestamp` and video `sends_in_place`, without importing a trait.
+`data()` always means active bytes or samples: owned frames return their packed
+slice; borrowed frames return `None` when padding separates active rows or
+channels. `BorrowedVideoFrame::storage()` also exposes validated frame storage
+including row padding, excluding extra input bytes and SDK tail room.
 
 Recover pooled buffers with `into_data()` or `swap_data()`. A rejected owned
 build or replacement returns its supplied storage in `Rejected`; recover it
 with `into_inner()` or `into_parts()` to repair and retry. Owned frames edit
 metadata with `set_metadata` and `clear_metadata`; invalid replacement text
-preserves the old value. [`media_buffers`](../examples/media_buffers.rs) shows
+preserves the old value and returns the original `String` in `Rejected<String>`.
+`MetadataFrame::new` and `set_data` return refused text the same way. A refused
+video or audio builder exposes its text with `supplied_metadata()` and
+`take_metadata()`. [`media_buffers`](../examples/media_buffers.rs) shows
 buffer reuse, borrowed planar audio and checked native video conversion.
 
 Optional per-frame metadata does not prevent reception of valid video or
@@ -211,7 +226,8 @@ controls through `controls()` without allowing the receiver to be replaced.
 
 ### Monitor reception of the expected media
 
-Poll `connection_stats()` on a diagnostics path, selecting
+Poll `connection_stats()?` on a diagnostics path, handling an SDK count error
+without treating it as a counter reset, and selecting
 `audio_frames_received()`, `video_frames_received()` or
 `metadata_frames_received()` for the expected media. Audio totals count packets,
 not samples played. Received totals include receiver queue/processing drops;
@@ -262,6 +278,19 @@ delay and native waits; processing can finish after that wait budget. Dropping a
 future skips queued work and stops a started wait before its next attempt.
 The attempt already in flight can still consume a frame/event and execute its
 callback; each native wait lasts at most 100 ms.
+
+Wrap a configured finder in `asynchronous::<runtime>::AsyncFinder::new(finder)`
+for `find_source`, `find_source_by_name` and `find_sources`. `AsyncSourceCache`
+also provides `sources_by_host`. These calls use the same first-poll budget and
+cancellation rule. Invalid names, host queries and timeouts are refused before
+worker submission. Predicates must be `Send + 'static`, and a running predicate
+or snapshot copy finishes. Async waits slice native calls into at most 100 ms;
+synchronous discovery keeps its whole-budget native waits.
+
+`watch()` returns an owned `AsyncSourceWatch` that can move into a spawned task.
+Take snapshots and wait through that same cursor. Failed or dropped operations
+leave its generation unchanged, so a report published while a wait was abandoned
+is visible to its next wait. Each consumer creates its own watch.
 
 Use typed `capture_with(timeout, callback)` or mixed
 `capture_any_with(timeout, callback)` for immediate inspection. A synchronous

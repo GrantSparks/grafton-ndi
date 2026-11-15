@@ -31,6 +31,7 @@ impl NativeChanges {
     }
 
     pub(super) fn wait(&self, timeout: u32, label: &str) -> bool {
+        log(&format!("{label}-wait-timeout:{timeout}"));
         log(&format!("{label}-wait-begin"));
         let end = Instant::now() + Duration::from_millis(u64::from(timeout));
         let mut state = self.state.lock().unwrap();

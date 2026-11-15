@@ -23,7 +23,7 @@
 //! }
 //! // Query connection state even when no status event arrived.
 //! println!("Connected: {}", receiver.is_connected());
-//! println!("Active connections: {}", receiver.connection_stats().connections());
+//! println!("Active connections: {}", receiver.connection_stats()?.connections());
 //! # Ok(())
 //! # }
 //! ```
@@ -37,7 +37,7 @@ use std::{
     os::raw::c_char,
     ptr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -50,10 +50,11 @@ use crate::{
         capture_any, capture_raw, AllSlots, AudioKind, CaptureKind, CaptureResult, CaptureStrategy,
         Delivered, Media, MetadataKind, NoSlots, Notification, SlotSet, VideoKind,
     },
+    connection_metadata::ConnectionMetadata,
     finder::{RawSource, Source},
     frames::MetadataPartsExt,
     sys::{self, bindings::*},
-    timeout::{self, Deadline},
+    timeout::{self, Deadline, NeverStop, Stop, POLL_INTERVAL},
     AudioFrame, AudioFrameRef, Error, MetadataFrame, MetadataFrameRef, MetadataSource, Ndi, Result,
     VideoFrame, VideoFrameRef,
 };
@@ -61,27 +62,22 @@ use crate::{
 /// A string the receiver API returned, released when dropped.
 struct RecvStringGuard<'a> {
     core: &'a ReceiverCore,
-    pointer: *const c_char,
+    string: sys::table::Called<*const c_char>,
     strings: &'a sys::ReceiverStrings,
 }
 impl RecvStringGuard<'_> {
     /// The string's bytes before its terminator, or `None` for a null string.
     ///
     /// The scan for the terminator is bounded by
-    /// [`MAX_METADATA_BYTES`](crate::frames::MAX_METADATA_BYTES); a string
+    /// [`MAX_SDK_STRING_BYTES`](crate::frames::MAX_SDK_STRING_BYTES); a string
     /// without one within it is an [`Error::UnexpectedSdkResult`].
     fn bytes(&self) -> Result<Option<&[u8]>> {
-        if self.pointer.is_null() {
+        if self.string.value().is_null() {
             return Ok(None);
         }
         // SAFETY: the SDK returned a readable NUL-terminated string, which
         // this guard keeps allocated for as long as it is borrowed.
-        let bytes = unsafe {
-            crate::frames::bounded_sdk_text(self.pointer, crate::frames::MAX_METADATA_BYTES)
-        }
-        .ok_or(Error::UnexpectedSdkResult(
-            crate::SdkResultDefect::UnterminatedReceiverText,
-        ))?;
+        let bytes = unsafe { crate::frames::sdk_text(self.string) }?;
         Ok(Some(bytes))
     }
 
@@ -107,12 +103,12 @@ impl RecvStringGuard<'_> {
 }
 impl Drop for RecvStringGuard<'_> {
     fn drop(&mut self) {
-        if !self.pointer.is_null() {
+        if !self.string.value().is_null() {
             // SAFETY: the SDK returned this string for this instance and it is
             // released exactly once.
             unsafe {
                 self.strings
-                    .NDIlib_recv_free_string(self.core.instance.0, self.pointer)
+                    .NDIlib_recv_free_string(self.core.instance.0, self.string.into_value())
             };
         }
     }
@@ -137,6 +133,62 @@ fn receiver_delay(millis: i32) -> Result<Duration> {
         })
 }
 
+/// Reject a signed native count while keeping its exact producing entry point.
+/// The returned u64 covers both the SDK's i32 counts and i64 performance totals.
+pub(crate) fn native_count<T: Into<i64>>(count: sys::table::Called<T>) -> Result<u64> {
+    let (value, operation) = count.into_parts();
+    let value = value.into();
+    u64::try_from(value).map_err(|_| {
+        Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
+            operation,
+            value: value.into(),
+        })
+    })
+}
+
+/// A coalesced status invalidation and its publication generation.
+/// Validation completes before a compare/exchange consumes that generation;
+/// failed validation or a newer publication therefore leaves status pending.
+#[derive(Default)]
+struct PendingStatus(AtomicUsize);
+
+impl PendingStatus {
+    fn publish(&self) {
+        let mut observed = self.0.load(Ordering::Acquire);
+        loop {
+            match self.0.compare_exchange_weak(
+                observed,
+                observed.wrapping_add(2) | 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_pending(&self) -> bool {
+        self.0.load(Ordering::Acquire) & 1 != 0
+    }
+
+    fn take_with<T>(&self, snapshot: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+        let observed = self.0.load(Ordering::Acquire);
+        if observed & 1 == 0 {
+            return Ok(None);
+        }
+        let status = snapshot()?;
+        // A failed CAS means another consumer took it or a new generation was
+        // published while validating. Neither case may consume that newer event.
+        Ok(self
+            .0
+            .compare_exchange(observed, observed & !1, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| status))
+    }
+}
+
 /// The SDK's millisecond count for a receive delay, rounded up by the one
 /// timeout rule, [`timeout::sdk_millis`], and refused above
 /// [`MAX_RECEIVE_DELAY_MILLIS`].
@@ -150,10 +202,6 @@ fn receiver_delay_millis(delay: Duration) -> Result<i32> {
             })
         })
 }
-
-/// The longest one capture attempt waits in the SDK. Bounded attempts let
-/// cancellation and pending notifications be observed between native waits.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The pause after an attempt that returned before its own end without a
 /// value: the SDK's early return, which would otherwise busy-wait.
@@ -172,31 +220,6 @@ enum Retry<T> {
 impl<T> From<Option<T>> for Retry<T> {
     fn from(value: Option<T>) -> Self {
         value.map_or(Self::Idle, Self::Item)
-    }
-}
-
-mod stop_sealed {
-    pub trait Sealed {}
-    impl Sealed for super::NeverStop {}
-    impl Sealed for &std::sync::atomic::AtomicBool {}
-}
-
-/// Whether a wait may begin another attempt. Checked only between attempts,
-/// so a delivered frame is always guarded and processed before cancellation.
-pub(crate) trait Stop: stop_sealed::Sealed {
-    fn is_stopped(&self) -> bool;
-}
-
-/// Synchronous waits have no cancellation state or atomic loads.
-pub(crate) struct NeverStop;
-impl Stop for NeverStop {
-    fn is_stopped(&self) -> bool {
-        false
-    }
-}
-impl Stop for &AtomicBool {
-    fn is_stopped(&self) -> bool {
-        self.load(Ordering::Acquire)
     }
 }
 
@@ -316,13 +339,7 @@ macro_rules! ptz_command {
     ($ptz:expr, $func:ident $(, $arg:expr)*) => {{
         // SAFETY: the receiver instance is live for the handle's borrow, and
         // every argument is a plain value.
-        if unsafe { $ptz.core.sdk().$func($ptz.core.instance.0 $(, $arg)*) } {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: stringify!($func),
-            })
-        }
+        unsafe { $ptz.core.sdk().named().$func($ptz.core.instance.0 $(, $arg)*) }.performed()
     }};
 }
 
@@ -654,7 +671,7 @@ impl ReceiverOptions {
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// println!("Connected: {}", receiver.is_connected());
-    /// println!("Active connections: {}", receiver.connection_stats().connections());
+    /// println!("Active connections: {}", receiver.connection_stats()?.connections());
     /// # Ok(())
     /// # }
     /// ```
@@ -852,6 +869,53 @@ impl Permits<VideoKind> for AvSyncAttached {}
 #[cfg(feature = "advanced")]
 impl Permits<MetadataKind> for AvSyncAttached {}
 
+/// Modes native receiver creation can produce directly.
+pub(crate) trait CreatableMode: ReceiverMode {}
+impl CreatableMode for RawCapture {}
+#[cfg(feature = "advanced")]
+impl CreatableMode for PacketAttached {}
+
+/// Modes whose native synchronizer must be destroyed before raw capture returns.
+pub(crate) trait SynchronizerMode: ReceiverMode {}
+impl SynchronizerMode for FrameSyncAttached {}
+#[cfg(feature = "advanced")]
+impl SynchronizerMode for AvSyncAttached {}
+
+/// Proof that this receiver's native synchronizer has been destroyed.
+/// Construction consumes a native resource; retained core identity prevents
+/// another synchronizer's release from restoring raw capture on a live one.
+pub(crate) struct Released<M: SynchronizerMode> {
+    core: Arc<ReceiverCore>,
+    _mode: PhantomData<fn() -> M>,
+}
+
+impl Released<FrameSyncAttached> {
+    pub(crate) fn release(resource: crate::framesync::FrameSyncResource) -> Self {
+        // Keep this exact core allocated through identity validation. Cloning
+        // avoids manual field extraction from a resource with a native Drop.
+        let core = Arc::clone(resource.receiver_core());
+        drop(resource);
+        Self {
+            core,
+            _mode: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "advanced")]
+impl Released<AvSyncAttached> {
+    pub(crate) fn release(resource: crate::advanced::AvResource) -> Self {
+        // Keep this exact core allocated through identity validation. Cloning
+        // avoids manual field extraction from a resource with a native Drop.
+        let core = Arc::clone(resource.receiver_core());
+        drop(resource);
+        Self {
+            core,
+            _mode: PhantomData,
+        }
+    }
+}
+
 /// Ordinary receiver mode, permitting raw video capture.
 #[derive(Debug)]
 pub enum RawCapture {}
@@ -959,11 +1023,76 @@ impl<M: ReceiverMode + std::panic::UnwindSafe> std::panic::UnwindSafe for Receiv
 
 /// A requested target and the native descriptor already validated for it.
 /// Replaced as one value under the target lock, so neither half can be stale.
-struct ConnectionTarget {
+pub(crate) struct ConnectionTarget {
     source: Source,
     // Keep both the descriptor and its strings at stable addresses until a
     // replacement request returns, or the native receiver is destroyed.
     raw: Box<RawSource>,
+}
+
+impl ConnectionTarget {
+    pub(crate) fn new(source: &Source) -> Result<Self> {
+        Ok(Self {
+            source: source.clone(),
+            raw: Box::new(source.to_raw()?),
+        })
+    }
+}
+
+/// Only a receiver's connection lock can issue this permit.
+struct ConnectionPermit;
+
+/// One local connection request, with this receiver's exclusive permit.
+/// It keeps the passed descriptor and its strings until a later request has
+/// returned or the native receiver is destroyed. Captures may overlap it.
+struct Connection<'a> {
+    core: &'a ReceiverCore,
+    _exclusive: MutexGuard<'a, ConnectionPermit>,
+}
+
+enum ConnectionRequest {
+    Connect(ConnectionTarget),
+    Reconnect,
+    Disconnect,
+}
+
+impl Connection<'_> {
+    fn connect(&self, next: ConnectionTarget) {
+        self.request(ConnectionRequest::Connect(next));
+    }
+
+    fn reconnect(&self) {
+        self.request(ConnectionRequest::Reconnect);
+    }
+
+    fn disconnect(&self) {
+        self.request(ConnectionRequest::Disconnect);
+    }
+
+    fn request(&self, request: ConnectionRequest) {
+        // Only reconnect needs the target during the call. Snapshots share this
+        // read lock, and every writer holds this Connection's exclusive permit.
+        let target =
+            matches!(request, ConnectionRequest::Reconnect).then(|| self.core.target.read());
+        let source = match &request {
+            ConnectionRequest::Connect(next) => ptr::from_ref(next.raw.as_raw()),
+            ConnectionRequest::Reconnect => ptr::from_ref(target.as_ref().unwrap().raw.as_raw()),
+            ConnectionRequest::Disconnect => ptr::null(),
+        };
+        // SAFETY: this permit fixes the live receiver and serializes requests.
+        // A connect passes the box moved into target below; reconnect passes
+        // the stored box under a read lock; disconnect passes null. The old
+        // target remains owned until this call returns, without assuming copies.
+        unsafe {
+            self.core
+                .sdk()
+                .NDIlib_recv_connect(self.core.instance.0, source)
+        };
+        drop(target);
+        if let ConnectionRequest::Connect(next) = request {
+            *self.core.target.write() = next;
+        }
+    }
 }
 
 /// A receiver's opaque native identity; ownership stays with `ReceiverCore`.
@@ -972,8 +1101,9 @@ pub(crate) struct RecvInstance(pub(crate) NDIlib_recv_instance_t);
 
 // SAFETY: the SDK gives receivers no thread affinity and permits concurrent
 // captures (Processing.NDI.Recv.h). CaptureLock records the native implementation
-// observations and tests supporting concurrent connection changes. The core's
-// connection lock serializes those changes; its query lock protects SDK strings.
+// observations and tests supporting concurrent connection changes. The core
+// serializes local connection changes with one another, and source-name waits
+// with one another.
 // Every native use retains the core; its other fields determine its auto traits.
 unsafe impl Send for RecvInstance {}
 // SAFETY: as above; receiver modes reserve the media paths used by synchronizers.
@@ -984,15 +1114,17 @@ pub(crate) struct ReceiverCore {
     pub(crate) _ndi: Ndi,
     /// Serializes local connection changes. Captures never take this lock;
     /// their overlap with connection changes is measured beside CaptureLock.
-    connection_guard: Mutex<()>,
-    /// The latest requested target. The connection guard serializes its writers;
+    connection_guard: Mutex<ConnectionPermit>,
+    /// The latest requested target. Connection serializes its writers;
     /// snapshots never take it and therefore never wait for a capture or a queued
     /// connection change. Writers hold this lock only to replace the value.
     target: RwLock<ConnectionTarget>,
-    pending_status: AtomicBool,
+    pending_status: PendingStatus,
     pending_source: AtomicBool,
     pending_unknown: Mutex<Option<u32>>,
     source_query_guard: Mutex<()>,
+    connection_metadata: Mutex<ConnectionMetadata>,
+    _name: Option<CString>,
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
 }
@@ -1065,16 +1197,18 @@ impl Receiver {
             Self::create(
                 ndi,
                 options,
-                "NDIlib_recv_create_v3",
                 #[cfg(feature = "advanced")]
                 None,
-                |core, raw| core.NDIlib_recv_create_v3(raw),
+                |core, raw| core.named().NDIlib_recv_create_v3(raw),
             )
         }
     }
+}
 
+#[allow(private_bounds)]
+impl<M: CreatableMode> Receiver<M> {
     /// The one creation path: check `options` against the runtime, create a
-    /// receiver through `create`, the entry point `operation`, which is
+    /// receiver through `create`, which is
     /// handed the core table and the native settings for `options`, and keep
     /// `config` for as long as the native receiver lives.
     ///
@@ -1085,33 +1219,72 @@ impl Receiver {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         options: &ReceiverOptions,
-        operation: &'static str,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
-        create: impl FnOnce(&'static sys::Core, &NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t,
+        create: impl FnOnce(
+            &'static sys::Core,
+            &NDIlib_recv_create_v3_t,
+        ) -> sys::table::Called<NDIlib_recv_instance_t>,
     ) -> Result<Self> {
-        let raw = options.to_raw(ndi)?;
-        let instance = create(&ndi.api().core, &raw.raw);
-        if instance.is_null() {
-            return Err(Error::NativeOperationFailed { operation });
-        }
+        let RawRecvCreateV3 {
+            _source,
+            _name,
+            raw,
+        } = options.to_raw(ndi)?;
+        // SAFETY: the core keeps every string these settings point to until
+        // after native destruction, including the target and receiver name.
+        let instance = create(&ndi.api().core, &raw).created()?.as_ptr();
         Ok(Self {
             core: Arc::new(ReceiverCore {
                 instance: RecvInstance(instance),
                 _ndi: ndi.clone(),
-                connection_guard: Mutex::new(()),
+                connection_guard: Mutex::new(ConnectionPermit),
                 target: RwLock::new(ConnectionTarget {
                     source: options.source.clone(),
-                    raw: Box::new(raw._source),
+                    raw: Box::new(_source),
                 }),
-                pending_status: AtomicBool::new(false),
+                pending_status: PendingStatus::default(),
                 pending_source: AtomicBool::new(false),
                 pending_unknown: Mutex::new(None),
                 source_query_guard: Mutex::new(()),
+                connection_metadata: Mutex::new(ConnectionMetadata::default()),
+                _name,
                 #[cfg(feature = "advanced")]
                 _config: config,
             }),
             _mode: PhantomData,
         })
+    }
+}
+
+impl Receiver<RawCapture> {
+    pub(crate) fn attach<M: SynchronizerMode>(self) -> Receiver<M> {
+        Receiver {
+            core: self.core,
+            _mode: PhantomData,
+        }
+    }
+
+    /// Synthetic packet-mode receiver for tests without a passthrough SDK.
+    #[cfg(all(test, feature = "advanced"))]
+    pub(crate) fn into_packet_for_test(self) -> Receiver<PacketAttached> {
+        Receiver {
+            core: self.core,
+            _mode: PhantomData,
+        }
+    }
+}
+
+#[allow(private_bounds)]
+impl<M: SynchronizerMode> Receiver<M> {
+    pub(crate) fn detach(self, released: Released<M>) -> Receiver<RawCapture> {
+        assert!(
+            Arc::ptr_eq(&self.core, &released.core),
+            "synchronizer release belongs to another receiver"
+        );
+        Receiver {
+            core: self.core,
+            _mode: PhantomData,
+        }
     }
 }
 
@@ -1230,13 +1403,6 @@ impl<M: ReceiverMode> Receiver<M> {
         )
     }
 
-    pub(crate) fn into_mode<T: ReceiverMode>(self) -> Receiver<T> {
-        Receiver {
-            core: self.core,
-            _mode: PhantomData,
-        }
-    }
-
     /// Set native video buffering, in the range zero through two seconds.
     ///
     /// Positive fractional milliseconds round up. Values above two seconds are
@@ -1299,21 +1465,26 @@ impl<M: ReceiverMode> Receiver<M> {
 
     /// Add validated metadata sent immediately and again on each connection.
     ///
-    /// Accepts owned or captured metadata. The SDK copies the text during
-    /// this call, so the input need not outlive the registration.
+    /// Accepts owned or captured metadata. The receiver keeps its own copy,
+    /// so the input need not outlive the registration.
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let table = self.core.connection_metadata()?;
-        let raw = metadata.metadata_raw();
-        // SAFETY: The metadata C string remains live for the synchronous SDK call.
-        unsafe { table.NDIlib_recv_add_connection_metadata(self.core.instance.0, &raw) };
+        let mut registrations = self.core.connection_metadata.lock();
+        let raw = registrations.add(metadata);
+        // SAFETY: the locked collection owns this stable descriptor and its
+        // text until clear returns or after the native receiver is destroyed.
+        unsafe { table.NDIlib_recv_add_connection_metadata(self.core.instance.0, raw) };
         Ok(())
     }
 
     /// Clear metadata registered for subsequent receiver connections.
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.core.connection_metadata()?;
-        // SAFETY: the receiver instance is live for this borrow.
+        let mut registrations = self.core.connection_metadata.lock();
+        // SAFETY: the receiver and every registered descriptor remain live
+        // until the native clear returns under the same registration lock.
         unsafe { table.NDIlib_recv_clear_connection_metadata(self.core.instance.0) };
+        registrations.clear();
         Ok(())
     }
 
@@ -1327,7 +1498,11 @@ impl<M: ReceiverMode> Receiver<M> {
         let guard = RecvStringGuard {
             core: &self.core,
             // SAFETY: the receiver instance is live for this borrow.
-            pointer: unsafe { web_control.NDIlib_recv_get_web_control(self.core.instance.0) },
+            string: unsafe {
+                web_control
+                    .named()
+                    .NDIlib_recv_get_web_control(self.core.instance.0)
+            },
             strings,
         };
         guard.copy()
@@ -1356,14 +1531,13 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Invalid input leaves the target unchanged. Existing FrameSync ownership
     /// remains.
     pub fn connect_to(&self, source: &Source) -> Result<()> {
-        let next = ConnectionTarget {
-            source: source.clone(),
-            raw: Box::new(source.to_raw()?),
-        };
-        let connection = self.core.connection_guard.lock();
-        self.core.connect_raw(Some(&next.raw), &connection);
-        *self.core.target.write() = next;
+        self.connect_target(ConnectionTarget::new(source)?);
         Ok(())
+    }
+
+    /// Apply an input already validated on the synchronous or async caller.
+    pub(crate) fn connect_target(&self, target: ConnectionTarget) {
+        self.core.lock_connection().connect(target);
     }
 
     /// Disconnect while retaining the target for [`Self::reconnect`].
@@ -1371,8 +1545,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Serializes with other local connection changes, as [`Self::reconnect`]
     /// does, while captures may continue.
     pub fn disconnect(&self) {
-        let connection = self.core.connection_guard.lock();
-        self.core.connect_raw(None, &connection);
+        self.core.lock_connection().disconnect();
     }
 
     /// Publish this receiver's program and preview tally to its source.
@@ -1465,6 +1638,8 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Ok(())
     /// # }
     /// ```
+    /// A negative native count reports no established connection; use
+    /// [`Self::connection_stats`] to inspect that SDK contract error.
     pub fn is_connected(&self) -> bool {
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -1511,11 +1686,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// issued, not that the feed recovered. Confirm recovery through
     /// [`Self::connection_stats`].
     pub fn reconnect(&self) {
-        // Read and submit under the same exclusive lock, so a concurrent
-        // connect_to cannot be overwritten by a stale retained descriptor.
-        let connection = self.core.connection_guard.lock();
-        let target = self.core.target.read();
-        self.core.connect_raw(Some(&target.raw), &connection);
+        self.core.lock_connection().reconnect();
     }
 
     /// An owned snapshot of the latest locally requested connection target.
@@ -1556,6 +1727,10 @@ impl<M: ReceiverMode> Receiver<M> {
     /// connection changes; see [`ConnectionStats`] and the
     /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
     ///
+    /// # Errors
+    ///
+    /// [`Error::UnexpectedSdkResult`] when any native count is negative.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -1563,7 +1738,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
     /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
-    /// let stats = receiver.connection_stats();
+    /// let stats = receiver.connection_stats()?;
     /// println!("Connections: {connections}", connections = stats.connections());
     /// println!("Video frames: {received} (dropped: {dropped})",
     ///          received = stats.video_frames_received(),
@@ -1573,12 +1748,13 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn connection_stats(&self) -> ConnectionStats {
+    pub fn connection_stats(&self) -> Result<ConnectionStats> {
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
         let connections = unsafe {
             self.core
                 .sdk()
+                .named()
                 .NDIlib_recv_get_no_connections(self.core.instance.0)
         };
 
@@ -1586,35 +1762,36 @@ impl<M: ReceiverMode> Receiver<M> {
         let mut dropped = NDIlib_recv_performance_t::default();
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
-        unsafe {
-            self.core.sdk().NDIlib_recv_get_performance(
+        let performance = unsafe {
+            self.core.sdk().named().NDIlib_recv_get_performance(
                 self.core.instance.0,
                 &mut total,
                 &mut dropped,
-            );
-        }
+            )
+        };
 
         let mut queue = NDIlib_recv_queue_t::default();
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
-        unsafe {
+        let queued = unsafe {
             self.core
                 .sdk()
-                .NDIlib_recv_get_queue(self.core.instance.0, &mut queue);
-        }
+                .named()
+                .NDIlib_recv_get_queue(self.core.instance.0, &mut queue)
+        };
 
-        ConnectionStats {
-            connections: connections.max(0) as u32,
-            video_frames_received: total.video_frames.max(0) as u64,
-            audio_frames_received: total.audio_frames.max(0) as u64,
-            metadata_frames_received: total.metadata_frames.max(0) as u64,
-            video_frames_dropped: dropped.video_frames.max(0) as u64,
-            audio_frames_dropped: dropped.audio_frames.max(0) as u64,
-            metadata_frames_dropped: dropped.metadata_frames.max(0) as u64,
-            video_frames_queued: queue.video_frames.max(0) as u32,
-            audio_frames_queued: queue.audio_frames.max(0) as u32,
-            metadata_frames_queued: queue.metadata_frames.max(0) as u32,
-        }
+        Ok(ConnectionStats {
+            connections: native_count(connections)? as u32,
+            video_frames_received: native_count(performance.map(|()| total.video_frames))?,
+            audio_frames_received: native_count(performance.map(|()| total.audio_frames))?,
+            metadata_frames_received: native_count(performance.map(|()| total.metadata_frames))?,
+            video_frames_dropped: native_count(performance.map(|()| dropped.video_frames))?,
+            audio_frames_dropped: native_count(performance.map(|()| dropped.audio_frames))?,
+            metadata_frames_dropped: native_count(performance.map(|()| dropped.metadata_frames))?,
+            video_frames_queued: native_count(queued.map(|()| queue.video_frames))? as u32,
+            audio_frames_queued: native_count(queued.map(|()| queue.audio_frames))? as u32,
+            metadata_frames_queued: native_count(queued.map(|()| queue.metadata_frames))? as u32,
+        })
     }
 }
 
@@ -1642,7 +1819,8 @@ impl<M: EventMode> Receiver<M> {
     ///
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
     /// (~49.7 days), and [`Error::ConnectionLost`] when the SDK reports a lost
-    /// connection.
+    /// connection, or [`Error::UnexpectedSdkResult`] when a status snapshot
+    /// contains a negative native connection count. Its invalidation stays pending.
     pub fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
         self.poll_event_until(Deadline::after(timeout)?, NeverStop)
     }
@@ -1718,17 +1896,12 @@ impl ReceiverCore {
         self._ndi.table()
     }
 
-    /// Point the native receiver at `source`, or at no source, under the
-    /// connection guard that serializes local requests and target updates.
-    /// Captures may overlap it, as measured beside [`CaptureLock`].
-    fn connect_raw(&self, source: Option<&RawSource>, _exclusive: &MutexGuard<'_, ()>) {
-        let source = source.map_or(ptr::null(), |raw| ptr::from_ref(raw.as_raw()));
-        // SAFETY: the receiver instance is live for this borrow. `source` is
-        // null or points into a boxed `RawSource`, which owns the strings its
-        // descriptor points to. The caller retains that same box in the
-        // receiver's target until a replacement request returns, or the native
-        // receiver is destroyed; no assumption about an SDK copy is needed.
-        unsafe { self.sdk().NDIlib_recv_connect(self.instance.0, source) };
+    /// Issue a permit tied to this receiver and its local connection lock.
+    fn lock_connection(&self) -> Connection<'_> {
+        Connection {
+            core: self,
+            _exclusive: self.connection_guard.lock(),
+        }
     }
 
     /// Bind `attempt` to this receiver and its runtime, without taking the
@@ -1737,10 +1910,6 @@ impl ReceiverCore {
     /// This is the only way to make a [`CaptureLock`], and so to call
     /// `NDIlib_recv_capture_v3` on this instance.
     fn capture_lock(&self, attempt: Attempt) -> CaptureLock<'_> {
-        #[cfg(test)]
-        if let Some(event) = capture_lock_test_event::take() {
-            self.retain(event);
-        }
         CaptureLock {
             core: self,
             attempt,
@@ -1751,7 +1920,7 @@ impl ReceiverCore {
     /// snapshots proceed while another connection change is queued.
     #[cfg(all(test, any(feature = "advanced", feature = "tokio", feature = "smol")))]
     pub(crate) fn reconnect_lock(&self) -> impl Drop + '_ {
-        self.connection_guard.lock()
+        self.lock_connection()._exclusive
     }
 
     /// One SDK capture of kind `K` within `attempt`.
@@ -1779,8 +1948,7 @@ impl ReceiverCore {
         match result {
             CaptureResult::Frame(guard) => {
                 // Validation (e.g. FourCC) happens during ref construction.
-                // SAFETY: the guard owns a frame this capture reported as `K`'s kind.
-                let frame_ref = unsafe { K::make_ref(guard)? };
+                let frame_ref = K::make_ref(guard)?;
                 Ok(Some(frame_ref))
             }
             CaptureResult::Notification(notification) => {
@@ -1802,9 +1970,9 @@ impl ReceiverCore {
     }
 
     /// The mixed-capture kernel, shared by raw and packet receivers and
-    /// notification-only polling. A pending event is taken before and after
-    /// preparing the native attempt, so one a capture retained meanwhile spares
-    /// the native wait. Only media reaches `convert`, retaining
+    /// notification-only polling. A pending event is taken before the native
+    /// attempt; events retained during that attempt merge with its result.
+    /// Only media reaches `convert`, retaining
     /// its guards through the caller's validation and copy.
     fn capture_any_until_with<'rx, S: SlotSet, T>(
         &'rx self,
@@ -1814,13 +1982,10 @@ impl ReceiverCore {
         mut convert: impl FnMut(S::Media<'rx>) -> Result<T>,
     ) -> Result<Option<T>> {
         capture_within(deadline, stop, |attempt| {
-            if let Some(pending) = self.take_pending_event() {
+            if let Some(pending) = self.take_pending_event()? {
                 return Ok(Some(event(pending)));
             }
             let lock = self.capture_lock(attempt);
-            if let Some(pending) = self.take_pending_event() {
-                return Ok(Some(event(pending)));
-            }
             let delivered = capture_any::<S>(&lock)?;
             self.capture_any_result_with(delivered, &mut event, &mut convert)
         })
@@ -1837,20 +2002,17 @@ impl ReceiverCore {
     ) -> Result<Option<T>> {
         match delivered {
             Delivered::Media(media) => convert(media).map(Some),
-            Delivered::Notification(notification) => Ok(self.event(notification).map(event)),
+            Delivered::Notification(notification) => {
+                self.event(notification).map(|item| item.map(event))
+            }
         }
     }
 
     fn combined_result(media: Media<'_>) -> Result<ReceiverItemRef<'_>> {
         Ok(match media {
-            // SAFETY: all-slot dispatch guards each delivered descriptor
-            // with its matching capture kind and free operation. Construction
-            // validates the active layout without reading native padding.
-            Media::Video(guard) => ReceiverItemRef::Video(unsafe { VideoKind::make_ref(guard)? }),
-            Media::Audio(guard) => ReceiverItemRef::Audio(unsafe { AudioKind::make_ref(guard)? }),
-            Media::Metadata(guard) => {
-                ReceiverItemRef::Metadata(unsafe { MetadataKind::make_ref(guard)? })
-            }
+            Media::Video(guard) => ReceiverItemRef::Video(VideoKind::make_ref(guard)?),
+            Media::Audio(guard) => ReceiverItemRef::Audio(AudioKind::make_ref(guard)?),
+            Media::Metadata(guard) => ReceiverItemRef::Metadata(MetadataKind::make_ref(guard)?),
         })
     }
 
@@ -1858,52 +2020,49 @@ impl ReceiverCore {
     /// typed capture retained during this wait, then consume one. A pending
     /// event returned before the native wait never comes through this path
     /// and is never published again.
-    fn event(&self, notification: Notification) -> Option<ReceiverEvent> {
+    fn event(&self, notification: Notification) -> Result<Option<ReceiverEvent>> {
         self.retain(notification);
         self.take_pending_event()
     }
 
-    fn take_pending_status(&self) -> Option<ReceiverStatus> {
-        // Atomic swap linearizes competing pollers with capture publication.
-        // A store after this take remains pending; no load/store pair can erase it.
-        self.pending_status
-            .swap(false, Ordering::AcqRel)
-            .then(|| self.current_status())
+    fn take_pending_status(&self) -> Result<Option<ReceiverStatus>> {
+        self.pending_status.take_with(|| self.current_status())
     }
 
-    fn current_status(&self) -> ReceiverStatus {
-        ReceiverStatus {
-            // SAFETY: the receiver instance is live for this borrow, and every pointer
-            // passed outlives the synchronous call.
-            connections: unsafe {
-                self.sdk()
-                    .NDIlib_recv_get_no_connections(self.instance.0)
-                    .max(0) as u32
-            },
-        }
+    fn current_status(&self) -> Result<ReceiverStatus> {
+        // SAFETY: the receiver is live for this nonblocking native query.
+        let count = unsafe {
+            self.sdk()
+                .named()
+                .NDIlib_recv_get_no_connections(self.instance.0)
+        };
+        Ok(ReceiverStatus {
+            connections: native_count(count)? as u32,
+        })
     }
 
     /// Keep a notification a capture reported for [`Receiver::poll_event`].
     fn retain(&self, notification: Notification) {
         match notification {
             Notification::None => {}
-            Notification::StatusChanged => self.pending_status.store(true, Ordering::Release),
+            Notification::StatusChanged => self.pending_status.publish(),
             Notification::SourceChanged => self.pending_source.store(true, Ordering::Release),
             Notification::Unknown(value) => *self.pending_unknown.lock() = Some(value),
         }
     }
 
-    fn take_pending_event(&self) -> Option<ReceiverEvent> {
-        if let Some(status) = self.take_pending_status() {
-            return Some(ReceiverEvent::StatusChanged(status));
+    fn take_pending_event(&self) -> Result<Option<ReceiverEvent>> {
+        if let Some(status) = self.take_pending_status()? {
+            return Ok(Some(ReceiverEvent::StatusChanged(status)));
         }
         if self.pending_source.swap(false, Ordering::AcqRel) {
-            return Some(ReceiverEvent::SourceChanged);
+            return Ok(Some(ReceiverEvent::SourceChanged));
         }
-        self.pending_unknown
+        Ok(self
+            .pending_unknown
             .lock()
             .take()
-            .map(ReceiverEvent::Unknown)
+            .map(ReceiverEvent::Unknown))
     }
 
     /// The one implementation of [`Receiver::poll_source_name_change`], also
@@ -1918,15 +2077,19 @@ impl ReceiverCore {
         stop: impl Stop,
     ) -> Result<Option<SourceNameChange>> {
         // The query comes with the function that releases what it returns.
-        let (source_name, strings) = self
-            ._ndi
-            .table::<(sys::ReceiverSourceName, sys::ReceiverStrings)>()?;
+        let (source_name, strings) = self.source_name_tables()?;
         self.poll_source_name_change_with(source_name, strings, deadline, stop)
+    }
+
+    pub(crate) fn source_name_tables(
+        &self,
+    ) -> Result<&'static (sys::ReceiverSourceName, sys::ReceiverStrings)> {
+        self._ndi.table()
     }
 
     /// [`Self::poll_source_name_change_until`] through the given tables, so
     /// that a test can substitute the SDK functions.
-    fn poll_source_name_change_with(
+    pub(crate) fn poll_source_name_change_with(
         &self,
         source_name: &sys::ReceiverSourceName,
         strings: &sys::ReceiverStrings,
@@ -1942,14 +2105,18 @@ impl ReceiverCore {
             // SAFETY: the receiver instance is live for this borrow and `pointer` is
             // writable storage for the returned string.
             let changed = unsafe {
-                source_name.NDIlib_recv_get_source_name(self.instance.0, &mut pointer, remaining)
+                source_name.named().NDIlib_recv_get_source_name(
+                    self.instance.0,
+                    &mut pointer,
+                    remaining,
+                )
             };
             let guard = RecvStringGuard {
                 core: self,
-                pointer,
+                string: changed.map(|_| pointer),
                 strings,
             };
-            if !changed {
+            if !changed.into_value() {
                 return Ok(None);
             }
             // The SDK reports a change only once, since the previous call, so a
@@ -2078,20 +2245,6 @@ pub(crate) mod native_capture_calls {
 
 /// Publish one event immediately after a test prepares a capture attempt, so
 /// its second pending-event check can be tested without a scheduling race.
-#[cfg(test)]
-mod capture_lock_test_event {
-    use super::Notification;
-    std::thread_local! {
-        static NEXT: std::cell::Cell<Option<Notification>> = const { std::cell::Cell::new(None) };
-    }
-    pub(super) fn set(event: Notification) {
-        NEXT.with(|next| next.set(Some(event)));
-    }
-    pub(super) fn take() -> Option<Notification> {
-        NEXT.with(|next| next.take())
-    }
-}
-
 /// A typed view over a [`Receiver`] for capturing frames of one kind.
 ///
 /// Created by [`Receiver::video`], [`Receiver::audio`], and
@@ -2717,6 +2870,9 @@ pub(crate) mod lifecycle_test_events {
             }
         });
     }
+    pub(crate) fn snapshot() -> Vec<&'static str> {
+        EVENTS.with(|events| events.borrow().as_ref().unwrap().clone())
+    }
     pub(crate) fn track(action: impl FnOnce()) -> Vec<&'static str> {
         EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
         action();
@@ -2742,7 +2898,9 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap().into_mode();
+        let receiver = Receiver::new(&ndi, &unconnected())
+            .unwrap()
+            .into_packet_for_test();
         // Model notifications retained before a mode transition. Packet capture
         // must consume them once without spending its timeout in native capture.
         receiver.core.retain(Notification::StatusChanged);
@@ -2762,7 +2920,7 @@ mod tests {
             assert_eq!(actual, expected);
         }
         assert_eq!(native_capture_calls::take(), 0);
-        assert_eq!(receiver.core.take_pending_event(), None);
+        assert_eq!(receiver.core.take_pending_event().unwrap(), None);
     }
 
     #[test]
@@ -2840,14 +2998,14 @@ mod tests {
         }
         receiver.core.retain(Notification::classify(987).unwrap());
         assert!(matches!(
-            receiver.core.take_pending_event(),
+            receiver.core.take_pending_event().unwrap(),
             Some(ReceiverEvent::SourceChanged)
         ));
         assert!(matches!(
-            receiver.core.take_pending_event(),
+            receiver.core.take_pending_event().unwrap(),
             Some(ReceiverEvent::Unknown(987))
         ));
-        assert!(receiver.core.take_pending_event().is_none());
+        assert!(receiver.core.take_pending_event().unwrap().is_none());
         assert!(receiver
             .core
             .capture_result::<VideoKind>(CaptureResult::Notification(Notification::Unknown(988)))
@@ -2857,11 +3015,11 @@ mod tests {
             Notification::classify(NDIlib_frame_type_e_NDIlib_frame_type_source_change).unwrap(),
         );
         assert!(matches!(
-            receiver.core.take_pending_event(),
+            receiver.core.take_pending_event().unwrap(),
             Some(ReceiverEvent::SourceChanged)
         ));
         assert!(matches!(
-            receiver.core.take_pending_event(),
+            receiver.core.take_pending_event().unwrap(),
             Some(ReceiverEvent::Unknown(988))
         ));
     }
@@ -2963,7 +3121,10 @@ mod tests {
         ] {
             let guard = RecvStringGuard {
                 core: &receiver.core,
-                pointer: CString::new(bytes).unwrap().into_raw(),
+                string: sys::table::for_test(
+                    CString::new(bytes).unwrap().into_raw().cast_const(),
+                    c"NDIlib_recv_get_web_control",
+                ),
                 strings: &strings,
             };
             assert_eq!(guard.copy().is_ok(), valid);
@@ -2971,7 +3132,7 @@ mod tests {
         }
         let empty = RecvStringGuard {
             core: &receiver.core,
-            pointer: ptr::null(),
+            string: sys::table::for_test(ptr::null(), c"NDIlib_recv_get_web_control"),
             strings: &strings,
         };
         assert_eq!(empty.copy().unwrap(), None);
@@ -2990,11 +3151,11 @@ mod tests {
         let strings = sys::ReceiverStrings {
             NDIlib_recv_free_string: keep,
         };
-        let max = crate::frames::MAX_METADATA_BYTES;
+        let max = crate::frames::MAX_SDK_STRING_BYTES;
         let copy = |bytes: &[u8]| {
             RecvStringGuard {
                 core: &receiver.core,
-                pointer: bytes.as_ptr().cast(),
+                string: sys::table::for_test(bytes.as_ptr().cast(), c"NDIlib_recv_get_source_name"),
                 strings: &strings,
             }
             .copy_lossy()
@@ -3009,10 +3170,24 @@ mod tests {
         assert_eq!(copy(&longest).unwrap().unwrap().len(), max - 1);
         // Without one, the scan stops at the bound and reports an error.
         let unterminated = vec![b'x'; max];
-        assert!(matches!(
-            copy(&unterminated),
-            Err(Error::UnexpectedSdkResult(_))
-        ));
+        let (result, allocations) = crate::test_alloc::allocation_count(|| copy(&unterminated));
+        assert!(
+            matches!(result, Err(Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedText { operation }))
+            if operation == c"NDIlib_recv_get_source_name")
+        );
+        assert_eq!(allocations, 0);
+        let guard = RecvStringGuard {
+            core: &receiver.core,
+            string: sys::table::for_test(
+                unterminated.as_ptr().cast(),
+                c"NDIlib_recv_get_web_control",
+            ),
+            strings: &strings,
+        };
+        assert!(
+            matches!(guard.copy(), Err(Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedText { operation }))
+            if operation == c"NDIlib_recv_get_web_control")
+        );
     }
 
     #[test]
@@ -3240,10 +3415,10 @@ mod tests {
                     .unwrap()
                     .is_none());
                 assert!(matches!(
-                    receiver.core.take_pending_event(),
+                    receiver.core.take_pending_event().unwrap(),
                     Some(ReceiverEvent::StatusChanged(_))
                 ));
-                assert!(receiver.core.take_pending_event().is_none());
+                assert!(receiver.core.take_pending_event().unwrap().is_none());
             });
             assert_eq!(allocations, 0);
         }
@@ -3253,19 +3428,103 @@ mod tests {
     }
 
     #[test]
+    fn native_counts_preserve_signed_evidence_without_allocating() {
+        for value in [0, 7, -1, i64::MIN] {
+            let (result, allocations) = crate::test_alloc::allocation_count(|| {
+                native_count(sys::table::for_test(value, c"native count"))
+            });
+            assert_eq!(allocations, 0);
+            if value < 0 {
+                assert!(
+                    matches!(result, Err(Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount { operation, value: evidence }))
+                    if operation == c"native count" && evidence.get() == value)
+                );
+            } else {
+                assert_eq!(result.unwrap(), value as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn pending_status_keeps_failed_and_newer_publications() {
+        let pending = PendingStatus::default();
+        pending.publish();
+        assert!(matches!(
+            pending.take_with::<()>(|| Err(Error::ConnectionLost)),
+            Err(Error::ConnectionLost)
+        ));
+        assert!(pending.is_pending());
+        assert_eq!(
+            pending
+                .take_with(|| {
+                    pending.publish();
+                    Ok(1)
+                })
+                .unwrap(),
+            None
+        );
+        assert!(
+            pending.is_pending(),
+            "a publication during validation must survive"
+        );
+        assert_eq!(pending.take_with(|| Ok(2)).unwrap(), Some(2));
+        assert!(!pending.is_pending());
+        pending.publish();
+        assert!(pending
+            .take_with::<()>(|| {
+                pending.publish();
+                Err(Error::ConnectionLost)
+            })
+            .is_err());
+        assert!(pending.is_pending());
+        assert_eq!(pending.take_with(|| Ok(3)).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn pending_status_validation_has_one_competing_consumer() {
+        let pending = PendingStatus::default();
+        pending.publish();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        pending
+                            .take_with(|| {
+                                barrier.wait();
+                                Ok(())
+                            })
+                            .unwrap()
+                            .is_some()
+                    })
+                })
+                .collect();
+            assert_eq!(
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .filter(|taken| *taken)
+                    .count(),
+                1
+            );
+        });
+        assert!(!pending.is_pending());
+    }
+
+    #[test]
     fn pending_status_survives_an_invalid_poll_event_timeout() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        receiver.core.pending_status.store(true, Ordering::Release);
+        receiver.core.pending_status.publish();
         assert!(receiver.poll_event(Duration::MAX).is_err());
-        assert!(receiver.core.pending_status.load(Ordering::Acquire));
+        assert!(receiver.core.pending_status.is_pending());
         assert!(matches!(
             receiver.poll_event(Duration::ZERO).unwrap(),
             Some(ReceiverEvent::StatusChanged(_))
         ));
-        assert!(!receiver.core.pending_status.load(Ordering::Acquire));
+        assert!(!receiver.core.pending_status.is_pending());
     }
 
     #[test]
@@ -3294,7 +3553,7 @@ mod tests {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        receiver.core.pending_status.store(true, Ordering::Release);
+        receiver.core.pending_status.publish();
         let barrier = std::sync::Barrier::new(3);
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..2)
@@ -3303,7 +3562,7 @@ mod tests {
                     let barrier = &barrier;
                     scope.spawn(move || {
                         barrier.wait();
-                        receiver.core.take_pending_status().is_some()
+                        receiver.core.take_pending_status().unwrap().is_some()
                     })
                 })
                 .collect();
@@ -3316,8 +3575,8 @@ mod tests {
                 1
             );
         });
-        receiver.core.pending_status.store(true, Ordering::Release);
-        assert!(receiver.core.take_pending_status().is_some());
+        receiver.core.pending_status.publish();
+        assert!(receiver.core.take_pending_status().unwrap().is_some());
     }
 
     #[test]
@@ -3327,7 +3586,7 @@ mod tests {
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         let expected = receiver.connection_target();
-        let connection = receiver.core.connection_guard.lock();
+        let connection = receiver.core.lock_connection();
         std::thread::scope(|scope| {
             let (started, waiting) = std::sync::mpsc::channel();
             let receiver = &receiver;
@@ -3377,35 +3636,13 @@ mod tests {
     }
 
     #[test]
-    fn pending_events_found_during_attempt_preparation_run_without_the_connection_lock() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        capture_lock_test_event::set(Notification::SourceChanged);
-        let result = receiver
-            .core
-            .capture_any_until_with::<NoSlots, _>(
-                Deadline::after(Duration::ZERO).unwrap(),
-                NeverStop,
-                |event| {
-                    assert!(receiver.core.connection_guard.try_lock().is_some());
-                    event
-                },
-                |_| unreachable!("a pending event avoids native capture"),
-            )
-            .unwrap();
-        assert_eq!(result, Some(ReceiverEvent::SourceChanged));
-    }
-
-    #[test]
     fn combined_capture_consumes_pending_events_once_even_during_reconnect() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         receiver.core.retain(Notification::SourceChanged);
-        let _exclusive = receiver.core.connection_guard.lock();
+        let _exclusive = receiver.core.lock_connection();
         native_capture_calls::take();
         assert!(matches!(
             receiver.capture_any_ref(Duration::ZERO).unwrap(),
@@ -3481,7 +3718,7 @@ mod tests {
             Some(ReceiverItemRef::Event(ReceiverEvent::SourceChanged))
         ));
         assert!(
-            receiver.core.take_pending_event().is_none(),
+            receiver.core.take_pending_event().unwrap().is_none(),
             "same invalidation must not replay"
         );
         receiver.core.retain(Notification::Unknown(987));
@@ -3489,7 +3726,7 @@ mod tests {
             deliver(Notification::None).unwrap(),
             Some(ReceiverItemRef::Event(ReceiverEvent::Unknown(987)))
         ));
-        assert!(receiver.core.take_pending_event().is_none());
+        assert!(receiver.core.take_pending_event().unwrap().is_none());
     }
 
     #[test]
@@ -3558,10 +3795,10 @@ mod tests {
             .core
             .capture_result::<AudioKind>(CaptureResult::Notification(Notification::StatusChanged))
             .unwrap();
-        assert!(receiver.core.take_pending_status().is_some());
+        assert!(receiver.core.take_pending_status().unwrap().is_some());
 
         // Publishing a pending notification needs no local connection lock.
-        let _exclusive = receiver.core.connection_guard.lock();
+        let _exclusive = receiver.core.lock_connection();
         receiver
             .core
             .capture_result::<VideoKind>(CaptureResult::Notification(Notification::StatusChanged))
@@ -3579,16 +3816,16 @@ mod tests {
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         let original_core = Arc::as_ptr(&receiver.core);
-        receiver.core.pending_status.store(true, Ordering::Release);
+        receiver.core.pending_status.publish();
         let fs = crate::FrameSync::new(receiver).unwrap();
-        assert!(fs.receiver().core.pending_status.load(Ordering::Acquire));
+        assert!(fs.receiver().core.pending_status.is_pending());
         assert_eq!(Arc::as_ptr(&fs.receiver().core), original_core);
         let receiver = fs.into_receiver();
         assert!(matches!(
             receiver.poll_event(Duration::ZERO).unwrap(),
             Some(ReceiverEvent::StatusChanged(_))
         ));
-        assert!(!receiver.core.pending_status.load(Ordering::Acquire));
+        assert!(!receiver.core.pending_status.is_pending());
         assert_eq!(Arc::as_ptr(&receiver.core), original_core);
         assert_eq!(
             std::mem::size_of::<Receiver>(),
@@ -3709,7 +3946,7 @@ mod tests {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        let exclusive = receiver.core.connection_guard.lock();
+        let exclusive = receiver.core.lock_connection();
         std::thread::scope(|scope| {
             let (done, completed) = std::sync::mpsc::channel();
             let receiver = &receiver;

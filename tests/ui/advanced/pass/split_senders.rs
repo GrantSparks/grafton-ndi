@@ -22,9 +22,9 @@ fn queued(queue: &mut QueuedSender, video: VideoFrame, audio: &AudioFrame) {
 fn compressed(sender: &mut CompressedSender, mut video: CompressedVideoFrame, mut audio: CompressedAudioFrame) {
     let (mut videos, mut audios) = sender.split();
     std::thread::scope(|scope| {
-        scope.spawn(move || videos.send_video(&mut video).unwrap());
+        scope.spawn(move || videos.send_video(&mut video));
         scope.spawn(move || {
-            audios.send_audio(&mut audio).unwrap();
+            audios.send_audio(&mut audio);
             let _ = audios.sender().source();
         });
     });

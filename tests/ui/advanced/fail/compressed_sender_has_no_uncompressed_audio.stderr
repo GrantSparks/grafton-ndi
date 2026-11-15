@@ -2,7 +2,7 @@ error[E0599]: the method `send_audio` exists for reference `&grafton_ndi::Sender
  --> tests/ui/advanced/fail/compressed_sender_has_no_uncompressed_audio.rs:3:21
   |
 3 |     sender.sender().send_audio(frame);
-  |                     ^^^^^^^^^^ method cannot be called on `&grafton_ndi::Sender<CompressedAttached>` due to unsatisfied trait bounds
+  |                     ^^^^^^^^^^
   |
  ::: src/sender.rs
   |

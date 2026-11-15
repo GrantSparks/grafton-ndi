@@ -322,7 +322,7 @@ fn exercise(library: std::path::PathBuf) {
             capture.audio_input_format().unwrap().unwrap().sample_rate(),
             48_000
         );
-        assert_eq!(capture.audio_queue_depth(), 42);
+        assert_eq!(capture.audio_queue_depth().unwrap(), 42);
         assert!(matches!(
             session.key_down(u32::MAX),
             Err(Error::InvalidInput(_))

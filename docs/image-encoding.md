@@ -36,11 +36,28 @@ scratch across calls, including WebP's whole converted image, PNG rows and
 downscale sums. `retained_bytes()` reports wrapper capacity; `release()` frees
 it. Use a separate workspace for each concurrent worker. Codec allocations
 and the encoded result are separate; both WebP formats buffer their output.
+`encode` remembers the last successful encoded length for matching format settings
+and uses a hint bounded by the next image's size. It retains no output buffer;
+`release()` also resets the hint. `encode_to` leaves output allocation to its writer.
 
 Encoding is synchronous CPU work. Keep it on a blocking worker in async
 applications, with an owned frame if the worker outlives the capture borrow.
 Bound active workers and pending snapshots. [Performance guidance](image-encoding-performance.md)
 explains the buffering choices and measurement boundaries.
+
+## Picture aspect
+
+PNG and JPEG carry a frame's non-square picture aspect in PNG pHYs and JPEG
+JFIF relative pixel-density tags. The tags preserve the displayed width/height
+ratio, including after downscaling with a partial final block. Encoders keep the
+stored pixel dimensions and samples; viewers that ignore the tags still display
+those dimensions. A zero aspect or an explicit square-pixel aspect stays
+untagged, with byte-identical output. WebP carries no pixel-shape tag; callers
+needing its display aspect retain `picture_aspect_ratio()` separately.
+
+Both density components are positive integers no larger than 65,535. Ordinary
+ratios are approximated to that precision; extreme ratios clamp to the nearest
+representable endpoint. No resampling to square pixels is performed.
 
 ## Formats
 
@@ -112,6 +129,11 @@ for the code-value contract.
 `Downscale::Half`, `Quarter` and `Eighth` average blocks during conversion.
 Output dimensions round upward; partial edge blocks use their available pixels.
 With alpha retained, colors are weighted by alpha to avoid darkening edges.
+Color channels are treated as straight (not premultiplied by alpha), and PNG
+and WebP output store straight alpha. The [NDI SDK frame-type reference](https://docs.ndi.video/all/developing-with-ndi/sdk/frame-types)
+documents this convention for BGRA and RGBA. That reference does not specify it
+for UYVA, PA16, NB48 or NB4G; the encoder assumes straight color for those formats
+too.
 The reduction operates on code values and does not allocate a full-size RGB
 image. It reduces full-size frames independently of the receiver's bandwidth
 selection; a `snapshot_preset` receiver already requests the preview stream.

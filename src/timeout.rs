@@ -7,9 +7,46 @@
 //! the SDK or in a retry loop, starts one [`Deadline`] from its caller's
 //! timeout and takes every wait from what is left of it.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 
 use crate::{Error, Result, MAX_TIMEOUT};
+
+/// The longest cancellable native wait. Receivers also use this bound to
+/// observe pending notifications between attempts.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+mod stop_sealed {
+    pub trait Sealed {}
+    impl Sealed for super::NeverStop {}
+    impl Sealed for &std::sync::atomic::AtomicBool {}
+}
+
+/// Whether a wait may begin another attempt. Checked only between attempts,
+/// so a delivered frame is always guarded and processed before cancellation.
+pub(crate) trait Stop: stop_sealed::Sealed + Copy {
+    /// Whether the caller can request cancellation while a wait is running.
+    const CAN_STOP: bool;
+    fn is_stopped(&self) -> bool;
+}
+
+/// Synchronous waits have no cancellation state or atomic loads.
+#[derive(Clone, Copy)]
+pub(crate) struct NeverStop;
+impl Stop for NeverStop {
+    const CAN_STOP: bool = false;
+    fn is_stopped(&self) -> bool {
+        false
+    }
+}
+impl Stop for &AtomicBool {
+    const CAN_STOP: bool = true;
+    fn is_stopped(&self) -> bool {
+        self.load(Ordering::Acquire)
+    }
+}
 
 /// [`MAX_TIMEOUT`] in the SDK's milliseconds.
 const MAX_MILLIS: u32 = u32::MAX - 1;

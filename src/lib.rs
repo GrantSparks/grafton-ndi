@@ -61,6 +61,7 @@
 mod capture;
 mod change_feed;
 mod color_info;
+mod connection_metadata;
 mod error;
 #[cfg(any(ndi_has_advanced_keyframe_demand, all(test, feature = "advanced")))]
 mod keyframe_changes;
@@ -131,7 +132,7 @@ pub use {
 };
 
 #[cfg(feature = "advanced")]
-pub use sender::{CompressedAttached, QueueAttached};
+pub use sender::{CompressedAttached, CompressedAudioSendMode, QueueAttached};
 
 pub use color_info::{ColorInfo, ColorPrimaries, TransferFunction, YuvMatrix};
 pub use media::{FourCc, FrameRate, MediaTypes, PictureAspectRatio, StreamTier};

@@ -3,9 +3,6 @@
 use std::{mem::MaybeUninit, sync::Arc};
 
 use super::aliasable::AliasableBox;
-use crate::sender::in_flight::Synchronized;
-#[cfg(ndi_has_advanced_scatter_send)]
-use crate::sys::advanced::FrameScatter;
 use crate::{sender::in_flight::Destroyed, sys::bindings::NDIlib_video_frame_v2_t};
 #[cfg(any(test, ndi_has_advanced_send_completion, ndi_has_advanced_scatter_send))]
 use crate::{Error, Result};
@@ -17,8 +14,6 @@ pub(super) fn unavailable(_: std::collections::TryReserveError) -> Error {
 
 struct Slot {
     header: MaybeUninit<NDIlib_video_frame_v2_t>,
-    #[cfg(ndi_has_advanced_scatter_send)]
-    scatter: MaybeUninit<FrameScatter>,
 }
 
 pub(super) struct DescriptorSlots {
@@ -44,13 +39,16 @@ pub(super) struct SlotKey {
 
 impl SlotKey {
     /// Consume this key and claim the storage allocation it keeps alive.
-    pub(super) fn claim(self) -> DescriptorLease {
-        DescriptorLease {
-            key: self,
-            header_written: false,
-            #[cfg(ndi_has_advanced_scatter_send)]
-            scatter_written: false,
-        }
+    pub(super) fn claim(self, descriptor: NDIlib_video_frame_v2_t) -> DescriptorLease {
+        let slot = self.owner.slot(self.index);
+        // SAFETY: this sole move-only key grants exclusive initialization of
+        // its aligned slot. The resulting lease permits no further writes.
+        unsafe {
+            std::ptr::addr_of_mut!((*slot).header)
+                .cast::<NDIlib_video_frame_v2_t>()
+                .write(descriptor)
+        };
+        DescriptorLease { key: self }
     }
 }
 
@@ -58,7 +56,6 @@ impl SlotKey {
 /// releases an entry. A completion stays with the entry the callback released.
 pub(super) enum Released<'a> {
     Completed(super::queued::Completion),
-    Synchronized(&'a Synchronized),
     Destroyed(&'a Destroyed),
 }
 
@@ -67,7 +64,6 @@ impl Released<'_> {
     fn consume(self) {
         match self {
             Self::Completed(_completion) => {}
-            Self::Synchronized(_synchronized) => {}
             Self::Destroyed(_destroyed) => {}
         }
     }
@@ -80,8 +76,6 @@ impl DescriptorSlots {
         storage.try_reserve_exact(len).map_err(unavailable)?;
         storage.resize_with(len, || Slot {
             header: MaybeUninit::uninit(),
-            #[cfg(ndi_has_advanced_scatter_send)]
-            scatter: MaybeUninit::uninit(),
         });
         let owner = Arc::new(Self {
             storage: AliasableBox::new(storage.into_boxed_slice()),
@@ -106,9 +100,6 @@ impl DescriptorSlots {
 /// A dropped lease loses its key; unwinding cannot make a live slot reusable.
 pub(super) struct DescriptorLease {
     key: SlotKey,
-    header_written: bool,
-    #[cfg(ndi_has_advanced_scatter_send)]
-    scatter_written: bool,
 }
 
 impl DescriptorLease {
@@ -117,78 +108,11 @@ impl DescriptorLease {
         self.key
     }
 
-    pub(super) fn header(
-        &mut self,
-        descriptor: NDIlib_video_frame_v2_t,
-    ) -> *const NDIlib_video_frame_v2_t {
-        assert!(
-            !self.header_written,
-            "a descriptor lease is initialized once"
-        );
+    pub(super) fn as_ptr(&self) -> *const NDIlib_video_frame_v2_t {
         let slot = self.key.owner.slot(self.key.index);
-        // SAFETY: this sole key grants exclusive initialization of an aligned
-        // slot; the flag prevents rewriting a header already lent to the SDK.
-        let pointer =
-            unsafe { std::ptr::addr_of_mut!((*slot).header).cast::<NDIlib_video_frame_v2_t>() };
-        // SAFETY: the reserved slot has room for the complete descriptor.
-        unsafe { pointer.write(descriptor) };
-        self.header_written = true;
-        pointer
-    }
-
-    #[cfg(ndi_has_advanced_scatter_send)]
-    pub(super) fn scatter(&mut self, descriptor: FrameScatter) -> ScatterLease {
-        assert!(!self.scatter_written, "a scatter lease is initialized once");
-        let slot = self.key.owner.slot(self.key.index);
-        // SAFETY: this fresh lease exclusively initializes the scatter list.
-        unsafe {
-            std::ptr::addr_of_mut!((*slot).scatter)
-                .cast::<FrameScatter>()
-                .write(descriptor)
-        };
-        self.scatter_written = true;
-        ScatterLease {
-            owner: Arc::clone(&self.key.owner),
-            index: self.key.index,
-            key: None,
-        }
-    }
-
-    /// Compressed streams retain only their scatter list. Transfer the key to
-    /// that owner so it cannot be recovered until the stream is synchronized.
-    #[cfg(ndi_has_advanced_scatter_send)]
-    pub(super) fn into_scatter(mut self, descriptor: FrameScatter) -> ScatterLease {
-        let mut scatter = self.scatter(descriptor);
-        scatter.key = Some(self.key);
-        scatter
-    }
-}
-
-/// A stable initialized scatter list. Queue entries retain its descriptor
-/// lease; compressed stream lists instead own that lease's move-only key.
-#[cfg(ndi_has_advanced_scatter_send)]
-pub(crate) struct ScatterLease {
-    owner: Arc<DescriptorSlots>,
-    index: usize,
-    key: Option<SlotKey>,
-}
-
-#[cfg(ndi_has_advanced_scatter_send)]
-impl ScatterLease {
-    pub(super) fn as_ptr(&self) -> *const FrameScatter {
-        let slot = self.owner.slot(self.index);
-        // SAFETY: construction initialized the list, and the owner keeps its
-        // allocation live through the native loan.
-        unsafe { std::ptr::addr_of!((*slot).scatter).cast::<FrameScatter>() }
-    }
-
-    pub(super) fn owns_key(&self) -> bool {
-        self.key.is_some()
-    }
-
-    pub(super) fn release(self, proof: Released<'_>) -> Option<SlotKey> {
-        proof.consume();
-        self.key
+        // SAFETY: claim initialized this lease's stable slot. Forming its
+        // address borrows no descriptor bytes while native code reads them.
+        unsafe { std::ptr::addr_of!((*slot).header).cast::<NDIlib_video_frame_v2_t>() }
     }
 }
 
@@ -262,7 +186,7 @@ mod send_slots;
         for (name, fixture, expected) in [
             (
                 "once",
-                moved.replace("    let _second = key.claim();\n", ""),
+                moved.replace("    let _second = key.claim(Default::default());\n", ""),
                 None,
             ),
             ("moved", moved.to_owned(), Some("E0382")),
@@ -301,8 +225,8 @@ mod send_slots;
         let (pointers, count) = crate::test_alloc::allocation_count(|| {
             let mut pointers = [std::ptr::null(); 4];
             for (index, key) in keys.into_iter().enumerate() {
-                let mut lease = key.claim();
-                pointers[index] = lease.header(NDIlib_video_frame_v2_t::default());
+                let lease = key.claim(NDIlib_video_frame_v2_t::default());
+                pointers[index] = lease.as_ptr();
             }
             pointers
         });
