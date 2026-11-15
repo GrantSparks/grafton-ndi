@@ -603,3 +603,22 @@ fn owned_metadata_states_keep_one_observation_and_reuse_their_storage() {
     assert_eq!(owned.view().status(), FrameMetadataStatus::Absent);
     assert_eq!(owned.retained_bytes(), capacity);
 }
+
+#[test]
+fn metadata_constructors_seal_the_sole_terminator_and_reuse_storage() {
+    use super::metadata::MetadataText;
+    assert_eq!(MetadataText::EMPTY.as_cstr().to_bytes_with_nul(), b"\0");
+    for bytes in [b"missing".as_slice(), b"a\0b\0", b"\xff\0"] {
+        assert!(MetadataText::from_terminated_bytes(bytes).is_err());
+    }
+    let text = MetadataText::from_terminated_bytes(b"<a/>\0").unwrap();
+    assert_eq!(text.as_str(), "<a/>");
+    let mut destination = OwnedFrameMetadata::Absent(String::with_capacity(64));
+    let capacity = destination.retained_bytes();
+    let ((), allocations) = crate::test_alloc::allocation_count(|| {
+        destination.copy_from(FrameMetadataRef::Text(text));
+    });
+    assert_eq!(allocations, 0);
+    assert_eq!(destination.retained_bytes(), capacity);
+    assert_eq!(destination.view().text().unwrap().as_str(), "<a/>");
+}
