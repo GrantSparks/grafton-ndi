@@ -11,9 +11,8 @@
 //! - [`FrameFree`] is the *free strategy*: the SDK instance handle type plus the
 //!   `free_*` call that releases one captured frame. The generic RAII guard
 //!   [`Guard<'owner, S>`](Guard) is written once against it, so every owning
-//!   surface — the [`Receiver`](crate::Receiver) capture path and
-//!   [`FrameSync`](crate::FrameSync) — shares one guard rather than hand-rolling
-//!   its own.
+//!   surface — receiver capture, FrameSync and Advanced AV sync — shares one
+//!   guard rather than hand-rolling its own.
 //! - [`CaptureKind`] exposes only the borrowed and owned frame types.
 //! - `CaptureStrategy` privately connects each receiver kind to its slot of
 //!   the SDK capture call and its frame-type discriminant, and copies a
@@ -57,6 +56,8 @@ mod sealed {
     impl Sealed for super::MetadataKind {}
     impl Sealed for super::FrameSyncVideoFree {}
     impl Sealed for super::FrameSyncAudioFree {}
+    #[cfg(feature = "advanced")]
+    impl Sealed for super::AvSyncAudioFree {}
     impl Sealed for super::AllSlots {}
     impl Sealed for super::NoSlots {}
 }
@@ -68,8 +69,8 @@ mod sealed {
 /// kinds ([`VideoKind`], [`AudioKind`], [`MetadataKind`]) free through
 /// `NDIlib_recv_free_*`; the FrameSync strategies ([`FrameSyncVideoFree`],
 /// [`FrameSyncAudioFree`]) free through `NDIlib_framesync_free_*`. Factoring the
-/// free call out of [`CaptureKind`] lets both families reuse one guard and one
-/// borrowed-reference core instead of maintaining parallel copies.
+/// free call out of [`CaptureKind`] lets every family, including Advanced
+/// AV sync, reuse one guard and borrowed-reference core.
 ///
 /// This is a sealed trait — it cannot be implemented outside this crate.
 ///
@@ -301,6 +302,63 @@ unsafe impl FrameFree for FrameSyncAudioFree {
     }
 }
 
+/// Free strategy for audio borrowed from [`AvSync`](crate::advanced::AvSync).
+#[cfg(feature = "advanced")]
+pub struct AvSyncAudioFree;
+
+/// The native owner and already-authorized table of one AV-sync audio loan.
+#[cfg(feature = "advanced")]
+#[derive(Clone, Copy)]
+pub(crate) enum AvSyncAudioInstance {
+    #[cfg_attr(
+        not(ndi_has_advanced_av_sync),
+        expect(
+            dead_code,
+            reason = "native construction requires Advanced AV-sync declarations"
+        )
+    )]
+    Native {
+        #[cfg(ndi_has_advanced_av_sync)]
+        handle: crate::sys::advanced::AvSyncHandle,
+        table: &'static crate::sys::advanced::AvSync,
+    },
+    #[cfg(test)]
+    Synthetic(*const std::cell::Cell<usize>),
+}
+
+// SAFETY: each instance carries the synchronizer and the same table that
+// returned its descriptor. The owner borrow outlives matching native release.
+#[cfg(feature = "advanced")]
+unsafe impl FrameFree for AvSyncAudioFree {
+    type Instance = AvSyncAudioInstance;
+    type RawFrame = NDIlib_audio_frame_v3_t;
+    const REF_DEBUG_NAME: &'static str = "AvSyncAudioRef";
+    // Advanced 6.3.2 and 6.4.0.2 return zero for the no-source audio
+    // descriptor, and sender timestamps for matched samples. The native
+    // avsync timestamp regression and synthetic normalization tests pin both.
+    const AUDIO_TIMESTAMP_UNDEFINED: i64 = 0;
+
+    unsafe fn free(_core: &sys::Core, instance: Self::Instance, _frame: &mut Self::RawFrame) {
+        match instance {
+            AvSyncAudioInstance::Native {
+                #[cfg(ndi_has_advanced_av_sync)]
+                handle,
+                table,
+            } => {
+                crate::sys::advanced::native!(AvSync, table => {
+                    if !_frame.p_data.is_null() || !_frame.p_metadata.is_null() {
+                        table.NDIlib_avsync_free_audio(handle, _frame);
+                    }
+                });
+            }
+            #[cfg(test)]
+            AvSyncAudioInstance::Synthetic(_) => {
+                unreachable!("synthetic guards use their test free")
+            }
+        }
+    }
+}
+
 /// Generic RAII guard for captured NDI frames.
 ///
 /// This guard ensures that captured frames are freed exactly once via the free
@@ -310,7 +368,7 @@ unsafe impl FrameFree for FrameSyncAudioFree {
 /// use `NDIlib_framesync_free_*`, all through the same guard.
 ///
 /// The lifetime parameter `'owner` ties this guard to the owner that created it
-/// (a `Receiver` or a `FrameSync`), preventing use-after-free by ensuring the
+/// (a receiver or synchronizer), preventing use-after-free by ensuring the
 /// owner cannot be dropped while this guard is alive.
 ///
 /// # Type Parameters
@@ -331,7 +389,7 @@ pub struct Guard<'owner, S: FrameFree> {
     release: Release<'owner>,
     #[cfg(test)]
     release: Release<'owner, S>,
-    // FrameSync buffers remain conservative about cross-thread use. Receiver
+    // Synchronizer buffers stay on their capture thread. Receiver
     // strategies explicitly opt in below using the SDK's cross-thread free
     // guarantee, rather than raw-pointer auto traits from generated bindings.
     _thread_affine: PhantomData<Rc<()>>,

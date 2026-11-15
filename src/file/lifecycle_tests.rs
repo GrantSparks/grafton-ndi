@@ -659,7 +659,7 @@ fn finishing_a_session_the_sdk_is_ending_itself_still_tells_it_to_stop() {
 }
 
 #[test]
-fn a_malformed_stale_event_refuses_sync_start_before_the_native_call() {
+fn a_malformed_stale_event_is_consumed_before_the_native_start() {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let mut recorder = mock::recorder_api()
@@ -669,14 +669,18 @@ fn a_malformed_stale_event_refuses_sync_start_before_the_native_call() {
         .unwrap();
     device.push(mock::OPEN_FAILED, "old.mkv");
     device.oversize_next_event.store(true, Ordering::Release);
+    assert_eq!(
+        recorder
+            .start(&target("malformed-stale"), RecordingTimecode::Preserve)
+            .unwrap(),
+        1
+    );
+    assert_eq!(device.starts.load(Ordering::Acquire), 1);
+    assert_eq!(recorder.report().error_events(), 0);
     assert!(matches!(
-        recorder.start(&target("malformed-stale"), RecordingTimecode::Preserve),
-        Err(Error::UnexpectedSdkResult(crate::SdkResultDefect::FileStructureTooLarge { bytes, name }))
-            if bytes == std::mem::size_of::<sys::bindings::NDIlib_file_recorder_event_t>()
-                && name == std::any::type_name::<sys::bindings::NDIlib_file_recorder_event_t>()
+        recorder.finish(Duration::from_secs(1)).unwrap(),
+        FinishStatus::Closed(_)
     ));
-    assert_eq!(device.starts.load(Ordering::Acquire), 0);
-    assert_eq!(recorder.state(), RecorderState::Idle);
 }
 
 #[test]
@@ -909,6 +913,40 @@ fn io_kind<T: std::fmt::Debug>(result: Result<T>) -> std::io::ErrorKind {
         Err(Error::Io(error)) => error.kind(),
         other => panic!("expected a filesystem error: {other:?}"),
     }
+}
+
+#[test]
+fn unreportable_recording_paths_never_reach_native_start_or_rollover() {
+    let directory = Directory::new("path-limit");
+    let device = mock::Recorder::new(Closing::AtStop);
+    device.install();
+    let mut recorder = mock::recorder_api().create_recorder(&exact()).unwrap();
+    let base = directory.0.to_str().unwrap();
+    let path_bytes = sys::bindings::NDIlib_file_recorder_event_path_max_size as usize - 1;
+    let too_long = RecordingTarget::new(format!(
+        "{base}/{}",
+        "x".repeat(path_bytes - base.len() - 1)
+    ))
+    .unwrap();
+    assert!(matches!(
+        recorder.start(&too_long, RecordingTimecode::Preserve),
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(device.starts.load(Ordering::Acquire), 0);
+    recorder
+        .start(&directory.target("take.mkv"), RecordingTimecode::Preserve)
+        .unwrap();
+    assert!(matches!(
+        recorder.rollover(&too_long),
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(device.starts.load(Ordering::Acquire), 1);
+    assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
+    assert_eq!(recorder.state(), RecorderState::Recording);
+    assert!(matches!(
+        recorder.finish(Duration::ZERO).unwrap(),
+        FinishStatus::Closed(_)
+    ));
 }
 
 #[test]

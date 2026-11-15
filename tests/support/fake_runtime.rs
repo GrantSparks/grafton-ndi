@@ -12,7 +12,9 @@
 //!   `GRAFTON_FAKE_NDI_LOG`, and the optional sender-metadata, routing and
 //!   advertiser functions are exported. Registrations log the flags they were
 //!   given, and a receiver's input-group name is read only when its
-//!   registration ends. `GRAFTON_FAKE_VALIDATE_VIDEO_COPY=1` makes ordinary
+//!   registration ends. `GRAFTON_FAKE_RETAIN_SOURCES=1` retains failover,
+//!   routing and receiver connection descriptor pointers for later reads.
+//!   `GRAFTON_FAKE_VALIDATE_VIDEO_COPY=1` makes ordinary
 //!   async sends retain and check each frame's first pixel until synchronization;
 //! * `fake_discovery` — export the sender and receiver listener functions over
 //!   a fixed membership whose identifiers and text are partly not UTF-8, and
@@ -226,6 +228,8 @@ export! {
             }
         };
         log(&format!("receiver-connect:{name}"));
+        #[cfg(fake_objects)]
+        unsafe { objects::connect_source(_p_instance, p_src) };
         #[cfg(fake_receiver_controls)]
         log(&format!("connect-instance:{_p_instance:p}"));
     }
@@ -310,7 +314,7 @@ stub! {
 #[path = "fake_receiver_controls.rs"]
 mod receiver_controls;
 
-#[cfg(not(fake_omit_required))]
+#[cfg(all(not(fake_omit_required), not(fake_objects)))]
 stub! {
     fn NDIlib_send_set_failover(p_instance: NDIlib_send_instance_t, p_failover_source: *const NDIlib_source_t);
 }
@@ -351,11 +355,42 @@ mod objects {
     /// The most frames the fake retains before treating a test as runaway.
     const PENDING_LIMIT: usize = 128;
 
+    /// Keep the caller's descriptor address, then inspect it on a later call.
+    /// Tests drop every input Source before these reads, so wrapper owners must
+    /// retain both the descriptor itself and all strings it points to.
+    #[derive(Default)]
+    struct RetainedSource(*const NDIlib_source_t);
+
+    impl RetainedSource {
+        unsafe fn read(&self, kind: &str) {
+            if self.0.is_null() || std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_none() {
+                return;
+            }
+            let source = unsafe { &*self.0 };
+            let name = unsafe { bytes(source.p_ndi_name) };
+            let address = unsafe { bytes(source.__bindgen_anon_1.p_url_address) };
+            log(&format!("retained-source:{kind}:{name}:{address}"));
+        }
+    }
+
+    struct Receiver {
+        source: RetainedSource,
+    }
+
+    pub(super) unsafe fn connect_source(instance: NDIlib_recv_instance_t, source: *const NDIlib_source_t) {
+        if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_some() {
+            let receiver = unsafe { &mut *instance.cast::<Receiver>() };
+            unsafe { receiver.source.read("receiver") };
+            receiver.source = RetainedSource(source);
+        }
+    }
+
     pub(super) struct Sender {
         pub(super) opaque: *mut c_void,
         pub(super) completion: Option<Completion>,
         pending: Vec<NDIlib_video_frame_v2_t>,
         copied: Option<(NDIlib_video_frame_v2_t, u8)>,
+        failover: RetainedSource,
     }
 
     impl Sender {
@@ -398,6 +433,8 @@ mod objects {
     struct Router {
         name: CString,
         source: NDIlib_source_t,
+        route: RetainedSource,
+        refused: RetainedSource,
     }
 
     /// Allocate a distinct non-null handle of pointer type `T`.
@@ -423,12 +460,13 @@ mod objects {
                 let settings = unsafe { &*_p_create_settings };
                 log(&format!("receiver-settings:{}:{}", settings.color_format, settings.bandwidth));
             }
-            handle()
+            Box::into_raw(Box::new(Receiver { source: RetainedSource::default() })).cast()
         }
 
         fn NDIlib_recv_destroy(p_instance: NDIlib_recv_instance_t) {
+            let receiver = unsafe { Box::from_raw(p_instance.cast::<Receiver>()) };
+            unsafe { receiver.source.read("receiver") };
             log("receiver-destroy");
-            unsafe { release(p_instance) };
         }
 
         fn NDIlib_send_create(_p_create_settings: *const NDIlib_send_create_t) -> NDIlib_send_instance_t {
@@ -438,6 +476,7 @@ mod objects {
                 completion: None,
                 pending: Vec::new(),
                 copied: None,
+                failover: RetainedSource::default(),
             }))
             .cast();
             #[cfg(fake_tally)]
@@ -449,9 +488,19 @@ mod objects {
             let mut sender = unsafe { Box::from_raw(p_instance.cast::<Sender>()) };
             log("sender-destroy-begin");
             unsafe { sender.complete() };
+            unsafe { sender.failover.read("failover") };
             #[cfg(fake_tally)]
             super::tally::destroyed(p_instance);
             log("sender-destroy");
+        }
+
+        fn NDIlib_send_set_failover(p_instance: NDIlib_send_instance_t, p_failover_source: *const NDIlib_source_t) {
+            let sender = unsafe { &mut *p_instance.cast::<Sender>() };
+            unsafe { sender.failover.read("failover") };
+            if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_some() {
+                sender.failover = RetainedSource(p_failover_source);
+            }
+            log("sender-failover");
         }
 
         fn NDIlib_send_send_video_async_v2(p_instance: NDIlib_send_instance_t, p_video_data: *const NDIlib_video_frame_v2_t) {
@@ -581,21 +630,45 @@ mod objects {
                 p_ndi_name: name.as_ptr(),
                 ..unsafe { std::mem::zeroed() }
             };
-            Box::into_raw(Box::new(Router { name, source })).cast()
+            Box::into_raw(Box::new(Router {
+                name,
+                source,
+                route: RetainedSource::default(),
+                refused: RetainedSource::default(),
+            })).cast()
         }
 
         fn NDIlib_routing_destroy(p_instance: NDIlib_routing_instance_t) {
+            let router = unsafe { Box::from_raw(p_instance.cast::<Router>()) };
+            unsafe { router.route.read("route") };
+            unsafe { router.refused.read("refused-route") };
             log("router-destroy");
-            drop(unsafe { Box::from_raw(p_instance.cast::<Router>()) });
         }
 
-        fn NDIlib_routing_change(_p_instance: NDIlib_routing_instance_t, p_source: *const NDIlib_source_t) -> bool {
+        fn NDIlib_routing_change(p_instance: NDIlib_routing_instance_t, p_source: *const NDIlib_source_t) -> bool {
             let name = unsafe { CStr::from_ptr((*p_source).p_ndi_name) };
             log(&format!("router-change {}", name.to_string_lossy()));
-            true
+            let router = unsafe { &mut *p_instance.cast::<Router>() };
+            unsafe { router.route.read("route") };
+            unsafe { router.refused.read("refused-route") };
+            let refuse = std::env::var_os("GRAFTON_FAKE_ROUTING_CHANGE").is_some_and(|mode| mode == "refuse");
+            if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_some() {
+                if refuse {
+                    router.refused = RetainedSource(p_source);
+                } else {
+                    router.route = RetainedSource(p_source);
+                    router.refused = RetainedSource::default();
+                }
+            }
+            !refuse
         }
 
-        fn NDIlib_routing_clear(_p_instance: NDIlib_routing_instance_t) -> bool {
+        fn NDIlib_routing_clear(p_instance: NDIlib_routing_instance_t) -> bool {
+            let router = unsafe { &mut *p_instance.cast::<Router>() };
+            unsafe { router.route.read("route") };
+            unsafe { router.refused.read("refused-route") };
+            router.route = RetainedSource::default();
+            router.refused = RetainedSource::default();
             log("router-clear");
             true
         }

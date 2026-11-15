@@ -6,9 +6,13 @@
 
 use std::{ffi::CStr, path::Path};
 
-use super::{api::Api, selection::Selection, table::Resolver};
+use super::{
+    api::{Gates, Resolved},
+    selection::Selection,
+    table::Resolver,
+};
 use crate::{
-    capabilities::{Capabilities, RuntimeInfo, SdkEdition, SdkVersion},
+    capabilities::{RuntimeInfo, SdkEdition, SdkVersion},
     frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
     runtime::RuntimeOptions,
     Error, LoadRefusal, Result, SelectionFailure,
@@ -22,12 +26,8 @@ const ADVANCED_RECEIVER: &CStr = c"NDIlib_recv_create_v4";
 
 /// The implementation selected for this process.
 pub(crate) struct Runtime {
-    pub(crate) api: Api,
-    /// The Advanced tables, handed out by their `Table::of`.
-    #[cfg(feature = "advanced")]
-    pub(crate) advanced: super::advanced::AdvancedApi,
+    pub(crate) gates: Gates,
     pub(crate) info: RuntimeInfo,
-    pub(crate) capabilities: Capabilities,
     provider: Provider,
 }
 
@@ -119,9 +119,7 @@ impl Runtime {
         provider: Provider,
         requested: SdkEdition,
     ) -> std::result::Result<Self, LoadRefusal> {
-        let mut api = Api::load(&provider)?;
-        #[cfg(feature = "advanced")]
-        let mut advanced_tables = super::advanced::AdvancedApi::load(&provider)?;
+        let resolved = Resolved::load(&provider)?;
         let advanced = AdvancedEntryPoints::detect(&provider)?;
         let edition = provider.edition(advanced);
         if !meets(requested, edition) {
@@ -129,7 +127,7 @@ impl Runtime {
         }
         // SAFETY: NDIlib_version takes no arguments and may be called before
         // initialization; it returns a static NUL-terminated string or null.
-        let version = unsafe { api.core.NDIlib_version() };
+        let version = unsafe { resolved.core().NDIlib_version() };
         if version.is_null() {
             return Err(LoadRefusal::UnreadableVersion {
                 detail: "NDIlib_version returned no version text".into(),
@@ -163,18 +161,8 @@ impl Runtime {
             raw_version,
             version,
         };
-        #[cfg(feature = "advanced")]
-        let capabilities = Capabilities::detect(&api, &advanced_tables, version, edition);
-        #[cfg(not(feature = "advanced"))]
-        let capabilities = Capabilities::detect(&api, version, edition);
-        api.apply_capabilities(&capabilities);
-        #[cfg(feature = "advanced")]
-        advanced_tables.apply_capabilities(&capabilities);
         Ok(Self {
-            capabilities,
-            api,
-            #[cfg(feature = "advanced")]
-            advanced: advanced_tables,
+            gates: resolved.seal(version, edition),
             info,
             provider,
         })
@@ -283,7 +271,10 @@ mod shared {
         /// The error carries the reason, including the operating system's own
         /// text, and the identity of the module when the location was loaded
         /// before it was refused: it stays loaded.
-        pub(super) fn open(location: &OsStr, anchor: &CStr) -> std::result::Result<Self, Refusal> {
+        pub(super) fn open(
+            location: &OsStr,
+            anchor: &'static CStr,
+        ) -> std::result::Result<Self, Refusal> {
             let (library, handle) = open_library(location).map_err(|error| {
                 Refusal::unloaded(LoadRefusal::PlatformLoader {
                     detail: error_chain(&error),
@@ -299,7 +290,7 @@ mod shared {
                 .map(|symbol| *symbol)
                 .map_err(|error| {
                     let reason = LoadRefusal::MissingEntryPoint {
-                        symbol: anchor.to_string_lossy().into_owned(),
+                        symbol: anchor,
                         required: false,
                         detail: Some(error_chain(&error)),
                     };
@@ -380,7 +371,7 @@ mod shared {
     impl Resolver for Module {
         fn resolve(
             &self,
-            name: &CStr,
+            name: &'static CStr,
         ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
             let Some((address, base)) = self.lookup(name)? else {
                 return Ok(None);
@@ -388,7 +379,7 @@ mod shared {
             // Accept a symbol only when this module itself defines it.
             if base != self.base {
                 return Err(LoadRefusal::EntryPointOutsideModule {
-                    symbol: name.to_string_lossy().into_owned(),
+                    symbol: name,
                     module: self.path.clone(),
                 });
             }
@@ -462,7 +453,7 @@ mod shared {
         /// each location.
         pub(in crate::sys) names: &'a [&'a str],
         /// A symbol the library must define; it identifies the opened module.
-        pub(in crate::sys) anchor: &'a CStr,
+        pub(in crate::sys) anchor: &'static CStr,
         /// The selected core's anchor when this search loads its File library.
         #[cfg(all(unix, not(target_vendor = "apple")))]
         pub(in crate::sys) selected_core: Option<*const c_void>,
@@ -1176,7 +1167,7 @@ mod linked {
     impl Resolver for Linked {
         fn resolve(
             &self,
-            name: &CStr,
+            name: &'static CStr,
         ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
             Ok(
                 linked_address(name.to_bytes())

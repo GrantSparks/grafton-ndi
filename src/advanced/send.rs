@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     sender::{
-        in_flight::{Destroyed, InFlight, Lend, Lending, Lent, Loans},
+        in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans},
         SendHandle,
     },
     sys::{
@@ -44,19 +44,32 @@ mod scatter_completion_tests;
 struct ScatterStorage {
     blocks: Box<[AliasableVec<u8>]>,
     #[cfg(any(test, ndi_has_advanced_scatter_send))]
-    pointers: AliasableBox<[*const u8]>,
+    pointers: BlockPointers,
     #[cfg(any(test, ndi_has_advanced_scatter_send))]
     sizes: AliasableBox<[i32]>,
     total: usize,
 }
 
-// SAFETY: every pointer in `pointers` refers to a block this value owns, and
-// moving the value moves none of its allocations.
-unsafe impl Send for ScatterStorage {}
-// SAFETY: a shared reference reads the blocks and never follows the stored
-// pointers. They are followed only by the SDK, which is given them through
-// `descriptor`, and that takes the storage exclusively.
-unsafe impl Sync for ScatterStorage {}
+/// Addresses lent to the SDK, never dereferenced by Rust.
+#[cfg(any(test, ndi_has_advanced_scatter_send))]
+#[derive(Debug)]
+struct BlockPointers(AliasableBox<[*const u8]>);
+
+// SAFETY: moving this array moves none of the blocks it describes. Rust never
+// dereferences its pointers; ScatterStorage::descriptor lends them to the SDK
+// only under exclusive access, and the send slot owns the lent frame.
+#[cfg(any(test, ndi_has_advanced_scatter_send))]
+unsafe impl Send for BlockPointers {}
+// SAFETY: shared access only reads the pointer values. The SDK receives them
+// through ScatterStorage::descriptor(&mut self), whose exclusive loan lasts
+// until the slot has synchronized or the sender has been destroyed.
+#[cfg(any(test, ndi_has_advanced_scatter_send))]
+unsafe impl Sync for BlockPointers {}
+
+const _: () = {
+    const fn send_and_sync<T: Send + Sync>() {}
+    send_and_sync::<ScatterStorage>();
+};
 
 impl Clone for ScatterStorage {
     /// Copies of the blocks, with arrays that describe the copies.
@@ -73,7 +86,7 @@ impl ScatterStorage {
         );
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
         let bytes = bytes
-            .saturating_add(self.pointers.len() * size_of::<*const u8>())
+            .saturating_add(self.pointers.0.len() * size_of::<*const u8>())
             .saturating_add(self.sizes.len() * size_of::<i32>());
         bytes
     }
@@ -118,7 +131,7 @@ impl ScatterStorage {
         Self {
             blocks,
             #[cfg(any(test, ndi_has_advanced_scatter_send))]
-            pointers: AliasableBox::new(pointers),
+            pointers: BlockPointers(AliasableBox::new(pointers)),
             #[cfg(any(test, ndi_has_advanced_scatter_send))]
             sizes: AliasableBox::new(sizes),
             total,
@@ -131,7 +144,7 @@ impl ScatterStorage {
     #[cfg(ndi_has_advanced_scatter_send)]
     fn descriptor(&mut self, table: &'static ScatterSend) -> FrameScatter {
         native!(ScatterSend, table => FrameScatter {
-            p_data_blocks: self.pointers.as_ptr().cast(),
+            p_data_blocks: self.pointers.0.as_ptr().cast(),
             p_data_blocks_size: self.sizes.as_ptr().cast(),
         })
     }
@@ -535,12 +548,7 @@ impl PendingVideo {
         self,
         _proof: super::send_slots::Released<'_>,
     ) -> (SubmittedVideo, Option<super::send_slots::SlotKey>) {
-        let this = std::mem::ManuallyDrop::new(self);
-        #[cfg(ndi_has_advanced_scatter_send)]
-        if let Self::Scatter { list, .. } = &*this {
-            list.validate_release(&_proof);
-        }
-        match std::mem::ManuallyDrop::into_inner(this) {
+        match self {
             Self::Contiguous(frame) => (SubmittedVideo::Contiguous(frame), None),
             #[cfg(ndi_has_advanced_scatter_send)]
             Self::Scatter { frame, list, .. } => {
@@ -587,8 +595,6 @@ struct PendingStreams {
     program: InFlight<PendingVideo>,
     preview: InFlight<PendingVideo>,
     #[cfg(ndi_has_advanced_scatter_send)]
-    scatter_slots: std::sync::Arc<super::send_slots::DescriptorSlots>,
-    #[cfg(ndi_has_advanced_scatter_send)]
     program_keys: ScatterKeys,
     #[cfg(ndi_has_advanced_scatter_send)]
     preview_keys: ScatterKeys,
@@ -597,12 +603,10 @@ struct PendingStreams {
 impl PendingStreams {
     fn new() -> Result<Self> {
         #[cfg(ndi_has_advanced_scatter_send)]
-        let (scatter_slots, mut keys) = super::send_slots::DescriptorSlots::new(4)?;
+        let mut keys = super::send_slots::DescriptorSlots::allocate_keys(4)?;
         Ok(Self {
             program: InFlight::default(),
             preview: InFlight::default(),
-            #[cfg(ndi_has_advanced_scatter_send)]
-            scatter_slots,
             #[cfg(ndi_has_advanced_scatter_send)]
             program_keys: ScatterKeys {
                 next: keys.pop(),
@@ -632,8 +636,7 @@ impl PendingStreams {
             .next
             .take()
             .expect("a stream keeps one alternate scatter key");
-        let mut slot = self.scatter_slots.claim(key);
-        slot.bind_sender(sender.identity());
+        let slot = key.claim();
         let list = slot.into_scatter(frame.storage.descriptor(table));
         let pending = PendingVideo::Scatter { frame, list, table };
         #[cfg(test)]
@@ -705,11 +708,6 @@ impl PendingStreams {
 }
 
 impl Loans for PendingStreams {
-    fn bind_sender(&mut self, sender: usize) {
-        self.program.bind_sender(sender);
-        self.preview.bind_sender(sender);
-    }
-
     fn release(self, destroyed: &Destroyed) {
         drop(self.into_reclaimed(destroyed));
     }
@@ -843,11 +841,11 @@ impl CompressedSender {
     /// Video keeps exclusive access to the pending streams. Each half is
     /// `Send`, but neither `Sync` nor `Clone`, and neither outlives this owner.
     pub fn split(&mut self) -> (CompressedVideo<'_>, CompressedAudio<'_>) {
-        let (sender, pending) = self.lending.parts();
+        let pair = self.lending.parts();
+        let sender = pair.sender();
         (
             CompressedVideo {
-                sender,
-                pending,
+                pair,
                 _not_sync: std::marker::PhantomData,
             },
             CompressedAudio {
@@ -951,8 +949,7 @@ impl CompressedSender {
 /// It is `Send`, but neither `Sync` nor `Clone`. Pending frames stay with the
 /// owner when the view is dropped; closing or dropping the owner drains them.
 pub struct CompressedVideo<'a> {
-    sender: &'a Sender<CompressedAttached>,
-    pending: &'a mut PendingStreams,
+    pair: LoanPair<'a, CompressedAttached, &'a mut PendingStreams>,
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
@@ -967,7 +964,7 @@ pub struct CompressedAudio<'a> {
 
 impl CompressedVideo<'_> {
     fn instance(&self) -> NDIlib_send_instance_t {
-        self.sender.native_instance()
+        self.pair.sender().native_instance()
     }
 
     /// See [`CompressedSender::send_video`].
@@ -981,7 +978,8 @@ impl CompressedVideo<'_> {
         // SAFETY: the sender is live, and the descriptor lends `frame`, which
         // is borrowed exclusively for longer than this synchronous call.
         unsafe {
-            self.sender
+            self.pair
+                .sender()
                 .core()
                 .NDIlib_send_send_video_v2(self.instance(), &descriptor)
         };
@@ -1001,8 +999,8 @@ impl CompressedVideo<'_> {
             return Err(Rejected::new(error, frame));
         }
         Ok(self
-            .pending
-            .submit(self.sender.handle(), PendingVideo::Contiguous(frame)))
+            .pair
+            .with(|pending, sender| pending.submit(sender, PendingVideo::Contiguous(frame))))
     }
 
     /// See [`CompressedSender::send_scatter_video`].
@@ -1011,7 +1009,7 @@ impl CompressedVideo<'_> {
     ///
     /// As for [`CompressedSender::send_scatter_video`].
     pub fn send_scatter_video(&mut self, _frame: &mut ScatterVideoFrame) -> Result<()> {
-        let table = self.sender.runtime().table::<ScatterSend>()?;
+        let table = self.pair.sender().runtime().table::<ScatterSend>()?;
         native!(ScatterSend, table => {
             let descriptor = _frame.descriptor();
             let scatter = _frame.storage.descriptor(table);
@@ -1033,12 +1031,12 @@ impl CompressedVideo<'_> {
         &mut self,
         frame: ScatterVideoFrame,
     ) -> std::result::Result<Option<SubmittedVideo>, Rejected<ScatterVideoFrame>> {
-        let table = match self.sender.runtime().table::<ScatterSend>() {
+        let table = match self.pair.sender().runtime().table::<ScatterSend>() {
             Ok(table) => table,
             Err(error) => return Err(Rejected::new(error, frame)),
         };
         native!(ScatterSend, table => {
-            Ok(self.pending.submit_scatter(self.sender.handle(), frame, table))
+            Ok(self.pair.with(|pending, sender| pending.submit_scatter(sender, frame, table)))
         })
     }
 }
@@ -1163,15 +1161,15 @@ mod tests {
         assert!(ScatterVideoFrame::new(format, vec![bytes.clone(), vec![]]).is_err());
         let frame = ScatterVideoFrame::new(format, split(&bytes, &[44, 47])).unwrap();
         assert_eq!(frame.total_bytes(), bytes.len());
-        assert_eq!(frame.storage.pointers.len(), 4);
-        assert!(frame.storage.pointers[3].is_null());
+        assert_eq!(frame.storage.pointers.0.len(), 4);
+        assert!(frame.storage.pointers.0[3].is_null());
         assert_eq!(&*frame.storage.sizes, &[44, 3, 2, 0]);
         let moved = Box::new(frame);
         for (block, pointer) in moved
             .storage
             .blocks
             .iter()
-            .zip(moved.storage.pointers.iter())
+            .zip(moved.storage.pointers.0.iter())
         {
             assert_eq!(block.as_ptr().cast::<u8>(), *pointer);
         }
@@ -1260,14 +1258,18 @@ mod tests {
             (copy.timecode(), copy.metadata()),
             (Timecode::from_ticks(3), Some("<scatter/>"))
         );
-        let blocks = copy.storage.blocks.iter().zip(copy.storage.pointers.iter());
+        let blocks = copy
+            .storage
+            .blocks
+            .iter()
+            .zip(copy.storage.pointers.0.iter());
         for ((block, pointer), original) in blocks.zip(frame.storage.blocks.iter()) {
             assert_eq!(block.as_ptr().cast::<u8>(), *pointer);
             assert_ne!(block.as_ptr(), original.as_ptr());
             assert_eq!(**block, **original);
         }
         assert_eq!(&*copy.storage.sizes, &*frame.storage.sizes);
-        assert!(copy.storage.pointers[3].is_null());
+        assert!(copy.storage.pointers.0[3].is_null());
 
         let mut audio =
             scatter_audio(AudioCodec::Opus, 48_000, 2, 960, vec![vec![1], vec![2]]).unwrap();
@@ -1288,7 +1290,7 @@ mod tests {
     fn a_scatter_frame_the_sdk_has_written_to_is_read_back_and_sendable() {
         let (format, bytes) = h264();
         let frame = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
-        let first = frame.storage.pointers[0].cast_mut();
+        let first = frame.storage.pointers.0[0].cast_mut();
         let moved = Box::new(frame);
         // SAFETY: the pointer was created to be written through, the block
         // holds a complete header, and no reference to it exists.
@@ -1431,10 +1433,10 @@ mod tests {
         };
         let table = ndi.table::<ScatterSend>().unwrap();
         let frame = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
-        let pointers = frame.storage.pointers.as_ptr().cast::<*const u8>();
+        let pointers = frame.storage.pointers.0.as_ptr().cast::<*const u8>();
         let sizes = frame.storage.sizes.as_ptr().cast::<i32>();
-        let (slots, mut keys) = super::super::send_slots::DescriptorSlots::new(1).unwrap();
-        let mut slot = slots.claim(keys.pop().unwrap());
+        let mut keys = super::super::send_slots::DescriptorSlots::allocate_keys(1).unwrap();
+        let mut slot = keys.pop().unwrap().claim();
         let (mut pending, allocations) = crate::test_alloc::allocation_count(|| {
             PendingVideo::scatter_in(frame, table, &mut slot)
         });

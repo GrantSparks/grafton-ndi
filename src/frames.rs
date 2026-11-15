@@ -21,6 +21,9 @@ use crate::{
     Error, FourCc, FrameRate, PictureAspectRatio, Rejected, Result, SdkTimestamp, Timecode,
 };
 
+#[cfg(feature = "advanced")]
+use crate::{advanced::AvSyncAudioRef, capture::AvSyncAudioFree};
+
 /// The uncompressed pixel formats NDI sends and receives.
 ///
 /// Each converts to and from its [`FourCc`].
@@ -777,26 +780,39 @@ pub(crate) trait VideoPartsExt: VideoParts {
     /// copying its old contents; its metadata string is reused as
     /// [`OwnedFrameMetadata::copy_from`] describes.
     ///
-    /// Nothing can fail part-way: any allocation happens while `destination`
-    /// is still a whole frame, and the only moment its buffer and layout
-    /// disagree spans copies into reserved capacity, which neither allocate
-    /// nor panic.
+    /// Any allocation happens while `destination` is still a whole frame.
+    /// If the packed-copy check panics, its previous layout still covers its
+    /// storage; pixel contents are unspecified, and its SDK room stays zero.
     fn copy_into_owned(&self, destination: &mut VideoFrame) {
         let packed = self.layout().packed();
         let len = packed.data_len_bytes;
         let room = crate::pixels::send_room(&packed, self.header().scan_type);
         let replacement =
             (!destination.data.holds(len, room)).then(|| Pixels::with_room(len, room));
-        let mut metadata = std::mem::take(&mut destination.metadata);
-        metadata.copy_from(self.frame_metadata());
-        let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
-        *destination = packed_video(self, data, metadata);
+        destination.metadata.copy_from(self.frame_metadata());
+        if let Some(data) = replacement {
+            let frame = packed_video(self, data, OwnedFrameMetadata::default());
+            destination.data = frame.data;
+            destination.layout = frame.layout;
+            destination.header = frame.header;
+            destination.timestamp = frame.timestamp;
+        } else {
+            let copied = self.copy_active_pixels(&mut destination.data);
+            destination.layout = *copied.layout();
+            destination.header = *copied.header();
+            destination.timestamp = copied.sdk_timestamp();
+        }
     }
 
     /// Fill packed rows and SDK tail room derived only from this frame.
     fn copy_active_pixels<'a>(&'a self, data: &'a mut Pixels) -> PackedVideo<'a> {
         let layout = self.layout().packed();
-        let room = crate::pixels::send_room(&layout, self.header().scan_type);
+        // Read every accessor before changing reused storage, so an accessor
+        // panic cannot leave the destination's old layout over a shorter copy.
+        let header = self.header();
+        let metadata = self.frame_metadata();
+        let timestamp = self.sdk_timestamp();
+        let room = crate::pixels::send_room(&layout, header.scan_type);
         data.fill(layout.data_len_bytes, room, |bytes| {
             for plane in self.plane_views() {
                 match plane.data() {
@@ -808,9 +824,9 @@ pub(crate) trait VideoPartsExt: VideoParts {
         PackedVideo {
             layout,
             pixels: data,
-            header: self.header(),
-            metadata: self.frame_metadata(),
-            timestamp: self.sdk_timestamp(),
+            header,
+            metadata,
+            timestamp,
         }
     }
 }
@@ -972,7 +988,8 @@ pub trait VideoSource: VideoParts {
 /// The owned copy of `source`: `packed`, its packed layout, with `data`,
 /// which holds `packed` and its scan-dependent [room](PixelFormat::send_tail_room),
 /// filled with every plane's active rows. Every owned video copy is made
-/// here. Filling storage that holds the copy neither allocates nor panics.
+/// here. A failed packed-copy check restores the storage's previous length
+/// and zeroed SDK room before unwinding.
 fn packed_video<P: VideoParts + ?Sized>(
     source: &P,
     mut data: Pixels,
@@ -1907,7 +1924,7 @@ impl VideoFrameBuilder {
 /// [`audio_accessors!`] generates their public accessors and `Debug`, so each
 /// is written and documented once. Each implementation takes every part from
 /// one value that was validated as a whole; the generic AudioRef
-/// implementation covers both receiver and FrameSync guards.
+/// implementation covers receiver and synchronizer guards.
 ///
 /// # Safety
 ///
@@ -1915,9 +1932,8 @@ impl VideoFrameBuilder {
 /// to `f32`-aligned storage that [`layout`](Self::layout) describes, with
 /// every channel's samples initialized and unchanged while `self` is
 /// borrowed. Padding between channels need not be initialized. Metadata text
-/// must remain a bounded NUL-terminated UTF-8 string for the borrow. Overridden
-/// descriptor builders must describe no more readable initialized samples or
-/// metadata than the implementation keeps alive.
+/// must remain a bounded NUL-terminated UTF-8 string for the borrow.
+/// Views, copying and descriptors are non-overridable helpers.
 pub(crate) unsafe trait AudioParts {
     /// The validated layout of the frame's samples.
     fn layout(&self) -> &ValidatedAudioLayout;
@@ -1933,7 +1949,10 @@ pub(crate) unsafe trait AudioParts {
 
     /// The frame's one validated metadata observation.
     fn frame_metadata(&self) -> FrameMetadataRef<'_>;
+}
 
+/// Shared audio operations whose blanket implementation prevents overrides.
+pub(crate) trait AudioPartsExt: AudioParts {
     /// Borrow the original validated channel stride, samples and metadata.
     fn audio_descriptor(&self) -> NDIlib_audio_frame_v3_t {
         let layout = self.layout();
@@ -1983,12 +2002,7 @@ pub(crate) unsafe trait AudioParts {
     fn owned_copy(&self) -> AudioFrame {
         let packed = self.layout().packed();
         let metadata = OwnedFrameMetadata::copied(self.frame_metadata());
-        packed_audio(
-            self,
-            packed,
-            Vec::with_capacity(packed.sample_count),
-            metadata,
-        )
+        packed_audio(self, Vec::with_capacity(packed.sample_count), metadata)
     }
 
     /// Copy the frame into `destination`, reusing its sample and metadata
@@ -1999,22 +2013,36 @@ pub(crate) unsafe trait AudioParts {
     /// holds the packed samples, and otherwise replaced without copying its
     /// old contents; its metadata string is reused as
     /// [`OwnedFrameMetadata::copy_from`] describes. As for video, any allocation
-    /// happens while `destination` is still a whole frame.
+    /// happens while `destination` is still a whole frame. If the packed-copy
+    /// check panics, its previous layout still covers initialized storage;
+    /// sample contents are unspecified.
     fn copy_into_owned(&self, destination: &mut AudioFrame) {
         let packed = self.layout().packed();
         let len = packed.sample_count();
         let replacement = (destination.data.capacity() < len).then(|| Vec::with_capacity(len));
-        let mut metadata = std::mem::take(&mut destination.metadata);
-        metadata.copy_from(self.frame_metadata());
-        let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
-        *destination = packed_audio(self, packed, data, metadata);
+        destination.metadata.copy_from(self.frame_metadata());
+        if let Some(data) = replacement {
+            let frame = packed_audio(self, data, OwnedFrameMetadata::default());
+            destination.data = frame.data;
+            destination.layout = frame.layout;
+            destination.timecode = frame.timecode;
+            destination.timestamp = frame.timestamp;
+        } else {
+            let layout = copy_audio_samples(self, &mut destination.data);
+            destination.layout = layout;
+            destination.timecode = self.audio_timecode();
+            destination.timestamp = self.sdk_timestamp();
+        }
     }
 }
+
+impl<T: AudioParts + ?Sized> AudioPartsExt for T {}
 
 /// A validated planar audio input for synchronous sending and conversion.
 ///
 /// Implemented by [`AudioFrame`], [`BorrowedAudioFrame`], [`AudioFrameRef`] and
-/// [`FrameSyncAudioRef`]. Generic and `dyn AudioSource` consumers can inspect
+/// [`FrameSyncAudioRef`], and Advanced AV-sync audio references. Generic and
+/// `dyn AudioSource` consumers can inspect
 /// validated layouts and channel samples without allocating.
 /// This sealed trait prevents unchecked sample pointers or channel layouts.
 /// Native operations borrow the original samples and channel stride directly,
@@ -2282,24 +2310,52 @@ impl<'buf> BorrowedAudioFrameBuilder<'buf> {
     }
 }
 
-/// The owned copy of `source`: `packed`, its packed layout, with `data`,
-/// whose capacity holds `packed`, filled with the channels back to back.
-/// Every owned audio copy is made here. Filling reserved capacity neither
-/// allocates nor panics.
+/// Fill exactly the packed samples derived from `source`, restoring the
+/// previous initialized length if filling or its check panics.
+fn copy_audio_samples<P: AudioParts + ?Sized>(
+    source: &P,
+    data: &mut Vec<f32>,
+) -> ValidatedAudioLayout {
+    struct Restore<'a> {
+        data: &'a mut Vec<f32>,
+        len: usize,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            // Capacity cannot shrink while the copy only appends samples.
+            self.data.resize(self.len, 0.0);
+        }
+    }
+    let packed = source.layout().packed();
+    let previous_len = data.len();
+    let restore = Restore {
+        data,
+        len: previous_len,
+    };
+    restore.data.clear();
+    // The views read channel samples only, never padding between channels.
+    for samples in source.channel_views() {
+        restore.data.extend_from_slice(samples);
+    }
+    assert_eq!(
+        restore.data.len(),
+        packed.sample_count(),
+        "packed audio copy must initialize its complete layout"
+    );
+    std::mem::forget(restore);
+    packed
+}
+
+/// The owned copy of `source`, with its own packed layout checked against the
+/// initialized samples before an owned frame is constructed.
 fn packed_audio<P: AudioParts + ?Sized>(
     source: &P,
-    packed: ValidatedAudioLayout,
     mut data: Vec<f32>,
     metadata: OwnedFrameMetadata,
 ) -> AudioFrame {
-    data.clear();
-    // The views read channel samples only, never padding between channels.
-    for samples in source.channel_views() {
-        data.extend_from_slice(samples);
-    }
-
+    let layout = copy_audio_samples(source, &mut data);
     AudioFrame {
-        layout: packed,
+        layout,
         timecode: source.audio_timecode(),
         data,
         metadata,
@@ -2405,14 +2461,14 @@ macro_rules! audio_accessors {
             $(#[$channel_data])*
             #[inline]
             pub fn channel_data(&self, channel: usize) -> Option<&[f32]> {
-                AudioParts::channel_view(self, channel)
+                AudioPartsExt::channel_view(self, channel)
             }
 
             /// Iterate over the channels' samples, in channel order, without
             /// copying or reading padding between channels.
             #[inline]
             pub fn channels(&self) -> AudioChannels<'_> {
-                AudioParts::channel_views(self)
+                AudioPartsExt::channel_views(self)
             }
         }
 
@@ -2537,11 +2593,6 @@ impl AudioFrame {
             data: None,
             metadata: None,
         }
-    }
-
-    /// The SDK descriptor of this frame, borrowing its samples and metadata.
-    pub(crate) fn to_raw(&self) -> NDIlib_audio_frame_v3_t {
-        self.audio_descriptor()
     }
 
     #[cfg(test)]
@@ -2992,15 +3043,6 @@ impl MetadataFrame {
         self.timecode = timecode;
     }
 
-    /// Borrow the retained C string through a synchronous SDK call.
-    pub(crate) fn to_raw(&self) -> NDIlib_metadata_frame_t {
-        NDIlib_metadata_frame_t {
-            length: self.data.inner.len() as i32,
-            timecode: self.timecode.ticks(),
-            p_data: self.data.as_ptr().cast_mut(),
-        }
-    }
-
     /// Create from raw NDI metadata frame (copies the data)
     ///
     /// # Safety
@@ -3029,12 +3071,15 @@ impl MetadataFrame {
 /// # Safety
 ///
 /// Returned text must be bounded NUL-terminated UTF-8, live and unchanged for
-/// the borrow. Any overridden descriptor builder must describe only that live
-/// initialized text, including its terminator, within the metadata size cap.
+/// the borrow, including its terminator, within the metadata size cap.
+/// Descriptor construction is a non-overridable helper.
 pub(crate) unsafe trait MetadataParts {
     fn metadata_text_for_send(&self) -> Option<MetadataText<'_>>;
     fn metadata_timecode(&self) -> Timecode;
+}
 
+/// Shared descriptor construction whose blanket implementation prevents overrides.
+pub(crate) trait MetadataPartsExt: MetadataParts {
     /// Canonicalize empty metadata to a non-null empty C string. The SDK
     /// reads/copies the text during the call, and the source remains borrowed
     /// until it returns. Validation has already bounded the length to i32.
@@ -3047,6 +3092,8 @@ pub(crate) unsafe trait MetadataParts {
         }
     }
 }
+
+impl<T: MetadataParts + ?Sized> MetadataPartsExt for T {}
 
 /// A validated metadata input for sending, connection metadata and recording.
 ///
@@ -3094,8 +3141,8 @@ pub trait MetadataSource: MetadataParts {
 }
 
 // SAFETY: TerminatedText owns bounded UTF-8 and its sole terminal NUL. The
-// overridden descriptor uses exactly that live initialized string, whose
-// allocation and contents stay unchanged for the borrow.
+// accessors lend exactly that live initialized string, whose allocation and
+// contents stay unchanged for the borrow.
 unsafe impl MetadataParts for MetadataFrame {
     fn metadata_text_for_send(&self) -> Option<MetadataText<'_>> {
         Some(self.data.text())
@@ -3103,10 +3150,6 @@ unsafe impl MetadataParts for MetadataFrame {
 
     fn metadata_timecode(&self) -> Timecode {
         self.timecode
-    }
-
-    fn metadata_raw(&self) -> NDIlib_metadata_frame_t {
-        self.to_raw()
     }
 }
 
@@ -3480,10 +3523,6 @@ impl TerminatedText {
     pub(crate) fn into_string(mut self) -> String {
         self.inner.pop();
         self.inner
-    }
-
-    pub(crate) fn as_ptr(&self) -> *const c_char {
-        self.inner.as_ptr().cast()
     }
 
     fn copied(text: MetadataText<'_>) -> Self {
@@ -5545,7 +5584,7 @@ macro_rules! borrowed_video_methods {
             ///
             /// The copy makes no SDK call. It runs wherever this reference may be
             /// used: a receiver frame can be copied on a scoped worker thread, while a
-            /// FrameSync frame stays on its capture thread. The destination is an
+            /// synchronizer frame stays on its capture thread. The destination is an
             /// ordinary owned frame either way.
             pub fn copy_into(&self, destination: &mut VideoFrame) {
                 self.frame.copy_into_owned(destination);
@@ -5655,6 +5694,12 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
         let frame = unsafe { ValidatedAudio::audio(guard)? };
         Ok(Self { frame })
     }
+
+    /// Wrap audio already validated while its guard retains the native loan.
+    #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_av_sync)))]
+    pub(crate) fn from_validated(frame: ValidatedAudio<Guard<'a, S>>) -> Self {
+        Self { frame }
+    }
 }
 
 // Specialize methods on the public aliases so rustdoc shows their full API
@@ -5702,7 +5747,7 @@ macro_rules! borrowed_audio_methods {
             ///
             /// The copy makes no SDK call. It runs wherever this reference may be
             /// used: a receiver frame can be copied on a scoped worker thread, while a
-            /// FrameSync frame stays on its capture thread. The destination is an
+            /// synchronizer frame stays on its capture thread. The destination is an
             /// ordinary owned frame either way.
             pub fn copy_into(&self, destination: &mut AudioFrame) {
                 self.frame.copy_into_owned(destination);
@@ -5712,9 +5757,13 @@ macro_rules! borrowed_audio_methods {
 }
 borrowed_audio_methods!(AudioFrameRef);
 borrowed_audio_methods!(FrameSyncAudioRef);
+#[cfg(feature = "advanced")]
+borrowed_audio_methods!(AvSyncAudioRef);
 
 impl AudioSource for AudioFrameRef<'_> {}
 impl AudioSource for FrameSyncAudioRef<'_> {}
+#[cfg(feature = "advanced")]
+impl AudioSource for AvSyncAudioRef<'_> {}
 
 // SAFETY: The validated frame holds a Guard that keeps the SDK allocation
 // alive until matching release. All parts delegate to that one validated
@@ -5753,8 +5802,8 @@ macro_rules! borrowed_audio_accessors {
                 /// [`Timecode::SYNTHESIZE`].
             }
             timestamp {
-                /// It is `None` when the SDK does not know it. FrameSync audio
-                /// also treats its zero timestamp marker as unknown; that
+                /// It is `None` when the SDK does not know it. FrameSync and
+                /// AV-sync audio also treat their zero marker as unknown; that
                 /// marker alone does not identify synthesized silence.
             }
             channel_stride_bytes {
@@ -5766,6 +5815,8 @@ macro_rules! borrowed_audio_accessors {
 }
 borrowed_audio_accessors!(AudioFrameRef, AudioKind);
 borrowed_audio_accessors!(FrameSyncAudioRef, FrameSyncAudioFree);
+#[cfg(feature = "advanced")]
+borrowed_audio_accessors!(AvSyncAudioRef, AvSyncAudioFree);
 
 impl<'rx> AudioRef<'rx, AudioKind> {
     /// Create a borrowed audio frame from a receiver RAII guard, validated
@@ -8189,7 +8240,7 @@ mod tests {
     fn validated_metadata_reuses_storage_and_copies_once() {
         let text = "é".repeat(550);
         let frame = MetadataFrame::new(text).unwrap();
-        let expected = frame.data.as_ptr() as *mut c_char;
+        let expected = frame.data.text().as_ptr() as *mut c_char;
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
             for _ in 0..100 {
                 let raw = frame.metadata_raw();
@@ -8424,7 +8475,7 @@ mod tests {
 
         assert_eq!(raw.length, 4);
         assert_eq!(raw.timecode, 101);
-        assert_eq!(raw.p_data, frame.data.as_ptr() as *mut c_char);
+        assert_eq!(raw.p_data, frame.data.text().as_ptr() as *mut c_char);
         assert_eq!(frame.data.inner.as_bytes(), b"abc\0");
     }
 
@@ -8779,7 +8830,7 @@ mod tests {
 
         let mut audio = AudioFrame::builder().metadata("").build().unwrap();
         assert_eq!(audio.metadata(), Some(""));
-        assert!(!audio.to_raw().p_metadata.is_null());
+        assert!(!audio.audio_descriptor().p_metadata.is_null());
         audio.set_metadata("audio meta").unwrap();
         assert_eq!(audio.metadata(), Some("audio meta"));
 
@@ -8841,7 +8892,7 @@ mod tests {
             assert_eq!(video.metadata(), None);
             assert_eq!(audio.metadata(), None);
             assert!(video.as_test_raw().p_metadata.is_null());
-            assert!(audio.to_raw().p_metadata.is_null());
+            assert!(audio.audio_descriptor().p_metadata.is_null());
         }
     }
 
@@ -9014,7 +9065,10 @@ mod tests {
         );
         let audio = AudioFrame::builder().num_samples(1).build().unwrap();
         assert_eq!(audio.timecode(), Timecode::SYNTHESIZE);
-        assert_eq!(audio.to_raw().timecode, NDIlib_send_timecode_synthesize);
+        assert_eq!(
+            audio.audio_descriptor().timecode,
+            NDIlib_send_timecode_synthesize
+        );
         assert_eq!(
             MetadataFrame::new("<x/>").unwrap().timecode(),
             Timecode::SYNTHESIZE
@@ -9036,7 +9090,7 @@ mod tests {
                 .timecode(zero)
                 .build()
                 .unwrap()
-                .to_raw()
+                .audio_descriptor()
                 .timecode,
             0
         );

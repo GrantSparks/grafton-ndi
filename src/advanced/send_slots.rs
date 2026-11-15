@@ -42,23 +42,20 @@ pub(super) struct SlotKey {
     index: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SlotIdentity {
-    owner: usize,
-    index: usize,
-}
-
 impl SlotKey {
-    fn identity(&self) -> SlotIdentity {
-        SlotIdentity {
-            owner: Arc::as_ptr(&self.owner) as usize,
-            index: self.index,
+    /// Consume this key and claim the storage allocation it keeps alive.
+    pub(super) fn claim(self) -> DescriptorLease {
+        DescriptorLease {
+            key: self,
+            header_written: false,
+            #[cfg(ndi_has_advanced_scatter_send)]
+            scatter_written: false,
         }
     }
 }
 
 /// Evidence that native access has ended, supplied by the operation that
-/// releases an entry. Completion evidence identifies its exact descriptor.
+/// releases an entry. A completion stays with the entry the callback released.
 pub(super) enum Released<'a> {
     Completed(super::queued::Completion),
     Synchronized(&'a Synchronized),
@@ -66,28 +63,19 @@ pub(super) enum Released<'a> {
 }
 
 impl Released<'_> {
-    fn validate(&self, key: &SlotKey, sender: Option<usize>) {
+    /// Consume the authority supplied by the owning synchronization operation.
+    fn consume(self) {
         match self {
-            Self::Completed(completion) => assert_eq!(
-                key.identity(),
-                completion.identity(),
-                "completion proof belongs to another descriptor slot"
-            ),
-            Self::Synchronized(proof) => {
-                proof.assert_sender(sender.expect("a compressed loan is bound to its sender"))
-            }
-            Self::Destroyed(proof) => {
-                if let Some(sender) = sender {
-                    proof.assert_sender(sender);
-                }
-            }
+            Self::Completed(_completion) => {}
+            Self::Synchronized(_synchronized) => {}
+            Self::Destroyed(_destroyed) => {}
         }
     }
 }
 
 impl DescriptorSlots {
     #[cfg(any(test, ndi_has_advanced_send_completion, ndi_has_advanced_scatter_send))]
-    pub(super) fn new(len: usize) -> Result<(Arc<Self>, Vec<SlotKey>)> {
+    pub(super) fn allocate_keys(len: usize) -> Result<Vec<SlotKey>> {
         let mut storage = Vec::new();
         storage.try_reserve_exact(len).map_err(unavailable)?;
         storage.resize_with(len, || Slot {
@@ -104,27 +92,11 @@ impl DescriptorSlots {
             owner: Arc::clone(&owner),
             index,
         }));
-        Ok((owner, keys))
-    }
-
-    /// Consume this slot's sole initialization key. A key from a different
-    /// storage allocation is refused in every build, before touching storage.
-    pub(super) fn claim(self: &Arc<Self>, key: SlotKey) -> DescriptorLease {
-        assert!(
-            Arc::ptr_eq(self, &key.owner),
-            "slot key belongs to another storage allocation"
-        );
-        DescriptorLease {
-            key,
-            sender: None,
-            header_written: false,
-            #[cfg(ndi_has_advanced_scatter_send)]
-            scatter_written: false,
-        }
+        Ok(keys)
     }
 
     fn slot(&self, index: usize) -> *mut Slot {
-        // SAFETY: only new creates indices, within the allocated array, and
+        // SAFETY: only allocate_keys creates indices, within the allocated array, and
         // no reference to this slot or other live slots is formed.
         unsafe { self.storage.as_ptr().cast::<Slot>().cast_mut().add(index) }
     }
@@ -134,34 +106,15 @@ impl DescriptorSlots {
 /// A dropped lease loses its key; unwinding cannot make a live slot reusable.
 pub(super) struct DescriptorLease {
     key: SlotKey,
-    sender: Option<usize>,
     header_written: bool,
     #[cfg(ndi_has_advanced_scatter_send)]
     scatter_written: bool,
 }
 
 impl DescriptorLease {
-    pub(super) fn bind_sender(&mut self, sender: usize) {
-        if let Some(current) = self.sender {
-            assert_eq!(current, sender, "descriptor loan belongs to another sender");
-        }
-        self.sender = Some(sender);
-    }
-
-    #[cfg(any(test, ndi_has_advanced_send_completion))]
-    pub(super) fn identity(&self) -> SlotIdentity {
-        self.key.identity()
-    }
-
-    pub(super) fn validate_release(&self, proof: &Released<'_>) {
-        proof.validate(&self.key, self.sender);
-    }
-
     pub(super) fn release(self, proof: Released<'_>) -> SlotKey {
-        // A rejected proof must retain native pointees rather than free them.
-        let this = std::mem::ManuallyDrop::new(self);
-        this.validate_release(&proof);
-        std::mem::ManuallyDrop::into_inner(this).key
+        proof.consume();
+        self.key
     }
 
     pub(super) fn header(
@@ -198,7 +151,6 @@ impl DescriptorLease {
             owner: Arc::clone(&self.key.owner),
             index: self.key.index,
             key: None,
-            sender: self.sender,
         }
     }
 
@@ -219,7 +171,6 @@ pub(super) struct ScatterLease {
     owner: Arc<DescriptorSlots>,
     index: usize,
     key: Option<SlotKey>,
-    sender: Option<usize>,
 }
 
 #[cfg(ndi_has_advanced_scatter_send)]
@@ -235,16 +186,9 @@ impl ScatterLease {
         self.key.is_some()
     }
 
-    pub(super) fn validate_release(&self, proof: &Released<'_>) {
-        if let Some(key) = &self.key {
-            proof.validate(key, self.sender);
-        }
-    }
-
     pub(super) fn release(self, proof: Released<'_>) -> Option<SlotKey> {
-        let this = std::mem::ManuallyDrop::new(self);
-        this.validate_release(&proof);
-        std::mem::ManuallyDrop::into_inner(this).key
+        proof.consume();
+        self.key
     }
 }
 
@@ -252,12 +196,19 @@ impl ScatterLease {
 mod tests {
     use super::*;
 
-    /// Compile the actual storage module, with only unrelated SDK proof types
-    /// stubbed. The accepted fixture rules out missing imports/privacy as the
-    /// reason the two ownership fixtures fail.
+    /// Compile the actual storage module and release-proof declarations.
+    /// The accepted fixture rules out unrelated imports or privacy failures;
+    /// rejected fixtures pin move-only keys and owner-private proof constructors.
     #[test]
     fn slot_keys_cannot_be_reused_or_cloned() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let proof_declaration = |name: &str| {
+            let source = include_str!("../sender.rs");
+            let marker = format!("pub(crate) struct {name} {{");
+            let start = source.find(&marker).unwrap();
+            let declaration = &source[start..];
+            &declaration[..declaration.find("\n    }").unwrap() + 6]
+        };
         let prelude = format!(
             r#"
 #![allow(dead_code, unused_imports, non_camel_case_types, non_snake_case, non_upper_case_globals)]
@@ -266,14 +217,11 @@ use std::sync::Arc;
 pub(crate) mod bindings;
 mod sys {{ pub(crate) use crate::bindings; }}
 mod sender {{ pub mod in_flight {{
-    pub struct Synchronized;
-    pub struct Destroyed;
-    impl Synchronized {{ pub fn assert_sender(&self, _: usize) {{ unimplemented!() }} }}
-    impl Destroyed {{ pub fn assert_sender(&self, _: usize) {{ unimplemented!() }} }}
+    {synchronized}
+    {destroyed}
 }} }}
 mod queued {{
-    pub struct Completion;
-    impl Completion {{ pub fn identity(&self) -> super::send_slots::SlotIdentity {{ unimplemented!() }} }}
+    {completion}
 }}
 #[path = {aliasable:?}]
 mod aliasable;
@@ -282,7 +230,15 @@ mod send_slots;
 "#,
             bindings = root.join("src/sys/bindings.rs"),
             aliasable = root.join("src/advanced/aliasable.rs"),
-            slots = root.join("src/advanced/send_slots.rs")
+            slots = root.join("src/advanced/send_slots.rs"),
+            synchronized = proof_declaration("Synchronized"),
+            destroyed = proof_declaration("Destroyed"),
+            completion = {
+                let source = include_str!("queued.rs");
+                let start = source.find("pub(super) struct Completion {").unwrap();
+                let declaration = &source[start..];
+                &declaration[..declaration.find("\n}").unwrap() + 2]
+            }
         );
         let moved = include_str!(
             "../../tests/ui/internal/fail/descriptor_slot_key_is_consumed_by_claim.rs"
@@ -295,11 +251,15 @@ mod send_slots;
         for (name, fixture, expected) in [
             (
                 "once",
-                moved.replace("    let _second = slots.claim(key);\n", ""),
+                moved.replace("    let _second = key.claim();\n", ""),
                 None,
             ),
             ("moved", moved.to_owned(), Some("E0382")),
             ("cloned", cloned.to_owned(), Some("E0599")),
+            ("synchronized_private", include_str!("../../tests/ui/internal/fail/synchronization_requires_its_owner.rs").to_owned(), Some("E0451")),
+            ("destroyed_private", include_str!("../../tests/ui/internal/fail/destruction_requires_its_owner.rs").to_owned(), Some("E0451")),
+            ("completion_private", include_str!("../../tests/ui/internal/fail/completion_requires_its_queue.rs").to_owned(), Some("E0451")),
+            ("foreign_storage", include_str!("../../tests/ui/internal/fail/descriptor_slot_key_cannot_claim_other_storage.rs").to_owned(), Some("E0599")),
         ] {
             let path = directory.join(format!("{name}.rs"));
             std::fs::write(&path, format!("{prelude}\n{fixture}")).unwrap();
@@ -323,22 +283,12 @@ mod send_slots;
     }
 
     #[test]
-    fn a_key_from_another_storage_is_refused_before_initialization() {
-        let (first, mut keys) = DescriptorSlots::new(1).unwrap();
-        let (second, _) = DescriptorSlots::new(1).unwrap();
-        let key = keys.pop().unwrap();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| second.claim(key)));
-        assert!(result.is_err());
-        drop(first);
-    }
-
-    #[test]
     fn every_key_initializes_a_disjoint_reserved_header_without_allocating() {
-        let (slots, keys) = DescriptorSlots::new(4).unwrap();
+        let keys = DescriptorSlots::allocate_keys(4).unwrap();
         let (pointers, count) = crate::test_alloc::allocation_count(|| {
             let mut pointers = [std::ptr::null(); 4];
             for (index, key) in keys.into_iter().enumerate() {
-                let mut lease = slots.claim(key);
+                let mut lease = key.claim();
                 pointers[index] = lease.header(NDIlib_video_frame_v2_t::default());
             }
             pointers

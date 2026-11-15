@@ -13,7 +13,8 @@ use std::{
 };
 
 use crate::{
-    finder::Source,
+    finder::{RawSource, Source},
+    frames::{AudioPartsExt, MetadataPartsExt},
     frames::{
         AudioSource, FrameMetadataRef, MetadataFrame, MetadataSource, MetadataText, PixelFormat,
         ScanType, Sendable, ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts, VideoSource,
@@ -84,12 +85,6 @@ pub(crate) struct SendHandle<'a> {
     _owner: PhantomData<&'a SenderResource>,
 }
 
-impl SendHandle<'_> {
-    pub(crate) fn identity(self) -> usize {
-        self.instance.0 as usize
-    }
-}
-
 /// The handle of a sender, and the lock that pairs a metadata capture with
 /// its free.
 struct Inner {
@@ -142,10 +137,17 @@ mod ownership {
         pub(super) instance: SendInstance,
         pub(super) _name: CString,
         pub(super) _groups: Option<CString>,
+        // A registration may keep this native sender alive after Sender drops.
+        pub(super) failover: parking_lot::Mutex<Option<Box<RawSource>>>,
         #[cfg(feature = "advanced")]
         pub(super) _config: Option<crate::advanced::AdvancedConfig>,
         pub(super) _ndi: Ndi,
     }
+
+    // No application code runs under the failover lock. A replacement keeps
+    // both descriptors alive through the native call, then commits one swap;
+    // unwinding cannot leave a dangling native source descriptor.
+    impl std::panic::RefUnwindSafe for SenderResource {}
 
     impl SenderResource {
         /// The native sender this token keeps alive.
@@ -179,6 +181,8 @@ mod ownership {
     pub trait NativeOwner: Send + Sync + fmt::Debug {
         /// Own a native sender that was just created.
         fn new(resource: SenderResource) -> Self;
+        /// The resource shared by this sender's common operations.
+        fn resource(&self) -> &SenderResource;
     }
 
     /// The native sender of a [`RawSend`] sender, which advertiser registrations
@@ -189,6 +193,10 @@ mod ownership {
     }
 
     impl NativeOwner for Shared {
+        fn resource(&self) -> &SenderResource {
+            &self.owner
+        }
+
         fn new(resource: SenderResource) -> Self {
             let owner = Arc::new(resource);
             Self {
@@ -217,6 +225,10 @@ mod ownership {
 
     #[cfg(feature = "advanced")]
     impl NativeOwner for Exclusive {
+        fn resource(&self) -> &SenderResource {
+            &self.0
+        }
+
         fn new(resource: SenderResource) -> Self {
             Self(resource)
         }
@@ -499,16 +511,11 @@ pub(crate) mod in_flight {
     ///
     /// [NDI-Send]: https://docs.ndi.video/all/developing-with-ndi/sdk/ndi-send
     #[must_use = "the proof releases the frame the SDK synchronized"]
-    pub(crate) struct Synchronized(usize);
-
-    impl Synchronized {
-        pub(crate) fn assert_sender(&self, sender: usize) {
-            assert_eq!(
-                self.0, sender,
-                "synchronization proof belongs to another sender"
-            );
-        }
+    pub(crate) struct Synchronized {
+        _private: (),
     }
+
+    const _: () = assert!(std::mem::size_of::<Synchronized>() == 0);
 
     /// Proof that a native sender has been destroyed, which ends the SDK's
     /// access to every frame it was lent, on every stream.
@@ -518,22 +525,16 @@ pub(crate) mod in_flight {
     /// slots.
     #[cfg(feature = "advanced")]
     #[must_use = "the proof releases the frames of the destroyed sender"]
-    pub(crate) struct Destroyed(usize);
+    pub(crate) struct Destroyed {
+        _private: (),
+    }
 
     #[cfg(feature = "advanced")]
-    impl Destroyed {
-        pub(crate) fn assert_sender(&self, sender: usize) {
-            assert_eq!(
-                self.0, sender,
-                "destruction proof belongs to another sender"
-            );
-        }
-    }
+    const _: () = assert!(std::mem::size_of::<Destroyed>() == 0);
 
     /// The loan storage attached to one exclusive native sender.
     #[cfg(feature = "advanced")]
     pub(crate) trait Loans {
-        fn bind_sender(&mut self, sender: usize);
         fn release(self, destroyed: &Destroyed);
     }
 
@@ -555,8 +556,7 @@ pub(crate) mod in_flight {
     where
         M: super::SenderMode + super::mode_sealed::Sealed<Native = Exclusive>,
     {
-        pub(crate) fn new(sender: super::Sender<M>, mut loans: L) -> Self {
-            loans.bind_sender(sender.native_instance() as usize);
+        pub(crate) fn new(sender: super::Sender<M>, loans: L) -> Self {
             Self {
                 sender: mem::ManuallyDrop::new(sender),
                 loans: mem::ManuallyDrop::new(loans),
@@ -569,8 +569,11 @@ pub(crate) mod in_flight {
         pub(crate) fn loans(&self) -> &L {
             &self.loans
         }
-        pub(crate) fn parts(&mut self) -> (&super::Sender<M>, &mut L) {
-            (&self.sender, &mut self.loans)
+        pub(crate) fn parts(&mut self) -> LoanPair<'_, M, &mut L> {
+            LoanPair {
+                sender: &self.sender,
+                loans: &mut self.loans,
+            }
         }
 
         pub(crate) fn close<R>(self, release: impl FnOnce(L, &Destroyed) -> R) -> R {
@@ -582,6 +585,41 @@ pub(crate) mod in_flight {
             // SAFETY: sender destruction returned, and this field is taken once.
             let loans = unsafe { mem::ManuallyDrop::take(&mut this.loans) };
             release(loans, &destroyed)
+        }
+    }
+
+    /// A loan view paired by its owner with that owner's live sender.
+    /// Neither field can be supplied independently by a synchronizing caller.
+    #[cfg(feature = "advanced")]
+    pub(crate) struct LoanPair<'a, M: super::SenderMode, L> {
+        sender: &'a super::Sender<M>,
+        loans: L,
+    }
+
+    #[cfg(feature = "advanced")]
+    impl<'a, M: super::SenderMode, L> LoanPair<'a, M, L> {
+        pub(crate) fn sender(&self) -> &'a super::Sender<M> {
+            self.sender
+        }
+
+        pub(crate) fn loans(&self) -> &L {
+            &self.loans
+        }
+
+        /// Obtain the handle from the same owner that lent this loan view.
+        pub(crate) fn with<R>(&mut self, operation: impl FnOnce(&mut L, SendHandle<'a>) -> R) -> R {
+            operation(&mut self.loans, self.sender.handle())
+        }
+    }
+
+    #[cfg(feature = "advanced")]
+    impl<'a, M: super::SenderMode, L> LoanPair<'a, M, &'a mut L> {
+        /// Queues synchronize their own shared callback state internally.
+        pub(crate) fn shared(self) -> LoanPair<'a, M, &'a L> {
+            LoanPair {
+                sender: self.sender,
+                loans: self.loans,
+            }
         }
     }
 
@@ -699,7 +737,7 @@ pub(crate) mod in_flight {
     /// [`Self::into_released`], which takes the proof that the sender was
     /// destroyed. Only a retained frame can be taken out. The state is
     /// private to this module, so no other code can reach a frame in flight.
-    pub(crate) struct InFlight<T>(State<T>, Option<usize>);
+    pub(crate) struct InFlight<T>(State<T>);
 
     #[derive(Default)]
     enum State<T> {
@@ -714,19 +752,11 @@ pub(crate) mod in_flight {
 
     impl<T> Default for InFlight<T> {
         fn default() -> Self {
-            Self(State::Idle, None)
+            Self(State::Idle)
         }
     }
 
     impl<T> InFlight<T> {
-        #[cfg(feature = "advanced")]
-        pub(crate) fn bind_sender(&mut self, sender: usize) {
-            if let Some(current) = self.1 {
-                assert_eq!(current, sender, "loan belongs to another sender");
-            }
-            self.1 = Some(sender);
-        }
-
         pub(crate) fn is_in_flight(&self) -> bool {
             matches!(self.0, State::InFlight(_))
         }
@@ -737,10 +767,7 @@ pub(crate) mod in_flight {
         /// `_synchronized` proves that the SDK has returned from a
         /// synchronizing call on this slot's stream made after the frame was
         /// submitted.
-        pub(crate) fn completed(&mut self, synchronized: Synchronized) -> Option<&T> {
-            if let Some(sender) = self.1 {
-                synchronized.assert_sender(sender);
-            }
+        pub(crate) fn completed(&mut self, _synchronized: Synchronized) -> Option<&T> {
             match mem::take(&mut self.0) {
                 State::InFlight(frame) => {
                     self.0 = State::Retained(frame);
@@ -769,9 +796,6 @@ pub(crate) mod in_flight {
             synchronized: Synchronized,
             release: impl FnOnce(T, &Synchronized) -> R,
         ) -> Option<R> {
-            if let Some(sender) = self.1 {
-                synchronized.assert_sender(sender);
-            }
             match mem::take(&mut self.0) {
                 State::Idle => None,
                 State::Retained(frame) | State::InFlight(frame) => {
@@ -795,10 +819,7 @@ pub(crate) mod in_flight {
         /// The frame, whatever its state, once the native sender it was lent
         /// to has been destroyed.
         #[cfg(feature = "advanced")]
-        pub(crate) fn into_released(mut self, destroyed: &Destroyed) -> Option<T> {
-            if let Some(sender) = self.1 {
-                destroyed.assert_sender(sender);
-            }
+        pub(crate) fn into_released(mut self, _destroyed: &Destroyed) -> Option<T> {
             match mem::take(&mut self.0) {
                 State::Idle => None,
                 State::Retained(frame) | State::InFlight(frame) => Some(frame),
@@ -850,17 +871,13 @@ pub(crate) mod in_flight {
             // The slot owns the new frame before the SDK sees it. Moving the
             // frame does not move what `lent` points to (the contract of
             // `Lend`).
-            if let Some(current) = self.1 {
-                assert_eq!(current, sender.identity(), "loan belongs to another sender");
-            }
-            self.1 = Some(sender.identity());
-            let displaced = Self(mem::replace(&mut self.0, State::InFlight(next)), self.1);
+            let displaced = Self(mem::replace(&mut self.0, State::InFlight(next)));
             // SAFETY: the slot owns the new payload and stable scatter list;
             // this call-scoped header stays readable through submission. The
             // displaced frame remains owned across this call and is returned
             // only with the synchronization proof produced after it returns.
             unsafe { lent.submit(sender, lent.descriptor()) };
-            (displaced, Synchronized(sender.identity()))
+            (displaced, Synchronized { _private: () })
         }
     }
 
@@ -869,9 +886,6 @@ pub(crate) mod in_flight {
         /// NULL frame pointer, the SDK's documented request to drain the
         /// asynchronous buffer.
         pub(crate) fn flush(&mut self, sender: SendHandle<'_>) -> Synchronized {
-            if let Some(owner) = self.1 {
-                assert_eq!(owner, sender.identity(), "loan belongs to another sender");
-            }
             // SAFETY: `sender` is the live sender whose stream this slot
             // holds, and a null frame pointer is the SDK's documented request
             // to drain the async buffer.
@@ -880,7 +894,7 @@ pub(crate) mod in_flight {
                     .core
                     .NDIlib_send_send_video_async_v2(sender.instance.0, async_flush_frame_ptr())
             };
-            Synchronized(sender.identity())
+            Synchronized { _private: () }
         }
 
         /// Send `frame` synchronously. When this returns, the SDK has
@@ -890,9 +904,6 @@ pub(crate) mod in_flight {
             sender: SendHandle<'_>,
             frame: PreparedVideo<'_>,
         ) -> Synchronized {
-            if let Some(owner) = self.1 {
-                assert_eq!(owner, sender.identity(), "loan belongs to another sender");
-            }
             let raw = frame.raw;
             // SAFETY: `sender` is the live sender whose stream this slot
             // holds. `raw` points into pixels and metadata that `frame`
@@ -906,7 +917,7 @@ pub(crate) mod in_flight {
                     .core
                     .NDIlib_send_send_video_v2(sender.instance.0, &raw)
             };
-            Synchronized(sender.identity())
+            Synchronized { _private: () }
         }
     }
 
@@ -926,10 +937,9 @@ pub(crate) mod in_flight {
             native: Exclusive(resource),
             ..
         } = sender;
-        let identity = resource.instance.0 as usize;
         // The only owner: dropping it calls `NDIlib_send_destroy`.
         drop(resource);
-        Destroyed(identity)
+        Destroyed { _private: () }
     }
 
     #[cfg(test)]
@@ -949,7 +959,7 @@ pub(crate) mod in_flight {
                 }
             }
             let drops = Arc::new(AtomicUsize::new(0));
-            let slot = InFlight(State::InFlight(Counted(Arc::clone(&drops))), Some(1));
+            let slot = InFlight(State::InFlight(Counted(Arc::clone(&drops))));
             let result = std::panic::catch_unwind(|| drop(slot));
             assert_eq!(result.is_err(), cfg!(debug_assertions));
             assert_eq!(
@@ -959,36 +969,16 @@ pub(crate) mod in_flight {
             );
         }
 
-        #[cfg(feature = "advanced")]
-        #[test]
-        fn a_destruction_proof_cannot_release_another_senders_loan() {
-            let slot = InFlight(State::InFlight(1u8), Some(1));
-            let result = std::panic::catch_unwind(|| slot.into_released(&Destroyed(2)));
-            assert!(result.is_err());
-        }
-
-        #[test]
-        fn a_foreign_synchronization_proof_keeps_the_loan_in_flight() {
-            let mut slot = InFlight(State::InFlight(7u8), Some(1));
-            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = slot.completed(Synchronized(2));
-            }));
-            assert!(refused.is_err());
-            assert!(slot.is_in_flight());
-            assert_eq!(slot.completed(Synchronized(1)), Some(&7));
-            assert_eq!(slot.take_retained(), Some(7));
-        }
-
         /// A frame in flight comes out of its slot only with a proof, and is
         /// completed only once.
         #[test]
         fn a_slot_releases_its_frame_only_with_proof() {
-            let mut slot = InFlight(State::InFlight(1u8), Some(1));
+            let mut slot = InFlight(State::InFlight(1u8));
             assert!(slot.take_retained().is_none());
             assert!(slot.is_in_flight());
-            assert_eq!(slot.completed(Synchronized(1)), Some(&1));
+            assert_eq!(slot.completed(Synchronized { _private: () }), Some(&1));
             assert!(!slot.is_in_flight());
-            assert_eq!(slot.completed(Synchronized(1)), None);
+            assert_eq!(slot.completed(Synchronized { _private: () }), None);
             assert_eq!(slot.take_retained(), Some(1));
             assert!(slot.take_retained().is_none());
             assert!(slot.frame().is_none());
@@ -997,12 +987,12 @@ pub(crate) mod in_flight {
         #[cfg(feature = "advanced")]
         #[test]
         fn a_displaced_or_destroyed_slot_hands_back_what_it_held() {
-            let release = |state| InFlight(state, Some(1)).release(Synchronized(1));
+            let release = |state| InFlight(state).release(Synchronized { _private: () });
             assert_eq!(release(State::InFlight(1u8)), Some(1));
             assert_eq!(release(State::Retained(2)), Some(2));
             assert_eq!(release(State::Idle), None);
-            let destroyed = Destroyed(1);
-            let unsent = |state| InFlight(state, Some(1)).into_released(&destroyed);
+            let destroyed = Destroyed { _private: () };
+            let unsent = |state| InFlight(state).into_released(&destroyed);
             assert_eq!(unsent(State::InFlight(3u8)), Some(3));
             assert_eq!(unsent(State::Retained(4)), Some(4));
             assert_eq!(unsent(State::Idle), None);
@@ -1596,6 +1586,7 @@ impl<M: SenderMode> Sender<M> {
                 instance,
                 _name: name,
                 _groups: groups,
+                failover: parking_lot::Mutex::new(None),
                 #[cfg(feature = "advanced")]
                 _config: config,
                 _ndi: ndi.clone(),
@@ -1980,7 +1971,7 @@ impl<M: SenderMode> Sender<M> {
             Err(Error::UnexpectedSdkResult(
                 crate::SdkResultDefect::UnexpectedFrameType {
                     operation: "sender metadata capture",
-                    kind: kind as u32,
+                    kind,
                 },
             ))
         }
@@ -2189,26 +2180,32 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// Returns an error if source conversion fails.
     pub fn set_failover(&self, source: &Source) -> Result<()> {
-        let raw_source = source.to_raw()?;
-        // SAFETY: the sender instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
+        let raw_source = Box::new(source.to_raw()?);
+        let mut failover = self.native.resource().failover.lock();
+        // SAFETY: the native owner retains this boxed descriptor and its
+        // strings until a later replacement has returned, or native destruction.
+        // The lock keeps concurrent failover calls from releasing each other's
+        // descriptors while the SDK may still read them.
         unsafe {
             self.inner
                 .core
                 .NDIlib_send_set_failover(self.inner.instance.0, raw_source.as_raw())
         }
+        *failover = Some(raw_source);
         Ok(())
     }
 
     /// Clear the failover source previously configured with [`Self::set_failover`].
     pub fn clear_failover(&self) {
-        // SAFETY: the sender instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
+        let mut failover = self.native.resource().failover.lock();
+        // SAFETY: the sender is live, and the previous descriptor stays owned
+        // until this null replacement has returned from the SDK.
         unsafe {
             self.inner
                 .core
                 .NDIlib_send_set_failover(self.inner.instance.0, ptr::null())
         }
+        *failover = None;
     }
 
     /// Get the source information for this sender.
@@ -2612,10 +2609,10 @@ mod tests {
         let frame = MetadataFrame::new("<ndi_text>é</ndi_text>")
             .unwrap()
             .with_timecode(Timecode::from_ticks(42));
-        let expected_ptr = frame.to_raw().p_data;
+        let expected_ptr = frame.metadata_raw().p_data;
         for _ in 0..3 {
             sender.send_metadata(&frame);
-            assert_eq!(frame.to_raw().p_data, expected_ptr);
+            assert_eq!(frame.metadata_raw().p_data, expected_ptr);
         }
         sender.add_connection_metadata(&frame);
         sender.clear_connection_metadata();

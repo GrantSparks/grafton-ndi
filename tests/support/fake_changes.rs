@@ -1,4 +1,10 @@
 //! Native change reports deliberately release only one waiter per update.
+//!
+//! Finder's retained flag, snapshot independence and consuming wait model the
+//! runtime contracts pinned by `a_report_waits_for_the_next_native_wait`,
+//! `another_consumers_snapshot_leaves_the_report_for_the_next_wait` and
+//! `a_native_wait_consumes_the_report_it_returns` in
+//! `tests/change_notifications.rs`.
 use super::*;
 use std::{
     collections::HashMap,

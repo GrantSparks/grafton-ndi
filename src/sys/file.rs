@@ -96,7 +96,7 @@ macro_rules! file_families {
                 if let [Some(first), ..] = missing {
                     if missing.iter().all(Option::is_some) {
                         return Err(LoadRefusal::NoCompleteFileFamily {
-                            first_missing: first.to_string_lossy().into_owned(),
+                            first_missing: first,
                         });
                     }
                 }
@@ -451,6 +451,22 @@ mod tests {
     }
 
     #[test]
+    fn refusing_every_file_family_borrows_the_missing_export_name() {
+        let (refusal, allocations) = crate::test_alloc::allocation_count(|| {
+            Families::load(&ExportsWhere(|_| false))
+                .err()
+                .expect("no File family is complete")
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(
+            refusal,
+            LoadRefusal::NoCompleteFileFamily {
+                first_missing: c"NDIlib_file_player_probe_file",
+            }
+        );
+    }
+
+    #[test]
     fn a_library_with_neither_family_is_not_a_file_library() {
         let Err(reason) = library(|name| {
             !name.starts_with("NDIlib_file_player_create")
@@ -461,7 +477,7 @@ mod tests {
         assert_eq!(
             reason,
             LoadRefusal::NoCompleteFileFamily {
-                first_missing: "NDIlib_file_player_create".into()
+                first_missing: c"NDIlib_file_player_create"
             }
         );
     }

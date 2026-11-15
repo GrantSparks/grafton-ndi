@@ -176,6 +176,10 @@ fn header_patterns_escape_every_separator() {
 
 #[test]
 fn only_apple_mobile_targets_link_statically() {
+    assert_eq!(
+        build_support::clang_target("aarch64-apple-visionos"),
+        "aarch64-apple-xros"
+    );
     for os in ["ios", "tvos", "visionos"] {
         assert!(build_support::links_statically(os), "{os}");
     }

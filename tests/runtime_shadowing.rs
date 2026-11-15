@@ -121,7 +121,7 @@ fn child(name: &str, root: &Path) {
     let rejected = root.join("rejected").join(NAME);
     let usable = root.join("usable").join(NAME);
     let missing_entry_point = LoadRefusal::MissingEntryPoint {
-        symbol: "NDIlib_send_set_failover".into(),
+        symbol: c"NDIlib_send_set_failover",
         required: true,
         detail: None,
     };
@@ -176,7 +176,7 @@ fn child(name: &str, root: &Path) {
             assert_eq!(environment.location(), anchorless);
             assert!(environment.loaded());
             assert!(
-                matches!(environment.refusal(), LoadRefusal::MissingEntryPoint { symbol, required: false, .. } if symbol == "NDIlib_version")
+                matches!(environment.refusal(), LoadRefusal::MissingEntryPoint { symbol, required: false, .. } if *symbol == c"NDIlib_version")
             );
             let loader = reason.attempts().last().unwrap();
             assert_eq!(loader.origin(), LoadOrigin::LoaderSearch);

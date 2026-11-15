@@ -556,7 +556,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert_eq!(
                 attempt.refusal(),
                 &LoadRefusal::MissingEntryPoint {
-                    symbol: "NDIlib_send_set_failover".into(),
+                    symbol: c"NDIlib_send_set_failover",
                     required: true,
                     detail: None
                 }
@@ -688,7 +688,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert_eq!(
                 reason.attempts()[0].refusal(),
                 &LoadRefusal::EntryPointOutsideModule {
-                    symbol: "NDIlib_send_set_failover".into(),
+                    symbol: c"NDIlib_send_set_failover",
                     module: fixtures.foreign()
                 }
             );

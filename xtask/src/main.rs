@@ -30,17 +30,23 @@ const PRIMARY_TARGET: &str = "x86_64-unknown-linux-gnu";
 const CRATE_EDITION: &str = "2021";
 
 /// Targets whose bindings must equal the vendored file, C-enum signedness aside.
-const EQUIVALENCE_TARGETS: [&str; 10] = [
+const EQUIVALENCE_TARGETS: [&str; 16] = [
     "i686-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
     "armv7-unknown-linux-gnueabihf",
     "x86_64-pc-windows-msvc",
     "i686-pc-windows-msvc",
-    "aarch64-pc-windows-msvc",
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
     "aarch64-apple-ios",
+    "x86_64-apple-ios",
+    "aarch64-apple-tvos",
+    "x86_64-apple-tvos",
+    "aarch64-apple-visionos",
     "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "i686-linux-android",
+    "x86_64-linux-android",
 ];
 
 /// Constants a header declares for a single platform. The crate exposes none of
@@ -211,15 +217,23 @@ impl Sdk {
 
     /// One part of the licensed headers as bindgen renders it for `target`.
     fn generate(&self, part: Part, target: &str, shim: &Shim) -> Result<String, String> {
+        let clang_target = build_support::clang_target(target);
+        let mut header = String::new();
+        if target.contains("-apple-") {
+            // Older libclang accepts unknown triples while selecting non-Apple
+            // header branches. Reject that false equivalence before generating.
+            header.push_str(
+                "#if !defined(__APPLE__)\n\
+                 #error libclang does not recognize this Apple target\n\
+                 #endif\n",
+            );
+        }
+        for umbrella in UMBRELLA_HEADERS {
+            header.push_str(&format!("#include <{umbrella}>\n"));
+        }
         let mut builder = bindgen::Builder::default()
-            .header_contents(
-                "wrapper.h",
-                &UMBRELLA_HEADERS
-                    .iter()
-                    .map(|header| format!("#include <{header}>\n"))
-                    .collect::<String>(),
-            )
-            .clang_arg(format!("--target={target}"))
+            .header_contents("wrapper.h", &header)
+            .clang_arg(format!("--target={clang_target}"))
             // Only the compiler's own freestanding headers are visible, so the
             // result does not depend on the host or an installed target sysroot.
             .clang_args(["-ffreestanding", "-nostdlibinc"])
@@ -241,7 +255,12 @@ impl Sdk {
         builder
             .generate()
             .map(|bindings| bindings.to_string())
-            .map_err(|error| format!("bindgen failed for {target}: {error}"))
+            .map_err(|error| {
+                format!(
+                    "bindgen failed for {target} (Clang target {clang_target}, {}): {error}",
+                    bindgen::clang_version().full
+                )
+            })
     }
 }
 
@@ -370,6 +389,19 @@ fn enum_alias(line: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visionos_uses_clangs_xros_target() {
+        assert_eq!(
+            build_support::clang_target("aarch64-apple-visionos"),
+            "aarch64-apple-xros"
+        );
+        for target in [PRIMARY_TARGET].into_iter().chain(EQUIVALENCE_TARGETS) {
+            if target != "aarch64-apple-visionos" {
+                assert_eq!(build_support::clang_target(target), target);
+            }
+        }
+    }
 
     #[test]
     fn enum_signedness_is_the_only_tolerated_difference() {

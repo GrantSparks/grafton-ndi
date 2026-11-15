@@ -11,11 +11,16 @@ use crate::LoadRefusal;
 /// linked SDK.
 pub(crate) trait Resolver {
     /// The address of `name`, or `None` when the implementation does not export it.
+    /// Names come from static entry-point declarations, so refusals retain the
+    /// exact C string without allocating a copy.
     ///
     /// # Errors
     ///
     /// Fails when the name resolves to code outside the selected implementation.
-    fn resolve(&self, name: &CStr) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal>;
+    fn resolve(
+        &self,
+        name: &'static CStr,
+    ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal>;
 }
 
 /// A table's exported symbol name, validated at compile time.
@@ -112,7 +117,10 @@ pub(crate) struct ExportsWhere<F: Fn(&str) -> bool>(pub(crate) F);
 
 #[cfg(test)]
 impl<F: Fn(&str) -> bool> Resolver for ExportsWhere<F> {
-    fn resolve(&self, name: &CStr) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
+    fn resolve(
+        &self,
+        name: &'static CStr,
+    ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
         let exported = (self.0)(name.to_str().expect("symbol names are ASCII"));
         Ok(exported.then(NonNull::dangling))
     }
@@ -163,7 +171,7 @@ mod tests {
         impl Resolver for Stubs {
             fn resolve(
                 &self,
-                name: &CStr,
+                name: &'static CStr,
             ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
                 Ok(NonNull::new(match name.to_bytes() {
                     b"NDIlib_initialize" => initialize as *mut c_void,
@@ -190,10 +198,10 @@ mod tests {
         impl Resolver for Foreign {
             fn resolve(
                 &self,
-                _name: &CStr,
+                _name: &'static CStr,
             ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
                 Err(LoadRefusal::EntryPointOutsideModule {
-                    symbol: "NDIlib_initialize".into(),
+                    symbol: c"NDIlib_initialize",
                     module: "selected module".into(),
                 })
             }

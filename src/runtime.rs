@@ -338,7 +338,7 @@ impl Runtime {
     /// # }
     /// ```
     pub fn capabilities(&self) -> &'static Capabilities {
-        &self.selected.capabilities
+        self.selected.gates.capabilities()
     }
 
     /// Check that the selected implementation provides `feature`.
@@ -382,7 +382,7 @@ impl Runtime {
     /// # }
     /// ```
     pub fn is_supported_cpu(&self) -> bool {
-        is_supported_cpu(&self.selected.api.core)
+        is_supported_cpu(&self.selected.gates.api().core)
     }
 
     /// Start NDI and return a handle to it.
@@ -652,7 +652,7 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
 static LIFECYCLE: OnceLock<RuntimeManager> = OnceLock::new();
 
 fn lifecycle(runtime: &'static sys::Runtime) -> &'static RuntimeManager {
-    LIFECYCLE.get_or_init(|| RuntimeManager::with_backend(SdkBackend(&runtime.api.core)))
+    LIFECYCLE.get_or_init(|| RuntimeManager::with_backend(SdkBackend(&runtime.gates.api().core)))
 }
 
 /// A handle to the started NDI runtime.
@@ -789,7 +789,7 @@ impl Ndi {
 
     /// The selected implementation's entry points.
     pub(crate) fn api(&self) -> &'static sys::Api {
-        &self.runtime.selected.api
+        self.runtime.selected.gates.api()
     }
 
     /// Reject an unavailable operation before passing newer inputs to the SDK.

@@ -337,10 +337,54 @@ pub struct FrameSync {
 const _: () = {
     const fn send_and_sync<T: Send + Sync>() {}
     send_and_sync::<FrameSync>();
+    send_and_sync::<FrameSyncResource>();
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameSyncInstance(NDIlib_framesync_instance_t);
+
+/// # Safety
+///
+/// The FrameSync instance has no affinity to the thread that created it: the
+/// SDK's own FrameSync audio examples create it on one thread and capture
+/// from an audio device's callback thread. FrameSyncResource owns this handle
+/// and retains the receiver core and its runtime through native destruction.
+/// Split views only borrow that resource. Borrowed frame guards cannot move
+/// between threads and keep the resource borrowed until their buffers are
+/// freed; destruction requires exclusive ownership.
+unsafe impl Send for FrameSyncInstance {}
+
+/// # Safety
+///
+/// Every `&self` method may run on several threads at once: video and audio
+/// capture, the input-format query, the queue depth, and the frees of
+/// borrowed frames. Neither `Processing.NDI.FrameSync.h` nor the SDK
+/// documentation of NDI 6.1.1, 6.3.2 or 6.4 says whether that is safe (the
+/// one threading statement, in `Processing.NDI.Recv.h`, covers receiver
+/// capture). The safety argument relies on these native implementation
+/// observations and concurrent capture tests:
+///
+/// - In the Linux x86_64 runtimes of all three versions, video capture, audio
+///   capture (and with it the input-format query) and the video free take the
+///   instance's exclusive lock, and the audio free returns its buffer through
+///   atomic operations. The queue depth is read without the lock, so it is
+///   approximate, which [`FrameSync::audio_queue_depth`] documents.
+/// - Under helgrind, four threads making all of these calls on one FrameSync
+///   of a live source show no conflict between two of them other than those
+///   two lock-free paths, on 6.3.2 and 6.4.
+/// - Sixteen threads making them for 120 s on each of 6.1.1, 6.3.2 and 6.4
+///   receive no torn video frame, no invalid audio and no error.
+///
+/// `one_framesync_serves_captures_from_several_threads_at_once` in
+/// tests/framesync_capture_boundary.rs repeats the last check briefly with
+/// every runtime the tests run against. The enclosing FrameSync's
+/// Receiver<FrameSyncAttached> contributes its own auto traits; attachment
+/// disables raw video and audio capture until this resource is destroyed,
+/// including when the receiver is accessed through [`FrameSync::receiver`].
+unsafe impl Sync for FrameSyncInstance {}
+
 struct FrameSyncResource {
-    instance: NDIlib_framesync_instance_t,
+    instance: FrameSyncInstance,
     // Native destruction reads this receiver; ownership keeps it and its runtime live.
     receiver: Arc<ReceiverCore>,
 }
@@ -435,7 +479,7 @@ impl<'a> FrameSyncCapture<'a> {
                 ._ndi
                 .api()
                 .core
-                .NDIlib_framesync_audio_queue_depth(self.resource.instance)
+                .NDIlib_framesync_audio_queue_depth(self.resource.instance.0)
         };
         u32::try_from(depth).unwrap_or(0)
     }
@@ -465,7 +509,7 @@ impl FrameSyncResource {
                 ._ndi
                 .api()
                 .core
-                .NDIlib_framesync_capture_video(self.instance, &mut frame, scan_type.to_sdk());
+                .NDIlib_framesync_capture_video(self.instance.0, &mut frame, scan_type.to_sdk());
         }
         if is_framesync_video_empty(&frame) {
             return None;
@@ -475,7 +519,7 @@ impl FrameSyncResource {
         // destroys the instance only when dropped, so the instance outlives
         // the guard, which frees the frame exactly once through
         // NDIlib_framesync_free_video, including when validation fails.
-        Some(unsafe { Guard::new(&self.receiver._ndi, self.instance, frame) })
+        Some(unsafe { Guard::new(&self.receiver._ndi, self.instance.0, frame) })
     }
 
     /// Make `call`: the guard of what the SDK returned, which it returns
@@ -513,7 +557,7 @@ impl FrameSyncResource {
                 .api()
                 .core
                 .NDIlib_framesync_capture_audio_v2(
-                    self.instance,
+                    self.instance.0,
                     &mut frame,
                     sample_rate,
                     num_channels,
@@ -526,7 +570,7 @@ impl FrameSyncResource {
         // destroys the instance only when dropped, so the instance outlives
         // the guard, which frees the frame exactly once through
         // NDIlib_framesync_free_audio_v2, including when validation fails.
-        unsafe { Guard::new(&self.receiver._ndi, self.instance, frame) }
+        unsafe { Guard::new(&self.receiver._ndi, self.instance.0, frame) }
     }
 }
 
@@ -539,7 +583,7 @@ impl Drop for FrameSyncResource {
                 ._ndi
                 .api()
                 .core
-                .NDIlib_framesync_destroy(self.instance)
+                .NDIlib_framesync_destroy(self.instance.0)
         };
         #[cfg(test)]
         crate::receiver::lifecycle_test_events::record("framesync");
@@ -596,7 +640,7 @@ impl FrameSync {
             ));
         }
         let resource = FrameSyncResource {
-            instance,
+            instance: FrameSyncInstance(instance),
             receiver: Arc::clone(&receiver.core),
         };
         Ok(Self {
@@ -982,50 +1026,10 @@ impl FrameSync {
     }
 }
 
-/// # Safety
-///
-/// The FrameSync instance has no affinity to the thread that created it: the
-/// SDK's own FrameSync audio examples create it on one thread and capture
-/// from an audio device's callback thread. This private resource is owned by
-/// FrameSync, while split views only borrow it. It retains the receiver core,
-/// and therefore its runtime, through native destruction. Borrowed frame guards cannot be moved
-/// between threads and keep this owner borrowed until their buffers are
-/// freed; destruction requires exclusive ownership.
-unsafe impl Send for FrameSyncResource {}
-
-/// # Safety
-///
-/// Every `&self` method may run on several threads at once: video and audio
-/// capture, the input-format query, the queue depth, and the frees of
-/// borrowed frames. Neither `Processing.NDI.FrameSync.h` nor the SDK
-/// documentation of NDI 6.1.1, 6.3.2 or 6.4 says whether that is safe (the
-/// one threading statement, in `Processing.NDI.Recv.h`, covers receiver
-/// capture). The safety argument relies on these native implementation
-/// observations and concurrent capture tests:
-///
-/// - In the Linux x86_64 runtimes of all three versions, video capture, audio
-///   capture (and with it the input-format query) and the video free take the
-///   instance's exclusive lock, and the audio free returns its buffer through
-///   atomic operations. The queue depth is read without the lock, so it is
-///   approximate, which [`FrameSync::audio_queue_depth`] documents.
-/// - Under helgrind, four threads making all of these calls on one FrameSync
-///   of a live source show no conflict between two of them other than those
-///   two lock-free paths, on 6.3.2 and 6.4.
-/// - Sixteen threads making them for 120 s on each of 6.1.1, 6.3.2 and 6.4
-///   receive no torn video frame, no invalid audio and no error.
-///
-/// `one_framesync_serves_captures_from_several_threads_at_once` in
-/// tests/framesync_capture_boundary.rs repeats the last check briefly with
-/// every runtime the tests run against. The enclosing FrameSync's
-/// Receiver<FrameSyncAttached> contributes its own auto traits; attachment
-/// disables raw video and audio capture until this resource is destroyed,
-/// including when the receiver is accessed through [`FrameSync::receiver`].
-unsafe impl Sync for FrameSyncResource {}
-
 impl fmt::Debug for FrameSync {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrameSync")
-            .field("instance", &self.resource.instance)
+            .field("instance", &self.resource.instance.0)
             .field("audio_queue_depth", &self.audio_queue_depth())
             .finish()
     }

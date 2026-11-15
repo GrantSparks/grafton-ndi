@@ -210,7 +210,6 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("ConfigurationNotObject", InputDefect::ConfigurationNotObject, "Advanced configuration must be a JSON object"),
         ("ConfigurationNul", InputDefect::ConfigurationNul, "Advanced configuration contains NUL"),
         ("QueueLimits", InputDefect::QueueLimits, "queue requires 1..=65536 frames and a positive addressable byte limit"),
-        ("ScatterTableRequired", InputDefect::ScatterTableRequired, "scatter table required by test"),
         ("QueueIdentifiersExhausted", InputDefect::QueueIdentifiersExhausted, "queue submission identifiers exhausted"),
         ("QueuedSenderRegistered", InputDefect::QueuedSenderRegistered, "queued conversion requires a sender without advertiser registrations"),
         ("CompletionStorage", InputDefect::CompletionStorage, "unable to allocate bounded completion storage"),
@@ -287,7 +286,7 @@ fn sdk_result_defect_diagnostics_preserve_their_text() {
         ("InvalidGuidance", SdkResultDefect::InvalidGuidance { operation: "native operation", value: -3 }, "native operation returned -3"),
         ("AvSyncFormatChange", SdkResultDefect::AvSyncFormatChange { sample_rate: 48000, channels: 2 }, "NDIlib_avsync_synchronize reported a format change to 48000 Hz and 2 channels"),
         ("UnknownStatus", SdkResultDefect::UnknownStatus { operation: "native operation", code: -3 }, "native operation returned unknown status -3"),
-        ("UnexpectedFrameType", SdkResultDefect::UnexpectedFrameType { operation: "native operation", kind: u32::MAX - 2 }, if cfg!(target_env = "msvc") { "native operation returned -3" } else { "native operation returned 4294967293" }),
+        ("UnexpectedFrameType", SdkResultDefect::UnexpectedFrameType { operation: "native operation", kind: u32::MAX - 2 }, "native operation returned 4294967293"),
         ("MalformedDiscoveryData", SdkResultDefect::MalformedDiscoveryData(DiscoveryDefect::NullArray), "SDK discovery array is null with a nonzero count"),
     ];
     check_cases("SdkResultDefect", &cases);

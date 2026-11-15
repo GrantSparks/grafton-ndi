@@ -200,7 +200,7 @@ where
     });
     assert_eq!(allocations, 0);
     assert_eq!(
-        owned.to_raw().p_metadata.is_null(),
+        owned.audio_descriptor().p_metadata.is_null(),
         status != FrameMetadataStatus::Text
     );
     owned
@@ -495,7 +495,7 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
                     video_source.metadata().is_none()
                 );
                 assert_eq!(
-                    audio.to_raw().p_metadata.is_null(),
+                    audio.audio_descriptor().p_metadata.is_null(),
                     audio_source.metadata().is_none()
                 );
                 assert_eq!(video.metadata.retained_bytes(), video_capacity);

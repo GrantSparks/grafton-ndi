@@ -43,7 +43,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+#[cfg(not(ndi_test_connect_overlap))]
+use parking_lot::RwLockReadGuard;
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 
 use crate::{
     capture::{
@@ -51,6 +53,7 @@ use crate::{
         Delivered, Media, MetadataKind, NoSlots, Notification, SlotSet, VideoKind,
     },
     finder::{RawSource, Source},
+    frames::MetadataPartsExt,
     sys::{self, bindings::*},
     timeout::{self, Deadline},
     AudioFrame, AudioFrameRef, Error, MetadataFrame, MetadataFrameRef, MetadataSource, Ndi, Result,
@@ -956,10 +959,12 @@ pub struct Receiver<M: ReceiverMode = RawCapture> {
 impl<M: ReceiverMode + std::panic::UnwindSafe> std::panic::UnwindSafe for Receiver<M> {}
 
 /// A requested target and the native descriptor already validated for it.
-/// Replaced as one value under the capture guard, so neither half can be stale.
+/// Replaced as one value under the target lock, so neither half can be stale.
 struct ConnectionTarget {
     source: Source,
-    raw: RawSource,
+    // Keep both the descriptor and its strings at stable addresses until a
+    // replacement request returns, or the native receiver is destroyed.
+    raw: Box<RawSource>,
 }
 
 /// A receiver's opaque native identity; ownership stays with `ReceiverCore`.
@@ -977,7 +982,7 @@ unsafe impl Sync for RecvInstance {}
 pub(crate) struct ReceiverCore {
     pub(crate) instance: RecvInstance,
     pub(crate) _ndi: Ndi,
-    /// The latest requested target; serializes connection changes against captures.
+    /// Serializes connection changes against captures.
     ///
     /// Capture calls take this lock *shared* (so video, audio, and metadata
     /// captures still run concurrently), while [`Receiver::reconnect`] takes it
@@ -987,7 +992,11 @@ pub(crate) struct ReceiverCore {
     ///
     /// A shared hold is a [`CaptureLock`], taken for one [`Attempt`] only, and
     /// the native capture cannot be called without one.
-    capture_guard: RwLock<ConnectionTarget>,
+    capture_gate: RwLock<()>,
+    /// The latest requested target. The gate serializes its writers; readers
+    /// never take the gate and therefore never wait for a capture or a queued
+    /// connection change. Writers hold this lock only to replace the value.
+    target: RwLock<ConnectionTarget>,
     pending_status: AtomicBool,
     pending_source: AtomicBool,
     pending_unknown: Mutex<Option<u32>>,
@@ -1097,9 +1106,10 @@ impl Receiver {
             core: Arc::new(ReceiverCore {
                 instance: RecvInstance(instance),
                 _ndi: ndi.clone(),
-                capture_guard: RwLock::new(ConnectionTarget {
+                capture_gate: RwLock::new(()),
+                target: RwLock::new(ConnectionTarget {
                     source: options.source.clone(),
-                    raw: raw._source,
+                    raw: Box::new(raw._source),
                 }),
                 pending_status: AtomicBool::new(false),
                 pending_source: AtomicBool::new(false),
@@ -1355,11 +1365,11 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn connect_to(&self, source: &Source) -> Result<()> {
         let next = ConnectionTarget {
             source: source.clone(),
-            raw: source.to_raw()?,
+            raw: Box::new(source.to_raw()?),
         };
-        let mut target = self.core.capture_guard.write();
-        self.core.connect_raw(Some(&next.raw), &target);
-        *target = next;
+        let gate = self.core.capture_gate.write();
+        self.core.connect_raw(Some(&next.raw), &gate);
+        *self.core.target.write() = next;
         Ok(())
     }
 
@@ -1367,8 +1377,8 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Waits for capture attempts in flight, as [`Self::reconnect`] does.
     pub fn disconnect(&self) {
-        let target = self.core.capture_guard.write();
-        self.core.connect_raw(None, &target);
+        let gate = self.core.capture_gate.write();
+        self.core.connect_raw(None, &gate);
     }
 
     /// Publish this receiver's program and preview tally to its source.
@@ -1485,6 +1495,11 @@ impl<M: ReceiverMode> Receiver<M> {
     /// source-rediscovery round trip — and the discovery race — that
     /// tearing down and rebuilding the receiver would incur.
     ///
+    /// This requests the last local target again. If a Discovery Server client
+    /// remotely changed this receiver's source, reconnecting replaces that
+    /// remote routing with the local target. Observe remote changes through
+    /// [`Self::poll_source_name_change`].
+    ///
     /// Observe native connection state with [`Self::is_connected`] and
     /// progress of the expected media with [`Self::connection_stats`]. A
     /// reconnect alone does not establish that new media has arrived.
@@ -1514,18 +1529,21 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn reconnect(&self) {
         // Read and submit under the same exclusive lock, so a concurrent
         // connect_to cannot be overwritten by a stale retained descriptor.
-        let target = self.core.capture_guard.write();
-        self.core.connect_raw(Some(&target.raw), &target);
+        let gate = self.core.capture_gate.write();
+        let target = self.core.target.read();
+        self.core.connect_raw(Some(&target.raw), &gate);
     }
 
-    /// An owned snapshot of the latest requested connection target.
+    /// An owned snapshot of the latest locally requested connection target.
     ///
     /// Initially the source specified in [`ReceiverOptions`], updated by each
     /// successful [`Self::connect_to`]. [`Self::disconnect`] retains it, and
-    /// [`Self::reconnect`] requests it again. This is the requested target;
-    /// observe actual connection changes with [`Self::poll_source_name_change`].
-    /// The snapshot clones the source's name and address. It briefly waits for
-    /// capture-lock access if a connection change is in progress.
+    /// [`Self::reconnect`] requests it again. A Discovery Server client's remote
+    /// connection change does not update this local target. Observe actual
+    /// connection changes with [`Self::poll_source_name_change`].
+    /// The snapshot clones the source's name and address. It never waits for
+    /// captures or queued connection changes; a concurrent `connect_to` holds
+    /// the target lock only while replacing the value after its request returns.
     ///
     /// ```no_run
     /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
@@ -1537,7 +1555,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # }
     /// ```
     pub fn connection_target(&self) -> Source {
-        self.core.capture_guard.read().source.clone()
+        self.core.target.read().source.clone()
     }
 
     /// Get connection and performance statistics for this receiver.
@@ -1726,16 +1744,13 @@ impl ReceiverCore {
     /// documents concurrent captures without establishing that connect may overlap them.
     /// Each attempt holds the guard for one [`Attempt`] at most, so this waits
     /// about one poll interval at most.
-    fn connect_raw(
-        &self,
-        source: Option<&RawSource>,
-        _exclusive: &RwLockWriteGuard<'_, ConnectionTarget>,
-    ) {
+    fn connect_raw(&self, source: Option<&RawSource>, _exclusive: &RwLockWriteGuard<'_, ()>) {
         let source = source.map_or(ptr::null(), |raw| ptr::from_ref(raw.as_raw()));
         // SAFETY: the receiver instance is live for this borrow. `source` is
-        // null or points into a `RawSource`, which owns the strings its
-        // descriptor points to and outlives this synchronous call, during
-        // which the SDK copies the descriptor.
+        // null or points into a boxed `RawSource`, which owns the strings its
+        // descriptor points to. The caller retains that same box in the
+        // receiver's target until a replacement request returns, or the native
+        // receiver is destroyed; no assumption about an SDK copy is needed.
         unsafe { self.sdk().NDIlib_recv_connect(self.instance.0, source) };
     }
 
@@ -1746,10 +1761,18 @@ impl ReceiverCore {
     /// This is the only way to make a [`CaptureLock`], and so to call
     /// `NDIlib_recv_capture_v3` on this instance.
     fn capture_lock(&self, attempt: Attempt) -> Option<CaptureLock<'_>> {
-        let shared = self.capture_guard.try_read_until(attempt.0.end())?;
+        // Only the native overlap probe opts out, to measure whether SDK
+        // connection changes can safely overlap its capture calls.
+        #[cfg(not(ndi_test_connect_overlap))]
+        let shared = self.capture_gate.try_read_until(attempt.0.end())?;
+        #[cfg(test)]
+        if let Some(event) = capture_lock_test_event::take() {
+            self.retain(event);
+        }
         Some(CaptureLock {
             core: self,
             attempt,
+            #[cfg(not(ndi_test_connect_overlap))]
             _shared: shared,
         })
     }
@@ -1757,7 +1780,7 @@ impl ReceiverCore {
     /// Hold the lock a reconnect holds, so that a test can contend with capture.
     #[cfg(all(test, any(feature = "advanced", feature = "tokio", feature = "smol")))]
     pub(crate) fn reconnect_lock(&self) -> impl Drop + '_ {
-        self.capture_guard.write()
+        self.capture_gate.write()
     }
 
     /// One SDK capture of kind `K` within `attempt`.
@@ -1834,6 +1857,7 @@ impl ReceiverCore {
                 return Ok(self.take_pending_event().map(&mut event));
             };
             if let Some(pending) = self.take_pending_event() {
+                drop(lock);
                 return Ok(Some(event(pending)));
             }
             let delivered = capture_any::<S>(&lock)?;
@@ -1991,7 +2015,8 @@ impl ReceiverCore {
 pub(crate) struct CaptureLock<'rx> {
     core: &'rx ReceiverCore,
     attempt: Attempt,
-    _shared: RwLockReadGuard<'rx, ConnectionTarget>,
+    #[cfg(not(ndi_test_connect_overlap))]
+    _shared: RwLockReadGuard<'rx, ()>,
 }
 
 impl<'rx> CaptureLock<'rx> {
@@ -2067,6 +2092,22 @@ pub(crate) mod native_capture_calls {
             CALLS.with(|calls| calls.replace(0)),
             LONGEST_WAIT_MS.with(|longest| longest.replace(0)),
         )
+    }
+}
+
+/// Publish one event immediately after a test takes the capture gate, so its
+/// post-lock pending-event path can be tested without a scheduling race.
+#[cfg(test)]
+mod capture_lock_test_event {
+    use super::Notification;
+    std::thread_local! {
+        static NEXT: std::cell::Cell<Option<Notification>> = const { std::cell::Cell::new(None) };
+    }
+    pub(super) fn set(event: Notification) {
+        NEXT.with(|next| next.set(Some(event)));
+    }
+    pub(super) fn take() -> Option<Notification> {
+        NEXT.with(|next| next.take())
     }
 }
 
@@ -3302,13 +3343,68 @@ mod tests {
     }
 
     #[test]
+    fn connection_target_waits_for_neither_captures_nor_queued_connection_changes() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        let expected = receiver.connection_target();
+        let shared = receiver.core.capture_gate.read();
+        std::thread::scope(|scope| {
+            let reconnect = scope.spawn(|| receiver.reconnect());
+            // A failed shared acquisition while our read hold remains proves
+            // that the fair gate has queued the connection writer.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while receiver.core.capture_gate.try_read().is_some() {
+                assert!(Instant::now() < deadline, "reconnect did not queue");
+                std::thread::yield_now();
+            }
+            let (done, completed) = std::sync::mpsc::channel();
+            let receiver = &receiver;
+            let getter = scope.spawn(move || {
+                done.send(receiver.connection_target()).unwrap();
+            });
+            let snapshot = completed.recv_timeout(Duration::from_millis(20));
+            // Always release the gate before inspecting the outcome, so a
+            // regression fails instead of leaving scoped threads deadlocked.
+            drop(shared);
+            getter.join().unwrap();
+            reconnect.join().unwrap();
+            assert_eq!(snapshot.expect("the getter waited for capture"), expected);
+        });
+        assert_eq!(receiver.connection_target(), expected);
+    }
+
+    #[test]
+    fn pending_events_found_under_the_gate_are_returned_after_release() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        capture_lock_test_event::set(Notification::SourceChanged);
+        let result = receiver
+            .core
+            .capture_any_until_with::<NoSlots, _>(
+                Deadline::after(Duration::ZERO).unwrap(),
+                NeverStop,
+                |event| {
+                    assert!(receiver.core.capture_gate.try_write().is_some());
+                    event
+                },
+                |_| unreachable!("a pending event avoids native capture"),
+            )
+            .unwrap();
+        assert_eq!(result, Some(ReceiverEvent::SourceChanged));
+    }
+
+    #[test]
     fn combined_capture_consumes_pending_events_once_even_during_reconnect() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         receiver.core.retain(Notification::SourceChanged);
-        let _exclusive = receiver.core.capture_guard.write();
+        let _exclusive = receiver.core.capture_gate.write();
         native_capture_calls::take();
         assert!(matches!(
             receiver.capture_any_ref(Duration::ZERO).unwrap(),
@@ -3464,7 +3560,7 @@ mod tests {
         assert!(receiver.core.take_pending_status().is_some());
 
         // A pending notification avoids even a contended reconnect lock.
-        let _exclusive = receiver.core.capture_guard.write();
+        let _exclusive = receiver.core.capture_gate.write();
         receiver
             .core
             .capture_result::<VideoKind>(CaptureResult::Notification(Notification::StatusChanged))
@@ -3595,14 +3691,14 @@ mod tests {
         let frame = MetadataFrame::new("<ndi_text>é</ndi_text>")
             .unwrap()
             .with_timecode(crate::Timecode::from_ticks(42));
-        let pointer = frame.to_raw().p_data;
+        let pointer = frame.metadata_raw().p_data;
         for _ in 0..3 {
             let sent = receiver.send_metadata(&frame);
             assert!(
                 matches!(sent, Ok(()) | Err(Error::NotConnected)),
                 "{sent:?}"
             );
-            assert_eq!(frame.to_raw().p_data, pointer);
+            assert_eq!(frame.metadata_raw().p_data, pointer);
         }
     }
 
@@ -3612,7 +3708,7 @@ mod tests {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        let exclusive = receiver.core.capture_guard.write();
+        let exclusive = receiver.core.capture_gate.write();
         std::thread::scope(|scope| {
             let (done, completed) = std::sync::mpsc::channel();
             let receiver = &receiver;

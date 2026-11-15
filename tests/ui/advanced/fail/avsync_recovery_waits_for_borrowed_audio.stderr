@@ -1,0 +1,13 @@
+error[E0505]: cannot move out of `sync` because it is borrowed
+ --> tests/ui/advanced/fail/avsync_recovery_waits_for_borrowed_audio.rs:6:20
+  |
+2 | fn recover(sync: AvSync) {
+  |            ---- binding `sync` declared here
+3 |     let AvSyncOutcomeRef::Audio { frame, .. } =
+4 |         sync.queued_audio_ref(AvSyncRequest::automatic()).unwrap()
+  |         ---- borrow of `sync` occurs here
+5 |     else { return; };
+6 |     let receiver = sync.into_receiver();
+  |                    ^^^^ move out of `sync` occurs here
+7 |     drop((frame, receiver));
+  |           ----- borrow later used here

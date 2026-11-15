@@ -15,6 +15,7 @@ use super::{
     RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec, StateError,
 };
 use crate::{
+    frames::MetadataPartsExt,
     sys::{self, bindings::*},
     timeout::Deadline,
     Error, MediaTypes, MetadataSource, Result,
@@ -984,6 +985,11 @@ impl FileRecorder {
     /// for uninterrupted recording and destination containment. Parent
     /// directories are not pinned against replacement.
     ///
+    /// Queued events from an earlier session, including unreadable events,
+    /// are consumed and discarded before the native start. Poll them before
+    /// starting if their contents are needed. The asynchronous recorder instead
+    /// forwards these events through its `next_event` operation.
+    ///
     /// The target is only read, so it stays with the caller whatever the
     /// outcome, for example to start again once a missing directory exists.
     /// [`RecordingTimecode::GenerateFrom`] takes a validated
@@ -998,12 +1004,13 @@ impl FileRecorder {
     ///   finish or poll it first, or [`reset`](Self::reset) it. With
     ///   [`StateError::EarlierSessionEvents`] when the SDK keeps reporting
     ///   events of an earlier session.
+    /// * [`Error::InvalidInput`] when the longest output path exceeds the
+    ///   recorder event's exact path limit (4094 UTF-8 bytes with the current
+    ///   SDK), reserving at least 20 digits per index token. The SDK is not called.
     /// * [`Error::Io`] when the directory of the file the pattern names
     ///   does not exist or cannot be written to, or, with an exact file name,
     ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
     ///   that file exists. The SDK is not called.
-    /// * [`Error::UnexpectedSdkResult`] when a stale event cannot be read
-    ///   before the new session starts. The native start is not called.
     /// * [`Error::NativeOperationFailed`] when the SDK cannot start the source
     ///   or open the first file. `Processing.NDI.Lib.File.Recorder.h` specifies
     ///   an open-failed event for an output-file open failure; source-start
@@ -1011,14 +1018,14 @@ impl FileRecorder {
     ///   that event, counted in no session's report. Retrying `start` discards
     ///   queued events before asking the SDK to start again.
     pub fn start(&mut self, target: &RecordingTarget, timecode: RecordingTimecode) -> Result<u64> {
-        self.start_with_sink(target, timecode, &mut |event| event.map(|_| ()))
+        self.start_with_sink(target, timecode, &mut |_| {})
     }
 
     pub(super) fn start_with_sink(
         &mut self,
         target: &RecordingTarget,
         timecode: RecordingTimecode,
-        sink: &mut impl FnMut(Result<RecorderEvent>) -> Result<()>,
+        sink: &mut impl FnMut(Result<RecorderEvent>),
     ) -> Result<u64> {
         if self.ledger.cleanup_pending() {
             return Err(Error::InvalidState(StateError::PreviousSessionOpen));
@@ -1064,19 +1071,10 @@ impl FileRecorder {
 
     /// Take events until the queue is empty, so that none from an earlier
     /// session is attributed to the next one.
-    fn discard_stale_events(
-        &mut self,
-        sink: &mut impl FnMut(Result<RecorderEvent>) -> Result<()>,
-    ) -> Result<()> {
+    fn discard_stale_events(&mut self, sink: &mut impl FnMut(Result<RecorderEvent>)) -> Result<()> {
         let mut budget = DrainBudget::late();
         for _ in 0..STALE_EVENT_LIMIT {
-            let mut error = None;
-            let polled = self.pump(&mut budget, Duration::ZERO, &mut |event| {
-                error = sink(event).err();
-            });
-            if let Some(error) = error {
-                return Err(error);
-            }
+            let polled = self.pump(&mut budget, Duration::ZERO, sink);
             if polled.drained {
                 return Ok(());
             }
@@ -1522,6 +1520,10 @@ impl FileRecorder {
     ///
     /// * [`Error::InvalidState`] with [`StateError::NotRecording`] unless
     ///   a session is recording.
+    /// * [`Error::InvalidInput`] when the longest output path exceeds the
+    ///   recorder event's exact path limit (4094 UTF-8 bytes with the current
+    ///   SDK), reserving at least 20 digits per index token. The SDK is not
+    ///   called and the session goes on.
     /// * [`Error::Io`] when the directory of the file the pattern names
     ///   does not exist or cannot be written to, or, with an exact file name,
     ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when

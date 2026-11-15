@@ -1,0 +1,67 @@
+error[E0277]: `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>` cannot be sent between threads safely
+ --> tests/ui/advanced/fail/avsync_audio_stays_on_its_capture_thread.rs:5:19
+  |
+5 |     assert_send::<AvSyncAudioRef<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>` cannot be sent between threads safely
+  |
+  = help: within `frames::borrowed::AudioRef<'static, grafton_ndi::capture::AvSyncAudioFree>`, the trait `Send` is not implemented for `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>`
+help: the following other types implement trait `Send`
+ --> src/capture.rs
+  |
+  | unsafe impl Send for Guard<'_, VideoKind> {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, VideoKind>`
+  | unsafe impl Sync for Guard<'_, VideoKind> {}
+  | unsafe impl Send for Guard<'_, AudioKind> {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, AudioKind>`
+  | unsafe impl Sync for Guard<'_, AudioKind> {}
+  | unsafe impl Send for Guard<'_, MetadataKind> {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, MetadataKind>`
+note: required because it appears within the type `frames::ValidatedFrame<grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>, frames::ValidatedAudioLayout>`
+ --> src/frames.rs
+  |
+  | pub(crate) struct ValidatedFrame<F, V> {
+  |                   ^^^^^^^^^^^^^^
+note: required because it appears within the type `frames::borrowed::AudioRef<'static, grafton_ndi::capture::AvSyncAudioFree>`
+ --> src/frames.rs
+  |
+  |     pub struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
+  |                ^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/advanced/fail/avsync_audio_stays_on_its_capture_thread.rs:2:19
+  |
+2 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>` cannot be shared between threads safely
+ --> tests/ui/advanced/fail/avsync_audio_stays_on_its_capture_thread.rs:6:19
+  |
+6 |     assert_sync::<AvSyncAudioRef<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>` cannot be shared between threads safely
+  |
+  = help: within `frames::borrowed::AudioRef<'static, grafton_ndi::capture::AvSyncAudioFree>`, the trait `Sync` is not implemented for `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>`
+help: the following other types implement trait `Sync`
+ --> src/capture.rs
+  |
+  | unsafe impl Sync for Guard<'_, VideoKind> {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, VideoKind>`
+  | unsafe impl Send for Guard<'_, AudioKind> {}
+  | unsafe impl Sync for Guard<'_, AudioKind> {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, AudioKind>`
+  | unsafe impl Send for Guard<'_, MetadataKind> {}
+  | unsafe impl Sync for Guard<'_, MetadataKind> {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, MetadataKind>`
+note: required because it appears within the type `frames::ValidatedFrame<grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>, frames::ValidatedAudioLayout>`
+ --> src/frames.rs
+  |
+  | pub(crate) struct ValidatedFrame<F, V> {
+  |                   ^^^^^^^^^^^^^^
+note: required because it appears within the type `frames::borrowed::AudioRef<'static, grafton_ndi::capture::AvSyncAudioFree>`
+ --> src/frames.rs
+  |
+  |     pub struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
+  |                ^^^^^^^^
+note: required by a bound in `assert_sync`
+ --> tests/ui/advanced/fail/avsync_audio_stays_on_its_capture_thread.rs:3:19
+  |
+3 | fn assert_sync<T: Sync>() {}
+  |                   ^^^^ required by this bound in `assert_sync`

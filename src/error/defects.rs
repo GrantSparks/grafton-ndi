@@ -702,9 +702,6 @@ pub enum InputDefect {
     /// queue requires 1..=65536 frames and a positive addressable byte limit.
     #[error("queue requires 1..=65536 frames and a positive addressable byte limit")]
     QueueLimits,
-    /// scatter table required by test.
-    #[error("scatter table required by test")]
-    ScatterTableRequired,
     /// queue submission identifiers exhausted.
     #[error("queue submission identifiers exhausted")]
     QueueIdentifiersExhausted,
@@ -1109,7 +1106,7 @@ pub enum SdkResultDefect {
         code: i32,
     },
     /// {operation} returned {kind}.
-    #[error("{operation} returned {}", NativeFrameCode(*kind))]
+    #[error("{operation} returned {kind}")]
     UnexpectedFrameType {
         /// The operation.
         operation: &'static str,
@@ -1320,21 +1317,5 @@ impl std::fmt::Display for PtzDefect {
             maximum,
         } = self;
         write!(f, "{name} must be finite and within {minimum}..={maximum}")
-    }
-}
-
-// The vendored C enum uses signed integers on MSVC and unsigned elsewhere.
-// Keep its exact bits in the public evidence and preserve native diagnostic text.
-struct NativeFrameCode(u32);
-impl std::fmt::Display for NativeFrameCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        #[cfg(target_env = "msvc")]
-        {
-            std::fmt::Display::fmt(&(self.0 as i32), f)
-        }
-        #[cfg(not(target_env = "msvc"))]
-        {
-            std::fmt::Display::fmt(&self.0, f)
-        }
     }
 }
