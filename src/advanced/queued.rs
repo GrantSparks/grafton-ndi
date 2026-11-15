@@ -39,9 +39,9 @@ use super::send_slots::DescriptorSlots;
 /// frame the SDK has finished with but that has not been collected still uses
 /// its share. The byte budget includes retained payload capacity, even when a
 /// compressed frame uses only part of a pooled vector. The defaults are 8 frames
-/// and 512 MiB. Construction reserves one stable frame descriptor per frame
-/// and, when scatter sending is compiled in, one scatter-list descriptor.
-/// Completed frames retain their slots until collected.
+/// and 512 MiB. Construction reserves one stable frame descriptor per frame.
+/// Scatter frames own their scatter-list descriptors. Completed frames retain
+/// their slots until collected.
 #[derive(Debug, Clone, Copy)]
 pub struct QueueOptions {
     frames: usize,
@@ -237,23 +237,13 @@ impl AuthorizedVideo {
         }
     }
 
-    /// The SDK returns this original allocation address on completion.
-    fn completion_key(&self) -> usize {
-        match self {
-            Self::Pixels(frame) => frame.data().as_ptr() as usize,
-            Self::Compressed(frame) => frame.data().as_ptr() as usize,
-            #[cfg(ndi_has_advanced_scatter_send)]
-            Self::Scatter { frame, .. } => frame.blocks().next().unwrap().as_ptr() as usize,
-        }
-    }
-
-    fn retain(self, _slot: &mut DescriptorLease) -> QueuedStorage {
+    fn retain(self) -> QueuedStorage {
         match self {
             Self::Pixels(frame) => QueuedStorage::Pixels(frame),
             Self::Compressed(frame) => QueuedStorage::Packet(PendingVideo::Contiguous(frame)),
             #[cfg(ndi_has_advanced_scatter_send)]
             Self::Scatter { frame, table } => {
-                QueuedStorage::Packet(PendingVideo::scatter_in(frame, table, _slot))
+                QueuedStorage::Packet(PendingVideo::Scatter { frame, table })
             }
         }
     }
@@ -339,8 +329,8 @@ impl Entry {
         let Self {
             id, slot, frame, ..
         } = self;
-        // Consuming packet storage releases its scatter view before its slot
-        // key can reenter admission. No frame or list is still native-borrowed.
+        // Native release covers the payload and its frame-owned scatter list
+        // before the header slot's key can reenter admission.
         let completed = CompletedVideo {
             id,
             frame: frame.into_frame(),
@@ -405,18 +395,17 @@ impl State {
         bytes: usize,
         protocol_error: &AtomicBool,
     ) -> std::result::Result<Admitted, Rejected<QueuedVideoFrame>> {
-        let key = frame.completion_key();
-        self.admit_with_key(frame, bytes, key, protocol_error)
+        self.admit_with_lend(frame, bytes, protocol_error, |frame| frame.lend(()))
     }
 
-    /// Check native completion-key uniqueness before consuming a free slot.
-    /// Production callers derive `key` from the authorized payload in `admit`.
-    fn admit_with_key(
+    /// Derive the completion key from the very descriptor handed to the SDK.
+    /// Lending needs no header slot: scatter lists belong to their frames.
+    fn admit_with_lend(
         &mut self,
         frame: AuthorizedVideo,
         bytes: usize,
-        key: usize,
         protocol_error: &AtomicBool,
+        lend: impl FnOnce(&mut QueuedStorage) -> Lent,
     ) -> std::result::Result<Admitted, Rejected<QueuedVideoFrame>> {
         let Some(total) = self
             .bytes
@@ -442,6 +431,9 @@ impl State {
                 frame.into_frame(),
             ));
         };
+        let mut frame = frame.retain();
+        let lent = lend(&mut frame);
+        let key = lent.descriptor().p_data as usize;
         if self.in_flight.capacity() == self.in_flight.len() {
             self.rebuild_index();
         }
@@ -456,13 +448,10 @@ impl State {
                 ));
             }
         };
-        let mut slot = slot_key.claim();
-        let mut frame = frame.retain(&mut slot);
-        // Frame-bound authorization makes descriptor construction infallible;
-        // no key is removed until all admission rejection checks have passed.
-        let lent = frame.lend(());
-        let pointer = slot.header(*lent.descriptor());
-        debug_assert_eq!(key, lent.descriptor().p_data as usize);
+        // All rejection checks and lending precede slot initialization. The
+        // move-only key can initialize this header only once.
+        let slot = slot_key.claim(*lent.descriptor());
+        let pointer = slot.as_ptr();
         let id = SubmissionId(self.next);
         self.next = next;
         self.bytes = total;
@@ -1097,11 +1086,16 @@ mod tests {
         let other_pointer = other.data().as_ptr();
         let bytes = other.retained_bytes();
         let rejected = state
-            .admit_with_key(
+            .admit_with_lend(
                 QueuedVideoFrame::from(other).authorize_for_test(None),
                 bytes,
-                key,
                 &callback.protocol_error,
+                |frame| {
+                    Lent::Frame(NDIlib_video_frame_v2_t {
+                        p_data: key as *mut u8,
+                        ..*frame.lend(()).descriptor()
+                    })
+                },
             )
             .err()
             .expect("an occupied completion key is refused");
@@ -1496,7 +1490,16 @@ mod tests {
     #[test]
     fn a_retired_slot_reduces_capacity_and_collection_still_allows_retry() {
         let callback = CallbackState::new(QueueOptions::default().max_frames(3)).unwrap();
-        drop(callback.state.lock().unwrap().free.pop().unwrap().claim());
+        drop(
+            callback
+                .state
+                .lock()
+                .unwrap()
+                .free
+                .pop()
+                .unwrap()
+                .claim(Default::default()),
+        );
         let first = insert(&callback, 1);
         insert(&callback, 2);
         let frame = VideoFrame::builder().resolution(2, 2).build().unwrap();
@@ -1568,7 +1571,7 @@ mod tests {
             Error::InvalidInput(crate::InputDefect::QueueIdentifiersExhausted)
         ));
         assert_eq!(state.free.len(), 1, "refusal returns the unused key");
-        drop(state.free.pop().unwrap().claim());
+        drop(state.free.pop().unwrap().claim(Default::default()));
         assert!(matches!(
             reject(&mut state, frame()),
             Error::QueueFull(QueueLimit::Frames)
@@ -1588,7 +1591,16 @@ mod tests {
             )
             .unwrap();
             let callback = queue.lending.loans();
-            drop(callback.state.lock().unwrap().free.pop().unwrap().claim());
+            drop(
+                callback
+                    .state
+                    .lock()
+                    .unwrap()
+                    .free
+                    .pop()
+                    .unwrap()
+                    .claim(Default::default()),
+            );
             let first = insert(callback, 1);
             insert(callback, 2);
             let third = insert(callback, 3);

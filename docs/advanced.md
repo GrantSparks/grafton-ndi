@@ -145,9 +145,9 @@ the encoder supplies separate header, payload and parameter-set blocks; it
 returns as `QueuedVideoFrame::Scatter`, and `into_blocks()` recovers the original
 allocations. This requires scatter-send support as well as completion support.
 The byte budget counts block capacities, the owned block collection, both
-scatter arrays and metadata. Queue construction reserves stable native frame
-descriptors and, where supported, scatter-list descriptors for `max_frames`,
-plus bookkeeping scratch for allocation-free index rebuilds.
+scatter arrays, the frame-owned scatter list and metadata. Queue construction
+reserves stable native frame descriptors for `max_frames`, plus bookkeeping
+scratch for allocation-free index rebuilds.
 Accepted submissions, completion callbacks and completion collection allocate
 nothing. A `QueueFull` refusal allocates only the returned `Rejected` value.
 The SDK completion callback runs no application code.

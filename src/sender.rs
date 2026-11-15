@@ -653,11 +653,10 @@ pub(crate) mod in_flight {
                 Err(error) => return Err(crate::Rejected::new(error, _frame)),
             };
             native!(ScatterSend, table => {
-                let tier = _frame.format().tier();
-                let next = self.loans.prepare_scatter(_frame, table);
-                let displaced = self.submit_prepared(next);
-                self.loans.advance_scatter(tier);
-                Ok(displaced)
+                Ok(self.submit_prepared(crate::advanced::PendingVideo::Scatter {
+                    frame: _frame,
+                    table,
+                }))
             })
         }
 
