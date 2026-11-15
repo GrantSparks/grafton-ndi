@@ -134,6 +134,13 @@ pub struct Router {
     route: Option<Box<RawSource>>,
     refused_route: Option<Box<RawSource>>,
     #[cfg(feature = "advanced")]
+    #[cfg_attr(
+        not(ndi_has_advanced_router_connection_metadata),
+        expect(
+            dead_code,
+            reason = "only native router metadata operations use this storage"
+        )
+    )]
     pub(crate) connection_metadata: crate::connection_metadata::ConnectionMetadata,
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
