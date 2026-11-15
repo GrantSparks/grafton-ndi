@@ -237,6 +237,7 @@ struct OpenFile {
 #[derive(Clone, Copy)]
 enum CleanupBudget {
     Skip,
+    Spent,
     For(Duration),
     Until(Deadline),
 }
@@ -246,10 +247,219 @@ impl CleanupBudget {
         if let Self::For(wait) = *self {
             *self = Deadline::starting(requested, wait).map_or(Self::Skip, Self::Until);
         }
-        match *self {
+        match std::mem::replace(self, Self::Spent) {
             Self::Until(deadline) => Some(deadline),
-            Self::Skip | Self::For(_) => None,
+            Self::Skip | Self::Spent | Self::For(_) => None,
         }
+    }
+}
+
+/// A wait's deadline and its one bounded drain after expiry.
+/// Reading expiry once per step keeps the native poll and settlement in agreement.
+pub(super) struct DrainBudget {
+    deadline: Option<Deadline>,
+    late_polls: usize,
+    spent: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrainStep {
+    Wait(u32),
+    Late,
+    Spent,
+}
+
+impl DrainBudget {
+    fn new(deadline: Deadline) -> Self {
+        Self {
+            deadline: Some(deadline),
+            late_polls: 0,
+            spent: false,
+        }
+    }
+
+    fn late() -> Self {
+        Self {
+            deadline: None,
+            late_polls: 0,
+            spent: false,
+        }
+    }
+
+    fn next(&mut self, step: Duration) -> DrainStep {
+        self.next_at(step, Instant::now())
+    }
+
+    fn next_at(&mut self, step: Duration, at: Instant) -> DrainStep {
+        if self.spent {
+            return DrainStep::Spent;
+        }
+        match self.deadline.filter(|deadline| deadline.end() > at) {
+            Some(deadline) => DrainStep::Wait(
+                crate::timeout::sdk_millis(deadline.remaining_at(at).min(step))
+                    .expect("a drain step is within the validated deadline"),
+            ),
+            None if self.late_polls < STALE_EVENT_LIMIT => {
+                self.late_polls += 1;
+                DrainStep::Late
+            }
+            None => {
+                self.spent = true;
+                DrainStep::Spent
+            }
+        }
+    }
+}
+
+/// Evidence from one poll, or from exhausting its bounded final drain.
+#[derive(Clone, Copy)]
+struct Pumped {
+    expired: bool,
+    drained: bool,
+}
+
+/// One fixed settlement batch. Reply callbacks cannot advance its clock.
+pub(super) struct Settlement {
+    pub(super) drained: bool,
+    pub(super) cleanup_expired: bool,
+    pub(super) at: Instant,
+}
+
+/// How a registered finish wait returns its result. Synchronous waits use a
+/// stack slot; async waits use their executor-independent reply.
+pub(super) trait FinishReply {
+    fn cancelled(&self) -> bool;
+    fn complete(self, result: Result<FinishStatus>);
+}
+
+struct FinishWaiter<R> {
+    deadline: Deadline,
+    session: u64,
+    reply: R,
+}
+
+/// The finish registry lives beside the ledger whose evidence settles it.
+pub(super) struct FinishWaiters<R> {
+    waiters: Vec<FinishWaiter<R>>,
+}
+
+impl<R: FinishReply> FinishWaiters<R> {
+    pub(super) fn new() -> Self {
+        Self {
+            waiters: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.waiters.len()
+    }
+    pub(super) fn is_empty(&self) -> bool {
+        self.waiters.is_empty()
+    }
+
+    pub(super) fn retain(&mut self) {
+        self.waiters.retain(|waiter| !waiter.reply.cancelled());
+    }
+
+    pub(super) fn register(&mut self, recorder: &FileRecorder, deadline: Deadline, reply: R) {
+        if let Err(error) = recorder.check_wait() {
+            reply.complete(Err(error));
+        } else if !reply.cancelled() {
+            self.waiters.push(FinishWaiter {
+                deadline,
+                session: recorder.ledger.report.session,
+                reply,
+            });
+        }
+    }
+
+    pub(super) fn close(&mut self) {
+        for waiter in self.waiters.drain(..) {
+            waiter
+                .reply
+                .complete(Err(Error::InvalidState(StateError::Closed)));
+        }
+    }
+
+    pub(super) fn wait_timeout(&self, tick: Duration) -> Duration {
+        self.waiters
+            .iter()
+            .fold(tick, |wait, waiter| wait.min(waiter.deadline.remaining()))
+    }
+
+    /// Fix the due batch before delivering any reply: executor callbacks may
+    /// take arbitrary time, so later deadlines need a fresh drain next time.
+    pub(super) fn settle_at(
+        &mut self,
+        recorder: &mut FileRecorder,
+        batch: Settlement,
+        sink: &mut impl FnMut(Result<RecorderEvent>),
+        closing: impl Fn() -> bool,
+        mut cleanup: Option<&mut DrainBudget>,
+    ) -> bool {
+        let Settlement {
+            mut drained,
+            cleanup_expired,
+            at,
+        } = batch;
+        self.retain();
+        if self
+            .waiters
+            .iter()
+            .any(|waiter| cleanup_expired || waiter.deadline.end() <= at)
+        {
+            // A pump poll before expiry is never evidence that the queue is
+            // empty after expiry. Every newly due batch gets its own drain.
+            let mut budget = DrainBudget::late();
+            loop {
+                if let Some(cleanup) = cleanup.as_deref_mut() {
+                    if cleanup.next(Duration::ZERO) == DrainStep::Spent {
+                        break;
+                    }
+                }
+                let polled = recorder.pump(&mut budget, Duration::ZERO, sink);
+                if polled.drained {
+                    break;
+                }
+            }
+            drained = true;
+        }
+        let session = recorder.ledger.report.session;
+        let mut index = 0;
+        while index < self.waiters.len() {
+            let waiter = &self.waiters[index];
+            let outcome = if waiter.session != session {
+                Some(Err(Error::InvalidState(StateError::Closed)))
+            } else {
+                recorder
+                    .settle_wait(cleanup_expired || waiter.deadline.end() <= at, drained)
+                    .map(|outcome| {
+                        if matches!(outcome, FinishStatus::TimedOut(_)) && closing() {
+                            Err(Error::InvalidState(StateError::Closed))
+                        } else {
+                            Ok(outcome)
+                        }
+                    })
+            };
+            if let Some(outcome) = outcome {
+                self.waiters.swap_remove(index).reply.complete(outcome);
+            } else {
+                index += 1;
+            }
+        }
+        drained
+    }
+}
+
+struct LocalFinish<'a>(&'a std::cell::RefCell<Option<Result<FinishStatus>>>);
+
+impl FinishReply for LocalFinish<'_> {
+    fn cancelled(&self) -> bool {
+        false
+    }
+    fn complete(self, result: Result<FinishStatus>) {
+        *self.0.borrow_mut() = Some(result);
     }
 }
 
@@ -670,12 +880,21 @@ impl FileRecorder {
     ///   that event, counted in no session's report. Retrying `start` discards
     ///   queued events before asking the SDK to start again.
     pub fn start(&mut self, target: &RecordingTarget, timecode: RecordingTimecode) -> Result<u64> {
+        self.start_with_sink(target, timecode, &mut |_| {})
+    }
+
+    pub(super) fn start_with_sink(
+        &mut self,
+        target: &RecordingTarget,
+        timecode: RecordingTimecode,
+        sink: &mut impl FnMut(Result<RecorderEvent>),
+    ) -> Result<u64> {
         if self.ledger.cleanup_pending() {
             return Err(Error::InvalidState(StateError::PreviousSessionOpen));
         }
         self.naming.check(target)?;
         // Events left over from an earlier session must not be counted in this one.
-        self.discard_stale_events()?;
+        self.discard_stale_events(sink)?;
         let session = self
             .ledger
             .report
@@ -712,9 +931,10 @@ impl FileRecorder {
 
     /// Take events until the queue is empty, so that none from an earlier
     /// session is attributed to the next one.
-    fn discard_stale_events(&mut self) -> Result<()> {
+    fn discard_stale_events(&mut self, sink: &mut impl FnMut(Result<RecorderEvent>)) -> Result<()> {
+        let mut budget = DrainBudget::late();
         for _ in 0..STALE_EVENT_LIMIT {
-            if self.capture(0)?.is_none() {
+            if self.pump(&mut budget, Duration::ZERO, sink).drained {
                 return Ok(());
             }
         }
@@ -865,61 +1085,37 @@ impl FileRecorder {
     /// session has not been asked to stop. Neither is returned once the wait
     /// has begun.
     pub fn wait_finished(&mut self, timeout: Duration) -> Result<FinishStatus> {
-        self.wait_finished_from(Deadline::after(timeout)?, |_| false)
+        self.wait_until(Deadline::after(timeout)?)
     }
 
-    /// Wait for a stopping session to end, until `deadline` is spent.
-    ///
-    /// `each` is called after every poll with what the poll returned,
-    /// including a malformed event's error, and ends the wait early by
-    /// returning true. A poll that fails has still taken an event, whose
-    /// effect is in the ledger, so the wait goes on to the outcome the ledger
-    /// then shows.
-    ///
-    /// Once the deadline has passed, events already queued are still taken,
-    /// without waiting, until the queue is found empty: the deadline may have
-    /// passed during the native stop, after the closure was reported.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidState`] with [`StateError::StopNotRequested`] when no
-    /// session was started or the session has not been asked to stop.
-    pub(super) fn wait_finished_from(
-        &mut self,
-        deadline: Deadline,
-        each: impl FnMut(Result<Option<RecorderEvent>>) -> bool,
-    ) -> Result<FinishStatus> {
+    pub(super) fn wait_until(&mut self, deadline: Deadline) -> Result<FinishStatus> {
         self.check_wait()?;
-        let mut each = each;
-        let mut interrupted = false;
-        let mut late_polls = 0;
+        let result = std::cell::RefCell::new(None);
+        let mut waiters = FinishWaiters::new();
+        waiters.register(self, deadline, LocalFinish(&result));
+        let mut budget = DrainBudget::new(deadline);
         loop {
-            if let Some(outcome) = self.settle_wait(false, false) {
-                return Ok(outcome);
-            }
-            if interrupted || late_polls == STALE_EVENT_LIMIT {
-                return Ok(self
-                    .settle_wait(true, true)
-                    .expect("a completed drain settles"));
-            }
-            // Read once, so the poll and its settlement agree whether this
-            // is part of the final, bounded nonblocking drain.
-            let expired = deadline.is_expired();
-            if expired {
-                late_polls += 1;
+            // Final reports do not need another native call.
+            waiters.settle_at(
+                self,
+                Settlement {
+                    drained: false,
+                    cleanup_expired: false,
+                    at: Instant::now(),
+                },
+                &mut |_| {},
+                || false,
+                Some(&mut budget),
+            );
+            if let Some(result) = result.borrow_mut().take() {
+                return result;
             }
             let step = if self.ledger.all_closed() {
                 SETTLE_POLL
             } else {
                 FINISH_POLL
             };
-            let polled =
-                self.poll_event_ms(deadline.within_at(Instant::now(), step).remaining_ms());
-            let drained = matches!(polled, Ok(None));
-            interrupted = each(polled);
-            if let Some(outcome) = self.settle_wait(expired, drained) {
-                return Ok(outcome);
-            }
+            self.pump(&mut budget, step, &mut |_| {});
         }
     }
 
@@ -944,25 +1140,85 @@ impl FileRecorder {
         self.ledger.cleanup_pending()
     }
 
-    /// Keep taking closure evidence even when the session's report is final.
-    fn wait_cleanup(&mut self, deadline: Deadline) {
-        let mut late_polls = 0;
-        while self.ledger.cleanup_pending() {
-            let expired = deadline.is_expired();
-            if expired {
-                if late_polls == STALE_EVENT_LIMIT {
-                    break;
+    /// Poll once through the shared deadline/drain rule and publish its event.
+    fn pump(
+        &mut self,
+        budget: &mut DrainBudget,
+        step: Duration,
+        sink: &mut impl FnMut(Result<RecorderEvent>),
+    ) -> Pumped {
+        let next = budget.next(step);
+        let (wait, expired) = match next {
+            DrainStep::Wait(wait) => (wait, false),
+            DrainStep::Late => (0, true),
+            DrainStep::Spent => {
+                return Pumped {
+                    expired: true,
+                    drained: true,
                 }
-                late_polls += 1;
             }
-            let polled = self.poll_event_ms(
-                deadline
-                    .within_at(Instant::now(), FINISH_POLL)
-                    .remaining_ms(),
+        };
+        let polled = self.poll_event_ms(wait);
+        let drained = matches!(polled, Ok(None));
+        if let Some(event) = polled.transpose() {
+            sink(event);
+        }
+        if expired && drained {
+            budget.spent = true;
+        }
+        Pumped { expired, drained }
+    }
+
+    /// Drop and async close share the same cleanup driver, including the
+    /// waiters' polls: a final drain spends this recorder's budget only once.
+    pub(super) fn drain_cleanup<R: FinishReply>(
+        &mut self,
+        requested: Instant,
+        waiters: &mut FinishWaiters<R>,
+        tick: Duration,
+        sink: &mut impl FnMut(Result<RecorderEvent>),
+        closing: impl Fn() -> bool,
+    ) {
+        let deadline = self.begin_cleanup(requested);
+        self.request_stop();
+        let mut budget = deadline.map_or_else(
+            || DrainBudget {
+                deadline: None,
+                late_polls: 0,
+                spent: true,
+            },
+            DrainBudget::new,
+        );
+        waiters.retain();
+        while self.cleanup_pending() || !waiters.is_empty() {
+            let polled = self.pump(&mut budget, waiters.wait_timeout(tick), sink);
+            let drained = waiters.settle_at(
+                self,
+                Settlement {
+                    drained: polled.drained,
+                    cleanup_expired: polled.expired,
+                    at: Instant::now(),
+                },
+                sink,
+                &closing,
+                Some(&mut budget),
             );
-            if expired && matches!(polled, Ok(None)) {
+            if polled.expired && drained {
                 break;
             }
+        }
+        // No new polls after this budget was spent. Resolve anything still
+        // pending as a timeout (or Closed for an async close).
+        let session = self.ledger.report.session;
+        for waiter in waiters.waiters.drain(..) {
+            let outcome = if waiter.session != session || closing() {
+                Err(Error::InvalidState(StateError::Closed))
+            } else {
+                Ok(self
+                    .settle_wait(true, true)
+                    .expect("a completed drain settles"))
+            };
+            waiter.reply.complete(outcome);
         }
     }
 
@@ -1221,10 +1477,13 @@ impl Drop for FileRecorder {
         // The SDK finalizes a file between the stop request and the
         // file-closed event; destroying sooner may truncate it.
         if self.ledger.cleanup_pending() {
-            self.request_stop();
-            if let Some(deadline) = self.cleanup.begin(Instant::now()) {
-                self.wait_cleanup(deadline);
-            }
+            self.drain_cleanup(
+                Instant::now(),
+                &mut FinishWaiters::<LocalFinish<'_>>::new(),
+                FINISH_POLL,
+                &mut |_| {},
+                || false,
+            );
         }
         // SAFETY: the recorder is live and is destroyed exactly once, on the
         // thread that created it.
@@ -1254,6 +1513,23 @@ mod tests {
     use RecorderEventKind::{
         Error, FileClosed, FormatChanged, OpenFailed, Rollover, Started, WriteFailed,
     };
+
+    #[test]
+    fn every_drain_uses_one_expiry_read_and_one_bounded_late_phase() {
+        let at = Instant::now();
+        let deadline = Deadline::starting(at, Duration::from_millis(7)).unwrap();
+        let mut budget = DrainBudget::new(deadline);
+        assert_eq!(budget.next_at(FINISH_POLL, at), DrainStep::Wait(7));
+        assert_eq!(budget.next_at(SETTLE_POLL, at), DrainStep::Wait(1));
+        for _ in 0..STALE_EVENT_LIMIT {
+            assert_eq!(budget.next_at(FINISH_POLL, deadline.end()), DrainStep::Late);
+        }
+        assert_eq!(
+            budget.next_at(FINISH_POLL, deadline.end()),
+            DrainStep::Spent
+        );
+        assert_eq!(budget.next_at(FINISH_POLL, at), DrainStep::Spent);
+    }
 
     #[test]
     fn closure_needs_the_matching_file_and_a_stopped_drained_recorder() {

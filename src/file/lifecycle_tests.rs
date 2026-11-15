@@ -700,7 +700,7 @@ fn a_wait_that_ends_during_a_slow_stop_still_takes_the_queued_close() {
     let deadline = Deadline::after(Duration::from_millis(10)).unwrap();
     recorder.request_stop();
     assert!(deadline.is_expired());
-    let outcome = recorder.wait_finished_from(deadline, |_| false).unwrap();
+    let outcome = recorder.wait_until(deadline).unwrap();
     assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
 }
 

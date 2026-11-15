@@ -9,6 +9,7 @@
 //! drop requests shutdown without joining another File thread, so notifications
 //! cannot stall behind cleanup or deadlock one another.
 
+use super::recorder::{FinishReply, FinishWaiters, Settlement};
 use super::types::resolve_path;
 use super::{
     EventText, FileApi, FileDuration, FileInfo, FilePlayer, FilePosition, FileRecorder,
@@ -929,19 +930,6 @@ impl Control {
     }
 }
 
-struct OperationContext {
-    cancelled: Arc<AtomicBool>,
-    #[cfg(test)]
-    control: Arc<Control>,
-}
-
-impl OperationContext {
-    #[cfg(test)]
-    fn interrupted(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire) || self.control.shutdown.load(Ordering::Acquire)
-    }
-}
-
 /// A native object that lives on an owner thread. Dropping it there performs
 /// its native cleanup.
 trait Owner: 'static {
@@ -983,23 +971,26 @@ impl Owner for FilePlayer {
 /// Recorder state that belongs to its owner thread, never to the native type.
 /// Drop replies before native cleanup when another command panics.
 struct RecorderOwner {
-    waiters: Vec<FinishWaiter>,
+    waiters: FinishWaiters<Reply<FinishStatus>>,
     /// A finish active when close began keeps receiving cleanup events,
     /// even if its indeterminate report becomes final before its files close.
     notify_cleanup: bool,
     recorder: FileRecorder,
 }
 
-struct FinishWaiter {
-    deadline: Deadline,
-    session: u64,
-    reply: Reply<FinishStatus>,
+impl FinishReply for Reply<FinishStatus> {
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+    fn complete(self, result: Result<FinishStatus>) {
+        Reply::complete(self, result);
+    }
 }
 
 impl RecorderOwner {
     fn new(recorder: FileRecorder) -> Self {
         Self {
-            waiters: Vec::new(),
+            waiters: FinishWaiters::new(),
             notify_cleanup: false,
             recorder,
         }
@@ -1009,88 +1000,44 @@ impl RecorderOwner {
         if stop {
             self.recorder.request_stop();
         }
-        if let Err(error) = self.recorder.check_wait() {
-            reply.complete(Err(error));
-        } else if !reply.cancelled.load(Ordering::Acquire) {
-            self.waiters.push(FinishWaiter {
-                deadline,
-                session: self.recorder.report().session(),
-                reply,
-            });
-        }
+        self.waiters.register(&self.recorder, deadline, reply);
+    }
+
+    fn start_notifying(
+        &mut self,
+        target: &RecordingTarget,
+        timecode: RecordingTimecode,
+        events: &EventQueue<RecorderEvent>,
+    ) -> Result<u64> {
+        self.recorder
+            .start_with_sink(target, timecode, &mut |event| events.push(event))
     }
 
     fn reset(&mut self, options: &RecorderOptions) -> Result<RecordingReport> {
         let report = self.recorder.reset(options)?;
-        // A successful reset explicitly abandons the old native object.
-        // Its waiters cannot follow the replacement's inherited report or
-        // a later session. A failed reset leaves every waiter intact.
-        for waiter in self.waiters.drain(..) {
-            waiter.reply.complete(Err(stopped(false)));
-        }
+        self.waiters.close();
         Ok(report)
     }
 
-    /// Take the bounded final drain once for every waiter that is due, then
-    /// resolve all waiters from the same ledger before another command runs.
     fn settle_at(
         &mut self,
-        mut drained: bool,
+        drained: bool,
         events: &EventQueue<RecorderEvent>,
         control: &Control,
         cleanup_expired: bool,
         at: Instant,
     ) -> bool {
-        self.waiters
-            .retain(|waiter| !waiter.reply.cancelled.load(Ordering::Acquire));
-        // An empty pump poll may precede expiry: the owner can be paused
-        // before settlement while a closure enters the native queue. Always
-        // establish fresh post-expiry drain evidence for this due batch.
-        if self
-            .waiters
-            .iter()
-            .any(|waiter| cleanup_expired || waiter.deadline.end() <= at)
-        {
-            for _ in 0..super::recorder::STALE_EVENT_LIMIT {
-                match self.poll_native() {
-                    Ok(None) => break,
-                    Ok(Some(event)) => events.push(Ok(event)),
-                    Err(error) => events.push(Err(error)),
-                }
-            }
-            // As with the synchronous wait, an endless backlog cannot keep
-            // a deadline alive after its bounded nonblocking drain.
-            drained = true;
-        }
-        let session = self.recorder.report().session();
-        // Reply callbacks can run arbitrary executor code and outlast another
-        // waiter's deadline. Only the fixed due batch above may time out;
-        // later deadlines receive a fresh drain on the next owner iteration.
-        let mut index = 0;
-        while index < self.waiters.len() {
-            let waiter = &self.waiters[index];
-            let outcome = if waiter.session != session {
-                Some(Err(stopped(false)))
-            } else {
-                self.recorder
-                    .settle_wait(cleanup_expired || waiter.deadline.end() <= at, drained)
-                    .map(|outcome| {
-                        if matches!(outcome, FinishStatus::TimedOut(_))
-                            && control.shutdown.load(Ordering::Acquire)
-                        {
-                            Err(stopped(false))
-                        } else {
-                            Ok(outcome)
-                        }
-                    })
-            };
-            if let Some(outcome) = outcome {
-                self.waiters.swap_remove(index).reply.complete(outcome);
-            } else {
-                index += 1;
-            }
-        }
-        drained
+        self.waiters.settle_at(
+            &mut self.recorder,
+            Settlement {
+                drained,
+                cleanup_expired,
+                at,
+            },
+            &mut |event| events.push(event),
+            || control.shutdown.load(Ordering::Acquire),
+            None,
+        )
     }
 }
 
@@ -1116,18 +1063,13 @@ impl Owner for RecorderOwner {
     }
 
     fn after_events(&mut self, drained: bool, events: &EventQueue<Self::Event>, control: &Control) {
-        self.notify_cleanup |= control.shutdown.load(Ordering::Acquire)
-            && self
-                .waiters
-                .iter()
-                .any(|waiter| !waiter.reply.cancelled.load(Ordering::Acquire));
+        self.waiters.retain();
+        self.notify_cleanup |= control.shutdown.load(Ordering::Acquire) && !self.waiters.is_empty();
         self.settle_at(drained, events, control, false, Instant::now());
     }
 
     fn wait_timeout(&self) -> Duration {
-        self.waiters
-            .iter()
-            .fold(TICK, |wait, waiter| wait.min(waiter.deadline.remaining()))
+        self.waiters.wait_timeout(TICK)
     }
 
     fn shutdown(
@@ -1136,40 +1078,22 @@ impl Owner for RecorderOwner {
         events: &EventQueue<Self::Event>,
         control: &Control,
     ) {
-        let deadline = self.recorder.begin_cleanup(requested);
-        self.recorder.request_stop();
-        self.waiters
-            .retain(|waiter| !waiter.reply.cancelled.load(Ordering::Acquire));
+        self.waiters.retain();
         let notify = self.notify_cleanup || !self.waiters.is_empty();
         if !notify {
-            // Event futures end as soon as only native cleanup remains.
             events.close(false);
         }
-        let mut late_polls = 0;
-        while self.recorder.cleanup_pending() || !self.waiters.is_empty() {
-            let expired = deadline.is_none_or(|deadline| deadline.is_expired());
-            if expired {
-                if late_polls == super::recorder::STALE_EVENT_LIMIT {
-                    break;
-                }
-                late_polls += 1;
-            }
-            let wait = deadline
-                .map_or(Duration::ZERO, |deadline| deadline.remaining())
-                .min(self.wait_timeout());
-            let polled = self.recorder.poll_event(wait);
-            let drained = matches!(polled, Ok(None));
-            if notify {
-                if let Some(event) = polled.transpose() {
+        self.recorder.drain_cleanup(
+            requested,
+            &mut self.waiters,
+            TICK,
+            &mut |event| {
+                if notify {
                     events.push(event);
                 }
-            }
-            let drained = self.settle_at(drained, events, control, expired, Instant::now());
-            if expired && drained {
-                break;
-            }
-        }
-        self.settle_at(true, events, control, true, Instant::now());
+            },
+            || control.shutdown.load(Ordering::Acquire),
+        );
     }
 }
 
@@ -1336,7 +1260,7 @@ impl<H: Owner> Worker<H> {
     fn submit<T: Send + 'static>(
         &self,
         stop: bool,
-        work: impl FnOnce(&mut H, &OperationContext) -> Result<T> + Send + 'static,
+        work: impl FnOnce(&mut H) -> Result<T> + Send + 'static,
     ) -> FileOperation<T> {
         self.prepare(move || Ok(work), stop)
     }
@@ -1349,16 +1273,14 @@ impl<H: Owner> Worker<H> {
         stop: bool,
     ) -> FileOperation<T>
     where
-        W: FnOnce(&mut H, &OperationContext) -> Result<T> + Send + 'static,
+        W: FnOnce(&mut H) -> Result<T> + Send + 'static,
     {
         self.prepare_reply(
             move || {
                 let work = prepare()?;
-                Ok(
-                    move |owner: &mut H, context: &OperationContext, reply: Reply<T>| {
-                        reply.complete(work(owner, context));
-                    },
-                )
+                Ok(move |owner: &mut H, reply: Reply<T>| {
+                    reply.complete(work(owner));
+                })
             },
             stop,
         )
@@ -1370,7 +1292,7 @@ impl<H: Owner> Worker<H> {
         stop: bool,
     ) -> FileOperation<T>
     where
-        W: FnOnce(&mut H, &OperationContext, Reply<T>) + Send + 'static,
+        W: FnOnce(&mut H, Reply<T>) + Send + 'static,
     {
         // Keep submission state, not Worker: an unpolled future must not
         // delay last-handle shutdown or make its own drop join the owner.
@@ -1399,7 +1321,7 @@ impl<H: Owner> Worker<H> {
         admission: &Arc<Admission>,
         control: &Arc<Control>,
         stop: bool,
-        work: impl FnOnce(&mut H, &OperationContext, Reply<T>) + Send + 'static,
+        work: impl FnOnce(&mut H, Reply<T>) + Send + 'static,
     ) -> FileOperation<T> {
         if control.failed() {
             return FileOperation::failed(stopped(true));
@@ -1413,18 +1335,14 @@ impl<H: Owner> Worker<H> {
         };
         let (mut reply, future) = operation();
         reply.owner = Some(Arc::clone(control));
-        let context = OperationContext {
-            cancelled: Arc::clone(&reply.cancelled),
-            #[cfg(test)]
-            control: Arc::clone(control),
-        };
+        let cancelled = Arc::clone(&reply.cancelled);
         let job: Job<H> = Box::new(move |owner| {
             // The command leaves the queue as it starts.
             drop(place);
-            if !stop && context.cancelled.load(Ordering::Acquire) {
+            if !stop && cancelled.load(Ordering::Acquire) {
                 return;
             }
-            work(owner, &context, reply);
+            work(owner, reply);
         });
         if sender.send(job).is_err() {
             future.immediate_failure(stopped(control.failed()));
@@ -1436,7 +1354,7 @@ impl<H: Owner> Worker<H> {
         &self,
         work: impl FnOnce(&mut H) -> Result<T> + Send + 'static,
     ) -> FileOperation<T> {
-        self.submit(false, move |owner, _| work(owner))
+        self.submit(false, work)
     }
 }
 
@@ -1792,7 +1710,7 @@ impl AsyncFilePlayer {
             move || {
                 // Resolve before waiting in the command queue.
                 let (path, _) = resolve_path(&path, "file path")?;
-                Ok(move |player: &mut FilePlayer, _: &OperationContext| player.start(path))
+                Ok(move |player: &mut FilePlayer| player.start(path))
             },
             false,
         )
@@ -1800,7 +1718,7 @@ impl AsyncFilePlayer {
     /// Stop the current file; the source stays advertised. The stop runs even
     /// if the future is dropped after its first poll or explicit submission.
     pub fn stop(&self) -> FileOperation<()> {
-        self.worker.submit(true, |p, _| {
+        self.worker.submit(true, |p| {
             p.stop();
             Ok(())
         })
@@ -1959,12 +1877,14 @@ impl AsyncFileRecorder {
         timecode: RecordingTimecode,
     ) -> FileOperation<u64> {
         let target = target.clone();
-        self.worker.call(move |r| r.start(&target, timecode))
+        let events = Arc::clone(&self.worker.events);
+        self.worker
+            .call(move |r| r.start_notifying(&target, timecode, &events))
     }
     /// Ask the SDK to stop the session. Once submitted by polling or calling
     /// [`FileOperation::submit`], the request runs even if its future is dropped.
     pub fn request_stop(&self) -> FileOperation<StopRequest> {
-        self.worker.submit(true, |r, _| Ok(r.request_stop()))
+        self.worker.submit(true, |r| Ok(r.request_stop()))
     }
     /// Stop the session and wait up to `timeout` for its last file to be
     /// closed; see [`FileRecorder::finish`].
@@ -2028,11 +1948,9 @@ impl AsyncFileRecorder {
             move || {
                 // Start at submission, including queue time and the native stop.
                 let deadline = Deadline::after(timeout)?;
-                Ok(
-                    move |owner: &mut RecorderOwner, _: &OperationContext, reply| {
-                        owner.finish(deadline, stop, reply);
-                    },
-                )
+                Ok(move |owner: &mut RecorderOwner, reply| {
+                    owner.finish(deadline, stop, reply);
+                })
             },
             stop,
         )
@@ -2597,7 +2515,7 @@ mod tests {
         let deferred = worker.prepare(
             move || {
                 flag.store(true, Ordering::Release);
-                Ok(|_: &mut LocalOwner, _: &OperationContext| Ok(()))
+                Ok(|_: &mut LocalOwner| Ok(()))
             },
             false,
         );
@@ -2640,7 +2558,7 @@ mod tests {
             .poll(&mut Context::from_waker(&idle_waker()))
             .is_pending());
         drop(ordinary);
-        let mut stopping = worker.submit(true, |owner, _| {
+        let mut stopping = worker.submit(true, |owner| {
             owner.counter += 10;
             Ok(())
         });
@@ -2664,11 +2582,10 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let started = worker
-            .submit(false, move |owner, context| {
+            .submit(false, move |owner| {
                 owner.counter += 1;
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
-                assert!(context.interrupted());
                 Ok(())
             })
             .submit();
@@ -2763,7 +2680,7 @@ mod tests {
         );
         owner_failed(block_on(worker.control.request_close()));
         owner_failed(block_on(worker.call(|_| Ok(()))));
-        owner_failed(block_on(worker.submit(true, |_, _| Ok(()))));
+        owner_failed(block_on(worker.submit(true, |_| Ok(()))));
         owner_failed(block_on(worker.events.wait(Duration::from_millis(10))));
     }
 
@@ -2774,7 +2691,7 @@ mod tests {
         block_on(worker.control.request_close()).unwrap();
         dropped.recv_timeout(Duration::from_secs(1)).unwrap();
         closed(block_on(worker.call(|_| Ok(()))));
-        closed(block_on(worker.submit(true, |_, _| Ok(()))));
+        closed(block_on(worker.submit(true, |_| Ok(()))));
         closed(block_on(pending_wait));
         closed(block_on(worker.events.wait(Duration::from_millis(10))));
         block_on(worker.control.request_close()).unwrap();
@@ -3081,6 +2998,71 @@ mod tests {
         ));
         assert_eq!(device.waits.load(Ordering::Acquire), 0);
         block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
+    fn an_expired_close_spends_its_final_drain_once_including_drop() {
+        let device = mock::Recorder::new(Closing::Never);
+        device.install();
+        let mut recorder = mock::recorder_api()
+            .create_recorder(
+                &RecorderOptions::new(SourceSpec::new("mock").unwrap()).drop_wait(Duration::ZERO),
+            )
+            .unwrap();
+        let target =
+            RecordingTarget::new(std::env::temp_dir().join("mock-close-drain-once")).unwrap();
+        recorder
+            .start(&target, RecordingTimecode::Preserve)
+            .unwrap();
+        for _ in 0..1024 {
+            device.push(mock::FIRST_FRAME, mock::TAKE);
+        }
+        let mut owner = RecorderOwner::new(recorder);
+        let (reply, finishing) = operation();
+        owner.finish(
+            Deadline::after(Duration::from_secs(30)).unwrap(),
+            true,
+            reply,
+        );
+        let control = Control::new();
+        control.request_shutdown();
+        let before = device.captures.load(Ordering::Acquire);
+        owner.shutdown(Instant::now(), &EventQueue::new(16), &control);
+        assert!(matches!(
+            block_on(finishing),
+            Err(Error::InvalidState(StateError::Closed))
+        ));
+        let after_close = device.captures.load(Ordering::Acquire);
+        assert_eq!(
+            after_close - before,
+            super::super::recorder::STALE_EVENT_LIMIT
+        );
+        drop(owner);
+        assert_eq!(device.captures.load(Ordering::Acquire), after_close);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn start_forwards_stale_events_through_the_recorder_pump() {
+        let device = mock::Recorder::new(Closing::AtStop);
+        device.install();
+        let mut recorder = mock::recorder_api()
+            .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
+            .unwrap();
+        let target =
+            RecordingTarget::new(std::env::temp_dir().join("mock-start-stale-events")).unwrap();
+        device.fail_next_start.store(true, Ordering::Release);
+        assert!(recorder
+            .start(&target, RecordingTimecode::Preserve)
+            .is_err());
+        let mut owner = RecorderOwner::new(recorder);
+        let events = EventQueue::new(16);
+        owner
+            .start_notifying(&target, RecordingTimecode::Preserve, &events)
+            .unwrap();
+        let event = lock(&events.0).queue.pop_front().unwrap().unwrap();
+        assert_eq!(event.kind(), super::super::RecorderEventKind::OpenFailed);
+        assert_eq!(owner.recorder.report().error_events(), 0);
     }
 
     #[test]
@@ -3719,7 +3701,7 @@ mod tests {
             .submit();
         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let add = |amount| {
-            move |owner: &mut LocalOwner, _: &OperationContext| {
+            move |owner: &mut LocalOwner| {
                 owner.counter += amount;
                 Ok::<(), Error>(())
             }

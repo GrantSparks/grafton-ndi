@@ -179,6 +179,9 @@ pub(super) struct Recorder {
     pub(super) stops: std::sync::atomic::AtomicUsize,
     /// Calls that wait for an event, rather than the owner's nonblocking pump.
     pub(super) waits: std::sync::atomic::AtomicUsize,
+    pub(super) captures: std::sync::atomic::AtomicUsize,
+    pub(super) recording_queries: std::sync::atomic::AtomicUsize,
+    pub(super) dropped_queries: std::sync::atomic::AtomicUsize,
     pub(super) destroys: std::sync::atomic::AtomicUsize,
     /// Whether the file-closed event had been captured when the recorder was destroyed.
     pub(super) closed_before_destroy: std::sync::atomic::AtomicBool,
@@ -221,6 +224,9 @@ impl Recorder {
             dropped_events: Default::default(),
             stops: Default::default(),
             waits: Default::default(),
+            captures: Default::default(),
+            recording_queries: Default::default(),
+            dropped_queries: Default::default(),
             destroys: Default::default(),
             closed_before_destroy: Default::default(),
             close_captured: Default::default(),
@@ -361,6 +367,9 @@ unsafe extern "C" fn recorder_capture(
     use std::sync::atomic::Ordering;
     // SAFETY: the wrapper passes a live handle.
     let recorder = unsafe { Recorder::from_handle(handle) };
+    recorder
+        .captures
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     if wait_ms != 0 {
         recorder.waits.fetch_add(1, Ordering::Release);
     }
@@ -432,14 +441,22 @@ unsafe extern "C" fn recorder_stop(handle: NDIlib_file_recorder_instance_t) {
 
 unsafe extern "C" fn recorder_is_recording(handle: NDIlib_file_recorder_instance_t) -> bool {
     // SAFETY: the wrapper passes a live handle.
-    unsafe { Recorder::from_handle(handle) }
+    let recorder = unsafe { Recorder::from_handle(handle) };
+    recorder
+        .recording_queries
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    recorder
         .recording
         .load(std::sync::atomic::Ordering::Acquire)
 }
 
 unsafe extern "C" fn recorder_dropped(handle: NDIlib_file_recorder_instance_t) -> u64 {
     // SAFETY: the wrapper passes a live handle.
-    unsafe { Recorder::from_handle(handle) }
+    let recorder = unsafe { Recorder::from_handle(handle) };
+    recorder
+        .dropped_queries
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    recorder
         .dropped_events
         .load(std::sync::atomic::Ordering::Acquire)
 }
