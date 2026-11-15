@@ -368,6 +368,12 @@ mod objects {
         /// Report every retained frame as complete, most recent first.
         unsafe fn complete(&mut self) {
             unsafe { self.release_copy() };
+            if std::env::var_os("GRAFTON_FAKE_VALIDATE_COMPRESSED_LOANS").is_some() {
+                for frame in self.pending.drain(..) {
+                    let first = unsafe { frame.p_data.read_volatile() };
+                    log(&format!("sender-loan-released={first}"));
+                }
+            }
             let Some(completion) = self.completion else {
                 return;
             };
@@ -464,6 +470,9 @@ mod objects {
                 return;
             }
             let Some(completion) = sender.completion else {
+                if std::env::var_os("GRAFTON_FAKE_VALIDATE_COMPRESSED_LOANS").is_some() {
+                    sender.pending.push(unsafe { *p_video_data });
+                }
                 return;
             };
             let mode = std::env::var("GRAFTON_FAKE_CALLBACK_MODE").unwrap_or_default();

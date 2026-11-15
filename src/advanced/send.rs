@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     sender::{
-        in_flight::{self, Destroyed, InFlight, Lend, Lent},
+        in_flight::{Destroyed, InFlight, Lend, Lending, Lent, Loans},
         SendHandle,
     },
     sys::{
@@ -580,7 +580,7 @@ impl PendingStreams {
     #[cfg(ndi_has_advanced_scatter_send)]
     fn submit_scatter(
         &mut self,
-        sender: SendHandle,
+        sender: SendHandle<'_>,
         frame: ScatterVideoFrame,
         table: &'static ScatterSend,
     ) -> Option<SubmittedVideo> {
@@ -622,7 +622,7 @@ impl PendingStreams {
 
     /// Hand `next` to the SDK through `sender`, then take back the frame it
     /// replaces on the same stream.
-    fn submit(&mut self, sender: SendHandle, next: PendingVideo) -> Option<SubmittedVideo> {
+    fn submit(&mut self, sender: SendHandle<'_>, next: PendingVideo) -> Option<SubmittedVideo> {
         let slot = match next.tier() {
             StreamTier::Program => &mut self.program,
             StreamTier::Preview => &mut self.preview,
@@ -644,6 +644,17 @@ impl PendingStreams {
             program: release(self.program),
             preview: release(self.preview),
         }
+    }
+}
+
+impl Loans for PendingStreams {
+    fn bind_sender(&mut self, sender: usize) {
+        self.program.bind_sender(sender);
+        self.preview.bind_sender(sender);
+    }
+
+    fn release(self, destroyed: &Destroyed) {
+        drop(self.into_reclaimed(destroyed));
     }
 }
 
@@ -730,12 +741,7 @@ impl PendingStreams {
 /// # }
 /// ```
 pub struct CompressedSender {
-    // Declared first so that it is destroyed first: destroying the native
-    // sender is what ends the SDK's use of the pending frames. Its mode owns
-    // the native sender exclusively, so no other owner, such as an advertiser
-    // registration, can keep it alive after they are freed.
-    sender: Sender<CompressedAttached>,
-    pending: PendingStreams,
+    lending: Lending<CompressedAttached, PendingStreams>,
 }
 
 impl CompressedSender {
@@ -752,9 +758,10 @@ impl CompressedSender {
     /// descriptor storage cannot be reserved.
     pub fn new(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
         let config = AdvancedConfig::or_empty(options.config.as_ref());
+        let pending = PendingStreams::new()?;
+        let sender = Sender::new_configured(ndi, options, &config)?;
         Ok(Self {
-            sender: Sender::new_configured(ndi, options, &config)?,
-            pending: PendingStreams::new()?,
+            lending: Lending::new(sender, pending),
         })
     }
 
@@ -771,7 +778,7 @@ impl CompressedSender {
     /// registered with an advertiser. Use [`split`](Self::split) to reach
     /// these controls through the audio half while video is being sent.
     pub fn sender(&self) -> &Sender<CompressedAttached> {
-        &self.sender
+        self.lending.sender()
     }
 
     /// Lend video and audio operations to separate scoped threads.
@@ -779,14 +786,15 @@ impl CompressedSender {
     /// Video keeps exclusive access to the pending streams. Each half is
     /// `Send`, but neither `Sync` nor `Clone`, and neither outlives this owner.
     pub fn split(&mut self) -> (CompressedVideo<'_>, CompressedAudio<'_>) {
+        let (sender, pending) = self.lending.parts();
         (
             CompressedVideo {
-                sender: &self.sender,
-                pending: &mut self.pending,
+                sender,
+                pending,
                 _not_sync: std::marker::PhantomData,
             },
             CompressedAudio {
-                sender: &self.sender,
+                sender,
                 _not_sync: std::marker::PhantomData,
             },
         )
@@ -877,8 +885,7 @@ impl CompressedSender {
     /// Destroying the native sender waits for the SDK to finish with every
     /// pending frame, without a timeout.
     pub fn close(self) -> ReclaimedVideo {
-        let Self { sender, pending } = self;
-        pending.into_reclaimed(&in_flight::destroy(sender))
+        self.lending.close(PendingStreams::into_reclaimed)
     }
 }
 
@@ -1377,11 +1384,11 @@ mod tests {
         let first = make(StreamTier::Program);
         let original = first.blocks().next().unwrap().as_ptr();
         sender.send_scatter_video_async(first).unwrap();
-        let program = list(&sender.pending.program);
+        let program = list(&sender.lending.loans().program);
         sender
             .send_scatter_video_async(make(StreamTier::Preview))
             .unwrap();
-        let preview = list(&sender.pending.preview);
+        let preview = list(&sender.lending.loans().preview);
         assert_ne!(program, preview);
         let replacement = make(StreamTier::Program);
         let (returned, allocations) =
@@ -1391,23 +1398,23 @@ mod tests {
             panic!("scatter")
         };
         assert_eq!(returned.blocks().next().unwrap().as_ptr(), original);
-        let next_program = list(&sender.pending.program);
+        let next_program = list(&sender.lending.loans().program);
         assert_ne!(next_program, program);
         assert_ne!(next_program, preview);
-        assert_eq!(list(&sender.pending.preview), preview);
+        assert_eq!(list(&sender.lending.loans().preview), preview);
         let replacement = make(StreamTier::Preview);
         let (returned, allocations) =
             crate::test_alloc::allocation_count(|| sender.send_scatter_video_async(replacement));
         returned.unwrap();
         assert_eq!(allocations, 0);
-        let next_preview = list(&sender.pending.preview);
+        let next_preview = list(&sender.lending.loans().preview);
         assert_ne!(next_preview, preview);
         assert_ne!(next_preview, next_program);
         sender
             .send_scatter_video_async(make(StreamTier::Program))
             .unwrap();
-        assert_eq!(list(&sender.pending.program), program);
-        assert_eq!(list(&sender.pending.preview), next_preview);
+        assert_eq!(list(&sender.lending.loans().program), program);
+        assert_eq!(list(&sender.lending.loans().preview), next_preview);
         // A contiguous replacement also ends the previous scatter loan; the
         // next scatter send can use the stream's reserved alternate index.
         sender
@@ -1419,7 +1426,7 @@ mod tests {
         sender
             .send_scatter_video_async(make(StreamTier::Preview))
             .unwrap();
-        assert_eq!(list(&sender.pending.preview), preview);
+        assert_eq!(list(&sender.lending.loans().preview), preview);
         let reclaimed = sender.close();
         assert!(reclaimed.program.is_some());
         assert!(reclaimed.preview.is_some());
@@ -1444,7 +1451,7 @@ mod tests {
         // A preview submission leaves the program frame in flight.
         let preview = sender.send_video_async(make(StreamTier::Preview));
         assert!(preview.unwrap().is_none());
-        assert!(sender.pending.program.is_in_flight());
+        assert!(sender.lending.loans().program.is_in_flight());
         let returned = sender
             .send_video_async(make(StreamTier::Program))
             .unwrap()

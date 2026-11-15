@@ -76,9 +76,10 @@ unsafe impl Sync for SendInstance {}
 /// A copy is a borrowed handle, valid while an owner of the native sender
 /// (`Shared` or `Exclusive`) keeps it alive.
 #[derive(Clone, Copy)]
-pub(crate) struct SendHandle {
+pub(crate) struct SendHandle<'a> {
     instance: SendInstance,
     core: &'static sys::Core,
+    _owner: PhantomData<&'a SenderResource>,
 }
 
 /// The handle of a sender, and the lock that pairs a metadata capture with
@@ -145,6 +146,16 @@ mod ownership {
         }
     }
 
+    impl SenderResource {
+        pub(super) fn handle(&self) -> SendHandle<'_> {
+            SendHandle {
+                instance: self.instance,
+                core: &self._ndi.api().core,
+                _owner: PhantomData,
+            }
+        }
+    }
+
     impl Drop for SenderResource {
         fn drop(&mut self) {
             // SAFETY: this token is the instance's final owner.
@@ -165,21 +176,16 @@ mod ownership {
     /// The native sender of a [`RawSend`] sender, which advertiser registrations
     /// may share, and the asynchronous video pipeline that sends through it.
     pub struct Shared {
-        // Declared first, so that it is dropped first: dropping the pipeline
-        // drains the SDK while `owner` still keeps the native sender alive.
         pub(super) video: VideoPipeline,
         pub(super) owner: Arc<SenderResource>,
     }
 
     impl NativeOwner for Shared {
         fn new(resource: SenderResource) -> Self {
-            let sender = SendHandle {
-                instance: resource.instance,
-                core: &resource._ndi.api().core,
-            };
+            let owner = Arc::new(resource);
             Self {
-                video: VideoPipeline::new(sender),
-                owner: Arc::new(resource),
+                video: VideoPipeline::new(Arc::clone(&owner)),
+                owner,
             }
         }
     }
@@ -317,10 +323,10 @@ pub struct Sender<M: SenderMode = RawSend> {
 /// the SDK may still be reading, or the one it last released, the copy a
 /// synchronous send makes of a frame it cannot send in place.
 ///
-/// [`Shared`] owns it beside the native sender and drops it first, so the
-/// pipeline drains the SDK while `sender` is still live.
+/// It owns the native resource it drains through, so that resource remains
+/// alive throughout the pipeline's destructor.
 struct VideoPipeline {
-    sender: SendHandle,
+    owner: Arc<SenderResource>,
     state: Mutex<VideoState>,
 }
 
@@ -340,17 +346,17 @@ struct VideoState {
 }
 
 impl VideoPipeline {
-    fn new(sender: SendHandle) -> Self {
+    fn new(owner: Arc<SenderResource>) -> Self {
         Self {
-            sender,
+            owner,
             state: Mutex::new(VideoState::default()),
         }
     }
 
     /// Lock the video state and make one synchronizing SDK call through `call`.
-    fn synchronize<R>(&self, call: impl FnOnce(&mut VideoState, SendHandle) -> R) -> R {
+    fn synchronize<R>(&self, call: impl FnOnce(&mut VideoState, SendHandle<'_>) -> R) -> R {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        call(&mut state, self.sender)
+        call(&mut state, self.owner.handle())
     }
 
     /// Send `frame` synchronously, which also releases the frame in flight.
@@ -419,7 +425,7 @@ impl VideoPipeline {
     #[cfg(all(feature = "advanced", ndi_has_advanced_send_completion))]
     fn retire(mut self) -> Option<VideoFrame> {
         let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        drain(&mut state.in_flight, self.sender);
+        drain(&mut state.in_flight, self.owner.handle());
         state.in_flight.take_retained()
         // Dropping the idle pipeline makes no SDK call.
     }
@@ -432,7 +438,7 @@ impl Drop for VideoPipeline {
         // registration shares it, so the pipeline drains the SDK itself
         // rather than relying on the sender's destruction.
         let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        drain(&mut state.in_flight, self.sender);
+        drain(&mut state.in_flight, self.owner.handle());
     }
 }
 
@@ -457,7 +463,7 @@ unsafe impl in_flight::Lend for VideoFrame {
 
 /// Synchronize the SDK if it may still read `state`'s frame, then complete
 /// it: the release a flush, a finish and the pipeline's destruction share.
-fn drain(state: &mut InFlight<VideoFrame>, sender: SendHandle) {
+fn drain(state: &mut InFlight<VideoFrame>, sender: SendHandle<'_>) {
     if !state.is_in_flight() {
         // A retained frame was completed when the SDK released it.
         return;
@@ -487,12 +493,10 @@ fn drain(state: &mut InFlight<VideoFrame>, sender: SendHandle) {
 ///
 /// Each synchronizing call takes the slot by `&mut`, so its caller holds the
 /// slot, by a lock or by `&mut`: one slot's calls never overlap. Each takes
-/// `sender`, the live sender whose stream the slot holds. Dropping a slot
-/// drops whatever it holds, so its owner ends the SDK's access first: a
-/// [`VideoPipeline`] drains the SDK when it is dropped, before [`Shared`]
-/// releases the native sender, and a `CompressedSender` destroys its native
-/// sender before it drops its streams. An owner that is never dropped leaks
-/// its frames rather than freeing them.
+/// `sender`, the live sender whose stream the slot holds. A [`VideoPipeline`]
+/// owns the resource it drains through; exclusively held senders use
+/// [`in_flight::Lending`] to destroy the sender before releasing its loans.
+/// A slot dropped without proof leaks an in-flight frame rather than freeing it.
 ///
 /// [NDI-Send]: https://docs.ndi.video/all/developing-with-ndi/sdk/ndi-send
 pub(crate) mod in_flight {
@@ -526,7 +530,88 @@ pub(crate) mod in_flight {
     /// slots.
     #[cfg(feature = "advanced")]
     #[must_use = "the proof releases the frames of the destroyed sender"]
-    pub(crate) struct Destroyed(());
+    pub(crate) struct Destroyed(usize);
+
+    #[cfg(feature = "advanced")]
+    impl Destroyed {
+        pub(crate) fn assert_sender(&self, sender: usize) {
+            assert_eq!(
+                self.0, sender,
+                "destruction proof belongs to another sender"
+            );
+        }
+    }
+
+    /// The loan storage attached to one exclusive native sender.
+    #[cfg(feature = "advanced")]
+    pub(crate) trait Loans {
+        fn bind_sender(&mut self, sender: usize);
+        fn release(self, destroyed: &Destroyed);
+    }
+
+    /// One owner for an exclusive sender and every native loan it retains.
+    ///
+    /// The fields stay live until this module takes them exactly once during
+    /// close or Drop. Native destruction happens while loans remain owned.
+    #[cfg(feature = "advanced")]
+    pub(crate) struct Lending<M, L: Loans>
+    where
+        M: super::SenderMode + super::mode_sealed::Sealed<Native = Exclusive>,
+    {
+        sender: mem::ManuallyDrop<super::Sender<M>>,
+        loans: mem::ManuallyDrop<L>,
+    }
+
+    #[cfg(feature = "advanced")]
+    impl<M, L: Loans> Lending<M, L>
+    where
+        M: super::SenderMode + super::mode_sealed::Sealed<Native = Exclusive>,
+    {
+        pub(crate) fn new(sender: super::Sender<M>, mut loans: L) -> Self {
+            loans.bind_sender(sender.native_instance() as usize);
+            Self {
+                sender: mem::ManuallyDrop::new(sender),
+                loans: mem::ManuallyDrop::new(loans),
+            }
+        }
+
+        pub(crate) fn sender(&self) -> &super::Sender<M> {
+            &self.sender
+        }
+        pub(crate) fn loans(&self) -> &L {
+            &self.loans
+        }
+        pub(crate) fn parts(&mut self) -> (&super::Sender<M>, &mut L) {
+            (&self.sender, &mut self.loans)
+        }
+
+        pub(crate) fn close<R>(self, release: impl FnOnce(L, &Destroyed) -> R) -> R {
+            let mut this = mem::ManuallyDrop::new(self);
+            // SAFETY: consuming self suppresses Drop, and neither field is
+            // accessed after being taken. Loans remain live during destruction.
+            let sender = unsafe { mem::ManuallyDrop::take(&mut this.sender) };
+            let destroyed = destroy(sender);
+            // SAFETY: sender destruction returned, and this field is taken once.
+            let loans = unsafe { mem::ManuallyDrop::take(&mut this.loans) };
+            release(loans, &destroyed)
+        }
+    }
+
+    #[cfg(feature = "advanced")]
+    impl<M, L: Loans> Drop for Lending<M, L>
+    where
+        M: super::SenderMode + super::mode_sealed::Sealed<Native = Exclusive>,
+    {
+        fn drop(&mut self) {
+            // SAFETY: Drop runs once, with no remaining borrower of either
+            // field. The loan storage is held until destruction supplies proof.
+            let sender = unsafe { mem::ManuallyDrop::take(&mut self.sender) };
+            let destroyed = destroy(sender);
+            // SAFETY: destruction ended every loan and the field is taken once.
+            let loans = unsafe { mem::ManuallyDrop::take(&mut self.loans) };
+            loans.release(&destroyed);
+        }
+    }
 
     /// A frame an asynchronous video send can lend to the SDK.
     ///
@@ -587,7 +672,7 @@ pub(crate) mod in_flight {
         /// the loan. Any displaced loan stays live through this call's return.
         pub(crate) unsafe fn submit(
             &self,
-            sender: SendHandle,
+            sender: SendHandle<'_>,
             descriptor: *const NDIlib_video_frame_v2_t,
         ) {
             match self {
@@ -626,7 +711,7 @@ pub(crate) mod in_flight {
     /// [`Self::into_released`], which takes the proof that the sender was
     /// destroyed. Only a retained frame can be taken out. The state is
     /// private to this module, so no other code can reach a frame in flight.
-    pub(crate) struct InFlight<T>(State<T>);
+    pub(crate) struct InFlight<T>(State<T>, Option<usize>);
 
     #[derive(Default)]
     enum State<T> {
@@ -641,11 +726,19 @@ pub(crate) mod in_flight {
 
     impl<T> Default for InFlight<T> {
         fn default() -> Self {
-            Self(State::Idle)
+            Self(State::Idle, None)
         }
     }
 
     impl<T> InFlight<T> {
+        #[cfg(feature = "advanced")]
+        pub(crate) fn bind_sender(&mut self, sender: usize) {
+            if let Some(current) = self.1 {
+                assert_eq!(current, sender, "loan belongs to another sender");
+            }
+            self.1 = Some(sender);
+        }
+
         pub(crate) fn is_in_flight(&self) -> bool {
             matches!(self.0, State::InFlight(_))
         }
@@ -692,8 +785,11 @@ pub(crate) mod in_flight {
         /// The frame, whatever its state, once the native sender it was lent
         /// to has been destroyed.
         #[cfg(feature = "advanced")]
-        pub(crate) fn into_released(self, _destroyed: &Destroyed) -> Option<T> {
-            match self.0 {
+        pub(crate) fn into_released(mut self, destroyed: &Destroyed) -> Option<T> {
+            if let Some(sender) = self.1 {
+                destroyed.assert_sender(sender);
+            }
+            match mem::take(&mut self.0) {
                 State::Idle => None,
                 State::Retained(frame) | State::InFlight(frame) => Some(frame),
             }
@@ -715,13 +811,28 @@ pub(crate) mod in_flight {
         }
     }
 
+    impl<T> Drop for InFlight<T> {
+        fn drop(&mut self) {
+            if let State::InFlight(frame) = mem::take(&mut self.0) {
+                // Retain native pointees even if a future owner forgets proof.
+                mem::forget(frame);
+                if !std::thread::panicking() {
+                    debug_assert!(
+                        false,
+                        "in-flight frame dropped without synchronization or destruction"
+                    );
+                }
+            }
+        }
+    }
+
     impl<T: Lend> InFlight<T> {
         /// Make `next` the frame in flight and lend it to the SDK. Returns
         /// the state it displaced, whose frame the SDK has released, with the
         /// proof of that release.
         pub(crate) fn submit(
             &mut self,
-            sender: SendHandle,
+            sender: SendHandle<'_>,
             mut next: T,
             authorization: T::Authorization,
         ) -> (Self, Synchronized) {
@@ -729,7 +840,14 @@ pub(crate) mod in_flight {
             // The slot owns the new frame before the SDK sees it. Moving the
             // frame does not move what `lent` points to (the contract of
             // `Lend`).
-            let displaced = Self(mem::replace(&mut self.0, State::InFlight(next)));
+            if let Some(current) = self.1 {
+                assert_eq!(
+                    current, sender.instance.0 as usize,
+                    "loan belongs to another sender"
+                );
+            }
+            self.1 = Some(sender.instance.0 as usize);
+            let displaced = Self(mem::replace(&mut self.0, State::InFlight(next)), self.1);
             // SAFETY: the slot owns the new payload and stable scatter list;
             // this call-scoped header stays readable through submission. The
             // displaced frame remains owned across this call and is returned
@@ -743,7 +861,7 @@ pub(crate) mod in_flight {
         /// Wait for the SDK to release the frame in flight by passing a true
         /// NULL frame pointer, the SDK's documented request to drain the
         /// asynchronous buffer.
-        pub(crate) fn flush(&mut self, sender: SendHandle) -> Synchronized {
+        pub(crate) fn flush(&mut self, sender: SendHandle<'_>) -> Synchronized {
             // SAFETY: `sender` is the live sender whose stream this slot
             // holds, and a null frame pointer is the SDK's documented request
             // to drain the async buffer.
@@ -759,7 +877,7 @@ pub(crate) mod in_flight {
         /// finished reading `frame` and has released the frame in flight.
         pub(crate) fn send(
             &mut self,
-            sender: SendHandle,
+            sender: SendHandle<'_>,
             frame: PreparedVideo<'_>,
         ) -> Synchronized {
             let raw = frame.raw;
@@ -787,7 +905,7 @@ pub(crate) mod in_flight {
     /// events, and the Advanced SDK documentation has `NDIlib_send_destroy`
     /// deliver every outstanding completion before it returns.
     #[cfg(feature = "advanced")]
-    pub(crate) fn destroy<M>(sender: super::Sender<M>) -> Destroyed
+    fn destroy<M>(sender: super::Sender<M>) -> Destroyed
     where
         M: super::SenderMode + super::mode_sealed::Sealed<Native = Exclusive>,
     {
@@ -795,20 +913,52 @@ pub(crate) mod in_flight {
             native: Exclusive(resource),
             ..
         } = sender;
+        let identity = resource.instance.0 as usize;
         // The only owner: dropping it calls `NDIlib_send_destroy`.
         drop(resource);
-        Destroyed(())
+        Destroyed(identity)
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
 
+        #[test]
+        fn an_unproven_drop_leaks_the_native_loan() {
+            use std::sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            };
+            struct Counted(Arc<AtomicUsize>);
+            impl Drop for Counted {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            let drops = Arc::new(AtomicUsize::new(0));
+            let slot = InFlight(State::InFlight(Counted(Arc::clone(&drops))), Some(1));
+            let result = std::panic::catch_unwind(|| drop(slot));
+            assert_eq!(result.is_err(), cfg!(debug_assertions));
+            assert_eq!(
+                drops.load(Ordering::Relaxed),
+                0,
+                "native pointees must remain allocated"
+            );
+        }
+
+        #[cfg(feature = "advanced")]
+        #[test]
+        fn a_destruction_proof_cannot_release_another_senders_loan() {
+            let slot = InFlight(State::InFlight(1u8), Some(1));
+            let result = std::panic::catch_unwind(|| slot.into_released(&Destroyed(2)));
+            assert!(result.is_err());
+        }
+
         /// A frame in flight comes out of its slot only with a proof, and is
         /// completed only once.
         #[test]
         fn a_slot_releases_its_frame_only_with_proof() {
-            let mut slot = InFlight(State::InFlight(1u8));
+            let mut slot = InFlight(State::InFlight(1u8), Some(1));
             assert!(slot.take_retained().is_none());
             assert!(slot.is_in_flight());
             assert_eq!(slot.completed(Synchronized(())), Some(&1));
@@ -822,12 +972,12 @@ pub(crate) mod in_flight {
         #[cfg(feature = "advanced")]
         #[test]
         fn a_displaced_or_destroyed_slot_hands_back_what_it_held() {
-            let release = |state| InFlight(state).release(Synchronized(()));
+            let release = |state| InFlight(state, Some(1)).release(Synchronized(()));
             assert_eq!(release(State::InFlight(1u8)), Some(1));
             assert_eq!(release(State::Retained(2)), Some(2));
             assert_eq!(release(State::Idle), None);
-            let destroyed = Destroyed(());
-            let unsent = |state| InFlight(state).into_released(&destroyed);
+            let destroyed = Destroyed(1);
+            let unsent = |state| InFlight(state, Some(1)).into_released(&destroyed);
             assert_eq!(unsent(State::InFlight(3u8)), Some(3));
             assert_eq!(unsent(State::Retained(4)), Some(4));
             assert_eq!(unsent(State::Idle), None);
@@ -1524,26 +1674,26 @@ impl Sender {
             _ndi,
             _mode,
         } = self;
-        match Arc::try_unwrap(owner) {
-            Ok(resource) => {
-                // `resource` keeps the native sender alive while the pipeline
-                // drains it.
-                let retained = video.retire();
-                let sender = Sender {
-                    inner,
-                    native: Exclusive(resource),
-                    _ndi,
-                    _mode: PhantomData,
-                };
-                Ok((sender, retained))
-            }
-            Err(owner) => Err(Self {
+        // Shared owns exactly two references: its owner and the pipeline's.
+        // With no other reference, no registration can create another one.
+        if Arc::strong_count(&owner) != 2 {
+            return Err(Self {
                 inner,
                 native: Shared { video, owner },
                 _ndi,
                 _mode,
-            }),
+            });
         }
+        let retained = video.retire();
+        let resource =
+            Arc::try_unwrap(owner).unwrap_or_else(|_| unreachable!("exclusive pipeline owner"));
+        let sender = Sender {
+            inner,
+            native: Exclusive(resource),
+            _ndi,
+            _mode: PhantomData,
+        };
+        Ok((sender, retained))
     }
 
     /// Send a video frame synchronously.
@@ -1743,10 +1893,11 @@ impl<M: SenderMode> Sender<M> {
     /// The handle the asynchronous video slots of this sender's owner send
     /// through.
     #[cfg(feature = "advanced")]
-    pub(crate) fn handle(&self) -> SendHandle {
+    pub(crate) fn handle(&self) -> SendHandle<'_> {
         SendHandle {
             instance: self.inner.instance,
             core: self.inner.core,
+            _owner: PhantomData,
         }
     }
 

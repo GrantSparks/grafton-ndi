@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{
     frames::{SendableVideoLayout, ValidatedVideoLayout, VideoParts},
-    sender::in_flight::{self, Destroyed, Lend, Lent},
+    sender::in_flight::{Destroyed, Lend, Lending, Lent, Loans},
     sys::{
         advanced::{native, ScatterSend, SendCompletion},
         bindings::*,
@@ -352,6 +352,7 @@ struct State {
     bytes: usize,
     next: u64,
     options: QueueOptions,
+    sender: Option<usize>,
     slots: std::sync::Arc<DescriptorSlots>,
     free: Vec<usize>,
     // A fallibly reserved submission-thread workspace for rebuilding a map
@@ -451,7 +452,10 @@ impl State {
     /// Release every retained entry only after native destruction. Both
     /// explicit close and implicit drop use this path, so even an unmatched
     /// completion cannot release a frame while the SDK might still use it.
-    fn release_retained(&mut self, _destroyed: &Destroyed, mut release: impl FnMut(Entry)) {
+    fn release_retained(&mut self, destroyed: &Destroyed, mut release: impl FnMut(Entry)) {
+        if let Some(sender) = self.sender {
+            destroyed.assert_sender(sender);
+        }
         for entry in self.ready.drain(..) {
             let index = entry.slot.index();
             release(entry);
@@ -514,6 +518,7 @@ impl CallbackState {
                 bytes: 0,
                 next: 1,
                 options,
+                sender: None,
                 slots,
                 free,
                 rehash,
@@ -653,36 +658,19 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 /// # }
 /// ```
 pub struct QueuedSender {
-    // Taking this value lets close and Drop share the same proof-gated
-    // teardown, without relying on the declaration order of owned fields.
-    inner: Option<QueuedSenderInner>,
+    lending: Lending<QueueAttached, AliasableBox<CallbackState>>,
 }
 
-struct QueuedSenderInner {
-    sender: Sender<QueueAttached>,
-    // The SDK holds this address for as long as the sender exists.
-    callback: AliasableBox<CallbackState>,
-}
-
-impl QueuedSenderInner {
-    fn teardown<T>(self, release: impl FnOnce(&mut State, &Destroyed) -> T) -> T {
-        let Self { sender, callback } = self;
-        // The attached mode owns the native sender exclusively. Destruction
-        // delivers outstanding callbacks, so keep their state alive and do
-        // not hold its mutex until destruction returns and supplies proof.
-        let destroyed = in_flight::destroy(sender);
-        let mut state = callback.state.lock().unwrap_or_else(|p| p.into_inner());
-        release(&mut state, &destroyed)
+impl Loans for AliasableBox<CallbackState> {
+    fn bind_sender(&mut self, sender: usize) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).sender = Some(sender);
     }
-}
 
-impl Drop for QueuedSender {
-    fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            // Drop needs no recovery collection; entries are freed only
-            // through the same destruction-proof gate used by close.
-            inner.teardown(|state, destroyed| state.release_retained(destroyed, drop));
-        }
+    fn release(self, destroyed: &Destroyed) {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .release_retained(destroyed, drop);
     }
 }
 
@@ -703,10 +691,6 @@ const _: () = {
 };
 
 impl QueuedSender {
-    fn inner(&self) -> &QueuedSenderInner {
-        self.inner.as_ref().expect("live queued sender")
-    }
-
     /// Create a sender, with the options' Advanced SDK
     /// [configuration](SenderOptions::config) when they carry one.
     ///
@@ -788,7 +772,7 @@ impl QueuedSender {
             )
         };
         Self {
-            inner: Some(QueuedSenderInner { sender, callback }),
+            lending: Lending::new(sender, callback),
         }
     }
 
@@ -804,7 +788,7 @@ impl QueuedSender {
     /// it cannot be registered with an advertiser. Use [`split`](Self::split)
     /// to send audio or metadata through it while another thread submits video.
     pub fn sender(&self) -> &Sender<QueueAttached> {
-        &self.inner().sender
+        self.lending.sender()
     }
 
     /// Lend video submission and completion collection separately from audio,
@@ -813,13 +797,13 @@ impl QueuedSender {
     ///
     /// Only the video half submits video, and it is neither `Sync` nor `Clone`.
     pub fn split(&mut self) -> (QueuedVideo<'_>, &Sender<QueueAttached>) {
-        let inner = self.inner();
+        let sender = self.lending.sender();
         let video = QueuedVideo {
-            sender: &inner.sender,
-            callback: &inner.callback,
+            sender,
+            callback: self.lending.loans(),
             _not_sync: std::marker::PhantomData,
         };
-        (video, &inner.sender)
+        (video, sender)
     }
 
     fn video(&mut self) -> QueuedVideo<'_> {
@@ -876,7 +860,7 @@ impl QueuedSender {
     /// The number of frames held: those still being sent and those completed
     /// but not yet collected.
     pub fn retained_frames(&self) -> usize {
-        self.inner().callback.retained_frames()
+        self.lending.loans().retained_frames()
     }
 
     /// Whether the SDK has reported a completion that matches no queued frame,
@@ -887,7 +871,7 @@ impl QueuedSender {
     /// collected. Use [`close`](Self::close) to destroy the native sender and
     /// take back every frame still retained, including unmatched submissions.
     pub fn completion_protocol_failed(&self) -> bool {
-        self.inner().callback.completion_protocol_failed()
+        self.lending.loans().completion_protocol_failed()
     }
 
     /// Destroy the sender and take back every frame it still holds.
@@ -902,11 +886,14 @@ impl QueuedSender {
     /// Native destruction waits without a timeout for the SDK to finish with
     /// every pending frame. Run this on a blocking thread when using an async
     /// executor. Only the returned collection is allocated.
-    pub fn close(mut self) -> Vec<CompletedVideo> {
-        self.inner
-            .take()
-            .expect("live queued sender")
-            .teardown(State::take_retained)
+    pub fn close(self) -> Vec<CompletedVideo> {
+        self.lending.close(|callback, destroyed| {
+            callback
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take_retained(destroyed)
+        })
     }
 }
 
@@ -1412,7 +1399,7 @@ mod tests {
             QueueOptions::default(),
         )
         .unwrap();
-        let state = &queue.inner().callback;
+        let state = queue.lending.loans();
         // These entries were not sent, so the native sender cannot report
         // additional completions. They exercise both teardown collections.
         let original = [1, 2, 3, 4, 5].map(|id| (id, insert(state, id)));
@@ -1453,7 +1440,7 @@ mod tests {
             QueueOptions::default(),
         )
         .unwrap();
-        let state = &queue.inner().callback;
+        let state = queue.lending.loans();
         let first = insert(state, 1);
         insert(state, 2);
         state.complete(first);
