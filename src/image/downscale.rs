@@ -45,12 +45,26 @@ impl<P: Sample> Downscaler<P> {
     }
 
     /// log2 of the factor.
+    #[cfg(test)]
     pub(super) fn shift(&self) -> u32 {
         self.shift
     }
 
     /// Average output row `y` of `reader`'s pixels into `sink`.
     pub(super) fn row(&mut self, reader: &Reader<'_, P>, y: usize, sink: &mut impl Sink<P>) {
+        if self.weighted {
+            self.row_with::<true>(reader, y, sink);
+        } else {
+            self.row_with::<false>(reader, y, sink);
+        }
+    }
+
+    fn row_with<const WEIGHTED: bool>(
+        &mut self,
+        reader: &Reader<'_, P>,
+        y: usize,
+        sink: &mut impl Sink<P>,
+    ) {
         let size = 1 << self.shift;
         let top = y << self.shift;
         let bottom = (top + size).min(reader.height());
@@ -58,10 +72,9 @@ impl<P: Sample> Downscaler<P> {
         for source_y in top..bottom {
             reader.row(
                 source_y,
-                &mut Accumulate {
+                &mut Accumulate::<P, WEIGHTED> {
                     sums: &mut self.sums,
                     shift: self.shift,
-                    weighted: self.weighted,
                     x: 0,
                 },
             );
@@ -72,8 +85,10 @@ impl<P: Sample> Downscaler<P> {
         for (start, sums) in self.sums.chunks(BATCH).enumerate() {
             for (offset, (pixel, sum)) in batch.iter_mut().zip(sums).enumerate() {
                 let left = (start * BATCH + offset) << self.shift;
-                let count = rows * (size.min(width - left)) as u64;
-                *pixel = mean::<P>(*sum, count, self.weighted);
+                let columns = size.min(width - left);
+                let count = rows * columns as u64;
+                let full_shift = (rows == size as u64 && columns == size).then_some(self.shift * 2);
+                *pixel = mean::<P, WEIGHTED>(*sum, count, full_shift);
             }
             sink.put(&batch[..sums.len()]);
         }
@@ -86,63 +101,73 @@ pub(super) fn reduced(length: usize, shift: u32) -> usize {
 }
 
 /// The average of a block of `count` pixels. Sums round half up.
-fn mean<P: Sample>(sum: [P::Sum; 4], count: u64, weighted: bool) -> [P; 4] {
+fn mean<P: Sample, const WEIGHTED: bool>(
+    sum: [P::Sum; 4],
+    count: u64,
+    full_shift: Option<u32>,
+) -> [P; 4] {
     let [red, green, blue, alpha] = sum.map(Into::<u64>::into);
-    let average = |total: u64, count: u64| P::narrow((total + count / 2) / count);
-    // A block weighted by alpha whose alpha is zero throughout holds plain
-    // sums, as `Accumulate` explains.
-    let weight = if weighted && alpha > 0 { alpha } else { count };
-    [
-        average(red, weight),
-        average(green, weight),
-        average(blue, weight),
-        average(alpha, count),
-    ]
+    let plain = |total: u64| {
+        P::narrow(match full_shift {
+            Some(shift) => (total + count / 2) >> shift,
+            None => (total + count / 2) / count,
+        })
+    };
+    let color = |total: u64| {
+        if WEIGHTED && alpha > 0 {
+            P::narrow((total + alpha / 2) / alpha)
+        } else {
+            plain(total)
+        }
+    };
+    [color(red), color(green), color(blue), plain(alpha)]
 }
 
-/// Adds a row's pixels into the accumulator of each one's output column.
-struct Accumulate<'s, P: Sample> {
+/// Adds one complete horizontal block at a time. The reader emits batches of
+/// 16 pixels, divisible by every reduction factor, so a block never straddles
+/// two batches. Plain and weighted sums stay in registers until one store.
+struct Accumulate<'s, P: Sample, const WEIGHTED: bool> {
     sums: &'s mut [[P::Sum; 4]],
     shift: u32,
-    weighted: bool,
-    /// The next pixel's column.
     x: usize,
 }
 
-impl<P: Sample> Sink<P> for Accumulate<'_, P> {
+impl<P: Sample, const WEIGHTED: bool> Sink<P> for Accumulate<'_, P, WEIGHTED> {
     fn put(&mut self, pixels: &[[P; 4]]) {
-        for &[red, green, blue, alpha] in pixels {
-            let sum = &mut self.sums[self.x >> self.shift];
-            self.x += 1;
-            let color = [red.widen(), green.widen(), blue.widen()];
-            let alpha = alpha.widen();
-            if !self.weighted {
-                for (total, value) in sum.iter_mut().zip(color) {
-                    *total += value;
-                }
-                sum[3] += alpha;
-                continue;
-            }
-            // Color weighted by alpha, Σ(a·c) / Σa, so that transparent
-            // pixels do not darken edges. While every pixel so far is fully
-            // transparent, the alpha sum is zero and the color sums hold
-            // plain sums instead, for a block that stays transparent: its
-            // plain mean. The first pixel with alpha replaces them, since a
-            // transparent pixel's weighted contribution is zero.
-            let transparent_so_far = sum[3] == P::Sum::default();
-            if alpha == P::Sum::default() {
-                if transparent_so_far {
-                    for (total, value) in sum.iter_mut().zip(color) {
-                        *total += value;
+        let size = 1 << self.shift;
+        debug_assert_eq!(self.x % size, 0);
+        let start = self.x >> self.shift;
+        self.x += pixels.len();
+        for (sum, block) in self.sums[start..].iter_mut().zip(pixels.chunks(size)) {
+            let mut plain = [P::Sum::default(); 3];
+            let mut weighted = [P::Sum::default(); 3];
+            let mut alpha = P::Sum::default();
+            for &[red, green, blue, opacity] in block {
+                let opacity = opacity.widen();
+                for ((plain, weighted), value) in
+                    plain.iter_mut().zip(&mut weighted).zip([red, green, blue])
+                {
+                    let value = value.widen();
+                    *plain += value;
+                    if WEIGHTED {
+                        *weighted += opacity * value;
                     }
                 }
-                continue;
+                alpha += opacity;
             }
-            for (total, value) in sum.iter_mut().zip(color) {
-                if transparent_so_far {
-                    *total = P::Sum::default();
+            if WEIGHTED && alpha != P::Sum::default() {
+                // A first nontransparent block replaces prior transparent
+                // blocks' plain color. Later blocks add weighted color only.
+                if sum[3] == P::Sum::default() {
+                    sum[..3].fill(P::Sum::default());
                 }
-                *total += alpha * value;
+                for (total, value) in sum.iter_mut().zip(weighted) {
+                    *total += value;
+                }
+            } else if !WEIGHTED || sum[3] == P::Sum::default() {
+                for (total, value) in sum.iter_mut().zip(plain) {
+                    *total += value;
+                }
             }
             sum[3] += alpha;
         }
@@ -317,6 +342,84 @@ mod tests {
                         ((sum + alpha / 2) / alpha) as u8
                     });
                     assert_eq!(*pixel, expected, "shift {shift} block {bx},{by}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_accumulation_matches_direct_means_at_both_depths_and_every_edge() {
+        fn check<P: Sample + std::fmt::Debug + PartialEq>(
+            frame: &VideoFrame,
+            pixels: &[[u8; 4]],
+            width: usize,
+            height: usize,
+            shift: u32,
+            weighted: bool,
+        ) {
+            let size = 1 << shift;
+            for (by, row) in reduce::<P>(frame, shift, weighted).iter().enumerate() {
+                for (bx, actual) in row.iter().enumerate() {
+                    let mut plain = [0u64; 3];
+                    let mut color = [0u64; 3];
+                    let (mut alpha, mut count) = (0, 0);
+                    for y in by * size..((by + 1) * size).min(height) {
+                        for x in bx * size..((bx + 1) * size).min(width) {
+                            let pixel = pixels[y * width + x].map(P::from_u8);
+                            let opacity: u64 =
+                                if weighted { pixel[3] } else { P::MAX }.widen().into();
+                            for c in 0..3 {
+                                let value: u64 = pixel[c].widen().into();
+                                plain[c] += value;
+                                color[c] += value * opacity;
+                            }
+                            alpha += opacity;
+                            count += 1;
+                        }
+                    }
+                    let average = |sum, divisor| P::narrow((sum + divisor / 2) / divisor);
+                    let expected = std::array::from_fn(|c| {
+                        if c == 3 {
+                            average(alpha, count)
+                        } else if weighted && alpha > 0 {
+                            average(color[c], alpha)
+                        } else {
+                            average(plain[c], count)
+                        }
+                    });
+                    assert_eq!(
+                        *actual, expected,
+                        "{width}x{height}, shift={shift}, weighted={weighted}, block={bx},{by}"
+                    );
+                }
+            }
+        }
+
+        for width in [2, 6, 14, 16, 18, 30, 34] {
+            for height in [1, 3, 9, 17] {
+                for alpha_case in 0..3 {
+                    let pixels: Vec<_> = (0..height)
+                        .flat_map(|y| (0..width).map(move |x| (x, y)))
+                        .map(|(x, y)| {
+                            [
+                                ((x * 7 + y * 3) % 256) as u8,
+                                ((x * 3 + y * 11) % 256) as u8,
+                                ((x * 5 + y * 7) % 256) as u8,
+                                match alpha_case {
+                                    0 => 0,
+                                    1 => 255,
+                                    _ => ((x * 17 + y * 29) % 256) as u8,
+                                },
+                            ]
+                        })
+                        .collect();
+                    let frame = rgba(width as u32, height as u32, &pixels);
+                    for shift in 1..=3 {
+                        for weighted in [false, true] {
+                            check::<u8>(&frame, &pixels, width, height, shift, weighted);
+                            check::<u16>(&frame, &pixels, width, height, shift, weighted);
+                        }
+                    }
                 }
             }
         }

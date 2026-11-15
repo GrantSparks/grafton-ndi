@@ -41,7 +41,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
     let reported = Box::new(Completions(Mutex::new(Vec::with_capacity(33))));
     let mut frames = Vec::with_capacity(33);
     let mut expected = Vec::with_capacity(33);
-    let slots = super::super::send_slots::DescriptorSlots::new(33).unwrap();
+    let (slots, mut keys) = super::super::send_slots::DescriptorSlots::new(33).unwrap();
     let sender: Sender<CompressedAttached> = Sender::open(
         &ndi,
         &SenderOptions::new(crate::test_support::unique_name("scatter-completion-key"))
@@ -58,7 +58,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             Some(completed),
         );
     }
-    let submit =
+    let mut submit =
         |number: i64, frames: &mut Vec<PendingVideo>, expected: &mut Vec<(usize, i64, i32)>| {
             let bytes = PacketEnvelope::encode(
                 EnvelopeCodec::H264,
@@ -83,9 +83,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             frame.set_timecode(Timecode::from_ticks(number));
             let key = frame.storage.blocks[0].as_mut_ptr();
             let length = frame.storage.blocks[0].len() as i32;
-            // SAFETY: each retained test frame gets a distinct pool index;
-            // no slot is claimed again while any frame remains retained.
-            let mut slot = unsafe { slots.claim(frames.len()) };
+            let mut slot = slots.claim(keys.pop().unwrap());
             frames.push(PendingVideo::scatter_in(frame, scatter, &mut slot));
             let Lent::Scatter {
                 frame,
@@ -112,12 +110,14 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
     let name = sender.source().unwrap().name().to_owned();
     let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut watch = finder.watch();
     let source = 'found: loop {
-        for source in finder.current_sources().unwrap() {
+        for source in watch.current_sources().unwrap() {
             if source.name() == name {
-                if let Some(SourceAddress::Ip(address)) = source.address() {
+                if let Some(address) = source.address().filter(|address| !address.is_url()) {
+                    let address = address.as_str();
                     let port = address.rsplit(':').next().unwrap();
-                    let endpoint = SourceAddress::Ip(format!("127.0.0.1:{port}"));
+                    let endpoint = SourceAddress::new(format!("127.0.0.1:{port}"));
                     break 'found source.with_address(endpoint);
                 }
             }
@@ -126,7 +126,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             Instant::now() < deadline,
             "local scatter sender was not discovered"
         );
-        finder.wait_for_sources(Duration::from_millis(100)).unwrap();
+        watch.wait_for_change(Duration::from_millis(100)).unwrap();
     };
     let receiver =
         PacketReceiver::new(&ndi, &ReceiverOptions::new(source), PassthroughPreset::H264).unwrap();

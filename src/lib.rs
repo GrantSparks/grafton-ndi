@@ -100,12 +100,12 @@ mod image;
 
 pub use {
     capabilities::{
-        Capabilities, CapabilityStatus, CapabilityUnavailable, RuntimeFeature, RuntimeInfo,
-        SdkEdition, SdkLinkage, SdkVersion,
+        Capabilities, CapabilityRefusal, CapabilityStatus, CapabilityUnavailable, RuntimeFeature,
+        RuntimeInfo, SdkEdition, SdkLinkage, SdkVersion,
     },
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
     error::*,
-    finder::{Finder, FinderOptions, Source, SourceAddress, SourceCache},
+    finder::{Finder, FinderOptions, Source, SourceAddress, SourceCache, SourceWatch},
     frames::{
         AudioChannels, AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout,
         AudioSource, BorrowedAudioFrame, BorrowedAudioFrameBuilder, FormatCategory,
@@ -134,7 +134,7 @@ pub use {
 pub use sender::{CompressedAttached, QueueAttached};
 
 pub use color_info::{ColorInfo, ColorPrimaries, TransferFunction, YuvMatrix};
-pub use media::{FourCc, FrameRate, MediaTypes, StreamTier};
+pub use media::{FourCc, FrameRate, MediaTypes, PictureAspectRatio, StreamTier};
 pub use rejected::Rejected;
 pub use time::{SdkTimestamp, Timecode};
 

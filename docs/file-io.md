@@ -176,8 +176,8 @@ for cancellation, queue and shutdown contracts.
 Library selection reports `RuntimeLoadFailed(failure)` with
 `failure.library() == LibraryKind::File` and typed search attempts. Inspect
 `LoadRefusal` and `failure.loaded_any()` before treating a load failure as an
-uninstalled library. `RuntimeConflict { kind, detail }` distinguishes a
-`FileNeedsAdvancedRuntime` conflict from a different selected library, linked
+uninstalled library. `RuntimeConflict(failure)` exposes `kind()` and typed
+library paths to distinguish a `FileNeedsAdvancedRuntime` conflict from a different selected library, linked
 implementation or foreign runtime in the global symbol scope.
 
 File operations use the crate's `Error`. Distinguish unavailable libraries or

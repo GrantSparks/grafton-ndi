@@ -2,15 +2,20 @@
 
 mod budget;
 
+#[cfg(ndi_test_finder_snapshot_guard)]
+#[path = "../tests/ui/internal/finder_snapshot_guard.rs"]
+mod snapshot_guard_contract;
+
 pub(crate) use budget::SnapshotBudget;
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     ffi::{c_char, CString},
     fmt::{self, Display, Formatter},
     net::IpAddr,
     ptr,
-    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -151,6 +156,17 @@ impl FinderOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FindInstance(NDIlib_find_instance_t);
+
+// SAFETY: the SDK gives finders no thread affinity and allows source-change
+// waits beside snapshot queries. Finder's snapshot lock covers every fetch and
+// copy before another query can invalidate its buffers; its change feed permits
+// only one native waiter. The surrounding Rust fields determine Finder's traits.
+unsafe impl Send for FindInstance {}
+// SAFETY: the same snapshot and waiter serialization applies to shared uses.
+unsafe impl Sync for FindInstance {}
+
 /// Discovers NDI sources on the network.
 ///
 /// `Finder` provides methods to discover and monitor NDI sources. It maintains
@@ -168,8 +184,9 @@ impl FinderOptions {
 /// let finder = Finder::new(&ndi, &FinderOptions::new())?;
 ///
 /// // Wait for initial discovery
-/// if finder.wait_for_sources(Duration::from_secs(5))? {
-///     let sources = finder.current_sources()?;
+/// let mut watch = finder.watch();
+/// if watch.wait_for_change(Duration::from_secs(5))? {
+///     let sources = watch.current_sources()?;
 ///     for source in sources {
 ///         println!("Found: {}", source);
 ///     }
@@ -178,15 +195,169 @@ impl FinderOptions {
 /// # }
 /// ```
 pub struct Finder {
-    instance: NDIlib_find_instance_t,
+    instance: FindInstance,
     // SDK snapshots and their strings expire on the next snapshot call.
-    sources_lock: Mutex<()>,
+    sources_lock: parking_lot::Mutex<FindInstance>,
     changes: ChangeFeed,
     _groups: Option<CString>,    // Hold ownership of CStrings
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
     _ndi: Ndi,
+}
+
+// The mutex guards a native snapshot's lifetime, not mutable Rust state. A
+// panic releases it without poisoning, and a later snapshot replaces all SDK
+// buffers before reading them. No partially updated Rust invariant survives.
+impl std::panic::RefUnwindSafe for Finder {}
+
+pub(crate) mod snapshot_sealed {
+    pub trait Sealed {}
+}
+
+/// One SDK snapshot entry point and its bounded descriptor copier.
+///
+/// # Safety
+///
+/// For a live finder, `fetch` returns null or the initialized descriptor array
+/// whose length it writes. The descriptors and their non-null strings remain
+/// readable through their NUL or the SDK string bound until the next snapshot
+/// call on that finder. `copy` reads only those descriptor fields and returns
+/// owned values; it neither replaces nor retains the native snapshot.
+pub(crate) unsafe trait FinderSnapshot: snapshot_sealed::Sealed {
+    type Descriptor;
+    type Item;
+
+    /// # Safety
+    /// `instance` is live and no snapshot call can overlap the fetch and copy.
+    unsafe fn fetch(
+        &self,
+        instance: NDIlib_find_instance_t,
+        count: &mut u32,
+    ) -> *const Self::Descriptor;
+
+    /// # Safety
+    /// `source` comes from this entry point's still-live snapshot.
+    unsafe fn copy(
+        &self,
+        source: &Self::Descriptor,
+        budget: &mut SnapshotBudget,
+    ) -> Result<Option<Self::Item>>;
+}
+
+impl snapshot_sealed::Sealed for sys::Core {}
+
+// SAFETY: the v1 SDK snapshot follows FinderSnapshot's contract, and its copier
+// produces owned source names and addresses within the shared byte budget.
+unsafe impl FinderSnapshot for sys::Core {
+    type Descriptor = NDIlib_source_t;
+    type Item = Source;
+
+    unsafe fn fetch(
+        &self,
+        instance: NDIlib_find_instance_t,
+        count: &mut u32,
+    ) -> *const Self::Descriptor {
+        // SAFETY: the guard supplies a live serialized finder instance.
+        unsafe { self.NDIlib_find_get_current_sources(instance, count) }
+    }
+
+    unsafe fn copy(
+        &self,
+        source: &Self::Descriptor,
+        budget: &mut SnapshotBudget,
+    ) -> Result<Option<Self::Item>> {
+        // SAFETY: FinderSnapshot's caller keeps this snapshot's strings live.
+        unsafe { snapshot_entry(source, budget) }
+    }
+}
+
+/// An acquired snapshot lock and the exact native handle it guards. Fetching
+/// gets its instance from this guard, never from a separate Finder argument.
+struct SnapshotGuard<'finder> {
+    instance: parking_lot::MutexGuard<'finder, FindInstance>,
+}
+
+impl SnapshotGuard<'_> {
+    fn snapshot<S: FinderSnapshot>(&self, snapshot: &S) -> Result<Vec<S::Item>> {
+        let mut count = 0;
+        // SAFETY: this private guard keeps its own finder's handle serialized
+        // until all copying completes. The sealed entry point supplies the
+        // array and string lifetimes required by the bounded copy kernel.
+        unsafe {
+            let descriptors = snapshot.fetch(self.instance.0, &mut count);
+            budget::copy_snapshot(descriptors, count, |source, budget| {
+                snapshot.copy(source, budget)
+            })
+        }
+    }
+}
+
+/// One consumer's cursor over a finder's source-list changes.
+///
+/// Take snapshots and wait through the same watch, so reports published by
+/// concurrent lookups between those operations cannot be missed. A report
+/// during a snapshot remains visible to the next wait. Each consumer must
+/// create its own watch; a watch can move between threads but is not `Sync`.
+///
+/// ```no_run
+/// # use grafton_ndi::{Finder, FinderOptions, Ndi};
+/// # use std::time::Duration;
+/// # fn main() -> grafton_ndi::Result<()> {
+/// # let ndi = Ndi::new()?;
+/// # let finder = Finder::new(&ndi, &FinderOptions::new())?;
+/// let mut watch = finder.watch();
+/// println!("{:?}", watch.current_sources()?);
+/// while watch.wait_for_change(Duration::from_secs(5))? {
+///     println!("{:?}", watch.current_sources()?);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub struct SourceWatch<'finder> {
+    finder: &'finder Finder,
+    // Cell makes a cursor Send but not Sync: one consumer advances it.
+    observed: Cell<u64>,
+}
+
+impl SourceWatch<'_> {
+    /// Copy the currently known sources and record the generation before
+    /// copying, preserving any report that arrives during the snapshot.
+    pub fn current_sources(&mut self) -> Result<Vec<Source>> {
+        self.observed.set(self.finder.changes.generation());
+        self.finder.current_sources()
+    }
+
+    /// Wait for a report newer than this consumer's last snapshot or wait.
+    ///
+    /// Returns `true` immediately if another lookup already published a report.
+    /// A zero timeout reads such reports even while another native waiter is
+    /// active; otherwise it makes one nonblocking native query. Returns `false`
+    /// when the timeout expires without a report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    pub fn wait_for_change(&mut self, timeout: Duration) -> Result<bool> {
+        Ok(self.wait_until(Deadline::after(timeout)?))
+    }
+
+    fn current_sources_until(&mut self, deadline: Deadline) -> Result<Option<Vec<Source>>> {
+        self.observed.set(self.finder.changes.generation());
+        self.finder.current_sources_until(deadline)
+    }
+
+    fn wait_until(&mut self, deadline: Deadline) -> bool {
+        if self
+            .finder
+            .wait_for_sources_since(self.observed.get(), deadline)
+        {
+            self.observed.set(self.finder.changes.generation());
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// One entry of a [`Finder::current_sources`] snapshot, or `None` for a
@@ -245,7 +416,7 @@ pub(crate) unsafe fn decode_source(
         let Some(address) = copy(address)? else {
             return Ok(None);
         };
-        Some(SourceAddress::from_sdk_text(address))
+        Some(SourceAddress::new(address))
     };
     Ok(Some(Source { name, address }))
 }
@@ -317,64 +488,38 @@ impl Finder {
         if instance.is_null() {
             return Err(Error::NativeOperationFailed { operation });
         }
-        Ok(Self {
-            instance,
-            sources_lock: Mutex::new(()),
+        let finder = Self {
+            instance: FindInstance(instance),
+            sources_lock: parking_lot::Mutex::new(FindInstance(instance)),
             changes: ChangeFeed::default(),
             _groups: groups,
             _extra_ips: extra_ips,
             #[cfg(feature = "advanced")]
             _config: config,
             _ndi: ndi.clone(),
-        })
+        };
+        // Some standard-library mutexes allocate their native backing on the
+        // first lock. Initialize before exposure, while Finder already owns
+        // the native instance so Drop also cleans it up if initialization panics.
+        let _ = finder.changes.generation();
+        Ok(finder)
     }
 
-    /// The one snapshot loop: while no other snapshot can be taken, `fetch`
-    /// the SDK's array of descriptors from this finder's instance and `copy`
-    /// each one, leaving out those `copy` rejects.
-    ///
-    /// The SDK owns a snapshot, the array and its strings, until the next
-    /// snapshot call on the same finder, so the fetch and every copy stay in
-    /// one critical section: locking only the SDK call would not be enough.
-    /// A descriptor the SDK should not produce (null strings naming neither a
-    /// source nor an address, or a string longer than the limit) is left
-    /// out, so that one malformed entry does not hide the others.
-    ///
-    /// # Safety
-    ///
-    /// `fetch` must return null, or a live array of at least the count it
-    /// writes, whose descriptors and the C strings they point to stay
-    /// readable until the next snapshot call on this finder.
-    pub(crate) unsafe fn snapshot<D, T>(
-        &self,
-        fetch: impl FnOnce(NDIlib_find_instance_t, &mut u32) -> *const D,
-        copy: impl FnMut(&D, &mut SnapshotBudget) -> Result<Option<T>>,
-    ) -> Result<Vec<T>> {
-        let _snapshot = self
-            .sources_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // SAFETY: this guard excludes replacement of the SDK's buffers through
-        // the entire shared fetch/copy kernel; caller supplies readable strings.
-        unsafe { self.snapshot_locked(_snapshot, fetch, copy) }
+    /// Copy one snapshot through the entry point's shared lifetime contract.
+    /// The guard carries the handle it protects, so fetching cannot pair a
+    /// different finder's instance with this lock.
+    pub(crate) fn snapshot<S: FinderSnapshot>(&self, snapshot: &S) -> Result<Vec<S::Item>> {
+        self.lock_snapshots(None)
+            .expect("an unbounded snapshot lock acquisition succeeds")
+            .snapshot(snapshot)
     }
 
-    /// The shared native fetch and bounded copy, with the lifetime lock held.
-    ///
-    /// # Safety
-    ///
-    /// As for `snapshot`; `snapshot_lock` must guard this finder's sources lock.
-    unsafe fn snapshot_locked<D, T>(
-        &self,
-        _snapshot_lock: MutexGuard<'_, ()>,
-        fetch: impl FnOnce(NDIlib_find_instance_t, &mut u32) -> *const D,
-        copy: impl FnMut(&D, &mut SnapshotBudget) -> Result<Option<T>>,
-    ) -> Result<Vec<T>> {
-        let mut count = 0;
-        let descriptors = fetch(self.instance, &mut count);
-        // SAFETY: fetch's contract supplies the array; the lock keeps it
-        // and its strings live until the complete bounded copy returns.
-        unsafe { budget::copy_snapshot(descriptors, count, copy) }
+    fn lock_snapshots(&self, deadline: Option<Deadline>) -> Option<SnapshotGuard<'_>> {
+        let instance = match deadline {
+            Some(deadline) => self.sources_lock.try_lock_until(deadline.end())?,
+            None => self.sources_lock.lock(),
+        };
+        Some(SnapshotGuard { instance })
     }
 
     /// The runtime this finder was created through.
@@ -383,45 +528,17 @@ impl Finder {
         &self._ndi
     }
 
-    /// Waits for the source list to change.
+    /// Monitor this finder's source list with a cursor for one consumer.
     ///
-    /// This method blocks until the list of discovered sources changes or the
-    /// timeout expires. Use this to efficiently monitor for source changes.
-    /// Concurrent waiters all observe a reported change. A zero timeout while
-    /// another thread waits only reads reports that thread has already
-    /// published; otherwise it makes one nonblocking native query.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Maximum time to wait ([`Duration::ZERO`] = no wait).
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// `true` if the source list changed, `false` if the timeout expired.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{Ndi, FinderOptions, Finder};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = Ndi::new()?;
-    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// // Wait up to 5 seconds for changes
-    /// if finder.wait_for_sources(Duration::from_secs(5))? {
-    ///     println!("Source list changed!");
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn wait_for_sources(&self, timeout: Duration) -> Result<bool> {
-        let deadline = Deadline::after(timeout)?;
-        Ok(self.wait_for_sources_since(self.changes.generation(), deadline))
+    /// Every consumer needs its own watch. Reports observed by a concurrent
+    /// lookup remain visible to this watch until it snapshots or waits again.
+    /// Creating a watch records the current generation without allocating.
+    #[must_use]
+    pub fn watch(&self) -> SourceWatch<'_> {
+        SourceWatch {
+            finder: self,
+            observed: Cell::new(self.changes.generation()),
+        }
     }
 
     /// Share one native report with every observer of the earlier generation.
@@ -432,7 +549,7 @@ impl Finder {
                 self._ndi
                     .api()
                     .core
-                    .NDIlib_find_wait_for_sources(self.instance, timeout_ms)
+                    .NDIlib_find_wait_for_sources(self.instance.0, timeout_ms)
             })
     }
 
@@ -472,57 +589,15 @@ impl Finder {
     /// # }
     /// ```
     pub fn current_sources(&self) -> Result<Vec<Source>> {
-        let api = self._ndi.api();
-        // SAFETY: `snapshot` hands the fetch the finder's live instance, for
-        // which the SDK returns null or `count` descriptors whose strings stay
-        // valid until the next snapshot call; the snapshot lock excludes that
-        // call until every descriptor has been copied, and each copy reads
-        // only its own descriptor meanwhile.
-        unsafe {
-            self.snapshot(
-                |instance, count| api.core.NDIlib_find_get_current_sources(instance, count),
-                |source, budget| snapshot_entry(source, budget),
-            )
-        }
-    }
-
-    /// Acquire the snapshot lock within a lookup's existing wait budget.
-    ///
-    /// The standard mutex preserves the finder's poisoning and unwind contracts.
-    /// It has no timed lock, so contended attempts sleep for at most one
-    /// millisecond of the remaining budget; zero/expired budgets only try once.
-    fn snapshot_lock_until(&self, deadline: Deadline) -> Option<MutexGuard<'_, ()>> {
-        loop {
-            match self.sources_lock.try_lock() {
-                Ok(guard) => return Some(guard),
-                Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
-                Err(TryLockError::WouldBlock) => {}
-            }
-            let remaining = deadline.remaining();
-            if remaining.is_zero() {
-                return None;
-            }
-            std::thread::sleep(remaining.min(Duration::from_millis(1)));
-        }
+        self.snapshot(&self._ndi.api().core)
     }
 
     /// The lookup's next snapshot, or none when contention exhausts its budget.
     fn current_sources_until(&self, deadline: Deadline) -> Result<Option<Vec<Source>>> {
-        let Some(snapshot_lock) = self.snapshot_lock_until(deadline) else {
+        let Some(guard) = self.lock_snapshots(Some(deadline)) else {
             return Ok(None);
         };
-        let api = self._ndi.api();
-        // SAFETY: the guard excludes snapshot replacement through the same
-        // bounded fetch/copy kernel as `current_sources`; the SDK owns live
-        // descriptors and strings until that guard is released.
-        unsafe {
-            self.snapshot_locked(
-                snapshot_lock,
-                |instance, count| api.core.NDIlib_find_get_current_sources(instance, count),
-                |source, budget| snapshot_entry(source, budget),
-            )
-            .map(Some)
-        }
+        guard.snapshot(&self._ndi.api().core).map(Some)
     }
 
     /// Poll discovery until `accept` selects a value or `timeout` elapses.
@@ -530,7 +605,7 @@ impl Finder {
     /// After each source-list snapshot, `accept` is handed the current sources
     /// and may return `Some` to stop immediately; otherwise this blocks on the
     /// next source-list change and retries until the deadline. A single
-    /// [`wait_for_sources`](Self::wait_for_sources) returns on the *first*
+    /// [`SourceWatch::wait_for_change`] returns on the *first*
     /// change, yielding only a partial snapshot when discovery is staggered
     /// (unicast / IP-hint-only networks where responders trickle in across
     /// several notifications); polling to the deadline makes resolution robust
@@ -546,9 +621,9 @@ impl Finder {
         // Validate up front so an over-long timeout is rejected even when the
         // first snapshot already satisfies `accept`.
         let deadline = Deadline::after(timeout)?;
+        let mut watch = self.watch();
         loop {
-            let generation = self.changes.generation();
-            let Some(sources) = self.current_sources_until(deadline)? else {
+            let Some(sources) = watch.current_sources_until(deadline)? else {
                 return Ok(None);
             };
             if let Some(selected) = accept(sources)? {
@@ -560,7 +635,7 @@ impl Finder {
             // Block until the source list changes or the window ends; either
             // way the next iteration re-snapshots. The wait is rounded up, so
             // the last one lasts until the deadline rather than polling.
-            self.wait_for_sources_since(generation, deadline);
+            watch.wait_until(deadline);
         }
     }
 
@@ -619,7 +694,7 @@ impl Finder {
     /// Discovers sources for up to `timeout`, returning the complete set.
     ///
     /// This honors the full `timeout` window and returns every source observed
-    /// within it. Unlike a single [`wait_for_sources`](Self::wait_for_sources)
+    /// within it. Unlike a single [`SourceWatch::wait_for_change`]
     /// followed by a snapshot — which returns on the *first* source-list change
     /// and so can miss responders that announce late on staggered or unicast
     /// (IP-hint-only) networks — enumeration here retains each source observed
@@ -640,7 +715,7 @@ impl Finder {
     /// # Returns
     ///
     /// Every source observed within the window, in first-observed order.
-    /// Identity includes the name and the complete address (including its variant);
+    /// Identity includes the name and the complete address text;
     /// a changed descriptor is returned as a distinct source. Network discovery
     /// cannot guarantee observation of every source. May be empty if none appear.
     ///
@@ -685,27 +760,15 @@ impl Finder {
 
 impl Drop for Finder {
     fn drop(&mut self) {
-        // SAFETY: the instance was created through this runtime and is
-        // destroyed exactly once, before the runtime handle is released.
-        unsafe { self._ndi.api().core.NDIlib_find_destroy(self.instance) };
+        // SAFETY: the instance belongs to this runtime and is destroyed once.
+        unsafe { self._ndi.api().core.NDIlib_find_destroy(self.instance.0) };
     }
 }
 
-/// # Safety
-///
-/// The SDK finder handle may be moved between threads. Its runtime and creation
-/// strings remain alive with it, and destruction requires exclusive ownership.
-unsafe impl std::marker::Send for Finder {}
-
-/// # Safety
-///
-/// The SDK forbids concurrent `NDIlib_find_get_current_sources` calls on one
-/// instance and invalidates its returned buffers on the next call. `sources_lock`
-/// serializes those calls through the complete deep copy into owned `Source`s.
-/// Waiting for source changes does not invalidate those buffers; destruction
-/// requires exclusive access through `Drop`. `changes` serializes native
-/// waits and broadcasts each report to concurrent Rust observers.
-unsafe impl std::marker::Sync for Finder {}
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Finder>();
+};
 
 fn accumulate_sources(
     discovered: &mut Vec<Source>,
@@ -724,9 +787,10 @@ fn accumulate_sources(
             ));
         }
         let text_bytes = source.name.capacity()
-            + source.address.as_ref().map_or(0, |a| match a {
-                SourceAddress::Ip(text) | SourceAddress::Url(text) => text.capacity(),
-            });
+            + source
+                .address
+                .as_ref()
+                .map_or(0, |address| address.0.capacity());
         let bytes = retained_bytes
             .checked_add(text_bytes * 2)
             .ok_or_else(|| budget::limit(ResourceKind::FinderDiscoveryBytes, budget::MAX_BYTES))?;
@@ -904,27 +968,27 @@ impl HostKeyBuffer {
     }
 }
 
-/// Network address of an NDI source.
+/// Opaque network address text of an NDI source.
 ///
-/// The SDK supplies one address string. A string containing `://` is classified
-/// as a URL; other strings use the IP variant. This classification does not
-/// establish the source's codec or whether it uses NDI|HX.
+/// Equality and hashing compare the exact text the SDK receives. The derived
+/// URL classification does not establish the codec or whether it uses NDI|HX.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum SourceAddress {
-    /// A URL address. SDK address strings containing `://` use this variant.
-    Url(String),
-    /// A host or IP address, optionally with a port. SDK strings without
-    /// `://` use this variant.
-    Ip(String),
-}
+pub struct SourceAddress(String);
 
 impl SourceAddress {
-    fn from_sdk_text(address: String) -> Self {
-        if address.contains("://") {
-            Self::Url(address)
-        } else {
-            Self::Ip(address)
-        }
+    /// Keep the address text unchanged, without interpreting or validating it.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    /// The exact address text, whether it names a host, IP address or URL.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether the address contains a URL scheme separator (`://`).
+    pub fn is_url(&self) -> bool {
+        self.0.contains("://")
     }
 
     /// Check whether this address has the exact host or IP.
@@ -941,11 +1005,11 @@ impl SourceAddress {
     /// ```
     /// use grafton_ndi::SourceAddress;
     ///
-    /// let addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
+    /// let addr = SourceAddress::new("192.168.1.100:5960".to_string());
     /// assert!(addr.matches_host("192.168.1.100"));
     /// assert!(!addr.matches_host("192.168.1"));
     ///
-    /// let url = SourceAddress::Url("http://camera.local:8080".to_string());
+    /// let url = SourceAddress::new("http://camera.local:8080".to_string());
     /// assert!(url.matches_host("camera.local"));
     /// ```
     pub fn matches_host(&self, host: &str) -> bool {
@@ -972,13 +1036,13 @@ impl SourceAddress {
     /// ```
     /// use grafton_ndi::SourceAddress;
     ///
-    /// let addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
+    /// let addr = SourceAddress::new("192.168.1.100:5960".to_string());
     /// assert_eq!(addr.port(), Some(5960));
     ///
-    /// let no_port = SourceAddress::Ip("192.168.1.100".to_string());
+    /// let no_port = SourceAddress::new("192.168.1.100".to_string());
     /// assert_eq!(no_port.port(), None);
     ///
-    /// let url = SourceAddress::Url("http://camera.local:8080".to_string());
+    /// let url = SourceAddress::new("http://camera.local:8080".to_string());
     /// assert_eq!(url.port(), Some(8080));
     /// ```
     pub fn port(&self) -> Option<u16> {
@@ -988,16 +1052,14 @@ impl SourceAddress {
     // SDK addresses are opaque. Only interpret conventional URL authorities and
     // host[:port] forms; never inspect their path, query, or fragment as a port.
     fn authority(&self) -> Option<Authority<'_>> {
-        match self {
-            Self::Ip(address) | Self::Url(address) => parse_authority(address),
-        }
+        parse_authority(self.as_str())
     }
 }
 
 /// An NDI source: its name and, when known, its network address.
 ///
-/// Equality and hashing compare the complete name and address, including the
-/// address variant; they do not imply persistent device identity.
+/// Equality and hashing compare the complete name and address text; they do
+/// not imply persistent device identity.
 ///
 /// The name typically includes the machine name and source name (e.g.,
 /// "MACHINE (Source)"). A source found by a [`Finder`] has the address it
@@ -1009,7 +1071,7 @@ impl SourceAddress {
 /// use grafton_ndi::{Source, SourceAddress};
 ///
 /// let source = Source::new("LAPTOP (Camera 1)")
-///     .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
+///     .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
 /// assert_eq!(source.name(), "LAPTOP (Camera 1)");
 /// assert_eq!(source.to_string(), "LAPTOP (Camera 1)@192.168.1.100:5960");
 /// assert!(Source::new("LAPTOP (Camera 1)").address().is_none());
@@ -1023,9 +1085,8 @@ pub struct Source {
 #[repr(C)]
 pub(crate) struct RawSource {
     _name: CString,
-    _url_address: Option<CString>,
-    _ip_address: Option<CString>,
-    pub raw: NDIlib_source_t,
+    _address: Option<CString>,
+    raw: NDIlib_source_t,
 }
 
 // SAFETY: the descriptor's pointers lead only into the strings this value
@@ -1039,19 +1100,21 @@ unsafe impl Send for RawSource {}
 // operation writes through them, so concurrent readers cannot race with mutation.
 unsafe impl Sync for RawSource {}
 
+impl RawSource {
+    /// Lend the descriptor only while its backing C strings remain owned.
+    pub(crate) fn as_raw(&self) -> &NDIlib_source_t {
+        &self.raw
+    }
+}
+
 impl Source {
-    /// Copy strings with exact reservations while preserving address variants.
+    /// Copy the name and opaque address text with exact reservations.
     fn try_copy(&self) -> Result<Self> {
         let name = budget::copy_string(&self.name)?;
         let address = self
             .address
             .as_ref()
-            .map(|address| -> Result<SourceAddress> {
-                Ok(match address {
-                    SourceAddress::Ip(text) => SourceAddress::Ip(budget::copy_string(text)?),
-                    SourceAddress::Url(text) => SourceAddress::Url(budget::copy_string(text)?),
-                })
-            })
+            .map(|address| budget::copy_string(address.as_str()).map(SourceAddress::new))
             .transpose()?;
         Ok(Self { name, address })
     }
@@ -1099,7 +1162,7 @@ impl Source {
     /// use grafton_ndi::{Source, SourceAddress};
     ///
     /// let source = Source::new("CAMERA1 (Chan1, 192.168.0.107)")
-    ///     .with_address(SourceAddress::Ip("192.168.0.107:5960".to_string()));
+    ///     .with_address(SourceAddress::new("192.168.0.107:5960".to_string()));
     ///
     /// assert!(source.matches_host("192.168.0.107"));
     /// assert!(source.matches_host("CAMERA1"));
@@ -1146,7 +1209,7 @@ impl Source {
     /// use grafton_ndi::{Source, SourceAddress};
     ///
     /// let source = Source::new("CAMERA1")
-    ///     .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
+    ///     .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
     ///
     /// assert_eq!(source.host(), Some("192.168.1.100"));
     /// ```
@@ -1205,45 +1268,23 @@ impl Source {
     pub(crate) fn to_raw(&self) -> Result<RawSource> {
         let name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
 
-        let (url_address, ip_address, __bindgen_anon_1) = match &self.address {
-            Some(SourceAddress::Url(url)) => {
-                let url_cstr = CString::new(url.clone()).map_err(Error::InvalidCString)?;
-                let p_url = url_cstr.as_ptr();
-                (
-                    Some(url_cstr),
-                    None,
-                    NDIlib_source_t__bindgen_ty_1 {
-                        p_url_address: p_url,
-                    },
-                )
-            }
-            Some(SourceAddress::Ip(ip)) => {
-                let ip_cstr = CString::new(ip.clone()).map_err(Error::InvalidCString)?;
-                let p_ip = ip_cstr.as_ptr();
-                (
-                    None,
-                    Some(ip_cstr),
-                    NDIlib_source_t__bindgen_ty_1 { p_ip_address: p_ip },
-                )
-            }
-            None => (
-                None,
-                None,
-                NDIlib_source_t__bindgen_ty_1 {
-                    p_ip_address: ptr::null(),
-                },
-            ),
-        };
-
+        let address = self
+            .address
+            .as_ref()
+            .map(|address| CString::new(address.as_str()))
+            .transpose()?;
+        let p_address = address
+            .as_ref()
+            .map_or(ptr::null(), |address| address.as_ptr());
         let p_ndi_name = name.as_ptr();
-
         Ok(RawSource {
             _name: name,
-            _url_address: url_address,
-            _ip_address: ip_address,
+            _address: address,
             raw: NDIlib_source_t {
                 p_ndi_name,
-                __bindgen_anon_1,
+                __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                    p_url_address: p_address,
+                },
             },
         })
     }
@@ -1252,9 +1293,12 @@ impl Source {
 impl Display for Source {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self.address {
-            Some(SourceAddress::Url(address) | SourceAddress::Ip(address)) => {
-                write!(f, "{name}@{address}", name = self.name)
-            }
+            Some(address) => write!(
+                f,
+                "{name}@{address}",
+                name = self.name,
+                address = address.as_str()
+            ),
             None => write!(f, "{name}", name = self.name),
         }
     }
@@ -1374,7 +1418,7 @@ impl SourceCache {
     /// A cache hit returns owned descriptor copies without an SDK call. On a
     /// miss, observes the full window using the configured finder; zero makes
     /// one non-waiting snapshot attempt. Results retain first-observed order and distinguish names,
-    /// full addresses, and address variants. Select the desired feed explicitly.
+    /// full address text. Select the desired feed explicitly.
     /// Empty results return an empty vector and are not retained.
     ///
     /// Discovery runs outside the cache lock; its window includes snapshot-lock
@@ -1602,6 +1646,20 @@ mod tests {
     }
 
     #[test]
+    fn the_first_watch_after_finder_creation_allocates_nothing() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let finder = Finder::new(&ndi, &FinderOptions::new()).unwrap();
+        // This exact Finder has had no watch, snapshot or generation query.
+        // Native mutex initialization belongs to construction, not this call.
+        let (watch, allocations) = crate::test_alloc::allocation_count(|| finder.watch());
+        assert_eq!(allocations, 0);
+        assert!(std::ptr::eq(watch.finder, &finder));
+        assert_eq!(watch.observed.get(), 0);
+    }
+
+    #[test]
     fn source_cache_moves_its_finder_without_allocating_or_recreating_it() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
@@ -1698,11 +1756,10 @@ mod tests {
         ] {
             for (first, second) in [(a, b), (b, a)] {
                 let cache = CachedSources::default();
-                let old =
-                    Source::new("camera").with_address(SourceAddress::Ip("192.0.2.1:5960".into()));
+                let old = Source::new("camera").with_address(SourceAddress::new("192.0.2.1:5960"));
                 let fresh = old
                     .clone()
-                    .with_address(SourceAddress::Ip("192.0.2.1:5961".into()));
+                    .with_address(SourceAddress::new("192.0.2.1:5961"));
                 cache
                     .sources_by_host_with(first, Duration::ZERO, |_| Ok(vec![old.clone()]))
                     .unwrap();
@@ -1755,18 +1812,18 @@ mod tests {
     #[test]
     fn exact_host_matching_ignores_labels_ports_and_url_payloads() {
         let other = Source::new("CAMERA10 (192.168.1.1)")
-            .with_address(SourceAddress::Ip("192.168.1.100:5960".into()));
+            .with_address(SourceAddress::new("192.168.1.100:5960"));
         assert!(!other.matches_host("192.168.1.1"));
         assert!(!other.matches_host("5960"));
         assert!(!other.matches_host("CAMERA1"));
-        let exact = Source::new("CAMERA1 (Program)").with_address(SourceAddress::Url(
-            "http://user:pass@Camera.Local:8080/ndi?next=192.0.2.1".into(),
+        let exact = Source::new("CAMERA1 (Program)").with_address(SourceAddress::new(
+            "http://user:pass@Camera.Local:8080/ndi?next=192.0.2.1",
         ));
         assert!(exact.matches_host("camera.local."));
         assert!(exact.matches_host("camera1"));
         assert!(!exact.matches_host("192.0.2.1"));
         assert!(!exact.matches_host("Program"));
-        let ipv6 = SourceAddress::Ip("[2001:0db8:0:0:0:0:0:1]:5960".into());
+        let ipv6 = SourceAddress::new("[2001:0db8:0:0:0:0:0:1]:5960");
         assert!(ipv6.matches_host("2001:db8::1"));
         assert!(ipv6.matches_host("[2001:db8::1]"));
         for invalid in [
@@ -1793,9 +1850,9 @@ mod tests {
     fn cache_selects_exact_host_and_rejects_invalid_queries_before_discovery() {
         let cache = CachedSources::default();
         let wrong = Source::new("CAMERA10 (Program)")
-            .with_address(SourceAddress::Ip("192.168.1.100:5960".into()));
-        let right = Source::new("CAMERA1 (Program)")
-            .with_address(SourceAddress::Ip("192.168.1.1:5961".into()));
+            .with_address(SourceAddress::new("192.168.1.100:5960"));
+        let right =
+            Source::new("CAMERA1 (Program)").with_address(SourceAddress::new("192.168.1.1:5961"));
         let timeout = Duration::ZERO;
         let selected = cache
             .sources_by_host_with("192.168.1.1", timeout, |query| {
@@ -1831,9 +1888,8 @@ mod tests {
             let cache = Arc::new(CachedSources::default());
             let (started_tx, started_rx) = mpsc::channel();
             let (resume_tx, resume_rx) = mpsc::channel();
-            let old = Source::new("old").with_address(SourceAddress::Ip("192.0.2.1:5960".into()));
-            let fresh =
-                Source::new("fresh").with_address(SourceAddress::Ip("192.0.2.1:5961".into()));
+            let old = Source::new("old").with_address(SourceAddress::new("192.0.2.1:5960"));
+            let fresh = Source::new("fresh").with_address(SourceAddress::new("192.0.2.1:5961"));
             let pending = Arc::clone(&cache);
             let old_result = old.clone();
             let thread = std::thread::spawn(move || {
@@ -1903,7 +1959,7 @@ mod tests {
         let cache = CachedSources::default();
         cache.cache.lock().unwrap().generation = Some(u64::MAX);
         cache.invalidate("absent");
-        let source = Source::new("camera").with_address(SourceAddress::Ip("192.0.2.1".into()));
+        let source = Source::new("camera").with_address(SourceAddress::new("192.0.2.1"));
         assert_eq!(
             cache
                 .sources_by_host_with("192.0.2.1", Duration::ZERO, |_| Ok(vec![source.clone()]))
@@ -1941,7 +1997,7 @@ mod tests {
             ("http://camera?x=:123", "camera", None),
             ("http://user:pass@[::1]:8080/path", "::1", Some(8080)),
         ] {
-            let source = Source::new("").with_address(SourceAddress::Url(address.into()));
+            let source = Source::new("").with_address(SourceAddress::new(address));
             assert_eq!(source.host(), Some(host), "{address}");
             assert_eq!(source.address().unwrap().port(), port, "{address}");
         }
@@ -1951,14 +2007,53 @@ mod tests {
     }
 
     #[test]
-    fn discovery_accumulates_structurally_distinct_sources_in_order() {
-        let first = Source::new("Camera").with_address(SourceAddress::Ip("192.0.2.1".into()));
-        let changed = first
-            .clone()
-            .with_address(SourceAddress::Ip("192.0.2.2".into()));
-        let distinct_variant = first
-            .clone()
-            .with_address(SourceAddress::Url("192.0.2.1".into()));
+    fn configured_and_discovered_sources_share_text_identity() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let hash = |source: &Source| {
+            let mut state = DefaultHasher::new();
+            source.hash(&mut state);
+            state.finish()
+        };
+        for text in [
+            "camera.local:8080",
+            "192.0.2.1:5960",
+            "[2001:db8::1]:5960",
+            "ndi://h:1",
+            "opaque text",
+        ] {
+            let configured = Source::new("Camera").with_address(SourceAddress::new(text));
+            let raw = configured.to_raw().unwrap();
+            // SAFETY: RawSource lends its descriptor while retaining both C
+            // strings for this synchronous owned copy.
+            let discovered = unsafe { Source::try_from_raw(raw.as_raw(), "test") }.unwrap();
+            assert_eq!(configured, discovered);
+            assert_eq!(hash(&configured), hash(&discovered));
+            let address = discovered.address().unwrap();
+            assert_eq!(address.as_str(), text);
+            assert_eq!(address.is_url(), text.contains("://"));
+            // Both native union member names denote the same address pointer.
+            // SAFETY: RawSource initialized the pointer member of this union.
+            unsafe {
+                assert_eq!(
+                    raw.as_raw().__bindgen_anon_1.p_url_address,
+                    raw.as_raw().__bindgen_anon_1.p_ip_address
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(raw.as_raw().__bindgen_anon_1.p_url_address)
+                        .to_str()
+                        .unwrap(),
+                    text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_accumulates_distinct_name_and_address_text_in_order() {
+        let first = Source::new("Camera").with_address(SourceAddress::new("192.0.2.1"));
+        let changed = first.clone().with_address(SourceAddress::new("192.0.2.2"));
+        let same_address = first.clone().with_address(SourceAddress::new("192.0.2.1"));
         let mut seen = HashSet::new();
         let mut discovered = Vec::new();
         let mut bytes = 0;
@@ -1968,10 +2063,11 @@ mod tests {
             &mut discovered,
             &mut seen,
             &mut bytes,
-            vec![first.clone(), changed.clone(), distinct_variant.clone()],
+            vec![first.clone(), changed.clone(), same_address.clone()],
         )
         .unwrap();
-        assert_eq!(discovered, vec![first, changed, distinct_variant]);
+        assert_eq!(same_address, first);
+        assert_eq!(discovered, vec![first, changed]);
     }
 
     #[test]
@@ -2001,8 +2097,47 @@ mod tests {
     fn concurrent_snapshots_keep_sdk_buffers_exclusive_until_copied() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
-            Barrier, TryLockError,
+            Barrier,
         };
+
+        struct Probe<'a> {
+            finder: &'a Finder,
+            raw: &'a NDIlib_source_t,
+            active: &'a AtomicUsize,
+        }
+        impl snapshot_sealed::Sealed for Probe<'_> {}
+        // SAFETY: the probe borrows its stack descriptor and live C strings
+        // through the entire serialized call and retains no native reference.
+        unsafe impl FinderSnapshot for Probe<'_> {
+            type Descriptor = NDIlib_source_t;
+            type Item = Source;
+
+            unsafe fn fetch(
+                &self,
+                instance: NDIlib_find_instance_t,
+                count: &mut u32,
+            ) -> *const Self::Descriptor {
+                assert_eq!(instance, self.finder.instance.0);
+                assert_eq!(self.active.fetch_add(1, Ordering::SeqCst), 0);
+                assert!(self.finder.sources_lock.try_lock().is_none());
+                *count = 1;
+                std::thread::yield_now();
+                self.raw
+            }
+
+            unsafe fn copy(
+                &self,
+                source: &Self::Descriptor,
+                budget: &mut SnapshotBudget,
+            ) -> Result<Option<Source>> {
+                assert!(self.finder.sources_lock.try_lock().is_none());
+                std::thread::yield_now();
+                // SAFETY: the probe's borrowed C strings remain live.
+                let owned = unsafe { snapshot_entry(source, budget) };
+                assert_eq!(self.active.fetch_sub(1, Ordering::SeqCst), 1);
+                owned
+            }
+        }
 
         let Some(ndi) = crate::test_support::ndi() else {
             return;
@@ -2026,32 +2161,15 @@ mod tests {
                         },
                     };
                     start.wait();
-                    // SAFETY: raw and both C strings stay live through copying;
-                    // this test's snapshot lock serializes their use.
-                    let sources = unsafe { finder.snapshot(
-                        |_, count| {
-                            // Model an SDK snapshot whose buffers remain borrowed
-                            // until conversion finishes, not just until fetch returns.
-                            assert_eq!(active_snapshot.fetch_add(1, Ordering::SeqCst), 0);
-                            assert!(matches!(finder.sources_lock.try_lock(), Err(TryLockError::WouldBlock)));
-                            *count = 1;
-                            std::thread::yield_now();
-                            &raw
-                        },
-                        |source, budget| {
-                            // Deterministically catches releasing the lock before
-                            // copying, even if competing threads are not scheduled.
-                            assert!(matches!(finder.sources_lock.try_lock(), Err(TryLockError::WouldBlock)));
-                            std::thread::yield_now();
-                            let owned = snapshot_entry(source, budget);
-                            assert_eq!(active_snapshot.fetch_sub(1, Ordering::SeqCst), 1);
-                            owned
-                        },
-                    ) }.unwrap();
+                    let sources = finder.snapshot(&Probe {
+                        finder,
+                        raw: &raw,
+                        active: active_snapshot,
+                    }).unwrap();
                     drop(name);
                     drop(address);
                     assert_eq!(sources[0].name(), format!("Camera {index}"));
-                    assert!(matches!(sources[0].address(), Some(SourceAddress::Ip(ip)) if ip == &format!("192.0.2.{index}:5960")));
+                    assert!(matches!(sources[0].address(), Some(address) if address.as_str() == format!("192.0.2.{index}:5960")));
                 });
             }
         });
@@ -2062,20 +2180,13 @@ mod tests {
         std::thread::scope(|scope| {
             assert!(scope
                 .spawn(|| {
-                    let _guard = finder.sources_lock.lock().unwrap();
+                    let _guard = finder.sources_lock.lock();
                     panic!("interrupted snapshot");
                 })
                 .join()
                 .is_err());
         });
-        assert!(unsafe {
-            finder.snapshot(
-                |_, _| ptr::null::<NDIlib_source_t>(),
-                |_, _| -> Result<Option<Source>> { panic!("empty snapshot must not copy") },
-            )
-        }
-        .unwrap()
-        .is_empty());
+        assert!(finder.current_sources().is_ok());
     }
 
     #[test]
@@ -2110,7 +2221,7 @@ mod tests {
                 name,
                 ip,
                 Expected::Source(
-                    Source::new("Camera").with_address(SourceAddress::Ip("192.0.2.1:5960".into())),
+                    Source::new("Camera").with_address(SourceAddress::new("192.0.2.1:5960")),
                 ),
             ),
             (
@@ -2119,7 +2230,7 @@ mod tests {
                 url,
                 Expected::Source(
                     Source::new("Camera")
-                        .with_address(SourceAddress::Url("ndi://camera.local:5960".into())),
+                        .with_address(SourceAddress::new("ndi://camera.local:5960")),
                 ),
             ),
             (
@@ -2127,7 +2238,7 @@ mod tests {
                 ptr::null(),
                 ip,
                 Expected::Source(
-                    Source::new("").with_address(SourceAddress::Ip("192.0.2.1:5960".into())),
+                    Source::new("").with_address(SourceAddress::new("192.0.2.1:5960")),
                 ),
             ),
             (
@@ -2159,13 +2270,13 @@ mod tests {
                 "empty address only",
                 ptr::null(),
                 empty,
-                Expected::Source(Source::new("").with_address(SourceAddress::Ip("".into()))),
+                Expected::Source(Source::new("").with_address(SourceAddress::new(""))),
             ),
             (
                 "empty address",
                 name,
                 empty,
-                Expected::Source(Source::new("Camera").with_address(SourceAddress::Ip("".into()))),
+                Expected::Source(Source::new("Camera").with_address(SourceAddress::new(""))),
             ),
             ("unterminated address", name, malformed, Expected::Malformed),
         ];
@@ -2273,16 +2384,33 @@ mod tests {
             named(ptr::null()),
             named(c"Last".as_ptr()),
         ];
-        // SAFETY: the array and its strings stay live through the copy.
-        let sources = unsafe {
-            finder.snapshot(
-                |_, count| {
-                    *count = snapshot.len() as u32;
-                    snapshot.as_ptr()
-                },
-                |source, budget| snapshot_entry(source, budget),
-            )
-        };
+        struct SliceSnapshot<'a>(&'a [NDIlib_source_t]);
+        impl snapshot_sealed::Sealed for SliceSnapshot<'_> {}
+        // SAFETY: this fixture is created only below, where its array and all
+        // strings stay live until the guard completes the bounded copy.
+        unsafe impl FinderSnapshot for SliceSnapshot<'_> {
+            type Descriptor = NDIlib_source_t;
+            type Item = Source;
+
+            unsafe fn fetch(
+                &self,
+                _: NDIlib_find_instance_t,
+                count: &mut u32,
+            ) -> *const Self::Descriptor {
+                *count = self.0.len() as u32;
+                self.0.as_ptr()
+            }
+
+            unsafe fn copy(
+                &self,
+                source: &Self::Descriptor,
+                budget: &mut SnapshotBudget,
+            ) -> Result<Option<Source>> {
+                // SAFETY: all fixture strings remain live through this call.
+                unsafe { snapshot_entry(source, budget) }
+            }
+        }
+        let sources = finder.snapshot(&SliceSnapshot(&snapshot));
         let sources = sources.unwrap();
         let names: Vec<_> = sources.iter().map(Source::name).collect();
         assert_eq!(names, ["First", "Last"]);
@@ -2319,10 +2447,10 @@ mod tests {
         let source = unsafe { Source::try_from_raw(&raw, "test") }.unwrap();
         assert!(source.name().is_empty());
         assert!(
-            matches!(source.address(), Some(SourceAddress::Url(address)) if address == "ndi://127.0.0.1:5960")
+            matches!(source.address(), Some(address) if address.is_url() && address.as_str() == "ndi://127.0.0.1:5960")
         );
         let roundtrip = source.to_raw().unwrap();
-        assert!(!roundtrip.raw.p_ndi_name.is_null());
+        assert!(!roundtrip.as_raw().p_ndi_name.is_null());
     }
 
     #[test]
@@ -2343,12 +2471,9 @@ mod tests {
 
         let source = result.unwrap();
         assert_eq!(source.name(), "Test Source");
-        match source.address() {
-            Some(SourceAddress::Ip(ip_str)) => {
-                assert_eq!(ip_str, "192.168.1.100:5960");
-            }
-            _ => panic!("Expected IP address"),
-        }
+        let address = source.address().expect("an address");
+        assert_eq!(address.as_str(), "192.168.1.100:5960");
+        assert!(!address.is_url());
     }
 
     #[test]
@@ -2369,12 +2494,9 @@ mod tests {
 
         let source = result.unwrap();
         assert_eq!(source.name(), "HX Source");
-        match source.address() {
-            Some(SourceAddress::Url(url_str)) => {
-                assert_eq!(url_str, "http://camera.local:8080/ndi");
-            }
-            _ => panic!("Expected URL address"),
-        }
+        let address = source.address().expect("an address");
+        assert_eq!(address.as_str(), "http://camera.local:8080/ndi");
+        assert!(address.is_url());
     }
 
     #[test]

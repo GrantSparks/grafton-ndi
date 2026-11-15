@@ -11,10 +11,10 @@ use crate::{
     capabilities::{Capabilities, RuntimeInfo, SdkEdition, SdkVersion},
     frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
     runtime::RuntimeOptions,
-    Error, LoadRefusal, Result, SelectionConflict,
+    Error, LoadRefusal, Result, SelectionFailure,
 };
 
-static SELECTED: Selection<Runtime> = Selection::new();
+static SELECTED: Selection<Runtime> = Selection::new(crate::LibraryKind::Runtime);
 
 /// Entry points only the Advanced SDK exports; together they identify its edition.
 const ADVANCED_SENDER: &CStr = c"NDIlib_send_create_v2";
@@ -121,9 +121,9 @@ impl Runtime {
         provider: Provider,
         requested: SdkEdition,
     ) -> std::result::Result<Self, LoadRefusal> {
-        let api = Api::load(&provider)?;
+        let mut api = Api::load(&provider)?;
         #[cfg(feature = "advanced")]
-        let advanced_tables = super::advanced::AdvancedApi::load(&provider)?;
+        let mut advanced_tables = super::advanced::AdvancedApi::load(&provider)?;
         let advanced = AdvancedEntryPoints::detect(&provider)?;
         let edition = provider.edition(advanced);
         if !meets(requested, edition) {
@@ -169,6 +169,9 @@ impl Runtime {
         let capabilities = Capabilities::detect(&api, &advanced_tables, version, edition);
         #[cfg(not(feature = "advanced"))]
         let capabilities = Capabilities::detect(&api, version, edition);
+        api.apply_capabilities(&capabilities);
+        #[cfg(feature = "advanced")]
+        advanced_tables.apply_capabilities(&capabilities);
         Ok(Self {
             capabilities,
             api,
@@ -192,10 +195,10 @@ impl Runtime {
             .edition
             .is_some_and(|requested| !meets(requested, self.info.edition))
         {
-            return Err(Error::RuntimeConflict {
-                kind: SelectionConflict::EditionNotMet,
-                detail: "the selected NDI implementation is not an Advanced SDK".into(),
-            });
+            return Err(Error::RuntimeConflict(SelectionFailure::edition_not_met(
+                self.info.library_path(),
+                options.library_path.as_deref(),
+            )));
         }
         self.provider
             .confirm_location(options.library_path.as_deref())
@@ -228,7 +231,7 @@ mod shared {
         capabilities::{SdkEdition, SdkLinkage},
         runtime::RuntimeOptions,
         Error, LibraryKind, LoadAttempt, LoadFailure, LoadOrigin as Origin, LoadRefusal, Result,
-        SelectionConflict,
+        SelectionFailure,
     };
 
     /// The environment variable naming the directory of an installed NDI runtime.
@@ -362,7 +365,7 @@ mod shared {
         /// Confirm that a request naming the library at `requested` is met by
         /// this module.
         pub(super) fn confirm_location(&self, requested: Option<&Path>) -> Result<()> {
-            confirm_selected(&self.path, requested)
+            confirm_selected(LibraryKind::Runtime, &self.path, requested)
         }
 
         /// A module is an Advanced runtime when it exports both Advanced entry
@@ -431,6 +434,7 @@ mod shared {
     /// Confirm that a request naming `requested` is met by the library at
     /// `selected`, which is pinned for the process and cannot be replaced.
     pub(in crate::sys) fn confirm_selected(
+        library: LibraryKind,
         selected: &Path,
         requested: Option<&Path>,
     ) -> Result<()> {
@@ -441,14 +445,9 @@ mod shared {
         if same_path(requested, selected) {
             Ok(())
         } else {
-            Err(Error::RuntimeConflict {
-                kind: SelectionConflict::DifferentLibrary,
-                detail: format!(
-                    "{} is already selected; it cannot be switched to {}",
-                    selected.display(),
-                    requested.display()
-                ),
-            })
+            Err(Error::RuntimeConflict(SelectionFailure::different_library(
+                library, selected, requested,
+            )))
         }
     }
 
@@ -518,12 +517,16 @@ mod shared {
                     }
                     Err(refusal) => refusal,
                 };
-                if let LoadRefusal::ForeignRuntimeInScope { .. } = &refusal.reason {
+                if let LoadRefusal::ForeignRuntimeInScope { module } = &refusal.reason {
                     if self.explicit.is_some() || self.kind == LibraryKind::File {
-                        return Err(Error::RuntimeConflict {
-                            kind: SelectionConflict::ForeignRuntimeInScope,
-                            detail: format!("{candidate}: {}", refusal.reason),
-                        });
+                        return Err(Error::RuntimeConflict(SelectionFailure::foreign(
+                            self.kind,
+                            self.beside,
+                            self.explicit,
+                            module,
+                            &candidate.location,
+                            candidate.origin,
+                        )));
                     }
                 }
                 failures.push(candidate.describe(refusal));
@@ -1137,7 +1140,7 @@ mod linked {
     use crate::{
         capabilities::{SdkEdition, SdkLinkage},
         runtime::RuntimeOptions,
-        Error, LibraryKind, LoadFailure, LoadRefusal, Result, SelectionConflict,
+        Error, LibraryKind, LoadFailure, LoadRefusal, Result, SelectionFailure,
     };
 
     // `fn linked_address(name: &[u8]) -> Option<*const c_void>`, generated by the
@@ -1159,13 +1162,10 @@ mod linked {
         pub(super) fn confirm_location(&self, requested: Option<&Path>) -> Result<()> {
             match requested {
                 None => Ok(()),
-                Some(requested) => Err(Error::RuntimeConflict {
-                    kind: SelectionConflict::LinkedImplementation,
-                    detail: format!(
-                        "the NDI SDK is linked into this program, so {} cannot be loaded instead",
-                        requested.display()
-                    ),
-                }),
+                Some(requested) => Err(Error::RuntimeConflict(SelectionFailure::linked(
+                    LibraryKind::Runtime,
+                    requested,
+                ))),
             }
         }
 

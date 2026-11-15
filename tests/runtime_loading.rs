@@ -6,7 +6,7 @@
 mod runtime_fixture;
 
 use grafton_ndi::{
-    capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
+    capabilities::{CapabilityUnavailable, RuntimeFeature, SdkEdition},
     runtime::{Runtime, RuntimeOptions},
     Error, LibraryKind, LoadFailure, LoadOrigin, LoadRefusal, Ndi, SelectionConflict,
 };
@@ -455,10 +455,15 @@ fn child(name: &str, fixtures: &Fixtures) {
                 Runtime::select(&options).unwrap_err(),
             ] {
                 match error {
-                    Error::RuntimeConflict { kind, detail } => {
-                        assert_eq!(kind, SelectionConflict::ForeignRuntimeInScope);
-                        assert!(detail.contains(complete.to_str().unwrap()));
-                        assert!(detail.contains(fixtures.preloaded().to_str().unwrap()));
+                    Error::RuntimeConflict(failure) => {
+                        assert_eq!(failure.kind(), SelectionConflict::ForeignRuntimeInScope);
+                        assert_eq!(failure.library(), LibraryKind::Runtime);
+                        assert_eq!(failure.requested(), Some(complete.as_path()));
+                        assert_eq!(
+                            failure.foreign_module(),
+                            Some(fixtures.preloaded().as_path())
+                        );
+                        assert_eq!(failure.selected(), None);
                     }
                     other => panic!("expected a global-scope conflict, got {other}"),
                 }
@@ -564,12 +569,12 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert_eq!(ndi.info().version().unwrap().minor(), 3);
             let capabilities = ndi.capabilities();
             assert_eq!(
-                capabilities.status(RuntimeFeature::ReceiveDelay),
-                CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+                (capabilities.status(RuntimeFeature::ReceiveDelay)).reason(),
+                Some(CapabilityUnavailable::SymbolUnavailable)
             );
             assert_eq!(
-                capabilities.status(RuntimeFeature::Planar444Video),
-                CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeTooOld)
+                (capabilities.status(RuntimeFeature::Planar444Video)).reason(),
+                Some(CapabilityUnavailable::RuntimeTooOld)
             );
             assert!(ndi.runtime().is_supported_cpu());
             assert!(ndi.info().raw_version().contains("6.3.2.0"));
@@ -581,20 +586,26 @@ fn child(name: &str, fixtures: &Fixtures) {
         }
         "conflict" => {
             let ndi = Ndi::with_options(&options).unwrap();
-            assert!(matches!(
-                Ndi::with_options(&explicit(fixtures.missing())),
-                Err(Error::RuntimeConflict {
-                    kind: SelectionConflict::DifferentLibrary,
-                    ..
-                })
-            ));
-            assert!(matches!(
-                Ndi::with_options(&RuntimeOptions::default().edition(SdkEdition::Advanced)),
-                Err(Error::RuntimeConflict {
-                    kind: SelectionConflict::EditionNotMet,
-                    ..
-                })
-            ));
+            let Error::RuntimeConflict(failure) =
+                Ndi::with_options(&explicit(fixtures.missing())).unwrap_err()
+            else {
+                panic!("expected path conflict")
+            };
+            assert_eq!(failure.kind(), SelectionConflict::DifferentLibrary);
+            assert_eq!(failure.library(), LibraryKind::Runtime);
+            assert_eq!(failure.selected(), Some(complete.as_path()));
+            assert_eq!(failure.requested(), Some(fixtures.missing().as_path()));
+            assert_eq!(failure.foreign_module(), None);
+            let Error::RuntimeConflict(failure) =
+                Ndi::with_options(&RuntimeOptions::default().edition(SdkEdition::Advanced))
+                    .unwrap_err()
+            else {
+                panic!("expected edition conflict")
+            };
+            assert_eq!(failure.kind(), SelectionConflict::EditionNotMet);
+            assert_eq!(failure.selected(), Some(complete.as_path()));
+            assert_eq!(failure.requested(), None);
+            assert_eq!(failure.foreign_module(), None);
             // The selected module satisfies a request that names no other one.
             drop(Ndi::with_options(&standard()).unwrap());
             drop(ndi);
@@ -886,6 +897,7 @@ fn configured_objects_are_refused_for_their_own_capability(ndi: &Ndi) {
             SendListener,
         },
         routing::{Router, RouterOptions},
+        CapabilityStatus,
     };
     let config = AdvancedConfig::parse("{}").unwrap();
     let advertisers = AdvertiserOptions::default()
@@ -934,8 +946,8 @@ fn configured_objects_are_refused_for_their_own_capability(ndi: &Ndi) {
         ),
     ] {
         assert_eq!(
-            ndi.capabilities().status(required),
-            CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable),
+            (ndi.capabilities().status(required)).reason(),
+            Some(CapabilityUnavailable::SymbolUnavailable),
             "{required:?}"
         );
         let status = ndi.capabilities().status(feature);
@@ -944,24 +956,20 @@ fn configured_objects_are_refused_for_their_own_capability(ndi: &Ndi) {
         } else {
             CapabilityUnavailable::BuildAbiUnavailable
         };
-        assert_eq!(
-            status,
-            CapabilityStatus::Unavailable(expected),
-            "{feature:?}"
-        );
+        assert_eq!(status.reason(), Some(expected), "{feature:?}");
         for error in [error, ndi.require_feature(feature).err()] {
-            let (refused, reason, detail) = match error {
-                Some(Error::UnsupportedCapability {
-                    feature,
-                    reason,
-                    detail,
-                }) => (feature, reason, detail),
+            let (refused, refusal) = match error {
+                Some(Error::UnsupportedCapability { feature, refusal }) => (feature, refusal),
                 other => panic!("{feature:?}: expected an unsupported capability, got {other:?}"),
             };
-            assert_eq!((refused, reason), (feature, expected));
+            assert_eq!((refused, refusal.reason()), (feature, expected));
+            assert_eq!(status, CapabilityStatus::Unavailable(refusal));
             if declared {
                 // The evidence is the core capability's: its first function.
-                assert_eq!(detail, first_missing, "{feature:?}");
+                assert!(
+                    matches!(refusal, grafton_ndi::CapabilityRefusal::SymbolUnavailable(symbol) if symbol.to_str().unwrap() == first_missing),
+                    "{feature:?}"
+                );
             }
         }
     }

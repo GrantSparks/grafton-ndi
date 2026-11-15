@@ -519,7 +519,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
         let receiver = Arc::clone(&self.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
             Ok(process_captured(
-                receiver.core.capture_any_ref_until(deadline, stop)?,
+                receiver.capture_any_ref_until(deadline, stop)?,
                 process,
             ))
         })
@@ -560,7 +560,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     pub async fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
         let receiver = Arc::clone(&self.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-            receiver.core.poll_event_until(deadline, stop)
+            receiver.poll_event_until(deadline, stop)
         })
         .await
     }
@@ -836,7 +836,7 @@ where
         let receiver = Arc::clone(&self.recv.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
             Ok(process_captured(
-                receiver.core.capture_ref_until::<K>(deadline, stop)?,
+                receiver.capture_ref_until::<K>(deadline, stop)?,
                 process,
             ))
         })

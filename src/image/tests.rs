@@ -1244,11 +1244,7 @@ fn lossy_webp_reduces_every_pixel_format_and_preserves_alpha() {
                             p[0] as u8,
                             p[1] as u8,
                             p[2] as u8,
-                            if reference.channels == 4 {
-                                p[3] as u8
-                            } else {
-                                255
-                            },
+                            p.get(3).map_or(255, |alpha| *alpha as u8),
                         ]
                     })
                     .collect();
@@ -1476,6 +1472,59 @@ fn sixteen_bit_png_keeps_high_bit_depth_precision() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn every_transfer_agrees_on_hdr_refusal_and_png_color_code() {
+    for transfer in crate::TransferFunction::ALL {
+        let sdk_name = match transfer {
+            crate::TransferFunction::Bt601 => "bt_601",
+            crate::TransferFunction::Bt709 => "bt_709",
+            crate::TransferFunction::Bt2020 => "bt_2020",
+            crate::TransferFunction::Hlg => "bt_2100_hlg",
+            crate::TransferFunction::Pq => "bt_2100_pq",
+        };
+        let metadata = format!("<ndi_color_info transfer=\"{sdk_name}\" primaries=\"bt_2020\"/>");
+        let frame = VideoFrame::builder()
+            .resolution(2, 2)
+            .metadata(metadata.as_str())
+            .build()
+            .unwrap();
+        let color = frame.color_info().unwrap().unwrap();
+        assert_eq!(color.is_hdr(), transfer.is_hdr());
+        assert_eq!(super::hdr_transfer(&color).is_some(), transfer.is_hdr());
+        assert_eq!(matches!(transfer.h273_code(), 16 | 18), transfer.is_hdr());
+        for format in [
+            ImageFormat::Png,
+            ImageFormat::Jpeg(85),
+            ImageFormat::WebpLossless,
+            ImageFormat::WebpLossy(75),
+        ] {
+            assert_eq!(
+                Plan::new(&Source::new(&frame), &options(format)).is_err(),
+                transfer.is_hdr(),
+                "{transfer:?} {format:?}"
+            );
+        }
+        let png = frame
+            .encode_image(&options(ImageFormat::Png).hdr(HdrPolicy::CodeValues))
+            .unwrap();
+        let chunks = png_chunks(&png);
+        let (_, tag) = chunks.iter().find(|(kind, _)| kind == b"cICP").unwrap();
+        assert_eq!(tag, &[9, transfer.h273_code(), 0, 1]);
+    }
+}
+
+#[test]
+fn every_image_format_has_its_documented_quality_bounds() {
+    for (format, expected) in [
+        (ImageFormat::Png, None),
+        (ImageFormat::Jpeg(85), Some(1..=100)),
+        (ImageFormat::WebpLossless, None),
+        (ImageFormat::WebpLossy(75), Some(0..=100)),
+    ] {
+        assert_eq!(format.quality_bounds(), expected);
+    }
+}
+
+#[test]
 fn hdr_frames_are_refused_by_default_in_every_format() {
     for format in PixelFormat::ALL {
         for (transfer, name) in [("bt_2100_pq", "PQ"), ("bt_2100_hlg", "HLG")] {
@@ -1682,7 +1731,17 @@ fn withheld_color_metadata_is_refused_by_every_encoder_before_output() {
         ] {
             let source = || {
                 let mut source = Source::new(&frame);
-                source.metadata = crate::color_info::Metadata::new(status, None);
+                source.metadata = crate::color_info::Metadata::new(
+                    crate::frames::FrameMetadataRef::Withheld(match status {
+                        crate::FrameMetadataStatus::NotUtf8 => {
+                            crate::frames::MetadataWithheld::NotUtf8
+                        }
+                        crate::FrameMetadataStatus::Unterminated => {
+                            crate::frames::MetadataWithheld::Unterminated
+                        }
+                        _ => unreachable!(),
+                    }),
+                );
                 source
             };
             for output_format in [
@@ -1771,6 +1830,60 @@ impl std::io::Write for Recorder {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[test]
+fn every_writer_encode_reports_final_flush_and_buffered_write_failures() {
+    struct FlushFails;
+    impl std::io::Write for FlushFails {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                DiskFull,
+            ))
+        }
+    }
+
+    let frame = VideoFrame::builder()
+        .resolution(2, 2)
+        .pixel_format(PixelFormat::Rgba)
+        .data(vec![127; 16])
+        .build()
+        .unwrap();
+    let mut workspace = crate::ImageWorkspace::new();
+    for options in [
+        options(ImageFormat::Png),
+        options(ImageFormat::Png).depth(SampleDepth::Sixteen),
+        options(ImageFormat::Jpeg(85)),
+        options(ImageFormat::WebpLossless),
+        options(ImageFormat::WebpLossy(75)),
+    ] {
+        let assert_error = |result: crate::Result<()>| match result {
+            Err(Error::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{options:?}");
+                assert!(error.get_ref().is_some_and(|inner| inner.is::<DiskFull>()));
+            }
+            result => panic!("{options:?}: expected the original writer error, got {result:?}"),
+        };
+        assert_error(frame.encode_image_to(&options, FlushFails));
+        assert_error(workspace.encode_to(&frame, &options, FlushFails));
+
+        // Every byte stays buffered until the encode's final flush. Dropping
+        // this writer by value used to discard the sink's failure for JPEG/WebP.
+        assert!(frame.encode_image(&options).unwrap().len() < 8192);
+        let buffered = || {
+            std::io::BufWriter::new(Recorder {
+                written: 0,
+                fail_after: Some(0),
+            })
+        };
+        assert_error(frame.encode_image_to(&options, buffered()));
+        assert_error(workspace.encode_to(&frame, &options, buffered()));
     }
 }
 
@@ -2046,6 +2159,43 @@ fn conversion_geometry_overflow_is_refused_before_output_or_row_access() {
     assert_eq!(output.written, 0);
 }
 
+/// Compare these fingerprints between a reference revision and an encoder
+/// refactor, including partial edge blocks and every source pixel layout.
+#[test]
+#[ignore = "manual byte-for-byte compatibility comparison between revisions"]
+fn image_encoding_compatibility_fingerprints() {
+    for format in PixelFormat::ALL {
+        let height = if matches!(
+            format,
+            PixelFormat::I420 | PixelFormat::Yv12 | PixelFormat::Nv12
+        ) {
+            10
+        } else {
+            11
+        };
+        let frame = VideoFrame::builder()
+            .resolution(18, height)
+            .pixel_format(format)
+            .data(any_frame_bytes(format, 18, height as usize, 0x5eed))
+            .build()
+            .unwrap();
+        for reduction in [
+            Downscale::Off,
+            Downscale::Half,
+            Downscale::Quarter,
+            Downscale::Eighth,
+        ] {
+            for alpha in [AlphaMode::Keep, AlphaMode::Discard] {
+                for options in every_output() {
+                    let options = options.downscale(reduction).alpha(alpha);
+                    let image = frame.encode_image(&options).unwrap();
+                    eprintln!("compat,{format:?},{options:?},{:02x?}", sha256(&image));
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn workspace_reuses_conversion_capacity_across_formats_sizes_and_failures() {
     let mut workspace = crate::ImageWorkspace::new();
@@ -2120,22 +2270,18 @@ fn warm_workspace_conversion_does_not_allocate() {
                         let plan = Plan::new(&source, &options).unwrap();
                         macro_rules! convert {
                             ($sample:ty, $sums:ident) => {
-                                plan.with_pixels::<$sample, _>(
-                                    &source,
-                                    &mut workspace.$sums,
-                                    |pixels| {
-                                        super::resize_scratch(
-                                            &mut workspace.row,
-                                            pixels.width()
-                                                * plan.channels()
-                                                * std::mem::size_of::<$sample>(),
-                                        )?;
-                                        for y in 0..pixels.height() {
-                                            pixels.pack_row(y, plan.channels(), &mut workspace.row);
-                                        }
-                                        Ok(())
-                                    },
-                                )
+                                plan.with_pixels::<$sample, _>(&mut workspace.$sums, |pixels| {
+                                    super::resize_scratch(
+                                        &mut workspace.row,
+                                        pixels.width()
+                                            * plan.channels().count()
+                                            * std::mem::size_of::<$sample>(),
+                                    )?;
+                                    for y in 0..pixels.height() {
+                                        pixels.pack_row(y, plan.channels(), &mut workspace.row);
+                                    }
+                                    Ok(())
+                                })
                                 .unwrap()
                             };
                         }
@@ -2156,14 +2302,10 @@ fn warm_workspace_conversion_does_not_allocate() {
                     for codec in [ImageFormat::WebpLossless, ImageFormat::WebpLossy(75)] {
                         let options = options(codec).alpha(alpha).downscale(reduction);
                         let plan = Plan::new(&source, &options).unwrap();
-                        let channels = if codec == ImageFormat::WebpLossless {
-                            plan.channels()
-                        } else {
-                            4
-                        };
+                        let shape = plan.shape.buffered().unwrap();
                         let mut convert = || {
-                            plan.with_pixels::<u8, _>(&source, &mut workspace.sums8, |pixels| {
-                                webp::image_with(pixels, channels, &mut workspace.image)?;
+                            plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
+                                webp::image_with(pixels, shape, &mut workspace.image)?;
                                 Ok(())
                             })
                             .unwrap()
@@ -2228,8 +2370,8 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                             .alpha(alpha)
                             .depth(depth)
                             .downscale(downscale);
-                        let plan = Plan::new(&source(), &options).unwrap();
                         let source = source();
+                        let plan = Plan::new(&source, &options).unwrap();
                         let bytes_per_sample = if depth == SampleDepth::Eight { 1 } else { 2 };
                         let sums = if shift == 0 {
                             0
@@ -2247,7 +2389,7 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                         let row_len = reduced.0 * channels * bytes_per_sample;
                         if depth == SampleDepth::Eight {
                             let ((mut pixels, allocations), peak) =
-                                peak_bytes(|| allocation_count(|| plan.pixels::<u8>(&source)));
+                                peak_bytes(|| allocation_count(|| plan.pixels::<u8>()));
                             check(allocations, peak);
                             let borrowed = pixels.rgba_rows().is_some();
                             assert_eq!(
@@ -2263,18 +2405,20 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                                 (1, row_len, row_len)
                             );
                             let (_, allocations) = allocation_count(|| {
-                                (0..reduced.1).for_each(|y| pixels.pack_row(y, channels, &mut row))
+                                (0..reduced.1)
+                                    .for_each(|y| pixels.pack_row(y, plan.shape.channels, &mut row))
                             });
                             assert_eq!(allocations, 0, "{format:?} {height} {options:?}");
                         } else {
                             let ((mut pixels, allocations), peak) =
-                                peak_bytes(|| allocation_count(|| plan.pixels::<u16>(&source)));
+                                peak_bytes(|| allocation_count(|| plan.pixels::<u16>()));
                             check(allocations, peak);
                             assert!(pixels.rgba_rows().is_none());
                             let mut row = row_buffer::<u16>(reduced.0, channels);
                             assert_eq!(row.len(), row_len);
                             let (_, allocations) = allocation_count(|| {
-                                (0..reduced.1).for_each(|y| pixels.pack_row(y, channels, &mut row))
+                                (0..reduced.1)
+                                    .for_each(|y| pixels.pack_row(y, plan.shape.channels, &mut row))
                             });
                             assert_eq!(allocations, 0, "{format:?} {height} {options:?}");
                         }
@@ -2286,11 +2430,14 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                         (ImageFormat::WebpLossy(75), 4),
                     ] {
                         let options = options(format).alpha(alpha).downscale(downscale);
-                        let plan = Plan::new(&source(), &options).unwrap();
                         let source = source();
-                        let mut pixels = plan.pixels::<u8>(&source);
-                        let ((image, allocations), peak) =
-                            peak_bytes(|| allocation_count(|| webp::image(&mut pixels, channels)));
+                        let plan = Plan::new(&source, &options).unwrap();
+                        let mut pixels = plan.pixels::<u8>();
+                        let ((image, allocations), peak) = peak_bytes(|| {
+                            allocation_count(|| {
+                                webp::image(&mut pixels, plan.shape.buffered().unwrap())
+                            })
+                        });
                         let len = reduced.0 * reduced.1 * channels;
                         let borrowed = matches!(image, std::borrow::Cow::Borrowed(_));
                         let expected_allocation = if borrowed { 0 } else { len };
@@ -2310,15 +2457,12 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                 // JPEG: pixels convert straight into the codec's component
                 // rows, so with those reserved nothing is allocated.
                 let options = options(ImageFormat::Jpeg(85)).downscale(downscale);
-                let plan = Plan::new(&source(), &options).unwrap();
                 let source = source();
-                let mut pixels = plan.pixels::<u8>(&source);
+                let plan = Plan::new(&source, &options).unwrap();
+                let mut pixels = plan.pixels::<u8>();
                 let (width, height) = (pixels.width() as u16, pixels.height() as u16);
-                let rows = jpeg::Rows {
-                    pixels: std::cell::RefCell::new(&mut pixels),
-                    width,
-                    height,
-                };
+                let mut cache = vec![0; plan.shape.row_bytes];
+                let rows = jpeg::Rows::new(&mut pixels, width, height, &mut cache);
                 let mut buffers = std::array::from_fn(|_| Vec::with_capacity(reduced.0));
                 let (_, allocations) = allocation_count(|| {
                     for y in (0..height).chain([height - 1]) {
@@ -2414,6 +2558,8 @@ fn image_encoding_resources() {
     let input = |name: &str| std::env::var_os(name).map(|path| std::fs::read(path).unwrap());
     let (photo, graphics) = (input("GRAFTON_NDI_PHOTO"), input("GRAFTON_NDI_GRAPHICS"));
     let selected = std::env::var("GRAFTON_NDI_OUTPUTS").ok();
+    let contents = std::env::var("GRAFTON_NDI_CONTENTS").ok();
+    let formats = std::env::var("GRAFTON_NDI_FORMATS").ok();
     let dump = std::env::var_os("GRAFTON_NDI_IMAGE_DUMP").map(std::path::PathBuf::from);
     if let Some(path) = &dump {
         std::fs::create_dir_all(path).unwrap();
@@ -2428,7 +2574,17 @@ fn image_encoding_resources() {
         .collect();
     eprintln!("source,content,width,height,output,median_ms,peak_encode_bytes,output_bytes");
     for (width, height) in sizes {
-        for (content, input) in [("photographic", &photo), ("graphics", &graphics)] {
+        for (content, input) in [
+            ("photographic", &photo),
+            ("graphics", &graphics),
+            ("graphics-alpha", &graphics),
+        ] {
+            if contents
+                .as_ref()
+                .is_some_and(|selected| !selected.split(',').any(|name| name == content))
+            {
+                continue;
+            }
             let rgba = content_rgba(content, width, height, input.as_deref());
             eprintln!(
                 "input,{content},{width},{height},sha256={:02x?}",
@@ -2445,6 +2601,13 @@ fn image_encoding_resources() {
                 PixelFormat::P216,
                 PixelFormat::Na4g,
             ] {
+                if formats.as_ref().is_some_and(|selected| {
+                    !selected
+                        .split(',')
+                        .any(|name| name.eq_ignore_ascii_case(&format!("{format:?}")))
+                }) {
+                    continue;
+                }
                 let frame = frame_from_rgba(format, width, height, &rgba);
                 let outputs = [
                     (
@@ -2478,6 +2641,42 @@ fn image_encoding_resources() {
                         options(ImageFormat::WebpLossy(75))
                             .webp_effort(0)
                             .webp_sharp_yuv(false),
+                    ),
+                    (
+                        "png-fast-half",
+                        options(ImageFormat::Png)
+                            .png_compression(PngCompression::Fast)
+                            .downscale(Downscale::Half),
+                    ),
+                    (
+                        "jpeg85-half",
+                        options(ImageFormat::Jpeg(85)).downscale(Downscale::Half),
+                    ),
+                    (
+                        "webp-half",
+                        options(ImageFormat::WebpLossless).downscale(Downscale::Half),
+                    ),
+                    (
+                        "webp-lossy75-half",
+                        options(ImageFormat::WebpLossy(75)).downscale(Downscale::Half),
+                    ),
+                    (
+                        "png-fast-eighth",
+                        options(ImageFormat::Png)
+                            .png_compression(PngCompression::Fast)
+                            .downscale(Downscale::Eighth),
+                    ),
+                    (
+                        "jpeg85-eighth",
+                        options(ImageFormat::Jpeg(85)).downscale(Downscale::Eighth),
+                    ),
+                    (
+                        "webp-eighth",
+                        options(ImageFormat::WebpLossless).downscale(Downscale::Eighth),
+                    ),
+                    (
+                        "webp-lossy75-eighth",
+                        options(ImageFormat::WebpLossy(75)).downscale(Downscale::Eighth),
                     ),
                     (
                         "png-fast-quarter",
@@ -2550,7 +2749,7 @@ fn content_rgba(content: &str, width: usize, height: usize, input: Option<&[u8]>
     let mut out = Vec::with_capacity(width * height * 4);
     for y in 0..height {
         for x in 0..width {
-            let pixel: [u8; 4] = match (content, input) {
+            let mut pixel: [u8; 4] = match (content, input) {
                 (_, Some(input)) => {
                     let (sx, sy) = (x * 1920 / width, y * 1080 / height);
                     input[(sy * 1920 + sx) * 4..][..4].try_into().unwrap()
@@ -2574,6 +2773,13 @@ fn content_rgba(content: &str, width: usize, height: usize, input: Option<&[u8]>
                     }
                 }
             };
+            if content == "graphics-alpha" {
+                pixel[3] = match (x / 31 + y / 23) % 4 {
+                    0 => 0,
+                    1 => 255,
+                    _ => ((x * 17 + y * 29) % 256) as u8,
+                };
+            }
             out.extend_from_slice(&pixel);
         }
     }

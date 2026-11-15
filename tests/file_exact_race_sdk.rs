@@ -40,11 +40,10 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
             common::skip(common::Requirement::File, &reason.to_string());
             return;
         }
-        Err(Error::RuntimeConflict {
-            kind: SelectionConflict::FileNeedsAdvancedRuntime,
-            detail,
-        }) => {
-            common::skip(common::Requirement::File, &detail);
+        Err(Error::RuntimeConflict(failure))
+            if failure.kind() == SelectionConflict::FileNeedsAdvancedRuntime =>
+        {
+            common::skip(common::Requirement::File, &failure.to_string());
             return;
         }
         Err(error) => panic!("{error}"),

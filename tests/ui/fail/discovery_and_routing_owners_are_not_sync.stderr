@@ -5,6 +5,11 @@ error[E0277]: `*mut grafton_ndi::sys::bindings::NDIlib_routing_instance_type` ca
    |                   ^^^^^^ `*mut grafton_ndi::sys::bindings::NDIlib_routing_instance_type` cannot be shared between threads safely
    |
    = help: within `Router`, the trait `Sync` is not implemented for `*mut grafton_ndi::sys::bindings::NDIlib_routing_instance_type`
+note: required because it appears within the type `routing::RoutingInstance`
+  --> src/routing.rs
+   |
+   | struct RoutingInstance(NDIlib_routing_instance_t);
+   |        ^^^^^^^^^^^^^^^
 note: required because it appears within the type `Router`
   --> src/routing.rs
    |
@@ -23,6 +28,21 @@ error[E0277]: `*mut grafton_ndi::sys::bindings::NDIlib_send_advertiser_instance_
    |                   ^^^^^^^^^^^^^^ `*mut grafton_ndi::sys::bindings::NDIlib_send_advertiser_instance_type` cannot be shared between threads safely
    |
    = help: within `SendAdvertiser`, the trait `Sync` is not implemented for `*mut grafton_ndi::sys::bindings::NDIlib_send_advertiser_instance_type`
+note: required because it appears within the type `discovery::SendAdvertiserInstance`
+  --> src/discovery/mod.rs
+   |
+   |     SendAdvertiserInstance,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `Option<discovery::SendAdvertiserInstance>`
+  --> $RUST/core/src/option.rs
+   |
+   | pub enum Option<T> {
+   |          ^^^^^^
+note: required because it appears within the type `discovery::ServerObject<grafton_ndi::sys::api::SenderAdvertising>`
+  --> src/discovery/mod.rs
+   |
+   | struct ServerObject<A: ServerApi> {
+   |        ^^^^^^^^^^^^
 note: required because it appears within the type `discovery::advertiser::Advertiser<grafton_ndi::sys::api::SenderAdvertising>`
   --> src/discovery/advertiser.rs
    |
@@ -46,6 +66,21 @@ error[E0277]: `*mut grafton_ndi::sys::bindings::NDIlib_recv_advertiser_instance_
    |                   ^^^^^^^^^^^^^^ `*mut grafton_ndi::sys::bindings::NDIlib_recv_advertiser_instance_type` cannot be shared between threads safely
    |
    = help: within `RecvAdvertiser`, the trait `Sync` is not implemented for `*mut grafton_ndi::sys::bindings::NDIlib_recv_advertiser_instance_type`
+note: required because it appears within the type `discovery::RecvAdvertiserInstance`
+  --> src/discovery/mod.rs
+   |
+   |     RecvAdvertiserInstance,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `Option<discovery::RecvAdvertiserInstance>`
+  --> $RUST/core/src/option.rs
+   |
+   | pub enum Option<T> {
+   |          ^^^^^^
+note: required because it appears within the type `discovery::ServerObject<grafton_ndi::sys::api::ReceiverAdvertising>`
+  --> src/discovery/mod.rs
+   |
+   | struct ServerObject<A: ServerApi> {
+   |        ^^^^^^^^^^^^
 note: required because it appears within the type `discovery::advertiser::Advertiser<grafton_ndi::sys::api::ReceiverAdvertising>`
   --> src/discovery/advertiser.rs
    |
@@ -69,10 +104,25 @@ error[E0277]: `*mut grafton_ndi::sys::bindings::NDIlib_send_listener_instance_ty
    |                   ^^^^^^^^^^^^ `*mut grafton_ndi::sys::bindings::NDIlib_send_listener_instance_type` cannot be shared between threads safely
    |
    = help: within `SendListener`, the trait `Sync` is not implemented for `*mut grafton_ndi::sys::bindings::NDIlib_send_listener_instance_type`
+note: required because it appears within the type `discovery::SendListenerInstance`
+  --> src/discovery/mod.rs
+   |
+   |     SendListenerInstance,
+   |     ^^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `Option<discovery::SendListenerInstance>`
+  --> $RUST/core/src/option.rs
+   |
+   | pub enum Option<T> {
+   |          ^^^^^^
+note: required because it appears within the type `discovery::ServerObject<grafton_ndi::sys::api::SenderDiscovery>`
+  --> src/discovery/mod.rs
+   |
+   | struct ServerObject<A: ServerApi> {
+   |        ^^^^^^^^^^^^
 note: required because it appears within the type `discovery::listener::Listener<grafton_ndi::sys::api::SenderDiscovery>`
   --> src/discovery/listener.rs
    |
-   | struct Listener<A: ListenerApi> {
+   | struct Listener<A: ListenerApi>(ServerObject<A>);
    |        ^^^^^^^^
 note: required because it appears within the type `SendListener`
   --> src/discovery/listener.rs
@@ -92,10 +142,25 @@ error[E0277]: `*mut grafton_ndi::sys::bindings::NDIlib_recv_listener_instance_ty
    |                   ^^^^^^^^^^^^ `*mut grafton_ndi::sys::bindings::NDIlib_recv_listener_instance_type` cannot be shared between threads safely
    |
    = help: within `RecvListener`, the trait `Sync` is not implemented for `*mut grafton_ndi::sys::bindings::NDIlib_recv_listener_instance_type`
+note: required because it appears within the type `discovery::RecvListenerInstance`
+  --> src/discovery/mod.rs
+   |
+   |     RecvListenerInstance,
+   |     ^^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `Option<discovery::RecvListenerInstance>`
+  --> $RUST/core/src/option.rs
+   |
+   | pub enum Option<T> {
+   |          ^^^^^^
+note: required because it appears within the type `discovery::ServerObject<grafton_ndi::sys::api::ReceiverDiscovery>`
+  --> src/discovery/mod.rs
+   |
+   | struct ServerObject<A: ServerApi> {
+   |        ^^^^^^^^^^^^
 note: required because it appears within the type `discovery::listener::Listener<grafton_ndi::sys::api::ReceiverDiscovery>`
   --> src/discovery/listener.rs
    |
-   | struct Listener<A: ListenerApi> {
+   | struct Listener<A: ListenerApi>(ServerObject<A>);
    |        ^^^^^^^^
 note: required because it appears within the type `RecvListener`
   --> src/discovery/listener.rs

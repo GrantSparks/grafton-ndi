@@ -124,8 +124,7 @@ impl LiveSource {
             crate::Finder::new(ndi, &crate::FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
         let source = finder
             .find_source(PATIENCE, |source| {
-                source.name() == name
-                    && matches!(source.address(), Some(crate::SourceAddress::Ip(_)))
+                source.name() == name && source.address().is_some_and(|address| !address.is_url())
             })
             .unwrap()
             .unwrap_or_else(|| panic!("{name} was not discovered"));
@@ -134,7 +133,7 @@ impl LiveSource {
             .unwrap()
             .port()
             .expect("an address with a port");
-        let selected = source.with_address(crate::SourceAddress::Ip(format!("127.0.0.1:{port}")));
+        let selected = source.with_address(crate::SourceAddress::new(format!("127.0.0.1:{port}")));
         SourceSpec::try_from(&selected).unwrap()
     }
 }
@@ -927,10 +926,7 @@ fn the_file_library_stays_selected_after_its_handles_are_dropped() {
                 &ndi,
                 &FileRuntimeOptions::default().library_path(selected.with_file_name("other"))
             ),
-            Err(Error::RuntimeConflict {
-                kind: crate::SelectionConflict::DifferentLibrary,
-                ..
-            })
+            Err(Error::RuntimeConflict(failure)) if failure.kind() == crate::SelectionConflict::DifferentLibrary
         ));
         FileApi::open(&ndi, &FileRuntimeOptions::default().library_path(selected)).unwrap();
     }

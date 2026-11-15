@@ -98,6 +98,8 @@ fn native_resource_ownership() {
     ];
     if cfg!(feature = "advanced") {
         scenarios.extend([
+            "compressed_destroy",
+            "compressed_close",
             "queue_immediate",
             "queue_backlog",
             "queue_split",
@@ -119,7 +121,7 @@ fn native_resource_ownership() {
                 "GRAFTON_OWNERSHIP_LIBRARY",
                 if case == "queue_scatter_unavailable" {
                     &missing_scatter
-                } else if case.starts_with("queue_") {
+                } else if case.starts_with("queue_") || case.starts_with("compressed_") {
                     &advanced
                 } else {
                     &standard
@@ -171,7 +173,7 @@ fn native_resource_ownership() {
     fs::remove_dir_all(directory).unwrap();
 }
 fn child(case: &str) {
-    let advanced = case.starts_with("queue_");
+    let advanced = case.starts_with("queue_") || case.starts_with("compressed_");
     let path = PathBuf::from(std::env::var_os("GRAFTON_OWNERSHIP_LIBRARY").unwrap());
     let ndi = Ndi::with_options(&RuntimeOptions::default().library_path(path).edition(
         if advanced {
@@ -193,6 +195,49 @@ fn child(case: &str) {
         }
     }
     match case {
+        #[cfg(feature = "advanced")]
+        "compressed_destroy" | "compressed_close" => {
+            use grafton_ndi::{
+                advanced::{CompressedSender, CompressedVideoFrame, VideoCodec, VideoPacketFormat},
+                StreamTier,
+            };
+            std::env::set_var("GRAFTON_FAKE_VALIDATE_COMPRESSED_LOANS", "1");
+            let mut sender =
+                CompressedSender::new(&ndi, &SenderOptions::new("compressed-owner")).unwrap();
+            for (tier, value) in [(StreamTier::Program, 11), (StreamTier::Preview, 22)] {
+                let format = VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16)
+                    .unwrap()
+                    .with_tier(tier);
+                let frame = CompressedVideoFrame::new(format, vec![value; 16]).unwrap();
+                assert!(sender.send_video_async(frame).unwrap().is_none());
+            }
+            if case == "compressed_close" {
+                let reclaimed = sender.close();
+                assert_eq!(
+                    match reclaimed.program.unwrap() {
+                        grafton_ndi::advanced::SubmittedVideo::Contiguous(frame) => frame.data()[0],
+                        _ => panic!("contiguous program"),
+                    },
+                    11
+                );
+                assert_eq!(
+                    match reclaimed.preview.unwrap() {
+                        grafton_ndi::advanced::SubmittedVideo::Contiguous(frame) => frame.data()[0],
+                        _ => panic!("contiguous preview"),
+                    },
+                    22
+                );
+            } else {
+                drop(sender);
+            }
+            let events = log();
+            for value in [11, 22] {
+                let release = position(&events, &format!("sender-loan-released={value}"));
+                assert!(position(&events, "sender-destroy-begin") < release);
+                assert!(release < position(&events, "sender-destroy"));
+            }
+            assert_eq!(events.matches("sender-destroy\n").count(), 1);
+        }
         "sender_copy_reuse" => {
             use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
             std::env::set_var("GRAFTON_FAKE_VALIDATE_VIDEO_COPY", "1");

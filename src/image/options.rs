@@ -54,6 +54,21 @@ impl ImageFormat {
         }
     }
 
+    pub(super) fn quality_bounds(self) -> Option<std::ops::RangeInclusive<u8>> {
+        match self {
+            Self::Png | Self::WebpLossless => None,
+            Self::Jpeg(_) => Some(1..=100),
+            Self::WebpLossy(_) => Some(0..=100),
+        }
+    }
+
+    pub(super) const fn quality(self) -> Option<u8> {
+        match self {
+            Self::Png | Self::WebpLossless => None,
+            Self::Jpeg(quality) | Self::WebpLossy(quality) => Some(quality),
+        }
+    }
+
     /// The format's media type, for a data URL.
     pub(super) const fn media_type(self) -> &'static str {
         match self {
@@ -145,14 +160,14 @@ impl ImageFormat {
 ///
 /// # Memory
 ///
-/// PNG and JPEG convert at most one output row at a time, so their
-/// conversion scratch does not grow with the frame's height: none for a PNG
-/// of an RGBA frame, whose rows the codec reads in place, or for a JPEG,
-/// whose pixels convert straight into the codec's rows; one row otherwise.
+/// PNG and JPEG convert one output row at a time, so conversion scratch
+/// does not grow with frame height. PNG borrows eligible RGBA rows or
+/// retains one row; JPEG converts into the codec's rows and retains its
+/// final component row to avoid converting padding requests again.
 /// WebP encodes from one buffer, so it holds the whole converted
 /// image, unless full-size contiguous RGBA can be borrowed with alpha kept.
 /// Lossless WebP uses three channels with alpha discarded; lossy WebP
-/// uses four with opaque alpha. Lossy WebP also buffers the complete encoded
+/// uses four with opaque alpha. Both WebP formats buffer the complete encoded
 /// image before writing it. Codec state and encoded output take memory besides.
 /// Each concurrent encode owns its own buffers, so worker and queue limits
 /// matter alongside compressed image size.
@@ -172,7 +187,7 @@ impl ImageFormat {
 /// | A PQ or HLG frame with [`HdrPolicy::Refuse`] | [`Error::InvalidFrame`] |
 /// | Unreadable `ndi_color_info` with [`ColorPolicy::Sdk`] | [`Error::InvalidFrame`] |
 /// | An image wider or taller than JPEG's 65,535, lossless WebP's 16,384 or lossy WebP's 16,383 pixels | [`Error::InvalidFrame`] |
-/// | The writer given to `encode_image_to` fails | [`Error::Io`] |
+/// | Writing or flushing the writer given to `encode_image_to` fails | [`Error::Io`] |
 /// | The codec fails for another reason | [`Error::InvalidFrame`] |
 ///
 /// `ImageOptions` holds settings only, no buffers, so one value serves any
@@ -423,6 +438,15 @@ pub enum SampleDepth {
     Sixteen,
 }
 
+impl SampleDepth {
+    pub(super) const fn bytes(self) -> usize {
+        match self {
+            Self::Eight => 1,
+            Self::Sixteen => 2,
+        }
+    }
+}
+
 /// Whether a PNG or WebP image has an alpha channel.
 ///
 /// This enum is marked `#[non_exhaustive]` so that modes can be added without
@@ -436,6 +460,15 @@ pub enum AlphaMode {
     Keep,
     /// Write RGB, dropping any alpha.
     Discard,
+}
+
+impl AlphaMode {
+    pub(super) const fn keeps_alpha(self) -> bool {
+        match self {
+            Self::Keep => true,
+            Self::Discard => false,
+        }
+    }
 }
 
 /// What happens to a frame whose `ndi_color_info` gives the PQ or HLG

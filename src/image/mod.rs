@@ -22,13 +22,17 @@ pub use options::{
     SampleDepth, YuvRange,
 };
 
-use std::{io::Write, marker::PhantomData};
+use std::{
+    io::{self, Write},
+    marker::PhantomData,
+};
 
 use self::{
     color::Sample,
     downscale::{reduced, Downscaler},
     read::{Reader, Sink},
 };
+use crate::frames::VideoPartsExt;
 use crate::{
     color_info, frames::VideoParts, ColorInfo, ColorPrimaries, Error, PixelFormat, Result,
     TransferFunction, VideoPlane, VideoPlanes, YuvMatrix,
@@ -58,7 +62,7 @@ impl<'a> Source<'a> {
 
 /// Reusable conversion storage for still-image encoding.
 ///
-/// Keeps one PNG row, WebP's complete converted image, and downscale sums
+/// Keeps one PNG row or JPEG final row, WebP's complete converted image, and downscale sums
 /// at each sample depth. Capacity grows to the largest encode and remains
 /// retained until [`release`](Self::release) or drop. Each concurrent worker
 /// needs its own workspace. Codec state and encoded output are not retained;
@@ -104,9 +108,11 @@ impl ImageWorkspace {
     }
 
     /// Encode into a writer, reusing conversion scratch. A cleared `Vec<u8>`
-    /// also reuses output capacity. Lossy WebP buffers its complete result
-    /// before writing; other codecs write incrementally. Validation happens
-    /// before writing; a codec/writer failure may leave partial output.
+    /// also reuses output capacity. Both WebP formats buffer their complete
+    /// encoded result before writing; PNG and JPEG write incrementally.
+    /// Success means every byte was written and the writer was flushed.
+    /// Validation happens before writing; a codec/writer failure may leave
+    /// partial output.
     ///
     /// ```
     /// use grafton_ndi::{ImageWorkspace, ImageOptions, ImageFormat, PixelFormat, VideoFrame};
@@ -129,7 +135,7 @@ impl ImageWorkspace {
     ) -> Result<()> {
         let source = Source::new(frame);
         let plan = Plan::new(&source, options)?;
-        write_image(&source, plan, &mut out, self)
+        write_image(plan, &mut out, self)
     }
 
     fn encode_source(&mut self, source: Source<'_>, options: &ImageOptions) -> Result<Vec<u8>> {
@@ -139,14 +145,15 @@ impl ImageWorkspace {
             quality,
             effort,
             sharp_yuv,
+            shape,
         } = plan.codec
         {
-            return plan.with_pixels::<u8, _>(&source, &mut self.sums8, |pixels| {
-                webp::encode_lossy(pixels, quality, effort, sharp_yuv, &mut self.image)
+            return plan.with_pixels::<u8, _>(&mut self.sums8, |pixels| {
+                webp::encode_lossy(pixels, shape, quality, effort, sharp_yuv, &mut self.image)
             });
         }
         let mut image = Vec::new();
-        write_image(&source, plan, &mut image, self)?;
+        write_image(plan, &mut image, self)?;
         Ok(image)
     }
 }
@@ -158,55 +165,106 @@ pub(crate) fn encode_to(
     out: &mut dyn Write,
 ) -> Result<()> {
     let plan = Plan::new(&source, options)?;
-    write_image(&source, plan, out, &mut ImageWorkspace::new())
+    write_image(plan, out, &mut ImageWorkspace::new())
 }
 
-fn write_image(
-    source: &Source<'_>,
-    plan: Plan,
-    out: &mut dyn Write,
-    workspace: &mut ImageWorkspace,
-) -> Result<()> {
-    match plan.codec {
+fn write_image(plan: Plan<'_>, out: &mut dyn Write, workspace: &mut ImageWorkspace) -> Result<()> {
+    let mut out = KeepError { out, error: None };
+    let result = match plan.codec {
         Codec::Png {
-            depth: SampleDepth::Sixteen,
+            depth,
             compression,
             cicp,
-        } => plan.with_pixels::<u16, _>(source, &mut workspace.sums16, |pixels| {
-            png::encode(
+        } => match depth {
+            SampleDepth::Eight => plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
+                png::encode(
+                    pixels,
+                    plan.shape,
+                    compression,
+                    cicp,
+                    &mut out,
+                    &mut workspace.row,
+                )
+            }),
+            SampleDepth::Sixteen => plan.with_pixels::<u16, _>(&mut workspace.sums16, |pixels| {
+                png::encode(
+                    pixels,
+                    plan.shape,
+                    compression,
+                    cicp,
+                    &mut out,
+                    &mut workspace.row,
+                )
+            }),
+        },
+        Codec::Jpeg {
+            quality,
+            width,
+            height,
+        } => plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
+            jpeg::encode(
                 pixels,
-                plan.channels(),
-                compression,
-                cicp,
-                out,
+                quality,
+                width,
+                height,
+                plan.shape.row_bytes,
                 &mut workspace.row,
+                &mut out,
             )
         }),
-        codec => plan.with_pixels::<u8, _>(source, &mut workspace.sums8, |pixels| match codec {
-            Codec::Png {
-                compression, cicp, ..
-            } => png::encode(
+        Codec::WebpLossless { shape } => plan
+            .with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
+                webp::encode_lossless(pixels, shape, &mut out, &mut workspace.image)
+            }),
+        Codec::WebpLossy {
+            quality,
+            effort,
+            sharp_yuv,
+            shape,
+        } => plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
+            let image = webp::encode_lossy(
                 pixels,
-                plan.channels(),
-                compression,
-                cicp,
-                out,
-                &mut workspace.row,
-            ),
-            Codec::Jpeg { quality } => jpeg::encode(pixels, quality, out),
-            Codec::WebpLossless => {
-                webp::encode_lossless(pixels, plan.channels(), out, &mut workspace.image)
-            }
-            Codec::WebpLossy {
+                shape,
                 quality,
                 effort,
                 sharp_yuv,
-            } => {
-                let image =
-                    webp::encode_lossy(pixels, quality, effort, sharp_yuv, &mut workspace.image)?;
-                out.write_all(&image).map_err(Error::Io)
-            }
+                &mut workspace.image,
+            )?;
+            out.write_all(&image).map_err(Error::Io)
         }),
+    };
+    let result = result.and_then(|()| out.flush().map_err(Error::Io));
+    match out.error {
+        Some(error) => Err(Error::Io(error)),
+        None => result,
+    }
+}
+
+/// Preserve the first writer failure even when a codec replaces it with text.
+struct KeepError<'w> {
+    out: &'w mut dyn Write,
+    error: Option<io::Error>,
+}
+
+impl KeepError<'_> {
+    fn keep(&mut self, error: io::Error) -> io::Error {
+        // `write_all` retries interruptions; they do not end the encode.
+        if error.kind() == io::ErrorKind::Interrupted {
+            return error;
+        }
+        let copy = io::Error::new(error.kind(), error.to_string());
+        self.error.get_or_insert(error);
+        copy
+    }
+}
+
+impl Write for KeepError<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.out.write(buf).map_err(|error| self.keep(error))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush().map_err(|error| self.keep(error))
     }
 }
 
@@ -253,17 +311,83 @@ pub(crate) fn encode_data_url(source: Source<'_>, options: &ImageOptions) -> Res
 /// What an encode resolves its options and frame to. Building one makes
 /// every check, so an encode that has a plan writes a whole image unless its
 /// writer or codec fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Plan {
+struct Plan<'a> {
+    source: &'a Source<'a>,
     codec: Codec,
-    /// The conversion of a YUV frame.
+    shape: ImageShape,
     matrix: YuvMatrix,
     range: YuvRange,
-    /// Whether the image has an alpha channel.
     alpha: bool,
-    /// log2 of the reduction.
     shift: u32,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Channels {
+    Rgb,
+    Rgba,
+}
+
+impl Channels {
+    const fn count(self) -> usize {
+        match self {
+            Self::Rgb => 3,
+            Self::Rgba => 4,
+        }
+    }
+
+    const fn from_alpha(alpha: bool) -> Self {
+        if alpha {
+            Self::Rgba
+        } else {
+            Self::Rgb
+        }
+    }
+}
+
+/// Checked row geometry. Row codecs do not require a whole-image product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImageShape {
+    width: u32,
+    height: u32,
+    channels: Channels,
+    row_bytes: usize,
+}
+
+impl ImageShape {
+    fn new(width: usize, height: usize, channels: Channels, sample_bytes: usize) -> Result<Self> {
+        let row_bytes = packed_len(width, 1, channels.count() * sample_bytes)?;
+        let dimension = |value| {
+            u32::try_from(value).map_err(|_| Error::InvalidFrame("image dimension overflow".into()))
+        };
+        Ok(Self {
+            width: dimension(width)?,
+            height: dimension(height)?,
+            channels,
+            row_bytes,
+        })
+    }
+
+    fn buffered(self) -> Result<BufferedImageShape> {
+        let image_bytes = self
+            .row_bytes
+            .checked_mul(self.height as usize)
+            .ok_or_else(|| Error::InvalidFrame("image scratch size overflow".into()))?;
+        Ok(BufferedImageShape {
+            rows: self,
+            image_bytes,
+        })
+    }
+}
+
+/// Whole-image codecs additionally carry their checked allocation size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BufferedImageShape {
+    rows: ImageShape,
+    image_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JpegQuality(u8);
 
 /// The codec and its settings, valid for the frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,32 +399,34 @@ enum Codec {
         cicp: Option<[u8; 4]>,
     },
     /// Quality in 1 to 100, dimensions within JPEG's limit.
-    Jpeg { quality: u8 },
+    Jpeg {
+        quality: JpegQuality,
+        width: u16,
+        height: u16,
+    },
     /// Dimensions within WebP's limit.
-    WebpLossless,
+    WebpLossless { shape: BufferedImageShape },
     /// Quality in 0 to 100, dimensions within lossy WebP's limit.
     WebpLossy {
+        shape: BufferedImageShape,
         quality: u8,
         effort: u8,
         sharp_yuv: bool,
     },
 }
 
-impl Plan {
+impl<'a> Plan<'a> {
     /// Check `options` with `source`, in this order: the options alone, then
     /// the frame's color description, its HDR transfer, and the image's size.
-    fn new(source: &Source<'_>, options: &ImageOptions) -> Result<Self> {
+    fn new(source: &'a Source<'a>, options: &ImageOptions) -> Result<Self> {
         let format = options.format;
-        let quality_range = match format {
-            ImageFormat::Jpeg(quality) => Some((quality, 1)),
-            ImageFormat::WebpLossy(quality) => Some((quality, 0)),
-            _ => None,
-        };
-        if let Some((quality, min)) = quality_range {
-            if !(min..=100).contains(&quality) {
+        if let Some((quality, bounds)) = format.quality().zip(format.quality_bounds()) {
+            if !bounds.contains(&quality) {
                 return Err(Error::InvalidInput(format!(
-                    "{} quality must be in {min}..=100, got {quality}",
-                    format.name()
+                    "{} quality must be in {}..={}, got {quality}",
+                    format.name(),
+                    bounds.start(),
+                    bounds.end()
                 )));
             }
         }
@@ -353,58 +479,58 @@ impl Plan {
 
         let shift = options.downscale.shift();
         let (width, height) = (reduced(source.width, shift), reduced(source.height, shift));
+        let alpha = options.alpha.keeps_alpha() && !matches!(format, ImageFormat::Jpeg(_));
+        let channels = match format {
+            ImageFormat::WebpLossy(_) => Channels::Rgba,
+            ImageFormat::Png | ImageFormat::Jpeg(_) | ImageFormat::WebpLossless => {
+                Channels::from_alpha(alpha)
+            }
+        };
+        let sample_bytes = match format {
+            ImageFormat::Png => options.depth.bytes(),
+            ImageFormat::Jpeg(_) | ImageFormat::WebpLossless | ImageFormat::WebpLossy(_) => 1,
+        };
+        // Preserve codec dimension diagnostics before checking conversion storage.
+        match format {
+            ImageFormat::Png => {}
+            ImageFormat::Jpeg(_) => check_size("JPEG", width, height, jpeg::MAX_DIMENSION)?,
+            ImageFormat::WebpLossless => {
+                check_size("WebP", width, height, webp::MAX_LOSSLESS_DIMENSION)?
+            }
+            ImageFormat::WebpLossy(_) => {
+                check_size("WebP", width, height, webp::MAX_LOSSY_DIMENSION)?
+            }
+        }
+        let shape = ImageShape::new(width, height, channels, sample_bytes)?;
         let codec = match format {
             ImageFormat::Png => Codec::Png {
                 depth: options.depth,
                 compression: options.png_compression,
                 cicp: color.and_then(|color| cicp(&color)),
             },
-            ImageFormat::Jpeg(quality) => {
-                check_size("JPEG", width, height, jpeg::MAX_DIMENSION)?;
-                Codec::Jpeg { quality }
-            }
-            ImageFormat::WebpLossless => {
-                check_size("WebP", width, height, webp::MAX_LOSSLESS_DIMENSION)?;
-                Codec::WebpLossless
-            }
-            ImageFormat::WebpLossy(quality) => {
-                check_size("WebP", width, height, webp::MAX_LOSSY_DIMENSION)?;
-                Codec::WebpLossy {
-                    quality,
-                    effort: options.webp_effort,
-                    sharp_yuv: options.webp_sharp_yuv,
-                }
-            }
+            // The dimension gates above establish these exact representations.
+            ImageFormat::Jpeg(quality) => Codec::Jpeg {
+                quality: JpegQuality(quality),
+                width: shape.width as u16,
+                height: shape.height as u16,
+            },
+            ImageFormat::WebpLossless => Codec::WebpLossless {
+                shape: shape.buffered()?,
+            },
+            ImageFormat::WebpLossy(quality) => Codec::WebpLossy {
+                shape: shape.buffered()?,
+                quality,
+                effort: options.webp_effort,
+                sharp_yuv: options.webp_sharp_yuv,
+            },
         };
-        let alpha = options.alpha == AlphaMode::Keep && !matches!(codec, Codec::Jpeg { .. });
-        let channels = if alpha { 4 } else { 3 };
-        let wide = matches!(
-            codec,
-            Codec::Png {
-                depth: SampleDepth::Sixteen,
-                ..
-            }
-        );
-        // Check conversion geometry before any codec can write a header.
-        // In particular, 16-bit PNG rows can exceed the source row size on
-        // 32-bit targets. Row codecs must not require a whole-image product.
-        match codec {
-            Codec::Png { .. } => {
-                packed_len(width, 1, channels * if wide { 2 } else { 1 })?;
-            }
-            Codec::WebpLossless => {
-                packed_len(width, height, channels)?;
-            }
-            Codec::WebpLossy { .. } => {
-                packed_len(width, height, 4)?;
-            }
-            Codec::Jpeg { .. } => {}
-        }
         if shift > 0 {
-            packed_len(width, 1, if wide { 32 } else { 16 })?;
+            packed_len(width, 1, if sample_bytes == 2 { 32 } else { 16 })?;
         }
         Ok(Self {
+            source,
             codec,
+            shape,
             matrix,
             range,
             alpha,
@@ -412,13 +538,9 @@ impl Plan {
         })
     }
 
-    /// The image's channels: RGBA or RGB.
-    fn channels(&self) -> usize {
-        if self.alpha {
-            4
-        } else {
-            3
-        }
+    #[cfg(test)]
+    fn channels(&self) -> Channels {
+        self.shape.channels
     }
 
     /// Lend the retained sums to a single encode, restoring them even when
@@ -426,11 +548,10 @@ impl Plan {
     /// leaves the workspace valid for reuse.
     fn with_pixels<P: Sample, T>(
         &self,
-        source: &Source<'_>,
         sums: &mut Vec<[P::Sum; 4]>,
         encode: impl FnOnce(&mut Pixels<'_, P>) -> Result<T>,
     ) -> Result<T> {
-        let reader = Reader::new(source, self.matrix, self.range, self.alpha);
+        let reader = Reader::new(self.source, self.matrix, self.range, self.alpha);
         let downscaler = if self.shift > 0 {
             resize_scratch(sums, reduced(reader.width(), self.shift))?;
             Some(Downscaler::with_sums(
@@ -451,8 +572,8 @@ impl Plan {
 
     /// The pixel pipeline for tests of individual conversion stages.
     #[cfg(test)]
-    fn pixels<'a, P: Sample>(&self, source: &Source<'a>) -> Pixels<'a, P> {
-        let reader = Reader::new(source, self.matrix, self.range, self.alpha);
+    fn pixels<P: Sample>(&self) -> Pixels<'a, P> {
+        let reader = Reader::new(self.source, self.matrix, self.range, self.alpha);
         let downscaler = (self.shift > 0).then(|| Downscaler::new(&reader, self.shift));
         Pixels { reader, downscaler }
     }
@@ -460,11 +581,10 @@ impl Plan {
 
 /// The PQ or HLG transfer of a color description, named for messages.
 fn hdr_transfer(color: &ColorInfo) -> Option<&'static str> {
-    match color.transfer()? {
-        TransferFunction::Pq => Some("PQ"),
-        TransferFunction::Hlg => Some("HLG"),
-        _ => None,
-    }
+    color
+        .transfer()
+        .filter(|transfer| transfer.is_hdr())
+        .map(TransferFunction::name)
 }
 
 /// The `cICP` chunk of a PNG whose colors an untagged viewer would show
@@ -477,17 +597,8 @@ fn hdr_transfer(color: &ColorInfo) -> Option<&'static str> {
 /// curve. The matrix is 0, the only one PNG allows for RGB, and the range
 /// flag 1, because the RGB written is full range.
 fn cicp(color: &ColorInfo) -> Option<[u8; 4]> {
-    let transfer = match color.transfer() {
-        Some(TransferFunction::Pq) => 16,
-        Some(TransferFunction::Hlg) => 18,
-        _ => 1,
-    };
-    let primaries = match color.primaries() {
-        Some(ColorPrimaries::Bt709) => 1,
-        Some(ColorPrimaries::Bt601) => 6,
-        Some(ColorPrimaries::Bt2020) => 9,
-        None => 2,
-    };
+    let transfer = color.transfer().map_or(1, TransferFunction::h273_code);
+    let primaries = color.primaries().map_or(2, ColorPrimaries::h273_code);
     (primaries == 9 || color.is_hdr()).then_some([primaries, transfer, 0, 1])
 }
 
@@ -512,14 +623,17 @@ struct Pixels<'a, P: Sample> {
 
 impl<'a, P: Sample> Pixels<'a, P> {
     /// log2 of the reduction.
+    #[cfg(test)]
     fn shift(&self) -> u32 {
         self.downscaler.as_ref().map_or(0, Downscaler::shift)
     }
 
+    #[cfg(test)]
     fn width(&self) -> usize {
         reduced(self.reader.width(), self.shift())
     }
 
+    #[cfg(test)]
     fn height(&self) -> usize {
         reduced(self.reader.height(), self.shift())
     }
@@ -543,10 +657,10 @@ impl<'a, P: Sample> Pixels<'a, P> {
 
     /// Convert row `y` into `row`, packed as `channels` samples a pixel in
     /// PNG's byte order: big-endian at 16 bits.
-    fn pack_row(&mut self, y: usize, channels: usize, row: &mut [u8]) {
-        match channels {
-            4 => self.row(y, &mut Packed::<P, 4>::new(row)),
-            _ => self.row(y, &mut Packed::<P, 3>::new(row)),
+    fn pack_row(&mut self, y: usize, components: Channels, row: &mut [u8]) {
+        match components {
+            Channels::Rgba => self.row(y, &mut Packed::<P, 4>::new(row)),
+            Channels::Rgb => self.row(y, &mut Packed::<P, 3>::new(row)),
         }
     }
 }

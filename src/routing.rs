@@ -14,7 +14,7 @@
 //! let mut router = Router::new(&ndi, &RouterOptions::new("Program"))?;
 //!
 //! let finder = Finder::new(&ndi, &FinderOptions::default())?;
-//! finder.wait_for_sources(Duration::from_secs(2))?;
+//! finder.watch().wait_for_change(Duration::from_secs(2))?;
 //! if let Some(camera) = finder.current_sources()?.first() {
 //!     router.change(camera)?;
 //! }
@@ -109,6 +109,13 @@ impl RouterOptions {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RoutingInstance(NDIlib_routing_instance_t);
+
+// SAFETY: routing handles have no thread affinity. Router owns this handle
+// exclusively and is not Sync, so its native calls and destruction cannot overlap.
+unsafe impl Send for RoutingInstance {}
+
 /// A native routing source. Dropping it removes its advertisement.
 ///
 /// # Threading
@@ -118,7 +125,7 @@ impl RouterOptions {
 /// threads share, put it in a [`Mutex`](std::sync::Mutex), which is `Sync`
 /// because the router is `Send`.
 pub struct Router {
-    instance: NDIlib_routing_instance_t,
+    instance: RoutingInstance,
     routing: &'static sys::Routing,
     _name: CString,
     _groups: Option<CString>,
@@ -126,12 +133,6 @@ pub struct Router {
     _config: Option<crate::advanced::AdvancedConfig>,
     _ndi: Ndi,
 }
-
-// SAFETY: the SDK attaches no routing instance to the thread that created it;
-// its objects may be used and destroyed from any thread as long as calls on one
-// object do not overlap. A router has exactly one owner and is not `Sync`, so
-// its calls cannot overlap, and everything else it holds is `Send`.
-unsafe impl Send for Router {}
 
 const _: () = {
     const fn assert_send<T: Send>() {}
@@ -212,7 +213,7 @@ impl Router {
             return Err(Error::NativeOperationFailed { operation });
         }
         Ok(Self {
-            instance,
+            instance: RoutingInstance(instance),
             routing,
             _name: name,
             _groups: groups,
@@ -225,7 +226,7 @@ impl Router {
     /// The native router, for calls through an Advanced table.
     #[cfg(all(feature = "advanced", ndi_has_advanced_router_connection_metadata))]
     pub(crate) fn native_instance(&self) -> NDIlib_routing_instance_t {
-        self.instance
+        self.instance.0
     }
 
     /// The runtime this router was created through.
@@ -244,7 +245,10 @@ impl Router {
     pub fn change(&mut self, source: &Source) -> Result<()> {
         let raw = source.to_raw()?;
         // SAFETY: the router is live and `raw` owns the strings it points to.
-        if unsafe { self.routing.NDIlib_routing_change(self.instance, &raw.raw) } {
+        if unsafe {
+            self.routing
+                .NDIlib_routing_change(self.instance.0, raw.as_raw())
+        } {
             Ok(())
         } else {
             Err(Error::NativeOperationFailed {
@@ -259,7 +263,7 @@ impl Router {
     /// Returns [`Error::NativeOperationFailed`] when the SDK rejects the change.
     pub fn clear(&mut self) -> Result<()> {
         // SAFETY: the router instance is live for this borrow.
-        if unsafe { self.routing.NDIlib_routing_clear(self.instance) } {
+        if unsafe { self.routing.NDIlib_routing_clear(self.instance.0) } {
             Ok(())
         } else {
             Err(Error::NativeOperationFailed {
@@ -283,7 +287,7 @@ impl Router {
         // SAFETY: the router instance is live for this borrow.
         let count = unsafe {
             self.routing
-                .NDIlib_routing_get_no_connections(self.instance, timeout)
+                .NDIlib_routing_get_no_connections(self.instance.0, timeout)
         };
         u32::try_from(count).map_err(|_| {
             Error::UnexpectedSdkResult(format!(
@@ -305,7 +309,7 @@ impl Router {
         // valid until the router is destroyed, after this copy completes.
         unsafe {
             Source::try_from_raw(
-                self.routing.NDIlib_routing_get_source_name(self.instance),
+                self.routing.NDIlib_routing_get_source_name(self.instance.0),
                 "NDIlib_routing_get_source_name",
             )
         }
@@ -315,6 +319,6 @@ impl Router {
 impl Drop for Router {
     fn drop(&mut self) {
         // SAFETY: the instance was created by this table and is destroyed once.
-        unsafe { self.routing.NDIlib_routing_destroy(self.instance) };
+        unsafe { self.routing.NDIlib_routing_destroy(self.instance.0) };
     }
 }

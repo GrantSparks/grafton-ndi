@@ -93,7 +93,8 @@
 //! `loaded_any()` distinguishes code that loaded and was refused from locations
 //! that could not be opened; `Display` retains the diagnostic text, including
 //! the operating system's own. [`Error::RuntimeConflict`] carries a
-//! [`crate::SelectionConflict`] beside its diagnostic context.
+//! [`crate::SelectionFailure`] with a typed kind and selected, requested or
+//! foreign module paths, alongside its diagnostic text.
 //!
 //! On dynamically loaded, non-Apple ELF targets, a runtime already linked or
 //! preloaded into the process's global symbol scope must also be the selected
@@ -806,6 +807,10 @@ impl Ndi {
     /// obtained without its gate or be reported as another capability.
     pub(crate) fn table<T: sys::Table>(&self) -> Result<&'static T> {
         T::of(self.runtime.selected)
+    }
+
+    pub(crate) fn evidence(&self) -> sys::Evidence<'static> {
+        self.runtime.selected.evidence()
     }
 
     /// The receiver color format that selects `preset`, or the error

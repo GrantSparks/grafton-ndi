@@ -20,8 +20,9 @@ For `RuntimeLoadFailed`, inspect the attempted paths and errors, then check the
 `RuntimeOptions::library_path` selects one file without fallback. Verify its
 architecture and dependencies as well as its name.
 
-For `RuntimeConflict`, inspect the selected path and edition. A successful
-selection lasts for the process, so configure it before another component
+For `RuntimeConflict(failure)`, inspect `failure.kind()`, `selected()`,
+`requested()` and `foreign_module()` alongside the selected runtime edition.
+A successful selection lasts for the process, so configure it before another component
 initializes NDI. Restart after changing the selected library.
 
 `SelectionConflict::ForeignRuntimeInScope` or
@@ -32,7 +33,7 @@ remove the other runtime's direct link or preload. Matching its version or
 edition does not make two different runtime modules interchangeable. A Standard
 runtime in scope also prevents selecting a separate Advanced runtime.
 
-For `UnsupportedCapability`, inspect its feature and reason, then check
+For `UnsupportedCapability`, inspect its feature and typed `refusal` (`reason()` gives its category), then check
 [runtime capabilities](setup.md#runtime-capabilities). A Cargo feature, SDK
 edition or exported entry point alone does not establish hardware support or
 license entitlement.

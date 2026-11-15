@@ -56,6 +56,37 @@ fn generated_session_timecodes_reach_the_native_start_unchanged() {
 }
 
 #[test]
+fn every_session_exit_issues_exactly_one_native_stop() {
+    for ending in 0..4 {
+        let device = mock::Recorder::new(Closing::AtStop);
+        let mut recorder = recording_on(&device);
+        recorder.poll_event(Duration::ZERO).unwrap();
+        match ending {
+            0 => {
+                recorder.request_stop();
+            }
+            1 => device.end_session_itself(),
+            2 => device.push(mock::ERROR, mock::TAKE),
+            3 => {
+                device.dropped_events.store(1, Ordering::Release);
+                device.close();
+            }
+            _ => unreachable!(),
+        }
+        while recorder.poll_event(Duration::ZERO).unwrap().is_some() {}
+        assert!(matches!(
+            recorder.state(),
+            RecorderState::Closed | RecorderState::Indeterminate
+        ));
+        assert_eq!(device.stops.load(Ordering::Acquire), 1, "ending {ending}");
+        recorder.request_stop();
+        drop(recorder);
+        assert_eq!(device.stops.load(Ordering::Acquire), 1, "ending {ending}");
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    }
+}
+
+#[test]
 fn a_timeout_keeps_the_recorder_and_a_later_close_completes_without_a_second_stop() {
     let device = mock::Recorder::new(Closing::Never);
     let mut recorder = recording_on(&device);
@@ -539,14 +570,14 @@ fn malformed_player_options_are_refused_before_the_sdk_creates_a_player() {
 
 #[test]
 fn a_family_the_library_lacks_is_refused_as_that_capability_by_the_entry_point_it_is_missing() {
-    use crate::capabilities::{CapabilityStatus, CapabilityUnavailable};
+    use crate::capabilities::CapabilityUnavailable;
     let api = FileApi::with_runtime(sys::FileRuntime::test_double(
         Err(c"NDIlib_file_player_seek_to_frame"),
         Ok(mock::recording()),
     ));
     assert_eq!(
-        api.status(FileFamily::Playback),
-        CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+        (api.status(FileFamily::Playback)).reason(),
+        Some(CapabilityUnavailable::SymbolUnavailable)
     );
     assert!(!api.supports(FileFamily::Playback));
     assert!(api.supports(FileFamily::Recording));
@@ -559,11 +590,11 @@ fn a_family_the_library_lacks_is_refused_as_that_capability_by_the_entry_point_i
             .unwrap_err(),
         api.create_player(&PlayerOptions::new("")).unwrap_err(),
     ] {
-        let Error::FileFamilyUnavailable { family, detail } = error else {
+        let Error::FileFamilyUnavailable { family, missing } = error else {
             panic!("expected the playback family to be unavailable: {error}");
         };
         assert_eq!(family, FileFamily::Playback);
-        assert_eq!(detail, "NDIlib_file_player_seek_to_frame");
+        assert_eq!(missing, c"NDIlib_file_player_seek_to_frame");
     }
     // The family the library provides is unaffected.
     let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap());
@@ -617,6 +648,25 @@ fn finishing_a_session_the_sdk_is_ending_itself_still_tells_it_to_stop() {
         .start(&target("second"), RecordingTimecode::Preserve)
         .unwrap();
     assert_eq!(device.stops.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn a_malformed_stale_event_refuses_sync_start_before_the_native_call() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    device.install();
+    let mut recorder = mock::recorder_api()
+        .create_recorder(&RecorderOptions::new(
+            SourceSpec::new("mock source").unwrap(),
+        ))
+        .unwrap();
+    device.push(mock::OPEN_FAILED, "old.mkv");
+    device.oversize_next_event.store(true, Ordering::Release);
+    assert!(matches!(
+        recorder.start(&target("malformed-stale"), RecordingTimecode::Preserve),
+        Err(Error::UnexpectedSdkResult(_))
+    ));
+    assert_eq!(device.starts.load(Ordering::Acquire), 0);
+    assert_eq!(recorder.state(), RecorderState::Idle);
 }
 
 #[test]
@@ -680,6 +730,27 @@ fn the_source_can_be_changed_after_a_session_that_ended_unconfirmed() {
 }
 
 #[test]
+fn waiting_on_a_final_report_preserves_queued_out_of_session_events() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    let mut recorder = recording_on(&device);
+    assert!(matches!(
+        recorder.finish(Duration::ZERO).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    device.push(mock::OPEN_FAILED, "later.mkv");
+    let before = device.captures.load(Ordering::Acquire);
+    assert!(matches!(
+        recorder.wait_finished(Duration::ZERO).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    assert_eq!(device.captures.load(Ordering::Acquire), before);
+    assert_eq!(
+        recorder.poll_event(Duration::ZERO).unwrap().unwrap().kind(),
+        RecorderEventKind::OpenFailed
+    );
+}
+
+#[test]
 fn finishing_without_a_wait_reports_a_close_the_stop_already_queued() {
     let device = mock::Recorder::new(Closing::AtStop);
     let mut recorder = recording_on(&device);
@@ -700,7 +771,7 @@ fn a_wait_that_ends_during_a_slow_stop_still_takes_the_queued_close() {
     let deadline = Deadline::after(Duration::from_millis(10)).unwrap();
     recorder.request_stop();
     assert!(deadline.is_expired());
-    let outcome = recorder.wait_finished_from(deadline, |_| false).unwrap();
+    let outcome = recorder.wait_until(deadline).unwrap();
     assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
 }
 
@@ -1094,7 +1165,7 @@ fn players_borrow_their_options() {
 fn selected_endpoints_and_deliberate_names_cross_creation_and_source_change() {
     use crate::{Source, SourceAddress};
     let selected =
-        Source::new("STUDIO (Camera 2)").with_address(SourceAddress::Ip("192.0.2.10:5962".into()));
+        Source::new("STUDIO (Camera 2)").with_address(SourceAddress::new("192.0.2.10:5962"));
     let spec = SourceSpec::try_from(&selected).unwrap();
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
@@ -1102,9 +1173,8 @@ fn selected_endpoints_and_deliberate_names_cross_creation_and_source_change() {
         .create_recorder(&RecorderOptions::new(spec.clone()))
         .unwrap();
     assert_eq!(recorder.last_accepted_source(), Some(&spec));
-    let second = Source::new("STUDIO (Program)").with_address(SourceAddress::Url(
-        "ndi://camera.local:5963/path?opaque=1".into(),
-    ));
+    let second = Source::new("STUDIO (Program)")
+        .with_address(SourceAddress::new("ndi://camera.local:5963/path?opaque=1"));
     recorder
         .set_source(&SourceSpec::try_from(&second).unwrap())
         .unwrap();
@@ -1120,10 +1190,10 @@ fn selected_endpoints_and_deliberate_names_cross_creation_and_source_change() {
         ]
     );
     let before = recorder.last_accepted_source().unwrap().clone();
-    assert!(SourceSpec::try_from(
-        &Source::new("valid name").with_address(SourceAddress::Ip("".into()))
-    )
-    .is_err());
+    assert!(
+        SourceSpec::try_from(&Source::new("valid name").with_address(SourceAddress::new("")))
+            .is_err()
+    );
     assert_eq!(recorder.last_accepted_source(), Some(&before));
     assert_eq!(device.source_changes.load(Ordering::Acquire), 2);
 }

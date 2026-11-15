@@ -41,10 +41,11 @@ macro_rules! lacks {
 
 #[test]
 fn split_views_stay_on_the_borrowing_thread() {
-    use grafton_ndi::FrameSyncCapture;
+    use grafton_ndi::{FrameSyncCapture, SourceWatch};
     lacks! {
         FrameSyncCapture<'static>: Send;
         FrameSyncCapture<'static>: Sync;
+        SourceWatch<'static>: Sync;
     }
     #[cfg(feature = "advanced")]
     {
@@ -133,6 +134,7 @@ fn crate_root_types_keep_their_auto_traits() {
         Source: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceAddress: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceCache: Send, Sync, UnwindSafe, RefUnwindSafe;
+        SourceWatch<'static>: Send, UnwindSafe;
         SourceNameChange: Send, Sync, UnwindSafe, RefUnwindSafe;
         StreamTier: Send, Sync, UnwindSafe, RefUnwindSafe;
         Tally: Send, Sync, UnwindSafe, RefUnwindSafe;

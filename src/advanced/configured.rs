@@ -22,8 +22,8 @@
 //! that path; the object's `new` calls `new_configured` when its options carry
 //! a configuration, and otherwise gives the creation path the SDK's plain
 //! entry point and no configuration. The advertisers and listeners share one
-//! generic owner each, which implements the trait once, beside its creation
-//! path, and makes the same choice in its own `new`.
+//! lifecycle owner, which implements the trait once for all four object kinds,
+//! beside its creation path, and makes the same choice in its own `new`.
 //!
 //! Taking the configured table applies its capability's gate, which includes
 //! the gates of the capabilities it requires: the router's includes source

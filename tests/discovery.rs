@@ -167,28 +167,40 @@ fn server() -> (AdvertiserOptions, ListenerOptions) {
 /// Every Discovery Server capability is unavailable for `expected`, and every
 /// constructor says so, reporting the capability with `evidence`, without
 /// calling the SDK. `Ndi::require_feature` gives the same error.
-fn assert_refused(ndi: &Ndi, expected: CapabilityUnavailable, evidence: &str) {
+fn assert_refused(ndi: &Ndi, expected: CapabilityUnavailable) {
     let (advertisers, listeners) = server();
-    let errors = constructor_errors(ndi, &advertisers, &listeners);
-    for ((feature, name), error) in DISCOVERY_SERVER.into_iter().zip(errors) {
-        assert_eq!(
-            ndi.capabilities().status(feature),
-            CapabilityStatus::Unavailable(expected),
-            "{feature:?}"
-        );
+    for ((feature, name), error) in
+        DISCOVERY_SERVER
+            .into_iter()
+            .zip(constructor_errors(ndi, &advertisers, &listeners))
+    {
         for error in [error, ndi.require_feature(feature).err()] {
-            match error {
-                Some(Error::UnsupportedCapability {
-                    feature: refused,
-                    reason,
-                    detail,
-                }) => {
-                    assert_eq!((refused, reason), (feature, expected));
-                    assert_eq!(detail, evidence, "{name}");
-                }
-                Some(other) => panic!("{name}: unexpected error {other}"),
-                None => panic!("{name}: the capability was not refused"),
-            }
+            let Some(Error::UnsupportedCapability {
+                feature: refused,
+                refusal,
+            }) = error
+            else {
+                panic!("{name}: expected unsupported capability");
+            };
+            assert_eq!((refused, refusal.reason()), (feature, expected));
+            assert_eq!(
+                ndi.capabilities().status(feature),
+                CapabilityStatus::Unavailable(refusal)
+            );
+            let (grafton_ndi::CapabilityRefusal::RuntimeTooOld { required }
+            | grafton_ndi::CapabilityRefusal::RuntimeVersionUnknown { required }) = refusal
+            else {
+                panic!("{name}: expected required version evidence");
+            };
+            assert_eq!(
+                (
+                    required.major(),
+                    required.minor(),
+                    required.patch(),
+                    required.build()
+                ),
+                (6, 4, 0, 0)
+            );
         }
     }
     assert!(!log().contains("-create\n"), "{}", log());
@@ -205,20 +217,12 @@ fn child(scenario: &str) {
     let (advertisers, listeners) = server();
     match scenario {
         "older_runtime_is_refused" => {
-            assert_refused(
-                &ndi,
-                CapabilityUnavailable::RuntimeTooOld,
-                "it needs NDI 6.4.0.0 or later and the runtime reports \"NDI SDK TEST 6.3.2.0\"",
-            );
+            assert_refused(&ndi, CapabilityUnavailable::RuntimeTooOld);
             // Routing has no destroy-time defect and stays usable.
             drop(Router::new(&ndi, &RouterOptions::new("older")).unwrap());
         }
         "unrecognized_version_is_refused" => {
-            assert_refused(
-                &ndi,
-                CapabilityUnavailable::RuntimeVersionUnknown,
-                "it needs NDI 6.4.0.0 or later and the runtime reports \"NDI SDK TEST unreleased\"",
-            );
+            assert_refused(&ndi, CapabilityUnavailable::RuntimeVersionUnknown);
             drop(Router::new(&ndi, &RouterOptions::new("unversioned")).unwrap());
         }
         "missing_functions_are_named" => {
@@ -236,35 +240,37 @@ fn child(scenario: &str) {
                 .zip(first_missing)
             {
                 assert_eq!(
-                    ndi.capabilities().status(feature),
-                    CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+                    (ndi.capabilities().status(feature)).reason(),
+                    Some(CapabilityUnavailable::SymbolUnavailable)
                 );
                 // The capability's own gate names the function too.
                 for error in [error, ndi.require_feature(feature).err()] {
                     let Some(Error::UnsupportedCapability {
                         feature: refused,
-                        reason,
-                        detail,
+                        refusal,
                     }) = error
                     else {
                         panic!("{name}: expected an unsupported capability");
                     };
                     assert_eq!(refused, feature);
-                    assert_eq!(reason, CapabilityUnavailable::SymbolUnavailable);
-                    assert_eq!(detail, symbol, "{name}");
+                    assert_eq!(refusal.reason(), CapabilityUnavailable::SymbolUnavailable);
+                    assert!(
+                        matches!(refusal, grafton_ndi::CapabilityRefusal::SymbolUnavailable(missing) if missing.to_str().unwrap() == symbol),
+                        "{name}"
+                    );
                 }
             }
-            let Err(Error::UnsupportedCapability {
-                feature,
-                reason,
-                detail,
-            }) = Router::new(&ndi, &RouterOptions::new("bare"))
+            let Err(Error::UnsupportedCapability { feature, refusal }) =
+                Router::new(&ndi, &RouterOptions::new("bare"))
             else {
                 panic!("routing needs its functions");
             };
             assert_eq!(feature, RuntimeFeature::Routing);
-            assert_eq!(reason, CapabilityUnavailable::SymbolUnavailable);
-            assert_eq!(detail, "NDIlib_routing_create");
+            assert_eq!(refusal.reason(), CapabilityUnavailable::SymbolUnavailable);
+            assert_eq!(
+                refusal,
+                grafton_ndi::CapabilityRefusal::SymbolUnavailable(c"NDIlib_routing_create")
+            );
         }
         "fixed_runtime_is_accepted" => {
             for (feature, _) in DISCOVERY_SERVER {

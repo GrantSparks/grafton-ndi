@@ -1,11 +1,14 @@
 //! JPEG: 8-bit YCbCr through `jpeg-encoder`, with pixels converted straight
 //! into the codec's component rows.
 
-use std::{cell::RefCell, io::Write};
+use std::{
+    cell::{Cell, RefCell},
+    io::Write,
+};
 
 use super::{
     read::{Sink, BATCH},
-    Pixels,
+    JpegQuality, Pixels,
 };
 use crate::{Error, Result};
 
@@ -14,7 +17,15 @@ pub(super) const MAX_DIMENSION: usize = u16::MAX as usize;
 
 /// Encode `pixels` as a JPEG of `quality` into `out`. The plan checked the
 /// quality and the dimensions.
-pub(super) fn encode(pixels: &mut Pixels<'_, u8>, quality: u8, out: &mut dyn Write) -> Result<()> {
+pub(super) fn encode(
+    pixels: &mut Pixels<'_, u8>,
+    quality: JpegQuality,
+    width: u16,
+    height: u16,
+    row_bytes: usize,
+    cache: &mut Vec<u8>,
+    out: &mut dyn Write,
+) -> Result<()> {
     // Plan validation precedes this function, including metadata/HDR checks.
     // VideoPlane::data exposes only initialized contiguous active pixels;
     // padded native rows must stay on the row path. Both color types ignore
@@ -27,22 +38,27 @@ pub(super) fn encode(pixels: &mut Pixels<'_, u8>, quality: u8, out: &mut dyn Wri
                 } else {
                     jpeg_encoder::ColorType::Bgra
                 };
-                return jpeg_encoder::Encoder::new(out, quality)
-                    .encode(data, to_u16(pixels.width()), to_u16(pixels.height()), color)
+                return jpeg_encoder::Encoder::new(out, quality.0)
+                    .encode(data, width, height, color)
                     .map_err(encoding_error);
             }
         }
     }
-    encode_rows(pixels, quality, out)
+    encode_rows(pixels, quality, width, height, row_bytes, cache, out)
 }
 
-fn encode_rows(pixels: &mut Pixels<'_, u8>, quality: u8, out: &mut dyn Write) -> Result<()> {
-    let image = Rows {
-        width: to_u16(pixels.width()),
-        height: to_u16(pixels.height()),
-        pixels: RefCell::new(pixels),
-    };
-    jpeg_encoder::Encoder::new(out, quality)
+fn encode_rows(
+    pixels: &mut Pixels<'_, u8>,
+    quality: JpegQuality,
+    width: u16,
+    height: u16,
+    row_bytes: usize,
+    cache: &mut Vec<u8>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    super::resize_scratch(cache, row_bytes)?;
+    let image = Rows::new(pixels, width, height, cache);
+    jpeg_encoder::Encoder::new(out, quality.0)
         .encode_image(image)
         .map_err(encoding_error)
 }
@@ -54,17 +70,32 @@ fn encoding_error(error: jpeg_encoder::EncodingError) -> Error {
     }
 }
 
-fn to_u16(length: usize) -> u16 {
-    u16::try_from(length).expect("the plan checked JPEG's dimension limit")
+/// The JPEG backend repeats the final row to pad its last block. Retain only
+/// that row's converted components; every other row still converts directly
+/// into the codec's buffers without an intermediate copy.
+pub(super) struct Rows<'p, 'a> {
+    pixels: RefCell<&'p mut Pixels<'a, u8>>,
+    cache: RefCell<&'p mut [u8]>,
+    last_filled: Cell<bool>,
+    width: u16,
+    height: u16,
 }
 
-/// The image the codec reads, a row at a time. The codec asks for its rows
-/// through a shared reference, and for the last row again to pad its final
-/// blocks, so the pixels sit in a `RefCell` and every row is read afresh.
-pub(super) struct Rows<'p, 'a> {
-    pub(super) pixels: RefCell<&'p mut Pixels<'a, u8>>,
-    pub(super) width: u16,
-    pub(super) height: u16,
+impl<'p, 'a> Rows<'p, 'a> {
+    pub(super) fn new(
+        pixels: &'p mut Pixels<'a, u8>,
+        width: u16,
+        height: u16,
+        cache: &'p mut [u8],
+    ) -> Self {
+        Self {
+            pixels: RefCell::new(pixels),
+            cache: RefCell::new(cache),
+            last_filled: Cell::new(false),
+            width,
+            height,
+        }
+    }
 }
 
 impl jpeg_encoder::ImageBuffer for Rows<'_, '_> {
@@ -81,9 +112,32 @@ impl jpeg_encoder::ImageBuffer for Rows<'_, '_> {
     }
 
     fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
-        self.pixels
-            .borrow_mut()
-            .row(usize::from(y), &mut Components(buffers));
+        if y != self.height - 1 {
+            self.pixels
+                .borrow_mut()
+                .row(usize::from(y), &mut Components(buffers));
+            return;
+        }
+        let mut cache = self.cache.borrow_mut();
+        if !self.last_filled.get() {
+            let width = usize::from(self.width);
+            let (luma, chroma) = cache.split_at_mut(width);
+            let (cb, cr) = chroma.split_at_mut(width);
+            self.pixels.borrow_mut().row(
+                usize::from(y),
+                &mut CachedComponents {
+                    rows: [luma, cb, cr],
+                    at: 0,
+                },
+            );
+            self.last_filled.set(true);
+        }
+        for (buffer, row) in buffers
+            .iter_mut()
+            .zip(cache.chunks_exact(usize::from(self.width)))
+        {
+            buffer.extend_from_slice(row);
+        }
     }
 }
 
@@ -109,6 +163,27 @@ impl Sink<u8> for Components<'_> {
     }
 }
 
+struct CachedComponents<'r> {
+    rows: [&'r mut [u8]; 3],
+    at: usize,
+}
+
+impl Sink<u8> for CachedComponents<'_> {
+    fn put(&mut self, pixels: &[[u8; 4]]) {
+        let mut components = [[0; BATCH]; 3];
+        for (i, &[red, green, blue, _]) in pixels.iter().enumerate() {
+            let (y, cb, cr) = jpeg_encoder::rgb_to_ycbcr(red, green, blue);
+            components[0][i] = y;
+            components[1][i] = cb;
+            components[2][i] = cr;
+        }
+        for (row, values) in self.rows.iter_mut().zip(&components) {
+            row[self.at..self.at + pixels.len()].copy_from_slice(&values[..pixels.len()]);
+        }
+        self.at += pixels.len();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +199,27 @@ mod tests {
         assert_eq!((info.width, info.height), size);
         assert_eq!(info.pixel_format, jpeg_decoder::PixelFormat::RGB24);
         decoded
+    }
+
+    #[test]
+    fn eighth_size_jpeg_reads_each_source_row_once_including_its_partial_last_band() {
+        for height in [1080, 1081, 2160] {
+            let frame = VideoFrame::builder()
+                .resolution(18, height)
+                .pixel_format(PixelFormat::Rgba)
+                .data(vec![127; 18 * height as usize * 4])
+                .build()
+                .unwrap();
+            let options =
+                ImageOptions::new(ImageFormat::Jpeg(85)).downscale(crate::Downscale::Eighth);
+            let (image, rows) =
+                crate::image::read::count_rows(|| frame.encode_image(&options).unwrap());
+            assert_eq!(rows, height as usize, "source height {height}");
+            assert_eq!(
+                decode(&image, (3, height.div_ceil(8) as u16)).len(),
+                3 * height.div_ceil(8) as usize * 3
+            );
+        }
     }
 
     #[test]
@@ -161,7 +257,16 @@ mod tests {
                     let source = Source::new(&frame);
                     let plan = Plan::new(&source, &options).unwrap();
                     let mut rows = Vec::new();
-                    encode_rows(&mut plan.pixels::<u8>(&source), quality, &mut rows).unwrap();
+                    encode_rows(
+                        &mut plan.pixels::<u8>(),
+                        JpegQuality(quality),
+                        width,
+                        3,
+                        plan.shape.row_bytes,
+                        &mut Vec::new(),
+                        &mut rows,
+                    )
+                    .unwrap();
                     let direct = decode(&direct, (width, 3));
                     let rows = decode(&rows, (width, 3));
                     // Runtime SIMD rounding is permitted: mean <= 1 code and

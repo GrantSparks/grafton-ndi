@@ -105,11 +105,7 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
             .find_source_by_name(&selected_name, PATIENCE)
             .unwrap()
             .unwrap();
-        let address = match selected.address().expect("discovered endpoint") {
-            grafton_ndi::SourceAddress::Ip(address) | grafton_ndi::SourceAddress::Url(address) => {
-                address
-            }
-        };
+        let address = selected.address().expect("discovered endpoint");
         let spec = SourceSpec::try_from(&selected).unwrap();
         assert_eq!(spec.name(), None);
         assert_eq!(spec.url(), Some(address.as_str()));
@@ -186,7 +182,7 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
         // Pair an unavailable endpoint with the public name that just delivered
         // media, so a hidden name fallback would record the logical feed.
         let unavailable = grafton_ndi::Source::new(&logical_name)
-            .with_address(grafton_ndi::SourceAddress::Ip("127.0.0.1:9".into()));
+            .with_address(grafton_ndi::SourceAddress::new("127.0.0.1:9"));
         let spec = SourceSpec::try_from(&unavailable).unwrap();
         assert_eq!(spec.name(), None);
         assert_eq!(spec.url(), Some("127.0.0.1:9"));

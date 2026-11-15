@@ -120,6 +120,48 @@ impl FrameRate {
     }
 }
 
+/// The displayed picture's width divided by its height.
+///
+/// Zero asks the SDK to derive the ratio from the frame dimensions (square
+/// pixels). Every other value is finite and positive.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PictureAspectRatio(f32);
+
+impl PictureAspectRatio {
+    /// Derive the displayed aspect ratio from the pixel dimensions.
+    pub const SQUARE_PIXELS: Self = Self(0.0);
+
+    /// A finite, nonnegative ratio; zero means square pixels.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] when `ratio` is negative or not finite.
+    pub fn new(ratio: f32) -> Result<Self> {
+        Self::checked(ratio).map_err(|reason| Error::InvalidInput(reason.to_string()))
+    }
+
+    /// The ratio, with zero representing square pixels.
+    #[must_use]
+    pub const fn get(self) -> f32 {
+        self.0
+    }
+
+    pub(crate) fn from_sdk(ratio: f32) -> Result<Self> {
+        Self::checked(ratio).map_err(Into::into)
+    }
+
+    pub(crate) const fn to_sdk(self) -> f32 {
+        self.0
+    }
+
+    fn checked(ratio: f32) -> crate::frames::LayoutResult<Self> {
+        if !ratio.is_finite() || ratio < 0.0 {
+            return Err(crate::frames::LayoutError::PictureAspectRatio(ratio));
+        }
+        Ok(Self(ratio))
+    }
+}
+
 /// A four-character code: the SDK's identifier for a pixel format or codec.
 ///
 /// It holds any value, including one this crate does not know, so a value
@@ -260,6 +302,26 @@ impl BitOrAssign for MediaTypes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picture_aspect_ratio_accepts_only_finite_nonnegative_values() {
+        assert_eq!(PictureAspectRatio::SQUARE_PIXELS.get(), 0.0);
+        for value in [0.0, -0.0, 1.0, 16.0 / 9.0, f32::MAX] {
+            let ratio = PictureAspectRatio::new(value).unwrap();
+            assert_eq!(ratio.get().to_bits(), value.to_bits());
+            assert_eq!(PictureAspectRatio::from_sdk(ratio.to_sdk()).unwrap(), ratio);
+        }
+        for value in [-1.0, f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
+            assert!(matches!(
+                PictureAspectRatio::new(value),
+                Err(Error::InvalidInput(_))
+            ));
+            assert!(matches!(
+                PictureAspectRatio::from_sdk(value),
+                Err(Error::InvalidFrame(_))
+            ));
+        }
+    }
 
     #[test]
     fn frame_rate_accepts_exactly_the_sdk_range_from_both_sides() {

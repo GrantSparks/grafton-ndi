@@ -367,13 +367,13 @@ fn test_timeout_duration_calculation() {
 fn test_source_address_contains_host() {
     use crate::finder::SourceAddress;
 
-    let ip_addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
+    let ip_addr = SourceAddress::new("192.168.1.100:5960".to_string());
     assert!(ip_addr.matches_host("192.168.1.100"));
     assert!(!ip_addr.matches_host("192.168.1"));
     assert!(!ip_addr.matches_host("5960"));
     assert!(!ip_addr.matches_host("192.168.2"));
 
-    let url_addr = SourceAddress::Url("http://camera.local:8080".to_string());
+    let url_addr = SourceAddress::new("http://camera.local:8080".to_string());
     assert!(url_addr.matches_host("camera.local"));
     assert!(!url_addr.matches_host("camera"));
     assert!(!url_addr.matches_host("8080"));
@@ -385,29 +385,29 @@ fn test_source_address_contains_host() {
 fn test_source_address_port() {
     use crate::finder::SourceAddress;
 
-    let ip_with_port = SourceAddress::Ip("192.168.1.100:5960".to_string());
+    let ip_with_port = SourceAddress::new("192.168.1.100:5960".to_string());
     assert_eq!(ip_with_port.port(), Some(5960));
 
-    let ip_no_port = SourceAddress::Ip("192.168.1.100".to_string());
+    let ip_no_port = SourceAddress::new("192.168.1.100".to_string());
     assert_eq!(ip_no_port.port(), None);
 
-    let url_with_port = SourceAddress::Url("http://camera.local:8080".to_string());
+    let url_with_port = SourceAddress::new("http://camera.local:8080".to_string());
     assert_eq!(url_with_port.port(), Some(8080));
 
-    let url_with_path = SourceAddress::Url("http://camera.local:8080/stream".to_string());
+    let url_with_path = SourceAddress::new("http://camera.local:8080/stream".to_string());
     assert_eq!(url_with_path.port(), Some(8080));
 
-    let url_no_port = SourceAddress::Url("http://camera.local".to_string());
+    let url_no_port = SourceAddress::new("http://camera.local".to_string());
     assert_eq!(url_no_port.port(), None);
 
-    let url_scheme_only = SourceAddress::Url("http://camera.local/stream".to_string());
+    let url_scheme_only = SourceAddress::new("http://camera.local/stream".to_string());
     assert_eq!(url_scheme_only.port(), None);
 
     // An unbracketed IPv6 literal has no explicit port delimiter.
-    let ipv6_literal = SourceAddress::Ip("fe80::1:5960".to_string());
+    let ipv6_literal = SourceAddress::new("fe80::1:5960".to_string());
     assert_eq!(ipv6_literal.port(), None);
 
-    let ipv6_with_port = SourceAddress::Ip("[fe80::1]:5960".to_string());
+    let ipv6_with_port = SourceAddress::new("[fe80::1]:5960".to_string());
     assert_eq!(ipv6_with_port.port(), Some(5960));
 }
 
@@ -416,7 +416,7 @@ fn test_source_matches_host() {
     use crate::finder::{Source, SourceAddress};
 
     let source = Source::new("CAMERA1 (Chan1)")
-        .with_address(SourceAddress::Ip("192.168.0.107:5960".to_string()));
+        .with_address(SourceAddress::new("192.168.0.107:5960".to_string()));
     assert!(source.matches_host("192.168.0.107"));
     assert!(!source.matches_host("192.168.0"));
     assert!(!source.matches_host("192.168.1"));
@@ -426,7 +426,7 @@ fn test_source_matches_host() {
     assert!(!source.matches_host("CAMERA2"));
 
     let url_source = Source::new("Studio Camera")
-        .with_address(SourceAddress::Url("http://studio.local:8080".to_string()));
+        .with_address(SourceAddress::new("http://studio.local:8080".to_string()));
     assert!(url_source.matches_host("studio.local"));
     assert!(!url_source.matches_host("Studio"));
     assert!(!url_source.matches_host("other"));
@@ -441,24 +441,24 @@ fn test_source_host() {
     use crate::finder::{Source, SourceAddress};
 
     let ip_source =
-        Source::new("CAMERA1").with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
+        Source::new("CAMERA1").with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
     assert_eq!(ip_source.host(), Some("192.168.1.100"));
 
     let ip_no_port =
-        Source::new("CAMERA2").with_address(SourceAddress::Ip("192.168.1.101".to_string()));
+        Source::new("CAMERA2").with_address(SourceAddress::new("192.168.1.101".to_string()));
     assert_eq!(ip_no_port.host(), Some("192.168.1.101"));
 
     let url_source = Source::new("Studio")
-        .with_address(SourceAddress::Url("http://camera.local:8080".to_string()));
+        .with_address(SourceAddress::new("http://camera.local:8080".to_string()));
     assert_eq!(url_source.host(), Some("camera.local"));
 
-    let url_with_path = Source::new("Studio2").with_address(SourceAddress::Url(
+    let url_with_path = Source::new("Studio2").with_address(SourceAddress::new(
         "http://camera.local:8080/stream".to_string(),
     ));
     assert_eq!(url_with_path.host(), Some("camera.local"));
 
     let url_no_scheme =
-        Source::new("Studio3").with_address(SourceAddress::Url("camera.local:8080".to_string()));
+        Source::new("Studio3").with_address(SourceAddress::new("camera.local:8080".to_string()));
     assert_eq!(url_no_scheme.host(), Some("camera.local"));
 
     let none_source = Source::new("None");
@@ -470,7 +470,7 @@ fn test_source_matching_real_world_example() {
     use crate::finder::{Source, SourceAddress};
 
     let source = Source::new("CAMERA1 (Chan1, 192.168.0.107)")
-        .with_address(SourceAddress::Ip("192.168.0.107:5960".to_string()));
+        .with_address(SourceAddress::new("192.168.0.107:5960".to_string()));
 
     assert!(source.matches_host("192.168.0.107"));
     assert!(!source.matches_host("192.168.0"));
@@ -488,7 +488,7 @@ fn test_receiver_snapshot_preset() {
     };
 
     let source = Source::new("Test Source")
-        .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
+        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
 
     let customized = ReceiverOptions::snapshot_preset(source.clone()).name("My Snapshot Receiver");
     let _ = format!("{customized:?}");
@@ -502,7 +502,7 @@ fn test_receiver_high_quality_preset() {
     };
 
     let source = Source::new("Test Source")
-        .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
+        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
 
     let customized = ReceiverOptions::high_quality_preset(source.clone()).name("My HQ Receiver");
     let _ = format!("{customized:?}");
@@ -516,7 +516,7 @@ fn test_receiver_monitoring_preset() {
     };
 
     let source = Source::new("Test Source")
-        .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
+        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
 
     let customized = ReceiverOptions::monitoring_preset(source.clone()).name("My Monitor");
     let _ = format!("{customized:?}");
@@ -530,7 +530,7 @@ fn test_receiver_presets_are_distinct() {
     };
 
     let source = Source::new("Test Source")
-        .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
+        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
 
     let _snapshot = ReceiverOptions::snapshot_preset(source.clone());
     let _hq = ReceiverOptions::high_quality_preset(source.clone());

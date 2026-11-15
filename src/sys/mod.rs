@@ -75,3 +75,6 @@ pub(crate) use api::*;
 #[cfg(feature = "file-io")]
 pub(crate) use file::{select_file, FilePlayback, FileRecording, FileRuntime, FileTable};
 pub(crate) use loader::{select, Runtime};
+
+#[cfg(test)]
+pub(crate) use api::with_test_evidence;

@@ -50,7 +50,7 @@
 //! fn main() -> Result<(), grafton_ndi::Error> {
 //!     let ndi = Ndi::new()?;
 //!     let finder = Finder::new(&ndi, &FinderOptions::default())?;
-//!     finder.wait_for_sources(Duration::from_secs(1))?;
+//!     finder.watch().wait_for_change(Duration::from_secs(1))?;
 //!     let sources = finder.current_sources()?;
 //!
 //!     let options = ReceiverOptions::new(sources[0].clone());
@@ -73,7 +73,7 @@
 //! }
 //! ```
 
-use std::{fmt, num::NonZeroU32};
+use std::{fmt, num::NonZeroU32, sync::Arc};
 
 use crate::{
     capture::{FrameSyncAudioFree, FrameSyncVideoFree, Guard},
@@ -81,7 +81,7 @@ use crate::{
         validate_returned_audio, AudioFrame, AudioRef, ReturnedAudio, ScanType,
         ValidatedAudioLayout, VideoFrame, VideoRef,
     },
-    receiver::{FrameSyncAttached, Receiver},
+    receiver::{FrameSyncAttached, Receiver, ReceiverCore},
     sys::bindings::*,
     Error, Rejected, Result,
 };
@@ -330,8 +330,6 @@ impl FrameSyncAudioRequest {
 /// # }
 /// ```
 pub struct FrameSync {
-    // Rust drops fields in declaration order. The SDK requires FrameSync to be
-    // destroyed before its receiver (Processing.NDI.FrameSync.h, create contract).
     resource: FrameSyncResource,
     receiver: Receiver<FrameSyncAttached>,
 }
@@ -343,8 +341,8 @@ const _: () = {
 
 struct FrameSyncResource {
     instance: NDIlib_framesync_instance_t,
-    // Retain the runtime directly until after native destruction.
-    _ndi: crate::Ndi,
+    // Native destruction reads this receiver; ownership keeps it and its runtime live.
+    receiver: Arc<ReceiverCore>,
 }
 
 /// Clocked capture access lent by `FrameSync::split` with the `advanced` feature.
@@ -433,6 +431,7 @@ impl<'a> FrameSyncCapture<'a> {
         // SAFETY: the view borrows a live synchronizer for the call.
         let depth = unsafe {
             self.resource
+                .receiver
                 ._ndi
                 .api()
                 .core
@@ -462,11 +461,11 @@ impl FrameSyncResource {
         // SAFETY: the FrameSync instance is live for this borrow and `frame` is
         // writable storage the SDK fills or leaves zeroed.
         unsafe {
-            self._ndi.api().core.NDIlib_framesync_capture_video(
-                self.instance,
-                &mut frame,
-                scan_type.to_sdk(),
-            );
+            self.receiver
+                ._ndi
+                .api()
+                .core
+                .NDIlib_framesync_capture_video(self.instance, &mut frame, scan_type.to_sdk());
         }
         if is_framesync_video_empty(&frame) {
             return None;
@@ -476,7 +475,7 @@ impl FrameSyncResource {
         // destroys the instance only when dropped, so the instance outlives
         // the guard, which frees the frame exactly once through
         // NDIlib_framesync_free_video, including when validation fails.
-        Some(unsafe { Guard::new(&self._ndi, self.instance, frame) })
+        Some(unsafe { Guard::new(&self.receiver._ndi, self.instance, frame) })
     }
 
     /// Make `call`: the guard of what the SDK returned, which it returns
@@ -509,13 +508,17 @@ impl FrameSyncResource {
         // Either way the SDK owns what it returned until it is freed through
         // this same instance.
         unsafe {
-            self._ndi.api().core.NDIlib_framesync_capture_audio_v2(
-                self.instance,
-                &mut frame,
-                sample_rate,
-                num_channels,
-                num_samples,
-            );
+            self.receiver
+                ._ndi
+                .api()
+                .core
+                .NDIlib_framesync_capture_audio_v2(
+                    self.instance,
+                    &mut frame,
+                    sample_rate,
+                    num_channels,
+                    num_samples,
+                );
         }
 
         // SAFETY: the call above filled `frame` through this instance, which
@@ -523,7 +526,7 @@ impl FrameSyncResource {
         // destroys the instance only when dropped, so the instance outlives
         // the guard, which frees the frame exactly once through
         // NDIlib_framesync_free_audio_v2, including when validation fails.
-        unsafe { Guard::new(&self._ndi, self.instance, frame) }
+        unsafe { Guard::new(&self.receiver._ndi, self.instance, frame) }
     }
 }
 
@@ -531,7 +534,13 @@ impl Drop for FrameSyncResource {
     fn drop(&mut self) {
         // SAFETY: Creation checked for null; exclusive ownership and borrowed
         // guards prevent destruction while capture buffers remain live.
-        unsafe { self._ndi.api().core.NDIlib_framesync_destroy(self.instance) };
+        unsafe {
+            self.receiver
+                ._ndi
+                .api()
+                .core
+                .NDIlib_framesync_destroy(self.instance)
+        };
         #[cfg(test)]
         crate::receiver::lifecycle_test_events::record("framesync");
     }
@@ -576,7 +585,7 @@ impl FrameSync {
         receiver: Receiver,
         create: impl FnOnce(NDIlib_recv_instance_t) -> NDIlib_framesync_instance_t,
     ) -> std::result::Result<Self, Rejected<Receiver>> {
-        let instance = create(receiver.core.instance);
+        let instance = create(receiver.core.instance.0);
         if instance.is_null() {
             // The untouched raw receiver goes back to the caller.
             return Err(Rejected::new(
@@ -588,7 +597,7 @@ impl FrameSync {
         }
         let resource = FrameSyncResource {
             instance,
-            _ndi: receiver.core._ndi.clone(),
+            receiver: Arc::clone(&receiver.core),
         };
         Ok(Self {
             resource,
@@ -978,8 +987,8 @@ impl FrameSync {
 /// The FrameSync instance has no affinity to the thread that created it: the
 /// SDK's own FrameSync audio examples create it on one thread and capture
 /// from an audio device's callback thread. This private resource is owned by
-/// FrameSync, which destroys it before its receiver; split views only borrow
-/// it. It retains the SDK runtime directly. Borrowed frame guards cannot be moved
+/// FrameSync, while split views only borrow it. It retains the receiver core,
+/// and therefore its runtime, through native destruction. Borrowed frame guards cannot be moved
 /// between threads and keep this owner borrowed until their buffers are
 /// freed; destruction requires exclusive ownership.
 unsafe impl Send for FrameSyncResource {}
@@ -1094,7 +1103,7 @@ mod tests {
         let receiver =
             Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
         let mut sync = FrameSync::new(receiver).unwrap();
-        let original = (sync.resource.instance, sync.receiver.core.instance);
+        let original = (sync.resource.instance, sync.receiver.core.instance.0);
         let (results, allocations) = crate::test_alloc::allocation_count(|| {
             let tier = sync.controls().set_stream_tier(crate::StreamTier::Preview);
             let streams = sync.controls().set_streams(crate::MediaTypes::ALL);
@@ -1105,7 +1114,7 @@ mod tests {
         assert_eq!(allocations, 0);
         assert!(results.0.is_ok() && results.1.is_ok() && results.2.is_ok());
         assert_eq!(
-            (sync.resource.instance, sync.receiver.core.instance),
+            (sync.resource.instance, sync.receiver.core.instance.0),
             original
         );
     }
@@ -1127,13 +1136,13 @@ mod tests {
                 let mut receiver =
                     Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new("")))
                         .unwrap();
-                let original = receiver.core.instance;
+                let original = receiver.core.instance.0;
                 drop(ndi);
                 for _ in 0..3 {
                     let fs = FrameSync::new(receiver).unwrap();
-                    assert_eq!(fs.receiver().core.instance, original);
+                    assert_eq!(fs.receiver().core.instance.0, original);
                     receiver = fs.into_receiver();
-                    assert_eq!(receiver.core.instance, original);
+                    assert_eq!(receiver.core.instance.0, original);
                     assert!(receiver.video().capture(std::time::Duration::ZERO).is_ok());
                 }
                 let fs = FrameSync::new(receiver).unwrap();

@@ -1,7 +1,7 @@
 //! Snapshots of, events from, and connection requests to what a Discovery
 //! Server advertises.
 
-use super::{not_created, Handle};
+use super::{ServerApi, ServerObject};
 use crate::{
     frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
     sdk_copy::{CopyBudget, CopyError, COPY_LIMIT},
@@ -16,52 +16,13 @@ use std::{
 };
 
 /// The operations the sender and receiver listener tables have in common.
-trait ListenerApi: sys::Table + Sync {
-    /// The native listener handle.
-    type Instance: Handle;
-    /// The native creation settings.
-    type Settings;
-    /// One element of the native membership snapshot.
+trait ListenerApi: ServerApi {
     type Entry;
-    /// What identifies one of the peers this listener lists.
     type Id: Identifier;
-    /// The Advanced table of the entry point that also takes a configuration.
-    #[cfg(feature = "advanced")]
-    type Configured: sys::Table;
-    /// That entry point's name.
-    #[cfg(feature = "advanced")]
-    const CONFIGURED: &'static str;
-
-    /// The settings for a listener of the Discovery Server at `url`, or of the
-    /// one the SDK is configured with when `url` is null.
-    fn settings(url: *const c_char) -> Self::Settings;
-
-    /// Create a listener. Returns null when the SDK creates none.
-    ///
-    /// # Safety
-    ///
-    /// The URL of `settings` must be null or a NUL-terminated string that
-    /// outlives the call.
-    unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance;
-
-    /// Create a listener with a per-instance configuration.
-    ///
-    /// # Safety
-    ///
-    /// `settings` must satisfy [`Self::create`]'s contract, and `config` must
-    /// point to a NUL-terminated configuration string that outlives the call.
-    #[cfg(feature = "advanced")]
-    unsafe fn create_configured(
-        table: &'static Self::Configured,
-        settings: *const Self::Settings,
-        config: *const c_char,
-    ) -> Self::Instance;
-
     /// # Safety
     ///
     /// Each method requires `instance` to be a live listener created by this
     /// table; pointer arguments must be valid for the SDK's documented use.
-    unsafe fn destroy(&self, instance: Self::Instance);
     unsafe fn is_connected(&self, instance: Self::Instance) -> bool;
     unsafe fn server_url(&self, instance: Self::Instance) -> *const c_char;
     unsafe fn entries(&self, instance: Self::Instance, count: &mut u32) -> *const Self::Entry;
@@ -79,70 +40,34 @@ trait ListenerApi: sys::Table + Sync {
 
 macro_rules! listener_api {
     (
-        $Table:ty, $Instance:ty, $Entry:ty, $Id:ty, $Settings:ident,
-        $create:ident, $destroy:ident, $is_connected:ident, $server_url:ident, $entries:ident,
-        $wait:ident, $subscribe:ident, $unsubscribe:ident, $events:ident, $free_events:ident,
-        $Configured:ident::$create_configured:ident
+        $Table:ty, $Entry:ty, $Id:ty,
+        $is_connected:ident, $server_url:ident, $entries:ident,
+        $wait:ident, $subscribe:ident, $unsubscribe:ident, $events:ident, $free_events:ident
     ) => {
         impl ListenerApi for $Table {
-            type Instance = $Instance;
-            type Settings = $Settings;
             type Entry = $Entry;
             type Id = $Id;
-            #[cfg(feature = "advanced")]
-            type Configured = sys::advanced::$Configured;
-            #[cfg(feature = "advanced")]
-            const CONFIGURED: &'static str = stringify!($create_configured);
-
-            fn settings(url: *const c_char) -> Self::Settings {
-                $Settings { p_url_address: url }
-            }
-            unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance {
-                self.$create(settings)
-            }
-            #[cfg(feature = "advanced")]
-            sys::advanced::declared! { $Configured {
-                unsafe fn create_configured(
-                    table: &'static Self::Configured,
-                    settings: *const Self::Settings,
-                    config: *const c_char,
-                ) -> Self::Instance {
-                    // SAFETY: forwarded to the caller's obligations.
-                    unsafe { table.$create_configured(settings, config) }
-                }
-            } else {
-                unsafe fn create_configured(
-                    table: &'static Self::Configured,
-                    _: *const Self::Settings,
-                    _: *const c_char,
-                ) -> Self::Instance {
-                    match *table {}
-                }
-            }}
-            unsafe fn destroy(&self, instance: Self::Instance) {
-                self.$destroy(instance)
-            }
             unsafe fn is_connected(&self, instance: Self::Instance) -> bool {
-                self.$is_connected(instance)
+                self.$is_connected(instance.0)
             }
             unsafe fn server_url(&self, instance: Self::Instance) -> *const c_char {
-                self.$server_url(instance)
+                self.$server_url(instance.0)
             }
             unsafe fn entries(
                 &self,
                 instance: Self::Instance,
                 count: &mut u32,
             ) -> *const Self::Entry {
-                self.$entries(instance, count)
+                self.$entries(instance.0, count)
             }
             unsafe fn wait_for_entries(&self, instance: Self::Instance, timeout_ms: u32) -> bool {
-                self.$wait(instance, timeout_ms)
+                self.$wait(instance.0, timeout_ms)
             }
             unsafe fn subscribe(&self, instance: Self::Instance, id: *const c_char) {
-                self.$subscribe(instance, id)
+                self.$subscribe(instance.0, id)
             }
             unsafe fn unsubscribe(&self, instance: Self::Instance, id: *const c_char) {
-                self.$unsubscribe(instance, id)
+                self.$unsubscribe(instance.0, id)
             }
             unsafe fn events(
                 &self,
@@ -150,14 +75,14 @@ macro_rules! listener_api {
                 count: &mut u32,
                 timeout_ms: u32,
             ) -> *const NDIlib_listener_event {
-                self.$events(instance, count, timeout_ms)
+                self.$events(instance.0, count, timeout_ms)
             }
             unsafe fn free_events(
                 &self,
                 instance: Self::Instance,
                 events: *const NDIlib_listener_event,
             ) {
-                self.$free_events(instance, events)
+                self.$free_events(instance.0, events)
             }
         }
     };
@@ -165,12 +90,8 @@ macro_rules! listener_api {
 
 listener_api!(
     sys::SenderDiscovery,
-    NDIlib_send_listener_instance_t,
     NDIlib_sender_t,
     SenderId,
-    NDIlib_send_listener_create_t,
-    NDIlib_send_listener_create,
-    NDIlib_send_listener_destroy,
     NDIlib_send_listener_is_connected,
     NDIlib_send_listener_get_server_url,
     NDIlib_send_listener_get_senders,
@@ -178,17 +99,12 @@ listener_api!(
     NDIlib_send_listener_subscribe_events,
     NDIlib_send_listener_unsubscribe_events,
     NDIlib_send_listener_get_events,
-    NDIlib_send_listener_free_events,
-    SenderListenerConfiguration::NDIlib_send_listener_create_ex
+    NDIlib_send_listener_free_events
 );
 listener_api!(
     sys::ReceiverDiscovery,
-    NDIlib_recv_listener_instance_t,
     NDIlib_receiver_t,
     ReceiverId,
-    NDIlib_recv_listener_create_t,
-    NDIlib_recv_listener_create,
-    NDIlib_recv_listener_destroy,
     NDIlib_recv_listener_is_connected,
     NDIlib_recv_listener_get_server_url,
     NDIlib_recv_listener_get_receivers,
@@ -196,8 +112,7 @@ listener_api!(
     NDIlib_recv_listener_subscribe_events,
     NDIlib_recv_listener_unsubscribe_events,
     NDIlib_recv_listener_get_events,
-    NDIlib_recv_listener_free_events,
-    ReceiverListenerConfiguration::NDIlib_recv_listener_create_ex
+    NDIlib_recv_listener_free_events
 );
 
 /// The Discovery Server a listener connects to.
@@ -617,114 +532,32 @@ unsafe fn endpoint(url: *const c_char) -> Option<String> {
     Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
-/// A native listener and the strings its creation settings point to.
-struct Listener<A: ListenerApi> {
-    instance: A::Instance,
-    api: &'static A,
-    _url: Option<CString>,
-    #[cfg(feature = "advanced")]
-    _config: Option<crate::advanced::AdvancedConfig>,
-    _ndi: Ndi,
-}
+/// A listener adds membership operations to the shared lifecycle owner.
+struct Listener<A: ListenerApi>(ServerObject<A>);
 
-// SAFETY: the SDK attaches no listener to the thread that created it; its
-// objects may be used and destroyed from any thread as long as calls on one
-// object do not overlap, which the SDK requires of membership queries in
-// particular. A listener has exactly one owner and is not `Sync`, so its calls
-// cannot overlap, and everything else it holds is `Send`.
-unsafe impl<A: ListenerApi> Send for Listener<A> {}
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Listener<sys::SenderDiscovery>>();
+    assert_send::<Listener<sys::ReceiverDiscovery>>();
+};
 
-impl<A: ListenerApi> Drop for Listener<A> {
-    fn drop(&mut self) {
-        // SAFETY: this listener is the instance's only owner.
-        unsafe { self.api.destroy(self.instance) };
-    }
-}
-impl<A: ListenerApi> Listener<A> {
-    /// Connect to the Discovery Server `options` name, through the Advanced
-    /// entry point when the options carry a configuration.
+impl<A: ListenerApi> Listener<A>
+where
+    A: ServerApi<Options = ListenerOptions>,
+{
     fn new(ndi: &Ndi, options: &ListenerOptions) -> Result<Self> {
-        #[cfg(feature = "advanced")]
-        if let Some(config) = &options.config {
-            use crate::advanced::Configurable;
-            // SAFETY: the closure returns what the configured entry point
-            // returned for the settings and the configuration it was handed.
-            return unsafe {
-                Self::configured(
-                    ndi,
-                    options,
-                    A::CONFIGURED,
-                    config,
-                    |table: &'static A::Configured, settings, text| {
-                        A::create_configured(table, settings, text)
-                    },
-                )
-            };
-        }
-        // SAFETY: the SDK's listener creation returns null or a fresh listener
-        // that nothing else owns, and the settings outlive the call.
-        unsafe {
-            Self::create(
-                ndi,
-                options,
-                #[cfg(feature = "advanced")]
-                None,
-                |api, settings| api.create(settings),
-            )
-        }
+        ServerObject::new(ndi, options).map(Self)
     }
+}
 
-    /// The one creation path of both listeners, with and without a
-    /// configuration: create the native listener through `create`, which is
-    /// handed the table and the native settings for `options`, and keep
-    /// `config` for as long as the listener lives.
-    ///
-    /// # Safety
-    ///
-    /// `create` returns null or a live listener of `ndi`'s runtime, made from
-    /// the settings it was handed, that nothing else owns.
-    unsafe fn create(
-        ndi: &Ndi,
-        options: &ListenerOptions,
-        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
-        create: impl FnOnce(&'static A, &A::Settings) -> A::Instance,
-    ) -> Result<Self> {
-        // A listener with a configuration gets here only once its own
-        // capability, which requires this table's, has been allowed, so it
-        // is never refused for this table.
-        let api = ndi.table::<A>()?;
-        if options
-            .server
-            .as_deref()
-            .is_some_and(|server| server.contains(','))
-        {
-            return Err(Error::InvalidInput(
-                "a listener accepts one Discovery Server endpoint".into(),
-            ));
-        }
-        let url = options.server.as_deref().map(CString::new).transpose()?;
-        let settings = A::settings(url.as_ref().map_or(ptr::null(), |v| v.as_ptr()));
-        let instance = create(api, &settings);
-        if instance.is_null() {
-            return Err(not_created("listener", options.server.as_deref()));
-        }
-        Ok(Self {
-            instance,
-            api,
-            _url: url,
-            #[cfg(feature = "advanced")]
-            _config: config,
-            _ndi: ndi.clone(),
-        })
-    }
-
+impl<A: ListenerApi> Listener<A> {
     fn is_connected(&self) -> bool {
         // SAFETY: the listener instance is live for this borrow.
-        unsafe { self.api.is_connected(self.instance) }
+        unsafe { self.0.api.is_connected(self.0.instance()) }
     }
     fn server_url(&self) -> Option<String> {
         // SAFETY: the listener instance is live for this borrow.
-        let url = unsafe { self.api.server_url(self.instance) };
+        let url = unsafe { self.0.api.server_url(self.0.instance()) };
         // SAFETY: a non-null result is a NUL-terminated string the SDK keeps
         // for the listener's lifetime, which this borrow is within.
         unsafe { endpoint(url) }
@@ -732,14 +565,14 @@ impl<A: ListenerApi> Listener<A> {
     fn wait_for_changes(&mut self, timeout: Duration) -> Result<bool> {
         let timeout = to_ms_checked(timeout)?;
         // SAFETY: the listener instance is live for this borrow.
-        Ok(unsafe { self.api.wait_for_entries(self.instance, timeout) })
+        Ok(unsafe { self.0.api.wait_for_entries(self.0.instance(), timeout) })
     }
     /// The native membership snapshot, valid until the next call on this listener.
     fn entries<'a>(&'a mut self, budget: &mut CopyBudget) -> Result<&'a [A::Entry]> {
         let mut count = 0;
         // SAFETY: the exclusive borrow keeps the SDK-owned array unchanged for
         // `'a`; the budget validates the pointer and count before use.
-        unsafe { budget.slice(self.api.entries(self.instance, &mut count), count) }
+        unsafe { budget.slice(self.0.api.entries(self.0.instance(), &mut count), count) }
             .map_err(CopyError::into_error)
     }
     fn subscription(&mut self, id: &A::Id, subscribe: bool) {
@@ -747,9 +580,9 @@ impl<A: ListenerApi> Listener<A> {
         // SAFETY: the listener instance is live and `id` outlives the call.
         unsafe {
             if subscribe {
-                self.api.subscribe(self.instance, id);
+                self.0.api.subscribe(self.0.instance(), id);
             } else {
-                self.api.unsubscribe(self.instance, id);
+                self.0.api.unsubscribe(self.0.instance(), id);
             }
         };
     }
@@ -763,15 +596,16 @@ impl<A: ListenerApi> Listener<A> {
                 // SAFETY: the batch came from this listener and is freed once.
                 unsafe {
                     self.listener
+                        .0
                         .api
-                        .free_events(self.listener.instance, self.events)
+                        .free_events(self.listener.0.instance(), self.events)
                 };
             }
         }
         let timeout = to_ms_checked(timeout)?;
         let mut count = 0;
         // SAFETY: the listener instance is live for this borrow.
-        let events = unsafe { self.api.events(self.instance, &mut count, timeout) };
+        let events = unsafe { self.0.api.events(self.0.instance(), &mut count, timeout) };
         let mut budget = copy_budget();
         if events.is_null() {
             // No event arrived only if the count agrees. A null batch with
@@ -797,26 +631,6 @@ impl<A: ListenerApi> Listener<A> {
                 })
             }
         })
-    }
-}
-
-#[cfg(feature = "advanced")]
-impl<A: ListenerApi> crate::advanced::Configurable for Listener<A> {
-    type Options = ListenerOptions;
-    type Settings = A::Settings;
-    type Instance = A::Instance;
-
-    /// A listener the SDK does not create is reported by the server it was
-    /// given, so the entry point's name is not needed.
-    unsafe fn create_with(
-        ndi: &Ndi,
-        options: &ListenerOptions,
-        _operation: &'static str,
-        config: crate::advanced::AdvancedConfig,
-        create: impl FnOnce(&A::Settings) -> A::Instance,
-    ) -> Result<Self> {
-        // SAFETY: forwarded to the caller's obligation.
-        unsafe { Self::create(ndi, options, Some(config), |_, settings| create(settings)) }
     }
 }
 
@@ -1124,8 +938,8 @@ impl RecvListener {
         unsafe { require_receiver_connect(receivers, id, &mut budget)? };
         // SAFETY: the listener instance is live and both strings outlive the call.
         if unsafe {
-            self.inner.api.NDIlib_recv_listener_send_connect(
-                self.inner.instance,
+            self.inner.0.api.NDIlib_recv_listener_send_connect(
+                self.inner.0.instance().0,
                 id.as_c_str().as_ptr(),
                 source.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
             )

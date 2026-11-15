@@ -9,9 +9,10 @@
 use std::ptr;
 
 use crate::{
-    frames::{MetadataText, ValidatedVideoLayout, VideoHeader, VideoParts, MAX_VIDEO_BYTES},
+    frames::{FrameMetadataRef, ValidatedVideoLayout, VideoHeader, VideoParts, MAX_VIDEO_BYTES},
     sys::{self, bindings::NDIlib_video_frame_v2_t},
-    Error, Ndi, PixelFormat, Result, ScanType, Timecode, VideoFrame, VideoSource,
+    Error, Ndi, PictureAspectRatio, PixelFormat, Result, ScanType, Timecode, VideoFrame,
+    VideoSource,
 };
 
 /// Validated V210 storage geometry, including optional initialized row padding.
@@ -165,7 +166,7 @@ impl V210Layout {
         let frame =
             crate::BorrowedVideoFrame::builder(data, self.width, self.height, PixelFormat::P216)
                 .build()?;
-        frame.video_descriptor(crate::frames::SendableVideoLayout::new(p216, ndi)?)
+        Ok(crate::frames::Sendable::borrowed(&frame, ndi)?.video_descriptor())
     }
 
     /// Borrow writable P216 storage without deriving the output pointer from
@@ -179,7 +180,7 @@ impl V210Layout {
             None,
         )?;
         let frame = P216Output::new(layout, data)?;
-        frame.video_descriptor(crate::frames::SendableVideoLayout::new(layout, ndi)?)
+        Ok(crate::frames::Sendable::borrowed(&frame, ndi)?.video_descriptor())
     }
 
     /// The SDK descriptor of this layout's V210 words at `data`: `p216`, the
@@ -220,12 +221,12 @@ impl<'a> P216Output<'a> {
         }
         Ok(Self {
             layout,
-            header: VideoHeader {
-                frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
-                picture_aspect_ratio: 0.0,
-                scan_type: ScanType::Progressive,
-                timecode: Timecode::SYNTHESIZE,
-            },
+            header: VideoHeader::new(
+                crate::media::DEFAULT_VIDEO_FRAME_RATE,
+                PictureAspectRatio::SQUARE_PIXELS,
+                ScanType::Progressive,
+                Timecode::SYNTHESIZE,
+            ),
             pointer: data.as_mut_ptr(),
             _borrow: std::marker::PhantomData,
         })
@@ -245,8 +246,8 @@ unsafe impl VideoParts for P216Output<'_> {
     fn pixels(&self) -> *const u8 {
         self.pointer.cast_const()
     }
-    fn metadata_text(&self) -> Option<MetadataText<'_>> {
-        None
+    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+        FrameMetadataRef::Absent
     }
     fn sdk_timestamp(&self) -> Option<crate::SdkTimestamp> {
         None
@@ -343,10 +344,7 @@ impl VideoConverter {
         layout.check_p216(source)?;
         self.pack_descriptor(
             layout,
-            source.video_descriptor(crate::frames::SendableVideoLayout::new(
-                *source.layout(),
-                &self._ndi,
-            )?)?,
+            crate::frames::Sendable::borrowed(source, &self._ndi)?.video_descriptor(),
             destination,
         )
     }
@@ -623,7 +621,7 @@ mod tests {
     fn strided_borrowed_and_captured_p216_convert_without_pixel_copies() {
         use crate::{
             capture::{FrameSyncVideoFree, Guard, VideoKind},
-            frames::{VideoParts, VideoRef},
+            frames::VideoRef,
             BorrowedVideoFrame,
         };
         let Some(ndi) = crate::test_support::ndi() else {
@@ -651,11 +649,7 @@ mod tests {
                             .metadata(c"<p216/>")
                             .build()
                             .unwrap();
-                    let raw = borrowed
-                        .video_descriptor(crate::frames::SendableVideoLayout::for_test(
-                            *borrowed.layout(),
-                        ))
-                        .unwrap();
+                    let raw = crate::frames::Sendable::for_test(&borrowed).video_descriptor();
                     // SAFETY: Both synthetic guards borrow storage and static
                     // metadata for this test, and neither callback frees them.
                     let receiver = unsafe {
@@ -687,11 +681,8 @@ mod tests {
                         .unwrap();
                     for source in [&borrowed as &dyn VideoSource, &receiver, &framesync] {
                         assert_eq!(
-                            source
-                                .video_descriptor(crate::frames::SendableVideoLayout::for_test(
-                                    *source.layout()
-                                ))
-                                .unwrap()
+                            crate::frames::Sendable::for_test(source)
+                                .video_descriptor()
                                 .p_data,
                             raw.p_data
                         );

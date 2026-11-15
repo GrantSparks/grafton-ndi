@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     advanced::{EnvelopeCodec, PacketEnvelope, VideoPacketFormat},
-    FrameMetadataStatus,
+    FrameMetadataStatus, SdkTimestamp,
 };
 use std::{
     ptr,
@@ -104,7 +104,20 @@ fn borrowed_compressed_payloads_allocate_nothing_and_release_once() {
         assert_eq!(allocations, 0);
         assert_eq!(frame.metadata_status(), status);
         assert_eq!(frame.metadata(), None);
-        assert_eq!(frame.to_owned().metadata(), None);
+        let copied = frame.to_owned();
+        assert_eq!(copied.metadata(), None);
+        assert_eq!(copied.metadata_status(), status);
+        assert_eq!(copied.clone().metadata_status(), status);
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            frame.copy_into(&mut owned);
+            assert_eq!(owned.metadata_status(), status);
+            assert_eq!(owned.metadata(), None);
+        });
+        assert_eq!(allocations, 0);
+        owned.set_metadata("").unwrap();
+        assert_eq!(owned.metadata_status(), FrameMetadataStatus::Text);
+        owned.clear_metadata();
+        assert_eq!(owned.metadata_status(), FrameMetadataStatus::Absent);
     }
 }
 
@@ -168,6 +181,44 @@ fn borrowed_audio_uses_receive_validation_and_reuses_owned_storage() {
     })
     .is_err());
     assert_eq!(frees.load(Ordering::Relaxed), 3);
+
+    let unterminated = vec![b'x'; crate::frames::MAX_METADATA_BYTES];
+    for (pointer, status, text) in [
+        (ptr::null(), FrameMetadataStatus::Absent, None),
+        (c"".as_ptr(), FrameMetadataStatus::Text, Some("")),
+        (
+            c"<audio/>".as_ptr(),
+            FrameMetadataStatus::Text,
+            Some("<audio/>"),
+        ),
+        (c"\xff".as_ptr(), FrameMetadataStatus::NotUtf8, None),
+        (
+            unterminated.as_ptr().cast(),
+            FrameMetadataStatus::Unterminated,
+            None,
+        ),
+    ] {
+        let raw = NDIlib_audio_frame_v3_t {
+            p_metadata: pointer,
+            ..raw
+        };
+        let frame = CompressedAudioRef::new(unsafe {
+            Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})
+        })
+        .unwrap();
+        assert_eq!(frame.metadata(), text);
+        assert_eq!(frame.metadata_status(), status);
+        let owned = frame.to_owned();
+        assert_eq!(owned.metadata(), text);
+        assert_eq!(owned.metadata_status(), status);
+        assert_eq!(owned.clone().metadata_status(), status);
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            frame.copy_into(&mut copy);
+            assert_eq!(copy.metadata(), text);
+            assert_eq!(copy.metadata_status(), status);
+        });
+        assert_eq!(allocations, 0);
+    }
 }
 
 #[test]
@@ -187,4 +238,50 @@ fn decoded_packet_fallback_borrows_the_original_pixels_without_allocating() {
     };
     assert_eq!(frame.data().unwrap().as_ptr(), source.data().as_ptr());
     assert_eq!(frame.metadata(), source.metadata());
+}
+
+#[test]
+fn borrowed_packets_normalize_timestamps_through_their_held_capture() {
+    let format = VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap();
+    let mut video = CompressedVideoFrame::new(
+        format,
+        PacketEnvelope::encode(EnvelopeCodec::H264, 1, 0, true, &[1, 2, 3], &[4]).unwrap(),
+    )
+    .unwrap();
+    let mut audio =
+        CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1, 2, 3, 4]).unwrap();
+    for (ticks, expected) in [
+        (NDIlib_recv_timestamp_undefined, None),
+        (0, Some(0)),
+        (123, Some(123)),
+    ] {
+        let raw_video = NDIlib_video_frame_v2_t {
+            timestamp: ticks,
+            ..video.raw()
+        };
+        let raw_audio = NDIlib_audio_frame_v3_t {
+            timestamp: ticks,
+            ..audio.raw()
+        };
+        // SAFETY: both source frames retain their immutable packet allocations;
+        // these synthetic guards only count the lifetime and free nothing.
+        let video_ref = CompressedVideoRef::new(unsafe {
+            Guard::with_test_free(ptr::null_mut(), raw_video, |_, _| {})
+        })
+        .unwrap();
+        let audio_ref = CompressedAudioRef::new(unsafe {
+            Guard::with_test_free(ptr::null_mut(), raw_audio, |_, _| {})
+        })
+        .unwrap();
+        assert_eq!(video_ref.timestamp().map(SdkTimestamp::ticks), expected);
+        assert_eq!(audio_ref.timestamp().map(SdkTimestamp::ticks), expected);
+        assert_eq!(
+            video_ref.to_owned().timestamp().map(SdkTimestamp::ticks),
+            expected
+        );
+        assert_eq!(
+            audio_ref.to_owned().timestamp().map(SdkTimestamp::ticks),
+            expected
+        );
+    }
 }

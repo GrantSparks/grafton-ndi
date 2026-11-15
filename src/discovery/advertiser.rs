@@ -1,15 +1,14 @@
 //! Registration of senders and receivers with a Discovery Server.
 
-use super::{not_created, Handle};
+use super::{ServerApi, ServerObject};
 use crate::{
     receiver::{ReceiverCore, ReceiverMode},
     sender::SenderResource,
-    sys::{self, bindings::*},
-    Error, Ndi, Receiver, Rejected, Result, Sender,
+    sys, Error, Ndi, Receiver, Rejected, Result, Sender,
 };
 use std::{
     collections::BTreeMap,
-    ffi::{c_char, CString},
+    ffi::CString,
     fmt, ptr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -165,106 +164,53 @@ impl RecvAdvertisement {
     }
 }
 
-/// What the sender and receiver advertiser tables have in common.
-trait AdvertiserApi: sys::Table + Sync {
-    /// The native advertiser handle.
-    type Instance: Handle;
-    /// The native creation settings.
-    type Settings;
-    /// The native owner a registration keeps alive.
-    type Member;
-    /// The Advanced table of the entry point that also takes a configuration.
-    #[cfg(feature = "advanced")]
-    type Configured: sys::Table;
-    /// That entry point's name.
-    #[cfg(feature = "advanced")]
-    const CONFIGURED: &'static str;
-
-    /// The settings for an advertiser of the Discovery Server at `url`, or of
-    /// the one the SDK is configured with when `url` is null.
-    fn settings(url: *const c_char) -> Self::Settings;
-
-    /// Create an advertiser. Returns null when the SDK creates none.
-    ///
+/// Registration operations added to the shared Discovery Server lifecycle.
+trait AdvertiserApi: ServerApi {
+    type Member: Send;
+    type Advertisement;
+    const MEMBER: &'static str;
+    const REGISTER: &'static str;
+    fn same_member(a: &Self::Member, b: &Self::Member) -> bool;
     /// # Safety
-    ///
-    /// The URL of `settings` must be null or a NUL-terminated string that
-    /// outlives the call.
-    unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance;
-
-    /// Create an advertiser with a per-instance configuration.
-    ///
+    /// The advertiser and member are live; the member retains its native handle
+    /// and all advertisement strings until removal or advertiser destruction.
+    unsafe fn add(
+        &self,
+        instance: Self::Instance,
+        member: &Self::Member,
+        options: &Self::Advertisement,
+    ) -> bool;
     /// # Safety
-    ///
-    /// `settings` must satisfy [`Self::create`]'s contract, and `config` must
-    /// point to a NUL-terminated configuration string that outlives the call.
-    #[cfg(feature = "advanced")]
-    unsafe fn create_configured(
-        table: &'static Self::Configured,
-        settings: *const Self::Settings,
-        config: *const c_char,
-    ) -> Self::Instance;
-
-    /// Destroy the advertiser.
-    ///
-    /// # Safety
-    ///
-    /// `instance` must be a live advertiser created through this table, and it
-    /// must not be used again.
-    unsafe fn destroy(&self, instance: Self::Instance);
-
-    /// Stop advertising `member`. Returns false, having removed nothing, when
-    /// the SDK did not know it.
-    ///
-    /// # Safety
-    ///
-    /// `instance` must be a live advertiser created through this table.
+    /// The advertiser and member are live and belong to this runtime.
     unsafe fn remove(&self, instance: Self::Instance, member: &Self::Member) -> bool;
 }
 
 impl AdvertiserApi for sys::SenderAdvertising {
-    type Instance = NDIlib_send_advertiser_instance_t;
-    type Settings = NDIlib_send_advertiser_create_t;
     type Member = Arc<SenderResource>;
-    #[cfg(feature = "advanced")]
-    type Configured = sys::advanced::SenderAdvertiserConfiguration;
-    #[cfg(feature = "advanced")]
-    const CONFIGURED: &'static str = "NDIlib_send_advertiser_create_ex";
-
-    fn settings(url: *const c_char) -> Self::Settings {
-        NDIlib_send_advertiser_create_t { p_url_address: url }
+    type Advertisement = SendAdvertisement;
+    const MEMBER: &'static str = "sender";
+    const REGISTER: &'static str = "register sender";
+    fn same_member(a: &Self::Member, b: &Self::Member) -> bool {
+        Arc::ptr_eq(a, b)
     }
-    unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance {
-        // SAFETY: forwarded to the caller's obligations.
-        unsafe { self.NDIlib_send_advertiser_create(settings) }
-    }
-    #[cfg(feature = "advanced")]
-    sys::advanced::declared! { SenderAdvertiserConfiguration {
-        unsafe fn create_configured(
-            table: &'static Self::Configured,
-            settings: *const Self::Settings,
-            config: *const c_char,
-        ) -> Self::Instance {
-            // SAFETY: forwarded to the caller's obligations.
-            unsafe { table.NDIlib_send_advertiser_create_ex(settings, config) }
+    unsafe fn add(
+        &self,
+        instance: Self::Instance,
+        member: &Self::Member,
+        options: &Self::Advertisement,
+    ) -> bool {
+        // SAFETY: forwarded to the caller's live-owner obligation.
+        unsafe {
+            self.NDIlib_send_advertiser_add_sender(
+                instance.0,
+                member.instance(),
+                options.monitoring,
+            )
         }
-    } else {
-        unsafe fn create_configured(
-            table: &'static Self::Configured,
-            _: *const Self::Settings,
-            _: *const c_char,
-        ) -> Self::Instance {
-            match *table {}
-        }
-    }}
-    unsafe fn destroy(&self, instance: Self::Instance) {
-        // SAFETY: forwarded to the caller's obligations.
-        unsafe { self.NDIlib_send_advertiser_destroy(instance) }
     }
     unsafe fn remove(&self, instance: Self::Instance, member: &Self::Member) -> bool {
-        // SAFETY: the caller supplies a live advertiser, and `member` owns a
-        // live sender.
-        unsafe { self.NDIlib_send_advertiser_del_sender(instance, member.instance()) }
+        // SAFETY: forwarded to the caller's live-owner obligation.
+        unsafe { self.NDIlib_send_advertiser_del_sender(instance.0, member.instance()) }
     }
 }
 
@@ -275,48 +221,36 @@ struct ReceiverMember {
 }
 
 impl AdvertiserApi for sys::ReceiverAdvertising {
-    type Instance = NDIlib_recv_advertiser_instance_t;
-    type Settings = NDIlib_recv_advertiser_create_t;
     type Member = ReceiverMember;
-    #[cfg(feature = "advanced")]
-    type Configured = sys::advanced::ReceiverAdvertiserConfiguration;
-    #[cfg(feature = "advanced")]
-    const CONFIGURED: &'static str = "NDIlib_recv_advertiser_create_ex";
-
-    fn settings(url: *const c_char) -> Self::Settings {
-        NDIlib_recv_advertiser_create_t { p_url_address: url }
+    type Advertisement = RecvAdvertisement;
+    const MEMBER: &'static str = "receiver";
+    const REGISTER: &'static str = "register receiver";
+    fn same_member(a: &Self::Member, b: &Self::Member) -> bool {
+        Arc::ptr_eq(&a.resource, &b.resource)
     }
-    unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance {
-        // SAFETY: forwarded to the caller's obligations.
-        unsafe { self.NDIlib_recv_advertiser_create(settings) }
-    }
-    #[cfg(feature = "advanced")]
-    sys::advanced::declared! { ReceiverAdvertiserConfiguration {
-        unsafe fn create_configured(
-            table: &'static Self::Configured,
-            settings: *const Self::Settings,
-            config: *const c_char,
-        ) -> Self::Instance {
-            // SAFETY: forwarded to the caller's obligations.
-            unsafe { table.NDIlib_recv_advertiser_create_ex(settings, config) }
+    unsafe fn add(
+        &self,
+        instance: Self::Instance,
+        member: &Self::Member,
+        options: &Self::Advertisement,
+    ) -> bool {
+        // SAFETY: forwarded to the caller's live-owner and retained-name obligation.
+        unsafe {
+            self.NDIlib_recv_advertiser_add_receiver(
+                instance.0,
+                member.resource.instance.0,
+                options.controlling,
+                options.monitoring,
+                member
+                    ._input_group
+                    .as_ref()
+                    .map_or(ptr::null(), |s| s.as_ptr()),
+            )
         }
-    } else {
-        unsafe fn create_configured(
-            table: &'static Self::Configured,
-            _: *const Self::Settings,
-            _: *const c_char,
-        ) -> Self::Instance {
-            match *table {}
-        }
-    }}
-    unsafe fn destroy(&self, instance: Self::Instance) {
-        // SAFETY: forwarded to the caller's obligations.
-        unsafe { self.NDIlib_recv_advertiser_destroy(instance) }
     }
     unsafe fn remove(&self, instance: Self::Instance, member: &Self::Member) -> bool {
-        // SAFETY: the caller supplies a live advertiser, and `member` owns a
-        // live receiver.
-        unsafe { self.NDIlib_recv_advertiser_del_receiver(instance, member.resource.instance) }
+        // SAFETY: forwarded to the caller's live-owner obligation.
+        unsafe { self.NDIlib_recv_advertiser_del_receiver(instance.0, member.resource.instance.0) }
     }
 }
 
@@ -329,90 +263,52 @@ static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
 /// The advertiser is the single owner of its registrations: each one keeps its
 /// sender or receiver alive until it is removed or the advertiser is dropped.
 struct Advertiser<A: AdvertiserApi> {
-    instance: A::Instance,
-    api: &'static A,
+    server: ServerObject<A>,
     members: BTreeMap<u64, A::Member>,
-    _url: Option<CString>,
-    #[cfg(feature = "advanced")]
-    _config: Option<crate::advanced::AdvancedConfig>,
-    _ndi: Ndi,
 }
 
-// SAFETY: the SDK attaches no advertiser to the thread that created it; its
-// objects may be used and destroyed from any thread as long as calls on one
-// object do not overlap. An advertiser has exactly one owner and is not `Sync`,
-// so its calls cannot overlap. The registered objects it may destroy are `Send`,
-// and everything else it holds is too.
-unsafe impl<A: AdvertiserApi> Send for Advertiser<A> where A::Member: Send {}
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Advertiser<sys::SenderAdvertising>>();
+    assert_send::<Advertiser<sys::ReceiverAdvertising>>();
+};
+
+impl<A: AdvertiserApi> Advertiser<A>
+where
+    A: ServerApi<Options = AdvertiserOptions>,
+{
+    fn new(ndi: &Ndi, options: &AdvertiserOptions) -> Result<Self> {
+        Ok(Self {
+            server: ServerObject::new(ndi, options)?,
+            members: BTreeMap::new(),
+        })
+    }
+}
 
 impl<A: AdvertiserApi> Advertiser<A> {
-    /// Connect to the Discovery Server `options` name, through the Advanced
-    /// entry point when the options carry a configuration.
-    fn new(ndi: &Ndi, options: &AdvertiserOptions) -> Result<Self> {
-        #[cfg(feature = "advanced")]
-        if let Some(config) = &options.config {
-            use crate::advanced::Configurable;
-            // SAFETY: the closure returns what the configured entry point
-            // returned for the settings and the configuration it was handed.
-            return unsafe {
-                Self::configured(
-                    ndi,
-                    options,
-                    A::CONFIGURED,
-                    config,
-                    |table: &'static A::Configured, settings, text| {
-                        A::create_configured(table, settings, text)
-                    },
-                )
-            };
+    fn register(&mut self, member: A::Member, options: &A::Advertisement) -> Result<u64> {
+        if self
+            .members
+            .values()
+            .any(|existing| A::same_member(existing, &member))
+        {
+            return Err(Error::InvalidInput(format!(
+                "{} is already registered",
+                A::MEMBER
+            )));
         }
-        // SAFETY: the SDK's advertiser creation returns null or a fresh
-        // advertiser that nothing else owns, and the settings outlive the call.
-        unsafe {
-            Self::create(
-                ndi,
-                options,
-                #[cfg(feature = "advanced")]
-                None,
-                |api, settings| api.create(settings),
-            )
+        // SAFETY: the member owns its native object and advertisement strings;
+        // successful registration retains that value until the SDK releases it.
+        if !unsafe {
+            self.server
+                .api
+                .add(self.server.instance(), &member, options)
+        } {
+            return Err(Error::NativeOperationFailed {
+                operation: A::REGISTER,
+            });
         }
-    }
-
-    /// The one creation path of both advertisers, with and without a
-    /// configuration: create the native advertiser through `create`, which
-    /// is handed the table and the native settings for `options`, and keep
-    /// `config` for as long as the advertiser lives.
-    ///
-    /// # Safety
-    ///
-    /// `create` returns null or a live advertiser of `ndi`'s runtime, made
-    /// from the settings it was handed, that nothing else owns.
-    unsafe fn create(
-        ndi: &Ndi,
-        options: &AdvertiserOptions,
-        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
-        create: impl FnOnce(&'static A, &A::Settings) -> A::Instance,
-    ) -> Result<Self> {
-        // An advertiser with a configuration gets here only once its own
-        // capability, which requires this table's, has been allowed, so it
-        // is never refused for this table.
-        let api = ndi.table::<A>()?;
-        let url = options.servers.as_deref().map(CString::new).transpose()?;
-        let settings = A::settings(url.as_ref().map_or(ptr::null(), |v| v.as_ptr()));
-        let instance = create(api, &settings);
-        if instance.is_null() {
-            return Err(not_created("advertiser", options.servers.as_deref()));
-        }
-        Ok(Self {
-            instance,
-            api,
-            members: BTreeMap::new(),
-            _url: url,
-            #[cfg(feature = "advanced")]
-            _config: config,
-            _ndi: ndi.clone(),
-        })
+        Ok(self.retain(member))
     }
 
     /// Keep a newly registered `member` alive and return its identifier.
@@ -445,7 +341,7 @@ impl<A: AdvertiserApi> Advertiser<A> {
             ));
         };
         // SAFETY: the advertiser is live for this borrow.
-        if !unsafe { self.api.remove(self.instance, member) } {
+        if !unsafe { self.server.api.remove(self.server.instance(), member) } {
             return Err(Rejected::new(
                 Error::NativeOperationFailed { operation },
                 registration,
@@ -457,37 +353,16 @@ impl<A: AdvertiserApi> Advertiser<A> {
     }
 }
 
-#[cfg(feature = "advanced")]
-impl<A: AdvertiserApi> crate::advanced::Configurable for Advertiser<A> {
-    type Options = AdvertiserOptions;
-    type Settings = A::Settings;
-    type Instance = A::Instance;
-
-    /// An advertiser the SDK does not create is reported by the server it
-    /// was given, so the entry point's name is not needed.
-    unsafe fn create_with(
-        ndi: &Ndi,
-        options: &AdvertiserOptions,
-        _operation: &'static str,
-        config: crate::advanced::AdvancedConfig,
-        create: impl FnOnce(&A::Settings) -> A::Instance,
-    ) -> Result<Self> {
-        // SAFETY: forwarded to the caller's obligation.
-        unsafe { Self::create(ndi, options, Some(config), |_, settings| create(settings)) }
-    }
-}
-
 impl<A: AdvertiserApi> Drop for Advertiser<A> {
     fn drop(&mut self) {
-        // The SDK's documented teardown order: stop advertising every object,
-        // destroy the advertiser, and only then release the objects, which
-        // happens when the fields drop after this body.
+        // End registrations, destroy their native advertiser, then release the
+        // retained members. Explicit destruction makes this independent of fields.
         for member in self.members.values() {
-            // SAFETY: the advertiser is live until the call below.
-            unsafe { self.api.remove(self.instance, member) };
+            // SAFETY: the advertiser and every member remain live through this call.
+            unsafe { self.server.api.remove(self.server.instance(), member) };
         }
-        // SAFETY: this is the advertiser's only owner, and it is not used again.
-        unsafe { self.api.destroy(self.instance) };
+        self.server.destroy();
+        self.members.clear();
     }
 }
 
@@ -655,29 +530,9 @@ impl SendAdvertiser {
         sender: &Sender,
         options: SendAdvertisement,
     ) -> Result<SendRegistration> {
-        let owner = sender.native_owner();
-        if self
-            .inner
-            .members
-            .values()
-            .any(|member| Arc::ptr_eq(member, &owner))
-        {
-            return Err(Error::InvalidInput("sender is already registered".into()));
-        }
-        // SAFETY: the advertiser is live for this borrow and `owner` keeps the
-        // sender alive for as long as the registration exists.
-        if !unsafe {
-            self.inner.api.NDIlib_send_advertiser_add_sender(
-                self.inner.instance,
-                owner.instance(),
-                options.monitoring,
-            )
-        } {
-            return Err(Error::NativeOperationFailed {
-                operation: "register sender",
-            });
-        }
-        Ok(SendRegistration(self.inner.retain(owner)))
+        self.inner
+            .register(sender.native_owner(), &options)
+            .map(SendRegistration)
     }
     /// Stop advertising a sender and release this advertiser's hold on it.
     ///
@@ -752,35 +607,15 @@ impl RecvAdvertiser {
             .as_deref()
             .map(CString::new)
             .transpose()?;
-        let resource = Arc::clone(&receiver.core);
-        if self
-            .inner
-            .members
-            .values()
-            .any(|member| Arc::ptr_eq(&member.resource, &resource))
-        {
-            return Err(Error::InvalidInput("receiver is already registered".into()));
-        }
-        // SAFETY: the advertiser is live for this borrow, `resource` keeps the
-        // receiver alive for as long as the registration exists, and the
-        // registration retains `input_group` for the same time.
-        if !unsafe {
-            self.inner.api.NDIlib_recv_advertiser_add_receiver(
-                self.inner.instance,
-                resource.instance,
-                options.controlling,
-                options.monitoring,
-                input_group.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+        self.inner
+            .register(
+                ReceiverMember {
+                    resource: Arc::clone(&receiver.core),
+                    _input_group: input_group,
+                },
+                &options,
             )
-        } {
-            return Err(Error::NativeOperationFailed {
-                operation: "register receiver",
-            });
-        }
-        Ok(RecvRegistration(self.inner.retain(ReceiverMember {
-            resource,
-            _input_group: input_group,
-        })))
+            .map(RecvRegistration)
     }
     /// Stop advertising a receiver and release this advertiser's hold on it.
     ///

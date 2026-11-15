@@ -395,9 +395,31 @@ pub struct AllocationBuffer {
     // Sync would let two threads make that call at once. Nothing needs it:
     // the registry keeps each buffer behind its mutex, which needs only Send,
     // and frees it by value.
-    storage: Box<dyn ExternalAllocation>,
+    storage: AllocationStorage,
     #[cfg(any(test, ndi_has_advanced_receive_allocators))]
     request: AllocationRequest,
+}
+
+enum AllocationStorage {
+    Owned(OwnedStorage),
+    External(Box<dyn ExternalAllocation>),
+}
+
+impl AllocationStorage {
+    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+    fn pointer(&self) -> NonNull<u8> {
+        match self {
+            Self::Owned(storage) => storage.pointer(),
+            Self::External(storage) => storage.pointer(),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Owned(storage) => storage.capacity(),
+            Self::External(storage) => storage.capacity(),
+        }
+    }
 }
 
 impl AllocationBuffer {
@@ -409,7 +431,7 @@ impl AllocationBuffer {
     /// much memory.
     pub fn zeroed(request: AllocationRequest) -> Result<Self> {
         Ok(Self {
-            storage: Box::new(OwnedStorage::zeroed(request.bytes)?),
+            storage: AllocationStorage::Owned(OwnedStorage::zeroed(request.bytes)?),
             #[cfg(any(test, ndi_has_advanced_receive_allocators))]
             request,
         })
@@ -439,7 +461,7 @@ impl AllocationBuffer {
         match problem {
             Some(problem) => Err(Rejected::new(invalid_input(problem), storage)),
             None => Ok(Self {
-                storage: Box::new(storage),
+                storage: AllocationStorage::External(Box::new(storage)),
                 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
                 request,
             }),
@@ -481,22 +503,8 @@ impl<F: Fn(AllocationRequest) -> Result<AllocationBuffer> + Send + Sync + 'stati
     }
 }
 
-/// Where a generation is in its life.
-#[cfg(any(test, ndi_has_advanced_receive_allocators))]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    /// Registered with a receiver: it may allocate.
-    Active,
-    /// Being replaced: a call already inside the policy may not publish.
-    Closing,
-    /// Replaced: only its outstanding leases keep it alive.
-    Retired,
-}
-
 /// One registered policy.
 struct Generation {
-    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-    phase: Mutex<Phase>,
     policy: ManuallyDrop<Arc<dyn ReceiveAllocator>>,
     count: Arc<AtomicUsize>,
 }
@@ -534,6 +542,10 @@ struct State {
     /// repeated free cannot release a later allocation that happens to reuse
     /// the address under another generation.
     leases: HashMap<(usize, usize), Lease>,
+    /// Reserved off the SDK threads to rebuild a lease table whose removal
+    /// tombstones have consumed its insertion capacity.
+    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+    rehash: Vec<((usize, usize), Lease)>,
     bytes: usize,
     #[cfg(any(test, ndi_has_advanced_receive_allocators))]
     reserved_bytes: usize,
@@ -547,6 +559,18 @@ impl State {
     fn decline(&mut self, reason: AllocationDecline) {
         let count = &mut self.declines[reason.index()];
         *count = count.saturating_add(1);
+    }
+
+    /// Draining resets tombstones in the existing allocation. Both containers
+    /// were reserved for every allowed lease before any SDK callback could run.
+    fn rebuild_leases(&mut self) {
+        debug_assert!(self.rehash.is_empty());
+        debug_assert!(self.rehash.capacity() >= self.leases.len());
+        self.rehash.extend(self.leases.drain());
+        for (key, lease) in self.rehash.drain(..) {
+            self.leases.insert(key, lease);
+        }
+        debug_assert!(self.leases.capacity() > self.leases.len());
     }
 }
 
@@ -610,13 +634,31 @@ impl Drop for Reservation<'_> {
 }
 
 impl Registry {
-    fn new(limits: AllocatorLimits) -> Self {
-        Self {
+    fn new(limits: AllocatorLimits) -> Result<Self> {
+        let unavailable = |_| invalid_input("Unable to reserve bounded allocator lease storage");
+        let mut leases = HashMap::new();
+        leases
+            .try_reserve(limits.max_allocations)
+            .map_err(unavailable)?;
+        #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+        let rehash = {
+            let mut rehash = Vec::new();
+            rehash
+                .try_reserve_exact(limits.max_allocations)
+                .map_err(unavailable)?;
+            rehash
+        };
+        Ok(Self {
             limits,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                leases,
+                #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+                rehash,
+                ..State::default()
+            }),
             generations: Arc::new(AtomicUsize::new(0)),
             next: AtomicUsize::new(1),
-        }
+        })
     }
 
     fn usage(&self) -> AllocatorUsage {
@@ -660,17 +702,9 @@ impl Registry {
             Err(error) => return Err(Rejected::new(error, policy)),
         };
         let generation = Arc::new(Generation {
-            #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-            phase: Mutex::new(Phase::Active),
             policy: ManuallyDrop::new(Arc::new(policy)),
             count: self.generations.clone(),
         });
-        // Some platforms, including macOS, allocate a mutex's native state on
-        // its first lock. Initialize it on this registering thread, before the
-        // generation is published, so the first SDK callback allocates nothing
-        // when checking the phase or recording a policy decline.
-        #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-        drop(lock(&generation.phase));
         lock(&self.state).active.insert(token, generation);
         Ok(token)
     }
@@ -690,20 +724,11 @@ impl Registry {
 
     #[cfg(any(test, ndi_has_advanced_receive_allocators))]
     fn closing(&self, token: usize) {
-        let generation = lock(&self.state).active.get(&token).cloned();
-        if let Some(g) = generation {
-            *lock(&g.phase) = Phase::Closing;
-        }
-    }
-
-    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-    fn retire(&self, token: usize) {
-        self.closing(token);
+        // Removing membership is the one transition: an admitted call retains
+        // the generation, but can no longer publish. User policy destruction
+        // runs after the state lock is released.
         let generation = lock(&self.state).active.remove(&token);
-        if let Some(g) = generation {
-            *lock(&g.phase) = Phase::Retired;
-            drop(g);
-        }
+        drop(generation);
     }
 
     #[cfg(any(test, ndi_has_advanced_receive_allocators))]
@@ -745,10 +770,6 @@ impl Registry {
             (generation, reservation)
         };
         request.capacity_limit = reservation.bytes;
-        if *lock(&generation.phase) != Phase::Active {
-            self.decline(AllocationDecline::GenerationUnavailable);
-            return None;
-        }
         // Storage accessors are application code too. A panic while checking a
         // returned buffer must be counted just like a panic in the policy,
         // before the outer native callback turns it into a refused request.
@@ -770,14 +791,19 @@ impl Registry {
             }
         };
         let actual = allocation.request;
-        if capacity > reservation.bytes
-            || actual.format != request.format
-            || actual.width != request.width
-            || actual.height != request.height
-            || actual.stride < request.stride
-            || actual.bytes < request.bytes
-            || capacity < actual.bytes
-        {
+        // The request's stride rule also defines the publication layout. A
+        // compressed size must match exactly; uncompressed padding must produce
+        // this same minimum extent. Capacity is a separate admission bound.
+        let consistent = request
+            .with_stride_bytes(actual.stride)
+            .is_ok_and(|expected| {
+                expected
+                    == AllocationRequest {
+                        capacity_limit: expected.capacity_limit,
+                        ..actual
+                    }
+            });
+        if capacity > reservation.bytes || !consistent || capacity < actual.bytes {
             self.decline(AllocationDecline::BufferRefused);
             return None;
         }
@@ -786,14 +812,13 @@ impl Registry {
             self.decline(AllocationDecline::BufferRefused);
             return None;
         };
-        // Serialize publication against Closing. An admitted policy may have
-        // blocked while replacement/destruction began; it must not publish late.
-        let phase = lock(&generation.phase);
-        if *phase != Phase::Active {
-            self.decline(AllocationDecline::GenerationUnavailable);
+        // Membership serializes publication against closing. An admitted policy
+        // may have blocked while replacement began; it must not publish late.
+        let mut s = lock(&self.state);
+        if !s.active.contains_key(&token) {
+            s.decline(AllocationDecline::GenerationUnavailable);
             return None;
         }
-        let mut s = lock(&self.state);
         if s.leases.contains_key(&(token, pointer.as_ptr() as usize)) {
             s.decline(AllocationDecline::BufferRefused);
             return None;
@@ -801,16 +826,18 @@ impl Registry {
         // The buffer takes the place of the grant that covered it.
         reservation.release(&mut s);
         s.bytes += capacity;
+        if s.leases.capacity() == s.leases.len() {
+            s.rebuild_leases();
+        }
         s.leases.insert(
             (token, pointer.as_ptr() as usize),
             Lease {
                 _buffer: allocation,
                 bytes: capacity,
-                _generation: generation.clone(),
+                _generation: generation,
             },
         );
         drop(s);
-        drop(phase);
         Some((pointer, stride))
     }
 
@@ -984,10 +1011,19 @@ impl AllocatorService {
     /// # Errors
     ///
     /// [`Error::InvalidInput`](crate::Error::InvalidInput) when the limits are
-    /// out of range or differ from those of an earlier service.
+    /// out of range, differ from those of an earlier service, or the bounded
+    /// lease bookkeeping cannot be reserved.
     pub fn new(runtime: ProcessLifetimeRuntime, limits: AllocatorLimits) -> Result<Self> {
         let limits = limits.validate()?;
-        let registry = REGISTRY.get_or_init(|| Registry::new(limits));
+        let registry = match REGISTRY.get() {
+            Some(registry) => registry,
+            None => {
+                // Reserve off the SDK's threads. If another caller initializes
+                // first, its limits win and the comparison below is unchanged.
+                let _ = REGISTRY.set(Registry::new(limits)?);
+                registry()
+            }
+        };
         if registry.limits != limits {
             return Err(crate::Error::InvalidInput(
                 "Allocator limits differ from the existing process allocator service".into(),
@@ -1312,7 +1348,7 @@ impl<M: ReceiverMode> Allocation<M> {
             registry.closing(earlier);
         }
         let opaque = token.map_or(std::ptr::null_mut(), |token| token as *mut c_void);
-        let instance = self.receiver().core.instance;
+        let instance = self.receiver().core.instance.0;
         let table = self.table;
         // SAFETY: the receiver is live. The callbacks are functions of this
         // program, which stays loaded, and the opaque value is a token they
@@ -1332,9 +1368,6 @@ impl<M: ReceiverMode> Allocation<M> {
                     token.map(|_| audio_free as _),
                 ),
             }
-        }
-        if let Some(earlier) = earlier {
-            registry.retire(earlier);
         }
     }
 
@@ -1628,7 +1661,7 @@ mod tests {
 
     #[test]
     fn request_conversion_declines_count_once_without_calling_a_policy() {
-        let registry = Registry::new(limits());
+        let registry = Registry::new(limits()).unwrap();
         let token = registry.register(AllocationBuffer::zeroed).unwrap();
         let video = NDIlib_video_frame_v2_t {
             FourCC: u32::MAX,
@@ -1659,7 +1692,7 @@ mod tests {
 
     #[test]
     fn unrepresentable_requests_decline_without_allocating_or_calling_the_policy() {
-        let registry = Registry::new(limits());
+        let registry = Registry::new(limits()).unwrap();
         let policy_calls = Arc::new(AtomicUsize::new(0));
         let calls = policy_calls.clone();
         let token = registry
@@ -1797,8 +1830,124 @@ mod tests {
     }
 
     #[test]
+    fn successful_owned_allocation_allocates_only_its_frame_memory() {
+        let registry = Registry::new(limits()).unwrap();
+        let token = registry.register(AllocationBuffer::zeroed).unwrap();
+        let (published, allocations) =
+            crate::test_alloc::allocation_count(|| registry.allocate(token, request()));
+        let (pointer, _) = published.unwrap();
+        assert_eq!(allocations, 1);
+        assert!(registry.free(token, pointer.as_ptr()));
+    }
+
+    #[test]
+    fn successful_preboxed_external_allocation_needs_no_bookkeeping_allocation() {
+        let registry = Registry::new(limits()).unwrap();
+        let buffer = AllocationBuffer::from_external(
+            request(),
+            OwnedStorage::zeroed(request().minimum_bytes()).unwrap(),
+        )
+        .unwrap();
+        let buffer = Mutex::new(Some(buffer));
+        // Some platforms allocate a native mutex on its first lock. Initialize
+        // this application policy's pool lock outside the measured callback;
+        // register initializes the registry's own lock before SDK calls begin.
+        drop(lock(&buffer));
+        let token = registry
+            .register(move |_| Ok(lock(&buffer).take().unwrap()))
+            .unwrap();
+        let (published, allocations) =
+            crate::test_alloc::allocation_count(|| registry.allocate(token, request()));
+        let (pointer, _) = published.unwrap();
+        assert_eq!(allocations, 0);
+        assert!(registry.free(token, pointer.as_ptr()));
+    }
+
+    #[test]
+    fn lease_bookkeeping_is_fallibly_reserved_for_the_full_limit() {
+        let limit = 32;
+        let registry = Registry::new(AllocatorLimits {
+            max_allocations: limit,
+            max_bytes: limit * 64,
+            ..limits()
+        })
+        .unwrap();
+        let token = registry.register(AllocationBuffer::zeroed).unwrap();
+        let capacity = lock(&registry.state).leases.capacity();
+        assert!(capacity >= limit);
+        let mut held = Vec::with_capacity(limit);
+        for _ in 0..limit {
+            let (published, allocations) =
+                crate::test_alloc::allocation_count(|| registry.allocate(token, request()));
+            held.push(published.unwrap().0);
+            assert_eq!(allocations, 1);
+        }
+        let state = lock(&registry.state);
+        assert_eq!(state.leases.len(), limit);
+        assert_eq!(state.leases.capacity(), capacity);
+        drop(state);
+        for pointer in held {
+            assert!(registry.free(token, pointer.as_ptr()));
+        }
+
+        // An impossible reservation is an input error, rather than a panic or
+        // an infallible allocation on the first SDK callback.
+        assert!(matches!(
+            Registry::new(AllocatorLimits {
+                max_allocations: usize::MAX,
+                ..limits()
+            }),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn lease_churn_never_allocates_for_preboxed_external_storage() {
+        let limit = 16;
+        let changes = 1024;
+        let registry = Registry::new(AllocatorLimits {
+            max_allocations: limit,
+            max_bytes: limit * 64,
+            ..limits()
+        })
+        .unwrap();
+        // Keeping every allocation alive before the measurement makes every
+        // subsequent address distinct, exercising removal tombstones rather
+        // than repeatedly inserting the same allocator-reused address.
+        let buffers = (0..limit + changes)
+            .map(|_| {
+                AllocationBuffer::from_external(
+                    request(),
+                    OwnedStorage::zeroed(request().minimum_bytes()).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let buffers = Mutex::new(buffers);
+        let token = registry
+            .register(move |_| Ok(lock(&buffers).pop().unwrap()))
+            .unwrap();
+        let mut held = Vec::with_capacity(limit);
+        for _ in 0..limit {
+            held.push(registry.allocate(token, request()).unwrap().0);
+        }
+        for change in 0..changes {
+            let slot = &mut held[change % limit];
+            let (published, allocations) = crate::test_alloc::allocation_count(|| {
+                assert!(registry.free(token, slot.as_ptr()));
+                registry.allocate(token, request())
+            });
+            *slot = published.unwrap().0;
+            assert_eq!(allocations, 0);
+        }
+        for pointer in held {
+            assert!(registry.free(token, pointer.as_ptr()));
+        }
+    }
+
+    #[test]
     fn unavailable_generations_and_policy_errors_have_distinct_decline_counts() {
-        let registry = Registry::new(limits());
+        let registry = Registry::new(limits()).unwrap();
         let token = registry
             .register(|_: AllocationRequest| -> Result<AllocationBuffer> {
                 Err(Error::InvalidInput(String::new()))
@@ -1811,7 +1960,7 @@ mod tests {
         assert_eq!(registry.usage().declined(AllocationDecline::PolicyError), 1);
         registry.closing(token);
         assert!(registry.allocate(token, request()).is_none());
-        registry.retire(token);
+        registry.closing(token);
         assert!(registry.allocate(token, request()).is_none());
         let usage = registry.usage();
         assert_eq!(usage.declined(AllocationDecline::GenerationUnavailable), 2);
@@ -1861,7 +2010,7 @@ mod tests {
         }
 
         for panic_in_pointer in [true, false] {
-            let registry = Registry::new(limits());
+            let registry = Registry::new(limits()).unwrap();
             let drops = Arc::new(AtomicUsize::new(0));
             let token = registry
                 .register({
@@ -1897,7 +2046,7 @@ mod tests {
 
     #[test]
     fn declined_budget_requests_allocate_nothing_and_stay_exact_under_contention() {
-        let registry = Registry::new(limits());
+        let registry = Registry::new(limits()).unwrap();
         let token = registry.register(AllocationBuffer::zeroed).unwrap();
         let oversized = request_of(128);
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
@@ -1939,7 +2088,7 @@ mod tests {
                 lock(&self.0).capacity()
             }
         }
-        let registry = Registry::new(limits());
+        let registry = Registry::new(limits()).unwrap();
         let storage = Arc::new(Mutex::new(OwnedStorage::zeroed(64).unwrap()));
         let token = registry
             .register(move |request| {
@@ -1963,17 +2112,18 @@ mod tests {
 
     #[test]
     fn invalid_buffer_layout_and_stride_overflow_are_counted_once() {
-        for overflow in [false, true] {
-            let registry = Registry::new(limits());
+        for malformed in 0..3 {
+            let registry = Registry::new(limits()).unwrap();
             let token = registry
                 .register(move |request| {
                     let mut buffer = AllocationBuffer::zeroed(request)?;
                     // Simulate a malformed policy result inside the fixture;
                     // neither value can be published as a native descriptor.
-                    if overflow {
-                        buffer.request.stride = i32::MAX as usize + 1;
-                    } else {
-                        buffer.request.width += 1;
+                    match malformed {
+                        0 => buffer.request.width += 1,
+                        1 => buffer.request.stride = i32::MAX as usize + 1,
+                        2 => buffer.request.bytes -= 1,
+                        _ => unreachable!(),
                     }
                     Ok(buffer)
                 })
@@ -1986,6 +2136,134 @@ mod tests {
             assert_eq!(usage.retained_bytes(), 0);
             assert_eq!(usage.in_progress_allocations(), 0);
         }
+    }
+
+    fn compressed_requests(bytes: i32) -> [AllocationRequest; 2] {
+        let mut video = NDIlib_video_frame_v2_t {
+            FourCC: VideoCodec::H264.outer(StreamTier::Program, false),
+            xres: 16,
+            yres: 16,
+            ..Default::default()
+        };
+        video.__bindgen_anon_1.data_size_in_bytes = bytes;
+        let mut audio = NDIlib_audio_frame_v3_t {
+            FourCC: AudioCodec::Opus.outer(false),
+            sample_rate: 48_000,
+            no_channels: 2,
+            no_samples: 8,
+            ..Default::default()
+        };
+        audio.__bindgen_anon_1.data_size_in_bytes = bytes;
+        [
+            video_request(&video).unwrap(),
+            audio_request(&audio).unwrap(),
+        ]
+    }
+
+    fn cached_request_policy() -> impl ReceiveAllocator {
+        let cached = Mutex::new(None);
+        move |request| AllocationBuffer::zeroed(*lock(&cached).get_or_insert(request))
+    }
+
+    #[test]
+    fn stale_compressed_requests_are_declined_without_retaining_storage() {
+        for (first, smaller) in compressed_requests(64)
+            .into_iter()
+            .zip(compressed_requests(32))
+        {
+            let registry = Registry::new(limits()).unwrap();
+            let token = registry.register(cached_request_policy()).unwrap();
+            let (pointer, size) = registry.allocate(token, first).unwrap();
+            assert_eq!(size, 64);
+            assert!(registry.free(token, pointer.as_ptr()));
+
+            assert!(registry.allocate(token, smaller).is_none());
+            let usage = registry.usage();
+            assert_eq!(usage.declined(AllocationDecline::BufferRefused), 1);
+            assert_eq!(usage.declined_allocations(), 1);
+            assert_eq!(usage.retained_allocations(), 0);
+            assert_eq!(usage.retained_bytes(), 0);
+            assert_eq!(usage.in_progress_allocations(), 0);
+        }
+    }
+
+    #[test]
+    fn exact_compressed_sizes_and_valid_uncompressed_padding_are_published() {
+        let video = video_request(&NDIlib_video_frame_v2_t {
+            FourCC: FourCc::from(PixelFormat::Bgra).raw(),
+            xres: 4,
+            yres: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        for request in compressed_requests(32)
+            .into_iter()
+            .chain([video, request_of(32)])
+        {
+            let registry = Registry::new(limits()).unwrap();
+            let token = registry
+                .register(|request: AllocationRequest| {
+                    AllocationBuffer::zeroed(request.with_stride_bytes(32)?)
+                })
+                .unwrap();
+            let (pointer, stride) = registry.allocate(token, request).unwrap();
+            assert_eq!(stride, 32);
+            assert_eq!(registry.usage().declined_allocations(), 0);
+            assert!(registry.free(token, pointer.as_ptr()));
+        }
+    }
+
+    #[cfg(ndi_has_advanced_receive_allocators)]
+    #[test]
+    fn compressed_callback_declines_clear_the_data_and_size() {
+        // This is the only unit test using the process-wide registry. It drives
+        // the native callback boundary directly without creating SDK objects.
+        let registry = REGISTRY.get_or_init(|| Registry::new(limits()).unwrap());
+        let token = registry.register(cached_request_policy()).unwrap();
+        let opaque = token as *mut c_void;
+        let mut video = NDIlib_video_frame_v2_t {
+            FourCC: VideoCodec::H264.outer(StreamTier::Program, false),
+            xres: 16,
+            yres: 16,
+            ..Default::default()
+        };
+        video.__bindgen_anon_1.data_size_in_bytes = 64;
+        // SAFETY: this live descriptor belongs to this call, and the token
+        // names a registered policy. The fixture performs no native access.
+        unsafe {
+            assert!(video_allocate(opaque, &mut video));
+            assert!(video_free(opaque, &video));
+            video.__bindgen_anon_1.data_size_in_bytes = 32;
+            assert!(!video_allocate(opaque, &mut video));
+            assert!(video.p_data.is_null());
+            assert_eq!(video.__bindgen_anon_1.data_size_in_bytes, 0);
+        }
+        registry.closing(token);
+
+        let token = registry.register(cached_request_policy()).unwrap();
+        let opaque = token as *mut c_void;
+        let mut audio = NDIlib_audio_frame_v3_t {
+            FourCC: AudioCodec::Opus.outer(false),
+            sample_rate: 48_000,
+            no_channels: 2,
+            no_samples: 8,
+            ..Default::default()
+        };
+        audio.__bindgen_anon_1.data_size_in_bytes = 64;
+        // SAFETY: as above, with the matching audio allocation and release.
+        unsafe {
+            assert!(audio_allocate(opaque, &mut audio));
+            assert!(audio_free(opaque, &audio));
+            audio.__bindgen_anon_1.data_size_in_bytes = 32;
+            assert!(!audio_allocate(opaque, &mut audio));
+            assert!(audio.p_data.is_null());
+            assert_eq!(audio.__bindgen_anon_1.data_size_in_bytes, 0);
+        }
+        registry.closing(token);
+        let usage = registry.usage();
+        assert_eq!(usage.declined(AllocationDecline::BufferRefused), 2);
+        assert_eq!(usage.retained_allocations(), 0);
+        assert_eq!(usage.in_progress_allocations(), 0);
     }
 
     /// A policy that can be told apart from another of its type.
@@ -2109,7 +2387,7 @@ mod tests {
     fn every_concurrent_call_the_limits_name_is_admitted() {
         let limits = AllocatorLimits::default();
         let calls = limits.max_concurrent_calls;
-        let registry = Registry::new(limits);
+        let registry = Registry::new(limits).unwrap();
         let gate = Arc::new(Gate::default());
         let granted = Arc::new(Mutex::new(Vec::new()));
         let token = registry
@@ -2161,7 +2439,7 @@ mod tests {
         for address in admitted {
             assert!(registry.free(token, address as *mut u8));
         }
-        registry.retire(token);
+        registry.closing(token);
     }
 
     /// A call is granted what is left of the byte budget, and declined only
@@ -2179,7 +2457,8 @@ mod tests {
             }
             .validate()
             .unwrap(),
-        );
+        )
+        .unwrap();
         let granted = Arc::new(Mutex::new(Vec::new()));
         let token = registry
             .register({
@@ -2214,7 +2493,7 @@ mod tests {
 
     #[test]
     fn a_buffer_beyond_its_grant_is_declined_and_nothing_stays_charged() {
-        let registry = Registry::new(limits());
+        let registry = Registry::new(limits()).unwrap();
         let token = registry
             .register(|request: AllocationRequest| {
                 // Twice what the call was granted.
@@ -2271,7 +2550,7 @@ mod tests {
 
     #[test]
     fn a_policy_the_process_has_no_room_for_is_handed_back() {
-        let registry = Registry::new(limits());
+        let registry = Registry::new(limits()).unwrap();
         let first = registry.register(Tagged(1)).unwrap();
         let second = registry.register(Tagged(2)).unwrap();
         assert_eq!((first, second), (1, 2));
@@ -2287,7 +2566,7 @@ mod tests {
 
         // Room again, but no token left to name a generation with: the
         // generation that was counted for the attempt is given up.
-        registry.retire(second);
+        registry.closing(second);
         assert_eq!(registry.generations.load(Ordering::Acquire), 1);
         registry.next.store(usize::MAX, Ordering::Release);
         let rejected = registry.register(Tagged(4)).unwrap_err();
@@ -2390,10 +2669,10 @@ mod tests {
 
     #[test]
     fn retired_lease_keeps_generation_and_budget_until_matching_free() {
-        let registry = Registry::new(limits());
+        let registry = Registry::new(limits()).unwrap();
         let token = registry.register(AllocationBuffer::zeroed).unwrap();
         let (pointer, _) = registry.allocate(token, request()).unwrap();
-        registry.retire(token);
+        registry.closing(token);
         assert!(registry.allocate(token, request()).is_none());
         assert_eq!(registry.generations.load(Ordering::Acquire), 1);
         let next = registry.register(AllocationBuffer::zeroed).unwrap();
@@ -2402,17 +2681,17 @@ mod tests {
         assert!(registry.free(token, pointer.as_ptr()));
         assert!(!registry.free(token, pointer.as_ptr()));
         assert_eq!(registry.generations.load(Ordering::Acquire), 1);
-        registry.retire(next);
+        registry.closing(next);
     }
 
     #[test]
     fn a_free_releases_only_an_allocation_of_the_generation_it_names() {
-        let registry = Registry::new(limits());
+        let registry = Registry::new(limits()).unwrap();
         let first = registry.register(AllocationBuffer::zeroed).unwrap();
         let (pointer, _) = registry.allocate(first, request()).unwrap();
         // The receiver moves on to a second generation while the SDK still
         // holds the first one's buffer.
-        registry.retire(first);
+        registry.closing(first);
         let second = registry.register(AllocationBuffer::zeroed).unwrap();
 
         // A free that names the second generation cannot release it.
@@ -2426,13 +2705,13 @@ mod tests {
         assert_eq!(lock(&registry.state).bytes, 0);
         assert!(lock(&registry.state).leases.is_empty());
         assert_eq!(registry.generations.load(Ordering::Acquire), 1);
-        registry.retire(second);
+        registry.closing(second);
         assert_eq!(registry.generations.load(Ordering::Acquire), 0);
     }
 
     #[test]
     fn policy_cannot_publish_after_close() {
-        let registry = Registry::new(limits());
+        let registry = Registry::new(limits()).unwrap();
         let gate = Arc::new(Gate::default());
         let token = registry
             .register({
@@ -2447,7 +2726,13 @@ mod tests {
             let worker = scope.spawn(|| registry.allocate(token, request()).is_some());
             assert!(gate.wait_for(1));
             registry.closing(token);
-            registry.retire(token);
+            assert_eq!(registry.usage().active_generations(), 0);
+            assert_eq!(registry.usage().in_progress_allocations(), 1);
+            assert_eq!(registry.usage().generations(), 1);
+            let replacement = registry.register(AllocationBuffer::zeroed).unwrap();
+            let (pointer, _) = registry.allocate(replacement, request()).unwrap();
+            assert!(registry.free(replacement, pointer.as_ptr()));
+            registry.closing(replacement);
             gate.open();
             worker.join().unwrap()
         });
@@ -2465,7 +2750,7 @@ mod tests {
 
     #[test]
     fn budgets_cover_multiple_generations_and_panic_paths() {
-        let registry = Registry::new(limits());
+        let registry = Registry::new(limits()).unwrap();
         let first = registry.register(AllocationBuffer::zeroed).unwrap();
         let second = registry.register(AllocationBuffer::zeroed).unwrap();
         let (a, _) = registry.allocate(first, request()).unwrap();
@@ -2477,8 +2762,8 @@ mod tests {
                 .declined(AllocationDecline::AllocationCountLimit),
             1
         );
-        registry.retire(first);
-        registry.retire(second);
+        registry.closing(first);
+        registry.closing(second);
         assert!(registry.free(first, a.as_ptr()));
         assert!(registry.free(second, b.as_ptr()));
         let panic = registry
@@ -2489,7 +2774,7 @@ mod tests {
         assert_eq!(registry.usage().declined_allocations(), 2);
         assert_eq!(lock(&registry.state).calls, 0);
         assert_eq!(lock(&registry.state).reserved_bytes, 0);
-        registry.retire(panic);
+        registry.closing(panic);
     }
 
     #[test]
@@ -2521,7 +2806,8 @@ mod tests {
             }
             .validate()
             .unwrap(),
-        );
+        )
+        .unwrap();
         let gate = Arc::new(Gate::default());
         let token = registry
             .register({
@@ -2547,6 +2833,6 @@ mod tests {
             assert!(free.join().unwrap());
         });
         assert_eq!(lock(&registry.state).bytes, 0);
-        registry.retire(token);
+        registry.closing(token);
     }
 }

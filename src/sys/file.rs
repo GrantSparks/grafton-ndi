@@ -26,9 +26,9 @@ use super::{
 #[cfg(ndi_link_static)]
 use crate::LoadFailure;
 use crate::{
-    capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeInfo},
+    capabilities::{CapabilityRefusal, CapabilityStatus, RuntimeInfo},
     file::FileFamily,
-    Error, LibraryKind, LoadRefusal, Result, SelectionConflict,
+    Error, LibraryKind, LoadRefusal, Result, SelectionFailure,
 };
 
 /// A family's table as one library resolved it, or the first of its entry
@@ -181,7 +181,7 @@ pub(crate) struct FileRuntime {
     path: std::path::PathBuf,
 }
 
-static SELECTED: Selection<FileRuntime> = Selection::new();
+static SELECTED: Selection<FileRuntime> = Selection::new(LibraryKind::File);
 
 /// Select the File library that accompanies the selected core runtime, or
 /// confirm that the one already pinned satisfies a request for `library_path`.
@@ -222,7 +222,7 @@ impl FileRuntime {
             .as_ref()
             .map_err(|symbol| Error::FileFamilyUnavailable {
                 family: T::FAMILY,
-                detail: symbol.to_string_lossy().into_owned(),
+                missing: symbol,
             })
     }
 
@@ -231,7 +231,9 @@ impl FileRuntime {
     pub(crate) fn status(&self, family: FileFamily) -> CapabilityStatus {
         match self.families.missing(family) {
             None => CapabilityStatus::Available,
-            Some(_) => CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable),
+            Some(symbol) => {
+                CapabilityStatus::Unavailable(CapabilityRefusal::SymbolUnavailable(symbol))
+            }
         }
     }
 }
@@ -270,13 +272,9 @@ impl FileRuntime {
         // process, so it is refused before anything is opened. The Windows
         // File library carries its own implementation and imports none.
         if cfg!(unix) && core.edition() != crate::capabilities::SdkEdition::Advanced {
-            return Err(Error::RuntimeConflict {
-                kind: SelectionConflict::FileNeedsAdvancedRuntime,
-                detail:
-                    "the NDI File library needs the Advanced SDK runtime, and the selected runtime \
-                 is the Standard one"
-                        .into(),
-            });
+            return Err(Error::RuntimeConflict(
+                SelectionFailure::file_needs_advanced(core.library_path(), explicit),
+            ));
         }
         Search {
             kind: LibraryKind::File,
@@ -313,7 +311,7 @@ impl FileRuntime {
     }
 
     fn accepts(&self, requested: Option<&Path>) -> Result<()> {
-        confirm_selected(&self.path, requested)
+        confirm_selected(LibraryKind::File, &self.path, requested)
     }
 }
 
@@ -341,13 +339,11 @@ impl FileRuntime {
     }
 
     fn reject_path(requested: Option<&Path>) -> Result<()> {
-        if requested.is_some() {
-            return Err(Error::RuntimeConflict {
-                kind: SelectionConflict::LinkedImplementation,
-                detail:
-                    "a statically linked NDI File implementation cannot be replaced by a library"
-                        .into(),
-            });
+        if let Some(requested) = requested {
+            return Err(Error::RuntimeConflict(SelectionFailure::linked(
+                LibraryKind::File,
+                requested,
+            )));
         }
         Ok(())
     }
@@ -377,6 +373,7 @@ impl FileRuntime {
 mod tests {
     use super::*;
     use crate::sys::table::ExportsWhere;
+    use crate::CapabilityUnavailable;
 
     /// A library that exports the names `exported` accepts.
     fn library(exported: impl Fn(&str) -> bool) -> std::result::Result<FileRuntime, LoadRefusal> {
@@ -388,10 +385,10 @@ mod tests {
     }
 
     /// A refusal's family and missing entry point.
-    fn refusal<T>(result: Result<T>) -> Option<(FileFamily, String)> {
+    fn refusal<T>(result: Result<T>) -> Option<(FileFamily, &'static CStr)> {
         match result {
             Ok(_) => None,
-            Err(Error::FileFamilyUnavailable { family, detail }) => Some((family, detail)),
+            Err(Error::FileFamilyUnavailable { family, missing }) => Some((family, missing)),
             Err(other) => panic!("unexpected error: {other}"),
         }
     }
@@ -405,15 +402,12 @@ mod tests {
         );
         assert!(library.table::<FilePlayback>().is_ok());
         assert_eq!(
-            library.status(FileFamily::Recording),
-            CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+            (library.status(FileFamily::Recording)).reason(),
+            Some(CapabilityUnavailable::SymbolUnavailable)
         );
         assert_eq!(
             refusal(library.table::<FileRecording>()),
-            Some((
-                FileFamily::Recording,
-                "NDIlib_file_recorder_rollover".into()
-            ))
+            Some((FileFamily::Recording, c"NDIlib_file_recorder_rollover"))
         );
     }
 
@@ -428,22 +422,26 @@ mod tests {
         for lacking in std::iter::once(None).chain(every_symbol.map(Some)) {
             let library = library(|name| Some(name) != lacking).unwrap();
             for family in FileFamily::ALL {
-                let refused = match family {
-                    FileFamily::Playback => refusal(library.table::<FilePlayback>()),
-                    FileFamily::Recording => refusal(library.table::<FileRecording>()),
-                };
+                let ((refused, status), allocations) = crate::test_alloc::allocation_count(|| {
+                    let refused = match family {
+                        FileFamily::Playback => refusal(library.table::<FilePlayback>()),
+                        FileFamily::Recording => refusal(library.table::<FileRecording>()),
+                    };
+                    (refused, library.status(family))
+                });
                 let context = format!("{family:?} lacking {lacking:?}");
-                match library.status(family) {
+                assert_eq!(allocations, 0, "{context}");
+                match status {
                     CapabilityStatus::Available => assert_eq!(refused, None, "{context}"),
                     CapabilityStatus::Unavailable(reason) => {
                         let (refused_family, detail) = refused.expect(&context);
                         assert_eq!(refused_family, family, "{context}");
                         assert_eq!(
                             reason,
-                            CapabilityUnavailable::SymbolUnavailable,
+                            CapabilityRefusal::SymbolUnavailable(detail),
                             "{context}"
                         );
-                        assert_eq!(Some(detail.as_str()), lacking, "{context}");
+                        assert_eq!(Some(detail.to_str().unwrap()), lacking, "{context}");
                     }
                 }
             }

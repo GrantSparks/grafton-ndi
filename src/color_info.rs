@@ -55,10 +55,10 @@ impl ColorInfo {
     /// [`TransferFunction::Hlg`].
     #[must_use]
     pub const fn is_hdr(&self) -> bool {
-        matches!(
-            self.transfer,
-            Some(TransferFunction::Pq | TransferFunction::Hlg)
-        )
+        match self.transfer {
+            Some(transfer) => transfer.is_hdr(),
+            None => false,
+        }
     }
 }
 
@@ -75,6 +75,17 @@ pub enum ColorPrimaries {
     Bt709,
     /// ITU-R BT.2020: `bt_2020`, or `bt_2100`, whose primaries are the same.
     Bt2020,
+}
+
+impl ColorPrimaries {
+    #[cfg(feature = "image-encoding")]
+    pub(crate) const fn h273_code(self) -> u8 {
+        match self {
+            Self::Bt709 => 1,
+            Self::Bt601 => 6,
+            Self::Bt2020 => 9,
+        }
+    }
 }
 
 /// The transfer function of a [`ColorInfo`].
@@ -95,6 +106,38 @@ pub enum TransferFunction {
     /// Perceptual quantization, ITU-R BT.2100 and SMPTE ST 2084:
     /// `bt_2100_pq`.
     Pq,
+}
+
+impl TransferFunction {
+    pub(crate) const fn is_hdr(self) -> bool {
+        match self {
+            Self::Bt601 | Self::Bt709 | Self::Bt2020 => false,
+            Self::Hlg | Self::Pq => true,
+        }
+    }
+
+    #[cfg(feature = "image-encoding")]
+    pub(crate) const fn h273_code(self) -> u8 {
+        match self {
+            Self::Bt601 | Self::Bt709 | Self::Bt2020 => 1,
+            Self::Hlg => 18,
+            Self::Pq => 16,
+        }
+    }
+
+    #[cfg(feature = "image-encoding")]
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Bt601 => "BT.601",
+            Self::Bt709 => "BT.709",
+            Self::Bt2020 => "BT.2020",
+            Self::Hlg => "HLG",
+            Self::Pq => "PQ",
+        }
+    }
+
+    #[cfg(all(test, feature = "image-encoding"))]
+    pub(crate) const ALL: [Self; 5] = [Self::Bt601, Self::Bt709, Self::Bt2020, Self::Hlg, Self::Pq];
 }
 
 /// The matrix that relates YCbCr to RGB, in a [`ColorInfo`] and in image
@@ -118,29 +161,28 @@ pub enum YuvMatrix {
 /// The element's name, which every scanned start tag is compared with.
 const ELEMENT: &[u8] = b"ndi_color_info";
 
-/// The optional text and its cached receive status. Retaining both lets an
-/// encoder choose its color policy before trying to read the description.
-pub(crate) struct Metadata<'a> {
-    status: crate::FrameMetadataStatus,
-    text: Option<&'a str>,
-}
+/// The frame's one validated metadata observation, read lazily after an
+/// encoder has chosen its color policy.
+pub(crate) struct Metadata<'a>(crate::frames::FrameMetadataRef<'a>);
 
 impl<'a> Metadata<'a> {
-    pub(crate) fn new(status: crate::FrameMetadataStatus, text: Option<&'a str>) -> Self {
-        Self { status, text }
+    pub(crate) fn new(metadata: crate::frames::FrameMetadataRef<'a>) -> Self {
+        Self(metadata)
     }
 
-    /// Read color only from metadata that was not withheld. Absent metadata
-    /// has no element; withheld text cannot establish that it has no element.
+    /// Absent text has no color element; withheld text cannot establish that.
     pub(crate) fn read(&self) -> Result<Option<ColorInfo>> {
-        match self.status {
-            crate::FrameMetadataStatus::Absent => Ok(None),
-            crate::FrameMetadataStatus::Text => parse(self.text),
-            status @ (crate::FrameMetadataStatus::NotUtf8
-            | crate::FrameMetadataStatus::Unterminated) => Err(Error::InvalidFrame(format!(
-                "The frame's color description cannot be read because its metadata was withheld \
-                 ({status:?}); ColorPolicy::Override explicitly supplies its color conversion"
-            ))),
+        use crate::frames::FrameMetadataRef;
+        match self.0 {
+            FrameMetadataRef::Absent => Ok(None),
+            FrameMetadataRef::Text(text) => parse(Some(text.as_str())),
+            FrameMetadataRef::Withheld(reason) => {
+                let status = FrameMetadataRef::Withheld(reason).status();
+                Err(Error::InvalidFrame(format!(
+                    "The frame's color description cannot be read because its metadata was withheld \
+                     ({status:?}); ColorPolicy::Override explicitly supplies its color conversion"
+                )))
+            }
         }
     }
 }

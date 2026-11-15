@@ -5,9 +5,10 @@ use std::ffi::c_char;
 
 use super::{aliasable::AliasableVec, descriptors, invalid_frame, sdk_quantity};
 use crate::{
-    frames::{check_picture_aspect_ratio, FrameMetadata, VideoHeader},
+    frames::{FrameMetadataRef, OwnedFrameMetadata, VideoHeader},
     sys::bindings::*,
-    Error, FourCc, FrameRate, Rejected, Result, ScanType, SdkTimestamp, StreamTier, Timecode,
+    Error, FourCc, FrameRate, PictureAspectRatio, Rejected, Result, ScanType, SdkTimestamp,
+    StreamTier, Timecode,
 };
 
 /// Maximum compressed frame size, in bytes, that this module sends or accepts.
@@ -505,7 +506,7 @@ pub struct VideoPacketFormat {
     width: u32,
     height: u32,
     frame_rate: FrameRate,
-    picture_aspect_ratio: f32,
+    picture_aspect_ratio: PictureAspectRatio,
     scan_type: ScanType,
 }
 
@@ -532,7 +533,7 @@ impl VideoPacketFormat {
                 width,
                 height,
                 frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
-                picture_aspect_ratio: 0.0,
+                picture_aspect_ratio: PictureAspectRatio::SQUARE_PIXELS,
                 scan_type: ScanType::Progressive,
             }),
             _ => Err(format!(
@@ -553,9 +554,9 @@ impl VideoPacketFormat {
         Ok(Self {
             tier,
             protected,
-            frame_rate: header.frame_rate,
-            picture_aspect_ratio: header.picture_aspect_ratio,
-            scan_type: header.scan_type,
+            frame_rate: header.frame_rate(),
+            picture_aspect_ratio: header.picture_aspect_ratio(),
+            scan_type: header.scan_type(),
             ..format
         })
     }
@@ -575,10 +576,8 @@ impl VideoPacketFormat {
     ///
     /// [`Error::InvalidInput`] when the value is negative or not finite.
     pub fn with_picture_aspect_ratio(self, ratio: f32) -> Result<Self> {
-        check_picture_aspect_ratio(ratio)
-            .map_err(|reason| Error::InvalidInput(reason.to_string()))?;
         Ok(Self {
-            picture_aspect_ratio: ratio,
+            picture_aspect_ratio: PictureAspectRatio::new(ratio)?,
             ..self
         })
     }
@@ -623,7 +622,7 @@ impl VideoPacketFormat {
 
     /// The picture aspect ratio; `0.0` means square pixels.
     pub fn picture_aspect_ratio(self) -> f32 {
-        self.picture_aspect_ratio
+        self.picture_aspect_ratio.get()
     }
 
     /// The stream this format belongs to.
@@ -690,7 +689,7 @@ impl VideoPacketFormat {
             FourCC: self.codec.outer(self.tier, self.protected),
             frame_rate_N: numerator,
             frame_rate_D: denominator,
-            picture_aspect_ratio: self.picture_aspect_ratio,
+            picture_aspect_ratio: self.picture_aspect_ratio.to_sdk(),
             frame_format_type: self.scan_type.to_sdk(),
             ..descriptors::video_frame()
         }
@@ -718,7 +717,7 @@ impl VideoPacketFormat {
 pub(crate) struct FrameExtras {
     timecode: Timecode,
     timestamp: Option<SdkTimestamp>,
-    metadata: Option<FrameMetadata>,
+    metadata: OwnedFrameMetadata,
 }
 
 impl FrameExtras {
@@ -729,32 +728,30 @@ impl FrameExtras {
     /// `metadata` is null or readable through its first NUL or the metadata cap.
     #[cfg(test)]
     unsafe fn received(timecode: i64, timestamp: i64, metadata: *const c_char) -> Result<Self> {
-        Ok(Self {
-            timecode: Timecode::from_ticks(timecode),
-            timestamp: SdkTimestamp::from_sdk(timestamp),
-            // SAFETY: forwarded to the caller's obligation.
-            metadata: unsafe { crate::frames::FrameMetadataState::scan(metadata).text(metadata) }
-                .map(|text| FrameMetadata::copy_from(text, None)),
-        })
+        let descriptor = NDIlib_video_frame_v2_t {
+            p_metadata: metadata,
+            ..Default::default()
+        };
+        // SAFETY: only metadata is inspected; the caller retains its bounded
+        // readable text while this synthetic descriptor is borrowed.
+        let frame = unsafe { crate::frames::ValidatedFrame::validate(&descriptor, |_| Ok(()))? };
+        let mut extras = Self::default();
+        extras.copy_received(
+            Timecode::from_ticks(timecode),
+            SdkTimestamp::from_sdk(timestamp),
+            frame.frame_metadata(),
+        );
+        Ok(extras)
     }
 
-    /// Reuse storage while copying already validated borrowed extras.
+    /// Reuse storage while copying the borrowed frame's one metadata value.
     fn copy_received(
         &mut self,
         timecode: Timecode,
         timestamp: Option<SdkTimestamp>,
-        text: Option<crate::frames::MetadataText<'_>>,
+        metadata: FrameMetadataRef<'_>,
     ) {
-        match text {
-            Some(text) => {
-                self.metadata = Some(FrameMetadata::copy_from(text, self.metadata.take()))
-            }
-            None => {
-                if let Some(storage) = &mut self.metadata {
-                    storage.clear();
-                }
-            }
-        }
+        self.metadata.copy_from(metadata);
         self.timecode = timecode;
         self.timestamp = timestamp;
     }
@@ -772,9 +769,13 @@ impl FrameExtras {
     /// The metadata text, if any.
     pub(crate) fn metadata(&self) -> Option<&str> {
         self.metadata
-            .as_ref()
-            .and_then(FrameMetadata::optional_text)
+            .view()
+            .text()
             .map(crate::frames::MetadataText::as_str)
+    }
+
+    pub(crate) fn metadata_status(&self) -> crate::FrameMetadataStatus {
+        self.metadata.view().status()
     }
 
     pub(crate) fn set_timecode(&mut self, timecode: Timecode) {
@@ -782,19 +783,18 @@ impl FrameExtras {
     }
 
     pub(crate) fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<()> {
-        self.metadata = Some(FrameMetadata::new(metadata)?);
-        Ok(())
+        self.metadata.set(metadata)
     }
 
     pub(crate) fn clear_metadata(&mut self) {
-        self.metadata = None;
+        // Explicit packet clearing releases retained metadata storage as before;
+        // copying an absent observation instead preserves it for later frames.
+        self.metadata = OwnedFrameMetadata::default();
     }
 
     /// Bytes the metadata keeps allocated, including terminator and spare capacity.
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.metadata
-            .as_ref()
-            .map_or(0, FrameMetadata::retained_bytes)
+        self.metadata.retained_bytes()
     }
 
     /// The timecode, timestamp and metadata fields of a native descriptor.
@@ -804,9 +804,7 @@ impl FrameExtras {
         (
             self.timecode.ticks(),
             SdkTimestamp::to_sdk(self.timestamp),
-            self.metadata
-                .as_ref()
-                .map_or(std::ptr::null(), |metadata| metadata.as_ptr()),
+            self.metadata.view().as_ptr(),
         )
     }
 }
@@ -828,6 +826,11 @@ macro_rules! frame_extras_accessors {
         /// The per-frame metadata, if any. Unreadable received text is omitted.
         pub fn metadata(&self) -> Option<&str> {
             self.extras.metadata()
+        }
+
+        /// Cached metadata presence or the reason unreadable text was withheld.
+        pub fn metadata_status(&self) -> $crate::FrameMetadataStatus {
+            self.extras.metadata_status()
         }
 
         /// Replace frame metadata. Use [`Self::clear_metadata`] to remove it.
@@ -1943,22 +1946,31 @@ mod tests {
         unsafe {
             let absent = FrameExtras::received(123, 456, std::ptr::null()).unwrap();
             assert_eq!(absent.metadata(), None);
+            assert_eq!(absent.metadata_status(), crate::FrameMetadataStatus::Absent);
             assert!(absent.to_sdk().2.is_null());
             for text in [c"", c"<received/>"] {
                 let extras = FrameExtras::received(123, 456, text.as_ptr()).unwrap();
                 assert_eq!(extras.metadata(), Some(text.to_str().unwrap()));
+                assert_eq!(extras.metadata_status(), crate::FrameMetadataStatus::Text);
                 assert_eq!(extras.retained_bytes(), text.to_bytes_with_nul().len());
                 assert_eq!(std::ffi::CStr::from_ptr(extras.to_sdk().2), text);
                 assert_eq!(extras.timecode().ticks(), 123);
                 assert_eq!(extras.timestamp().unwrap().ticks(), 456);
             }
             let unterminated = vec![b'x'; crate::frames::MAX_METADATA_BYTES];
-            for pointer in [c"\xff".as_ptr(), unterminated.as_ptr().cast()] {
+            for (pointer, status) in [
+                (c"\xff".as_ptr(), crate::FrameMetadataStatus::NotUtf8),
+                (
+                    unterminated.as_ptr().cast(),
+                    crate::FrameMetadataStatus::Unterminated,
+                ),
+            ] {
                 let (extras, allocations) = crate::test_alloc::allocation_count(|| {
                     FrameExtras::received(123, 456, pointer).unwrap()
                 });
                 assert_eq!(allocations, 0);
                 assert_eq!(extras.metadata(), None);
+                assert_eq!(extras.metadata_status(), status);
                 assert!(extras.to_sdk().2.is_null());
             }
         }

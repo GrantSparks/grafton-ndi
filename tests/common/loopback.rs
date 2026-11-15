@@ -19,7 +19,7 @@ pub fn loopback_source(ndi: &Ndi, sender: &Sender) -> grafton_ndi::Result<Source
 /// their source, not themselves.
 pub fn loopback_endpoint(ndi: &Ndi, name: &str) -> grafton_ndi::Result<Source> {
     let (source, port) = advertised_endpoint(ndi, name)?;
-    let loopback = SourceAddress::Ip(format!("{}:{port}", Ipv4Addr::LOCALHOST));
+    let loopback = SourceAddress::new(format!("{}:{port}", Ipv4Addr::LOCALHOST));
     Ok(source.with_address(loopback))
 }
 
@@ -39,10 +39,12 @@ pub fn loopback_finder(ndi: &Ndi) -> grafton_ndi::Result<Finder> {
 /// [`advertised_endpoint`], through `finder`, which the caller keeps.
 pub fn advertised_endpoint_by(finder: &Finder, name: &str) -> grafton_ndi::Result<(Source, u16)> {
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut watch = finder.watch();
     loop {
-        for source in finder.current_sources()? {
+        for source in watch.current_sources()? {
             if source.name() == name {
-                if let Some(SourceAddress::Ip(address)) = source.address() {
+                if let Some(address) = source.address().filter(|address| !address.is_url()) {
+                    let address = address.as_str();
                     let port = address
                         .rsplit(':')
                         .next()
@@ -56,6 +58,6 @@ pub fn advertised_endpoint_by(finder: &Finder, name: &str) -> grafton_ndi::Resul
             Instant::now() < deadline,
             "local sender endpoint not discovered: {name}"
         );
-        finder.wait_for_sources(Duration::from_millis(100))?;
+        watch.wait_for_change(Duration::from_millis(100))?;
     }
 }

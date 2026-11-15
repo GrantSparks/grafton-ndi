@@ -13,9 +13,9 @@ mod fixture;
 mod runtime_fixture;
 
 use grafton_ndi::{
-    capabilities::{CapabilityUnavailable, RuntimeFeature},
-    Error, Ndi, PixelFormat, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions,
-    RuntimeOptions, Sender, SenderOptions, Source, VideoFrame,
+    capabilities::RuntimeFeature, Error, Ndi, PixelFormat, Receiver, ReceiverBandwidth,
+    ReceiverColorFormat, ReceiverOptions, RuntimeOptions, Sender, SenderOptions, Source,
+    VideoFrame,
 };
 #[cfg(feature = "advanced")]
 use std::time::Duration;
@@ -73,7 +73,7 @@ fn calls(prefix: &str) -> usize {
 fn refused(error: &Error, expected: RuntimeFeature) {
     assert!(
         matches!(error, Error::UnsupportedCapability {
-        feature, reason: CapabilityUnavailable::RuntimeTooOld, ..
+        feature, refusal: grafton_ndi::CapabilityRefusal::RuntimeTooOld { .. }, ..
     } if *feature == expected),
         "wrong gate refusal: {error}"
     );
@@ -279,6 +279,7 @@ fn advanced(ndi: &Ndi, modern: bool) {
         );
         return;
     }
+    synchronizer_lifetimes(ndi);
     for (color, bandwidth, feature) in [
         (
             ReceiverColorFormat::Best444,
@@ -396,4 +397,42 @@ fn advanced(ndi: &Ndi, modern: bool) {
             assert_eq!(calls("avsync-synchronize:"), before + usize::from(modern));
         }
     }
+}
+
+#[cfg(feature = "advanced")]
+fn synchronizer_lifetimes(ndi: &Ndi) {
+    use grafton_ndi::advanced::{AdvancedConfig, AvSync, Genlock};
+    for recover in [false, true] {
+        let start = events().len();
+        let receiver =
+            Receiver::new(ndi, &ReceiverOptions::new(Source::new("lifetime fixture"))).unwrap();
+        let sync = AvSync::new(receiver).unwrap();
+        if recover {
+            drop(sync.into_receiver());
+        } else {
+            drop(sync);
+        }
+        let trace = events();
+        let trace = &trace[start..];
+        assert_eq!(trace.matches("avsync-destroy").count(), 1);
+        assert_eq!(trace.matches("receiver-destroy").count(), 1);
+        assert!(trace.find("avsync-destroy").unwrap() < trace.find("receiver-destroy").unwrap());
+    }
+    if let Err(error) = ndi.require_feature(RuntimeFeature::Genlock) {
+        common::skip(
+            common::Requirement::Advanced,
+            &format!("genlock fixture needs declarations: {error}"),
+        );
+        return;
+    }
+    let source = Source::new("genlock-source");
+    let config = AdvancedConfig::parse(r#"{"marker":"alive"}"#).unwrap();
+    let mut genlock = Genlock::new(ndi, Some(&source), Some(&config)).unwrap();
+    drop(source);
+    drop(config);
+    genlock
+        .connect(Some(&Source::new("genlock-reconnected")))
+        .unwrap();
+    drop(genlock);
+    assert!(events().contains(r#"genlock-destroy:genlock-reconnected:{"marker":"alive"}"#));
 }

@@ -7,7 +7,7 @@
 use super::{bindings::NDIlib_recv_color_format_e, table::Resolver, Evidence, Table};
 use crate::{
     advanced::PassthroughPreset,
-    capabilities::{CapabilityUnavailable, RuntimeFeature},
+    capabilities::{Capabilities, CapabilityRefusal, RuntimeFeature},
     LoadRefusal, Result,
 };
 use std::ffi::CStr;
@@ -100,40 +100,40 @@ macro_rules! advanced_tables {
 
         /// Each family is resolved atomically from the selected implementation.
         pub(crate) struct AdvancedApi {
-            $($field: std::result::Result<$Table, &'static CStr>,)+
+            $($field: std::result::Result<$Table, CapabilityRefusal>,)+
         }
 
         impl AdvancedApi {
             pub(crate) fn load(resolver: &dyn Resolver) -> std::result::Result<Self, LoadRefusal> {
-                Ok(Self { $($field: $Table::load(resolver)?,)+ })
+                Ok(Self { $($field: $Table::load(resolver)?.map_err(|symbol| {
+                    declared! { $Table { CapabilityRefusal::SymbolUnavailable(symbol) } else { CapabilityRefusal::BuildAbiUnavailable(symbol) } }
+                }),)+ })
+            }
+
+            /// Retain the exact detected decision in every table slot.
+            pub(crate) fn apply_capabilities(&mut self, capabilities: &Capabilities) {
+                $(if let Err(refusal) = capabilities.decision(RuntimeFeature::$feature) {
+                    self.$field = Err(refusal);
+                })+
             }
 
             /// The first function of the table gated by `feature` that did not
             /// resolve: one the implementation does not export or, when its
-            /// family is not declared, one this build does not declare. A
-            /// passthrough preset's receiver is the configured receiver, after
-            /// the color format constant this build may not declare. `None`
-            /// when everything resolved, and for a core feature.
-            pub(crate) fn missing(&self, feature: RuntimeFeature) -> Option<&'static CStr> {
+            /// family is not declared, one this build does not declare.
+            /// `None` when everything resolved, or for a feature without a
+            /// table in this registry.
+            pub(crate) fn missing(&self, feature: RuntimeFeature) -> Option<CapabilityRefusal> {
                 match feature {
                     $(RuntimeFeature::$feature => self.$field.as_ref().err().copied(),)+
-                    RuntimeFeature::Passthrough(preset) => passthrough_format(preset)
-                        .err()
-                        .or_else(|| self.missing(RuntimeFeature::AdvancedReceiverConfiguration)),
                     _ => None,
                 }
             }
 
-            /// Whether this build declares what `feature` needs: the table it
-            /// gates and, for a passthrough preset, the color format constant
-            /// that selects it. `false` for a core feature.
+            /// Whether this build declares the table `feature` gates.
+            /// `false` for a feature without a table in this registry.
             pub(crate) fn declares(feature: RuntimeFeature) -> bool {
                 match feature {
                     $(RuntimeFeature::$feature => declared! { $Table { true } else { false } },)+
-                    RuntimeFeature::Passthrough(preset) => {
-                        passthrough_format(preset).is_ok()
-                            && Self::declares(RuntimeFeature::AdvancedReceiverConfiguration)
-                    }
                     _ => false,
                 }
             }
@@ -168,9 +168,13 @@ macro_rules! passthrough_presets {
     ($($Preset:ident => $constant:ident,)+) => {
         impl PassthroughPreset {
             /// Every preset, in the order listed, for tests that cover each one.
-            #[cfg(test)]
             pub(crate) const ALL: [Self; [$(stringify!($Preset)),+].len()] =
                 [$(Self::$Preset),+];
+
+            pub(crate) fn index(self) -> usize {
+                enum Index { $($Preset,)+ }
+                match self { $(Self::$Preset => Index::$Preset as usize,)+ }
+            }
         }
 
         /// The receiver color format a packet receiver is created with to pass
@@ -235,12 +239,12 @@ impl Evidence<'_> {
         self,
         preset: PassthroughPreset,
     ) -> Result<NDIlib_recv_color_format_e> {
-        let feature = RuntimeFeature::Passthrough(preset);
-        self.require(feature)?;
-        // The preset's status is available only when its constant is
-        // declared, so this is reached only if that rule ever changes.
-        passthrough_format(preset)
-            .map_err(|_| self.unavailable(feature, CapabilityUnavailable::BuildAbiUnavailable))
+        self.capabilities
+            .passthrough_format(preset)
+            .map_err(|refusal| crate::Error::UnsupportedCapability {
+                feature: RuntimeFeature::Passthrough(preset),
+                refusal,
+            })
     }
 }
 

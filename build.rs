@@ -34,7 +34,13 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
-    for cfg in ["ndi_link_static", "ndi_has_advanced_header"] {
+    for cfg in [
+        "ndi_link_static",
+        "ndi_has_advanced_header",
+        "ndi_test_capture_permissions",
+        "ndi_test_finder_snapshot_guard",
+        "ndi_test_foreign_snapshot_guard",
+    ] {
         println!("cargo:rustc-check-cfg=cfg({cfg})");
     }
     for cfg in build_advanced::cfgs() {

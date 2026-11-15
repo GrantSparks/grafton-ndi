@@ -15,6 +15,20 @@ use super::{
 };
 use crate::{frames::VideoPlane, PixelFormat, YuvMatrix};
 
+#[cfg(test)]
+thread_local! {
+    static ROW_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn count_rows<T>(read: impl FnOnce() -> T) -> (T, usize) {
+    ROW_READS.with(|rows| {
+        let previous = rows.replace(0);
+        let result = read();
+        (result, rows.replace(previous))
+    })
+}
+
 /// The most pixels a [`Sink`] receives at once. Converting a batch of
 /// fixed size in small arrays keeps the conversion free of allocation and
 /// lets the compiler vectorize it.
@@ -229,6 +243,8 @@ impl<'a, P: Sample> Reader<'a, P> {
 
     /// Convert row `y` into `sink`.
     pub(super) fn row(&self, y: usize, sink: &mut impl Sink<P>) {
+        #[cfg(test)]
+        ROW_READS.with(|rows| rows.set(rows.get() + 1));
         let width = self.width;
         match &self.layout {
             &Layout::Rgb {

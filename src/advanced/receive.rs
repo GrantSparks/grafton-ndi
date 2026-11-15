@@ -343,7 +343,7 @@ impl PacketReceiver {
         receiver: &Receiver<PacketAttached>,
         timeout: Duration,
     ) -> Result<Option<PacketItemRef<'_>>> {
-        receiver.core.capture_any_until_with::<AllSlots, _>(
+        receiver.capture_any_until_with::<AllSlots, _>(
             Deadline::after(timeout)?,
             crate::receiver::NeverStop,
             PacketItemRef::Event,
@@ -707,10 +707,7 @@ mod tests {
     #[test]
     fn packet_receivers_validate_the_color_format_the_sdk_is_given() {
         use crate::{
-            capabilities::{
-                Capabilities, CapabilityUnavailable, RuntimeFeature, RuntimeInfo, SdkEdition,
-                SdkLinkage, SdkVersion,
-            },
+            capabilities::{Capabilities, RuntimeFeature, SdkEdition, SdkVersion},
             sys::{advanced::AdvancedApi, table::ExportsWhere, Api, Evidence},
             ReceiverColorFormat, Source,
         };
@@ -718,37 +715,31 @@ mod tests {
         // An Advanced 6.3.2 runtime that exports every function the crate
         // knows, gated as the loader gates the runtime it selects.
         let exports = ExportsWhere(|_: &str| true);
-        let (api, advanced) = (
+        let (mut api, mut advanced) = (
             Api::load(&exports).unwrap(),
             AdvancedApi::load(&exports).unwrap(),
         );
         let version = SdkVersion::parse("NDI SDK TEST 6.3.2.0");
         let capabilities = Capabilities::detect(&api, &advanced, version, SdkEdition::Advanced);
-        let info = RuntimeInfo {
-            edition: SdkEdition::Advanced,
-            linkage: SdkLinkage::Shared,
-            library_path: None,
-            raw_version: "NDI SDK TEST 6.3.2.0".into(),
-            version,
-        };
+        api.apply_capabilities(&capabilities);
+        advanced.apply_capabilities(&capabilities);
         let runtime = Evidence {
             api: &api,
             advanced: &advanced,
-            info: &info,
             capabilities: &capabilities,
         };
-        let require = |feature| runtime.require(feature);
-        let too_old = |result: Result<()>, wanted: RuntimeFeature| {
+        let too_old = |result: Result<crate::receiver::ValidatedReceiveOptions<'_>>,
+                       wanted: RuntimeFeature| {
             assert!(
                 matches!(
                     result,
                     Err(Error::UnsupportedCapability {
                         feature,
-                        reason: CapabilityUnavailable::RuntimeTooOld,
+                        refusal: crate::CapabilityRefusal::RuntimeTooOld { .. },
                         ..
                     }) if feature == wanted
                 ),
-                "{result:?}"
+                "expected the version-gated receive option to be refused"
             );
         };
 
@@ -757,7 +748,7 @@ mod tests {
             .allow_video_fields(false);
         // An ordinary receiver would be given Best444.
         too_old(
-            best.validate_runtime(require),
+            best.validate_runtime(runtime),
             RuntimeFeature::ReceiveBest444,
         );
 
@@ -765,12 +756,16 @@ mod tests {
         for preset in PassthroughPreset::ALL {
             let Ok(color_format) = runtime.passthrough_format(preset) else {
                 // Only a preset this build's headers do not declare.
-                assert!(!AdvancedApi::declares(RuntimeFeature::Passthrough(preset)));
+                assert!(!capabilities.supports(RuntimeFeature::Passthrough(preset)));
                 continue;
             };
             let packets = creation_options(&best, color_format);
-            packets.validate_runtime(require).unwrap();
-            let settings = packets.as_test_raw().unwrap().raw;
+            let settings = packets
+                .validate_runtime(runtime)
+                .unwrap()
+                .to_raw()
+                .unwrap()
+                .raw;
             assert_eq!(settings.color_format, color_format, "{preset:?}");
             assert!(settings.allow_video_fields);
 
@@ -780,14 +775,14 @@ mod tests {
                 .clone()
                 .bandwidth(crate::ReceiverBandwidth::VideoOnlyHighest);
             too_old(
-                creation_options(&video_only, color_format).validate_runtime(require),
+                creation_options(&video_only, color_format).validate_runtime(runtime),
                 RuntimeFeature::ReceiveVideoOnly,
             );
             checked += 1;
         }
         let declared = PassthroughPreset::ALL
             .into_iter()
-            .filter(|&preset| AdvancedApi::declares(RuntimeFeature::Passthrough(preset)))
+            .filter(|&preset| capabilities.supports(RuntimeFeature::Passthrough(preset)))
             .count();
         assert_eq!(checked, declared);
     }
