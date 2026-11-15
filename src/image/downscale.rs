@@ -45,6 +45,7 @@ impl<P: Sample> Downscaler<P> {
     }
 
     /// log2 of the factor.
+    #[cfg(test)]
     pub(super) fn shift(&self) -> u32 {
         self.shift
     }

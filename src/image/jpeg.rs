@@ -5,7 +5,7 @@ use std::{cell::RefCell, io::Write};
 
 use super::{
     read::{Sink, BATCH},
-    Pixels,
+    JpegQuality, Pixels,
 };
 use crate::{Error, Result};
 
@@ -14,7 +14,13 @@ pub(super) const MAX_DIMENSION: usize = u16::MAX as usize;
 
 /// Encode `pixels` as a JPEG of `quality` into `out`. The plan checked the
 /// quality and the dimensions.
-pub(super) fn encode(pixels: &mut Pixels<'_, u8>, quality: u8, out: &mut dyn Write) -> Result<()> {
+pub(super) fn encode(
+    pixels: &mut Pixels<'_, u8>,
+    quality: JpegQuality,
+    width: u16,
+    height: u16,
+    out: &mut dyn Write,
+) -> Result<()> {
     // Plan validation precedes this function, including metadata/HDR checks.
     // VideoPlane::data exposes only initialized contiguous active pixels;
     // padded native rows must stay on the row path. Both color types ignore
@@ -27,22 +33,28 @@ pub(super) fn encode(pixels: &mut Pixels<'_, u8>, quality: u8, out: &mut dyn Wri
                 } else {
                     jpeg_encoder::ColorType::Bgra
                 };
-                return jpeg_encoder::Encoder::new(out, quality)
-                    .encode(data, to_u16(pixels.width()), to_u16(pixels.height()), color)
+                return jpeg_encoder::Encoder::new(out, quality.0)
+                    .encode(data, width, height, color)
                     .map_err(encoding_error);
             }
         }
     }
-    encode_rows(pixels, quality, out)
+    encode_rows(pixels, quality, width, height, out)
 }
 
-fn encode_rows(pixels: &mut Pixels<'_, u8>, quality: u8, out: &mut dyn Write) -> Result<()> {
+fn encode_rows(
+    pixels: &mut Pixels<'_, u8>,
+    quality: JpegQuality,
+    width: u16,
+    height: u16,
+    out: &mut dyn Write,
+) -> Result<()> {
     let image = Rows {
-        width: to_u16(pixels.width()),
-        height: to_u16(pixels.height()),
+        width,
+        height,
         pixels: RefCell::new(pixels),
     };
-    jpeg_encoder::Encoder::new(out, quality)
+    jpeg_encoder::Encoder::new(out, quality.0)
         .encode_image(image)
         .map_err(encoding_error)
 }
@@ -52,10 +64,6 @@ fn encoding_error(error: jpeg_encoder::EncodingError) -> Error {
         jpeg_encoder::EncodingError::IoError(error) => Error::Io(error),
         error => Error::InvalidFrame(format!("JPEG encoding failed: {error}")),
     }
-}
-
-fn to_u16(length: usize) -> u16 {
-    u16::try_from(length).expect("the plan checked JPEG's dimension limit")
 }
 
 /// The image the codec reads, a row at a time. The codec asks for its rows
@@ -161,7 +169,14 @@ mod tests {
                     let source = Source::new(&frame);
                     let plan = Plan::new(&source, &options).unwrap();
                     let mut rows = Vec::new();
-                    encode_rows(&mut plan.pixels::<u8>(&source), quality, &mut rows).unwrap();
+                    encode_rows(
+                        &mut plan.pixels::<u8>(),
+                        JpegQuality(quality),
+                        width,
+                        3,
+                        &mut rows,
+                    )
+                    .unwrap();
                     let direct = decode(&direct, (width, 3));
                     let rows = decode(&rows, (width, 3));
                     // Runtime SIMD rounding is permitted: mean <= 1 code and

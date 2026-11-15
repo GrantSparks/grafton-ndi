@@ -3,7 +3,7 @@
 
 use std::io::Write;
 
-use super::{color::Sample, options::PngCompression, Pixels};
+use super::{color::Sample, options::PngCompression, Channels, ImageShape, Pixels};
 use crate::{Error, Result};
 
 /// Encode `pixels` as a PNG of `channels` channels into `out`, with a `cICP`
@@ -13,18 +13,16 @@ use crate::{Error, Result};
 /// else converts into one row of scratch, reused for every row.
 pub(super) fn encode<P: Sample>(
     pixels: &mut Pixels<'_, P>,
-    channels: usize,
+    shape: ImageShape,
     compression: PngCompression,
     cicp: Option<[u8; 4]>,
     out: &mut dyn Write,
     row: &mut Vec<u8>,
 ) -> Result<()> {
-    let (width, height) = (pixels.width(), pixels.height());
-    let mut encoder = ::png::Encoder::new(out, to_u32(width), to_u32(height));
-    encoder.set_color(if channels == 4 {
-        ::png::ColorType::Rgba
-    } else {
-        ::png::ColorType::Rgb
+    let mut encoder = ::png::Encoder::new(out, shape.width, shape.height);
+    encoder.set_color(match shape.channels {
+        Channels::Rgba => ::png::ColorType::Rgba,
+        Channels::Rgb => ::png::ColorType::Rgb,
     });
     encoder.set_depth(if P::BYTES == 1 {
         ::png::BitDepth::Eight
@@ -51,9 +49,9 @@ pub(super) fn encode<P: Sample>(
                 stream.write_all(row)?;
             }
         } else {
-            super::resize_scratch(row, super::packed_len(width, 1, channels * P::BYTES)?)?;
-            for y in 0..height {
-                pixels.pack_row(y, channels, row);
+            super::resize_scratch(row, shape.row_bytes)?;
+            for y in 0..shape.height as usize {
+                pixels.pack_row(y, shape.channels, row);
                 stream.write_all(row)?;
             }
         }
@@ -66,11 +64,6 @@ pub(super) fn encode<P: Sample>(
 #[cfg(test)]
 pub(super) fn row_buffer<P: Sample>(width: usize, channels: usize) -> Vec<u8> {
     vec![0; width * channels * P::BYTES]
-}
-
-/// A PNG dimension, which the frame's own `u32` dimension bounds.
-fn to_u32(length: usize) -> u32 {
-    u32::try_from(length).expect("an image is no larger than its frame, whose size is a u32")
 }
 
 fn png_error(error: ::png::EncodingError) -> Error {

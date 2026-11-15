@@ -1244,11 +1244,7 @@ fn lossy_webp_reduces_every_pixel_format_and_preserves_alpha() {
                             p[0] as u8,
                             p[1] as u8,
                             p[2] as u8,
-                            if reference.channels == 4 {
-                                p[3] as u8
-                            } else {
-                                255
-                            },
+                            p.get(3).map_or(255, |alpha| *alpha as u8),
                         ]
                     })
                     .collect();
@@ -2163,6 +2159,43 @@ fn conversion_geometry_overflow_is_refused_before_output_or_row_access() {
     assert_eq!(output.written, 0);
 }
 
+/// Compare these fingerprints between a reference revision and an encoder
+/// refactor, including partial edge blocks and every source pixel layout.
+#[test]
+#[ignore = "manual byte-for-byte compatibility comparison between revisions"]
+fn image_encoding_compatibility_fingerprints() {
+    for format in PixelFormat::ALL {
+        let height = if matches!(
+            format,
+            PixelFormat::I420 | PixelFormat::Yv12 | PixelFormat::Nv12
+        ) {
+            10
+        } else {
+            11
+        };
+        let frame = VideoFrame::builder()
+            .resolution(18, height)
+            .pixel_format(format)
+            .data(any_frame_bytes(format, 18, height as usize, 0x5eed))
+            .build()
+            .unwrap();
+        for reduction in [
+            Downscale::Off,
+            Downscale::Half,
+            Downscale::Quarter,
+            Downscale::Eighth,
+        ] {
+            for alpha in [AlphaMode::Keep, AlphaMode::Discard] {
+                for options in every_output() {
+                    let options = options.downscale(reduction).alpha(alpha);
+                    let image = frame.encode_image(&options).unwrap();
+                    eprintln!("compat,{format:?},{options:?},{:02x?}", sha256(&image));
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn workspace_reuses_conversion_capacity_across_formats_sizes_and_failures() {
     let mut workspace = crate::ImageWorkspace::new();
@@ -2237,22 +2270,18 @@ fn warm_workspace_conversion_does_not_allocate() {
                         let plan = Plan::new(&source, &options).unwrap();
                         macro_rules! convert {
                             ($sample:ty, $sums:ident) => {
-                                plan.with_pixels::<$sample, _>(
-                                    &source,
-                                    &mut workspace.$sums,
-                                    |pixels| {
-                                        super::resize_scratch(
-                                            &mut workspace.row,
-                                            pixels.width()
-                                                * plan.channels()
-                                                * std::mem::size_of::<$sample>(),
-                                        )?;
-                                        for y in 0..pixels.height() {
-                                            pixels.pack_row(y, plan.channels(), &mut workspace.row);
-                                        }
-                                        Ok(())
-                                    },
-                                )
+                                plan.with_pixels::<$sample, _>(&mut workspace.$sums, |pixels| {
+                                    super::resize_scratch(
+                                        &mut workspace.row,
+                                        pixels.width()
+                                            * plan.channels().count()
+                                            * std::mem::size_of::<$sample>(),
+                                    )?;
+                                    for y in 0..pixels.height() {
+                                        pixels.pack_row(y, plan.channels(), &mut workspace.row);
+                                    }
+                                    Ok(())
+                                })
                                 .unwrap()
                             };
                         }
@@ -2273,14 +2302,10 @@ fn warm_workspace_conversion_does_not_allocate() {
                     for codec in [ImageFormat::WebpLossless, ImageFormat::WebpLossy(75)] {
                         let options = options(codec).alpha(alpha).downscale(reduction);
                         let plan = Plan::new(&source, &options).unwrap();
-                        let channels = if codec == ImageFormat::WebpLossless {
-                            plan.channels()
-                        } else {
-                            4
-                        };
+                        let shape = plan.shape.buffered().unwrap();
                         let mut convert = || {
-                            plan.with_pixels::<u8, _>(&source, &mut workspace.sums8, |pixels| {
-                                webp::image_with(pixels, channels, &mut workspace.image)?;
+                            plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
+                                webp::image_with(pixels, shape, &mut workspace.image)?;
                                 Ok(())
                             })
                             .unwrap()
@@ -2345,8 +2370,8 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                             .alpha(alpha)
                             .depth(depth)
                             .downscale(downscale);
-                        let plan = Plan::new(&source(), &options).unwrap();
                         let source = source();
+                        let plan = Plan::new(&source, &options).unwrap();
                         let bytes_per_sample = if depth == SampleDepth::Eight { 1 } else { 2 };
                         let sums = if shift == 0 {
                             0
@@ -2364,7 +2389,7 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                         let row_len = reduced.0 * channels * bytes_per_sample;
                         if depth == SampleDepth::Eight {
                             let ((mut pixels, allocations), peak) =
-                                peak_bytes(|| allocation_count(|| plan.pixels::<u8>(&source)));
+                                peak_bytes(|| allocation_count(|| plan.pixels::<u8>()));
                             check(allocations, peak);
                             let borrowed = pixels.rgba_rows().is_some();
                             assert_eq!(
@@ -2380,18 +2405,20 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                                 (1, row_len, row_len)
                             );
                             let (_, allocations) = allocation_count(|| {
-                                (0..reduced.1).for_each(|y| pixels.pack_row(y, channels, &mut row))
+                                (0..reduced.1)
+                                    .for_each(|y| pixels.pack_row(y, plan.shape.channels, &mut row))
                             });
                             assert_eq!(allocations, 0, "{format:?} {height} {options:?}");
                         } else {
                             let ((mut pixels, allocations), peak) =
-                                peak_bytes(|| allocation_count(|| plan.pixels::<u16>(&source)));
+                                peak_bytes(|| allocation_count(|| plan.pixels::<u16>()));
                             check(allocations, peak);
                             assert!(pixels.rgba_rows().is_none());
                             let mut row = row_buffer::<u16>(reduced.0, channels);
                             assert_eq!(row.len(), row_len);
                             let (_, allocations) = allocation_count(|| {
-                                (0..reduced.1).for_each(|y| pixels.pack_row(y, channels, &mut row))
+                                (0..reduced.1)
+                                    .for_each(|y| pixels.pack_row(y, plan.shape.channels, &mut row))
                             });
                             assert_eq!(allocations, 0, "{format:?} {height} {options:?}");
                         }
@@ -2403,11 +2430,14 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                         (ImageFormat::WebpLossy(75), 4),
                     ] {
                         let options = options(format).alpha(alpha).downscale(downscale);
-                        let plan = Plan::new(&source(), &options).unwrap();
                         let source = source();
-                        let mut pixels = plan.pixels::<u8>(&source);
-                        let ((image, allocations), peak) =
-                            peak_bytes(|| allocation_count(|| webp::image(&mut pixels, channels)));
+                        let plan = Plan::new(&source, &options).unwrap();
+                        let mut pixels = plan.pixels::<u8>();
+                        let ((image, allocations), peak) = peak_bytes(|| {
+                            allocation_count(|| {
+                                webp::image(&mut pixels, plan.shape.buffered().unwrap())
+                            })
+                        });
                         let len = reduced.0 * reduced.1 * channels;
                         let borrowed = matches!(image, std::borrow::Cow::Borrowed(_));
                         let expected_allocation = if borrowed { 0 } else { len };
@@ -2427,9 +2457,9 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                 // JPEG: pixels convert straight into the codec's component
                 // rows, so with those reserved nothing is allocated.
                 let options = options(ImageFormat::Jpeg(85)).downscale(downscale);
-                let plan = Plan::new(&source(), &options).unwrap();
                 let source = source();
-                let mut pixels = plan.pixels::<u8>(&source);
+                let plan = Plan::new(&source, &options).unwrap();
+                let mut pixels = plan.pixels::<u8>();
                 let (width, height) = (pixels.width() as u16, pixels.height() as u16);
                 let rows = jpeg::Rows {
                     pixels: std::cell::RefCell::new(&mut pixels),
