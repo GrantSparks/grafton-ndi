@@ -343,7 +343,9 @@ pub enum FileNaming {
     /// `{prefix}` is replaced by the [`RecordingTarget`], and `{index:N}` pads
     /// the index with zeros to `N` digits, from 1 through 1024. The pattern
     /// may name a directory, for example `{prefix}/{index:03}.mkv`; that
-    /// directory must exist.
+    /// directory must exist. Index tokens must be in the file name: directories
+    /// may come only from literal text and `{prefix}`. A pattern placing an
+    /// index in a directory is refused when the recorder is created.
     ///
     /// A pattern without `{index}` or `{index:N}` names its file exactly,
     /// with every rule of [`Exact`](Self::Exact).
@@ -509,6 +511,8 @@ impl RecorderOptions {
     /// ([`FileNaming::Exact`], or a [`FileNaming::Pattern`] without
     /// `{index}`): creating the recorder then fails with
     /// [`Error::InvalidInput`].
+    /// Index tokens must remain in the file name, as [`FileNaming::Pattern`]
+    /// requires, so every rollover uses the directory checked at preflight.
     ///
     /// [`RecordingReport::stopped_by_sdk`]: super::RecordingReport::stopped_by_sdk
     #[must_use]
@@ -531,6 +535,8 @@ impl RecorderOptions {
     /// ([`FileNaming::Exact`], or a [`FileNaming::Pattern`] without
     /// `{index}`), because the next file would have the same name: creating
     /// the recorder then fails with [`Error::InvalidInput`].
+    /// Index tokens must remain in the file name, as [`FileNaming::Pattern`]
+    /// requires, so every rollover uses the directory checked at preflight.
     #[must_use]
     pub fn rollover_size(mut self, bytes: u64) -> Self {
         self.rollover_size = bytes;
@@ -683,6 +689,26 @@ impl NamePattern {
     /// malformed.
     fn new(pattern: &str) -> Result<Self> {
         let parts = pattern_parts(pattern)?;
+        let mut indexed = false;
+        for part in &parts {
+            let directory_after_index = match part {
+                PatternPart::Index(_) => {
+                    indexed = true;
+                    false
+                }
+                PatternPart::Text(range) => {
+                    indexed && pattern[range.clone()].chars().any(std::path::is_separator)
+                }
+                // A RecordingTarget is absolute, so its expansion always
+                // contains a directory separator even if no literal follows.
+                PatternPart::Prefix => indexed,
+            };
+            if directory_after_index {
+                return Err(Error::InvalidInput(
+                    crate::InputDefect::FilenamePatternIndexInDirectory,
+                ));
+            }
+        }
         let exact = !parts
             .iter()
             .any(|part| matches!(part, PatternPart::Index(_)));
@@ -1964,6 +1990,41 @@ mod tests {
             crate::test_alloc::allocation_count(|| pattern.first_file(&target).unwrap());
         assert!(file.ends_with("take_001.mkv"));
         assert!(allocations <= 3, "preflight made {allocations} allocations");
+    }
+
+    #[test]
+    fn filename_indexes_cannot_change_the_preflight_directory() {
+        for pattern in [
+            "{prefix}/{index:03}/clip.mkv",
+            "{index}/{prefix}.mkv",
+            "{prefix}_{index}/clip.mkv",
+            "{index}{prefix}.mkv",
+            "{prefix}_{index}{prefix}.mkv",
+            "{prefix}/{index}_{index}/clip.mkv",
+        ] {
+            assert_eq!(
+                invalid_cause(NamePattern::new(pattern)),
+                crate::InputDefect::FilenamePatternIndexInDirectory,
+                "{pattern}"
+            );
+        }
+        for pattern in [
+            DEFAULT_PATTERN,
+            EXACT_PATTERN,
+            "{prefix}/{index:03}.mkv",
+            "{prefix}_{index:03}.mkv",
+            "{prefix}_{index}_{index:03}.mkv",
+            "{prefix}{prefix}_{index}.mkv",
+        ] {
+            assert!(NamePattern::new(pattern).is_ok(), "{pattern}");
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            invalid_cause(NamePattern::new(r"{prefix}\{index}\clip.mkv")),
+            crate::InputDefect::FilenamePatternIndexInDirectory
+        );
+        #[cfg(unix)]
+        assert!(NamePattern::new(r"{prefix}_{index}\clip.mkv").is_ok());
     }
 
     #[test]

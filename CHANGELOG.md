@@ -54,6 +54,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Recorder start and rollover refuse output paths that cannot be reported
   exactly in native events (currently 4094 UTF-8 bytes), reserving at least
   20 digits per index token so later rollovers remain reportable.
+  Custom filename patterns also refuse indexes in directories, keeping every
+  rollover in the directory checked at preflight.
 
 - `Finder::watch` replaces `Finder::wait_for_sources`. Keep one `SourceWatch`
   per consumer and take snapshots and wait through that cursor, so concurrent

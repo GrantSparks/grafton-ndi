@@ -151,6 +151,7 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("ExactNameFormatRollover", InputDefect::ExactNameFormatRollover, "a recorder with an exact file name cannot roll over at a format change, because the next file would have the same name; use a filename pattern with {index}, or leave format-change rollover unset"),
         ("ExactNameSizeRollover", InputDefect::ExactNameSizeRollover, "a recorder with an exact file name cannot roll over at a size limit, because the next file would have the same name; use a filename pattern with {index}"),
         ("FilenamePatternBrace", InputDefect::FilenamePatternBrace, "unmatched filename-pattern brace"),
+        ("FilenamePatternIndexInDirectory", InputDefect::FilenamePatternIndexInDirectory, "filename-pattern indexes must be in the file name; move {index} out of the directory"),
         ("FilePositionOverflow", InputDefect::FilePositionOverflow, "file position exceeds 64-bit ticks"),
         ("SynthesizeRecordingStart", InputDefect::SynthesizeRecordingStart, "a recording start cannot use Timecode::SYNTHESIZE; choose an explicit start such as zero"),
         ("SessionCounterExhausted", InputDefect::SessionCounterExhausted, "the session counter is exhausted"),

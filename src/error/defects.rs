@@ -628,6 +628,11 @@ pub enum InputDefect {
     /// unmatched filename-pattern brace.
     #[error("unmatched filename-pattern brace")]
     FilenamePatternBrace,
+    /// A filename index would change the output directory.
+    #[error(
+        "filename-pattern indexes must be in the file name; move {{index}} out of the directory"
+    )]
+    FilenamePatternIndexInDirectory,
     /// file position exceeds 64-bit ticks.
     #[error("file position exceeds 64-bit ticks")]
     FilePositionOverflow,

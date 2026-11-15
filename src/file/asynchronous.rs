@@ -5211,6 +5211,28 @@ mod tests {
                 crate::InputDefect::ExactNameFormatRollover
             ))
         ));
+        for pattern in [
+            "{prefix}/{index:03}/clip.mkv",
+            "{index}/{prefix}.mkv",
+            "{prefix}_{index}/clip.mkv",
+            "{index}{prefix}.mkv",
+        ] {
+            let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap())
+                .naming(FileNaming::Pattern(pattern.into()));
+            let api = mock::recorder_api();
+            assert!(matches!(
+                api.create_recorder(&options),
+                Err(Error::InvalidInput(
+                    crate::InputDefect::FilenamePatternIndexInDirectory
+                ))
+            ));
+            assert!(matches!(
+                block_on(AsyncFileRecorder::create(&api, &options)),
+                Err(Error::InvalidInput(
+                    crate::InputDefect::FilenamePatternIndexInDirectory
+                ))
+            ));
+        }
     }
 
     #[test]

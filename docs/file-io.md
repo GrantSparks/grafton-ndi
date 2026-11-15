@@ -87,6 +87,12 @@ For an exact name, the wrapper rejects format-change rollover, a nonzero
 rollover size, and source changes during a session. See
 [`RecorderOptions`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.RecorderOptions.html).
 
+In custom patterns, `{index}` and `{index:N}` must be in the file name.
+Directories may use literal text and `{prefix}`, for example
+`{prefix}/{index:03}.mkv`. Patterns such as `{prefix}/{index}/clip.mkv` are
+refused when the recorder is created: every rollover must stay in the directory
+checked at preflight.
+
 `start` and `rollover` preflight the output directory and reject an existing
 exact target. This does not reserve the path or pin parent directories against
 replacement. Use a recorder-controlled output directory. A successful rollover
