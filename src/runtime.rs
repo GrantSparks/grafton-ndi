@@ -808,6 +808,10 @@ impl Ndi {
         T::of(self.runtime.selected)
     }
 
+    pub(crate) fn evidence(&self) -> sys::Evidence<'static> {
+        self.runtime.selected.evidence()
+    }
+
     /// The receiver color format that selects `preset`, or the error
     /// [`Self::require_feature`] reports for it. The preset's gate includes
     /// the configured receiver's, so that table is then available too.

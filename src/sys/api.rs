@@ -126,12 +126,18 @@ pub(crate) trait Table: Sized + 'static {
 // proofs use the same gate as tables, so descriptor builders cannot bypass it.
 macro_rules! version_gates {
     ($($gate:ident),+ $(,)?) => {$(
+        #[derive(Debug)]
         pub(crate) struct $gate(());
-        impl Table for $gate {
-            fn within(evidence: Evidence<'_>) -> Result<&'_ Self> {
+        impl $gate {
+            pub(crate) fn check(evidence: Evidence<'_>) -> Result<&'static Self> {
                 evidence.require(RuntimeFeature::$gate)?;
                 static PROOF: $gate = $gate(());
                 Ok(&PROOF)
+            }
+        }
+        impl Table for $gate {
+            fn within(evidence: Evidence<'_>) -> Result<&'_ Self> {
+                Self::check(evidence)
             }
         }
     )+};
@@ -428,6 +434,29 @@ impl<'a> Evidence<'a> {
             .as_ref()
             .map_err(|&refusal| Error::UnsupportedCapability { feature, refusal })
     }
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_evidence<T>(version: &str, run: impl FnOnce(Evidence<'_>) -> T) -> T {
+    use crate::capabilities::{SdkEdition, SdkVersion};
+    let exports = super::table::ExportsWhere(|_: &str| true);
+    let mut api = Api::load(&exports).unwrap();
+    #[cfg(feature = "advanced")]
+    let mut advanced = super::advanced::AdvancedApi::load(&exports).unwrap();
+    let version = SdkVersion::parse(version);
+    #[cfg(feature = "advanced")]
+    let capabilities = Capabilities::detect(&api, &advanced, version, SdkEdition::Advanced);
+    #[cfg(not(feature = "advanced"))]
+    let capabilities = Capabilities::detect(&api, version, SdkEdition::Advanced);
+    api.apply_capabilities(&capabilities);
+    #[cfg(feature = "advanced")]
+    advanced.apply_capabilities(&capabilities);
+    run(Evidence {
+        api: &api,
+        #[cfg(feature = "advanced")]
+        advanced: &advanced,
+        capabilities: &capabilities,
+    })
 }
 
 #[cfg(test)]

@@ -28,6 +28,9 @@
 //! # }
 //! ```
 
+#[cfg(test)]
+use crate::RuntimeFeature;
+
 use std::{
     ffi::CString,
     marker::PhantomData,
@@ -43,7 +46,6 @@ use std::{
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{
-    capabilities::RuntimeFeature,
     capture::{
         capture_any, capture_raw, AllSlots, AudioKind, CaptureKind, CaptureResult, CaptureStrategy,
         Delivered, Media, MetadataKind, NoSlots, Notification, SlotSet, VideoKind,
@@ -724,57 +726,46 @@ impl ReceiverOptions {
         self.color_format.to_sdk()
     }
 
-    /// Refuse settings that the runtime cannot take, before anything is
-    /// created: `require` refuses a capability the runtime lacks, as
-    /// [`Ndi::require_feature`] does.
-    ///
-    /// Only the settings the SDK is given are checked: a color format that a
-    /// passthrough preset replaced is not.
-    pub(crate) fn validate_runtime(
-        &self,
-        require: impl Fn(RuntimeFeature) -> Result<()>,
-    ) -> Result<()> {
-        if self.sdk_color_format() == ReceiverColorFormat::Best444.to_sdk() {
-            require(RuntimeFeature::ReceiveBest444)?;
-        }
-        if matches!(
+    /// Validate exactly the options passed to the SDK, retaining each
+    /// capability proof the native descriptor relies on.
+    pub(crate) fn validate_runtime<'a>(
+        &'a self,
+        evidence: sys::Evidence<'a>,
+    ) -> Result<ValidatedReceiveOptions<'a>> {
+        let best444 = (self.sdk_color_format() == ReceiverColorFormat::Best444.to_sdk())
+            .then(|| <sys::ReceiveBest444 as sys::Table>::within(evidence))
+            .transpose()?;
+        let video_only = matches!(
             self.bandwidth,
             ReceiverBandwidth::VideoOnlyLowest | ReceiverBandwidth::VideoOnlyHighest
-        ) {
-            require(RuntimeFeature::ReceiveVideoOnly)?;
-        }
-        Ok(())
+        )
+        .then(|| <sys::ReceiveVideoOnly as sys::Table>::within(evidence))
+        .transpose()?;
+        Ok(ValidatedReceiveOptions {
+            options: self,
+            _best444: best444,
+            _video_only: video_only,
+        })
     }
 
     /// The native creation settings, with the strings they point to.
     pub(crate) fn to_raw(&self, ndi: &Ndi) -> Result<RawRecvCreateV3> {
-        self.validate_runtime(|feature| match feature {
-            RuntimeFeature::ReceiveBest444 => ndi.table::<sys::ReceiveBest444>().map(|_| ()),
-            RuntimeFeature::ReceiveVideoOnly => ndi.table::<sys::ReceiveVideoOnly>().map(|_| ()),
-            _ => unreachable!("receiver option gate"),
-        })?;
-        ValidatedReceiveOptions { options: self }.to_raw()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn as_test_raw(&self) -> Result<RawRecvCreateV3> {
-        ValidatedReceiveOptions { options: self }.to_raw()
+        self.validate_runtime(ndi.evidence())?.to_raw()
     }
 }
 
-// Created only after the selected runtime has authorized the options. Unit
-// fixtures construct it without a runtime to inspect enum/descriptor mappings.
-struct ValidatedReceiveOptions<'a> {
+pub(crate) struct ValidatedReceiveOptions<'a> {
     options: &'a ReceiverOptions,
+    _best444: Option<&'a sys::ReceiveBest444>,
+    _video_only: Option<&'a sys::ReceiveVideoOnly>,
 }
 
 impl ValidatedReceiveOptions<'_> {
-    fn to_raw(&self) -> Result<RawRecvCreateV3> {
+    pub(crate) fn to_raw(&self) -> Result<RawRecvCreateV3> {
         let source = self.options.source.to_raw()?;
         let name = self.options.name.as_deref().map(CString::new).transpose()?;
         let p_ndi_recv_name = name.as_ref().map_or(ptr::null(), |n| n.as_ptr());
         let source_raw = source.raw;
-
         Ok(RawRecvCreateV3 {
             raw: NDIlib_recv_create_v3_t {
                 source_to_connect_to: source_raw,
@@ -2750,33 +2741,32 @@ mod tests {
 
     #[test]
     fn receive_64_modes_require_the_selected_runtime_before_native_creation() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let best = ReceiverOptions::new(test_source()).color_format(ReceiverColorFormat::Best444);
-        assert_eq!(best.as_test_raw().unwrap().raw.color_format, 102);
-        assert_eq!(
-            best.validate_runtime(|feature| ndi.require_feature(feature))
-                .is_ok(),
-            ndi.require_feature(RuntimeFeature::ReceiveBest444).is_ok()
-        );
-        for (bandwidth, value) in [
-            (ReceiverBandwidth::VideoOnlyLowest, 1),
-            (ReceiverBandwidth::VideoOnlyHighest, 101),
-        ] {
-            let options = ReceiverOptions::new(test_source()).bandwidth(bandwidth);
-            assert_eq!(options.as_test_raw().unwrap().raw.bandwidth, value);
-            assert_eq!(
-                options
-                    .validate_runtime(|feature| ndi.require_feature(feature))
-                    .is_ok(),
-                ndi.require_feature(RuntimeFeature::ReceiveVideoOnly)
-                    .is_ok()
-            );
+        for version in ["6.1.1.0", "6.4.0.2"] {
+            sys::with_test_evidence(version, |evidence| {
+                let supported = version == "6.4.0.2";
+                let best =
+                    ReceiverOptions::new(test_source()).color_format(ReceiverColorFormat::Best444);
+                let validated = best.validate_runtime(evidence);
+                assert_eq!(validated.is_ok(), supported);
+                if let Ok(validated) = validated {
+                    assert!(validated._best444.is_some());
+                    assert_eq!(validated.to_raw().unwrap().raw.color_format, 102);
+                }
+                for (bandwidth, value) in [
+                    (ReceiverBandwidth::VideoOnlyLowest, 1),
+                    (ReceiverBandwidth::VideoOnlyHighest, 101),
+                ] {
+                    let options = ReceiverOptions::new(test_source()).bandwidth(bandwidth);
+                    let validated = options.validate_runtime(evidence);
+                    assert_eq!(validated.is_ok(), supported);
+                    if let Ok(validated) = validated {
+                        assert!(validated._video_only.is_some());
+                        assert_eq!(validated.to_raw().unwrap().raw.bandwidth, value);
+                    }
+                }
+                assert!(unconnected().validate_runtime(evidence).is_ok());
+            });
         }
-        assert!(unconnected()
-            .validate_runtime(|feature| ndi.require_feature(feature))
-            .is_ok());
     }
 
     #[test]
@@ -3775,9 +3765,19 @@ mod tests {
         );
     }
 
+    fn raw_settings(options: &ReceiverOptions) -> RawRecvCreateV3 {
+        sys::with_test_evidence("6.4.0.2", |evidence| {
+            options
+                .validate_runtime(evidence)
+                .unwrap()
+                .to_raw()
+                .unwrap()
+        })
+    }
+
     #[test]
     fn receiver_options_defaults_emit_operational_raw_modes() {
-        let raw = unconnected().as_test_raw().unwrap();
+        let raw = raw_settings(&unconnected());
 
         assert_raw_receiver_modes(
             &raw,
@@ -3789,9 +3789,7 @@ mod tests {
 
     #[test]
     fn snapshot_preset_emits_operational_raw_modes() {
-        let raw = ReceiverOptions::snapshot_preset(test_source())
-            .as_test_raw()
-            .unwrap();
+        let raw = raw_settings(&ReceiverOptions::snapshot_preset(test_source()));
 
         assert_raw_receiver_modes(
             &raw,
@@ -3803,9 +3801,7 @@ mod tests {
 
     #[test]
     fn high_quality_preset_emits_operational_raw_modes() {
-        let raw = ReceiverOptions::high_quality_preset(test_source())
-            .as_test_raw()
-            .unwrap();
+        let raw = raw_settings(&ReceiverOptions::high_quality_preset(test_source()));
 
         assert_raw_receiver_modes(
             &raw,
@@ -3817,9 +3813,7 @@ mod tests {
 
     #[test]
     fn monitoring_preset_emits_operational_raw_modes() {
-        let raw = ReceiverOptions::monitoring_preset(test_source())
-            .as_test_raw()
-            .unwrap();
+        let raw = raw_settings(&ReceiverOptions::monitoring_preset(test_source()));
 
         assert_raw_receiver_modes(
             &raw,

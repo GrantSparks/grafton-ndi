@@ -524,14 +524,17 @@ impl PixelFormat {
     /// planar 4:4:4 formats need [`RuntimeFeature::Planar444Video`].
     ///
     /// [`RuntimeFeature::Planar444Video`]: crate::RuntimeFeature::Planar444Video
-    pub(crate) fn require_sendable(self, ndi: &crate::Ndi) -> Result<()> {
+    pub(crate) fn require_sendable(
+        self,
+        ndi: &crate::Ndi,
+    ) -> Result<Option<&'static sys::Planar444Video>> {
         if matches!(
             self.info().category(),
             FormatCategory::Planar444 | FormatCategory::Planar444Alpha
         ) {
-            ndi.table::<sys::Planar444Video>()?;
+            return ndi.table::<sys::Planar444Video>().map(Some);
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -707,7 +710,7 @@ pub(crate) unsafe trait VideoParts {
     /// Borrow this validated frame's SDK descriptor without copying pixels.
     fn video_descriptor(&self, authorized: SendableVideoLayout) -> Result<NDIlib_video_frame_v2_t> {
         let layout = self.layout();
-        if authorized.0 != layout.pixel_format() {
+        if authorized.pixel_format != layout.pixel_format() {
             return Err(Error::InvalidFrame(
                 "video send authorization does not match the storage's pixel format".into(),
             ));
@@ -3695,17 +3698,37 @@ pub(crate) struct ValidatedVideoLayout {
 /// A pixel format authorized for the selected runtime. Geometry belongs only
 /// to the storage described by `VideoParts`, never to this capability proof.
 #[derive(Clone, Copy)]
-pub(crate) struct SendableVideoLayout(PixelFormat);
+pub(crate) struct SendableVideoLayout {
+    pixel_format: PixelFormat,
+    _planar444: Option<&'static sys::Planar444Video>,
+}
 
 impl SendableVideoLayout {
     pub(crate) fn new(layout: ValidatedVideoLayout, ndi: &crate::Ndi) -> Result<Self> {
-        layout.pixel_format().require_sendable(ndi)?;
-        Ok(Self(layout.pixel_format()))
+        let planar444 = layout.pixel_format().require_sendable(ndi)?;
+        Ok(Self {
+            pixel_format: layout.pixel_format(),
+            _planar444: planar444,
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(layout: ValidatedVideoLayout) -> Self {
-        Self(layout.pixel_format())
+        let pixel_format = layout.pixel_format();
+        let planar444 = if matches!(
+            pixel_format.info().category(),
+            FormatCategory::Planar444 | FormatCategory::Planar444Alpha
+        ) {
+            Some(sys::with_test_evidence("6.4.0.2", |evidence| {
+                sys::Planar444Video::check(evidence).unwrap()
+            }))
+        } else {
+            None
+        };
+        Self {
+            pixel_format,
+            _planar444: planar444,
+        }
     }
 }
 

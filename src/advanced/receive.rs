@@ -728,8 +728,8 @@ mod tests {
             advanced: &advanced,
             capabilities: &capabilities,
         };
-        let require = |feature| runtime.require(feature);
-        let too_old = |result: Result<()>, wanted: RuntimeFeature| {
+        let too_old = |result: Result<crate::receiver::ValidatedReceiveOptions<'_>>,
+                       wanted: RuntimeFeature| {
             assert!(
                 matches!(
                     result,
@@ -739,7 +739,7 @@ mod tests {
                         ..
                     }) if feature == wanted
                 ),
-                "{result:?}"
+                "expected the version-gated receive option to be refused"
             );
         };
 
@@ -748,7 +748,7 @@ mod tests {
             .allow_video_fields(false);
         // An ordinary receiver would be given Best444.
         too_old(
-            best.validate_runtime(require),
+            best.validate_runtime(runtime),
             RuntimeFeature::ReceiveBest444,
         );
 
@@ -760,8 +760,12 @@ mod tests {
                 continue;
             };
             let packets = creation_options(&best, color_format);
-            packets.validate_runtime(require).unwrap();
-            let settings = packets.as_test_raw().unwrap().raw;
+            let settings = packets
+                .validate_runtime(runtime)
+                .unwrap()
+                .to_raw()
+                .unwrap()
+                .raw;
             assert_eq!(settings.color_format, color_format, "{preset:?}");
             assert!(settings.allow_video_fields);
 
@@ -771,7 +775,7 @@ mod tests {
                 .clone()
                 .bandwidth(crate::ReceiverBandwidth::VideoOnlyHighest);
             too_old(
-                creation_options(&video_only, color_format).validate_runtime(require),
+                creation_options(&video_only, color_format).validate_runtime(runtime),
                 RuntimeFeature::ReceiveVideoOnly,
             );
             checked += 1;
