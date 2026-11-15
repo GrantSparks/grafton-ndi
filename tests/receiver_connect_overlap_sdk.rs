@@ -117,12 +117,25 @@ impl Peers {
         } else {
             PixelFormat::Uyvy
         };
-        let mut video = VideoFrame::builder()
-            .resolution(self.width, self.height)
-            .pixel_format(format)
-            .frame_rate(FrameRate::new(60, 1).unwrap())
-            .build()
-            .unwrap();
+        // Reuse twelve prepared gray levels. Filling every HD pixel in Rust
+        // for every send would dominate a detector run before the SDK could
+        // deliver the video's following audio packet.
+        let mut videos: [VideoFrame; 12] = std::array::from_fn(|phase| {
+            let level = 16 + phase as u8 * 16;
+            let count = self.width as usize * self.height as usize;
+            let pixels = if index == 0 {
+                [level, level, level, 255].repeat(count)
+            } else {
+                [128, level, 128, level].repeat(count / 2)
+            };
+            VideoFrame::builder()
+                .resolution(self.width, self.height)
+                .pixel_format(format)
+                .frame_rate(FrameRate::new(60, 1).unwrap())
+                .data(pixels)
+                .build()
+                .unwrap()
+        });
         let audio = AudioFrame::builder()
             .sample_rate(48_000)
             .num_channels(2)
@@ -135,18 +148,9 @@ impl Peers {
             if stopped.load(Ordering::Acquire) {
                 break;
             }
-            let level = 16 + (sequence % 12) as u8 * 16;
-            if index == 0 {
-                for pixel in video.data_mut().as_chunks_mut::<4>().0 {
-                    pixel.copy_from_slice(&[level, level, level, 255]);
-                }
-            } else {
-                for pair in video.data_mut().as_chunks_mut::<4>().0 {
-                    pair.copy_from_slice(&[128, level, 128, level]);
-                }
-            }
+            let video = &mut videos[sequence as usize % videos.len()];
             video.set_timecode(Timecode::from_ticks(sequence * 2 + index as i64));
-            self.senders[index].send_video(&video).unwrap();
+            self.senders[index].send_video(video).unwrap();
             self.senders[index].send_audio(&audio);
             self.senders[index].send_metadata(&metadata);
         }
@@ -226,6 +230,22 @@ impl Loans {
     fn audio<T: AudioSource>(&self, frame: T) {
         self.check(frame, check_audio);
         self.audio.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn ready(&self) -> bool {
+        self.videos.load(Ordering::Relaxed) > 0 && self.audio.load(Ordering::Relaxed) > 0
+    }
+
+    fn wait_for_media(&self, ndi: &Ndi) {
+        let deadline = Instant::now() + PATIENCE + margin();
+        while !self.ready() {
+            assert!(
+                Instant::now() < deadline,
+                "video/audio did not warm up: {:?}",
+                ndi.info()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn balanced(&self, ndi: &Ndi) {
@@ -356,6 +376,7 @@ fn native_capture_and_connect_overlap_without_torn_frames() {
                 });
             }
             progress(&receiver);
+            loans.wait_for_media(&ndi);
             storm(&receiver, &peers, stopped);
         });
     });
@@ -401,6 +422,7 @@ fn framesync_capture_and_connect_overlap_without_torn_frames() {
                 }
             });
             progress(sync.receiver());
+            loans.wait_for_media(&ndi);
             storm(sync.receiver(), &peers, stopped);
         });
     });
@@ -425,29 +447,44 @@ fn avsync_capture_and_connect_overlap_without_invalid_audio() {
             .unwrap();
     let loans = Loans::default();
     peers.run(|stopped| {
+        let receiver = sync.receiver();
+        let receive = || {
+            let Some(video) = captured(timed("AV video capture", SLICE, || {
+                receiver.video().capture_ref(SLICE)
+            })) else {
+                return;
+            };
+            check_video(&video, &peers);
+            if let Some(stamped) = AvSyncVideo::new(&video) {
+                if let AvSyncOutcome::Audio { frame, .. } =
+                    timed("AV synchronization", Duration::ZERO, || {
+                        sync.synchronize(stamped, AvSyncRequest::automatic())
+                    })
+                    .unwrap()
+                {
+                    loans.audio(frame);
+                }
+            }
+            loans.video(video, &peers);
+        };
+        let warmup = Instant::now() + PATIENCE + margin();
+        while !loans.ready() {
+            receive();
+            assert!(
+                Instant::now() < warmup,
+                "AV media did not warm up: {:?}",
+                ndi.info()
+            );
+        }
+        let finished = AtomicBool::new(false);
         thread::scope(|scope| {
             let _stop = Stop(stopped);
-            let receiver = sync.receiver();
-            scope.spawn(|| storm(receiver, &peers, stopped));
-            let deadline = Instant::now() + duration();
-            while Instant::now() < deadline {
-                let Some(video) = captured(timed("AV video capture", SLICE, || {
-                    receiver.video().capture_ref(SLICE)
-                })) else {
-                    continue;
-                };
-                check_video(&video, &peers);
-                if let Some(stamped) = AvSyncVideo::new(&video) {
-                    if let AvSyncOutcome::Audio { frame, .. } =
-                        timed("AV synchronization", Duration::ZERO, || {
-                            sync.synchronize(stamped, AvSyncRequest::automatic())
-                        })
-                        .unwrap()
-                    {
-                        loans.audio(frame);
-                    }
-                }
-                loans.video(video, &peers);
+            scope.spawn(|| {
+                let _finished = Stop(&finished);
+                storm(receiver, &peers, stopped);
+            });
+            while !finished.load(Ordering::Acquire) {
+                receive();
             }
         });
     });
@@ -600,6 +637,7 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
                     peers.sources[index].name().to_owned(),
                 ));
                 progress_after(&receiver, before);
+                loans.wait_for_media(&ndi);
                 assert_eq!(
                     receiver.connection_target(),
                     peers.sources[0],
