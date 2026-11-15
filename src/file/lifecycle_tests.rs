@@ -56,6 +56,37 @@ fn generated_session_timecodes_reach_the_native_start_unchanged() {
 }
 
 #[test]
+fn every_session_exit_issues_exactly_one_native_stop() {
+    for ending in 0..4 {
+        let device = mock::Recorder::new(Closing::AtStop);
+        let mut recorder = recording_on(&device);
+        recorder.poll_event(Duration::ZERO).unwrap();
+        match ending {
+            0 => {
+                recorder.request_stop();
+            }
+            1 => device.end_session_itself(),
+            2 => device.push(mock::ERROR, mock::TAKE),
+            3 => {
+                device.dropped_events.store(1, Ordering::Release);
+                device.close();
+            }
+            _ => unreachable!(),
+        }
+        while recorder.poll_event(Duration::ZERO).unwrap().is_some() {}
+        assert!(matches!(
+            recorder.state(),
+            RecorderState::Closed | RecorderState::Indeterminate
+        ));
+        assert_eq!(device.stops.load(Ordering::Acquire), 1, "ending {ending}");
+        recorder.request_stop();
+        drop(recorder);
+        assert_eq!(device.stops.load(Ordering::Acquire), 1, "ending {ending}");
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    }
+}
+
+#[test]
 fn a_timeout_keeps_the_recorder_and_a_later_close_completes_without_a_second_stop() {
     let device = mock::Recorder::new(Closing::Never);
     let mut recorder = recording_on(&device);

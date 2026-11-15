@@ -88,10 +88,9 @@ pub struct RecordingReport {
 /// stopping, whether the caller asked it to stop while the SDK was still
 /// recording.
 ///
-/// The report's [`closure_confirmed`](RecordingReport::closure_confirmed) and
-/// [`stopped_by_sdk`](RecordingReport::stopped_by_sdk), and the recorder's
-/// [`RecorderState`], are all read from this one value, so they cannot
-/// disagree.
+/// A ledger's session enum produces this immutable report phase together
+/// with its counts. The report's closure and stopped-by-SDK verdicts are
+/// therefore snapshots of that same session state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SessionPhase {
     /// No session has been started.
@@ -107,17 +106,6 @@ enum SessionPhase {
 }
 
 impl SessionPhase {
-    /// Whether the caller asked the session to stop while the SDK was still
-    /// recording.
-    fn requested(self) -> bool {
-        match self {
-            Self::NotStarted | Self::Recording => false,
-            Self::Stopping { requested }
-            | Self::Closed { requested }
-            | Self::Indeterminate { requested } => requested,
-        }
-    }
-
     fn state(self) -> RecorderState {
         match self {
             Self::NotStarted => RecorderState::Idle,
@@ -348,13 +336,21 @@ struct FinishWaiter<R> {
 /// The finish registry lives beside the ledger whose evidence settles it.
 pub(super) struct FinishWaiters<R> {
     waiters: Vec<FinishWaiter<R>>,
+    // Captured in the same step that resolves waiters, including shutdown
+    // initiated by an executor callback during reply delivery.
+    notify_cleanup: bool,
 }
 
 impl<R: FinishReply> FinishWaiters<R> {
     pub(super) fn new() -> Self {
         Self {
             waiters: Vec::new(),
+            notify_cleanup: false,
         }
+    }
+
+    pub(super) fn notifies_cleanup(&self) -> bool {
+        self.notify_cleanup || !self.waiters.is_empty()
     }
 
     #[cfg(test)]
@@ -411,6 +407,8 @@ impl<R: FinishReply> FinishWaiters<R> {
             at,
         } = batch;
         self.retain();
+        let had_waiters = !self.waiters.is_empty();
+        self.notify_cleanup |= had_waiters && closing();
         if self
             .waiters
             .iter()
@@ -455,6 +453,7 @@ impl<R: FinishReply> FinishWaiters<R> {
                 index += 1;
             }
         }
+        self.notify_cleanup |= had_waiters && closing();
         drained
     }
 }
@@ -470,236 +469,354 @@ impl FinishReply for LocalFinish<'_> {
     }
 }
 
-/// The record of one session, built from the recorder's events.
-struct Ledger {
-    /// The session's report, whose phase is where the session is.
-    report: RecordingReport,
-    /// The report is that of a session started on the native recorder this
-    /// one replaced. This one is idle until it starts its own.
-    inherited: bool,
-    /// Files reported open and not yet reported closed. A rollover opens the
-    /// next file before the previous one is reported closed, so two can be
-    /// open at once.
-    open_files: Vec<OpenFile>,
-    /// The session records audio or video, so every file with content gets a
-    /// first-frame event.
-    records_media: bool,
-    /// An event was lost, malformed or out of place, so `open_files` may not
-    /// be the truth.
-    uncertain: bool,
-    /// The SDK's count of discarded events when the session began.
-    dropped_base: u64,
+/// Counts and paths belong to a session; its lifecycle determines the
+/// phase when producing an immutable public report.
+struct SessionReport {
+    session: u64,
+    closed_files: u64,
+    empty_files: u64,
+    error_events: u64,
+    write_failures: u64,
+    dropped_events: u64,
+    last_closed_path: Option<EventText>,
 }
 
-impl Ledger {
-    /// The ledger of a recorder that has started no session.
-    fn idle() -> Self {
-        Self::with_report(0, SessionPhase::NotStarted, 0, false)
-    }
-
-    /// The ledger of a recorder that replaced one whose last report is
-    /// `report`: idle, and numbering its sessions on from that one.
-    fn inheriting(report: RecordingReport) -> Self {
+impl SessionReport {
+    fn new(session: u64) -> Self {
         Self {
-            report,
-            inherited: true,
-            ..Self::idle()
+            session,
+            closed_files: 0,
+            empty_files: 0,
+            error_events: 0,
+            write_failures: 0,
+            dropped_events: 0,
+            last_closed_path: None,
         }
     }
 
-    /// The ledger of a session that has just started recording.
-    fn session(session: u64, dropped_base: u64, records_media: bool) -> Self {
-        Self::with_report(
-            session,
-            SessionPhase::Recording,
-            dropped_base,
-            records_media,
-        )
+    fn report(&self, phase: SessionPhase) -> RecordingReport {
+        RecordingReport {
+            session: self.session,
+            phase,
+            closed_files: self.closed_files,
+            empty_files: self.empty_files,
+            error_events: self.error_events,
+            write_failures: self.write_failures,
+            dropped_events: self.dropped_events,
+            last_closed_path: self.last_closed_path.clone(),
+        }
     }
 
+    fn into_report(self, phase: SessionPhase) -> RecordingReport {
+        RecordingReport {
+            session: self.session,
+            phase,
+            closed_files: self.closed_files,
+            empty_files: self.empty_files,
+            error_events: self.error_events,
+            write_failures: self.write_failures,
+            dropped_events: self.dropped_events,
+            last_closed_path: self.last_closed_path,
+        }
+    }
+}
+
+/// A successful native start owes exactly one native stop, including when
+/// the SDK ends recording itself. Only stop_native consumes this obligation.
+#[must_use = "ending a native recording must issue its owed stop"]
+struct StopOwed;
+
+struct OpenSession {
+    report: SessionReport,
+    open_files: Vec<OpenFile>,
+    records_media: bool,
+    uncertain: bool,
+    dropped_base: u64,
+}
+
+/// Each state owns only the data it can use. A stopping session has already
+/// issued its stop; a final session retains only its report and cleanup files.
+enum Session {
+    Idle {
+        last: Option<RecordingReport>,
+    },
+    Open {
+        data: OpenSession,
+        stop: StopOwed,
+    },
+    Stopping {
+        data: OpenSession,
+        requested: bool,
+    },
+    Ended {
+        report: RecordingReport,
+        pending: Vec<OpenFile>,
+    },
+}
+
+/// The record of one session, built from the recorder's events.
+struct Ledger {
+    session: Session,
+}
+
+impl Ledger {
+    fn idle() -> Self {
+        Self {
+            session: Session::Idle { last: None },
+        }
+    }
+
+    /// A replacement is explicitly idle while retaining the previous report.
+    fn inheriting(report: RecordingReport) -> Self {
+        Self {
+            session: Session::Idle { last: Some(report) },
+        }
+    }
+
+    fn session(session: u64, dropped_base: u64, records_media: bool) -> Self {
+        Self {
+            session: Session::Open {
+                data: OpenSession {
+                    report: SessionReport::new(session),
+                    open_files: Vec::new(),
+                    records_media,
+                    uncertain: false,
+                    dropped_base,
+                },
+                stop: StopOwed,
+            },
+        }
+    }
+
+    #[cfg(test)]
     fn with_report(
         session: u64,
         phase: SessionPhase,
         dropped_base: u64,
         records_media: bool,
     ) -> Self {
-        Self {
-            report: RecordingReport {
-                session,
-                phase,
-                closed_files: 0,
-                empty_files: 0,
-                error_events: 0,
-                write_failures: 0,
-                dropped_events: 0,
-                last_closed_path: None,
+        let mut ledger = Self::session(session, dropped_base, records_media);
+        match phase {
+            SessionPhase::NotStarted => Self::idle(),
+            SessionPhase::Recording => ledger,
+            SessionPhase::Stopping { requested } => {
+                let _ = ledger.stop_requested(requested);
+                ledger
+            }
+            SessionPhase::Closed { .. } | SessionPhase::Indeterminate { .. } => Self {
+                session: Session::Ended {
+                    report: SessionReport::new(session).into_report(phase),
+                    pending: Vec::new(),
+                },
             },
-            inherited: false,
-            open_files: Vec::new(),
-            records_media,
-            uncertain: false,
-            dropped_base,
         }
     }
 
-    /// Where the recorder is in its session.
+    fn report(&self) -> RecordingReport {
+        match &self.session {
+            Session::Idle { last } => last
+                .clone()
+                .unwrap_or_else(|| SessionReport::new(0).into_report(SessionPhase::NotStarted)),
+            Session::Open { data, .. } => data.report.report(SessionPhase::Recording),
+            Session::Stopping { data, requested } => data.report.report(SessionPhase::Stopping {
+                requested: *requested,
+            }),
+            Session::Ended { report, .. } => report.clone(),
+        }
+    }
+
+    fn session_number(&self) -> u64 {
+        match &self.session {
+            Session::Idle { last } => last.as_ref().map_or(0, |report| report.session),
+            Session::Open { data, .. } | Session::Stopping { data, .. } => data.report.session,
+            Session::Ended { report, .. } => report.session,
+        }
+    }
+
     fn state(&self) -> RecorderState {
-        if self.inherited {
-            RecorderState::Idle
-        } else {
-            self.report.phase.state()
+        match &self.session {
+            Session::Idle { .. } => RecorderState::Idle,
+            Session::Open { .. } => RecorderState::Recording,
+            Session::Stopping { .. } => RecorderState::Stopping,
+            Session::Ended { report, .. } => report.phase.state(),
         }
     }
 
-    /// Whether a session has started and not yet reached a final state.
-    fn session_open(&self) -> bool {
-        matches!(
-            self.state(),
-            RecorderState::Recording | RecorderState::Stopping
-        )
-    }
-
-    /// A final report can still leave known files awaiting cleanup.
-    fn cleanup_pending(&self) -> bool {
-        self.session_open() || !self.open_files.is_empty()
-    }
-
-    /// Whether every file reported open has been reported closed.
-    fn all_closed(&self) -> bool {
-        self.open_files.is_empty() && self.report.closed_files > 0
-    }
-
-    /// Settle a wait once the session is final, or its final drain is done.
-    fn settle(&self, expired: bool, drained: bool) -> Option<FinishStatus> {
-        match self.state() {
-            RecorderState::Closed => Some(FinishStatus::Closed(self.report.clone())),
-            RecorderState::Indeterminate => Some(FinishStatus::Indeterminate(self.report.clone())),
-            _ if expired && drained => Some(FinishStatus::TimedOut(self.report.clone())),
+    fn open(&self) -> Option<&OpenSession> {
+        match &self.session {
+            Session::Open { data, .. } | Session::Stopping { data, .. } => Some(data),
             _ => None,
         }
     }
 
-    /// Record that a stop is under way, announced by the SDK after an
-    /// unrecoverable error, or `requested` by the caller. A stop the caller
-    /// requested stays requested.
-    fn stopping(&mut self, requested: bool) {
-        self.report.phase = SessionPhase::Stopping {
-            requested: requested || self.report.phase.requested(),
-        };
+    fn open_mut(&mut self) -> Option<&mut OpenSession> {
+        match &mut self.session {
+            Session::Open { data, .. } | Session::Stopping { data, .. } => Some(data),
+            _ => None,
+        }
     }
 
-    /// Record that the caller asked for the session to stop.
-    ///
-    /// `still_recording` is whether the SDK was still recording when asked:
-    /// a request that comes after the SDK has ended the session by itself
-    /// does not make the caller the one who stopped it.
-    fn stop_requested(&mut self, still_recording: bool) {
-        self.stopping(still_recording);
+    fn session_open(&self) -> bool {
+        matches!(
+            self.session,
+            Session::Open { .. } | Session::Stopping { .. }
+        )
     }
 
-    /// Record the SDK's cumulative count of discarded events.
-    ///
-    /// Like every event, a loss outside a session belongs to none: a start
-    /// the SDK refuses queues events too, and they must not alter the report
-    /// of the session before it.
+    fn files(&self) -> &[OpenFile] {
+        match &self.session {
+            Session::Open { data, .. } | Session::Stopping { data, .. } => &data.open_files,
+            Session::Ended { pending, .. } => pending,
+            Session::Idle { .. } => &[],
+        }
+    }
+
+    fn cleanup_pending(&self) -> bool {
+        self.session_open() || !self.files().is_empty()
+    }
+
+    fn all_closed(&self) -> bool {
+        self.open()
+            .is_some_and(|data| data.open_files.is_empty() && data.report.closed_files > 0)
+    }
+
+    fn settle(&self, expired: bool, drained: bool) -> Option<FinishStatus> {
+        match self.state() {
+            RecorderState::Closed => Some(FinishStatus::Closed(self.report())),
+            RecorderState::Indeterminate => Some(FinishStatus::Indeterminate(self.report())),
+            _ if expired && drained => Some(FinishStatus::TimedOut(self.report())),
+            _ => None,
+        }
+    }
+
+    /// Moving out of Open transfers the only native-stop obligation to its
+    /// caller; repeating the transition cannot mint another one.
+    fn stop_requested(&mut self, requested: bool) -> Option<StopOwed> {
+        let previous = std::mem::replace(&mut self.session, Session::Idle { last: None });
+        match previous {
+            Session::Open { data, stop } => {
+                self.session = Session::Stopping { data, requested };
+                Some(stop)
+            }
+            previous => {
+                self.session = previous;
+                None
+            }
+        }
+    }
+
+    fn mark_uncertain(&mut self) {
+        if let Some(data) = self.open_mut() {
+            data.uncertain = true;
+        }
+    }
+
+    #[cfg(test)]
+    fn is_uncertain(&self) -> bool {
+        self.open().is_some_and(|data| data.uncertain)
+    }
+
     fn dropped(&mut self, cumulative: u64) {
-        if !self.session_open() {
+        let Some(data) = self.open_mut() else {
             return;
-        }
-        self.report.dropped_events = cumulative.saturating_sub(self.dropped_base);
-        if cumulative != self.dropped_base {
-            self.uncertain = true;
+        };
+        data.report.dropped_events = cumulative.saturating_sub(data.dropped_base);
+        if cumulative != data.dropped_base {
+            data.uncertain = true;
         }
     }
 
-    /// Record one event of the open session.
-    fn observe(&mut self, kind: RecorderEventKind, path: EventText) {
-        // A path that is cut short cannot be matched with a later event.
+    fn observe(&mut self, kind: RecorderEventKind, path: EventText) -> Option<StopOwed> {
         let exact =
             !path.as_bytes().is_empty() && path.is_terminated() && !path.is_possibly_truncated();
-        if !self.session_open() {
-            // Keep cleanup evidence after an indeterminate verdict without
-            // changing the report already returned to the caller.
-            if kind == RecorderEventKind::FileClosed && exact {
-                if let Some(index) = self.open_files.iter().position(|open| open.path == path) {
-                    self.open_files.remove(index);
+        let Some(data) = self.open_mut() else {
+            // Cleanup evidence cannot change a report already returned.
+            if let Session::Ended { pending, .. } = &mut self.session {
+                if kind == RecorderEventKind::FileClosed && exact {
+                    if let Some(index) = pending.iter().position(|open| open.path == path) {
+                        pending.remove(index);
+                    }
                 }
             }
-            return;
-        }
+            return None;
+        };
         match kind {
             RecorderEventKind::Started | RecorderEventKind::Rollover => {
-                let first = kind == RecorderEventKind::Started;
                 if !exact
-                    || self.open_files.iter().any(|open| open.path == path)
-                    || (first && !self.open_files.is_empty())
+                    || data.open_files.iter().any(|open| open.path == path)
+                    || (kind == RecorderEventKind::Started && !data.open_files.is_empty())
                 {
-                    self.uncertain = true;
+                    data.uncertain = true;
                 }
-                self.open_files.push(OpenFile {
+                data.open_files.push(OpenFile {
                     path,
                     has_media: false,
                 });
             }
             RecorderEventKind::FirstFrame => {
-                if let Some(open) = self.open_files.iter_mut().find(|open| open.path == path) {
+                if let Some(open) = data.open_files.iter_mut().find(|open| open.path == path) {
                     open.has_media = true;
                 }
             }
             RecorderEventKind::FileClosed => {
-                match self.open_files.iter().position(|open| open.path == path) {
+                match data.open_files.iter().position(|open| open.path == path) {
                     Some(index) if exact => {
-                        let closed = self.open_files.remove(index);
-                        if self.records_media && !closed.has_media {
-                            self.report.empty_files = self.report.empty_files.saturating_add(1);
+                        let closed = data.open_files.remove(index);
+                        if data.records_media && !closed.has_media {
+                            data.report.empty_files = data.report.empty_files.saturating_add(1);
                         }
                     }
-                    _ => self.uncertain = true,
+                    _ => data.uncertain = true,
                 }
-                self.report.closed_files = self.report.closed_files.saturating_add(1);
-                self.report.last_closed_path = Some(path);
+                data.report.closed_files = data.report.closed_files.saturating_add(1);
+                data.report.last_closed_path = Some(path);
             }
             RecorderEventKind::Error => {
-                self.report.error_events = self.report.error_events.saturating_add(1);
-                // The SDK stops the session itself after this event.
-                if self.session_open() {
-                    self.stopping(false);
-                }
+                data.report.error_events = data.report.error_events.saturating_add(1);
+                return self.stop_requested(false);
             }
             RecorderEventKind::OpenFailed => {
-                self.report.error_events = self.report.error_events.saturating_add(1);
+                data.report.error_events = data.report.error_events.saturating_add(1);
             }
             RecorderEventKind::WriteFailed => {
-                self.report.write_failures = self.report.write_failures.saturating_add(1);
+                data.report.write_failures = data.report.write_failures.saturating_add(1);
             }
             _ => {}
         }
+        None
     }
 
-    /// Record that the event queue is empty, and whether the SDK is still
-    /// recording.
-    ///
-    /// Once the SDK has stopped and has nothing more to report, the session's
-    /// outcome is final: confirmed when every opened file was closed, and
-    /// indeterminate otherwise. A stop that is still being carried out leaves
-    /// a file open, and the session keeps waiting for its closure.
-    /// Finality here relies on rollovers reporting the next file open before
-    /// the previous file closes: an empty ledger then cannot hide a pending
-    /// open. The SDK headers do not specify the order; the native test
-    /// `rollovers_open_the_next_file_before_closing_the_previous_file` pins it.
-    fn drained(&mut self, native_recording: bool) {
-        if native_recording || !self.session_open() {
-            return;
+    /// Finality relies on open-before-close rollover events, pinned by the
+    /// native rollover-order test. Every exit transfers any owed native stop.
+    fn drained(&mut self, native_recording: bool) -> Option<StopOwed> {
+        if native_recording {
+            return None;
         }
-        let requested = self.report.phase.requested();
-        if self.uncertain {
-            self.report.phase = SessionPhase::Indeterminate { requested };
-        } else if self.all_closed() {
-            self.report.phase = SessionPhase::Closed { requested };
-        } else if self.state() == RecorderState::Stopping && self.open_files.is_empty() {
-            // The session stopped without ever reporting a file.
-            self.report.phase = SessionPhase::Indeterminate { requested };
-        }
+        let data = self.open()?;
+        let requested = match self.session {
+            Session::Stopping { requested, .. } => requested,
+            _ => false,
+        };
+        let phase = if data.uncertain {
+            SessionPhase::Indeterminate { requested }
+        } else if data.open_files.is_empty() && data.report.closed_files > 0 {
+            SessionPhase::Closed { requested }
+        } else if matches!(self.session, Session::Stopping { .. }) && data.open_files.is_empty() {
+            SessionPhase::Indeterminate { requested }
+        } else {
+            return None;
+        };
+        let previous = std::mem::replace(&mut self.session, Session::Idle { last: None });
+        let (data, stop) = match previous {
+            Session::Open { data, stop } => (data, Some(stop)),
+            Session::Stopping { data, .. } => (data, None),
+            _ => unreachable!("only an open session can finish"),
+        };
+        self.session = Session::Ended {
+            report: data.report.into_report(phase),
+            pending: data.open_files,
+        };
+        stop
     }
 }
 
@@ -765,18 +882,14 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 pub struct FileRecorder {
     recording: &'static sys::FileRecording,
     handle: NonNull<NDIlib_file_recorder_instance_type>,
-    /// Whether audio or video is recorded, rather than metadata alone.
-    records_media: bool,
+    /// The configured tracks, used when starting each new session.
+    tracks: MediaTypes,
     /// The source in effect, when the last change of source was accepted.
     accepted_source: Option<SourceSpec>,
     /// How the recorder names its files.
     naming: NamePattern,
     ledger: Ledger,
     generation: u64,
-    /// The SDK has not yet been told to stop the session started last. It
-    /// needs to be, even when it ended that session itself: until then it
-    /// refuses to start another.
-    native_stop_owed: bool,
     cleanup: CleanupBudget,
     // Keeps the NDI runtime initialized.
     _api: FileApi,
@@ -794,7 +907,7 @@ impl std::fmt::Debug for FileRecorder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileRecorder")
             .field("state", &self.ledger.state())
-            .field("session", &self.ledger.report.session)
+            .field("session", &self.ledger.session_number())
             .finish_non_exhaustive()
     }
 }
@@ -824,14 +937,12 @@ impl FileRecorder {
         Ok(Self {
             recording,
             handle,
-            records_media: options.tracks.contains(MediaTypes::VIDEO)
-                || options.tracks.contains(MediaTypes::AUDIO),
+            tracks: options.tracks,
             cleanup: CleanupBudget::For(options.drop_wait),
             accepted_source: Some(options.source.clone()),
             naming: resolved.naming,
             ledger: Ledger::idle(),
             generation: 0,
-            native_stop_owed: false,
             _api: api,
             _thread: PhantomData,
         })
@@ -848,13 +959,13 @@ impl FileRecorder {
 
     /// What the events taken so far have shown about the current session.
     pub fn report(&self) -> RecordingReport {
-        self.ledger.report.clone()
+        self.ledger.report()
     }
 
     fn session_id(&self) -> SessionId {
         SessionId {
             recorder: self.generation,
-            session: self.ledger.report.session,
+            session: self.ledger.session_number(),
         }
     }
 
@@ -913,8 +1024,7 @@ impl FileRecorder {
         self.discard_stale_events(sink)?;
         let session = self
             .ledger
-            .report
-            .session
+            .session_number()
             .checked_add(1)
             .ok_or_else(|| Error::InvalidInput("the session counter is exhausted".into()))?;
         let dropped = self.dropped_event_count();
@@ -940,8 +1050,11 @@ impl FileRecorder {
                 operation: "recorder start",
             });
         }
-        self.native_stop_owed = true;
-        self.ledger = Ledger::session(session, dropped, self.records_media);
+        self.ledger = Ledger::session(
+            session,
+            dropped,
+            self.tracks.contains(MediaTypes::VIDEO) || self.tracks.contains(MediaTypes::AUDIO),
+        );
         Ok(session)
     }
 
@@ -973,31 +1086,28 @@ impl FileRecorder {
     /// alone does not show that it has. Use [`finish`](Self::finish) or
     /// [`wait_finished`](Self::wait_finished) to find out.
     pub fn request_stop(&mut self) -> StopRequest {
-        let outcome = match self.state() {
+        match self.state() {
             RecorderState::Idle => StopRequest::NotStarted,
             RecorderState::Closed => StopRequest::AlreadyClosed,
             RecorderState::Indeterminate => StopRequest::AlreadyEnded,
             RecorderState::Stopping => StopRequest::AlreadyStopping,
             RecorderState::Recording => {
                 let still_recording = self.is_recording();
-                self.ledger.stop_requested(still_recording);
+                if let Some(stop) = self.ledger.stop_requested(still_recording) {
+                    self.stop_native(stop);
+                }
                 StopRequest::Requested
             }
-        };
-        // A session the SDK is ending by itself has not been told to stop.
-        self.stop_native();
-        outcome
+        }
     }
 
-    /// Tell the SDK to stop, unless the session started last was already told.
-    fn stop_native(&mut self) {
-        if std::mem::take(&mut self.native_stop_owed) {
-            // SAFETY: the recorder is live for this borrow.
-            unsafe {
-                self.recording
-                    .NDIlib_file_recorder_stop(self.handle.as_ptr())
-            };
-        }
+    fn stop_native(&mut self, _stop: StopOwed) {
+        // SAFETY: the recorder is live and the consumed token is the one
+        // obligation minted by its successful native start.
+        unsafe {
+            self.recording
+                .NDIlib_file_recorder_stop(self.handle.as_ptr())
+        };
     }
 
     /// Take the next queued event, waiting up to `timeout` for one, or
@@ -1022,22 +1132,21 @@ impl FileRecorder {
     fn poll_event_ms(&mut self, wait_ms: u32) -> Result<Option<RecorderEvent>> {
         let event = self.capture(wait_ms);
         self.ledger.dropped(self.dropped_event_count());
-        let Some(event) = event.inspect_err(|_| self.ledger.uncertain = true)? else {
+        let Some(event) = event.inspect_err(|_| self.ledger.mark_uncertain())? else {
             // This empty-capture/recording check relies on open-before-close
             // rollover events, pinned by the native File test
             // `rollovers_open_the_next_file_before_closing_the_previous_file`.
-            self.ledger.drained(self.is_recording());
-            if !self.ledger.session_open() {
-                // The session is over. When the SDK ended it itself, this is
-                // the stop it still needs before it will start another.
-                self.stop_native();
+            if let Some(stop) = self.ledger.drained(self.is_recording()) {
+                self.stop_native(stop);
             }
             return Ok(None);
         };
-        self.ledger.observe(
+        if let Some(stop) = self.ledger.observe(
             RecorderEventKind::from_raw(event.type_),
             EventText::from_buffer(&event.p_path),
-        );
+        ) {
+            self.stop_native(stop);
+        }
         // Decoded after the ledger is updated, so that a malformed payload
         // cannot hide the event that closes a file.
         Ok(Some(RecorderEvent::from_sdk(&event)?))
@@ -1372,7 +1481,7 @@ impl FileRecorder {
     /// The path is as the SDK gave it, and lags the recorder by the events not
     /// yet taken.
     pub fn reported_current_file(&self) -> Option<&EventText> {
-        self.ledger.open_files.last().map(|open| &open.path)
+        self.ledger.files().last().map(|open| &open.path)
     }
 
     /// Close the current file and continue the session in a new one named
@@ -1565,61 +1674,61 @@ mod tests {
     #[test]
     fn closure_needs_the_matching_file_and_a_stopped_drained_recorder() {
         let mut ledger = session();
-        ledger.observe(Started, path("take.mkv"));
-        ledger.stop_requested(true);
-        ledger.observe(FileClosed, path("take.mkv"));
-        assert!(!ledger.report.closure_confirmed());
-        ledger.drained(true);
+        let _ = ledger.observe(Started, path("take.mkv"));
+        let _ = ledger.stop_requested(true);
+        let _ = ledger.observe(FileClosed, path("take.mkv"));
+        assert!(!ledger.report().closure_confirmed());
+        let _ = ledger.drained(true);
         assert_eq!(ledger.state(), RecorderState::Stopping);
-        ledger.drained(false);
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        assert!(ledger.report.closure_confirmed());
+        assert!(ledger.report().closure_confirmed());
     }
 
     #[test]
     fn a_close_for_another_file_never_confirms_the_session() {
         let mut ledger = session();
-        ledger.observe(Started, path("first.mkv"));
-        ledger.stop_requested(true);
-        ledger.observe(FileClosed, path("other.mkv"));
-        ledger.drained(false);
+        let _ = ledger.observe(Started, path("first.mkv"));
+        let _ = ledger.stop_requested(true);
+        let _ = ledger.observe(FileClosed, path("other.mkv"));
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
-        assert!(!ledger.report.closure_confirmed());
+        assert!(!ledger.report().closure_confirmed());
     }
 
     #[test]
     fn lost_events_taint_an_otherwise_matching_close() {
         let mut ledger = Ledger::session(1, 7, true);
-        ledger.observe(Started, path("take.mkv"));
-        ledger.stop_requested(true);
-        ledger.observe(FileClosed, path("take.mkv"));
+        let _ = ledger.observe(Started, path("take.mkv"));
+        let _ = ledger.stop_requested(true);
+        let _ = ledger.observe(FileClosed, path("take.mkv"));
         ledger.dropped(8);
-        ledger.drained(false);
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
-        assert_eq!(ledger.report.dropped_events, 1);
+        assert_eq!(ledger.report().dropped_events, 1);
     }
 
     #[test]
     fn an_indeterminate_report_keeps_its_pending_cleanup_without_changing_the_report() {
         let mut ledger = session();
-        ledger.observe(Started, path("take.mkv"));
+        let _ = ledger.observe(Started, path("take.mkv"));
         ledger.dropped(1);
-        ledger.drained(false);
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
         assert!(ledger.cleanup_pending());
-        let report = ledger.report.clone();
-        ledger.observe(FileClosed, path("other.mkv"));
+        let report = ledger.report();
+        let _ = ledger.observe(FileClosed, path("other.mkv"));
         assert!(ledger.cleanup_pending());
-        ledger.observe(FileClosed, path("take.mkv"));
+        let _ = ledger.observe(FileClosed, path("take.mkv"));
         assert!(!ledger.cleanup_pending());
-        assert_eq!(ledger.report, report);
+        assert_eq!(ledger.report(), report);
     }
 
     #[test]
     fn a_wait_settles_only_on_a_final_report_or_an_expired_completed_drain() {
         let mut ledger = session();
-        ledger.observe(Started, path("take.mkv"));
-        ledger.stop_requested(true);
+        let _ = ledger.observe(Started, path("take.mkv"));
+        let _ = ledger.stop_requested(true);
         assert_eq!(ledger.settle(false, false), None);
         assert_eq!(ledger.settle(false, true), None);
         assert_eq!(ledger.settle(true, false), None);
@@ -1627,8 +1736,8 @@ mod tests {
             ledger.settle(true, true),
             Some(FinishStatus::TimedOut(_))
         ));
-        ledger.observe(FileClosed, path("take.mkv"));
-        ledger.drained(false);
+        let _ = ledger.observe(FileClosed, path("take.mkv"));
+        let _ = ledger.drained(false);
         assert!(matches!(
             ledger.settle(false, false),
             Some(FinishStatus::Closed(_))
@@ -1643,33 +1752,33 @@ mod tests {
         // pins it for explicit, source-switch and size rollovers, with and
         // without proxy recording.
         let mut ledger = session();
-        ledger.observe(Started, path("first.mkv"));
-        ledger.observe(Rollover, path("second.mkv"));
-        assert_eq!(ledger.open_files.len(), 2);
-        ledger.observe(FileClosed, path("first.mkv"));
-        ledger.drained(true);
+        let _ = ledger.observe(Started, path("first.mkv"));
+        let _ = ledger.observe(Rollover, path("second.mkv"));
+        assert_eq!(ledger.files().len(), 2);
+        let _ = ledger.observe(FileClosed, path("first.mkv"));
+        let _ = ledger.drained(true);
         assert_eq!(ledger.state(), RecorderState::Recording);
-        ledger.stop_requested(true);
-        ledger.observe(FileClosed, path("second.mkv"));
-        ledger.drained(false);
+        let _ = ledger.stop_requested(true);
+        let _ = ledger.observe(FileClosed, path("second.mkv"));
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        assert_eq!(ledger.report.closed_files, 2);
+        assert_eq!(ledger.report().closed_files, 2);
     }
 
     #[test]
     fn a_rollover_reported_after_the_previous_close_is_followed_too() {
         let mut ledger = session();
-        ledger.observe(Started, path("first.mkv"));
-        ledger.observe(FileClosed, path("first.mkv"));
+        let _ = ledger.observe(Started, path("first.mkv"));
+        let _ = ledger.observe(FileClosed, path("first.mkv"));
         // Still recording: the close of the first file is not the end.
-        ledger.drained(true);
+        let _ = ledger.drained(true);
         assert_eq!(ledger.state(), RecorderState::Recording);
-        ledger.observe(Rollover, path("second.mkv"));
-        ledger.stop_requested(true);
-        ledger.drained(false);
+        let _ = ledger.observe(Rollover, path("second.mkv"));
+        let _ = ledger.stop_requested(true);
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Stopping);
-        ledger.observe(FileClosed, path("second.mkv"));
-        ledger.drained(false);
+        let _ = ledger.observe(FileClosed, path("second.mkv"));
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
     }
 
@@ -1678,54 +1787,54 @@ mod tests {
         // A rollover was requested and the session stopped before the cut:
         // the SDK reports only the close of the file that was open.
         let mut ledger = session();
-        ledger.observe(Started, path("first.mkv"));
-        ledger.stop_requested(true);
-        ledger.observe(FileClosed, path("first.mkv"));
-        ledger.drained(false);
+        let _ = ledger.observe(Started, path("first.mkv"));
+        let _ = ledger.stop_requested(true);
+        let _ = ledger.observe(FileClosed, path("first.mkv"));
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
     }
 
     #[test]
     fn a_stop_the_sdk_decides_on_confirms_its_observed_close() {
         let mut ledger = session();
-        ledger.observe(Started, path("take.mkv"));
-        ledger.observe(FormatChanged, path("take.mkv"));
-        ledger.observe(FileClosed, path("take.mkv"));
-        ledger.drained(false);
+        let _ = ledger.observe(Started, path("take.mkv"));
+        let _ = ledger.observe(FormatChanged, path("take.mkv"));
+        let _ = ledger.observe(FileClosed, path("take.mkv"));
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        assert!(ledger.report.closure_confirmed());
+        assert!(ledger.report().closure_confirmed());
     }
 
     #[test]
     fn a_fatal_error_closes_the_session_and_stays_in_the_report() {
         let mut ledger = session();
-        ledger.observe(Started, path("take.mkv"));
-        ledger.observe(WriteFailed, path("take.mkv"));
-        ledger.observe(Error, path("take.mkv"));
+        let _ = ledger.observe(Started, path("take.mkv"));
+        let _ = ledger.observe(WriteFailed, path("take.mkv"));
+        let _ = ledger.observe(Error, path("take.mkv"));
         assert_eq!(ledger.state(), RecorderState::Stopping);
-        ledger.observe(FileClosed, path("take.mkv"));
-        ledger.drained(false);
+        let _ = ledger.observe(FileClosed, path("take.mkv"));
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        assert_eq!(ledger.report.error_events, 1);
-        assert_eq!(ledger.report.write_failures, 1);
+        assert_eq!(ledger.report().error_events, 1);
+        assert_eq!(ledger.report().write_failures, 1);
     }
 
     #[test]
     fn a_failed_rollover_open_is_counted_without_opening_a_file() {
         let mut ledger = session();
-        ledger.observe(Started, path("first.mkv"));
-        ledger.observe(OpenFailed, path("second.mkv"));
-        ledger.observe(FileClosed, path("first.mkv"));
-        ledger.drained(false);
+        let _ = ledger.observe(Started, path("first.mkv"));
+        let _ = ledger.observe(OpenFailed, path("second.mkv"));
+        let _ = ledger.observe(FileClosed, path("first.mkv"));
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        assert_eq!(ledger.report.error_events, 1);
+        assert_eq!(ledger.report().error_events, 1);
     }
 
     #[test]
     fn a_session_that_stops_without_reporting_a_file_is_indeterminate_not_pending() {
         let mut ledger = session();
-        ledger.stop_requested(true);
-        ledger.drained(false);
+        let _ = ledger.stop_requested(true);
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
     }
 
@@ -1734,92 +1843,92 @@ mod tests {
         // A start the SDK refuses queues an open-failed event while the
         // previous session's record is still the current one.
         let mut ledger = session();
-        ledger.observe(Started, path("take.mkv"));
-        ledger.stop_requested(true);
-        ledger.observe(FileClosed, path("take.mkv"));
-        ledger.drained(false);
+        let _ = ledger.observe(Started, path("take.mkv"));
+        let _ = ledger.stop_requested(true);
+        let _ = ledger.observe(FileClosed, path("take.mkv"));
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        ledger.observe(OpenFailed, path("next.mkv"));
+        let _ = ledger.observe(OpenFailed, path("next.mkv"));
         ledger.dropped(3);
-        assert_eq!(ledger.report.error_events, 0);
-        assert_eq!(ledger.report.dropped_events, 0);
-        assert!(ledger.report.closure_confirmed());
+        assert_eq!(ledger.report().error_events, 0);
+        assert_eq!(ledger.report().dropped_events, 0);
+        assert!(ledger.report().closure_confirmed());
     }
 
     #[test]
     fn a_session_stopped_on_request_was_not_stopped_by_the_sdk() {
         let mut ledger = session();
-        ledger.observe(Started, path("take.mkv"));
-        assert!(!ledger.report.stopped_by_sdk(), "an open session");
-        ledger.stop_requested(true);
-        ledger.observe(FileClosed, path("take.mkv"));
-        ledger.drained(true);
-        assert!(!ledger.report.stopped_by_sdk(), "still stopping");
-        ledger.drained(false);
+        let _ = ledger.observe(Started, path("take.mkv"));
+        assert!(!ledger.report().stopped_by_sdk(), "an open session");
+        let _ = ledger.stop_requested(true);
+        let _ = ledger.observe(FileClosed, path("take.mkv"));
+        let _ = ledger.drained(true);
+        assert!(!ledger.report().stopped_by_sdk(), "still stopping");
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        assert!(!ledger.report.stopped_by_sdk());
+        assert!(!ledger.report().stopped_by_sdk());
     }
 
     #[test]
     fn an_sdk_error_that_starts_the_stop_is_not_a_request() {
         let mut ledger = session();
-        ledger.observe(Started, path("take.mkv"));
-        ledger.observe(OpenFailed, path("next.mkv"));
-        ledger.observe(Error, path(""));
+        let _ = ledger.observe(Started, path("take.mkv"));
+        let _ = ledger.observe(OpenFailed, path("next.mkv"));
+        let _ = ledger.observe(Error, path(""));
         assert_eq!(ledger.state(), RecorderState::Stopping);
-        ledger.observe(FileClosed, path("take.mkv"));
-        ledger.drained(false);
+        let _ = ledger.observe(FileClosed, path("take.mkv"));
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        assert!(ledger.report.closure_confirmed());
-        assert!(ledger.report.stopped_by_sdk());
+        assert!(ledger.report().closure_confirmed());
+        assert!(ledger.report().stopped_by_sdk());
     }
 
     #[test]
     fn a_close_at_a_format_change_with_no_request_was_the_sdks() {
         let mut ledger = session();
-        ledger.observe(Started, path("take.mkv"));
-        ledger.observe(FormatChanged, path("take.mkv"));
-        ledger.observe(FileClosed, path("take.mkv"));
-        ledger.drained(false);
+        let _ = ledger.observe(Started, path("take.mkv"));
+        let _ = ledger.observe(FormatChanged, path("take.mkv"));
+        let _ = ledger.observe(FileClosed, path("take.mkv"));
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        assert!(ledger.report.stopped_by_sdk());
+        assert!(ledger.report().stopped_by_sdk());
     }
 
     #[test]
     fn a_request_after_the_sdk_stopped_recording_leaves_the_stop_to_the_sdk() {
         let mut ledger = session();
-        ledger.observe(Started, path("take.mkv"));
+        let _ = ledger.observe(Started, path("take.mkv"));
         // The SDK had ended the session before the request reached it.
-        ledger.stop_requested(false);
-        ledger.observe(FileClosed, path("take.mkv"));
-        ledger.drained(false);
+        let _ = ledger.stop_requested(false);
+        let _ = ledger.observe(FileClosed, path("take.mkv"));
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        assert!(ledger.report.stopped_by_sdk());
+        assert!(ledger.report().stopped_by_sdk());
     }
 
     #[test]
     fn an_indeterminate_end_with_no_request_was_the_sdks() {
         let mut ledger = session();
-        ledger.observe(Started, path("take.mkv"));
+        let _ = ledger.observe(Started, path("take.mkv"));
         ledger.dropped(1);
-        ledger.drained(false);
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
-        assert!(ledger.report.stopped_by_sdk());
+        assert!(ledger.report().stopped_by_sdk());
     }
 
     #[test]
     fn a_truncated_or_repeated_open_cannot_be_matched() {
         let mut ledger = session();
-        ledger.observe(
+        let _ = ledger.observe(
             Started,
             EventText::from_buffer(&[b'a' as std::ffi::c_char; 8]),
         );
-        assert!(ledger.uncertain);
+        assert!(ledger.is_uncertain());
 
         let mut ledger = session();
-        ledger.observe(Started, path("take.mkv"));
-        ledger.observe(Rollover, path("take.mkv"));
-        assert!(ledger.uncertain);
+        let _ = ledger.observe(Started, path("take.mkv"));
+        let _ = ledger.observe(Rollover, path("take.mkv"));
+        assert!(ledger.is_uncertain());
     }
 
     /// The state and the report's two verdicts are read from one phase, so
@@ -1869,25 +1978,25 @@ mod tests {
         ] {
             let ledger = Ledger::with_report(1, phase, 0, true);
             assert_eq!(ledger.state(), state, "{phase:?}");
-            assert_eq!(ledger.report.closure_confirmed(), confirmed, "{phase:?}");
-            assert_eq!(ledger.report.stopped_by_sdk(), by_sdk, "{phase:?}");
+            assert_eq!(ledger.report().closure_confirmed(), confirmed, "{phase:?}");
+            assert_eq!(ledger.report().stopped_by_sdk(), by_sdk, "{phase:?}");
             // A replacement keeps the report but has no session of its own.
-            let inherited = Ledger::inheriting(ledger.report.clone());
+            let inherited = Ledger::inheriting(ledger.report());
             assert_eq!(inherited.state(), RecorderState::Idle, "{phase:?}");
             assert!(!inherited.session_open(), "{phase:?}");
-            assert_eq!(inherited.report, ledger.report, "{phase:?}");
+            assert_eq!(inherited.report(), ledger.report(), "{phase:?}");
         }
     }
 
     #[test]
     fn a_stop_requested_before_an_sdk_error_stays_requested() {
         let mut ledger = session();
-        ledger.observe(Started, path("take.mkv"));
-        ledger.stop_requested(true);
-        ledger.observe(Error, path("take.mkv"));
-        ledger.observe(FileClosed, path("take.mkv"));
-        ledger.drained(false);
+        let _ = ledger.observe(Started, path("take.mkv"));
+        let _ = ledger.stop_requested(true);
+        let _ = ledger.observe(Error, path("take.mkv"));
+        let _ = ledger.observe(FileClosed, path("take.mkv"));
+        let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        assert!(!ledger.report.stopped_by_sdk());
+        assert!(!ledger.report().stopped_by_sdk());
     }
 }

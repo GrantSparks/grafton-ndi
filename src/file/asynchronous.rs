@@ -972,9 +972,6 @@ impl Owner for FilePlayer {
 /// Drop replies before native cleanup when another command panics.
 struct RecorderOwner {
     waiters: FinishWaiters<Reply<FinishStatus>>,
-    /// A finish active when close began keeps receiving cleanup events,
-    /// even if its indeterminate report becomes final before its files close.
-    notify_cleanup: bool,
     recorder: FileRecorder,
 }
 
@@ -991,7 +988,6 @@ impl RecorderOwner {
     fn new(recorder: FileRecorder) -> Self {
         Self {
             waiters: FinishWaiters::new(),
-            notify_cleanup: false,
             recorder,
         }
     }
@@ -1087,8 +1083,6 @@ impl Owner for RecorderOwner {
     }
 
     fn after_events(&mut self, drained: bool, events: &EventQueue<Self::Event>, control: &Control) {
-        self.waiters.retain();
-        self.notify_cleanup |= control.shutdown.load(Ordering::Acquire) && !self.waiters.is_empty();
         self.settle_at(drained, events, control, false, Instant::now());
     }
 
@@ -1103,7 +1097,7 @@ impl Owner for RecorderOwner {
         control: &Control,
     ) {
         self.waiters.retain();
-        let notify = self.notify_cleanup || !self.waiters.is_empty();
+        let notify = self.waiters.notifies_cleanup();
         if !notify {
             events.close(false);
         }
@@ -3149,6 +3143,62 @@ mod tests {
         let (reply, finishing) = operation();
         owner.finish(deadline, true, reply);
         (device, owner, finishing)
+    }
+
+    #[test]
+    fn a_close_during_reply_settlement_keeps_delivering_pending_cleanup() {
+        struct CloseOnReply {
+            control: Arc<Control>,
+            device: Arc<mock::Recorder>,
+        }
+        impl Wake for CloseOnReply {
+            fn wake(self: Arc<Self>) {
+                self.control.request_shutdown();
+                self.device.close();
+            }
+        }
+        let device = mock::Recorder::new(Closing::Never);
+        device.install();
+        let mut recorder = mock::recorder_api()
+            .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
+            .unwrap();
+        recorder
+            .start(
+                &RecordingTarget::new(std::env::temp_dir().join("mock-settlement-close")).unwrap(),
+                RecordingTimecode::Preserve,
+            )
+            .unwrap();
+        recorder.poll_event(Duration::ZERO).unwrap();
+        let mut owner = RecorderOwner::new(recorder);
+        let (reply, finishing) = operation();
+        owner.finish(
+            Deadline::after(Duration::from_secs(30)).unwrap(),
+            true,
+            reply,
+        );
+        device.dropped_events.store(1, Ordering::Release);
+        assert!(owner.poll_native().unwrap().is_none());
+        assert_eq!(owner.recorder.state(), RecorderState::Indeterminate);
+        let control = Arc::new(Control::new());
+        let events = EventQueue::new(16);
+        let mut finishing = Box::pin(finishing);
+        let waker = Waker::from(Arc::new(CloseOnReply {
+            control: Arc::clone(&control),
+            device: Arc::clone(&device),
+        }));
+        assert!(finishing
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        owner.after_events(true, &events, &control);
+        assert!(control.shutdown.load(Ordering::Acquire));
+        assert!(matches!(
+            block_on(finishing).unwrap(),
+            FinishStatus::Indeterminate(_)
+        ));
+        owner.shutdown(Instant::now(), &events, &control);
+        let event = lock(&events.0).queue.pop_front().unwrap().unwrap();
+        assert_eq!(event.kind(), super::super::RecorderEventKind::FileClosed);
     }
 
     #[test]
