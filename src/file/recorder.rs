@@ -1,7 +1,6 @@
 //! Recording an NDI source to disk, with explicit finalization.
 
 use std::{
-    ffi::CString,
     marker::PhantomData,
     ptr::NonNull,
     rc::Rc,
@@ -10,7 +9,7 @@ use std::{
 
 use super::{
     out_param,
-    types::{track_flags, NamePattern},
+    types::{track_flags, FileText, NamePattern},
     EventText, FileApi, RecorderEvent, RecorderEventKind, RecorderOptions, RecorderStats,
     RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec, StateError,
 };
@@ -843,7 +842,7 @@ impl Ledger {
 
 fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
     let pointer =
-        |text: &Option<CString>| text.as_ref().map_or(std::ptr::null(), |text| text.as_ptr());
+        |text: &Option<FileText>| text.as_ref().map_or(std::ptr::null(), |text| text.as_ptr());
     NDIlib_file_recorder_source_t {
         p_ndi_name: pointer(&source.name),
         p_url_address: pointer(&source.url),

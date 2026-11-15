@@ -101,6 +101,39 @@ fn cstring(value: &str, what: &'static str, allow_empty: bool) -> Result<CString
     Ok(CString::new(value)?)
 }
 
+/// UTF-8 text whose only NUL is its final byte, proven at construction.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) struct FileText(Box<str>);
+
+impl FileText {
+    fn new(value: &str, what: &'static str) -> Result<Self> {
+        if value.is_empty() {
+            return Err(Error::InvalidInput(crate::InputDefect::Empty { what }));
+        }
+        if value.contains('\0') {
+            return Err(CString::new(value).unwrap_err().into());
+        }
+        let mut text = String::with_capacity(value.len() + 1);
+        text.push_str(value);
+        text.push('\0');
+        Ok(Self(text.into_boxed_str()))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0[..self.0.len() - 1]
+    }
+
+    pub(super) fn as_ptr(&self) -> *const c_char {
+        self.0.as_ptr().cast()
+    }
+}
+
+impl std::fmt::Debug for FileText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
 /// An owned source name or direct URL used by a recorder.
 ///
 /// Name and URL constructors are separate because the SDK gives a nonempty name
@@ -112,8 +145,8 @@ fn cstring(value: &str, what: &'static str, allow_empty: bool) -> Result<CString
 /// occurs while constructing this value; constructors allocate one C string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceSpec {
-    pub(super) name: Option<CString>,
-    pub(super) url: Option<CString>,
+    pub(super) name: Option<FileText>,
+    pub(super) url: Option<FileText>,
 }
 
 impl SourceSpec {
@@ -125,7 +158,7 @@ impl SourceSpec {
     /// [`Error::InvalidCString`] when it contains a NUL.
     pub fn new(name: impl AsRef<str>) -> Result<Self> {
         Ok(Self {
-            name: Some(cstring(name.as_ref(), "source name", false)?),
+            name: Some(FileText::new(name.as_ref(), "source name")?),
             url: None,
         })
     }
@@ -140,22 +173,18 @@ impl SourceSpec {
     pub fn from_url(url: impl AsRef<str>) -> Result<Self> {
         Ok(Self {
             name: None,
-            url: Some(cstring(url.as_ref(), "source URL", false)?),
+            url: Some(FileText::new(url.as_ref(), "source URL")?),
         })
     }
 
     /// The requested display name, when selecting by name.
     pub fn name(&self) -> Option<&str> {
-        self.name
-            .as_ref()
-            .map(|s| s.to_str().expect("validated UTF-8"))
+        self.name.as_ref().map(FileText::as_str)
     }
 
     /// The requested URL/address, when selecting directly.
     pub fn url(&self) -> Option<&str> {
-        self.url
-            .as_ref()
-            .map(|s| s.to_str().expect("validated UTF-8"))
+        self.url.as_ref().map(FileText::as_str)
     }
 }
 
@@ -586,16 +615,16 @@ const RECORDER_PATH_LIMIT: usize = NDIlib_file_recorder_event_path_max_size as u
 const INDEX_DIGITS: usize = u64::MAX.ilog10() as usize + 1;
 
 /// One part of a filename pattern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PatternPart<'a> {
-    Text(&'a str),
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PatternPart {
+    Text(std::ops::Range<usize>),
     Prefix,
     /// `{index}`, with no padding, or `{index:N}`, padded to `N` digits.
     Index(usize),
 }
 
 /// The literal text and tokens of a filename pattern, in order.
-fn pattern_parts(pattern: &str) -> Result<Vec<PatternPart<'_>>> {
+fn pattern_parts(pattern: &str) -> Result<Vec<PatternPart>> {
     let unmatched = || Error::InvalidInput(crate::InputDefect::FilenamePatternBrace);
     let mut parts = Vec::new();
     let mut rest = pattern;
@@ -604,7 +633,8 @@ fn pattern_parts(pattern: &str) -> Result<Vec<PatternPart<'_>>> {
             return Err(unmatched());
         }
         if start > 0 {
-            parts.push(PatternPart::Text(&rest[..start]));
+            let offset = pattern.len() - rest.len();
+            parts.push(PatternPart::Text(offset..offset + start));
         }
         let after = &rest[start + 1..];
         let end = after.find('}').ok_or_else(unmatched)?;
@@ -632,7 +662,7 @@ fn pattern_parts(pattern: &str) -> Result<Vec<PatternPart<'_>>> {
         rest = &after[end + 1..];
     }
     if !rest.is_empty() {
-        parts.push(PatternPart::Text(rest));
+        parts.push(PatternPart::Text(pattern.len() - rest.len()..pattern.len()));
     }
     Ok(parts)
 }
@@ -641,6 +671,7 @@ fn pattern_parts(pattern: &str) -> Result<Vec<PatternPart<'_>>> {
 #[derive(Debug, Clone)]
 pub(super) struct NamePattern {
     pattern: String,
+    parts: Vec<PatternPart>,
     /// The pattern has no index, so each target names exactly one file.
     exact: bool,
     /// Extra digits beyond index 1, reserving the full range of a u64 index.
@@ -664,6 +695,7 @@ impl NamePattern {
             .fold(0usize, usize::saturating_add);
         Ok(Self {
             pattern: pattern.to_owned(),
+            parts,
             exact,
             index_digits_reserved,
         })
@@ -680,13 +712,15 @@ impl NamePattern {
     /// A pattern that leaves the path relative is resolved, as the SDK
     /// resolves it, against the current directory.
     pub(super) fn first_file(&self, target: &RecordingTarget) -> Result<PathBuf> {
-        let prefix = target.prefix.to_str().expect("validated UTF-8");
+        let prefix = target.prefix.as_str();
         let mut name = String::new();
-        for part in pattern_parts(&self.pattern)? {
+        for part in &self.parts {
             match part {
-                PatternPart::Text(text) => name.push_str(text),
+                PatternPart::Text(range) => name.push_str(&self.pattern[range.clone()]),
                 PatternPart::Prefix => name.push_str(prefix),
-                PatternPart::Index(width) => name.push_str(&format!("{:0width$}", 1)),
+                PatternPart::Index(width) => {
+                    name.push_str(&format!("{:0width$}", 1, width = *width))
+                }
             }
         }
         let file = PathBuf::from(name);
@@ -778,8 +812,7 @@ fn check_directory(directory: &Path) -> Result<()> {
 /// losslessly representable UTF-8 paths.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RecordingTarget {
-    pub(super) prefix: CString,
-    path: PathBuf,
+    pub(super) prefix: FileText,
 }
 
 impl RecordingTarget {
@@ -791,13 +824,13 @@ impl RecordingTarget {
     /// [`Error::InvalidCString`] when it contains a NUL, and [`Error::Io`]
     /// when the operating system cannot resolve a relative path.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
-        let (path, prefix) = resolve_path(path.as_ref(), "recording target")?;
-        Ok(Self { prefix, path })
+        let (_, prefix) = resolve_path(path.as_ref(), "recording target")?;
+        Ok(Self { prefix })
     }
 
     /// The frozen absolute path/prefix, without filesystem canonicalization.
     pub fn path(&self) -> &Path {
-        &self.path
+        Path::new(self.prefix.as_str())
     }
 }
 
@@ -810,7 +843,7 @@ impl RecordingTarget {
 /// [`Error::InvalidInput`] naming `what` when the path is empty or is not
 /// UTF-8, [`Error::InvalidCString`] when it contains a NUL, and
 /// [`Error::Io`] when the operating system cannot resolve a relative path.
-pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<(PathBuf, CString)> {
+pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<(PathBuf, FileText)> {
     if path.as_os_str().is_empty() {
         return Err(Error::InvalidInput(crate::InputDefect::Empty { what }));
     }
@@ -836,12 +869,12 @@ pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<(PathBuf, 
         .ok_or(Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
             what,
         }))?;
-    let text = cstring(text, what, false)?;
+    let text = FileText::new(text, what)?;
     Ok((absolute, text))
 }
 
 /// A path to play or probe, as the SDK takes it.
-pub(super) fn path_string(path: &Path) -> Result<CString> {
+pub(super) fn path_string(path: &Path) -> Result<FileText> {
     Ok(resolve_path(path, "file path")?.1)
 }
 
@@ -1835,7 +1868,7 @@ mod tests {
     fn relative_paths_are_made_absolute_once() {
         let (absolute, text) = resolve_path(Path::new("take.mkv"), "file path").unwrap();
         assert!(absolute.is_absolute());
-        assert_eq!(text.to_str().unwrap(), absolute.to_str().unwrap());
+        assert_eq!(text.as_str(), absolute.to_str().unwrap());
         assert_eq!(
             RecordingTarget::new("take.mkv").unwrap().path(),
             absolute.as_path()
@@ -1856,7 +1889,7 @@ mod tests {
             let (absolute, text) = resolve_path(Path::new(path), "file path").unwrap();
             assert!(absolute.is_absolute(), "{absolute:?}");
             assert!(absolute.ends_with("take.mkv"));
-            assert_eq!(text.to_str().unwrap(), absolute.to_str().unwrap());
+            assert_eq!(text.as_str(), absolute.to_str().unwrap());
             assert_eq!(path_string(Path::new(path)).unwrap(), text);
             assert_eq!(RecordingTarget::new(path).unwrap().path(), absolute);
         }
@@ -1883,6 +1916,54 @@ mod tests {
         let source = SourceSpec::from_url("ndi://camera").unwrap();
         assert_eq!(source.name(), None);
         assert_eq!(source.url(), Some("ndi://camera"));
+    }
+
+    #[test]
+    fn file_text_retains_utf8_termination_identity_and_allocation_budgets() {
+        use std::hash::{Hash, Hasher};
+        fn hash<T: Hash>(value: &T) -> u64 {
+            let mut state = std::hash::DefaultHasher::new();
+            value.hash(&mut state);
+            state.finish()
+        }
+        let (source, allocations) =
+            crate::test_alloc::allocation_count(|| SourceSpec::new("Caméra").unwrap());
+        assert_eq!(allocations, 1);
+        let (_, allocations) = crate::test_alloc::allocation_count(|| {
+            for _ in 0..100 {
+                assert_eq!(source.name(), Some("Caméra"));
+                assert_eq!(source.url(), None);
+            }
+        });
+        assert_eq!(allocations, 0);
+        let same = SourceSpec::new("Caméra").unwrap();
+        assert_eq!(source, same);
+        assert_eq!(hash(&source), hash(&same));
+        assert_ne!(source, SourceSpec::from_url("Caméra").unwrap());
+        assert_ne!(source, SourceSpec::new("Other camera").unwrap());
+        let text = source.name.as_ref().unwrap();
+        // SAFETY: FileText owns its only trailing NUL and the bytes stay live.
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(text.as_ptr()) }.to_bytes(),
+            "Caméra".as_bytes()
+        );
+
+        let target = RecordingTarget::new("take-é").unwrap();
+        let same = RecordingTarget::new(target.path()).unwrap();
+        assert_eq!(target, same);
+        assert_eq!(hash(&target), hash(&same));
+        assert_ne!(target, RecordingTarget::new("take-other").unwrap());
+        assert_eq!(target.prefix.as_str(), target.path().to_str().unwrap());
+    }
+
+    #[test]
+    fn cached_pattern_parts_avoid_preflight_parse_allocation() {
+        let target = RecordingTarget::new("take").unwrap();
+        let pattern = NamePattern::new(DEFAULT_PATTERN).unwrap();
+        let (file, allocations) =
+            crate::test_alloc::allocation_count(|| pattern.first_file(&target).unwrap());
+        assert!(file.ends_with("take_001.mkv"));
+        assert!(allocations <= 3, "preflight made {allocations} allocations");
     }
 
     #[test]
