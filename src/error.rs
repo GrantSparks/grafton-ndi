@@ -5,6 +5,7 @@ mod allocation_tests;
 mod defects;
 #[cfg(test)]
 mod defects_tests;
+pub use crate::sys::table::NativeFunction;
 pub use defects::*;
 
 mod loading;
