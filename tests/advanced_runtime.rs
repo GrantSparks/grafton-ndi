@@ -4007,6 +4007,28 @@ fn router_connection_metadata_survives_the_registered_input() {
     router
         .change(&loopback(&ndi, &sender.source().unwrap()))
         .unwrap();
+    let receiver = Receiver::new(
+        &ndi,
+        &ReceiverOptions::new(loopback(&ndi, &router.source().unwrap())),
+    )
+    .unwrap();
+    let frame = video();
+    // A routing request alone does not establish a live downstream connection.
+    // Observe an actual routed frame before testing immediate registration
+    // delivery. Retained-pointer fixtures separately cover reads on later
+    // connections, clear and destruction, independent of native startup timing.
+    let connected_deadline = Instant::now() + PATIENCE;
+    loop {
+        sender.send_video(&frame).unwrap();
+        if receiver.video().capture_ref(SLICE).unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < connected_deadline,
+            "router did not deliver a frame before registration; {}",
+            link(&receiver)
+        );
+    }
     let text = "<router-registration/>";
     router
         .add_connection_metadata(
@@ -4015,12 +4037,6 @@ fn router_connection_metadata_survives_the_registered_input() {
                 .with_timecode(Timecode::from_ticks(22)),
         )
         .unwrap();
-    let receiver = Receiver::new(
-        &ndi,
-        &ReceiverOptions::new(loopback(&ndi, &router.source().unwrap())),
-    )
-    .unwrap();
-    let frame = video();
     let deadline = Instant::now() + PATIENCE;
     loop {
         sender.send_video(&frame).unwrap();
