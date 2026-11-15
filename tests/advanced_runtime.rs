@@ -4068,19 +4068,27 @@ fn router_connection_metadata_survives_the_registered_input() {
     )
     .unwrap();
     let frame = video();
-    // A routing request alone does not establish a live downstream connection.
-    // Observe an actual routed frame before testing immediate registration
-    // delivery. Retained-pointer fixtures separately cover reads on later
-    // connections, clear and destruction, independent of native startup timing.
+    // Routed media bypasses the router. Require the router itself to report
+    // a connected receiver as well as observing video: its metadata operation
+    // promises immediate delivery to receivers already connected to the router.
+    // Drain every slot throughout startup and delivery; retained-pointer
+    // fixtures separately cover reads on later connections, clear and destroy.
     let connected_deadline = Instant::now() + PATIENCE;
+    let mut received_video = false;
     loop {
         sender.send_video(&frame).unwrap();
-        if receiver.video().capture_ref(SLICE).unwrap().is_some() {
+        received_video |= matches!(
+            receiver.capture_any_ref(SLICE).unwrap(),
+            Some(grafton_ndi::ReceiverItemRef::Video(_))
+        );
+        let router_connections = router.connection_count(Duration::ZERO).unwrap();
+        if received_video && router_connections > 0 {
             break;
         }
         assert!(
             Instant::now() < connected_deadline,
-            "router did not deliver a frame before registration; {}",
+            "router not ready before registration: {router_connections} router connections, \
+             received video {received_video}; {}",
             link(&receiver)
         );
     }
@@ -4093,16 +4101,28 @@ fn router_connection_metadata_survives_the_registered_input() {
         )
         .unwrap();
     let deadline = Instant::now() + PATIENCE;
+    let mut observed_metadata = Vec::new();
     loop {
         sender.send_video(&frame).unwrap();
-        if let Some(metadata) = receiver.metadata().capture_ref(SLICE).unwrap() {
+        if let Some(grafton_ndi::ReceiverItemRef::Metadata(metadata)) =
+            receiver.capture_any_ref(SLICE).unwrap()
+        {
             if metadata.data() == text {
                 break;
+            }
+            if observed_metadata.len() < 4 {
+                observed_metadata.push((
+                    metadata.timecode(),
+                    metadata.data().len(),
+                    metadata.data().chars().take(256).collect::<String>(),
+                ));
             }
         }
         assert!(
             Instant::now() < deadline,
-            "router connection metadata was not delivered; {}",
+            "router connection metadata was not delivered; router connections {:?}; \
+             observed metadata (timecode, full byte length, first 256 chars) {observed_metadata:?}; {}",
+            router.connection_count(Duration::ZERO),
             link(&receiver)
         );
     }
