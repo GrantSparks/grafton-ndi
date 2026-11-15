@@ -1754,24 +1754,12 @@ impl ReceiverCore {
         }
     }
 
-    #[cfg(test)]
-    fn try_lock_connection(&self) -> Option<Connection<'_>> {
-        Some(Connection {
-            core: self,
-            _exclusive: self.connection_guard.try_lock()?,
-        })
-    }
-
     /// Bind `attempt` to this receiver and its runtime, without taking the
     /// connection guard. Connection changes may overlap native captures.
     ///
     /// This is the only way to make a [`CaptureLock`], and so to call
     /// `NDIlib_recv_capture_v3` on this instance.
     fn capture_lock(&self, attempt: Attempt) -> CaptureLock<'_> {
-        #[cfg(test)]
-        if let Some(event) = capture_lock_test_event::take() {
-            self.retain(event);
-        }
         CaptureLock {
             core: self,
             attempt,
@@ -1833,9 +1821,9 @@ impl ReceiverCore {
     }
 
     /// The mixed-capture kernel, shared by raw and packet receivers and
-    /// notification-only polling. A pending event is taken before and after
-    /// preparing the native attempt, so one a capture retained meanwhile spares
-    /// the native wait. Only media reaches `convert`, retaining
+    /// notification-only polling. A pending event is taken before the native
+    /// attempt; events retained during that attempt merge with its result.
+    /// Only media reaches `convert`, retaining
     /// its guards through the caller's validation and copy.
     fn capture_any_until_with<'rx, S: SlotSet, T>(
         &'rx self,
@@ -1849,9 +1837,6 @@ impl ReceiverCore {
                 return Ok(Some(event(pending)));
             }
             let lock = self.capture_lock(attempt);
-            if let Some(pending) = self.take_pending_event() {
-                return Ok(Some(event(pending)));
-            }
             let delivered = capture_any::<S>(&lock)?;
             self.capture_any_result_with(delivered, &mut event, &mut convert)
         })
@@ -2109,20 +2094,6 @@ pub(crate) mod native_capture_calls {
 
 /// Publish one event immediately after a test prepares a capture attempt, so
 /// its second pending-event check can be tested without a scheduling race.
-#[cfg(test)]
-mod capture_lock_test_event {
-    use super::Notification;
-    std::thread_local! {
-        static NEXT: std::cell::Cell<Option<Notification>> = const { std::cell::Cell::new(None) };
-    }
-    pub(super) fn set(event: Notification) {
-        NEXT.with(|next| next.set(Some(event)));
-    }
-    pub(super) fn take() -> Option<Notification> {
-        NEXT.with(|next| next.take())
-    }
-}
-
 /// A typed view over a [`Receiver`] for capturing frames of one kind.
 ///
 /// Created by [`Receiver::video`], [`Receiver::audio`], and
@@ -3405,28 +3376,6 @@ mod tests {
             };
             result.expect("reconnect waited for the capture attempt");
         });
-    }
-
-    #[test]
-    fn pending_events_found_during_attempt_preparation_run_without_the_connection_lock() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        capture_lock_test_event::set(Notification::SourceChanged);
-        let result = receiver
-            .core
-            .capture_any_until_with::<NoSlots, _>(
-                Deadline::after(Duration::ZERO).unwrap(),
-                NeverStop,
-                |event| {
-                    assert!(receiver.core.try_lock_connection().is_some());
-                    event
-                },
-                |_| unreachable!("a pending event avoids native capture"),
-            )
-            .unwrap();
-        assert_eq!(result, Some(ReceiverEvent::SourceChanged));
     }
 
     #[test]
