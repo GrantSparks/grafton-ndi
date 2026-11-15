@@ -247,7 +247,7 @@ impl Router {
         // SAFETY: the router is live and `raw` owns the strings it points to.
         if unsafe {
             self.routing
-                .NDIlib_routing_change(self.instance.0, &raw.raw)
+                .NDIlib_routing_change(self.instance.0, raw.as_raw())
         } {
             Ok(())
         } else {

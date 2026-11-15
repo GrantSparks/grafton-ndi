@@ -412,7 +412,7 @@ pub(crate) unsafe fn decode_source(
         let Some(address) = copy(address)? else {
             return Ok(None);
         };
-        Some(SourceAddress::from_sdk_text(address))
+        Some(SourceAddress::new(address))
     };
     Ok(Some(Source { name, address }))
 }
@@ -706,7 +706,7 @@ impl Finder {
     /// # Returns
     ///
     /// Every source observed within the window, in first-observed order.
-    /// Identity includes the name and the complete address (including its variant);
+    /// Identity includes the name and the complete address text;
     /// a changed descriptor is returned as a distinct source. Network discovery
     /// cannot guarantee observation of every source. May be empty if none appear.
     ///
@@ -778,9 +778,10 @@ fn accumulate_sources(
             ));
         }
         let text_bytes = source.name.capacity()
-            + source.address.as_ref().map_or(0, |a| match a {
-                SourceAddress::Ip(text) | SourceAddress::Url(text) => text.capacity(),
-            });
+            + source
+                .address
+                .as_ref()
+                .map_or(0, |address| address.0.capacity());
         let bytes = retained_bytes
             .checked_add(text_bytes * 2)
             .ok_or_else(|| budget::limit(ResourceKind::FinderDiscoveryBytes, budget::MAX_BYTES))?;
@@ -958,27 +959,27 @@ impl HostKeyBuffer {
     }
 }
 
-/// Network address of an NDI source.
+/// Opaque network address text of an NDI source.
 ///
-/// The SDK supplies one address string. A string containing `://` is classified
-/// as a URL; other strings use the IP variant. This classification does not
-/// establish the source's codec or whether it uses NDI|HX.
+/// Equality and hashing compare the exact text the SDK receives. The derived
+/// URL classification does not establish the codec or whether it uses NDI|HX.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum SourceAddress {
-    /// A URL address. SDK address strings containing `://` use this variant.
-    Url(String),
-    /// A host or IP address, optionally with a port. SDK strings without
-    /// `://` use this variant.
-    Ip(String),
-}
+pub struct SourceAddress(String);
 
 impl SourceAddress {
-    fn from_sdk_text(address: String) -> Self {
-        if address.contains("://") {
-            Self::Url(address)
-        } else {
-            Self::Ip(address)
-        }
+    /// Keep the address text unchanged, without interpreting or validating it.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    /// The exact address text, whether it names a host, IP address or URL.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether the address contains a URL scheme separator (`://`).
+    pub fn is_url(&self) -> bool {
+        self.0.contains("://")
     }
 
     /// Check whether this address has the exact host or IP.
@@ -995,11 +996,11 @@ impl SourceAddress {
     /// ```
     /// use grafton_ndi::SourceAddress;
     ///
-    /// let addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
+    /// let addr = SourceAddress::new("192.168.1.100:5960".to_string());
     /// assert!(addr.matches_host("192.168.1.100"));
     /// assert!(!addr.matches_host("192.168.1"));
     ///
-    /// let url = SourceAddress::Url("http://camera.local:8080".to_string());
+    /// let url = SourceAddress::new("http://camera.local:8080".to_string());
     /// assert!(url.matches_host("camera.local"));
     /// ```
     pub fn matches_host(&self, host: &str) -> bool {
@@ -1026,13 +1027,13 @@ impl SourceAddress {
     /// ```
     /// use grafton_ndi::SourceAddress;
     ///
-    /// let addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
+    /// let addr = SourceAddress::new("192.168.1.100:5960".to_string());
     /// assert_eq!(addr.port(), Some(5960));
     ///
-    /// let no_port = SourceAddress::Ip("192.168.1.100".to_string());
+    /// let no_port = SourceAddress::new("192.168.1.100".to_string());
     /// assert_eq!(no_port.port(), None);
     ///
-    /// let url = SourceAddress::Url("http://camera.local:8080".to_string());
+    /// let url = SourceAddress::new("http://camera.local:8080".to_string());
     /// assert_eq!(url.port(), Some(8080));
     /// ```
     pub fn port(&self) -> Option<u16> {
@@ -1042,16 +1043,14 @@ impl SourceAddress {
     // SDK addresses are opaque. Only interpret conventional URL authorities and
     // host[:port] forms; never inspect their path, query, or fragment as a port.
     fn authority(&self) -> Option<Authority<'_>> {
-        match self {
-            Self::Ip(address) | Self::Url(address) => parse_authority(address),
-        }
+        parse_authority(self.as_str())
     }
 }
 
 /// An NDI source: its name and, when known, its network address.
 ///
-/// Equality and hashing compare the complete name and address, including the
-/// address variant; they do not imply persistent device identity.
+/// Equality and hashing compare the complete name and address text; they do
+/// not imply persistent device identity.
 ///
 /// The name typically includes the machine name and source name (e.g.,
 /// "MACHINE (Source)"). A source found by a [`Finder`] has the address it
@@ -1063,7 +1062,7 @@ impl SourceAddress {
 /// use grafton_ndi::{Source, SourceAddress};
 ///
 /// let source = Source::new("LAPTOP (Camera 1)")
-///     .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
+///     .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
 /// assert_eq!(source.name(), "LAPTOP (Camera 1)");
 /// assert_eq!(source.to_string(), "LAPTOP (Camera 1)@192.168.1.100:5960");
 /// assert!(Source::new("LAPTOP (Camera 1)").address().is_none());
@@ -1077,9 +1076,8 @@ pub struct Source {
 #[repr(C)]
 pub(crate) struct RawSource {
     _name: CString,
-    _url_address: Option<CString>,
-    _ip_address: Option<CString>,
-    pub raw: NDIlib_source_t,
+    _address: Option<CString>,
+    raw: NDIlib_source_t,
 }
 
 // SAFETY: the descriptor's pointers lead only into the strings this value
@@ -1093,19 +1091,21 @@ unsafe impl Send for RawSource {}
 // operation writes through them, so concurrent readers cannot race with mutation.
 unsafe impl Sync for RawSource {}
 
+impl RawSource {
+    /// Lend the descriptor only while its backing C strings remain owned.
+    pub(crate) fn as_raw(&self) -> &NDIlib_source_t {
+        &self.raw
+    }
+}
+
 impl Source {
-    /// Copy strings with exact reservations while preserving address variants.
+    /// Copy the name and opaque address text with exact reservations.
     fn try_copy(&self) -> Result<Self> {
         let name = budget::copy_string(&self.name)?;
         let address = self
             .address
             .as_ref()
-            .map(|address| -> Result<SourceAddress> {
-                Ok(match address {
-                    SourceAddress::Ip(text) => SourceAddress::Ip(budget::copy_string(text)?),
-                    SourceAddress::Url(text) => SourceAddress::Url(budget::copy_string(text)?),
-                })
-            })
+            .map(|address| budget::copy_string(address.as_str()).map(SourceAddress::new))
             .transpose()?;
         Ok(Self { name, address })
     }
@@ -1153,7 +1153,7 @@ impl Source {
     /// use grafton_ndi::{Source, SourceAddress};
     ///
     /// let source = Source::new("CAMERA1 (Chan1, 192.168.0.107)")
-    ///     .with_address(SourceAddress::Ip("192.168.0.107:5960".to_string()));
+    ///     .with_address(SourceAddress::new("192.168.0.107:5960".to_string()));
     ///
     /// assert!(source.matches_host("192.168.0.107"));
     /// assert!(source.matches_host("CAMERA1"));
@@ -1200,7 +1200,7 @@ impl Source {
     /// use grafton_ndi::{Source, SourceAddress};
     ///
     /// let source = Source::new("CAMERA1")
-    ///     .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
+    ///     .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
     ///
     /// assert_eq!(source.host(), Some("192.168.1.100"));
     /// ```
@@ -1259,45 +1259,23 @@ impl Source {
     pub(crate) fn to_raw(&self) -> Result<RawSource> {
         let name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
 
-        let (url_address, ip_address, __bindgen_anon_1) = match &self.address {
-            Some(SourceAddress::Url(url)) => {
-                let url_cstr = CString::new(url.clone()).map_err(Error::InvalidCString)?;
-                let p_url = url_cstr.as_ptr();
-                (
-                    Some(url_cstr),
-                    None,
-                    NDIlib_source_t__bindgen_ty_1 {
-                        p_url_address: p_url,
-                    },
-                )
-            }
-            Some(SourceAddress::Ip(ip)) => {
-                let ip_cstr = CString::new(ip.clone()).map_err(Error::InvalidCString)?;
-                let p_ip = ip_cstr.as_ptr();
-                (
-                    None,
-                    Some(ip_cstr),
-                    NDIlib_source_t__bindgen_ty_1 { p_ip_address: p_ip },
-                )
-            }
-            None => (
-                None,
-                None,
-                NDIlib_source_t__bindgen_ty_1 {
-                    p_ip_address: ptr::null(),
-                },
-            ),
-        };
-
+        let address = self
+            .address
+            .as_ref()
+            .map(|address| CString::new(address.as_str()))
+            .transpose()?;
+        let p_address = address
+            .as_ref()
+            .map_or(ptr::null(), |address| address.as_ptr());
         let p_ndi_name = name.as_ptr();
-
         Ok(RawSource {
             _name: name,
-            _url_address: url_address,
-            _ip_address: ip_address,
+            _address: address,
             raw: NDIlib_source_t {
                 p_ndi_name,
-                __bindgen_anon_1,
+                __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                    p_url_address: p_address,
+                },
             },
         })
     }
@@ -1306,9 +1284,12 @@ impl Source {
 impl Display for Source {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self.address {
-            Some(SourceAddress::Url(address) | SourceAddress::Ip(address)) => {
-                write!(f, "{name}@{address}", name = self.name)
-            }
+            Some(address) => write!(
+                f,
+                "{name}@{address}",
+                name = self.name,
+                address = address.as_str()
+            ),
             None => write!(f, "{name}", name = self.name),
         }
     }
@@ -1428,7 +1409,7 @@ impl SourceCache {
     /// A cache hit returns owned descriptor copies without an SDK call. On a
     /// miss, observes the full window using the configured finder; zero makes
     /// one non-waiting snapshot attempt. Results retain first-observed order and distinguish names,
-    /// full addresses, and address variants. Select the desired feed explicitly.
+    /// full address text. Select the desired feed explicitly.
     /// Empty results return an empty vector and are not retained.
     ///
     /// Discovery runs outside the cache lock; its window includes snapshot-lock
@@ -1752,11 +1733,10 @@ mod tests {
         ] {
             for (first, second) in [(a, b), (b, a)] {
                 let cache = CachedSources::default();
-                let old =
-                    Source::new("camera").with_address(SourceAddress::Ip("192.0.2.1:5960".into()));
+                let old = Source::new("camera").with_address(SourceAddress::new("192.0.2.1:5960"));
                 let fresh = old
                     .clone()
-                    .with_address(SourceAddress::Ip("192.0.2.1:5961".into()));
+                    .with_address(SourceAddress::new("192.0.2.1:5961"));
                 cache
                     .sources_by_host_with(first, Duration::ZERO, |_| Ok(vec![old.clone()]))
                     .unwrap();
@@ -1809,18 +1789,18 @@ mod tests {
     #[test]
     fn exact_host_matching_ignores_labels_ports_and_url_payloads() {
         let other = Source::new("CAMERA10 (192.168.1.1)")
-            .with_address(SourceAddress::Ip("192.168.1.100:5960".into()));
+            .with_address(SourceAddress::new("192.168.1.100:5960"));
         assert!(!other.matches_host("192.168.1.1"));
         assert!(!other.matches_host("5960"));
         assert!(!other.matches_host("CAMERA1"));
-        let exact = Source::new("CAMERA1 (Program)").with_address(SourceAddress::Url(
-            "http://user:pass@Camera.Local:8080/ndi?next=192.0.2.1".into(),
+        let exact = Source::new("CAMERA1 (Program)").with_address(SourceAddress::new(
+            "http://user:pass@Camera.Local:8080/ndi?next=192.0.2.1",
         ));
         assert!(exact.matches_host("camera.local."));
         assert!(exact.matches_host("camera1"));
         assert!(!exact.matches_host("192.0.2.1"));
         assert!(!exact.matches_host("Program"));
-        let ipv6 = SourceAddress::Ip("[2001:0db8:0:0:0:0:0:1]:5960".into());
+        let ipv6 = SourceAddress::new("[2001:0db8:0:0:0:0:0:1]:5960");
         assert!(ipv6.matches_host("2001:db8::1"));
         assert!(ipv6.matches_host("[2001:db8::1]"));
         for invalid in [
@@ -1847,9 +1827,9 @@ mod tests {
     fn cache_selects_exact_host_and_rejects_invalid_queries_before_discovery() {
         let cache = CachedSources::default();
         let wrong = Source::new("CAMERA10 (Program)")
-            .with_address(SourceAddress::Ip("192.168.1.100:5960".into()));
-        let right = Source::new("CAMERA1 (Program)")
-            .with_address(SourceAddress::Ip("192.168.1.1:5961".into()));
+            .with_address(SourceAddress::new("192.168.1.100:5960"));
+        let right =
+            Source::new("CAMERA1 (Program)").with_address(SourceAddress::new("192.168.1.1:5961"));
         let timeout = Duration::ZERO;
         let selected = cache
             .sources_by_host_with("192.168.1.1", timeout, |query| {
@@ -1885,9 +1865,8 @@ mod tests {
             let cache = Arc::new(CachedSources::default());
             let (started_tx, started_rx) = mpsc::channel();
             let (resume_tx, resume_rx) = mpsc::channel();
-            let old = Source::new("old").with_address(SourceAddress::Ip("192.0.2.1:5960".into()));
-            let fresh =
-                Source::new("fresh").with_address(SourceAddress::Ip("192.0.2.1:5961".into()));
+            let old = Source::new("old").with_address(SourceAddress::new("192.0.2.1:5960"));
+            let fresh = Source::new("fresh").with_address(SourceAddress::new("192.0.2.1:5961"));
             let pending = Arc::clone(&cache);
             let old_result = old.clone();
             let thread = std::thread::spawn(move || {
@@ -1957,7 +1936,7 @@ mod tests {
         let cache = CachedSources::default();
         cache.cache.lock().unwrap().generation = Some(u64::MAX);
         cache.invalidate("absent");
-        let source = Source::new("camera").with_address(SourceAddress::Ip("192.0.2.1".into()));
+        let source = Source::new("camera").with_address(SourceAddress::new("192.0.2.1"));
         assert_eq!(
             cache
                 .sources_by_host_with("192.0.2.1", Duration::ZERO, |_| Ok(vec![source.clone()]))
@@ -1995,7 +1974,7 @@ mod tests {
             ("http://camera?x=:123", "camera", None),
             ("http://user:pass@[::1]:8080/path", "::1", Some(8080)),
         ] {
-            let source = Source::new("").with_address(SourceAddress::Url(address.into()));
+            let source = Source::new("").with_address(SourceAddress::new(address));
             assert_eq!(source.host(), Some(host), "{address}");
             assert_eq!(source.address().unwrap().port(), port, "{address}");
         }
@@ -2005,14 +1984,53 @@ mod tests {
     }
 
     #[test]
-    fn discovery_accumulates_structurally_distinct_sources_in_order() {
-        let first = Source::new("Camera").with_address(SourceAddress::Ip("192.0.2.1".into()));
-        let changed = first
-            .clone()
-            .with_address(SourceAddress::Ip("192.0.2.2".into()));
-        let distinct_variant = first
-            .clone()
-            .with_address(SourceAddress::Url("192.0.2.1".into()));
+    fn configured_and_discovered_sources_share_text_identity() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let hash = |source: &Source| {
+            let mut state = DefaultHasher::new();
+            source.hash(&mut state);
+            state.finish()
+        };
+        for text in [
+            "camera.local:8080",
+            "192.0.2.1:5960",
+            "[2001:db8::1]:5960",
+            "ndi://h:1",
+            "opaque text",
+        ] {
+            let configured = Source::new("Camera").with_address(SourceAddress::new(text));
+            let raw = configured.to_raw().unwrap();
+            // SAFETY: RawSource lends its descriptor while retaining both C
+            // strings for this synchronous owned copy.
+            let discovered = unsafe { Source::try_from_raw(raw.as_raw(), "test") }.unwrap();
+            assert_eq!(configured, discovered);
+            assert_eq!(hash(&configured), hash(&discovered));
+            let address = discovered.address().unwrap();
+            assert_eq!(address.as_str(), text);
+            assert_eq!(address.is_url(), text.contains("://"));
+            // Both native union member names denote the same address pointer.
+            // SAFETY: RawSource initialized the pointer member of this union.
+            unsafe {
+                assert_eq!(
+                    raw.as_raw().__bindgen_anon_1.p_url_address,
+                    raw.as_raw().__bindgen_anon_1.p_ip_address
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(raw.as_raw().__bindgen_anon_1.p_url_address)
+                        .to_str()
+                        .unwrap(),
+                    text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_accumulates_distinct_name_and_address_text_in_order() {
+        let first = Source::new("Camera").with_address(SourceAddress::new("192.0.2.1"));
+        let changed = first.clone().with_address(SourceAddress::new("192.0.2.2"));
+        let same_address = first.clone().with_address(SourceAddress::new("192.0.2.1"));
         let mut seen = HashSet::new();
         let mut discovered = Vec::new();
         let mut bytes = 0;
@@ -2022,10 +2040,11 @@ mod tests {
             &mut discovered,
             &mut seen,
             &mut bytes,
-            vec![first.clone(), changed.clone(), distinct_variant.clone()],
+            vec![first.clone(), changed.clone(), same_address.clone()],
         )
         .unwrap();
-        assert_eq!(discovered, vec![first, changed, distinct_variant]);
+        assert_eq!(same_address, first);
+        assert_eq!(discovered, vec![first, changed]);
     }
 
     #[test]
@@ -2127,7 +2146,7 @@ mod tests {
                     drop(name);
                     drop(address);
                     assert_eq!(sources[0].name(), format!("Camera {index}"));
-                    assert!(matches!(sources[0].address(), Some(SourceAddress::Ip(ip)) if ip == &format!("192.0.2.{index}:5960")));
+                    assert!(matches!(sources[0].address(), Some(address) if address.as_str() == format!("192.0.2.{index}:5960")));
                 });
             }
         });
@@ -2179,7 +2198,7 @@ mod tests {
                 name,
                 ip,
                 Expected::Source(
-                    Source::new("Camera").with_address(SourceAddress::Ip("192.0.2.1:5960".into())),
+                    Source::new("Camera").with_address(SourceAddress::new("192.0.2.1:5960")),
                 ),
             ),
             (
@@ -2188,7 +2207,7 @@ mod tests {
                 url,
                 Expected::Source(
                     Source::new("Camera")
-                        .with_address(SourceAddress::Url("ndi://camera.local:5960".into())),
+                        .with_address(SourceAddress::new("ndi://camera.local:5960")),
                 ),
             ),
             (
@@ -2196,7 +2215,7 @@ mod tests {
                 ptr::null(),
                 ip,
                 Expected::Source(
-                    Source::new("").with_address(SourceAddress::Ip("192.0.2.1:5960".into())),
+                    Source::new("").with_address(SourceAddress::new("192.0.2.1:5960")),
                 ),
             ),
             (
@@ -2228,13 +2247,13 @@ mod tests {
                 "empty address only",
                 ptr::null(),
                 empty,
-                Expected::Source(Source::new("").with_address(SourceAddress::Ip("".into()))),
+                Expected::Source(Source::new("").with_address(SourceAddress::new(""))),
             ),
             (
                 "empty address",
                 name,
                 empty,
-                Expected::Source(Source::new("Camera").with_address(SourceAddress::Ip("".into()))),
+                Expected::Source(Source::new("Camera").with_address(SourceAddress::new(""))),
             ),
             ("unterminated address", name, malformed, Expected::Malformed),
         ];
@@ -2405,10 +2424,10 @@ mod tests {
         let source = unsafe { Source::try_from_raw(&raw, "test") }.unwrap();
         assert!(source.name().is_empty());
         assert!(
-            matches!(source.address(), Some(SourceAddress::Url(address)) if address == "ndi://127.0.0.1:5960")
+            matches!(source.address(), Some(address) if address.is_url() && address.as_str() == "ndi://127.0.0.1:5960")
         );
         let roundtrip = source.to_raw().unwrap();
-        assert!(!roundtrip.raw.p_ndi_name.is_null());
+        assert!(!roundtrip.as_raw().p_ndi_name.is_null());
     }
 
     #[test]
@@ -2429,12 +2448,9 @@ mod tests {
 
         let source = result.unwrap();
         assert_eq!(source.name(), "Test Source");
-        match source.address() {
-            Some(SourceAddress::Ip(ip_str)) => {
-                assert_eq!(ip_str, "192.168.1.100:5960");
-            }
-            _ => panic!("Expected IP address"),
-        }
+        let address = source.address().expect("an address");
+        assert_eq!(address.as_str(), "192.168.1.100:5960");
+        assert!(!address.is_url());
     }
 
     #[test]
@@ -2455,12 +2471,9 @@ mod tests {
 
         let source = result.unwrap();
         assert_eq!(source.name(), "HX Source");
-        match source.address() {
-            Some(SourceAddress::Url(url_str)) => {
-                assert_eq!(url_str, "http://camera.local:8080/ndi");
-            }
-            _ => panic!("Expected URL address"),
-        }
+        let address = source.address().expect("an address");
+        assert_eq!(address.as_str(), "http://camera.local:8080/ndi");
+        assert!(address.is_url());
     }
 
     #[test]

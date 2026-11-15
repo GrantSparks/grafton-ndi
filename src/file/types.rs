@@ -164,9 +164,7 @@ impl TryFrom<&crate::Source> for SourceSpec {
 
     fn try_from(source: &crate::Source) -> Result<Self> {
         match source.address() {
-            Some(crate::SourceAddress::Ip(address) | crate::SourceAddress::Url(address)) => {
-                Self::from_url(address)
-            }
+            Some(address) => Self::from_url(address.as_str()),
             None => Self::new(source.name()),
         }
     }
@@ -1849,12 +1847,10 @@ mod tests {
     fn discovered_sources_pin_the_complete_endpoint_without_name_precedence() {
         use crate::{Source, SourceAddress};
         for address in [
-            SourceAddress::Ip("192.0.2.10:5962".into()),
-            SourceAddress::Url("ndi://user@camera.local:5962/path?opaque=1".into()),
+            SourceAddress::new("192.0.2.10:5962"),
+            SourceAddress::new("ndi://user@camera.local:5962/path?opaque=1"),
         ] {
-            let text = match &address {
-                SourceAddress::Ip(text) | SourceAddress::Url(text) => text.as_str(),
-            };
+            let text = address.as_str();
             for name in ["STUDIO (Camera 2)", "", "diagnostic\0name"] {
                 let selected = Source::new(name).with_address(address.clone());
                 let spec = SourceSpec::try_from(&selected).unwrap();
@@ -1869,21 +1865,16 @@ mod tests {
         assert_eq!(spec.url(), None);
         let addressed = named
             .clone()
-            .with_address(SourceAddress::Ip("192.0.2.10:5962".into()));
+            .with_address(SourceAddress::new("192.0.2.10:5962"));
         let logical = SourceSpec::new(addressed.name()).unwrap();
         assert_eq!(logical.name(), Some(addressed.name()));
         assert_eq!(logical.url(), None);
         for bad in ["", "bad\0endpoint"] {
-            for address in [
-                SourceAddress::Ip(bad.into()),
-                SourceAddress::Url(bad.into()),
-            ] {
-                let selected = named.clone().with_address(address);
-                assert!(
-                    SourceSpec::try_from(&selected).is_err(),
-                    "invalid endpoint must not fall back to name"
-                );
-            }
+            let selected = named.clone().with_address(SourceAddress::new(bad));
+            assert!(
+                SourceSpec::try_from(&selected).is_err(),
+                "invalid endpoint must not fall back to name"
+            );
         }
         assert!(SourceSpec::try_from(&Source::new("")).is_err());
         assert!(matches!(

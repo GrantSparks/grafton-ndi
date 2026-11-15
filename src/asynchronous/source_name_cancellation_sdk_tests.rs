@@ -14,7 +14,7 @@ fn loopback_source(ndi: &crate::Ndi, sender: &Sender) -> Source {
     let finder = Finder::new(ndi, &FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
     let source = finder
         .find_source(Duration::from_secs(15), |source| {
-            source.name() == name && matches!(source.address(), Some(SourceAddress::Ip(_)))
+            source.name() == name && source.address().is_some_and(|address| !address.is_url())
         })
         .unwrap()
         .expect("the local sender must be discovered");
@@ -23,7 +23,7 @@ fn loopback_source(ndi: &crate::Ndi, sender: &Sender) -> Source {
         .unwrap()
         .port()
         .expect("an advertised port");
-    source.with_address(SourceAddress::Ip(format!("127.0.0.1:{port}")))
+    source.with_address(SourceAddress::new(format!("127.0.0.1:{port}")))
 }
 
 struct Publishing {

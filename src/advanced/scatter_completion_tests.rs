@@ -116,9 +116,10 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
     let source = 'found: loop {
         for source in watch.current_sources().unwrap() {
             if source.name() == name {
-                if let Some(SourceAddress::Ip(address)) = source.address() {
+                if let Some(address) = source.address().filter(|address| !address.is_url()) {
+                    let address = address.as_str();
                     let port = address.rsplit(':').next().unwrap();
-                    let endpoint = SourceAddress::Ip(format!("127.0.0.1:{port}"));
+                    let endpoint = SourceAddress::new(format!("127.0.0.1:{port}"));
                     break 'found source.with_address(endpoint);
                 }
             }

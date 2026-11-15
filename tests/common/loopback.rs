@@ -19,7 +19,7 @@ pub fn loopback_source(ndi: &Ndi, sender: &Sender) -> grafton_ndi::Result<Source
 /// their source, not themselves.
 pub fn loopback_endpoint(ndi: &Ndi, name: &str) -> grafton_ndi::Result<Source> {
     let (source, port) = advertised_endpoint(ndi, name)?;
-    let loopback = SourceAddress::Ip(format!("{}:{port}", Ipv4Addr::LOCALHOST));
+    let loopback = SourceAddress::new(format!("{}:{port}", Ipv4Addr::LOCALHOST));
     Ok(source.with_address(loopback))
 }
 
@@ -43,7 +43,8 @@ pub fn advertised_endpoint_by(finder: &Finder, name: &str) -> grafton_ndi::Resul
     loop {
         for source in watch.current_sources()? {
             if source.name() == name {
-                if let Some(SourceAddress::Ip(address)) = source.address() {
+                if let Some(address) = source.address().filter(|address| !address.is_url()) {
+                    let address = address.as_str();
                     let port = address
                         .rsplit(':')
                         .next()

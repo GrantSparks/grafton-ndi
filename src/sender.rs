@@ -2216,7 +2216,7 @@ impl<M: SenderMode> Sender<M> {
         unsafe {
             self.inner
                 .core
-                .NDIlib_send_set_failover(self.inner.instance.0, &raw_source.raw)
+                .NDIlib_send_set_failover(self.inner.instance.0, raw_source.as_raw())
         }
         Ok(())
     }

@@ -141,7 +141,7 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
         );
         assert_eq!(
             selected.address(),
-            Some(&SourceAddress::Ip("192.0.2.10:5962".into()))
+            Some(&SourceAddress::new("192.0.2.10:5962"))
         );
         assert!(studio
             .find_source_by_name("camera 2", Duration::ZERO)
@@ -162,7 +162,7 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
             Err(Error::InvalidInput(_))
         ));
         // Reentrant snapshots prove predicates run after releasing the SDK snapshot lock.
-        let target = SourceAddress::Ip("192.0.2.10:5962".into());
+        let target = SourceAddress::new("192.0.2.10:5962");
         let program = studio
             .find_source(Duration::ZERO, |source| {
                 assert!(!studio.current_sources().unwrap().is_empty());

@@ -765,7 +765,7 @@ impl ValidatedReceiveOptions<'_> {
         let source = self.options.source.to_raw()?;
         let name = self.options.name.as_deref().map(CString::new).transpose()?;
         let p_ndi_recv_name = name.as_ref().map_or(ptr::null(), |n| n.as_ptr());
-        let source_raw = source.raw;
+        let source_raw = *source.as_raw();
         Ok(RawRecvCreateV3 {
             raw: NDIlib_recv_create_v3_t {
                 source_to_connect_to: source_raw,
@@ -1644,7 +1644,7 @@ impl ReceiverCore {
         source: Option<&RawSource>,
         _exclusive: &RwLockWriteGuard<'_, ConnectionTarget>,
     ) {
-        let source = source.map_or(ptr::null(), |raw| ptr::from_ref(&raw.raw));
+        let source = source.map_or(ptr::null(), |raw| ptr::from_ref(raw.as_raw()));
         // SAFETY: the receiver instance is live for this borrow. `source` is
         // null or points into a `RawSource`, which owns the strings its
         // descriptor points to and outlives this synchronous call, during
@@ -2872,9 +2872,8 @@ mod tests {
         for source in [
             Source::new("retained name"),
             Source::new("retained URL")
-                .with_address(crate::SourceAddress::Url("ndi://127.0.0.1:5961".into())),
-            Source::new("retained IP")
-                .with_address(crate::SourceAddress::Ip("127.0.0.1:5961".into())),
+                .with_address(crate::SourceAddress::new("ndi://127.0.0.1:5961")),
+            Source::new("retained IP").with_address(crate::SourceAddress::new("127.0.0.1:5961")),
         ] {
             let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source.clone())).unwrap();
             let ((), allocations) = crate::test_alloc::allocation_count(|| receiver.reconnect());

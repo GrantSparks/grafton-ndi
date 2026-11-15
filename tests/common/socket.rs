@@ -1,14 +1,12 @@
 //! Diagnostics for a receiver that could not connect to its sender.
 
-use grafton_ndi::{Source, SourceAddress};
+use grafton_ndi::Source;
 
 /// The port of an endpoint that names an IP address and port, such as those
 /// [`loopback_endpoint`] returns.
 pub fn port_of(source: &Source) -> Option<u16> {
-    match source.address()? {
-        SourceAddress::Ip(address) => address.rsplit(':').next()?.parse().ok(),
-        _ => None,
-    }
+    let address = source.address()?;
+    (!address.is_url()).then(|| address.port()).flatten()
 }
 
 /// What the operating system's TCP table holds for `port`, for the message of

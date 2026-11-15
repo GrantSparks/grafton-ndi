@@ -81,7 +81,7 @@ fn serve() {
     )
     .unwrap();
     let source = common::loopback_source(&ndi, &sender).unwrap();
-    let Some(SourceAddress::Ip(address)) = source.address() else {
+    let Some(address) = source.address().filter(|address| !address.is_url()) else {
         panic!("no loopback endpoint")
     };
     // Native diagnostics need not be UTF-8. Exercise the same pipe before our
@@ -89,7 +89,7 @@ fn serve() {
     std::io::stdout()
         .write_all(b"\xffnative diagnostic\n")
         .unwrap();
-    println!("GRAFTON_PEER_READY {address} {}", source.name());
+    println!("GRAFTON_PEER_READY {} {}", address.as_str(), source.name());
     let video = VideoFrame::builder()
         .resolution(64, 32)
         .frame_rate(FrameRate::new(30, 1).unwrap())
@@ -196,7 +196,7 @@ fn different_sdk_versions_exchange_video_audio_and_metadata() {
     let receiver = Receiver::new(
         &ndi,
         &ReceiverOptions::new(
-            Source::new(name.to_owned()).with_address(SourceAddress::Ip(address.to_owned())),
+            Source::new(name.to_owned()).with_address(SourceAddress::new(address.to_owned())),
         )
         .color_format(ReceiverColorFormat::BgrxBgra),
     )

@@ -28,7 +28,9 @@ waits, including when polling with a zero timeout.
 A zero timeout makes one non-waiting attempt, which can miss a busy snapshot
 lock. Native snapshot work, copying and caller predicates can finish after the
 budget. `current_sources()` uses ordinary blocking serialization. Discovery
-cannot guarantee continued availability or observation of every source.
+cannot guarantee continued availability or observation of every source. Source
+identity compares the name and opaque address text. Construct addresses with
+`SourceAddress::new(text)`; inspect `as_str()` or the derived `is_url()` test.
 
 Snapshots and accumulated results have bounded, fallible allocations.
 `Error::ResourceLimit` identifies the resource and units through `ResourceKind`.

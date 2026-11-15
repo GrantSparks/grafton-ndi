@@ -2861,8 +2861,8 @@ mod tests {
         use crate::{Source, SourceAddress};
         let device = mock::Recorder::new(Closing::AtStop);
         let installed = Arc::clone(&device);
-        let selected = Source::new("STUDIO (Camera 2)")
-            .with_address(SourceAddress::Ip("192.0.2.10:5962".into()));
+        let selected =
+            Source::new("STUDIO (Camera 2)").with_address(SourceAddress::new("192.0.2.10:5962"));
         let options = RecorderOptions::new(SourceSpec::try_from(&selected).unwrap());
         let recorder = block_on(spawn_owner(
             "file-endpoint-copy",
@@ -2879,7 +2879,7 @@ mod tests {
         drop(selected);
         let command = {
             let selected = Source::new("STUDIO (Program)")
-                .with_address(SourceAddress::Url("ndi://camera.local:5963/path".into()));
+                .with_address(SourceAddress::new("ndi://camera.local:5963/path"));
             let source = SourceSpec::try_from(&selected).unwrap();
             recorder.set_source(&source)
         };

@@ -874,7 +874,7 @@ impl Genlock {
             // strings that this value keeps alive for as long as the genlock.
             let handle = unsafe {
                 table.NDIlib_genlock_create(
-                    source.as_ref().map_or(ptr::null(), |source| &source.raw),
+                    source.as_ref().map_or(ptr::null(), |source| source.as_raw()),
                     _config.map_or(ptr::null(), AdvancedConfig::as_ptr),
                 )
             };
@@ -914,7 +914,7 @@ impl Genlock {
             unsafe {
                 table.NDIlib_genlock_connect(
                     handle,
-                    _source.as_ref().map_or(ptr::null(), |source| &source.raw),
+                    _source.as_ref().map_or(ptr::null(), |source| source.as_raw()),
                 )
             };
             self.resource._source = _source;
