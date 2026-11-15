@@ -75,7 +75,7 @@ impl Released<'_> {
 
 impl DescriptorSlots {
     #[cfg(any(test, ndi_has_advanced_send_completion, ndi_has_advanced_scatter_send))]
-    pub(super) fn new(len: usize) -> Result<Vec<SlotKey>> {
+    pub(super) fn allocate_keys(len: usize) -> Result<Vec<SlotKey>> {
         let mut storage = Vec::new();
         storage.try_reserve_exact(len).map_err(unavailable)?;
         storage.resize_with(len, || Slot {
@@ -96,7 +96,7 @@ impl DescriptorSlots {
     }
 
     fn slot(&self, index: usize) -> *mut Slot {
-        // SAFETY: only new creates indices, within the allocated array, and
+        // SAFETY: only allocate_keys creates indices, within the allocated array, and
         // no reference to this slot or other live slots is formed.
         unsafe { self.storage.as_ptr().cast::<Slot>().cast_mut().add(index) }
     }
@@ -284,7 +284,7 @@ mod send_slots;
 
     #[test]
     fn every_key_initializes_a_disjoint_reserved_header_without_allocating() {
-        let keys = DescriptorSlots::new(4).unwrap();
+        let keys = DescriptorSlots::allocate_keys(4).unwrap();
         let (pointers, count) = crate::test_alloc::allocation_count(|| {
             let mut pointers = [std::ptr::null(); 4];
             for (index, key) in keys.into_iter().enumerate() {

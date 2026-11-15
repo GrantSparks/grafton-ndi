@@ -41,7 +41,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
     let reported = Box::new(Completions(Mutex::new(Vec::with_capacity(33))));
     let mut frames = Vec::with_capacity(33);
     let mut expected = Vec::with_capacity(33);
-    let mut keys = super::super::send_slots::DescriptorSlots::new(33).unwrap();
+    let mut keys = super::super::send_slots::DescriptorSlots::allocate_keys(33).unwrap();
     let sender: Sender<CompressedAttached> = Sender::open(
         &ndi,
         &SenderOptions::new(crate::test_support::unique_name("scatter-completion-key"))

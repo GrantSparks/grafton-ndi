@@ -605,7 +605,7 @@ struct PendingStreams {
 impl PendingStreams {
     fn new() -> Result<Self> {
         #[cfg(ndi_has_advanced_scatter_send)]
-        let mut keys = super::send_slots::DescriptorSlots::new(4)?;
+        let mut keys = super::send_slots::DescriptorSlots::allocate_keys(4)?;
         Ok(Self {
             program: InFlight::default(),
             preview: InFlight::default(),
@@ -1398,7 +1398,7 @@ mod tests {
         let frame = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
         let pointers = frame.storage.pointers.0.as_ptr().cast::<*const u8>();
         let sizes = frame.storage.sizes.as_ptr().cast::<i32>();
-        let mut keys = super::super::send_slots::DescriptorSlots::new(1).unwrap();
+        let mut keys = super::super::send_slots::DescriptorSlots::allocate_keys(1).unwrap();
         let mut slot = keys.pop().unwrap().claim();
         let (mut pending, allocations) = crate::test_alloc::allocation_count(|| {
             PendingVideo::scatter_in(frame, table, &mut slot)

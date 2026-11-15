@@ -544,7 +544,7 @@ impl CallbackState {
         rehash
             .try_reserve_exact(options.frames)
             .map_err(unavailable)?;
-        let free = DescriptorSlots::new(options.frames)?;
+        let free = DescriptorSlots::allocate_keys(options.frames)?;
         let state = Box::new(Self {
             max_bytes: options.bytes,
             state: Mutex::new(State {
