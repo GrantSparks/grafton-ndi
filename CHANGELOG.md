@@ -195,6 +195,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   the old policy's destructor blocks.
 - Cancelling an async File creation whose handle has not reached the caller
   requests cleanup without joining its owner thread, even after delivery.
+- Audio and metadata frame implementations supply only validated accessors;
+  shared views, copies and native descriptors cannot be overridden. Packed
+  audio copies derive and check their own layout. Failed packed-copy checks
+  leave reused video and audio destinations valid after unwinding.
 - Every image encode into a writer flushes on success and preserves the first
   writer error, including final JPEG and WebP writes from an owned `BufWriter`.
 - Custom receive buffers use the same stride validation as their requests.

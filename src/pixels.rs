@@ -86,16 +86,39 @@ impl Pixels {
             // Free the old allocation before making the new one.
             self.bytes = Vec::new();
             self.bytes.reserve_exact(len + tail);
+            self.tail = 0;
         }
-        self.bytes.clear();
-        write(&mut self.bytes);
+        struct Restore<'a> {
+            pixels: &'a mut Pixels,
+            len: usize,
+            tail: usize,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                // Filling only appends; the previous length and room still
+                // fit. Reinitialize any samples the failed fill did not write.
+                self.pixels.bytes.resize(self.len, 0);
+                seal(&mut self.pixels.bytes, self.tail);
+                self.pixels.tail = self.tail;
+            }
+        }
+        let len_before = self.bytes.len();
+        let tail_before = self.tail;
+        let restore = Restore {
+            pixels: self,
+            len: len_before,
+            tail: tail_before,
+        };
+        restore.pixels.bytes.clear();
+        write(&mut restore.pixels.bytes);
         assert_eq!(
-            self.bytes.len(),
+            restore.pixels.bytes.len(),
             len,
             "packed copy must initialize its complete layout"
         );
-        seal(&mut self.bytes, tail);
-        self.tail = tail;
+        seal(&mut restore.pixels.bytes, tail);
+        restore.pixels.tail = tail;
+        std::mem::forget(restore);
     }
 
     /// Recover pixels without shrinking their allocation or exposing tail bytes.
@@ -225,10 +248,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "packed copy must initialize its complete layout")]
     fn an_incomplete_packed_fill_is_refused_in_every_build() {
-        let mut pixels = Pixels::with_room(8, 64);
-        pixels.fill(8, 64, |bytes| bytes.extend_from_slice(&[7; 7]));
+        let mut pixels = Pixels::zeroed(8, 64);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pixels.fill(8, 64, |bytes| bytes.extend_from_slice(&[7; 7]));
+        }));
+        assert!(result.is_err());
+        assert_eq!(pixels.len(), 8);
+        assert_eq!(pixels.room(), [0; 64]);
     }
 
     #[test]

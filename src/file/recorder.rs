@@ -15,6 +15,7 @@ use super::{
     RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec, StateError,
 };
 use crate::{
+    frames::MetadataPartsExt,
     sys::{self, bindings::*},
     timeout::Deadline,
     Error, MediaTypes, MetadataSource, Result,

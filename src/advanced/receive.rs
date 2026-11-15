@@ -442,7 +442,7 @@ mod tests {
     use crate::{
         advanced::{EnvelopeCodec, PacketEnvelope, VideoPacketFormat},
         capture::{Delivered, Notification},
-        frames::PixelFormat,
+        frames::{AudioPartsExt, MetadataPartsExt, PixelFormat},
         receiver::native_capture_calls,
         Error, Timecode,
     };
@@ -583,7 +583,7 @@ mod tests {
         for (index, sample) in source.data_mut().iter_mut().enumerate() {
             *sample = index as f32;
         }
-        let (event, releases) = deliver::<AudioKind>(source.to_raw(), audio_event);
+        let (event, releases) = deliver::<AudioKind>(source.audio_descriptor(), audio_event);
         assert_eq!(releases, 1);
         let PacketItem::Audio(ReceivedAudio::Decoded(frame)) = event.unwrap() else {
             panic!("uncompressed audio is decoded");
@@ -594,11 +594,11 @@ mod tests {
 
         let no_samples = NDIlib_audio_frame_v3_t {
             p_data: ptr::null_mut(),
-            ..source.to_raw()
+            ..source.audio_descriptor()
         };
         let bad_metadata = NDIlib_audio_frame_v3_t {
             p_metadata: NOT_UTF8.as_ptr().cast(),
-            ..source.to_raw()
+            ..source.audio_descriptor()
         };
         let (event, releases) = deliver::<AudioKind>(bad_metadata, audio_event);
         let PacketItem::Audio(ReceivedAudio::Decoded(frame)) = event.unwrap() else {
@@ -633,7 +633,7 @@ mod tests {
         let source = MetadataFrame::new("<tally/>")
             .unwrap()
             .with_timecode(Timecode::from_ticks(31));
-        let (event, releases) = deliver::<MetadataKind>(source.to_raw(), metadata_event);
+        let (event, releases) = deliver::<MetadataKind>(source.metadata_raw(), metadata_event);
         assert_eq!(releases, 1);
         let PacketItem::Metadata(frame) = event.unwrap() else {
             panic!("metadata is copied");

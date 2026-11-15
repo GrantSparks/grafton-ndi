@@ -53,6 +53,7 @@ use crate::{
         Delivered, Media, MetadataKind, NoSlots, Notification, SlotSet, VideoKind,
     },
     finder::{RawSource, Source},
+    frames::MetadataPartsExt,
     sys::{self, bindings::*},
     timeout::{self, Deadline},
     AudioFrame, AudioFrameRef, Error, MetadataFrame, MetadataFrameRef, MetadataSource, Ndi, Result,
@@ -3693,14 +3694,14 @@ mod tests {
         let frame = MetadataFrame::new("<ndi_text>é</ndi_text>")
             .unwrap()
             .with_timecode(crate::Timecode::from_ticks(42));
-        let pointer = frame.to_raw().p_data;
+        let pointer = frame.metadata_raw().p_data;
         for _ in 0..3 {
             let sent = receiver.send_metadata(&frame);
             assert!(
                 matches!(sent, Ok(()) | Err(Error::NotConnected)),
                 "{sent:?}"
             );
-            assert_eq!(frame.to_raw().p_data, pointer);
+            assert_eq!(frame.metadata_raw().p_data, pointer);
         }
     }
 

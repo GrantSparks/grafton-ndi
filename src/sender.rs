@@ -14,6 +14,7 @@ use std::{
 
 use crate::{
     finder::Source,
+    frames::{AudioPartsExt, MetadataPartsExt},
     frames::{
         AudioSource, FrameMetadataRef, MetadataFrame, MetadataSource, MetadataText, PixelFormat,
         ScanType, Sendable, ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts, VideoSource,
@@ -2607,10 +2608,10 @@ mod tests {
         let frame = MetadataFrame::new("<ndi_text>é</ndi_text>")
             .unwrap()
             .with_timecode(Timecode::from_ticks(42));
-        let expected_ptr = frame.to_raw().p_data;
+        let expected_ptr = frame.metadata_raw().p_data;
         for _ in 0..3 {
             sender.send_metadata(&frame);
-            assert_eq!(frame.to_raw().p_data, expected_ptr);
+            assert_eq!(frame.metadata_raw().p_data, expected_ptr);
         }
         sender.add_connection_metadata(&frame);
         sender.clear_connection_metadata();

@@ -19,7 +19,7 @@ use crate::{
 
 use super::descriptors;
 #[cfg(any(test, ndi_has_advanced_av_sync))]
-use crate::frames::{AudioParts, ReturnedAudio, ValidatedAudio};
+use crate::frames::{AudioPartsExt, ReturnedAudio, ValidatedAudio};
 #[cfg(ndi_has_advanced_av_sync)]
 use crate::sys::advanced::AvSyncHandle;
 #[cfg(ndi_has_advanced_genlock)]

@@ -6,6 +6,7 @@
 //! descriptors, which have no metadata or timestamp fields.
 
 use crate::{
+    frames::AudioPartsExt,
     frames::{AudioSource, ValidatedAudioLayout},
     sender::AudioSendMode,
     sys::{self, bindings::*},
@@ -252,7 +253,7 @@ macro_rules! conversions {
         pub fn $into_method(&self, source: &$input<'_>, destination: &mut AudioFrame) -> Result<()> {
             source.shape.check_planar(destination)?;
             let source = source.raw();
-            let mut raw = destination.to_raw();
+            let mut raw = destination.audio_descriptor();
             raw.p_data = destination.data_mut().as_mut_ptr().cast();
             // SAFETY: Source and destination have matching checked dimensions;
             // the exclusively borrowed output is initialized and correctly aligned.
@@ -357,7 +358,6 @@ impl<M: AudioSendMode> Sender<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::AudioParts;
 
     #[test]
     fn captured_audio_sources_lend_the_original_strided_descriptor() {

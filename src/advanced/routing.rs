@@ -20,6 +20,7 @@ impl Router {
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, _metadata: &S) -> Result<()> {
         let table = self.runtime().table::<RouterConnectionMetadata>()?;
         native!(RouterConnectionMetadata, table => {
+            use crate::frames::MetadataPartsExt;
             let router = self.native_instance();
             let metadata = _metadata.metadata_raw();
             // SAFETY: the router is live for this borrow, and the descriptor
@@ -38,6 +39,7 @@ impl Router {
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.runtime().table::<RouterConnectionMetadata>()?;
         native!(RouterConnectionMetadata, table => {
+            use crate::frames::MetadataPartsExt;
             let router = self.native_instance();
             // SAFETY: the router is live for this borrow.
             unsafe { table.NDIlib_routing_clear_connection_metadata(router) };
