@@ -1069,10 +1069,7 @@ impl RecorderOwner {
         events: &EventQueue<RecorderEvent>,
     ) -> Result<u64> {
         self.recorder
-            .start_with_sink(target, timecode, &mut |event| {
-                events.push(event);
-                Ok(())
-            })
+            .start_with_sink(target, timecode, &mut |event| events.push(event))
     }
 
     fn reset(&mut self, options: &RecorderOptions) -> Result<RecordingReport> {
@@ -3380,14 +3377,55 @@ mod tests {
         assert!(recorder
             .start(&target, RecordingTimecode::Preserve)
             .is_err());
+        device.push(mock::OPEN_FAILED, "another-old-event.mkv");
+        device.oversize_next_event.store(true, Ordering::Release);
         let mut owner = RecorderOwner::new(recorder);
         let events = EventQueue::new(16);
         owner
             .start_notifying(&target, RecordingTimecode::Preserve, &events)
             .unwrap();
-        let event = lock(&events.0).queue.pop_front().unwrap().unwrap();
+        let mut notifications = lock(&events.0);
+        assert!(matches!(
+            notifications.queue.pop_front().unwrap(),
+            Err(Error::UnexpectedSdkResult(_))
+        ));
+        let event = notifications.queue.pop_front().unwrap().unwrap();
         assert_eq!(event.kind(), super::super::RecorderEventKind::OpenFailed);
         assert_eq!(owner.recorder.report().error_events(), 0);
+    }
+
+    #[test]
+    fn unreadable_stale_captures_refuse_both_start_paths_at_the_same_limit() {
+        for asynchronous in [false, true] {
+            let device = mock::Recorder::new(Closing::AtStop);
+            device.install();
+            let mut recorder = mock::recorder_api()
+                .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
+                .unwrap();
+            let target =
+                RecordingTarget::new(std::env::temp_dir().join("mock-undrainable-stale-events"))
+                    .unwrap();
+            device.oversize_every_event.store(true, Ordering::Release);
+            let result = if asynchronous {
+                RecorderOwner::new(recorder).start_notifying(
+                    &target,
+                    RecordingTimecode::Preserve,
+                    &EventQueue::new(16),
+                )
+            } else {
+                recorder.start(&target, RecordingTimecode::Preserve)
+            };
+            assert!(matches!(
+                result,
+                Err(Error::InvalidState(StateError::EarlierSessionEvents))
+            ));
+            assert_eq!(device.starts.load(Ordering::Acquire), 0);
+            assert_eq!(
+                device.captures.load(Ordering::Acquire),
+                super::super::recorder::STALE_EVENT_LIMIT
+            );
+            device.oversize_every_event.store(false, Ordering::Release);
+        }
     }
 
     #[test]

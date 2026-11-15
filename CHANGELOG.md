@@ -190,6 +190,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Performance and correctness
 
+- Synchronous and async recorder starts both consume unreadable stale events;
+  only a queue that fails to drain refuses the next session.
 - Receive allocator replacement installs the new native callbacks before
   retiring the old policy, avoiding dropped frames while the setter runs or
   the old policy's destructor blocks.
