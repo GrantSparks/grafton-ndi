@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{
     frames::Sendable,
-    sender::in_flight::{Destroyed, Lend, Lending, Lent, Loans},
+    sender::in_flight::{Destroyed, Lend, Lending, Lent, LoanPair, Loans},
     sys::{
         advanced::{native, ScatterSend, SendCompletion},
         bindings::*,
@@ -811,10 +811,10 @@ impl QueuedSender {
     ///
     /// Only the video half submits video, and it is neither `Sync` nor `Clone`.
     pub fn split(&mut self) -> (QueuedVideo<'_>, &Sender<QueueAttached>) {
-        let sender = self.lending.sender();
+        let pair = self.lending.parts().shared();
+        let sender = pair.sender();
         let video = QueuedVideo {
-            sender,
-            callback: self.lending.loans(),
+            pair,
             _not_sync: std::marker::PhantomData,
         };
         (video, sender)
@@ -917,8 +917,7 @@ impl QueuedSender {
 /// metadata or controls. It is `Send`, but neither `Sync` nor `Clone`, and
 /// cannot outlive its owner. Dropping it leaves pending frames with the owner.
 pub struct QueuedVideo<'a> {
-    sender: &'a Sender<QueueAttached>,
-    callback: &'a CallbackState,
+    pair: LoanPair<'a, QueueAttached, &'a AliasableBox<CallbackState>>,
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
@@ -932,42 +931,45 @@ impl QueuedVideo<'_> {
         &mut self,
         frame: impl Into<QueuedVideoFrame>,
     ) -> std::result::Result<SubmissionId, Rejected<QueuedVideoFrame>> {
-        let frame = frame.into();
-        let failure = Rejected::new;
-        let bytes = frame.retained_bytes();
-        let frame = frame.authorize(self.sender)?;
-        if let Err(error) = self.callback.validate_frame_size(bytes) {
-            return Err(failure(error, frame.into_frame()));
-        }
-        if self.callback.protocol_error.load(Ordering::Acquire) {
-            return Err(failure(
-                Error::UnexpectedSdkResult(
-                    "native completion protocol failed; use QueuedSender::close to recover retained frames".into(),
-                ),
-                frame.into_frame(),
-            ));
-        }
-        let admitted = {
-            let mut state = self
-                .callback
-                .state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            state.admit(frame, bytes)?
-        };
-        // The entry is recorded and the lock released before dispatch because
-        // the SDK may complete this submission before the native call returns.
-        // SAFETY: the live sender owns this queue; admission retained the stable
-        // descriptor and all pointees until native completion or destruction.
-        unsafe { admitted.lent.submit(self.sender.handle(), admitted.pointer) };
-        let id = admitted.id;
-        Ok(id)
+        let owner = self.pair.sender();
+        self.pair.with(|callback, sender| {
+            let frame = frame.into();
+            let failure = Rejected::new;
+            let bytes = frame.retained_bytes();
+            let frame = frame.authorize(owner)?;
+            if let Err(error) = callback.validate_frame_size(bytes) {
+                return Err(failure(error, frame.into_frame()));
+            }
+            if callback.protocol_error.load(Ordering::Acquire) {
+                return Err(failure(
+                    Error::UnexpectedSdkResult(
+                        "native completion protocol failed; use QueuedSender::close to recover retained frames".into(),
+                    ),
+                    frame.into_frame(),
+                ));
+            }
+            let admitted = {
+                let mut state = callback
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                state.admit(frame, bytes)?
+            };
+            // The entry is recorded and the lock released before dispatch because
+            // the SDK may complete this submission before the native call returns.
+            // SAFETY: the live sender owns this queue; admission retained the stable
+            // descriptor and all pointees until native completion or destruction.
+            unsafe { admitted.lent.submit(sender, admitted.pointer) };
+            let id = admitted.id;
+            Ok(id)
+        })
     }
 
     /// See [`QueuedSender::try_take_completed`].
     pub fn try_take_completed(&mut self) -> Option<CompletedVideo> {
         let mut state = self
-            .callback
+            .pair
+            .loans()
             .state
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -982,7 +984,8 @@ impl QueuedVideo<'_> {
     pub fn wait_completed(&mut self, timeout: Duration) -> Result<Option<CompletedVideo>> {
         let deadline = Deadline::after(timeout)?;
         let mut state = self
-            .callback
+            .pair
+            .loans()
             .state
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -990,7 +993,7 @@ impl QueuedVideo<'_> {
             if let Some(frame) = take_completed(&mut state) {
                 return Ok(Some(frame));
             }
-            if self.callback.protocol_error.load(Ordering::Acquire) {
+            if self.pair.loans().protocol_error.load(Ordering::Acquire) {
                 return Err(Error::UnexpectedSdkResult(
                     "native completion protocol failed; use QueuedSender::close to recover retained frames".into(),
                 ));
@@ -1000,7 +1003,8 @@ impl QueuedVideo<'_> {
                 return Ok(None);
             }
             let (next, _) = self
-                .callback
+                .pair
+                .loans()
                 .changed
                 .wait_timeout(state, remaining)
                 .unwrap_or_else(|p| p.into_inner());
@@ -1010,12 +1014,12 @@ impl QueuedVideo<'_> {
 
     /// See [`QueuedSender::retained_frames`].
     pub fn retained_frames(&self) -> usize {
-        self.callback.retained_frames()
+        self.pair.loans().retained_frames()
     }
 
     /// See [`QueuedSender::completion_protocol_failed`].
     pub fn completion_protocol_failed(&self) -> bool {
-        self.callback.completion_protocol_failed()
+        self.pair.loans().completion_protocol_failed()
     }
 }
 

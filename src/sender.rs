@@ -570,8 +570,11 @@ pub(crate) mod in_flight {
         pub(crate) fn loans(&self) -> &L {
             &self.loans
         }
-        pub(crate) fn parts(&mut self) -> (&super::Sender<M>, &mut L) {
-            (&self.sender, &mut self.loans)
+        pub(crate) fn parts(&mut self) -> LoanPair<'_, M, &mut L> {
+            LoanPair {
+                sender: &self.sender,
+                loans: &mut self.loans,
+            }
         }
 
         pub(crate) fn close<R>(self, release: impl FnOnce(L, &Destroyed) -> R) -> R {
@@ -583,6 +586,41 @@ pub(crate) mod in_flight {
             // SAFETY: sender destruction returned, and this field is taken once.
             let loans = unsafe { mem::ManuallyDrop::take(&mut this.loans) };
             release(loans, &destroyed)
+        }
+    }
+
+    /// A loan view paired by its owner with that owner's live sender.
+    /// Neither field can be supplied independently by a synchronizing caller.
+    #[cfg(feature = "advanced")]
+    pub(crate) struct LoanPair<'a, M: super::SenderMode, L> {
+        sender: &'a super::Sender<M>,
+        loans: L,
+    }
+
+    #[cfg(feature = "advanced")]
+    impl<'a, M: super::SenderMode, L> LoanPair<'a, M, L> {
+        pub(crate) fn sender(&self) -> &'a super::Sender<M> {
+            self.sender
+        }
+
+        pub(crate) fn loans(&self) -> &L {
+            &self.loans
+        }
+
+        /// Obtain the handle from the same owner that lent this loan view.
+        pub(crate) fn with<R>(&mut self, operation: impl FnOnce(&mut L, SendHandle<'a>) -> R) -> R {
+            operation(&mut self.loans, self.sender.handle())
+        }
+    }
+
+    #[cfg(feature = "advanced")]
+    impl<'a, M: super::SenderMode, L> LoanPair<'a, M, &'a mut L> {
+        /// Queues synchronize their own shared callback state internally.
+        pub(crate) fn shared(self) -> LoanPair<'a, M, &'a L> {
+            LoanPair {
+                sender: self.sender,
+                loans: self.loans,
+            }
         }
     }
 

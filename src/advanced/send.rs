@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     sender::{
-        in_flight::{Destroyed, InFlight, Lend, Lending, Lent, Loans},
+        in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans},
         SendHandle,
     },
     sys::{
@@ -854,11 +854,11 @@ impl CompressedSender {
     /// Video keeps exclusive access to the pending streams. Each half is
     /// `Send`, but neither `Sync` nor `Clone`, and neither outlives this owner.
     pub fn split(&mut self) -> (CompressedVideo<'_>, CompressedAudio<'_>) {
-        let (sender, pending) = self.lending.parts();
+        let pair = self.lending.parts();
+        let sender = pair.sender();
         (
             CompressedVideo {
-                sender,
-                pending,
+                pair,
                 _not_sync: std::marker::PhantomData,
             },
             CompressedAudio {
@@ -962,8 +962,7 @@ impl CompressedSender {
 /// It is `Send`, but neither `Sync` nor `Clone`. Pending frames stay with the
 /// owner when the view is dropped; closing or dropping the owner drains them.
 pub struct CompressedVideo<'a> {
-    sender: &'a Sender<CompressedAttached>,
-    pending: &'a mut PendingStreams,
+    pair: LoanPair<'a, CompressedAttached, &'a mut PendingStreams>,
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
@@ -978,7 +977,7 @@ pub struct CompressedAudio<'a> {
 
 impl CompressedVideo<'_> {
     fn instance(&self) -> NDIlib_send_instance_t {
-        self.sender.native_instance()
+        self.pair.sender().native_instance()
     }
 
     /// See [`CompressedSender::send_video`].
@@ -992,7 +991,8 @@ impl CompressedVideo<'_> {
         // SAFETY: the sender is live, and the descriptor lends `frame`, which
         // is borrowed exclusively for longer than this synchronous call.
         unsafe {
-            self.sender
+            self.pair
+                .sender()
                 .core()
                 .NDIlib_send_send_video_v2(self.instance(), &descriptor)
         };
@@ -1012,8 +1012,8 @@ impl CompressedVideo<'_> {
             return Err(Rejected::new(error, frame));
         }
         Ok(self
-            .pending
-            .submit(self.sender.handle(), PendingVideo::Contiguous(frame)))
+            .pair
+            .with(|pending, sender| pending.submit(sender, PendingVideo::Contiguous(frame))))
     }
 
     /// See [`CompressedSender::send_scatter_video`].
@@ -1022,7 +1022,7 @@ impl CompressedVideo<'_> {
     ///
     /// As for [`CompressedSender::send_scatter_video`].
     pub fn send_scatter_video(&mut self, _frame: &mut ScatterVideoFrame) -> Result<()> {
-        let table = self.sender.runtime().table::<ScatterSend>()?;
+        let table = self.pair.sender().runtime().table::<ScatterSend>()?;
         native!(ScatterSend, table => {
             let descriptor = _frame.descriptor();
             let scatter = _frame.storage.descriptor(table);
@@ -1044,12 +1044,12 @@ impl CompressedVideo<'_> {
         &mut self,
         frame: ScatterVideoFrame,
     ) -> std::result::Result<Option<SubmittedVideo>, Rejected<ScatterVideoFrame>> {
-        let table = match self.sender.runtime().table::<ScatterSend>() {
+        let table = match self.pair.sender().runtime().table::<ScatterSend>() {
             Ok(table) => table,
             Err(error) => return Err(Rejected::new(error, frame)),
         };
         native!(ScatterSend, table => {
-            Ok(self.pending.submit_scatter(self.sender.handle(), frame, table))
+            Ok(self.pair.with(|pending, sender| pending.submit_scatter(sender, frame, table)))
         })
     }
 }
