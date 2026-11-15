@@ -488,10 +488,15 @@ impl Finder {
         if instance.is_null() {
             return Err(Error::NativeOperationFailed { operation });
         }
+        let changes = ChangeFeed::default();
+        // Some standard-library mutexes allocate their native backing on the
+        // first lock. Initialize it during successful construction, so even
+        // the first watch can read its generation without allocating.
+        let _ = changes.generation();
         Ok(Self {
             instance: FindInstance(instance),
             sources_lock: parking_lot::Mutex::new(FindInstance(instance)),
-            changes: ChangeFeed::default(),
+            changes,
             _groups: groups,
             _extra_ips: extra_ips,
             #[cfg(feature = "advanced")]
@@ -1638,6 +1643,20 @@ mod tests {
                 |_| panic!("stale discovery must not allocate a publication copy"),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn the_first_watch_after_finder_creation_allocates_nothing() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let finder = Finder::new(&ndi, &FinderOptions::new()).unwrap();
+        // This exact Finder has had no watch, snapshot or generation query.
+        // Native mutex initialization belongs to construction, not this call.
+        let (watch, allocations) = crate::test_alloc::allocation_count(|| finder.watch());
+        assert_eq!(allocations, 0);
+        assert!(std::ptr::eq(watch.finder, &finder));
+        assert_eq!(watch.observed.get(), 0);
     }
 
     #[test]

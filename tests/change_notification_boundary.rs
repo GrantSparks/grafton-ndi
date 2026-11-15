@@ -5,6 +5,9 @@
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
+#[path = "../src/test_alloc.rs"]
+#[allow(dead_code)]
+mod test_alloc;
 
 use fixture::FixtureDir;
 use grafton_ndi::{Finder, FinderOptions, Ndi, RuntimeOptions};
@@ -69,6 +72,7 @@ fn shared_native_change_reports() {
             "handoff" => handoff(&ndi, || unsafe { publish() }),
             "cursor" => cursor(&ndi, || unsafe { publish() }),
             "snapshot" => snapshot_ordering(&ndi, || unsafe { publish() }),
+            "cold-watch" => cold_watch(&ndi),
             #[cfg(feature = "advanced")]
             "keyframe" => keyframe(&ndi, false),
             #[cfg(feature = "advanced")]
@@ -90,7 +94,14 @@ fn shared_native_change_reports() {
         ..Default::default()
     }
     .build(&library);
-    let mut cases = vec!["find", "wait", "handoff", "cursor", "snapshot"];
+    let mut cases = vec![
+        "find",
+        "wait",
+        "handoff",
+        "cursor",
+        "snapshot",
+        "cold-watch",
+    ];
     if cfg!(feature = "advanced") {
         cases.extend(["keyframe", "keyframe-cleared"]);
     }
@@ -121,6 +132,15 @@ fn run_child(directory: &Path, library: &Path, case: &str) {
     if !output.stderr.is_empty() {
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
     }
+}
+
+// Exercise the real Rust Finder constructor even without an installed SDK,
+// measuring its first watch rather than a warmed-up repeat.
+fn cold_watch(ndi: &Ndi) {
+    let finder = Finder::new(ndi, &FinderOptions::new()).unwrap();
+    let (mut watch, allocations) = test_alloc::allocation_count(|| finder.watch());
+    assert_eq!(allocations, 0);
+    assert_eq!(watch.current_sources().unwrap().len(), 1);
 }
 
 fn find(ndi: &Ndi, publish: impl Fn()) {
