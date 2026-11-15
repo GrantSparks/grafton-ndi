@@ -53,7 +53,7 @@ use crate::{
     finder::{RawSource, Source},
     frames::MetadataPartsExt,
     sys::{self, bindings::*},
-    timeout::{self, Deadline},
+    timeout::{self, Deadline, NeverStop, Stop, POLL_INTERVAL},
     AudioFrame, AudioFrameRef, Error, MetadataFrame, MetadataFrameRef, MetadataSource, Ndi, Result,
     VideoFrame, VideoFrameRef,
 };
@@ -151,10 +151,6 @@ fn receiver_delay_millis(delay: Duration) -> Result<i32> {
         })
 }
 
-/// The longest one capture attempt waits in the SDK. Bounded attempts let
-/// cancellation and pending notifications be observed between native waits.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
 /// The pause after an attempt that returned before its own end without a
 /// value: the SDK's early return, which would otherwise busy-wait.
 const EARLY_RETURN_PAUSE: Duration = Duration::from_millis(10);
@@ -172,31 +168,6 @@ enum Retry<T> {
 impl<T> From<Option<T>> for Retry<T> {
     fn from(value: Option<T>) -> Self {
         value.map_or(Self::Idle, Self::Item)
-    }
-}
-
-mod stop_sealed {
-    pub trait Sealed {}
-    impl Sealed for super::NeverStop {}
-    impl Sealed for &std::sync::atomic::AtomicBool {}
-}
-
-/// Whether a wait may begin another attempt. Checked only between attempts,
-/// so a delivered frame is always guarded and processed before cancellation.
-pub(crate) trait Stop: stop_sealed::Sealed {
-    fn is_stopped(&self) -> bool;
-}
-
-/// Synchronous waits have no cancellation state or atomic loads.
-pub(crate) struct NeverStop;
-impl Stop for NeverStop {
-    fn is_stopped(&self) -> bool {
-        false
-    }
-}
-impl Stop for &AtomicBool {
-    fn is_stopped(&self) -> bool {
-        self.load(Ordering::Acquire)
     }
 }
 
