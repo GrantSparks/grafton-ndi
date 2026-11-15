@@ -3174,7 +3174,9 @@ pub enum FrameMetadataStatus {
 mod metadata;
 use metadata::FrameMetadataState;
 #[cfg(test)]
-pub(crate) use metadata::{metadata_len_to_i32, validate_frame_metadata, MetadataWithheld};
+pub(crate) use metadata::{validate_frame_metadata, MetadataWithheld};
+#[cfg(test)]
+use metadata::metadata_len_to_i32;
 pub(crate) use metadata::{
     validate_metadata_layout, validate_sender_metadata, FrameMetadataRef, MetadataText,
     OwnedFrameMetadata, TerminatedText,
