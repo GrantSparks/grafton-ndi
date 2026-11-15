@@ -11,7 +11,8 @@ use std::ptr;
 use crate::{
     frames::{MetadataText, ValidatedVideoLayout, VideoHeader, VideoParts, MAX_VIDEO_BYTES},
     sys::{self, bindings::NDIlib_video_frame_v2_t},
-    Error, Ndi, PixelFormat, Result, ScanType, Timecode, VideoFrame, VideoSource,
+    Error, Ndi, PictureAspectRatio, PixelFormat, Result, ScanType, Timecode, VideoFrame,
+    VideoSource,
 };
 
 /// Validated V210 storage geometry, including optional initialized row padding.
@@ -220,12 +221,12 @@ impl<'a> P216Output<'a> {
         }
         Ok(Self {
             layout,
-            header: VideoHeader {
-                frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
-                picture_aspect_ratio: 0.0,
-                scan_type: ScanType::Progressive,
-                timecode: Timecode::SYNTHESIZE,
-            },
+            header: VideoHeader::new(
+                crate::media::DEFAULT_VIDEO_FRAME_RATE,
+                PictureAspectRatio::SQUARE_PIXELS,
+                ScanType::Progressive,
+                Timecode::SYNTHESIZE,
+            ),
             pointer: data.as_mut_ptr(),
             _borrow: std::marker::PhantomData,
         })

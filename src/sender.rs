@@ -23,7 +23,7 @@ use crate::{
     receiver::Tally,
     sys::{self, bindings::*},
     timeout::Deadline,
-    to_ms_checked, Error, FrameRate, Ndi, Rejected, Result, Timecode,
+    to_ms_checked, Error, FrameRate, Ndi, PictureAspectRatio, Rejected, Result, Timecode,
 };
 
 #[cfg(not(target_has_atomic = "ptr"))]
@@ -942,7 +942,7 @@ impl<'a> PreparedVideo<'a> {
             frame.video_descriptor(authorized)?
         } else {
             let layout = frame.layout().packed();
-            let room = send_room(&layout, frame.header().scan_type);
+            let room = send_room(&layout, frame.header().scan_type());
             frame.copy_active_pixels(staging, &layout, room);
             StagedVideo {
                 layout,
@@ -1054,7 +1054,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
             pixel_format,
             line_stride: None,
             frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
-            picture_aspect_ratio: VideoHeader::SQUARE_PIXELS,
+            aspect_ratio_input: 0.0,
             scan_type: ScanType::Progressive,
             timecode: Timecode::SYNTHESIZE,
             metadata: None,
@@ -1187,7 +1187,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// ```
     #[must_use]
     pub fn sends_in_place(&self) -> bool {
-        let room = send_room(&self.layout, self.header.scan_type);
+        let room = send_room(&self.layout, self.header.scan_type());
         room == 0 || (self.allow_padding_and_tail && self.tail_room >= room)
     }
 
@@ -1208,7 +1208,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// ```
     #[must_use]
     pub fn with_timecode(mut self, timecode: Timecode) -> Self {
-        self.header.timecode = timecode;
+        self.header = self.header.with_timecode(timecode);
         self
     }
 
@@ -1229,7 +1229,7 @@ pub struct BorrowedVideoFrameBuilder<'buf> {
     pixel_format: PixelFormat,
     line_stride: Option<usize>,
     frame_rate: FrameRate,
-    picture_aspect_ratio: f32,
+    aspect_ratio_input: f32,
     scan_type: ScanType,
     timecode: Timecode,
     metadata: Option<&'buf CStr>,
@@ -1261,7 +1261,7 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
     /// Set a finite nonnegative aspect ratio; zero selects square pixels.
     #[must_use]
     pub fn picture_aspect_ratio(mut self, ratio: f32) -> Self {
-        self.picture_aspect_ratio = ratio;
+        self.aspect_ratio_input = ratio;
         self
     }
     /// Select progressive, interlaced, or field scanning.
@@ -1367,7 +1367,7 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
     /// metadata exceeding the 4 MiB cap return [`Error::InvalidFrame`];
     /// invalid metadata UTF-8 returns [`Error::InvalidUtf8`].
     pub fn build(self) -> Result<BorrowedVideoFrame<'buf>> {
-        crate::frames::validate_picture_aspect_ratio(self.picture_aspect_ratio)?;
+        let picture_aspect_ratio = PictureAspectRatio::from_sdk(self.aspect_ratio_input)?;
         let layout = ValidatedVideoLayout::new_uncompressed(
             self.pixel_format,
             self.width,
@@ -1385,12 +1385,12 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
         let metadata = self.metadata.map(MetadataText::from_cstr).transpose()?;
         Ok(BorrowedVideoFrame {
             layout,
-            header: VideoHeader {
-                frame_rate: self.frame_rate,
-                picture_aspect_ratio: self.picture_aspect_ratio,
-                scan_type: self.scan_type,
-                timecode: self.timecode,
-            },
+            header: VideoHeader::new(
+                self.frame_rate,
+                picture_aspect_ratio,
+                self.scan_type,
+                self.timecode,
+            ),
             data,
             tail_room: (layout.trailing_padding() + (self.data.len() - data.len()))
                 .saturating_add(self.readable_after),
@@ -2292,7 +2292,7 @@ mod tests {
                 assert!(staging.room().iter().all(|&byte| byte == 0));
                 assert_eq!(
                     staging.tail_room(),
-                    send_room(&source.layout().packed(), source.header().scan_type)
+                    send_room(&source.layout().packed(), source.header().scan_type())
                 );
             }
             let pointer = raw.p_data;

@@ -18,7 +18,7 @@ use crate::{
     framesync::{AudioInputFormat, FrameSyncAudioRef, FrameSyncVideoRef},
     pixels::Pixels,
     sys::{self, bindings::*},
-    Error, FourCc, FrameRate, Rejected, Result, SdkTimestamp, Timecode,
+    Error, FourCc, FrameRate, PictureAspectRatio, Rejected, Result, SdkTimestamp, Timecode,
 };
 
 /// The uncompressed pixel formats NDI sends and receives.
@@ -599,33 +599,59 @@ impl ScanType {
 /// together: they are the same for owned, borrowed and received frames.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct VideoHeader {
-    pub(crate) frame_rate: FrameRate,
-    /// Finite and nonnegative; zero means square pixels.
-    pub(crate) picture_aspect_ratio: f32,
-    pub(crate) scan_type: ScanType,
-    pub(crate) timecode: Timecode,
+    frame_rate: FrameRate,
+    picture_aspect_ratio: PictureAspectRatio,
+    scan_type: ScanType,
+    timecode: Timecode,
 }
 
 impl VideoHeader {
-    /// Let the SDK derive display aspect from the frame dimensions.
-    pub(crate) const SQUARE_PIXELS: f32 = 0.0;
+    pub(crate) const fn new(
+        frame_rate: FrameRate,
+        picture_aspect_ratio: PictureAspectRatio,
+        scan_type: ScanType,
+        timecode: Timecode,
+    ) -> Self {
+        Self {
+            frame_rate,
+            picture_aspect_ratio,
+            scan_type,
+            timecode,
+        }
+    }
+
+    pub(crate) const fn frame_rate(self) -> FrameRate {
+        self.frame_rate
+    }
+    pub(crate) const fn picture_aspect_ratio(self) -> PictureAspectRatio {
+        self.picture_aspect_ratio
+    }
+    pub(crate) const fn scan_type(self) -> ScanType {
+        self.scan_type
+    }
+    pub(crate) const fn timecode(self) -> Timecode {
+        self.timecode
+    }
+    pub(crate) fn with_timecode(self, timecode: Timecode) -> Self {
+        Self { timecode, ..self }
+    }
 
     /// Validate the header of a frame the SDK delivered.
     pub(crate) fn from_sdk(raw: &NDIlib_video_frame_v2_t) -> Result<Self> {
         let frame_rate = FrameRate::from_sdk(raw.frame_rate_N, raw.frame_rate_D)?;
-        validate_picture_aspect_ratio(raw.picture_aspect_ratio)?;
+        let picture_aspect_ratio = PictureAspectRatio::from_sdk(raw.picture_aspect_ratio)?;
         let scan_type = ScanType::from_sdk(raw.frame_format_type).ok_or_else(|| {
             Error::InvalidFrame(format!(
                 "Unknown scan type: 0x{:08X}",
                 raw.frame_format_type
             ))
         })?;
-        Ok(Self {
+        Ok(Self::new(
             frame_rate,
-            picture_aspect_ratio: raw.picture_aspect_ratio,
+            picture_aspect_ratio,
             scan_type,
-            timecode: Timecode::from_ticks(raw.timecode),
-        })
+            Timecode::from_ticks(raw.timecode),
+        ))
     }
 }
 
@@ -706,7 +732,7 @@ pub(crate) unsafe trait VideoParts {
             FourCC: FourCc::from(layout.pixel_format()).raw(),
             frame_rate_N: frame_rate_n,
             frame_rate_D: frame_rate_d,
-            picture_aspect_ratio: header.picture_aspect_ratio,
+            picture_aspect_ratio: header.picture_aspect_ratio.to_sdk(),
             frame_format_type: header.scan_type.to_sdk(),
             timecode: header.timecode.ticks(),
             p_data: self.pixels().cast_mut(),
@@ -836,7 +862,7 @@ pub trait VideoSource: VideoParts {
 
     /// Display width divided by height; zero means square pixels.
     fn picture_aspect_ratio(&self) -> f32 {
-        self.header().picture_aspect_ratio
+        self.header().picture_aspect_ratio.get()
     }
 
     /// Progressive, interlaced, or field scanning.
@@ -1053,20 +1079,20 @@ macro_rules! video_accessors {
             /// Get the frame rate.
             #[inline]
             pub fn frame_rate(&self) -> $crate::FrameRate {
-                $crate::frames::VideoParts::header(self).frame_rate
+                $crate::frames::VideoParts::header(self).frame_rate()
             }
 
             /// Get the picture aspect ratio, width over height as displayed; `0.0`
             /// means square pixels.
             #[inline]
             pub fn picture_aspect_ratio(&self) -> f32 {
-                $crate::frames::VideoParts::header(self).picture_aspect_ratio
+                $crate::frames::VideoParts::header(self).picture_aspect_ratio().get()
             }
 
             /// Get the scan type: progressive, interlaced, or a single field.
             #[inline]
             pub fn scan_type(&self) -> $crate::ScanType {
-                $crate::frames::VideoParts::header(self).scan_type
+                $crate::frames::VideoParts::header(self).scan_type()
             }
 
             /// Get the timecode.
@@ -1074,7 +1100,7 @@ macro_rules! video_accessors {
             $(#[$timecode])*
             #[inline]
             pub fn timecode(&self) -> $crate::Timecode {
-                $crate::frames::VideoParts::header(self).timecode
+                $crate::frames::VideoParts::header(self).timecode()
             }
 
             /// Get the validated first-plane line stride in bytes: the
@@ -1479,7 +1505,7 @@ impl VideoFrame {
             height: 1080,
             pixel_format: PixelFormat::Bgra,
             frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
-            picture_aspect_ratio: VideoHeader::SQUARE_PIXELS,
+            aspect_ratio_input: 0.0,
             scan_type: ScanType::Progressive,
             timecode: Timecode::SYNTHESIZE,
             metadata: None,
@@ -1538,8 +1564,7 @@ impl VideoFrame {
     /// Returns [`Error::InvalidFrame`] if `ratio` is negative or not finite.
     /// The frame is unchanged.
     pub fn set_picture_aspect_ratio(&mut self, ratio: f32) -> Result<()> {
-        validate_picture_aspect_ratio(ratio)?;
-        self.header.picture_aspect_ratio = ratio;
+        self.header.picture_aspect_ratio = PictureAspectRatio::from_sdk(ratio)?;
         Ok(())
     }
 
@@ -1666,12 +1691,12 @@ impl VideoFrame {
         assert_eq!(data.len(), layout.data_len_bytes);
         Self {
             layout,
-            header: VideoHeader {
-                frame_rate: FrameRate::new(60, 1).unwrap(),
-                picture_aspect_ratio: VideoHeader::SQUARE_PIXELS,
-                scan_type: ScanType::Progressive,
-                timecode: Timecode::from_ticks(0),
-            },
+            header: VideoHeader::new(
+                FrameRate::new(60, 1).unwrap(),
+                PictureAspectRatio::SQUARE_PIXELS,
+                ScanType::Progressive,
+                Timecode::from_ticks(0),
+            ),
             data: Pixels::adopt(
                 data,
                 crate::pixels::send_room(&layout, ScanType::Progressive),
@@ -1711,7 +1736,7 @@ pub struct VideoFrameBuilder {
     height: u32,
     pixel_format: PixelFormat,
     frame_rate: FrameRate,
-    picture_aspect_ratio: f32,
+    aspect_ratio_input: f32,
     scan_type: ScanType,
     timecode: Timecode,
     metadata: Option<String>,
@@ -1746,7 +1771,7 @@ impl VideoFrameBuilder {
     /// means square pixels. It must be finite and nonnegative.
     #[must_use]
     pub fn picture_aspect_ratio(mut self, ratio: f32) -> Self {
-        self.picture_aspect_ratio = ratio;
+        self.aspect_ratio_input = ratio;
         self
     }
 
@@ -1838,7 +1863,7 @@ impl VideoFrameBuilder {
     /// NUL byte.
     pub fn build(mut self) -> std::result::Result<VideoFrame, Rejected<Self>> {
         let mut validate = || -> Result<_> {
-            validate_picture_aspect_ratio(self.picture_aspect_ratio)?;
+            let picture_aspect_ratio = PictureAspectRatio::from_sdk(self.aspect_ratio_input)?;
             let layout = ValidatedVideoLayout::new_uncompressed(
                 self.pixel_format,
                 self.width,
@@ -1851,9 +1876,9 @@ impl VideoFrameBuilder {
             // The last fallible check transfers metadata only on success,
             // preserving the complete builder on every rejected input.
             let metadata = FrameMetadata::take_from(&mut self.metadata)?.unwrap_or_default();
-            Ok((layout, metadata))
+            Ok((layout, metadata, picture_aspect_ratio))
         };
-        let (layout, metadata) = match validate() {
+        let (layout, metadata, picture_aspect_ratio) = match validate() {
             Ok(parts) => parts,
             Err(error) => return Err(Rejected::new(error, self)),
         };
@@ -1865,12 +1890,12 @@ impl VideoFrameBuilder {
 
         Ok(VideoFrame {
             layout,
-            header: VideoHeader {
-                frame_rate: self.frame_rate,
-                picture_aspect_ratio: self.picture_aspect_ratio,
-                scan_type: self.scan_type,
-                timecode: self.timecode,
-            },
+            header: VideoHeader::new(
+                self.frame_rate,
+                picture_aspect_ratio,
+                self.scan_type,
+                self.timecode,
+            ),
             data,
             metadata_status: FrameMetadataState::from_text(metadata.optional_text()).status(),
             metadata,
@@ -4052,19 +4077,6 @@ fn validate_video_width(width: i64) -> LayoutResult<()> {
         return Err(LayoutError::VideoOddWidth(width));
     }
 
-    Ok(())
-}
-
-/// The one picture-aspect-ratio check: finite and nonnegative, where zero
-/// means square pixels.
-pub(crate) fn validate_picture_aspect_ratio(ratio: f32) -> Result<()> {
-    check_picture_aspect_ratio(ratio).map_err(Into::into)
-}
-
-pub(crate) fn check_picture_aspect_ratio(ratio: f32) -> LayoutResult<()> {
-    if !ratio.is_finite() || ratio < 0.0 {
-        return Err(LayoutError::PictureAspectRatio(ratio));
-    }
     Ok(())
 }
 

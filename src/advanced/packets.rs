@@ -5,9 +5,10 @@ use std::ffi::c_char;
 
 use super::{aliasable::AliasableVec, descriptors, invalid_frame, sdk_quantity};
 use crate::{
-    frames::{check_picture_aspect_ratio, FrameMetadata, VideoHeader},
+    frames::{FrameMetadata, VideoHeader},
     sys::bindings::*,
-    Error, FourCc, FrameRate, Rejected, Result, ScanType, SdkTimestamp, StreamTier, Timecode,
+    Error, FourCc, FrameRate, PictureAspectRatio, Rejected, Result, ScanType, SdkTimestamp,
+    StreamTier, Timecode,
 };
 
 /// Maximum compressed frame size, in bytes, that this module sends or accepts.
@@ -505,7 +506,7 @@ pub struct VideoPacketFormat {
     width: u32,
     height: u32,
     frame_rate: FrameRate,
-    picture_aspect_ratio: f32,
+    picture_aspect_ratio: PictureAspectRatio,
     scan_type: ScanType,
 }
 
@@ -532,7 +533,7 @@ impl VideoPacketFormat {
                 width,
                 height,
                 frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
-                picture_aspect_ratio: 0.0,
+                picture_aspect_ratio: PictureAspectRatio::SQUARE_PIXELS,
                 scan_type: ScanType::Progressive,
             }),
             _ => Err(format!(
@@ -553,9 +554,9 @@ impl VideoPacketFormat {
         Ok(Self {
             tier,
             protected,
-            frame_rate: header.frame_rate,
-            picture_aspect_ratio: header.picture_aspect_ratio,
-            scan_type: header.scan_type,
+            frame_rate: header.frame_rate(),
+            picture_aspect_ratio: header.picture_aspect_ratio(),
+            scan_type: header.scan_type(),
             ..format
         })
     }
@@ -575,10 +576,8 @@ impl VideoPacketFormat {
     ///
     /// [`Error::InvalidInput`] when the value is negative or not finite.
     pub fn with_picture_aspect_ratio(self, ratio: f32) -> Result<Self> {
-        check_picture_aspect_ratio(ratio)
-            .map_err(|reason| Error::InvalidInput(reason.to_string()))?;
         Ok(Self {
-            picture_aspect_ratio: ratio,
+            picture_aspect_ratio: PictureAspectRatio::new(ratio)?,
             ..self
         })
     }
@@ -623,7 +622,7 @@ impl VideoPacketFormat {
 
     /// The picture aspect ratio; `0.0` means square pixels.
     pub fn picture_aspect_ratio(self) -> f32 {
-        self.picture_aspect_ratio
+        self.picture_aspect_ratio.get()
     }
 
     /// The stream this format belongs to.
@@ -690,7 +689,7 @@ impl VideoPacketFormat {
             FourCC: self.codec.outer(self.tier, self.protected),
             frame_rate_N: numerator,
             frame_rate_D: denominator,
-            picture_aspect_ratio: self.picture_aspect_ratio,
+            picture_aspect_ratio: self.picture_aspect_ratio.to_sdk(),
             frame_format_type: self.scan_type.to_sdk(),
             ..descriptors::video_frame()
         }

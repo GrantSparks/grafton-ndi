@@ -134,7 +134,7 @@ pub use {
 pub use sender::{CompressedAttached, QueueAttached};
 
 pub use color_info::{ColorInfo, ColorPrimaries, TransferFunction, YuvMatrix};
-pub use media::{FourCc, FrameRate, MediaTypes, StreamTier};
+pub use media::{FourCc, FrameRate, MediaTypes, PictureAspectRatio, StreamTier};
 pub use rejected::Rejected;
 pub use time::{SdkTimestamp, Timecode};
 
