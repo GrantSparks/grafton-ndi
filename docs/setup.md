@@ -84,14 +84,21 @@ fn main() -> grafton_ndi::Result<()> {
 
 ## SDK editions
 
-Without an edition request, search accepts either library. Use
+On dynamically loaded targets, search without an edition request accepts either
+library. Use
 `RuntimeOptions::new().edition(SdkEdition::Advanced)` to search only Advanced
 names and require Advanced entry points. `SdkEdition::Standard` searches Standard
 names, but an Advanced runtime found under that name or an explicit path also
-satisfies the request. Installed build inputs do not choose the runtime.
+satisfies the request. On these targets, installed build inputs do not choose
+the runtime, and `ndi.info().edition()` reports the loaded library's edition
+from its exports.
 
-`ndi.info().edition()` reports the loaded library's edition from its exports;
-it does not establish license entitlement.
+On statically linked Apple mobile targets, `ndi.info().edition()` reports the
+linked archive's edition. The build selects the Advanced archive when
+`NDI_SDK_DIR` holds one, otherwise the Standard archive; see
+[Apple mobile targets](#apple-mobile-targets). An Advanced edition request is
+met only by an Advanced archive, while a Standard request accepts either.
+The reported edition does not establish license entitlement.
 
 ## Runtime capabilities
 

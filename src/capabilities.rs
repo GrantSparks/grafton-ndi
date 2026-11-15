@@ -24,8 +24,12 @@ const NDI_6_4: SdkVersion = SdkVersion {
 
 /// The edition of a native SDK implementation.
 ///
-/// The edition of the selected implementation is detected from what it exports,
-/// never taken from its file name or from the caller's request.
+/// On dynamically loaded targets, the selected library's exports decide its
+/// edition, regardless of its file name or the caller's request.
+/// On statically linked targets (iOS, tvOS and visionOS), it is the edition of
+/// the archive linked at build time: the Advanced archive when `NDI_SDK_DIR`
+/// holds one, otherwise the Standard archive. See the
+/// [Apple mobile setup](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/setup.md#apple-mobile-targets).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SdkEdition {
@@ -120,7 +124,8 @@ pub struct RuntimeInfo {
 }
 
 impl RuntimeInfo {
-    /// The edition detected from the entry points the implementation exports.
+    /// The edition of the selected implementation; see [`SdkEdition`] for
+    /// how it is decided.
     ///
     /// This does not establish a license entitlement.
     pub fn edition(&self) -> SdkEdition {

@@ -204,15 +204,17 @@ impl RuntimeOptions {
 
     /// Search only for the runtime library of this SDK edition.
     ///
-    /// Requesting [`SdkEdition::Advanced`] also requires the selected
-    /// implementation to export the Advanced SDK entry points. Requesting
+    /// On dynamically loaded targets, requesting [`SdkEdition::Advanced`]
+    /// requires the selected library to export the Advanced SDK entry points. Requesting
     /// [`SdkEdition::Standard`] never rejects an implementation for exporting
     /// more than the Standard SDK does, so an Advanced runtime found under the
     /// Standard file name, or named by [`library_path`](Self::library_path),
     /// meets it. Without a request, the libraries of both editions are sought.
     ///
     /// A statically linked target has one implementation, the archive linked
-    /// at build time, and the same rule decides whether it meets the request.
+    /// at build time. An Advanced request is met only when the build linked the
+    /// Advanced archive; a Standard request accepts either archive. See
+    /// [`SdkEdition`] for how the build chooses the archive.
     #[must_use]
     pub fn edition(mut self, edition: SdkEdition) -> Self {
         self.edition = Some(edition);
