@@ -987,8 +987,8 @@ impl HostKeyBuffer {
             .expect("ASCII lowercase preserves a host key's UTF-8")
     }
 
-    fn into_owned(self) -> HostKey {
-        HostKey(self.as_str().to_owned())
+    fn into_owned(self) -> Result<HostKey> {
+        budget::copy_string(self.as_str()).map(HostKey)
     }
 }
 
@@ -1358,7 +1358,8 @@ impl Display for Source {
 ///
 /// Entries remain until [`Self::invalidate`] or [`Self::clear`]; they can contain
 /// offline endpoints and omit feeds announced after the original window. Empty
-/// results are not cached. The accepted grammar is [`Source::matches_host`]'s.
+/// results are not cached. Results that cannot be stored are returned uncached.
+/// The accepted grammar is [`Source::matches_host`]'s.
 /// Equivalent hostname or machine-name ASCII case/final-dot and numeric IP
 /// spellings share an entry. Other spellings, including DNS aliases, remain
 /// distinct identities.
@@ -1474,8 +1475,9 @@ impl SourceCache {
     ///
     /// [`Error::InvalidInput`] for a query outside [`Source::matches_host`]'s
     /// grammar or a timeout above [`crate::MAX_TIMEOUT`], even on a cache hit;
-    /// discovery/resource errors propagate without filling an entry. IP hints must already be configured
-    /// on the finder; this method does not change its discovery scope.
+    /// discovery/resource errors propagate without filling an entry. A completed
+    /// result the cache cannot store is returned uncached. IP hints must already
+    /// be configured on the finder; this method does not change its scope.
     pub fn sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
         self.entries.sources_by_host_with(host, timeout, |query| {
             let mut seen = HashSet::new();
@@ -1575,23 +1577,31 @@ impl CachedSources {
             // The bounded, fallible deep copy happens outside the mutex.
             // Publication must still recheck both generation and key: another
             // discovery or invalidation may have completed during this copy.
-            let snapshot = Arc::new(copy(&sources)?);
-            let mut cache = self
-                .cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if generation.is_some()
-                && cache.generation == generation
-                && !cache.entries.contains_key(key.as_str())
-            {
-                cache
-                    .entries
-                    .try_reserve(1)
-                    .map_err(|_| budget::allocation_failed())?;
-                cache.entries.insert(key.into_owned(), snapshot);
-            }
+            let Ok(snapshot) = copy(&sources) else {
+                return Ok(sources);
+            };
+            let Ok(key) = key.into_owned() else {
+                return Ok(sources);
+            };
+            self.publish(generation, key, Arc::new(snapshot));
         }
         Ok(sources)
+    }
+
+    // Admission cannot change the caller's discovered result. Prepare copies
+    // outside the lock, then recheck ownership before reserving and inserting.
+    fn publish(&self, generation: Option<u64>, key: HostKey, snapshot: Arc<Vec<Source>>) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if generation.is_some()
+            && cache.generation == generation
+            && !cache.entries.contains_key(key.0.as_str())
+            && cache.entries.try_reserve(1).is_ok()
+        {
+            cache.entries.insert(key, snapshot);
+        }
     }
 
     fn invalidate(&self, host: &str) {
@@ -1686,6 +1696,58 @@ mod tests {
     }
 
     #[test]
+    fn publication_failure_returns_discovery_but_hit_failure_is_reported() {
+        let cache = CachedSources::default();
+        let sources = vec![Source::new("camera (Program)")];
+        for invalidate in [false, true] {
+            let result = cache
+                .sources_by_host_with_copy(
+                    "camera",
+                    Duration::ZERO,
+                    |_| Ok(sources.clone()),
+                    |_| {
+                        if invalidate {
+                            cache.invalidate("camera");
+                        }
+                        Err(budget::allocation_failed())
+                    },
+                )
+                .unwrap();
+            assert_eq!(result, sources);
+            assert!(cache.is_empty());
+        }
+        cache
+            .sources_by_host_with("camera", Duration::ZERO, |_| Ok(sources.clone()))
+            .unwrap();
+        let result = cache.sources_by_host_with_copy(
+            "camera",
+            Duration::ZERO,
+            |_| panic!("a hit must not run discovery"),
+            |_| Err(budget::allocation_failed()),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::UnexpectedSdkResult(
+                crate::SdkResultDefect::DiscoveryAllocation
+            ))
+        ));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn successful_cache_publication_keeps_its_allocation_count() {
+        let cache = CachedSources::default();
+        let sources = vec![Source::new("camera (Program)")];
+        let (result, allocations) = crate::test_alloc::allocation_count(|| {
+            cache.sources_by_host_with("camera", Duration::ZERO, |_| Ok(sources))
+        });
+        assert_eq!(result.unwrap().len(), 1);
+        // One vector, its name, the Arc header, host key and map storage.
+        assert_eq!(allocations, 5);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
     fn the_first_watch_after_finder_creation_allocates_nothing() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
@@ -1714,7 +1776,9 @@ mod tests {
     }
 
     fn host_key(host: &str) -> HostKey {
-        HostKeyBuffer::new(HostQuery::parse(host).unwrap()).into_owned()
+        HostKeyBuffer::new(HostQuery::parse(host).unwrap())
+            .into_owned()
+            .unwrap()
     }
 
     #[test]
@@ -2203,7 +2267,9 @@ mod tests {
     fn cache_validates_timeout_before_returning_cached_source() {
         let cache = CachedSources::default();
         cache.cache.lock().unwrap().entries.insert(
-            HostKeyBuffer::new(HostQuery::parse("camera").unwrap()).into_owned(),
+            HostKeyBuffer::new(HostQuery::parse("camera").unwrap())
+                .into_owned()
+                .unwrap(),
             Arc::new(vec![Source::new("camera")]),
         );
         for host in ["camera", "not_cached"] {
