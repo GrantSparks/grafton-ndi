@@ -869,6 +869,53 @@ impl Permits<VideoKind> for AvSyncAttached {}
 #[cfg(feature = "advanced")]
 impl Permits<MetadataKind> for AvSyncAttached {}
 
+/// Modes native receiver creation can produce directly.
+pub(crate) trait CreatableMode: ReceiverMode {}
+impl CreatableMode for RawCapture {}
+#[cfg(feature = "advanced")]
+impl CreatableMode for PacketAttached {}
+
+/// Modes whose native synchronizer must be destroyed before raw capture returns.
+pub(crate) trait SynchronizerMode: ReceiverMode {}
+impl SynchronizerMode for FrameSyncAttached {}
+#[cfg(feature = "advanced")]
+impl SynchronizerMode for AvSyncAttached {}
+
+/// Proof that this receiver's native synchronizer has been destroyed.
+/// Construction consumes a native resource; retained core identity prevents
+/// another synchronizer's release from restoring raw capture on a live one.
+pub(crate) struct Released<M: SynchronizerMode> {
+    core: Arc<ReceiverCore>,
+    _mode: PhantomData<fn() -> M>,
+}
+
+impl Released<FrameSyncAttached> {
+    pub(crate) fn release(resource: crate::framesync::FrameSyncResource) -> Self {
+        // Keep this exact core allocated through identity validation. Cloning
+        // avoids manual field extraction from a resource with a native Drop.
+        let core = Arc::clone(resource.receiver_core());
+        drop(resource);
+        Self {
+            core,
+            _mode: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "advanced")]
+impl Released<AvSyncAttached> {
+    pub(crate) fn release(resource: crate::advanced::AvResource) -> Self {
+        // Keep this exact core allocated through identity validation. Cloning
+        // avoids manual field extraction from a resource with a native Drop.
+        let core = Arc::clone(resource.receiver_core());
+        drop(resource);
+        Self {
+            core,
+            _mode: PhantomData,
+        }
+    }
+}
+
 /// Ordinary receiver mode, permitting raw video capture.
 #[derive(Debug)]
 pub enum RawCapture {}
@@ -1156,7 +1203,10 @@ impl Receiver {
             )
         }
     }
+}
 
+#[allow(private_bounds)]
+impl<M: CreatableMode> Receiver<M> {
     /// The one creation path: check `options` against the runtime, create a
     /// receiver through `create`, which is
     /// handed the core table and the native settings for `options`, and keep
@@ -1203,6 +1253,38 @@ impl Receiver {
             }),
             _mode: PhantomData,
         })
+    }
+}
+
+impl Receiver<RawCapture> {
+    pub(crate) fn attach<M: SynchronizerMode>(self) -> Receiver<M> {
+        Receiver {
+            core: self.core,
+            _mode: PhantomData,
+        }
+    }
+
+    /// Synthetic packet-mode receiver for tests without a passthrough SDK.
+    #[cfg(all(test, feature = "advanced"))]
+    pub(crate) fn into_packet_for_test(self) -> Receiver<PacketAttached> {
+        Receiver {
+            core: self.core,
+            _mode: PhantomData,
+        }
+    }
+}
+
+#[allow(private_bounds)]
+impl<M: SynchronizerMode> Receiver<M> {
+    pub(crate) fn detach(self, released: Released<M>) -> Receiver<RawCapture> {
+        assert!(
+            Arc::ptr_eq(&self.core, &released.core),
+            "synchronizer release belongs to another receiver"
+        );
+        Receiver {
+            core: self.core,
+            _mode: PhantomData,
+        }
     }
 }
 
@@ -1319,13 +1401,6 @@ impl<M: ReceiverMode> Receiver<M> {
             |event| event,
             |media| match media {},
         )
-    }
-
-    pub(crate) fn into_mode<T: ReceiverMode>(self) -> Receiver<T> {
-        Receiver {
-            core: self.core,
-            _mode: PhantomData,
-        }
     }
 
     /// Set native video buffering, in the range zero through two seconds.
@@ -2795,6 +2870,9 @@ pub(crate) mod lifecycle_test_events {
             }
         });
     }
+    pub(crate) fn snapshot() -> Vec<&'static str> {
+        EVENTS.with(|events| events.borrow().as_ref().unwrap().clone())
+    }
     pub(crate) fn track(action: impl FnOnce()) -> Vec<&'static str> {
         EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
         action();
@@ -2820,7 +2898,9 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap().into_mode();
+        let receiver = Receiver::new(&ndi, &unconnected())
+            .unwrap()
+            .into_packet_for_test();
         // Model notifications retained before a mode transition. Packet capture
         // must consume them once without spending its timeout in native capture.
         receiver.core.retain(Notification::StatusChanged);

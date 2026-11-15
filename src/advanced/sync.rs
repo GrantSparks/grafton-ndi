@@ -10,7 +10,7 @@ use crate::{
     finder::RawSource,
     frames::AudioRef,
     frames::MAX_AUDIO_BYTES,
-    receiver::{AvSyncAttached, ReceiverCore},
+    receiver::{AvSyncAttached, ReceiverCore, Released},
     sys::{
         advanced::{native, AvSync as AvSyncTable, Genlock as GenlockTable},
         bindings::*,
@@ -231,11 +231,7 @@ enum Synchronized {
 }
 
 /// A native synchronizer, destroyed when dropped.
-struct AvResource {
-    #[cfg_attr(
-        not(ndi_has_advanced_av_sync),
-        expect(dead_code, reason = "runtime authorizes native AV sync descriptors")
-    )]
+pub(crate) struct AvResource {
     receiver: Arc<ReceiverCore>,
     #[cfg(ndi_has_advanced_av_sync)]
     handle: AvSyncInstance,
@@ -261,6 +257,16 @@ const _: () = {
     const fn send<T: Send>() {}
     send::<AvResource>();
 };
+
+impl AvResource {
+    pub(crate) fn receiver_core(&self) -> &Arc<ReceiverCore> {
+        &self.receiver
+    }
+
+    fn release(self) -> Released<AvSyncAttached> {
+        Released::<AvSyncAttached>::release(self)
+    }
+}
 
 impl Drop for AvResource {
     fn drop(&mut self) {
@@ -374,7 +380,7 @@ impl AvSync {
             };
             Ok(Self {
                 resource: AvResource { handle: AvSyncInstance(handle), table, receiver: Arc::clone(&receiver.core) },
-                receiver: receiver.into_mode(),
+                receiver: receiver.attach(),
                 _not_sync: NotSync(PhantomData),
             })
         })
@@ -441,8 +447,7 @@ impl AvSync {
         let Self {
             resource, receiver, ..
         } = self;
-        drop(resource);
-        receiver.into_mode()
+        receiver.detach(resource.release())
     }
 
     /// Fetch the audio that belongs to `video`.
@@ -1151,6 +1156,28 @@ mod tests {
             )
         };
         outcome(status, guard).map(|outcome| outcome.to_owned())
+    }
+
+    #[test]
+    fn recovery_destroys_avsync_before_raw_capture_is_available() {
+        use crate::receiver::lifecycle_test_events::{snapshot, track};
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let events = track(|| {
+            let receiver =
+                Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new(""))).unwrap();
+            let sync = AvSync::new(receiver).unwrap();
+            let receiver = sync.into_receiver();
+            assert_eq!(snapshot(), ["avsync"]);
+            assert!(receiver
+                .audio()
+                .capture(std::time::Duration::ZERO)
+                .unwrap()
+                .is_none());
+            drop(receiver);
+        });
+        assert_eq!(events, ["avsync", "receiver"]);
     }
 
     #[test]

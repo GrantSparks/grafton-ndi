@@ -81,7 +81,7 @@ use crate::{
         validate_returned_audio, AudioFrame, AudioRef, ReturnedAudio, ScanType,
         ValidatedAudioLayout, VideoFrame, VideoRef,
     },
-    receiver::{FrameSyncAttached, Receiver, ReceiverCore},
+    receiver::{FrameSyncAttached, Receiver, ReceiverCore, Released},
     sys::bindings::*,
     Error, Rejected, Result,
 };
@@ -383,7 +383,7 @@ unsafe impl Send for FrameSyncInstance {}
 /// including when the receiver is accessed through [`FrameSync::receiver`].
 unsafe impl Sync for FrameSyncInstance {}
 
-struct FrameSyncResource {
+pub(crate) struct FrameSyncResource {
     instance: FrameSyncInstance,
     // Native destruction reads this receiver; ownership keeps it and its runtime live.
     receiver: Arc<ReceiverCore>,
@@ -499,6 +499,15 @@ enum AudioCall {
 }
 
 impl FrameSyncResource {
+    pub(crate) fn receiver_core(&self) -> &Arc<ReceiverCore> {
+        &self.receiver
+    }
+
+    /// Destroy the synchronizer before issuing permission to restore raw capture.
+    fn release(self) -> Released<FrameSyncAttached> {
+        Released::<FrameSyncAttached>::release(self)
+    }
+
     /// Capture video for `scan_type`: the guard of the frame the SDK
     /// returned, or `None` for the documented all-zero "no video yet" state,
     /// which holds nothing to free. The one place a FrameSync video guard is
@@ -645,7 +654,7 @@ impl FrameSync {
         };
         Ok(Self {
             resource,
-            receiver: receiver.into_mode(),
+            receiver: receiver.attach(),
         })
     }
 
@@ -731,8 +740,7 @@ impl FrameSync {
     /// continued use with raw capture or for creating a new FrameSync.
     pub fn into_receiver(self) -> Receiver {
         let Self { resource, receiver } = self;
-        drop(resource);
-        receiver.into_mode()
+        receiver.detach(resource.release())
     }
 
     /// Capture video with time-base correction, as an owned frame that can
@@ -1134,6 +1142,67 @@ mod tests {
         FourCc,
     };
     use std::ptr;
+
+    #[test]
+    fn recovery_destroys_framesync_before_raw_capture_is_available() {
+        use crate::receiver::lifecycle_test_events::{snapshot, track};
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let events = track(|| {
+            let receiver =
+                Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
+            let sync = FrameSync::new(receiver).unwrap();
+            let receiver = sync.into_receiver();
+            assert_eq!(snapshot(), ["framesync"]);
+            assert!(receiver
+                .video()
+                .capture(std::time::Duration::ZERO)
+                .unwrap()
+                .is_none());
+            drop(receiver);
+        });
+        assert_eq!(events, ["framesync", "receiver"]);
+    }
+
+    #[test]
+    fn release_of_another_framesync_cannot_restore_raw_capture() {
+        use crate::receiver::lifecycle_test_events::{snapshot, track};
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let events = track(|| {
+            let make = || {
+                FrameSync::new(
+                    Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new("")))
+                        .unwrap(),
+                )
+                .unwrap()
+            };
+            let FrameSync {
+                resource: first_resource,
+                receiver: first_receiver,
+            } = make();
+            let FrameSync {
+                resource: second_resource,
+                receiver: second_receiver,
+            } = make();
+            let released = first_resource.release();
+            assert_eq!(snapshot(), ["framesync"]);
+            let mismatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                second_receiver.detach(released)
+            }));
+            assert!(mismatch.is_err(), "a foreign token restored raw capture");
+            assert_eq!(
+                snapshot(),
+                ["framesync"],
+                "the second synchronizer is still alive"
+            );
+            drop(second_resource);
+            drop(first_receiver);
+        });
+        assert_eq!(events, ["framesync", "framesync", "receiver", "receiver"]);
+    }
 
     #[test]
     fn receiver_modes_preserve_resource_order_and_exactly_once_destruction() {

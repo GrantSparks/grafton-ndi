@@ -255,14 +255,14 @@ impl PacketReceiver {
         // preset's color format and fielded video; the strings they point to
         // belong to the creation path, which outlives the call.
         let receiver = unsafe {
-            <Receiver as super::Configurable>::configured(
+            <Receiver<PacketAttached> as super::Configurable>::configured(
                 ndi,
                 &options,
                 &config,
                 |table: &'static ReceiverConfiguration, _settings, _text| native!(ReceiverConfiguration, table => table.named().NDIlib_recv_create_v4(_settings, _text)),
             )
         }?;
-        Ok(Self::from_receiver(receiver.into_mode()))
+        Ok(Self::from_receiver(receiver))
     }
 
     pub(crate) fn from_receiver(receiver: Receiver<PacketAttached>) -> Self {
@@ -447,7 +447,7 @@ mod tests {
         };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("")))
             .unwrap()
-            .into_mode();
+            .into_packet_for_test();
         let Some(PacketItem::Event(ReceiverEvent::StatusChanged(status))) =
             PacketReceiver::capture_result(
                 &receiver,
@@ -654,7 +654,7 @@ mod tests {
         let receiver: Receiver<PacketAttached> =
             Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("")))
                 .unwrap()
-                .into_mode();
+                .into_packet_for_test();
         native_capture_calls::take();
         assert!(matches!(
             PacketReceiver::capture_from(&receiver, Duration::MAX),

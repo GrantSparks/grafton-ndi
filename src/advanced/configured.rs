@@ -140,6 +140,8 @@ macro_rules! configurable {
             }
         }
 
+        // These creation helpers are crate-private, including their mode bounds.
+        #[allow(private_bounds)]
         impl$(<$Mode: $Bound>)? $Object {
             /// Create the object through its configured entry point with
             /// `config`, which it keeps for as long as it lives: what `new`
@@ -176,7 +178,7 @@ configurable!(
     SenderConfiguration::NDIlib_send_create_v2
 );
 configurable!(
-    Receiver => (ReceiverOptions, NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t,
+    Receiver<M> where M: crate::receiver::CreatableMode => (ReceiverOptions, NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t,
     ReceiverConfiguration::NDIlib_recv_create_v4
 );
 configurable!(
