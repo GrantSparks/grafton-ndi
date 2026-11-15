@@ -215,6 +215,13 @@ impl WakerSlot {
 struct Shared<T> {
     cancelled: AtomicBool,
     slot: Mutex<Slot<T>>,
+    on_take: Option<Arc<dyn OnTake>>,
+}
+
+/// An internal result handoff hook. Only creation registers one, so ordinary
+/// command results need no knowledge of handles or their owner threads.
+trait OnTake: Send + Sync {
+    fn on_take(&self);
 }
 
 enum Slot<T> {
@@ -248,7 +255,9 @@ enum Stage<T> {
 /// and operation deadlines start at submission, including any time spent queued.
 /// Dropping an unsubmitted future does nothing. After submission, dropping an
 /// ordinary command before it begins cancels it; once it has begun, dropping
-/// only discards the result. Submitted requests to stop, finish or close run
+/// only discards the result. Dropping a creation operation before receiving
+/// its handle never waits for owner shutdown, including after creation has
+/// completed. Submitted requests to stop, finish or close run
 /// even if their future is dropped, as those methods say.
 ///
 /// An unsubmitted command does not keep an existing player or recorder alive.
@@ -322,7 +331,7 @@ impl<T> Future for FileOperation<T> {
         let stage = this.stage.get_mut().unwrap_or_else(PoisonError::into_inner);
         let value = match stage {
             Stage::Live(Live::Waiting(shared)) => {
-                WakerSlot::poll(&shared.slot, cx.waker(), |slot, _| match slot {
+                let value = WakerSlot::poll(&shared.slot, cx.waker(), |slot, _| match slot {
                     Slot::Pending(waker) => WakerPoll::Pending(Some(waker)),
                     Slot::Ready(_) => {
                         let Slot::Ready(value) = std::mem::replace(slot, Slot::Taken) else {
@@ -331,7 +340,13 @@ impl<T> Future for FileOperation<T> {
                         WakerPoll::Ready(value, None)
                     }
                     Slot::Taken => unreachable!("a response is taken only by its operation"),
-                })
+                });
+                if value.as_ref().is_some_and(Result::is_ok) {
+                    if let Some(hook) = &shared.on_take {
+                        hook.on_take();
+                    }
+                }
+                value
             }
             Stage::Live(Live::Immediate(_)) => {
                 let Stage::Live(Live::Immediate(value)) = std::mem::replace(stage, Stage::Done)
@@ -376,9 +391,14 @@ struct Reply<T> {
 }
 
 fn operation<T>() -> (Reply<T>, Live<T>) {
+    operation_with_hook(None)
+}
+
+fn operation_with_hook<T>(on_take: Option<Arc<dyn OnTake>>) -> (Reply<T>, Live<T>) {
     let shared = Arc::new(Shared {
         cancelled: AtomicBool::new(false),
         slot: Mutex::new(Slot::Pending(WakerSlot::default())),
+        on_take,
     });
     (
         Reply {
@@ -869,6 +889,9 @@ struct Closing {
 }
 
 struct Control {
+    /// Creation has returned its handle to the caller. Only a claimed handle
+    /// can make its last ordinary drop wait for finalization.
+    claimed: AtomicBool,
     shutdown: AtomicBool,
     /// The first close or last-handle drop starts the one finalization budget.
     shutdown_at: Mutex<Option<Instant>>,
@@ -878,9 +901,16 @@ struct Control {
     closing: Mutex<Closing>,
 }
 
+impl OnTake for Control {
+    fn on_take(&self) {
+        self.claimed.store(true, Ordering::Release);
+    }
+}
+
 impl Control {
     fn new() -> Self {
         Self {
+            claimed: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             shutdown_at: Mutex::new(None),
             failed: AtomicBool::new(false),
@@ -1285,10 +1315,10 @@ struct Worker<H: Owner> {
 
 impl<H: Owner> Drop for Worker<H> {
     fn drop(&mut self) {
-        // An explicit close has a future to report through. A plain drop has
-        // nothing else, so it waits here: when it returns, the owner thread
-        // has destroyed the native object, and a recorder has had its file
-        // finalized first.
+        // A handle received by the caller waits on its plain last drop: the
+        // native object is destroyed and a recorder's file finalized first.
+        // A handle still in its creation response cannot be closed by the
+        // caller, so cancellation only requests shutdown and detaches.
         let closing = self.control.request_shutdown();
         let Some(thread) = lock(&self.thread).take() else {
             return;
@@ -1296,7 +1326,7 @@ impl<H: Owner> Drop for Worker<H> {
         // A File thread may release this last handle through an executor's
         // waker callback. It must not stall the timer/probe thread or join
         // an owner that could join it back while releasing another handle.
-        if !closing && !FILE_THREAD.get() {
+        if self.control.claimed.load(Ordering::Acquire) && !closing && !FILE_THREAD.get() {
             // A panic on the owner thread was already reported to its commands.
             let _ = thread.join();
         }
@@ -1491,7 +1521,7 @@ fn spawn_owner_now<H: Owner, T: Send + 'static>(
         events: Arc::clone(&events),
         thread: Mutex::new(None),
     });
-    let (ready, future) = operation();
+    let (ready, future) = operation_with_hook(Some(control.clone()));
     let thread_worker = Arc::clone(&worker);
     let thread_control = Arc::clone(&control);
     let thread_events = Arc::clone(&events);
@@ -1696,6 +1726,9 @@ impl ProbeQueue {
 ///
 /// # Dropping blocks
 ///
+/// This applies after creation returns the handle. Dropping its creation
+/// operation before receiving the handle requests cleanup without waiting.
+///
 /// Dropping the last clone stops playback, removes the advertised source and
 /// then **blocks the dropping thread** until the player's thread has
 /// destroyed the player, for as long as the SDK takes. When the drop
@@ -1880,6 +1913,9 @@ impl AsyncFilePlayer {
 /// blocks the executor.
 ///
 /// # Dropping blocks
+///
+/// This applies after creation returns the handle. Dropping its creation
+/// operation before receiving the handle requests cleanup without waiting.
 ///
 /// Dropping the last clone **blocks the dropping thread** until the
 /// recorder's thread has finished: it stops a session that is still open,
@@ -2820,6 +2856,90 @@ mod tests {
         closed(block_on(pending_wait));
         closed(block_on(worker.events.wait(Duration::from_millis(10))));
         block_on(worker.control.request_close()).unwrap();
+    }
+
+    /// A blocked destructor makes joining observable without timing how long
+    /// normal native destruction takes. Both paths use the same created owner.
+    fn check_delivered_creation_drop(claimed: bool) {
+        struct DeliveryWake(Sender<()>);
+        impl Wake for DeliveryWake {
+            fn wake(self: Arc<Self>) {
+                let _ = self.0.send(());
+            }
+        }
+        struct HeldDrop {
+            entered: Sender<thread::ThreadId>,
+            release: Receiver<()>,
+            finished: Sender<()>,
+        }
+        impl Owner for HeldDrop {
+            type Event = ();
+            fn poll_native(&mut self) -> Result<Option<()>> {
+                Ok(None)
+            }
+        }
+        impl Drop for HeldDrop {
+            fn drop(&mut self) {
+                self.entered.send(thread::current().id()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                self.finished.send(()).unwrap();
+            }
+        }
+        let (create_release, create_gate) = mpsc::channel();
+        let (delivered, delivery) = mpsc::channel();
+        let (drop_entered, drop_entry) = mpsc::channel();
+        let (drop_release, drop_gate) = mpsc::channel();
+        let (drop_finished, drop_finish) = mpsc::channel();
+        let mut creation = spawn_owner(
+            "file-test-creation-handoff",
+            move || {
+                create_gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(HeldDrop {
+                    entered: drop_entered,
+                    release: drop_gate,
+                    finished: drop_finished,
+                })
+            },
+            AsyncFileOptions::new(),
+            |worker| worker,
+        );
+        let waker = Waker::from(Arc::new(DeliveryWake(delivered)));
+        assert!(Pin::new(&mut creation)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        create_release.send(()).unwrap();
+        delivery.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (drop_returned, drop_return) = mpsc::channel();
+        let dropper = if claimed {
+            let worker = block_on(creation).unwrap();
+            thread::spawn(move || {
+                drop(worker);
+                drop_returned.send(()).unwrap();
+            })
+        } else {
+            thread::spawn(move || {
+                drop(creation);
+                drop_returned.send(()).unwrap();
+            })
+        };
+        let owner_thread = drop_entry.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_ne!(owner_thread, dropper.thread().id());
+        let returned = drop_return.recv_timeout(Duration::from_millis(100));
+        // Always release and join before asserting, including on a regression.
+        drop_release.send(()).unwrap();
+        drop_finish.recv_timeout(Duration::from_secs(1)).unwrap();
+        dropper.join().unwrap();
+        assert_eq!(returned.is_ok(), !claimed);
+    }
+
+    #[test]
+    fn dropping_a_delivered_unclaimed_creation_does_not_join() {
+        check_delivered_creation_drop(false);
+    }
+
+    #[test]
+    fn dropping_a_received_handle_still_joins_its_owner() {
+        check_delivered_creation_drop(true);
     }
 
     #[test]

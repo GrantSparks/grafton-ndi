@@ -190,6 +190,11 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Performance and correctness
 
+- Receive allocator replacement installs the new native callbacks before
+  retiring the old policy, avoiding dropped frames while the setter runs or
+  the old policy's destructor blocks.
+- Cancelling an async File creation whose handle has not reached the caller
+  requests cleanup without joining its owner thread, even after delivery.
 - Every image encode into a writer flushes on success and preserves the first
   writer error, including final JPEG and WebP writes from an owned `BufWriter`.
 - Custom receive buffers use the same stride validation as their requests.
@@ -308,9 +313,6 @@ linkage and Rust 1.88 baseline.
 
 ### Fixed
 
-- Receive allocator replacement installs the new native callbacks before
-  retiring the old policy, avoiding dropped frames while the setter runs or
-  the old policy's destructor blocks.
 - FrameSync audio reports no timestamp when the synchronizer supplies its
   zero marker for unknown source timing, including in owned copies.
 
