@@ -2926,3 +2926,41 @@ fn frame_from_rgba(format: PixelFormat, width: usize, height: usize, rgba: &[u8]
     })
     .frame(None)
 }
+
+#[test]
+fn png_scratch_failure_precedes_every_output_byte() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::FAIL_SCRATCH_RESERVATION.with(|fail| fail.set(false));
+        }
+    }
+    for depth in [SampleDepth::Eight, SampleDepth::Sixteen] {
+        for hdr in [false, true] {
+            let frame = VideoFrame::builder()
+                .resolution(2, 2)
+                .pixel_format(PixelFormat::Bgra)
+                .metadata(if hdr {
+                    "<ndi_color_info primaries=\"bt_2020\" transfer=\"bt_2100_pq\"/>"
+                } else {
+                    ""
+                })
+                .build()
+                .unwrap();
+            let options = options(ImageFormat::Png)
+                .depth(depth)
+                .hdr(HdrPolicy::CodeValues);
+            let mut output = Vec::new();
+            let _reset = Reset;
+            super::FAIL_SCRATCH_RESERVATION.with(|fail| fail.set(true));
+            let error = crate::ImageWorkspace::new()
+                .encode_to(&frame, &options, &mut output)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::InvalidFrame(crate::FrameDefect::ImageScratchAllocation(_))
+            ));
+            assert!(output.is_empty(), "{depth:?} HDR={hdr}");
+        }
+    }
+}

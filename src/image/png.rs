@@ -19,6 +19,11 @@ pub(super) fn encode<P: Sample>(
     out: &mut dyn Write,
     row: &mut Vec<u8>,
 ) -> Result<()> {
+    // Complete wrapper storage preparation before the signature, IHDR or cICP.
+    // Eligible RGBA rows borrow the source and need no conversion storage.
+    if pixels.rgba_rows().is_none() {
+        super::resize_scratch(row, shape.row_bytes)?;
+    }
     let mut encoder = ::png::Encoder::new(out, shape.width, shape.height);
     encoder.set_color(match shape.channels {
         Channels::Rgba => ::png::ColorType::Rgba,
@@ -48,7 +53,6 @@ pub(super) fn encode<P: Sample>(
                 stream.write_all(row)?;
             }
         } else {
-            super::resize_scratch(row, shape.row_bytes)?;
             for y in 0..shape.height as usize {
                 pixels.pack_row(y, shape.channels, row);
                 stream.write_all(row)?;
