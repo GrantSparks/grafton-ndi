@@ -17,6 +17,15 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- `InvalidFrame`, `InvalidInput` and `UnexpectedSdkResult` carry typed
+  `FrameDefect`, `InputDefect` and `SdkResultDefect` causes. Receiver capture
+  failures use `ConnectionLost`; initialization retains `InitializationFailure`
+  and invalid UTF-8 retains `Utf8Error`. Load-refusal symbol names borrow static
+  `CStr` values. Update matches as described in the migration guide.
+- Recorder start and rollover refuse output paths that cannot be reported
+  exactly in native events (currently 4094 UTF-8 bytes), reserving at least
+  20 digits per index token so later rollovers remain reportable.
+
 - `Finder::watch` replaces `Finder::wait_for_sources`. Keep one `SourceWatch`
   per consumer and take snapshots and wait through that cursor, so concurrent
   lookups cannot hide reports between a snapshot and its next wait.
@@ -128,6 +137,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Added
 
+- `AvSync::synchronize_ref` and `queued_audio_ref` lend matched SDK audio
+  through `AvSyncOutcomeRef` and `AvSyncAudioRef`. Send and convert it in place,
+  retain it with `to_owned`, or reuse owned storage with `copy_into`; owned
+  synchronization keeps the same API and shares the borrowed capture path.
 - `PictureAspectRatio` validates finite, nonnegative display ratios, including
   the SDK's square-pixel request. Existing `f32` convenience setters remain.
 - `QueuedSender::close` returns every retained frame with its submission id,
@@ -186,6 +199,27 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Performance and correctness
 
+- Validation, timeout, HDR, withheld-metadata and completion refusals retain
+  typed evidence without formatting allocations. Wide cold-path evidence uses
+  boxes only on 32-bit targets; arbitrary color, encoder, filename-token and
+  rejected-address diagnostics remain boxed on every target. Diagnostic text
+  and the existing error-size bound are preserved.
+
+- Synchronous and async recorder starts both consume unreadable stale events;
+  only a queue that fails to drain refuses the next session.
+- Receive allocator replacement installs the new native callbacks before
+  retiring the old policy, avoiding dropped frames while the setter runs or
+  the old policy's destructor blocks.
+- Cancelling an async File creation whose handle has not reached the caller
+  requests cleanup without joining its owner thread, even after delivery.
+- Audio and metadata frame implementations supply only validated accessors;
+  shared views, copies and native descriptors cannot be overridden. Packed
+  audio copies derive and check their own layout. Failed packed-copy checks
+  leave reused video and audio destinations valid after unwinding.
+- Host lookups and `SourceCache` accept NDI machine names containing spaces,
+  underscores and other label text, while rejecting endpoint and URI syntax.
+  Matching and cache keys preserve ASCII case/final-dot equivalence without
+  allocating; machine-name queries match only SDK label machine components.
 - Every image encode into a writer flushes on success and preserves the first
   writer error, including final JPEG and WebP writes from an owned `BufWriter`.
 - Custom receive buffers use the same stride validation as their requests.

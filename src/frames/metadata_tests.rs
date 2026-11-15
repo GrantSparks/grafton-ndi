@@ -200,7 +200,7 @@ where
     });
     assert_eq!(allocations, 0);
     assert_eq!(
-        owned.to_raw().p_metadata.is_null(),
+        owned.audio_descriptor().p_metadata.is_null(),
         status != FrameMetadataStatus::Text
     );
     owned
@@ -326,8 +326,8 @@ fn withheld_video_color_is_refused_on_receiver_framesync_and_owned_frames() {
                     let Error::InvalidFrame(message) = source.color_info().unwrap_err() else {
                         panic!("expected an invalid color description")
                     };
-                    assert!(message.contains(&format!("{status:?}")), "{message}");
-                    assert!(message.contains("ColorPolicy::Override"), "{message}");
+                    assert!(matches!(message, crate::FrameDefect::ColorMetadataWithheld {status:found} if found==status), "{message}");
+
                 }
                 assert!(matches!(frame.color_info(), Err(Error::InvalidFrame(_))));
                 assert!(matches!(owned.color_info(), Err(Error::InvalidFrame(_))));
@@ -495,7 +495,7 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
                     video_source.metadata().is_none()
                 );
                 assert_eq!(
-                    audio.to_raw().p_metadata.is_null(),
+                    audio.audio_descriptor().p_metadata.is_null(),
                     audio_source.metadata().is_none()
                 );
                 assert_eq!(video.metadata.retained_bytes(), video_capacity);

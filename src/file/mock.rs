@@ -175,6 +175,8 @@ pub(super) struct Recorder {
     pub(super) created_without_proxy: std::sync::atomic::AtomicBool,
     /// Make the next captured event larger than this crate's layout of it.
     pub(super) oversize_next_event: std::sync::atomic::AtomicBool,
+    /// Every capture reports an oversized event, even when its queue is empty.
+    pub(super) oversize_every_event: std::sync::atomic::AtomicBool,
     pub(super) dropped_events: std::sync::atomic::AtomicU64,
     pub(super) stops: std::sync::atomic::AtomicUsize,
     /// Calls that wait for an event, rather than the owner's nonblocking pump.
@@ -221,6 +223,7 @@ impl Recorder {
             created_pattern: Default::default(),
             created_without_proxy: Default::default(),
             oversize_next_event: Default::default(),
+            oversize_every_event: Default::default(),
             dropped_events: Default::default(),
             stops: Default::default(),
             waits: Default::default(),
@@ -387,8 +390,13 @@ unsafe extern "C" fn recorder_capture(
         let wait = std::time::Duration::from_millis(wait_ms.into());
         (events, _) = recorder.changed.wait_timeout(events, wait).unwrap();
     }
-    let Some(event) = events.pop_front() else {
-        return NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_none;
+    let event = if recorder.oversize_every_event.load(Ordering::Acquire) {
+        recorder_event(OPEN_FAILED, TAKE)
+    } else {
+        let Some(event) = events.pop_front() else {
+            return NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_none;
+        };
+        event
     };
     if event.type_ == FILE_CLOSED {
         recorder.close_captured.store(true, Ordering::Release);
@@ -396,7 +404,9 @@ unsafe extern "C" fn recorder_capture(
     // SAFETY: the wrapper passes storage for one event, followed by its guard.
     unsafe {
         out.write(event);
-        if recorder.oversize_next_event.swap(false, Ordering::AcqRel) {
+        if recorder.oversize_next_event.swap(false, Ordering::AcqRel)
+            || recorder.oversize_every_event.load(Ordering::Acquire)
+        {
             out.add(1).cast::<u8>().write_bytes(0, 16);
         }
     }

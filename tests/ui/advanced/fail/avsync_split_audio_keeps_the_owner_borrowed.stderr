@@ -1,0 +1,13 @@
+error[E0505]: cannot move out of `sync` because it is borrowed
+  --> tests/ui/advanced/fail/avsync_split_audio_keeps_the_owner_borrowed.rs:10:20
+   |
+ 2 | fn recover(mut sync: AvSync) {
+   |            -------- binding `sync` declared here
+ 3 |     let frame = {
+ 4 |         let (capture, _) = sync.split();
+   |                            ---- borrow of `sync` occurs here
+...
+10 |     let receiver = sync.into_receiver();
+   |                    ^^^^ move out of `sync` occurs here
+11 |     drop((frame, receiver));
+   |           ----- borrow later used here

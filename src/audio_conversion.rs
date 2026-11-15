@@ -6,6 +6,7 @@
 //! descriptors, which have no metadata or timestamp fields.
 
 use crate::{
+    frames::AudioPartsExt,
     frames::{AudioSource, ValidatedAudioLayout},
     sender::AudioSendMode,
     sys::{self, bindings::*},
@@ -60,10 +61,11 @@ impl AudioShape {
             .filter(|&channels| channels > 0 && len.is_multiple_of(channels))
             .and_then(|channels| u32::try_from(len / channels).ok())
             .filter(|&samples| samples > 0)
-            .ok_or_else(|| {
-                Error::InvalidFrame(format!(
-                    "interleaved audio has {len} samples, which is not a non-zero multiple of {num_channels} channels"
-                ))
+            .ok_or({
+                Error::InvalidFrame(crate::FrameDefect::InterleavedAudioLength {
+                    actual: len,
+                    channels: num_channels,
+                })
             })?;
         Self::new(sample_rate, num_channels, num_samples)
     }
@@ -79,10 +81,12 @@ impl AudioShape {
 
     fn check_output(self, length: usize) -> Result<()> {
         if length < self.0.sample_count() {
-            return Err(Error::InvalidFrame(format!(
-                "audio destination has {length} samples, requires {}",
-                self.0.sample_count()
-            )));
+            return Err(Error::InvalidFrame(
+                crate::FrameDefect::AudioDestinationLength {
+                    actual: length,
+                    minimum: self.0.sample_count(),
+                },
+            ));
         }
         Ok(())
     }
@@ -94,10 +98,7 @@ impl AudioShape {
             || frame.num_channels() != self.0.num_channels()
             || frame.num_samples() != self.0.num_samples()
         {
-            return Err(Error::InvalidFrame(
-                "planar destination rate, channels and samples must match the interleaved source"
-                    .into(),
-            ));
+            return Err(Error::InvalidFrame(crate::FrameDefect::PlanarAudioMismatch));
         }
         Ok(())
     }
@@ -252,7 +253,7 @@ macro_rules! conversions {
         pub fn $into_method(&self, source: &$input<'_>, destination: &mut AudioFrame) -> Result<()> {
             source.shape.check_planar(destination)?;
             let source = source.raw();
-            let mut raw = destination.to_raw();
+            let mut raw = destination.audio_descriptor();
             raw.p_data = destination.data_mut().as_mut_ptr().cast();
             // SAFETY: Source and destination have matching checked dimensions;
             // the exclusively borrowed output is initialized and correctly aligned.
@@ -357,7 +358,6 @@ impl<M: AudioSendMode> Sender<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::AudioParts;
 
     #[test]
     fn captured_audio_sources_lend_the_original_strided_descriptor() {

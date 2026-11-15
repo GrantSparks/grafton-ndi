@@ -74,21 +74,23 @@ pub use finder::ExtendedSource;
 pub use kvm::*;
 pub use kvm_receiver::KvmReceiver;
 pub use packets::*;
+pub(crate) use queued::QueueLoans;
 pub use queued::*;
 pub use receive::*;
 pub use send::*;
+pub(crate) use send::{PendingStreams, PendingVideo};
 pub use sync::*;
 
-/// [`Error::InvalidFrame`](crate::Error::InvalidFrame) with `message`: a frame
+/// [`Error::InvalidFrame`](crate::Error::InvalidFrame) with its typed `cause`: a frame
 /// or packet that is malformed, or that cannot be built or sent.
-fn invalid_frame(message: impl Into<String>) -> crate::Error {
-    crate::Error::InvalidFrame(message.into())
+fn invalid_frame(cause: crate::FrameDefect) -> crate::Error {
+    crate::Error::InvalidFrame(cause)
 }
 
-/// [`Error::InvalidInput`](crate::Error::InvalidInput) with `message`: a value
+/// [`Error::InvalidInput`](crate::Error::InvalidInput) with its typed `cause`: a value
 /// this module was given that it cannot use, whatever frame it is for.
-fn invalid_input(message: impl Into<String>) -> crate::Error {
-    crate::Error::InvalidInput(message.into())
+fn invalid_input(cause: crate::InputDefect) -> crate::Error {
+    crate::Error::InvalidInput(cause)
 }
 
 /// `value` when it is in `1..=i32::MAX`, the range of the SDK's signed

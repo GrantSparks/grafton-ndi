@@ -48,11 +48,12 @@ impl<T: Copy + Default> OutParam<T> {
     /// layout of `T`, in which case nothing it wrote can be trusted.
     pub(super) fn read(&self) -> Result<T> {
         if self.guard.iter().any(|&byte| byte != SENTINEL) {
-            return Err(Error::UnexpectedSdkResult(format!(
-                "the File library wrote past the {} bytes this crate's SDK headers give {}",
-                size_of::<T>(),
-                std::any::type_name::<T>()
-            )));
+            return Err(Error::UnexpectedSdkResult(
+                crate::SdkResultDefect::FileStructureTooLarge {
+                    bytes: size_of::<T>(),
+                    name: std::any::type_name::<T>(),
+                },
+            ));
         }
         Ok(self.value)
     }
@@ -92,7 +93,11 @@ pub(super) fn capture_event<T: Copy + Default, K: PartialEq>(
         return Ok(None);
     }
     if kind != event_type(&event) {
-        return Err(Error::UnexpectedSdkResult(mismatch.into()));
+        return Err(Error::UnexpectedSdkResult(
+            crate::SdkResultDefect::EventTypeMismatch {
+                diagnostic: mismatch,
+            },
+        ));
     }
     Ok(Some(event))
 }
@@ -118,7 +123,13 @@ mod tests {
         // `larger` stays within them.
         unsafe { out.as_mut_ptr().cast::<u8>().write_bytes(0, larger) };
         let error = out.read().unwrap_err();
-        assert!(matches!(error, Error::UnexpectedSdkResult(_)), "{error}");
+        assert!(
+            matches!(error,
+            Error::UnexpectedSdkResult(crate::SdkResultDefect::FileStructureTooLarge { bytes, name })
+            if bytes == size_of::<NDIlib_file_recorder_event_t>()
+                && name == std::any::type_name::<NDIlib_file_recorder_event_t>()),
+            "{error}"
+        );
     }
 
     #[test]
@@ -156,10 +167,16 @@ mod tests {
         unsafe { out.cast::<u8>().add(size_of::<T>()).write(0) };
     }
 
-    fn assert_guard_damage<T: std::fmt::Debug>(result: Result<T>) {
-        assert!(
-            matches!(result, Err(Error::UnexpectedSdkResult(message)) if message.contains("wrote past")),
-            "a damaged guard must be checked before the native result"
+    fn assert_guard_damage<T: std::fmt::Debug>(result: Result<Option<T>>) {
+        let Err(Error::UnexpectedSdkResult(cause)) = result else {
+            panic!("a damaged guard must be checked before the native result: {result:?}");
+        };
+        assert_eq!(
+            cause,
+            crate::SdkResultDefect::FileStructureTooLarge {
+                bytes: size_of::<T>(),
+                name: std::any::type_name::<T>()
+            }
         );
     }
 
@@ -266,22 +283,22 @@ mod tests {
                 SourceSpec::new("mock source").unwrap(),
             ))
             .unwrap();
-        for (result, owner) in [
+        for (result, diagnostic) in [
             (
                 player.poll_event(std::time::Duration::ZERO).map(|_| ()),
-                "player",
+                "the player returned one event type and stored another",
             ),
             (
                 recorder.poll_event(std::time::Duration::ZERO).map(|_| ()),
-                "recorder",
+                "the recorder returned one event type and stored another",
             ),
         ] {
-            let Err(Error::UnexpectedSdkResult(message)) = result else {
-                panic!("the {owner} must refuse mismatched event types: {result:?}");
+            let Err(Error::UnexpectedSdkResult(cause)) = result else {
+                panic!("mismatched event types were not refused: {result:?}");
             };
             assert_eq!(
-                message,
-                format!("the {owner} returned one event type and stored another")
+                cause,
+                crate::SdkResultDefect::EventTypeMismatch { diagnostic }
             );
         }
     }

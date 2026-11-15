@@ -29,8 +29,8 @@ use grafton_ndi::{
     capabilities::{CapabilityStatus, RuntimeFeature, SdkEdition},
     AudioFrame, Error, Finder, FinderOptions, FrameRate, MediaTypes, MetadataFrame, Ndi, Receiver,
     ReceiverBandwidth, ReceiverColorFormat, ReceiverMode, ReceiverOptions, ScanType, Sender,
-    SenderMode, SenderOptions, SettingChange, Source, StreamTier, Tally, Timecode, VideoFrame,
-    VideoFrameRef,
+    SenderMode, SenderOptions, SettingChange, Source, SourceCache, StreamTier, Tally, Timecode,
+    VideoFrame, VideoFrameRef,
 };
 use std::{
     sync::{
@@ -2718,6 +2718,57 @@ fn a_finder_is_told_the_metadata_a_sender_advertises() {
     );
 }
 
+/// Per-sender machine names are SDK label text, including spaces and underscores,
+/// and remain selectable through a cache by another ASCII letter case.
+#[test]
+fn configured_machine_names_are_discovered_and_cached_without_dns_restrictions() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let machine = format!("Grafton Studio_{}", std::process::id());
+    let group = common::unique_name("machine-query");
+    let config =
+        AdvancedConfig::parse(format!(r#"{{"ndi":{{"machinename":"{machine}"}}}}"#)).unwrap();
+    let sender = Sender::new(
+        &ndi,
+        &options("machine-query").groups(&group).config(config),
+    )
+    .unwrap();
+    let advertised = sender.source().unwrap();
+    assert!(
+        advertised
+            .name()
+            .split_once(" (")
+            .is_some_and(|(label, _)| label.eq_ignore_ascii_case(&machine)),
+        "the configured machine name was not advertised: {:?}",
+        advertised.name()
+    );
+    let finder = Finder::new(
+        &ndi,
+        &FinderOptions::new().groups(&group).extra_ips("127.0.0.1"),
+    )
+    .unwrap();
+    let discovered = finder
+        .find_source_by_name(advertised.name(), PATIENCE)
+        .unwrap()
+        .expect("the finder did not discover its configured-machine-name sender");
+    assert!(discovered.matches_host(&machine.to_ascii_uppercase()));
+    let cache = SourceCache::new(finder);
+    let matches = cache
+        .sources_by_host(&machine.to_ascii_lowercase(), SLICE)
+        .unwrap();
+    assert!(
+        matches
+            .iter()
+            .any(|source| source.name() == advertised.name()),
+        "the cache could not select its sender by machine name: {matches:?}"
+    );
+    assert_eq!(cache.len(), 1);
+    cache.invalidate(&format!("{}.", machine.to_ascii_uppercase()));
+    assert!(cache.is_empty());
+}
+
 /// A real encoded picture exercises the decoder and planar pixel layout. The
 /// adjacent-pixel chroma pattern detects accidental 4:2:2/4:2:0 conversion.
 #[test]
@@ -3582,4 +3633,114 @@ fn borrowed_packet_capture_decodes_formats_outside_its_preset() {
             return;
         }
     }
+}
+
+/// AV-sync loans keep separate native buffers across consecutive requests.
+/// Borrowing, owned conversion, forwarding and reverse-order release all use
+/// the same matched samples and known sender timestamp.
+#[test]
+fn avsync_borrows_two_results_and_releases_them_out_of_order() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let sender = Sender::new(
+        &ndi,
+        &SenderOptions::new(common::unique_name("avsync-loans"))
+            .clock_video(true)
+            .clock_audio(false),
+    )
+    .unwrap();
+    let receiver = Receiver::new(
+        &ndi,
+        &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap()),
+    )
+    .unwrap();
+    let sync = AvSync::new(receiver).unwrap();
+    let forward = Sender::new(
+        &ndi,
+        &SenderOptions::new(common::unique_name("avsync-forward")).clock_audio(false),
+    )
+    .unwrap();
+    let listener = Receiver::new(
+        &ndi,
+        &ReceiverOptions::new(common::loopback_source(&ndi, &forward).unwrap()),
+    )
+    .unwrap();
+    let video = VideoFrame::builder()
+        .resolution(64, 32)
+        .frame_rate(FrameRate::new(30, 1).unwrap())
+        .build()
+        .unwrap();
+    let audio = AudioFrame::builder()
+        .sample_rate(48_000)
+        .num_channels(2)
+        .num_samples(1600)
+        .data(vec![0.25; 3200])
+        .build()
+        .unwrap();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&stop);
+        scope.spawn(|| {
+            while !stop.load(Ordering::Acquire) {
+                sender.send_video(&video).unwrap();
+                sender.send_audio(&audio);
+            }
+        });
+        let next = || {
+            let deadline = Instant::now() + PATIENCE;
+            loop {
+                assert!(Instant::now() < deadline, "no borrowed AV-sync audio");
+                let Some(video) = sync.receiver().video().capture_ref(SLICE).unwrap() else {
+                    continue;
+                };
+                if let AvSyncOutcomeRef::Audio { frame, .. } = sync
+                    .synchronize_ref(stamped(&video), AvSyncRequest::automatic())
+                    .unwrap()
+                {
+                    break frame;
+                }
+            }
+        };
+        let first = next();
+        let first_samples = first.to_owned();
+        let second = next();
+        assert!(first.timestamp().is_some() && second.timestamp().is_some());
+        assert_ne!(
+            first.channel_data(0).unwrap().as_ptr(),
+            second.channel_data(0).unwrap().as_ptr()
+        );
+        assert_eq!(first.channel_data(0), first_samples.channel_data(0));
+        assert!(first
+            .channels()
+            .chain(second.channels())
+            .flatten()
+            .all(|&sample| sample == 0.25));
+        let copied = AvSyncOutcomeRef::Audio {
+            frame: second,
+            samples_adjusted: false,
+        };
+        let AvSyncOutcome::Audio { frame: owned, .. } = copied.to_owned() else {
+            panic!("owned audio")
+        };
+        if let AvSyncOutcomeRef::Audio { frame, .. } = &copied {
+            assert_eq!(frame.channel_data(0), owned.channel_data(0));
+            let deadline = Instant::now() + PATIENCE;
+            loop {
+                forward.send_audio(frame);
+                if let Some(received) = listener.audio().capture(SLICE).unwrap() {
+                    assert!(received.data().iter().all(|&sample| sample == 0.25));
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "borrowed forwarding produced no audio"
+                );
+            }
+        }
+        drop(copied);
+        assert_eq!(first.channel_data(0), first_samples.channel_data(0));
+        drop(first);
+    });
 }

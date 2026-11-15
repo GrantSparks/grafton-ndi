@@ -131,7 +131,7 @@ impl<'rx> CompressedAudioRef<'rx> {
         let frame = unsafe {
             ValidatedFrame::validate(frame, |raw| {
                 let (codec, protected) = AudioCodec::from_outer(raw.FourCC)
-                    .ok_or_else(|| invalid_frame("Unknown compressed audio FourCC"))?;
+                    .ok_or_else(|| invalid_frame(crate::FrameDefect::UnknownCompressedAudio))?;
                 let parameters = AudioParameters::from_sdk(raw)?;
                 // SAFETY: this delivered union names the guard's initialized
                 // readable payload; packet_bytes checks the positive extent.

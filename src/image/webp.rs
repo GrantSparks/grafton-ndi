@@ -33,7 +33,10 @@ pub(super) fn encode_lossless(
         .encode(image, width, height, color)
         .map_err(|error| match error {
             image_webp::EncodingError::IoError(error) => Error::Io(error),
-            error => Error::InvalidFrame(format!("WebP encoding failed: {error}")),
+            error => Error::InvalidFrame(crate::FrameDefect::EncodingFailed {
+                codec: crate::ImageCodec::Webp,
+                diagnostic: error.to_string().into_boxed_str(),
+            }),
         })
 }
 
@@ -67,7 +70,12 @@ pub(super) fn encode_lossy(
         },
         &config,
     )
-    .map_err(|error| Error::InvalidFrame(format!("WebP encoding failed: {error}")))
+    .map_err(|error| {
+        Error::InvalidFrame(crate::FrameDefect::EncodingFailed {
+            codec: crate::ImageCodec::Webp,
+            diagnostic: error.to_string().into_boxed_str(),
+        })
+    })
 }
 
 /// Borrow only initialized active pixels; otherwise reuse a converted image.

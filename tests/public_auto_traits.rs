@@ -50,12 +50,16 @@ fn split_views_stay_on_the_borrowing_thread() {
     #[cfg(feature = "advanced")]
     {
         use grafton_ndi::{
-            advanced::{AvSyncCapture, ReceiverControls},
+            advanced::{AvSyncAudioRef, AvSyncCapture, AvSyncOutcomeRef, ReceiverControls},
             RawCapture,
         };
         lacks! {
             AvSyncCapture<'static>: Send;
             AvSyncCapture<'static>: Sync;
+            AvSyncAudioRef<'static>: Send;
+            AvSyncAudioRef<'static>: Sync;
+            AvSyncOutcomeRef<'static>: Send;
+            AvSyncOutcomeRef<'static>: Sync;
             ReceiverControls<'static, RawCapture>: Send;
             ReceiverControls<'static, RawCapture>: Sync;
         }
@@ -273,6 +277,8 @@ fn advanced_types_keep_their_auto_traits() {
         ReceiverControls<'static, RawCapture>: RefUnwindSafe;
         AvSyncAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSyncOutcome: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AvSyncAudioRef<'static>: UnwindSafe, RefUnwindSafe;
+        AvSyncOutcomeRef<'static>: UnwindSafe, RefUnwindSafe;
         AvSyncRequest: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSyncVideo<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         ClockSource: Send, Sync, UnwindSafe, RefUnwindSafe;

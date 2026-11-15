@@ -1,4 +1,10 @@
 //! Broadcast a consumable native change report to concurrent Rust waiters.
+//!
+//! Finder's native model is pinned by `a_report_waits_for_the_next_native_wait`,
+//! `another_consumers_snapshot_leaves_the_report_for_the_next_wait` and
+//! `a_native_wait_consumes_the_report_it_returns` in
+//! `tests/change_notifications.rs`: reports survive idle intervals and snapshots,
+//! and a native wait consumes the report it returns.
 
 use std::sync::{Condvar, Mutex, MutexGuard};
 

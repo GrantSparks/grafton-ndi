@@ -684,9 +684,7 @@ impl Finder {
     pub fn find_source_by_name(&self, name: &str, timeout: Duration) -> Result<Option<Source>> {
         to_ms_checked(timeout)?;
         if name.is_empty() || name.contains('\0') {
-            return Err(Error::InvalidInput(
-                "Source name must be nonempty and contain no NUL".into(),
-            ));
+            return Err(Error::InvalidInput(crate::InputDefect::InvalidSourceName));
         }
         self.find_source(timeout, |source| source.name() == name)
     }
@@ -871,7 +869,8 @@ fn parse_authority(address: &str) -> Option<Authority<'_>> {
 #[derive(Clone, Copy)]
 enum HostQuery<'a> {
     Ip(IpAddr),
-    Name(&'a str),
+    Host(&'a str),
+    Machine(&'a str),
 }
 
 impl<'a> HostQuery<'a> {
@@ -884,32 +883,38 @@ impl<'a> HostQuery<'a> {
         if let Ok(ip) = ip_text.parse::<IpAddr>() {
             return Some(Self::Ip(ip));
         }
-        if host != ip_text || host.is_empty() || host.contains('\0') {
+        if host != ip_text {
             return None;
         }
         let name = host.strip_suffix('.').unwrap_or(host);
         if name.is_empty()
-            || (name.contains('.') && name.bytes().all(|c| c.is_ascii_digit() || c == b'.'))
-            || !name.split('.').all(|label| {
-                !label.is_empty()
-                    && label.len() <= 63
-                    && label.as_bytes()[0].is_ascii_alphanumeric()
-                    && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-                    && label
-                        .bytes()
-                        .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-            })
             || name.len() > 253
+            || name.trim() != name
+            || name.chars().any(char::is_control)
+            || name.contains([':', '/', '?', '#', '@', '[', ']', '(', ')'])
+            || (name.contains('.') && name.bytes().all(|c| c.is_ascii_digit() || c == b'.'))
         {
             return None;
         }
-        Some(Self::Name(name))
+        if name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                && label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        }) {
+            Some(Self::Host(name))
+        } else {
+            Some(Self::Machine(name))
+        }
     }
 
     fn matches(self, candidate: &str) -> bool {
         match self {
             Self::Ip(ip) => candidate.parse::<IpAddr>() == Ok(ip),
-            Self::Name(name) => candidate
+            Self::Host(name) | Self::Machine(name) => candidate
                 .strip_suffix('.')
                 .unwrap_or(candidate)
                 .eq_ignore_ascii_case(name),
@@ -919,7 +924,8 @@ impl<'a> HostQuery<'a> {
 
 /// Canonical retained cache identity. IPs use their numeric display spelling;
 /// names use the parser's final-dot policy and ASCII lowercase. Those domains
-/// are disjoint: valid names cannot contain colons or dotted numeric IP text.
+/// are disjoint: text that parses as an IP is always an IP query, and names
+/// cannot equal the dotted-numeric or colon-containing display of an IP.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct HostKey(String);
 
@@ -950,7 +956,7 @@ impl HostKeyBuffer {
                 write!(cursor, "{ip}").expect("IP fits in host key buffer");
                 key.len = cursor.position() as usize;
             }
-            HostQuery::Name(name) => {
+            HostQuery::Host(name) | HostQuery::Machine(name) => {
                 key.len = name.len();
                 key.bytes[..key.len].copy_from_slice(name.as_bytes());
                 key.bytes[..key.len].make_ascii_lowercase();
@@ -960,7 +966,8 @@ impl HostKeyBuffer {
     }
 
     fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.bytes[..self.len]).expect("host keys are ASCII")
+        std::str::from_utf8(&self.bytes[..self.len])
+            .expect("ASCII lowercase preserves a host key's UTF-8")
     }
 
     fn into_owned(self) -> HostKey {
@@ -993,8 +1000,9 @@ impl SourceAddress {
 
     /// Check whether this address has the exact host or IP.
     ///
-    /// Hostnames compare without ASCII case or a final DNS dot. Invalid bare-host
-    /// queries return false.
+    /// Hostnames compare without ASCII case or a final DNS dot. The query
+    /// grammar is defined by [`Source::matches_host`]. Machine-name queries
+    /// and invalid queries return false because an address has no machine label.
     ///
     /// # Arguments
     ///
@@ -1017,8 +1025,10 @@ impl SourceAddress {
     }
 
     fn matches_query(&self, query: HostQuery<'_>) -> bool {
-        self.authority()
-            .is_some_and(|authority| query.matches(authority.host))
+        !matches!(query, HostQuery::Machine(_))
+            && self
+                .authority()
+                .is_some_and(|authority| query.matches(authority.host))
     }
 
     /// Extract an explicit port from conventional host/port or URL syntax.
@@ -1147,14 +1157,26 @@ impl Source {
         self.address.as_ref()
     }
 
-    /// Check if this source matches a given host or IP address.
+    /// Check if this source matches a hostname, IP address or NDI machine name.
     ///
-    /// This checks the complete address host, or for hostname queries the
-    /// machine component of an SDK `MACHINE (Source Name)` label.
+    /// An IP query checks the complete address host numerically; IP literals may
+    /// have enclosing square brackets. A DNS hostname checks both the address
+    /// host and the machine component of an SDK
+    /// `MACHINE (Source Name)` label. Other machine-name queries check only that
+    /// machine component, never the label's source name or an address.
+    ///
+    /// Names are nonempty and at most 253 bytes after an optional final dot is
+    /// removed. They have no control characters, leading or trailing whitespace,
+    /// endpoint/URI delimiters (`: / ? # @ [ ]`), or label delimiters (`( )`).
+    /// Dotted-numeric text must be a complete IP address. DNS hostnames use
+    /// ASCII letters, digits and interior hyphens in labels of at most 63 bytes;
+    /// other accepted names, including spaces and underscores, are machine names.
+    /// Both name cases ignore a final dot and fold only ASCII letters: other
+    /// Unicode characters compare exactly. Invalid queries return false.
     ///
     /// # Arguments
     ///
-    /// * `host` - The hostname or IP address to match against
+    /// * `host` - The hostname, IP address or machine name to match against
     ///
     /// # Examples
     ///
@@ -1182,7 +1204,7 @@ impl Source {
         }
         match query {
             HostQuery::Ip(_) => false,
-            HostQuery::Name(_) => self
+            HostQuery::Host(_) | HostQuery::Machine(_) => self
                 .name
                 .split_once(" (")
                 .filter(|(_, source)| source.ends_with(')'))
@@ -1319,8 +1341,10 @@ impl Display for Source {
 ///
 /// Entries remain until [`Self::invalidate`] or [`Self::clear`]; they can contain
 /// offline endpoints and omit feeds announced after the original window. Empty
-/// results are not cached. Equivalent hostname case/final-dot and numeric IP
-/// spellings share an entry. DNS aliases otherwise remain distinct identities.
+/// results are not cached. The accepted grammar is [`Source::matches_host`]'s.
+/// Equivalent hostname or machine-name ASCII case/final-dot and numeric IP
+/// spellings share an entry. Other spellings, including DNS aliases, remain
+/// distinct identities.
 ///
 /// The cache is `Send + Sync`. Discovery runs outside its mutex so unrelated
 /// lookups and invalidation remain available; SDK snapshots retain their normal
@@ -1413,7 +1437,7 @@ impl SourceCache {
         &self.finder
     }
 
-    /// All feeds observed on a complete hostname or IP within `timeout`.
+    /// All feeds observed for a hostname, IP or NDI machine name within `timeout`.
     ///
     /// A cache hit returns owned descriptor copies without an SDK call. On a
     /// miss, observes the full window using the configured finder; zero makes
@@ -1431,9 +1455,9 @@ impl SourceCache {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] for a non-bare host or a timeout above
-    /// [`crate::MAX_TIMEOUT`], even on a cache hit; discovery/resource errors
-    /// propagate without filling an entry. IP hints must already be configured
+    /// [`Error::InvalidInput`] for a query outside [`Source::matches_host`]'s
+    /// grammar or a timeout above [`crate::MAX_TIMEOUT`], even on a cache hit;
+    /// discovery/resource errors propagate without filling an entry. IP hints must already be configured
     /// on the finder; this method does not change its discovery scope.
     pub fn sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
         self.entries.sources_by_host_with(host, timeout, |query| {
@@ -1501,9 +1525,8 @@ impl CachedSources {
         discover: impl FnOnce(HostQuery<'_>) -> Result<Vec<Source>>,
         mut copy: impl FnMut(&[Source]) -> Result<Vec<Source>>,
     ) -> Result<Vec<Source>> {
-        let query = HostQuery::parse(host).ok_or_else(|| {
-            Error::InvalidInput("Host must be a bare hostname or IP address".into())
-        })?;
+        let query = HostQuery::parse(host)
+            .ok_or(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))?;
         to_ms_checked(timeout)?;
         let key = HostKeyBuffer::new(query);
         let (snapshot, generation) = {
@@ -1691,6 +1714,9 @@ mod tests {
         };
         for variants in [
             vec!["camera.local", "CAMERA.LOCAL", "Camera.Local."],
+            vec!["Studio A", "STUDIO A", "studio a."],
+            vec!["STUDIO_PC", "studio_pc", "Studio_Pc."],
+            vec!["ÉTAGE A", "Étage a", "Étage A."],
             vec!["2001:db8::1", "[2001:0DB8:0:0:0:0:0:1]", "2001:db8:0::1"],
             vec!["192.0.2.1", "[192.0.2.1]"],
         ] {
@@ -1701,7 +1727,16 @@ mod tests {
                 }
             }
         }
-        for name in ["camera", "camera-1.local", "a.b.c", "123", &"a".repeat(63)] {
+        for name in [
+            "camera",
+            "camera-1.local",
+            "a.b.c",
+            "123",
+            "Studio A",
+            "studio_pc",
+            "Étage A",
+            &"a".repeat(63),
+        ] {
             let expected = host_key(name);
             // Vary each ASCII letter's case independently, then the final dot.
             for i in 0..name.len() {
@@ -1736,6 +1771,11 @@ mod tests {
             "::1",
             "::ffff:192.0.2.1",
             "123",
+            "studio a",
+            "studio-a",
+            "studio_a",
+            "Étage a",
+            "étage a",
         ];
         assert_eq!(
             distinct
@@ -1752,6 +1792,8 @@ mod tests {
         for (a, b) in [
             ("CAMERA.LOCAL", "camera.local"),
             ("camera.local.", "camera.local"),
+            ("STUDIO A", "studio a."),
+            ("STUDIO_PC.", "studio_pc"),
             ("[2001:0db8:0:0:0:0:0:1]", "2001:db8::1"),
         ] {
             for (first, second) in [(a, b), (b, a)] {
@@ -1797,7 +1839,7 @@ mod tests {
                 cache.clear();
                 assert!(cache
                     .sources_by_host_with(first, Duration::ZERO, |_| Err(Error::InvalidInput(
-                        "discovery failed".into()
+                        crate::InputDefect::InvalidHostQuery
                     )))
                     .is_err());
                 assert!(cache
@@ -1826,6 +1868,20 @@ mod tests {
         let ipv6 = SourceAddress::new("[2001:0db8:0:0:0:0:0:1]:5960");
         assert!(ipv6.matches_host("2001:db8::1"));
         assert!(ipv6.matches_host("[2001:db8::1]"));
+        let studio = Source::new("Studio A (Camera)");
+        assert!(studio.matches_host("studio a"));
+        assert!(studio.matches_host("STUDIO A."));
+        assert!(!studio.matches_host("Studio"));
+        assert!(!studio.matches_host("Camera"));
+        assert!(Source::new("STUDIO_PC (Camera)").matches_host("studio_pc"));
+        let unicode = Source::new("ÉTAGE A (Camera)");
+        assert!(unicode.matches_host("Étage a"));
+        assert!(!unicode.matches_host("étage a"));
+        assert!(!SourceAddress::new("http://studio-a:80").matches_host("Studio A"));
+        // Even opaque address text that contains the same machine name cannot
+        // make a machine query match an address rather than the SDK label.
+        assert!(!SourceAddress::new("Studio A:5960").matches_host("Studio A"));
+        let too_long = "x".repeat(254);
         for invalid in [
             "",
             "camera:5960",
@@ -1834,6 +1890,13 @@ mod tests {
             "192.168.1",
             "foo\0bar",
             "[bad]",
+            "Studio (A)",
+            " Studio",
+            "Studio\t",
+            "Studio .",
+            "\u{2003}Studio",
+            "Studio\u{2003}",
+            &too_long,
         ] {
             assert!(HostQuery::parse(invalid).is_none(), "{invalid:?}");
         }
@@ -1841,9 +1904,48 @@ mod tests {
             for _ in 0..100 {
                 assert!(exact.matches_host("CAMERA.LOCAL"));
                 assert!(ipv6.matches_host("2001:db8::1"));
+                assert!(studio.matches_host("STUDIO A."));
+                assert!(unicode.matches_host("Étage a"));
+                let key = HostKeyBuffer::new(HostQuery::parse("Studio A").unwrap());
+                assert_eq!(key.as_str(), "studio a");
             }
         });
         assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn machine_query_grammar_covers_each_printable_ascii_byte() {
+        for byte in b' '..=b'~' {
+            let delimiter = b":/?#@[]()".contains(&byte);
+            let embedded = format!("Studio{}A", char::from(byte));
+            assert_eq!(
+                HostQuery::parse(&embedded).is_some(),
+                !delimiter,
+                "embedded byte {byte:#x}: {embedded:?}"
+            );
+            let single = char::from(byte).to_string();
+            assert_eq!(
+                HostQuery::parse(&single).is_some(),
+                !delimiter && !matches!(byte, b' ' | b'.'),
+                "standalone byte {byte:#x}: {single:?}"
+            );
+        }
+        for character in (0..=31).chain(127..=159).map(char::from) {
+            let name = format!("Studio{character}A");
+            assert!(HostQuery::parse(&name).is_none(), "{name:?}");
+        }
+        for machine in ["Studio A", "STUDIO_PC", "Étage A", "a".repeat(253).as_str()] {
+            assert!(
+                matches!(HostQuery::parse(machine), Some(HostQuery::Machine(_))),
+                "{machine:?}"
+            );
+        }
+        for host in ["studio-a", "studio.local", "STUDIO"] {
+            assert!(
+                matches!(HostQuery::parse(host), Some(HostQuery::Host(_))),
+                "{host:?}"
+            );
+        }
     }
 
     #[test]
@@ -1870,7 +1972,17 @@ mod tests {
                 .unwrap(),
             vec![right]
         );
-        for invalid in ["", "192.168.1.1:5961", "camera?query", "foo\0bar"] {
+        let too_long = "x".repeat(254);
+        for invalid in [
+            "",
+            "192.168.1.1:5961",
+            "camera?query",
+            "foo\0bar",
+            "Studio (A)",
+            " Studio",
+            "Studio\t",
+            &too_long,
+        ] {
             assert!(matches!(
                 cache.sources_by_host_with(invalid, timeout, |_| panic!(
                     "invalid query reached discovery"
@@ -2355,11 +2467,12 @@ mod tests {
                 else {
                     panic!("a string longer than the limit must be refused");
                 };
-                assert!(
-                    reason.starts_with("NDIlib_send_get_source_name"),
-                    "{reason}"
+                assert_eq!(
+                    reason,
+                    crate::SdkResultDefect::UnterminatedText {
+                        operation: "NDIlib_send_get_source_name"
+                    }
                 );
-                assert!(reason.contains("4 MiB"), "{reason}");
             }
         }
     }

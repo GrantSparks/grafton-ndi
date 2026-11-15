@@ -27,8 +27,7 @@
 //!
 //! For owned/scoped captures, `poll_event` and `poll_source_name_change`, the timeout
 //! budget starts when the future is first polled, rather than when it is
-//! constructed. The same deadline covers blocking-pool queue delay, receiver
-//! capture-gate contention, and SDK waits.
+//! constructed. The same deadline covers blocking-pool queue delay and SDK waits.
 //! This is a wait budget, not a hard completion deadline: scheduling, frame copying,
 //! and other processing can delay the result beyond it.
 //!
@@ -370,8 +369,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// [`poll_source_name_change`](Receiver::poll_source_name_change),
     /// [`connect_to`](Receiver::connect_to),
     /// [`disconnect`](Receiver::disconnect) and
-    /// [`reconnect`](Receiver::reconnect), the last three for as long as a
-    /// capture attempt in flight takes to return. Async code should use this
+    /// [`reconnect`](Receiver::reconnect). Connection changes serialize with
+    /// one another and run native work on the calling thread. Async code should use this
     /// type's async methods for those instead.
     ///
     /// # Example
@@ -540,7 +539,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// * `timeout` - Total budget to wait for an event, starting when the
     ///   future is first polled and spent as [`Receiver::poll_event`] spends
-    ///   it. Blocking-pool queue delay and capture-gate contention count
+    ///   it. Blocking-pool queue delay and SDK waits count
     ///   against the same budget, and `None` comes only once all of it is
     ///   spent. [`Duration::ZERO`], like a budget that queue delay has
     ///   already spent, makes one attempt without waiting. Completion can
@@ -633,11 +632,9 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// the target that [`Self::reconnect`] retries. See
     /// [`Receiver::connect_to`].
     ///
-    /// Like [`Self::reconnect`], this takes the receiver's capture guard
-    /// exclusively, so it blocks until the capture attempts in flight return:
-    /// one attempt of at most 100 ms each, whatever their timeouts. It
-    /// therefore runs on the blocking pool, and is safe to call while
-    /// captures on this receiver are in flight. Success means the request was
+    /// Like [`Self::reconnect`], this serializes with other local connection
+    /// changes and runs the native request on the blocking pool. Captures may
+    /// continue while the SDK applies it. Success means the request was
     /// issued, not that the source is available; watch
     /// [`Self::poll_source_name_change`] or [`Self::connection_stats`].
     /// `source` is copied, so that the blocking task can own it.
@@ -653,7 +650,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// Dropping this future skips work if the blocking closure observes the
     /// cancellation flag at its entry gate. After passing that gate, the
-    /// connection change continues, including waiting for in-flight captures,
+    /// connection change continues, including waiting for earlier connection changes,
     /// and may take effect after this future is dropped.
     pub async fn connect_to(&self, source: &Source) -> Result<()> {
         let receiver = Arc::clone(&self.inner);
@@ -665,8 +662,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// latest target that [`Self::reconnect`] retries. See
     /// [`Receiver::disconnect`].
     ///
-    /// Like [`Self::reconnect`], this waits for the capture attempts in
-    /// flight, at most 100 ms each, and therefore runs on the blocking pool.
+    /// Like [`Self::reconnect`], this serializes with local connection changes
+    /// and runs the native request on the blocking pool while captures continue.
     ///
     /// # Errors
     ///
@@ -677,7 +674,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// Dropping this future skips work if the blocking closure observes the
     /// cancellation flag at its entry gate. After passing that gate,
-    /// disconnect continues, including waiting for in-flight captures, and may
+    /// disconnect continues, including waiting for earlier connection changes, and may
     /// disconnect after this future is dropped.
     pub async fn disconnect(&self) -> Result<()> {
         let receiver = Arc::clone(&self.inner);
@@ -687,13 +684,10 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// Re-establish the underlying receiver's connection to its source
     /// in place. See [`Receiver::reconnect`].
     ///
-    /// Unlike the inline connection and statistics queries above, a reconnect takes the receiver's
-    /// capture guard exclusively, so it blocks until the capture attempts in
-    /// flight (which run on the blocking pool) return: one attempt of at most
-    /// 100 ms each, whatever their timeouts. It therefore runs on the blocking
-    /// pool too, never on the async runtime's threads, and is safe to call
-    /// while captures on this receiver are in flight — they serialize instead
-    /// of racing. Confirm recovery via [`Self::connection_stats`].
+    /// Reconnect serializes with other local connection changes and runs the
+    /// native request on the blocking pool. Captures may continue meanwhile.
+    /// Confirm recovery via [`Self::connection_stats`]. A remote Discovery
+    /// Server source change does not update the local target this requests.
     ///
     /// # Errors
     ///
@@ -704,7 +698,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// Dropping this future skips work if the blocking closure observes the
     /// cancellation flag at its entry gate. After passing that gate, reconnect
-    /// continues, including waiting for in-flight captures, and may reconnect
+    /// continues, including waiting for earlier connection changes, and may reconnect
     /// after this future is dropped.
     pub async fn reconnect(&self) -> Result<()> {
         let receiver = Arc::clone(&self.inner);
@@ -760,7 +754,7 @@ where
     /// # Arguments
     ///
     /// * `timeout` - Total budget to wait for a frame, starting when the future
-    ///   is first polled. Blocking-pool queue delay and capture-gate contention
+    ///   is first polled. Blocking-pool queue delay and SDK waits
     ///   count against the same budget, and `None` comes only once all of it
     ///   is spent. Completion can occur after this budget because scheduling
     ///   and frame processing are not bounded by it. Must not exceed
@@ -1234,10 +1228,12 @@ mod receiver_tests {
         AsyncReceiver::new(Receiver::new(ndi, &ReceiverOptions::new(Source::new(""))).unwrap())
     }
 
-    // Both scoped entry points spend their budget waiting for reconnect and
-    // never call application code when that budget delivers no frame.
-    #[allow(clippy::await_holding_lock)] // Deliberately contend with the worker's capture lock.
-    async fn scoped_reconnect_contention<R: AsyncRuntime>(receiver: &AsyncReceiver<R>) {
+    // Scoped entry points keep capturing while local connection changes are
+    // locked. A disconnected source can still deliver connection events.
+    #[allow(clippy::await_holding_lock)] // Verify captures do not take the connection lock.
+    async fn scoped_captures_during_connection_changes<R: AsyncRuntime>(
+        receiver: &AsyncReceiver<R>,
+    ) {
         let _exclusive = receiver.inner.core.reconnect_lock();
         for timeout in [Duration::ZERO, Duration::from_millis(25)] {
             assert!(receiver
@@ -1246,11 +1242,12 @@ mod receiver_tests {
                 .await
                 .unwrap()
                 .is_none());
-            assert!(receiver
-                .capture_any_with(timeout, |_| panic!("no item"))
+            receiver
+                .capture_any_with(timeout, |item| {
+                    assert!(matches!(item, ReceiverItemRef::Event(_)));
+                })
                 .await
-                .unwrap()
-                .is_none());
+                .unwrap();
         }
     }
 
@@ -1365,7 +1362,7 @@ mod receiver_tests {
         };
         let receiver = unconnected::<Smol>(&ndi);
         ::smol::block_on(operations_of_an_unconnected_receiver(&ndi, &receiver));
-        ::smol::block_on(scoped_reconnect_contention(&receiver));
+        ::smol::block_on(scoped_captures_during_connection_changes(&receiver));
     }
 
     #[cfg(feature = "tokio")]
@@ -1415,7 +1412,7 @@ mod receiver_tests {
             };
             let receiver = unconnected::<Tokio>(&ndi);
             runtime().block_on(operations_of_an_unconnected_receiver(&ndi, &receiver));
-            runtime().block_on(scoped_reconnect_contention(&receiver));
+            runtime().block_on(scoped_captures_during_connection_changes(&receiver));
         }
 
         #[test]
@@ -1573,7 +1570,7 @@ mod receiver_tests {
         }
 
         #[test]
-        fn combined_capture_counts_reconnect_lock_wait_in_one_budget() {
+        fn combined_capture_reaches_the_sdk_while_connection_changes_are_locked() {
             let Some(ndi) = crate::test_support::ndi() else {
                 return;
             };
@@ -1586,7 +1583,7 @@ mod receiver_tests {
                     .await
                     .unwrap()
                     .is_none());
-                assert_eq!(worker_capture_calls().await, 0);
+                assert_eq!(worker_capture_calls().await, 1);
                 let began = Instant::now();
                 assert!(receiver
                     .capture_any(Duration::from_millis(25))
@@ -1594,7 +1591,7 @@ mod receiver_tests {
                     .unwrap()
                     .is_none());
                 assert!(began.elapsed() >= Duration::from_millis(25));
-                assert_eq!(worker_capture_calls().await, 0);
+                assert!(worker_capture_calls().await >= 1);
             });
         }
     }

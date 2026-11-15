@@ -113,7 +113,10 @@ mod tests {
 
     #[test]
     fn returns_the_value_and_converts_to_the_reason() {
-        let rejected = Rejected::new(Error::InvalidFrame("too short".into()), vec![1u8, 2]);
+        let rejected = Rejected::new(
+            Error::InvalidFrame(crate::FrameDefect::NullVideoData),
+            vec![1u8, 2],
+        );
         assert_eq!(rejected.to_string(), rejected.error().to_string());
         assert!(format!("{rejected:?}").contains("Vec<u8>"));
 
@@ -122,7 +125,10 @@ mod tests {
         assert_eq!(value, [1, 2]);
 
         fn through_question_mark() -> crate::Result<()> {
-            Err(Rejected::new(Error::InvalidFrame("x".into()), ()))?
+            Err(Rejected::new(
+                Error::InvalidFrame(crate::FrameDefect::NullVideoData),
+                (),
+            ))?
         }
         assert!(matches!(
             through_question_mark(),

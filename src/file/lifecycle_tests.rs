@@ -291,7 +291,13 @@ fn an_event_larger_than_this_crate_expects_is_rejected_and_taints_the_session() 
     let mut recorder = recording_on(&device);
     device.oversize_next_event.store(true, Ordering::Release);
     let error = recorder.poll_event(Duration::ZERO).unwrap_err();
-    assert!(matches!(error, Error::UnexpectedSdkResult(_)), "{error}");
+    assert!(
+        matches!(error,
+        Error::UnexpectedSdkResult(crate::SdkResultDefect::FileStructureTooLarge { bytes, name })
+        if bytes == std::mem::size_of::<sys::bindings::NDIlib_file_recorder_event_t>()
+            && name == std::any::type_name::<sys::bindings::NDIlib_file_recorder_event_t>()),
+        "{error}"
+    );
     let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
     assert!(
         matches!(outcome, FinishStatus::Indeterminate(_)),
@@ -549,7 +555,9 @@ fn malformed_player_options_are_refused_before_the_sdk_creates_a_player() {
     );
     assert!(matches!(
         api.create_player(&PlayerOptions::new("")),
-        Err(Error::InvalidInput(_))
+        Err(Error::InvalidInput(crate::InputDefect::Empty {
+            what: "player name"
+        }))
     ));
     for options in [
         PlayerOptions::new("mock\0player"),
@@ -651,7 +659,7 @@ fn finishing_a_session_the_sdk_is_ending_itself_still_tells_it_to_stop() {
 }
 
 #[test]
-fn a_malformed_stale_event_refuses_sync_start_before_the_native_call() {
+fn a_malformed_stale_event_is_consumed_before_the_native_start() {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let mut recorder = mock::recorder_api()
@@ -661,12 +669,18 @@ fn a_malformed_stale_event_refuses_sync_start_before_the_native_call() {
         .unwrap();
     device.push(mock::OPEN_FAILED, "old.mkv");
     device.oversize_next_event.store(true, Ordering::Release);
+    assert_eq!(
+        recorder
+            .start(&target("malformed-stale"), RecordingTimecode::Preserve)
+            .unwrap(),
+        1
+    );
+    assert_eq!(device.starts.load(Ordering::Acquire), 1);
+    assert_eq!(recorder.report().error_events(), 0);
     assert!(matches!(
-        recorder.start(&target("malformed-stale"), RecordingTimecode::Preserve),
-        Err(Error::UnexpectedSdkResult(_))
+        recorder.finish(Duration::from_secs(1)).unwrap(),
+        FinishStatus::Closed(_)
     ));
-    assert_eq!(device.starts.load(Ordering::Acquire), 0);
-    assert_eq!(recorder.state(), RecorderState::Idle);
 }
 
 #[test]
@@ -795,7 +809,7 @@ fn a_timeout_out_of_range_is_refused_before_the_stop() {
     let too_long = crate::MAX_TIMEOUT + Duration::from_nanos(1);
     for result in [recorder.finish(too_long), recorder.wait_finished(too_long)] {
         assert!(
-            matches!(&result, Err(Error::InvalidInput(reason)) if reason.contains("MAX_TIMEOUT")),
+            matches!(&result, Err(Error::InvalidInput(crate::InputDefect::TimeoutTooLong { requested })) if *requested == too_long),
             "{result:?}"
         );
     }
@@ -902,21 +916,75 @@ fn io_kind<T: std::fmt::Debug>(result: Result<T>) -> std::io::ErrorKind {
 }
 
 #[test]
+fn unreportable_recording_paths_never_reach_native_start_or_rollover() {
+    let directory = Directory::new("path-limit");
+    let device = mock::Recorder::new(Closing::AtStop);
+    device.install();
+    let mut recorder = mock::recorder_api().create_recorder(&exact()).unwrap();
+    let base = directory.0.to_str().unwrap();
+    let path_bytes = sys::bindings::NDIlib_file_recorder_event_path_max_size as usize - 1;
+    let too_long = RecordingTarget::new(format!(
+        "{base}/{}",
+        "x".repeat(path_bytes - base.len() - 1)
+    ))
+    .unwrap();
+    assert!(matches!(
+        recorder.start(&too_long, RecordingTimecode::Preserve),
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(device.starts.load(Ordering::Acquire), 0);
+    recorder
+        .start(&directory.target("take.mkv"), RecordingTimecode::Preserve)
+        .unwrap();
+    assert!(matches!(
+        recorder.rollover(&too_long),
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(device.starts.load(Ordering::Acquire), 1);
+    assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
+    assert_eq!(recorder.state(), RecorderState::Recording);
+    assert!(matches!(
+        recorder.finish(Duration::ZERO).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+}
+
+#[test]
 fn conflicting_options_are_refused_before_the_sdk_creates_anything() {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let indexed = || RecorderOptions::new(SourceSpec::new("mock source").unwrap());
-    for options in [
-        exact().format_change_rollover(true),
-        exact().rollover_size(4096),
-        indexed().tracks(MediaTypes::NONE),
-        indexed().drop_wait(crate::MAX_TIMEOUT + Duration::from_millis(1)),
-        indexed().naming(FileNaming::Pattern("{prefix}_{take}.mkv".into())),
+    let requested = crate::MAX_TIMEOUT + Duration::from_millis(1);
+    for (options, expected) in [
+        (
+            exact().format_change_rollover(true),
+            crate::InputDefect::ExactNameFormatRollover,
+        ),
+        (
+            exact().rollover_size(4096),
+            crate::InputDefect::ExactNameSizeRollover,
+        ),
+        (
+            indexed().tracks(MediaTypes::NONE),
+            crate::InputDefect::EmptyRecordingTracks,
+        ),
+        (
+            indexed().drop_wait(requested),
+            crate::InputDefect::TimeoutTooLong {
+                requested: requested.into(),
+            },
+        ),
+        (
+            indexed().naming(FileNaming::Pattern("{prefix}_{take}.mkv".into())),
+            crate::InputDefect::FilenamePatternToken {
+                token: "take".into(),
+            },
+        ),
     ] {
-        assert!(matches!(
-            mock::recorder_api().create_recorder(&options),
-            Err(Error::InvalidInput(_))
-        ));
+        let Err(Error::InvalidInput(cause)) = mock::recorder_api().create_recorder(&options) else {
+            panic!("conflicting options were not refused");
+        };
+        assert_eq!(cause, expected);
     }
     assert_eq!(device.creates.load(Ordering::Acquire), 0);
 
@@ -972,7 +1040,9 @@ fn a_reset_to_conflicting_options_keeps_the_recorder() {
     replacement.install();
     assert!(matches!(
         recorder.reset(&exact().rollover_size(4096)),
-        Err(Error::InvalidInput(_))
+        Err(Error::InvalidInput(
+            crate::InputDefect::ExactNameSizeRollover
+        ))
     ));
     assert_eq!(replacement.creates.load(Ordering::Acquire), 0);
     assert_eq!(old.destroys.load(Ordering::Acquire), 0);

@@ -371,14 +371,14 @@ fn options(format: ImageFormat) -> ImageOptions {
     ImageOptions::new(format)
 }
 
-fn invalid_frame(result: crate::Result<impl std::fmt::Debug>) -> String {
+fn invalid_frame(result: crate::Result<impl std::fmt::Debug>) -> crate::FrameDefect {
     match result {
         Err(Error::InvalidFrame(message)) => message,
         other => panic!("expected InvalidFrame, got {other:?}"),
     }
 }
 
-fn invalid_input(result: crate::Result<impl std::fmt::Debug>) -> String {
+fn invalid_input(result: crate::Result<impl std::fmt::Debug>) -> crate::InputDefect {
     match result {
         Err(Error::InvalidInput(message)) => message,
         other => panic!("expected InvalidInput, got {other:?}"),
@@ -1543,7 +1543,7 @@ fn hdr_frames_are_refused_by_default_in_every_format() {
             ] {
                 let message = invalid_frame(shortcut);
                 assert!(
-                    message.contains(name) && message.contains("HdrPolicy::CodeValues"),
+                    matches!(message,crate::FrameDefect::HdrRefused {transfer} if transfer == if name=="PQ" {crate::TransferFunction::Pq} else {crate::TransferFunction::Hlg}),
                     "{message}"
                 );
             }
@@ -1555,7 +1555,7 @@ fn hdr_frames_are_refused_by_default_in_every_format() {
             ] {
                 let message = invalid_input(frame.encode_image(&hdr(refused)));
                 assert!(
-                    message.contains(name) && message.contains("ImageFormat::Png"),
+                    matches!(message, crate::InputDefect::HdrNeedsPng {transfer,..} if transfer == if name=="PQ" {crate::TransferFunction::Pq} else {crate::TransferFunction::Hlg}),
                     "{message}"
                 );
             }
@@ -1705,7 +1705,13 @@ fn unreadable_color_metadata_is_refused_unless_the_caller_overrides() {
         assert!(frame.color_info().is_err());
         let message = invalid_frame(frame.encode_png());
         assert!(
-            message.contains("matrix") && message.contains("bt_9000"),
+            matches!(
+                message,
+                crate::FrameDefect::ColorMetadata {
+                    issue: crate::ColorMetadataIssue::UndefinedValue,
+                    ..
+                }
+            ),
             "{message}"
         );
         let overridden = options(ImageFormat::Png).color(ColorPolicy::Override {
@@ -1756,8 +1762,11 @@ fn withheld_color_metadata_is_refused_by_every_encoder_before_output() {
                     fail_after: None,
                 };
                 let message = invalid_frame(super::encode_to(source(), &sdk, &mut out));
-                assert!(message.contains(&format!("{status:?}")), "{message}");
-                assert!(message.contains("ColorPolicy::Override"), "{message}");
+                assert!(
+                    matches!(message, crate::FrameDefect::ColorMetadataWithheld {status:found} if found==status),
+                    "{message}"
+                );
+
                 assert_eq!(out.written, 0);
                 invalid_frame(super::encode(source(), &sdk));
                 invalid_frame(super::encode_data_url(source(), &sdk));
@@ -1923,14 +1932,28 @@ fn conflicting_options_are_refused_before_anything_is_written() {
             fail_after: None,
         };
         let message = invalid_input(frame.encode_image_to(&options, &mut out));
-        assert!(message.contains(needle), "{message}");
+        assert!(
+            match needle {
+                "quality" | "WebP quality" =>
+                    matches!(message, crate::InputDefect::ImageQuality { .. }),
+                "WebP effort" => matches!(message, crate::InputDefect::WebpEffort { .. }),
+                "SampleDepth::Sixteen" =>
+                    matches!(message, crate::InputDefect::SixteenBitNeedsPng { .. }),
+                other => panic!("unexpected case {other}"),
+            },
+            "{message}"
+        );
         assert_eq!(out.written, 0, "{options:?}");
     }
     for quality in [0, 101] {
-        assert!(invalid_input(frame.encode_jpeg(quality)).contains("quality"));
-        assert!(
-            invalid_input(frame.encode_data_url(ImageFormat::Jpeg(quality))).contains("quality")
-        );
+        assert!(matches!(
+            invalid_input(frame.encode_jpeg(quality)),
+            crate::InputDefect::ImageQuality { .. }
+        ));
+        assert!(matches!(
+            invalid_input(frame.encode_data_url(ImageFormat::Jpeg(quality))),
+            crate::InputDefect::ImageQuality { .. }
+        ));
     }
     // Quality is checked before the frame: even an HDR frame reports it.
     let hdr = VideoFrame::builder()
@@ -1970,7 +1993,15 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
         .pixel_format(PixelFormat::Uyvy)
         .build()
         .unwrap();
-    assert!(invalid_frame(wide.encode_jpeg(85)).contains("JPEG width 65536"));
+    assert!(matches!(
+        invalid_frame(wide.encode_jpeg(85)),
+        crate::FrameDefect::ImageDimension {
+            codec: crate::ImageCodec::Jpeg,
+            dimension: crate::ImageDimension::Width,
+            length: 65536,
+            ..
+        }
+    ));
     // Reduced, it fits.
     let jpeg = wide
         .encode_image(&options(ImageFormat::Jpeg(85)).downscale(Downscale::Half))
@@ -1981,16 +2012,29 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
         .pixel_format(PixelFormat::Nv12)
         .build()
         .unwrap();
-    assert!(invalid_frame(tall.encode_jpeg(85)).contains("JPEG height 65536"));
+    assert!(matches!(
+        invalid_frame(tall.encode_jpeg(85)),
+        crate::FrameDefect::ImageDimension {
+            codec: crate::ImageCodec::Jpeg,
+            dimension: crate::ImageDimension::Height,
+            length: 65536,
+            ..
+        }
+    ));
     let webp = VideoFrame::builder()
         .resolution(16_386, 1)
         .pixel_format(PixelFormat::Uyvy)
         .build()
         .unwrap();
-    assert!(
-        invalid_frame(webp.encode_image(&options(ImageFormat::WebpLossless)))
-            .contains("WebP width 16386")
-    );
+    assert!(matches!(
+        invalid_frame(webp.encode_image(&options(ImageFormat::WebpLossless))),
+        crate::FrameDefect::ImageDimension {
+            codec: crate::ImageCodec::Webp,
+            dimension: crate::ImageDimension::Width,
+            length: 16386,
+            ..
+        }
+    ));
     webp.encode_image(&options(ImageFormat::WebpLossless).downscale(Downscale::Half))
         .unwrap();
     // Lossless permits 16384; VP8's 14-bit dimension stops at 16383.
@@ -2006,7 +2050,7 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
         let message =
             invalid_frame(frame.encode_image_to(&options(ImageFormat::WebpLossy(75)), &mut out));
         assert!(
-            message.contains(&format!("WebP {dimension} 16384")),
+            matches!(message,crate::FrameDefect::ImageDimension {codec:crate::ImageCodec::Webp,dimension:found,length:16384,..} if found == if dimension=="width" {crate::ImageDimension::Width} else {crate::ImageDimension::Height}),
             "{message}"
         );
         assert_eq!(out.written, 0);
@@ -2155,7 +2199,19 @@ fn conversion_geometry_overflow_is_refused_before_output_or_row_access() {
         written: 0,
         fail_after: None,
     };
-    assert!(invalid_frame(super::encode_to(source, &options, &mut output)).contains("overflow"));
+    assert!(matches!(
+        invalid_frame(super::encode_to(source, &options, &mut output)),
+        crate::FrameDefect::AudioChannelOffset { .. }
+            | crate::FrameDefect::AudioSampleCount { .. }
+            | crate::FrameDefect::AudioByteSize(_)
+            | crate::FrameDefect::AudioBytes(_)
+            | crate::FrameDefect::VideoStrideOverflow { .. }
+            | crate::FrameDefect::VideoBufferOverflow
+            | crate::FrameDefect::VideoPayloadOverflow
+            | crate::FrameDefect::VideoBytes(_)
+            | crate::FrameDefect::ImageScratchOverflow
+            | crate::FrameDefect::ImageDimensionOverflow
+    ));
     assert_eq!(output.written, 0);
 }
 

@@ -4,9 +4,7 @@
 //! Input is the complete source name; stop with Ctrl-C. Synchronous media
 //! sends borrow their capture guard, with reusable video staging where the
 //! SDK requires initialized padding/tail. Metadata is forwarded from its borrow.
-use grafton_ndi::{
-    Error, Ndi, Receiver, ReceiverItemRef, ReceiverOptions, Sender, SenderOptions, Source,
-};
+use grafton_ndi::{Ndi, Receiver, ReceiverItemRef, ReceiverOptions, Sender, SenderOptions, Source};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -15,12 +13,10 @@ use std::{
     time::Duration,
 };
 
-fn main() -> grafton_ndi::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     if arguments.len() != 2 || arguments.iter().any(String::is_empty) {
-        return Err(Error::InvalidInput(
-            "usage: mixed_media_relay \"HOST (Camera)\" \"Relay\"".into(),
-        ));
+        return Err("usage: mixed_media_relay \"HOST (Camera)\" \"Relay\"".into());
     }
     let ndi = Ndi::new()?;
     let receiver = Receiver::new(
@@ -35,8 +31,7 @@ fn main() -> grafton_ndi::Result<()> {
     )?;
     let running = Arc::new(AtomicBool::new(true));
     let stop = Arc::clone(&running);
-    ctrlc::set_handler(move || stop.store(false, Ordering::Relaxed))
-        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    ctrlc::set_handler(move || stop.store(false, Ordering::Relaxed))?;
     while running.load(Ordering::Relaxed) {
         match receiver.capture_any_ref(Duration::from_millis(100))? {
             Some(ReceiverItemRef::Video(frame)) => sender.send_video(&frame)?,

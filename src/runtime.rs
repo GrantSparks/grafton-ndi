@@ -338,7 +338,7 @@ impl Runtime {
     /// # }
     /// ```
     pub fn capabilities(&self) -> &'static Capabilities {
-        &self.selected.capabilities
+        self.selected.gates.capabilities()
     }
 
     /// Check that the selected implementation provides `feature`.
@@ -382,7 +382,7 @@ impl Runtime {
     /// # }
     /// ```
     pub fn is_supported_cpu(&self) -> bool {
-        is_supported_cpu(&self.selected.api.core)
+        is_supported_cpu(&self.selected.gates.api().core)
     }
 
     /// Start NDI and return a handle to it.
@@ -585,8 +585,10 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
 
                 Phase::Running => {
                     // Runtime is already initialized, just increment refcount
-                    guard.refcount = guard.refcount.checked_add(1).ok_or_else(|| {
-                        Error::InitializationFailed("NDI runtime reference count exhausted".into())
+                    guard.refcount = guard.refcount.checked_add(1).ok_or({
+                        Error::InitializationFailed(
+                            crate::InitializationFailure::HandleCountExhausted,
+                        )
                     })?;
                     return Ok(());
                 }
@@ -603,7 +605,7 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
             Ok(())
         } else if self.backend.is_supported_cpu() {
             Err(Error::InitializationFailed(
-                "NDIlib_initialize returned false on a CPU the runtime reports as supported".into(),
+                crate::InitializationFailure::NotStarted,
             ))
         } else {
             Err(Error::UnsupportedCpu)
@@ -650,7 +652,7 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
 static LIFECYCLE: OnceLock<RuntimeManager> = OnceLock::new();
 
 fn lifecycle(runtime: &'static sys::Runtime) -> &'static RuntimeManager {
-    LIFECYCLE.get_or_init(|| RuntimeManager::with_backend(SdkBackend(&runtime.api.core)))
+    LIFECYCLE.get_or_init(|| RuntimeManager::with_backend(SdkBackend(&runtime.gates.api().core)))
 }
 
 /// A handle to the started NDI runtime.
@@ -787,7 +789,7 @@ impl Ndi {
 
     /// The selected implementation's entry points.
     pub(crate) fn api(&self) -> &'static sys::Api {
-        &self.runtime.selected.api
+        self.runtime.selected.gates.api()
     }
 
     /// Reject an unavailable operation before passing newer inputs to the SDK.

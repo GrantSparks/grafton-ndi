@@ -99,9 +99,13 @@ impl<'a, M: ReceiverMode> ReceiverControls<'a, M> {
 /// describes as a size, a bit rate or a quality: a negative value breaks that
 /// contract.
 #[cfg(any(ndi_has_advanced_encoder_guidance, ndi_has_advanced_quality_planning))]
-fn guidance(value: i32, operation: &str) -> Result<u32> {
-    u32::try_from(value)
-        .map_err(|_| crate::Error::UnexpectedSdkResult(format!("{operation} returned {value}")))
+fn guidance(value: i32, operation: &'static str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        crate::Error::UnexpectedSdkResult(crate::SdkResultDefect::InvalidGuidance {
+            operation,
+            value,
+        })
+    })
 }
 
 /// Refuse a format the quality factor does not apply to.
@@ -112,9 +116,7 @@ fn guidance(value: i32, operation: &str) -> Result<u32> {
 fn require_speedhq(format: VideoPacketFormat) -> Result<()> {
     match format.codec() {
         VideoCodec::SpeedHq420 | VideoCodec::SpeedHq422 | VideoCodec::SpeedHq422Alpha => Ok(()),
-        codec => Err(invalid_input(format!(
-            "SpeedHQ quality guidance does not apply to {codec:?}"
-        ))),
+        codec => Err(invalid_input(crate::InputDefect::SpeedHqCodec { codec })),
     }
 }
 

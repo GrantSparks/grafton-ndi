@@ -17,7 +17,7 @@ pub(crate) const COPY_LIMIT: usize = 16 * 1024 * 1024;
 /// instead stop the complete copy, including when found in a nested array.
 #[derive(Debug)]
 pub(crate) enum CopyError {
-    Malformed(&'static str),
+    Malformed(crate::DiscoveryDefect),
     Failed(Error),
 }
 
@@ -26,7 +26,9 @@ pub(crate) type CopyResult<T> = std::result::Result<T, CopyError>;
 impl CopyError {
     pub(crate) fn into_error(self) -> Error {
         match self {
-            Self::Malformed(reason) => Error::UnexpectedSdkResult(reason.into()),
+            Self::Malformed(reason) => {
+                Error::UnexpectedSdkResult(crate::SdkResultDefect::MalformedDiscoveryData(reason))
+            }
             Self::Failed(error) => error,
         }
     }
@@ -39,7 +41,7 @@ impl From<Error> for CopyError {
 }
 
 pub(crate) fn allocation_failed() -> Error {
-    Error::UnexpectedSdkResult("could not reserve memory for discovery results".into())
+    Error::UnexpectedSdkResult(crate::SdkResultDefect::DiscoveryAllocation)
 }
 
 /// One budget for native bytes scanned and owned storage reserved. Individual
@@ -79,7 +81,9 @@ impl CopyBudget {
         count
             .checked_mul(element_size)
             .filter(|&bytes| bytes <= isize::MAX as usize)
-            .ok_or(CopyError::Malformed("SDK discovery array span overflow"))
+            .ok_or(CopyError::Malformed(
+                crate::DiscoveryDefect::ArraySpanOverflow,
+            ))
     }
 
     /// Charge complete owned element storage before reserving it, including
@@ -143,7 +147,7 @@ impl CopyBudget {
             return Err(if limit < MAX_SDK_STRING_BYTES {
                 self.exceeded().into()
             } else {
-                CopyError::Malformed("SDK discovery string exceeds its 4 MiB bound")
+                CopyError::Malformed(crate::DiscoveryDefect::UnterminatedString)
             });
         };
         self.take(bytes.len() + 1)?;
@@ -201,12 +205,10 @@ impl CopyBudget {
             return Ok(&[]);
         }
         if value.is_null() {
-            return Err(CopyError::Malformed(
-                "SDK discovery array is null with a nonzero count",
-            ));
+            return Err(CopyError::Malformed(crate::DiscoveryDefect::NullArray));
         }
         let count = usize::try_from(count)
-            .map_err(|_| CopyError::Malformed("SDK discovery array count overflow"))?;
+            .map_err(|_| CopyError::Malformed(crate::DiscoveryDefect::ArrayCountOverflow))?;
         self.take(Self::span_bytes(count, size_of::<T>())?)?;
         // SAFETY: the caller provides initialized storage, and its total span
         // has passed preflight before a slice is formed.

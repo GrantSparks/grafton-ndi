@@ -48,18 +48,18 @@ impl AdvancedConfig {
         let json = json.as_ref();
         if json.len() > maximum_bytes {
             return Err(Error::InvalidInput(
-                "Advanced configuration exceeds its byte limit".into(),
+                crate::InputDefect::ConfigurationTooLarge,
             ));
         }
         let value: serde_json::Value = serde_json::from_str(json)
-            .map_err(|_| Error::InvalidInput("Invalid Advanced configuration JSON".into()))?;
+            .map_err(|_| Error::InvalidInput(crate::InputDefect::ConfigurationJson))?;
         if !value.is_object() {
             return Err(Error::InvalidInput(
-                "Advanced configuration must be a JSON object".into(),
+                crate::InputDefect::ConfigurationNotObject,
             ));
         }
         let json = CString::new(json)
-            .map_err(|_| Error::InvalidInput("Advanced configuration contains NUL".into()))?;
+            .map_err(|_| Error::InvalidInput(crate::InputDefect::ConfigurationNul))?;
         Ok(Self(Arc::new(json)))
     }
 

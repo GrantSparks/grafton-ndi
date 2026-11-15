@@ -359,6 +359,58 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn the_longest_exact_event_path_records_closes_and_starts_again() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("path-limit");
+    let source = LiveSource::start(&ndi, "path-limit");
+    let limit = crate::sys::bindings::NDIlib_file_recorder_event_path_max_size as usize - 2;
+    let mut directory = scratch.0.clone();
+    while directory.to_str().unwrap().len() + 1 + 255 < limit {
+        directory.push("d".repeat(200));
+        std::fs::create_dir(&directory).unwrap();
+    }
+    let filename_bytes = limit - directory.to_str().unwrap().len() - 1;
+    let file = |leading: char, extra: usize| {
+        directory.join(format!(
+            "{leading}{}.mkv",
+            "x".repeat(filename_bytes - 5 + extra)
+        ))
+    };
+    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
+    let unreportable = RecordingTarget::new(file('r', 1)).unwrap();
+    assert_eq!(unreportable.path().to_str().unwrap().len(), limit + 1);
+    assert!(matches!(
+        recorder.start(&unreportable, RecordingTimecode::Preserve),
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(recorder.state(), RecorderState::Idle);
+    for (session, leading) in [(1, 'a'), (2, 'b')] {
+        let target = RecordingTarget::new(file(leading, 0)).unwrap();
+        assert_eq!(target.path().to_str().unwrap().len(), limit);
+        assert_eq!(
+            recorder
+                .start(&target, RecordingTimecode::Preserve)
+                .unwrap(),
+            session
+        );
+        await_event(&mut recorder, RecorderEventKind::FirstFrame);
+        assert_eq!(
+            recorder.reported_current_file().unwrap().as_bytes(),
+            target.path().to_str().unwrap().as_bytes()
+        );
+        let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+            panic!("the boundary-length file did not close exactly");
+        };
+        assert!(report.closure_confirmed());
+        assert_eq!(report.closed_files(), 1);
+        assert_eq!(report.error_events(), 0);
+    }
+}
+
+#[test]
 fn a_recording_is_finalized_and_probes_with_its_video_track() {
     let Some((ndi, api)) = file_api() else {
         return;

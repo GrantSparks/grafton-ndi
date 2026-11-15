@@ -55,6 +55,13 @@ policy for your service. IP hints belong on the finder; a lookup never changes
 its scope. See the compilable server-state example in
 [`SourceCache::new`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.SourceCache.html#method.new).
 
+Queries accept IP addresses, DNS hostnames and NDI machine names, including
+spaces and underscores. Machine names compare only with the machine component
+of an SDK source label. The grammar is defined by
+[`Source::matches_host`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.Source.html#method.matches_host).
+Names share cache entries across ASCII letter case and an optional final dot;
+other Unicode characters compare exactly.
+
 Keep other owning handles in service state or workers too. Create borrowed
 capture/control views for an operation; retain owned media or encoded bytes
 between operations. Use `copy_into` when a copy is needed and destination
@@ -96,8 +103,8 @@ Combined capture consumes pending and native receiver events. Typed capture
 retains events for `poll_event` or a combined reader. These consumers compete
 for coalesced invalidations; they receive neither broadcasts nor an ordered
 history. After `SourceChanged`, query `poll_source_name_change` for the connected
-name. The shared wait budget covers reconnect-lock contention and bounded
-native attempts. A queued frame may predate the current wait, and a timeout
+name. The shared wait budget covers bounded native attempts. Connection changes
+may run concurrently. A queued frame may predate the current wait, and a timeout
 alone does not prove disconnection or stale input.
 
 ## Publish sources
@@ -241,12 +248,17 @@ returns its owned snapshot. `disconnect()` retains it and `reconnect()` retries
 it. Success means the request was issued; observe connection state and media
 progress separately.
 
+The connection target is the last local request. A Discovery Server client's
+remote source change is observed through `poll_source_name_change()` and does
+not update `connection_target()`. Calling `reconnect()` requests the local
+target again, replacing any remote routing.
+
 ## Integrate with async runtimes
 
 Enable `tokio` or `smol` and wrap the receiver in the corresponding
 `asynchronous::<runtime>::AsyncReceiver`. It runs blocking SDK work on workers.
-Capture/event timeouts start at the future's first poll and include queue and
-receiver-lock waits; processing can finish after that wait budget. Dropping a
+Capture/event timeouts start at the future's first poll and include worker queue
+delay and native waits; processing can finish after that wait budget. Dropping a
 future skips queued work and stops a started wait before its next attempt.
 The attempt already in flight can still consume a frame/event and execute its
 callback; each native wait lasts at most 100 ms.

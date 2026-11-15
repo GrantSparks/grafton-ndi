@@ -97,11 +97,11 @@ fn cancelling_a_close_releases_executor_state_before_pruning_replies() {
     let control = Arc::new(Control::new());
     let weak = Arc::downgrade(&control);
     let (waker, released) = drop_probe(move || weak.upgrade().unwrap().closing.try_lock().is_ok());
-    let mut future = control.request_close_now();
+    let mut future = FileOperation::live(control.request_close_now());
     assert!(poll(&mut future, &waker).is_pending());
     drop(waker);
     drop(future);
-    let _next = control.request_close_now();
+    let _next = FileOperation::live(control.request_close_now());
     assert_released_unlocked(released);
 }
 
@@ -109,7 +109,8 @@ fn cancelling_a_close_releases_executor_state_before_pruning_replies() {
 fn panicking_executor_cleanup_does_not_escape_cancellation_or_poison_locks() {
     let events = Arc::new(EventQueue::<()>::new(1));
     let mut event = events.wait(Duration::from_secs(60));
-    let (_reply, mut command) = operation::<()>();
+    let (_reply, command) = operation::<()>();
+    let mut command = FileOperation::live(command);
     let waker = || Waker::from(Arc::new(OnDrop(|| panic!("executor destructor panicked"))));
     assert!(poll(&mut event, &waker()).is_pending());
     assert!(poll(&mut command, &waker()).is_pending());
@@ -287,7 +288,8 @@ fn events_and_closure_during_waker_cloning_are_observed_by_the_same_poll() {
 
 #[test]
 fn ready_and_same_waker_command_polls_do_not_clone() {
-    let (reply, mut future) = operation::<()>();
+    let (reply, future) = operation::<()>();
+    let mut future = FileOperation::live(future);
     let probe = CloneProbe::new(|| {});
     let waker = probe.waker();
     assert!(poll(&mut future, &waker).is_pending());
@@ -298,7 +300,8 @@ fn ready_and_same_waker_command_polls_do_not_clone() {
     assert!(matches!(poll(&mut future, &waker), Poll::Ready(Ok(()))));
     assert_eq!(probe.clones.load(Ordering::Relaxed), 1);
 
-    let (reply, mut ready) = operation::<()>();
+    let (reply, ready) = operation::<()>();
+    let mut ready = FileOperation::live(ready);
     reply.complete(Ok(()));
     assert!(poll(&mut ready, &waker).is_ready());
     assert_eq!(probe.clones.load(Ordering::Relaxed), 1);
@@ -432,7 +435,8 @@ fn a_timer_callback_can_release_the_last_owner_without_delaying_other_deadlines(
 #[test]
 fn a_probe_completion_can_release_the_last_owner_without_delaying_the_next_probe() {
     let (worker, release_owner, destroyed) = held_owner();
-    let (reply, mut response) = operation::<()>();
+    let (reply, response) = operation::<()>();
+    let mut response = FileOperation::live(response);
     let (waker, released) = owner_releasing_waker(worker);
     assert!(poll(&mut response, &waker).is_pending());
     drop(waker);

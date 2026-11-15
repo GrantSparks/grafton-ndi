@@ -1,5 +1,12 @@
 //! The crate's one error type.
 
+#[cfg(test)]
+mod allocation_tests;
+mod defects;
+#[cfg(test)]
+mod defects_tests;
+pub use defects::*;
+
 mod loading;
 pub use loading::{
     LibraryKind, LoadAttempt, LoadFailure, LoadOrigin, LoadRefusal, SelectionConflict,
@@ -25,6 +32,18 @@ pub enum SpawnFailure {
     /// The runtime cancelled the blocking task, or its abandoned closure never started.
     #[error("the blocking task was cancelled")]
     TaskCancelled,
+}
+
+/// Why the selected native runtime could not initialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum InitializationFailure {
+    /// The SDK refused initialization on a supported CPU.
+    #[error("NDIlib_initialize returned false on a CPU the runtime reports as supported")]
+    NotStarted,
+    /// Another runtime handle would overflow the reference count.
+    #[error("NDI runtime reference count exhausted")]
+    HandleCountExhausted,
 }
 
 /// Every error this crate reports, from the core API, the `advanced` module
@@ -132,7 +151,7 @@ pub enum Error {
         operation: &'static str,
     },
 
-    /// NDI runtime initialization failed.
+    /// NDI runtime initialization failed, with its [`InitializationFailure`].
     ///
     /// Returned only for the runtime itself: the SDK refused to start, or the
     /// runtime handle reference count was exhausted. A finder, receiver,
@@ -142,7 +161,7 @@ pub enum Error {
     /// [`Error::RuntimeLoadFailed`] instead, and one that does not start
     /// because of the CPU as [`Error::UnsupportedCpu`].
     #[error("Failed to initialize the NDI runtime: {0}")]
-    InitializationFailed(String),
+    InitializationFailed(InitializationFailure),
 
     /// The selected NDI runtime cannot run on this CPU.
     ///
@@ -161,7 +180,7 @@ pub enum Error {
     #[error("Not connected: the NDI SDK sent nothing")]
     NotConnected,
 
-    /// Text the SDK delivered is not UTF-8.
+    /// Text the SDK delivered is not UTF-8; the original [`std::str::Utf8Error`] retains its offsets.
     ///
     /// Reported for standalone received metadata frames and strings a receiver
     /// returns, such as its source's web-control URL. Unreadable per-frame
@@ -169,22 +188,18 @@ pub enum Error {
     /// [`crate::FrameMetadataStatus`] instead. Text a peer advertises through a Discovery Server is
     /// decoded lossily instead.
     #[error("Invalid UTF-8 string in data: {0}")]
-    InvalidUtf8(String),
+    InvalidUtf8(std::str::Utf8Error),
 
     /// Text passed to the SDK contains a NUL byte, which a C string cannot
     /// hold.
     #[error("Invalid CString: {0}")]
     InvalidCString(#[from] NulError),
 
-    /// A capture reported a failure instead of a frame or an event.
-    ///
-    /// A receiver's capture returned the SDK's error frame type, which
-    /// `Processing.NDI.Recv.h` documents as a lost connection; or a sender's
-    /// metadata capture returned a frame type other than metadata or none.
-    #[error("Failed to capture frame: {0}")]
-    CaptureFailed(String),
+    /// A receiver reported the SDK error frame: its connection was lost.
+    #[error("Failed to capture frame: the SDK returned an error frame: the connection was lost")]
+    ConnectionLost,
 
-    /// A frame, or a value describing media, is invalid.
+    /// A frame, or a value describing media, is invalid; [`FrameDefect`] identifies the cause.
     ///
     /// * A frame the SDK delivered (video, audio, metadata or a compressed
     ///   packet) fails validation: its dimensions, format, strides, sizes or
@@ -203,9 +218,9 @@ pub enum Error {
     /// or an allocation, AV sync, clock or remote-control value of the
     /// `advanced` module, is [`Error::InvalidInput`] when it is out of range.
     #[error("Invalid frame data: {0}")]
-    InvalidFrame(String),
+    InvalidFrame(FrameDefect),
 
-    /// A value passed to the crate cannot be used.
+    /// A value passed to the crate cannot be used; [`InputDefect`] identifies the cause.
     ///
     /// It is out of range, malformed, or conflicts with another setting: for
     /// example a timeout above [`MAX_TIMEOUT`](crate::MAX_TIMEOUT), a relative
@@ -221,7 +236,7 @@ pub enum Error {
     /// or listener for any address it can parse, so when it creates none, the
     /// address it was given, or the lack of one, is reported here.
     #[error("Invalid input: {0}")]
-    InvalidInput(String),
+    InvalidInput(InputDefect),
 
     /// A bounded queue is full. The same call can succeed once queued work
     /// has completed, with nothing else changed; the [`QueueLimit`] says
@@ -243,6 +258,7 @@ pub enum Error {
 
     /// A value the SDK returned, other than a frame, breaks the SDK's
     /// documented contract, or owned storage could not be reserved for it.
+    /// [`SdkResultDefect`] identifies that contract breach.
     ///
     /// For example a negative connection count, a receive delay outside the
     /// range the SDK accepts, a string without a terminator within its limit,
@@ -255,8 +271,8 @@ pub enum Error {
     /// frames are reported as [`Error::InvalidFrame`], and text that is not
     /// UTF-8 as [`Error::InvalidUtf8`]. Ordinary resource-budget ceilings are
     /// [`Error::ResourceLimit`] instead.
-    #[error("Unexpected NDI SDK result: {0}")]
-    UnexpectedSdkResult(String),
+    #[error("{prefix}{cause}", prefix = sdk_result_prefix(.0), cause = .0)]
+    UnexpectedSdkResult(SdkResultDefect),
 
     /// Discovery data exceeded a per-copy or whole-discovery resource limit.
     /// No partial result is returned. `resource` identifies the exhausted
@@ -512,6 +528,69 @@ mod tests {
                 Error::QueueFull(limit).to_string(),
                 format!("Queue full: {text}")
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod initialization_failure_tests {
+    use super::*;
+
+    #[test]
+    fn initialization_causes_preserve_their_diagnostics() {
+        for (cause, expected) in [
+            (
+                InitializationFailure::NotStarted,
+                "NDIlib_initialize returned false on a CPU the runtime reports as supported",
+            ),
+            (
+                InitializationFailure::HandleCountExhausted,
+                "NDI runtime reference count exhausted",
+            ),
+        ] {
+            assert_eq!(cause.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn utf8_errors_keep_the_offset_and_incomplete_sequence() {
+        let bytes = [b'a', 0xe2, 0x82];
+        let cause = std::str::from_utf8(std::hint::black_box(&bytes)).unwrap_err();
+        let error = Error::InvalidUtf8(cause);
+        assert!(
+            matches!(error, Error::InvalidUtf8(found) if found.valid_up_to() == 1 && found.error_len().is_none())
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("Invalid UTF-8 string in data: {cause}")
+        );
+    }
+}
+
+// Preserve the sender capture diagnostic while exposing its typed SDK breach.
+fn sdk_result_prefix(cause: &SdkResultDefect) -> &'static str {
+    match cause {
+        SdkResultDefect::UnexpectedFrameType { .. } => "Failed to capture frame: ",
+        _ => "Unexpected NDI SDK result: ",
+    }
+}
+
+#[cfg(test)]
+mod full_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn error_groups_preserve_their_complete_diagnostic_prefixes() {
+        for (error, expected) in [
+            (Error::InvalidFrame(FrameDefect::AudioRate(0.into())), "Invalid frame data: Invalid sample rate: 0"),
+            (Error::InvalidInput(InputDefect::RelativeLibraryPath), "Invalid input: an explicit NDI library path must be absolute"),
+            (Error::UnexpectedSdkResult(SdkResultDefect::NegativeCount {operation:"NDIlib_send_get_no_connections",value:-1}), "Unexpected NDI SDK result: NDIlib_send_get_no_connections returned a negative count: -1"),
+            (Error::UnexpectedSdkResult(SdkResultDefect::UnexpectedFrameType {operation:"sender metadata capture",kind:17}), "Failed to capture frame: sender metadata capture returned 17"),
+            (Error::ConnectionLost, "Failed to capture frame: the SDK returned an error frame: the connection was lost"),
+            (Error::InitializationFailed(InitializationFailure::NotStarted), "Failed to initialize the NDI runtime: NDIlib_initialize returned false on a CPU the runtime reports as supported"),
+            (Error::InitializationFailed(InitializationFailure::HandleCountExhausted), "Failed to initialize the NDI runtime: NDI runtime reference count exhausted"),
+        ] {
+            assert_eq!(error.to_string(), expected);
         }
     }
 }

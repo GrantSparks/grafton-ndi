@@ -25,6 +25,7 @@
 #![warn(missing_docs)]
 
 use crate::{
+    finder::RawSource,
     sys::{self, bindings::*},
     to_ms_checked, Error, Ndi, Result, Source,
 };
@@ -129,6 +130,9 @@ pub struct Router {
     routing: &'static sys::Routing,
     _name: CString,
     _groups: Option<CString>,
+    // The SDK may retain both an effective route and its last refused request.
+    route: Option<Box<RawSource>>,
+    refused_route: Option<Box<RawSource>>,
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
     _ndi: Ndi,
@@ -217,6 +221,8 @@ impl Router {
             routing,
             _name: name,
             _groups: groups,
+            route: None,
+            refused_route: None,
             #[cfg(feature = "advanced")]
             _config: config,
             _ndi: ndi.clone(),
@@ -243,14 +249,21 @@ impl Router {
     /// contains a NUL byte, and [`Error::NativeOperationFailed`] when the SDK
     /// rejects the change.
     pub fn change(&mut self, source: &Source) -> Result<()> {
-        let raw = source.to_raw()?;
-        // SAFETY: the router is live and `raw` owns the strings it points to.
+        let raw = Box::new(source.to_raw()?);
+        // SAFETY: the boxed descriptor and its strings stay owned by this
+        // router until a later request has returned, or native destruction.
+        // Both previous descriptors remain owned throughout this call.
         if unsafe {
             self.routing
                 .NDIlib_routing_change(self.instance.0, raw.as_raw())
         } {
+            self.route = Some(raw);
+            self.refused_route = None;
             Ok(())
         } else {
+            // A refusal preserves the effective route. No SDK text says what
+            // it retained from this request, so keep that descriptor too.
+            self.refused_route = Some(raw);
             Err(Error::NativeOperationFailed {
                 operation: "routing change",
             })
@@ -264,6 +277,8 @@ impl Router {
     pub fn clear(&mut self) -> Result<()> {
         // SAFETY: the router instance is live for this borrow.
         if unsafe { self.routing.NDIlib_routing_clear(self.instance.0) } {
+            self.route = None;
+            self.refused_route = None;
             Ok(())
         } else {
             Err(Error::NativeOperationFailed {
@@ -290,9 +305,10 @@ impl Router {
                 .NDIlib_routing_get_no_connections(self.instance.0, timeout)
         };
         u32::try_from(count).map_err(|_| {
-            Error::UnexpectedSdkResult(format!(
-                "NDIlib_routing_get_no_connections returned a negative count: {count}"
-            ))
+            Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
+                operation: "NDIlib_routing_get_no_connections",
+                value: count,
+            })
         })
     }
     /// The source descriptor this router is advertised under, which receivers

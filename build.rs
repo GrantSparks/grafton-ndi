@@ -221,12 +221,7 @@ fn deployment_target_at_least(value: &str, floor: u32) -> bool {
 /// including modules import the vendored bindings.
 #[cfg(feature = "advanced")]
 fn generate_advanced_bindings(sdk: &Sdk, target: &str, out: &Path) -> String {
-    // visionOS is called xros by Apple's Clang; Rust's target name differs.
-    let clang_target = if target == "aarch64-apple-visionos" {
-        "aarch64-apple-xros"
-    } else {
-        target
-    };
+    let clang_target = build_support::clang_target(target);
     // Only the compiler's own freestanding headers are visible, so no target
     // sysroot is needed. The SDK includes <string.h> without using it.
     let freestanding = out.join("ndi-freestanding");

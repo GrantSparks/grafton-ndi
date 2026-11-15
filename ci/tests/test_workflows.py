@@ -482,6 +482,25 @@ class SdkJob(unittest.TestCase):
                                   for edition, pin in baselines.items()})
 
 class Repository(unittest.TestCase):
+    def test_vendored_bindings_cover_exactly_the_supported_platform_targets(self):
+        setup = (ROOT / 'docs/setup.md').read_text(encoding='utf-8')
+        table = setup.split('| Platform | Rust targets | Configured coverage |', 1)[1].split('\n\n', 1)[0]
+        supported = {target for row in table.splitlines() if row.startswith('|')
+                     for target in re.findall(r'`([^`]+)`', row.split('|')[2])}
+        xtask = (ROOT / 'xtask/src/main.rs').read_text(encoding='utf-8')
+        primary = re.search(r'const PRIMARY_TARGET: &str = "([^"]+)";', xtask).group(1)
+        equivalents = re.search(r'const EQUIVALENCE_TARGETS: \[&str; \d+\] = \[(.*?)\];',
+                                xtask, re.DOTALL).group(1)
+        checked = [primary, *re.findall(r'"([^"]+)"', equivalents)]
+        self.assertEqual(len(checked), len(set(checked)), 'ABI targets must not repeat')
+        self.assertEqual(set(checked), supported)
+
+    def test_bindings_check_selects_the_visionos_capable_linux_libclang(self):
+        sdk_job = workflows.load(read_workflows()['rust.yml'])['jobs']['sdk']
+        install = next(step for step in sdk_job['steps'] if step.get('name') == 'Linux libclang')
+        self.assertIn('libclang-19-dev', install['run'])
+        self.assertIn("echo 'LIBCLANG_PATH=/usr/lib/llvm-19/lib' >> \"$GITHUB_ENV\"", install['run'])
+
     def test_semver_check_runs_where_no_secret_is(self):
         texts = read_workflows()
         lint = workflows.load(texts['rust.yml'])['jobs']['lint']

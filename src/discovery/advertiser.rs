@@ -150,6 +150,11 @@ impl RecvAdvertisement {
         self
     }
     /// Permit Discovery Server clients to change this receiver's source.
+    ///
+    /// Remote changes are observed through [`Receiver::poll_source_name_change`].
+    /// They do not update [`Receiver::connection_target`], the latest local
+    /// request; [`Receiver::reconnect`] requests that local target again and
+    /// replaces any remote routing.
     #[must_use]
     pub fn allow_controlling(mut self, enabled: bool) -> Self {
         self.controlling = enabled;
@@ -292,10 +297,9 @@ impl<A: AdvertiserApi> Advertiser<A> {
             .values()
             .any(|existing| A::same_member(existing, &member))
         {
-            return Err(Error::InvalidInput(format!(
-                "{} is already registered",
-                A::MEMBER
-            )));
+            return Err(Error::InvalidInput(crate::InputDefect::AlreadyRegistered {
+                member: A::MEMBER,
+            }));
         }
         // SAFETY: the member owns its native object and advertisement strings;
         // successful registration retains that value until the SDK releases it.
@@ -336,7 +340,7 @@ impl<A: AdvertiserApi> Advertiser<A> {
     ) -> std::result::Result<(), Rejected<R>> {
         let Some(member) = self.members.get(&id) else {
             return Err(Rejected::new(
-                Error::InvalidInput("the registration was issued by another advertiser".into()),
+                Error::InvalidInput(crate::InputDefect::ForeignRegistration),
                 registration,
             ));
         };

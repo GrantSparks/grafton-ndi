@@ -21,6 +21,9 @@ use crate::{
     Error, FourCc, FrameRate, PictureAspectRatio, Rejected, Result, SdkTimestamp, Timecode,
 };
 
+#[cfg(feature = "advanced")]
+use crate::{advanced::AvSyncAudioRef, capture::AvSyncAudioFree};
+
 /// The uncompressed pixel formats NDI sends and receives.
 ///
 /// Each converts to and from its [`FourCc`].
@@ -229,14 +232,10 @@ impl PixelFormatInfo {
     /// ```
     pub fn buffer_len(&self, line_stride: usize, height: u32) -> Result<usize> {
         if line_stride == 0 {
-            return Err(Error::InvalidFrame(
-                "Video line stride must be positive, got 0".into(),
-            ));
+            return Err(Error::InvalidFrame(crate::FrameDefect::VideoZeroStride));
         }
         if height == 0 {
-            return Err(Error::InvalidFrame(
-                "Video frame height must be positive, got 0".into(),
-            ));
+            return Err(Error::InvalidFrame(crate::FrameDefect::VideoZeroHeight));
         }
 
         let len = calculate_buffer_len_for_info_checked(*self, line_stride, height as usize)?;
@@ -292,7 +291,9 @@ impl PixelFormat {
         layout
             .data_len_bytes
             .checked_add(crate::pixels::send_room(&layout, scan_type))
-            .ok_or_else(|| Error::InvalidFrame("Video send allocation size overflow".into()))
+            .ok_or(Error::InvalidFrame(
+                crate::FrameDefect::VideoAllocationOverflow,
+            ))
     }
 
     /// Get compile-time format properties.
@@ -484,9 +485,9 @@ impl PixelFormat {
         validate_video_width(width.into())?;
         let stride = min_video_line_stride_checked(self, width as usize)?;
         if i32::try_from(stride).is_err() {
-            return Err(Error::InvalidFrame(format!(
-                "Video line stride {stride} exceeds i32 range"
-            )));
+            return Err(Error::InvalidFrame(crate::FrameDefect::VideoStrideRange {
+                stride,
+            }));
         }
         Ok(stride)
     }
@@ -643,11 +644,10 @@ impl VideoHeader {
     pub(crate) fn from_sdk(raw: &NDIlib_video_frame_v2_t) -> Result<Self> {
         let frame_rate = FrameRate::from_sdk(raw.frame_rate_N, raw.frame_rate_D)?;
         let picture_aspect_ratio = PictureAspectRatio::from_sdk(raw.picture_aspect_ratio)?;
-        let scan_type = ScanType::from_sdk(raw.frame_format_type).ok_or_else(|| {
-            Error::InvalidFrame(format!(
-                "Unknown scan type: 0x{:08X}",
-                raw.frame_format_type
-            ))
+        let scan_type = ScanType::from_sdk(raw.frame_format_type).ok_or({
+            Error::InvalidFrame(crate::FrameDefect::UnknownScanType {
+                code: raw.frame_format_type,
+            })
         })?;
         Ok(Self::new(
             frame_rate,
@@ -782,26 +782,39 @@ pub(crate) trait VideoPartsExt: VideoParts {
     /// copying its old contents; its metadata string is reused as
     /// [`OwnedFrameMetadata::copy_from`] describes.
     ///
-    /// Nothing can fail part-way: any allocation happens while `destination`
-    /// is still a whole frame, and the only moment its buffer and layout
-    /// disagree spans copies into reserved capacity, which neither allocate
-    /// nor panic.
+    /// Any allocation happens while `destination` is still a whole frame.
+    /// If the packed-copy check panics, its previous layout still covers its
+    /// storage; pixel contents are unspecified, and its SDK room stays zero.
     fn copy_into_owned(&self, destination: &mut VideoFrame) {
         let packed = self.layout().packed();
         let len = packed.data_len_bytes;
         let room = crate::pixels::send_room(&packed, self.header().scan_type);
         let replacement =
             (!destination.data.holds(len, room)).then(|| Pixels::with_room(len, room));
-        let mut metadata = std::mem::take(&mut destination.metadata);
-        metadata.copy_from(self.frame_metadata());
-        let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
-        *destination = packed_video(self, data, metadata);
+        destination.metadata.copy_from(self.frame_metadata());
+        if let Some(data) = replacement {
+            let frame = packed_video(self, data, OwnedFrameMetadata::default());
+            destination.data = frame.data;
+            destination.layout = frame.layout;
+            destination.header = frame.header;
+            destination.timestamp = frame.timestamp;
+        } else {
+            let copied = self.copy_active_pixels(&mut destination.data);
+            destination.layout = *copied.layout();
+            destination.header = *copied.header();
+            destination.timestamp = copied.sdk_timestamp();
+        }
     }
 
     /// Fill packed rows and SDK tail room derived only from this frame.
     fn copy_active_pixels<'a>(&'a self, data: &'a mut Pixels) -> PackedVideo<'a> {
         let layout = self.layout().packed();
-        let room = crate::pixels::send_room(&layout, self.header().scan_type);
+        // Read every accessor before changing reused storage, so an accessor
+        // panic cannot leave the destination's old layout over a shorter copy.
+        let header = self.header();
+        let metadata = self.frame_metadata();
+        let timestamp = self.sdk_timestamp();
+        let room = crate::pixels::send_room(&layout, header.scan_type);
         data.fill(layout.data_len_bytes, room, |bytes| {
             for plane in self.plane_views() {
                 match plane.data() {
@@ -813,9 +826,9 @@ pub(crate) trait VideoPartsExt: VideoParts {
         PackedVideo {
             layout,
             pixels: data,
-            header: self.header(),
-            metadata: self.frame_metadata(),
-            timestamp: self.sdk_timestamp(),
+            header,
+            metadata,
+            timestamp,
         }
     }
 }
@@ -977,7 +990,8 @@ pub trait VideoSource: VideoParts {
 /// The owned copy of `source`: `packed`, its packed layout, with `data`,
 /// which holds `packed` and its scan-dependent [room](PixelFormat::send_tail_room),
 /// filled with every plane's active rows. Every owned video copy is made
-/// here. Filling storage that holds the copy neither allocates nor panics.
+/// here. A failed packed-copy check restores the storage's previous length
+/// and zeroed SDK room before unwinding.
 fn packed_video<P: VideoParts + ?Sized>(
     source: &P,
     mut data: Pixels,
@@ -1912,7 +1926,7 @@ impl VideoFrameBuilder {
 /// [`audio_accessors!`] generates their public accessors and `Debug`, so each
 /// is written and documented once. Each implementation takes every part from
 /// one value that was validated as a whole; the generic AudioRef
-/// implementation covers both receiver and FrameSync guards.
+/// implementation covers receiver and synchronizer guards.
 ///
 /// # Safety
 ///
@@ -1920,9 +1934,8 @@ impl VideoFrameBuilder {
 /// to `f32`-aligned storage that [`layout`](Self::layout) describes, with
 /// every channel's samples initialized and unchanged while `self` is
 /// borrowed. Padding between channels need not be initialized. Metadata text
-/// must remain a bounded NUL-terminated UTF-8 string for the borrow. Overridden
-/// descriptor builders must describe no more readable initialized samples or
-/// metadata than the implementation keeps alive.
+/// must remain a bounded NUL-terminated UTF-8 string for the borrow.
+/// Views, copying and descriptors are non-overridable helpers.
 pub(crate) unsafe trait AudioParts {
     /// The validated layout of the frame's samples.
     fn layout(&self) -> &ValidatedAudioLayout;
@@ -1938,7 +1951,10 @@ pub(crate) unsafe trait AudioParts {
 
     /// The frame's one validated metadata observation.
     fn frame_metadata(&self) -> FrameMetadataRef<'_>;
+}
 
+/// Shared audio operations whose blanket implementation prevents overrides.
+pub(crate) trait AudioPartsExt: AudioParts {
     /// Borrow the original validated channel stride, samples and metadata.
     fn audio_descriptor(&self) -> NDIlib_audio_frame_v3_t {
         let layout = self.layout();
@@ -1988,12 +2004,7 @@ pub(crate) unsafe trait AudioParts {
     fn owned_copy(&self) -> AudioFrame {
         let packed = self.layout().packed();
         let metadata = OwnedFrameMetadata::copied(self.frame_metadata());
-        packed_audio(
-            self,
-            packed,
-            Vec::with_capacity(packed.sample_count),
-            metadata,
-        )
+        packed_audio(self, Vec::with_capacity(packed.sample_count), metadata)
     }
 
     /// Copy the frame into `destination`, reusing its sample and metadata
@@ -2004,22 +2015,36 @@ pub(crate) unsafe trait AudioParts {
     /// holds the packed samples, and otherwise replaced without copying its
     /// old contents; its metadata string is reused as
     /// [`OwnedFrameMetadata::copy_from`] describes. As for video, any allocation
-    /// happens while `destination` is still a whole frame.
+    /// happens while `destination` is still a whole frame. If the packed-copy
+    /// check panics, its previous layout still covers initialized storage;
+    /// sample contents are unspecified.
     fn copy_into_owned(&self, destination: &mut AudioFrame) {
         let packed = self.layout().packed();
         let len = packed.sample_count();
         let replacement = (destination.data.capacity() < len).then(|| Vec::with_capacity(len));
-        let mut metadata = std::mem::take(&mut destination.metadata);
-        metadata.copy_from(self.frame_metadata());
-        let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
-        *destination = packed_audio(self, packed, data, metadata);
+        destination.metadata.copy_from(self.frame_metadata());
+        if let Some(data) = replacement {
+            let frame = packed_audio(self, data, OwnedFrameMetadata::default());
+            destination.data = frame.data;
+            destination.layout = frame.layout;
+            destination.timecode = frame.timecode;
+            destination.timestamp = frame.timestamp;
+        } else {
+            let layout = copy_audio_samples(self, &mut destination.data);
+            destination.layout = layout;
+            destination.timecode = self.audio_timecode();
+            destination.timestamp = self.sdk_timestamp();
+        }
     }
 }
+
+impl<T: AudioParts + ?Sized> AudioPartsExt for T {}
 
 /// A validated planar audio input for synchronous sending and conversion.
 ///
 /// Implemented by [`AudioFrame`], [`BorrowedAudioFrame`], [`AudioFrameRef`] and
-/// [`FrameSyncAudioRef`]. Generic and `dyn AudioSource` consumers can inspect
+/// [`FrameSyncAudioRef`], and Advanced AV-sync audio references. Generic and
+/// `dyn AudioSource` consumers can inspect
 /// validated layouts and channel samples without allocating.
 /// This sealed trait prevents unchecked sample pointers or channel layouts.
 /// Native operations borrow the original samples and channel stride directly,
@@ -2271,12 +2296,11 @@ impl<'buf> BorrowedAudioFrameBuilder<'buf> {
         )?;
         // The slice supplies alignment; the layout's extent establishes that
         // every active channel is initialized and borrowed for 'buf.
-        let data = self.data.get(..layout.sample_count).ok_or_else(|| {
-            Error::InvalidFrame(format!(
-                "Audio buffer has {} samples, requires at least {}",
-                self.data.len(),
-                layout.sample_count,
-            ))
+        let data = self.data.get(..layout.sample_count).ok_or({
+            Error::InvalidFrame(crate::FrameDefect::AudioBufferTooSmall {
+                actual: self.data.len(),
+                minimum: layout.sample_count,
+            })
         })?;
         let metadata = self.metadata.map(MetadataText::from_cstr).transpose()?;
         Ok(BorrowedAudioFrame {
@@ -2288,24 +2312,52 @@ impl<'buf> BorrowedAudioFrameBuilder<'buf> {
     }
 }
 
-/// The owned copy of `source`: `packed`, its packed layout, with `data`,
-/// whose capacity holds `packed`, filled with the channels back to back.
-/// Every owned audio copy is made here. Filling reserved capacity neither
-/// allocates nor panics.
+/// Fill exactly the packed samples derived from `source`, restoring the
+/// previous initialized length if filling or its check panics.
+fn copy_audio_samples<P: AudioParts + ?Sized>(
+    source: &P,
+    data: &mut Vec<f32>,
+) -> ValidatedAudioLayout {
+    struct Restore<'a> {
+        data: &'a mut Vec<f32>,
+        len: usize,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            // Capacity cannot shrink while the copy only appends samples.
+            self.data.resize(self.len, 0.0);
+        }
+    }
+    let packed = source.layout().packed();
+    let previous_len = data.len();
+    let restore = Restore {
+        data,
+        len: previous_len,
+    };
+    restore.data.clear();
+    // The views read channel samples only, never padding between channels.
+    for samples in source.channel_views() {
+        restore.data.extend_from_slice(samples);
+    }
+    assert_eq!(
+        restore.data.len(),
+        packed.sample_count(),
+        "packed audio copy must initialize its complete layout"
+    );
+    std::mem::forget(restore);
+    packed
+}
+
+/// The owned copy of `source`, with its own packed layout checked against the
+/// initialized samples before an owned frame is constructed.
 fn packed_audio<P: AudioParts + ?Sized>(
     source: &P,
-    packed: ValidatedAudioLayout,
     mut data: Vec<f32>,
     metadata: OwnedFrameMetadata,
 ) -> AudioFrame {
-    data.clear();
-    // The views read channel samples only, never padding between channels.
-    for samples in source.channel_views() {
-        data.extend_from_slice(samples);
-    }
-
+    let layout = copy_audio_samples(source, &mut data);
     AudioFrame {
-        layout: packed,
+        layout,
         timecode: source.audio_timecode(),
         data,
         metadata,
@@ -2411,14 +2463,14 @@ macro_rules! audio_accessors {
             $(#[$channel_data])*
             #[inline]
             pub fn channel_data(&self, channel: usize) -> Option<&[f32]> {
-                AudioParts::channel_view(self, channel)
+                AudioPartsExt::channel_view(self, channel)
             }
 
             /// Iterate over the channels' samples, in channel order, without
             /// copying or reading padding between channels.
             #[inline]
             pub fn channels(&self) -> AudioChannels<'_> {
-                AudioParts::channel_views(self)
+                AudioPartsExt::channel_views(self)
             }
         }
 
@@ -2543,11 +2595,6 @@ impl AudioFrame {
             data: None,
             metadata: None,
         }
-    }
-
-    /// The SDK descriptor of this frame, borrowing its samples and metadata.
-    pub(crate) fn to_raw(&self) -> NDIlib_audio_frame_v3_t {
-        self.audio_descriptor()
     }
 
     #[cfg(test)]
@@ -2998,15 +3045,6 @@ impl MetadataFrame {
         self.timecode = timecode;
     }
 
-    /// Borrow the retained C string through a synchronous SDK call.
-    pub(crate) fn to_raw(&self) -> NDIlib_metadata_frame_t {
-        NDIlib_metadata_frame_t {
-            length: self.data.inner.len() as i32,
-            timecode: self.timecode.ticks(),
-            p_data: self.data.as_ptr().cast_mut(),
-        }
-    }
-
     /// Create from raw NDI metadata frame (copies the data)
     ///
     /// # Safety
@@ -3035,12 +3073,15 @@ impl MetadataFrame {
 /// # Safety
 ///
 /// Returned text must be bounded NUL-terminated UTF-8, live and unchanged for
-/// the borrow. Any overridden descriptor builder must describe only that live
-/// initialized text, including its terminator, within the metadata size cap.
+/// the borrow, including its terminator, within the metadata size cap.
+/// Descriptor construction is a non-overridable helper.
 pub(crate) unsafe trait MetadataParts {
     fn metadata_text_for_send(&self) -> Option<MetadataText<'_>>;
     fn metadata_timecode(&self) -> Timecode;
+}
 
+/// Shared descriptor construction whose blanket implementation prevents overrides.
+pub(crate) trait MetadataPartsExt: MetadataParts {
     /// Canonicalize empty metadata to a non-null empty C string. The SDK
     /// reads/copies the text during the call, and the source remains borrowed
     /// until it returns. Validation has already bounded the length to i32.
@@ -3053,6 +3094,8 @@ pub(crate) unsafe trait MetadataParts {
         }
     }
 }
+
+impl<T: MetadataParts + ?Sized> MetadataPartsExt for T {}
 
 /// A validated metadata input for sending, connection metadata and recording.
 ///
@@ -3100,8 +3143,8 @@ pub trait MetadataSource: MetadataParts {
 }
 
 // SAFETY: TerminatedText owns bounded UTF-8 and its sole terminal NUL. The
-// overridden descriptor uses exactly that live initialized string, whose
-// allocation and contents stay unchanged for the borrow.
+// accessors lend exactly that live initialized string, whose allocation and
+// contents stay unchanged for the borrow.
 unsafe impl MetadataParts for MetadataFrame {
     fn metadata_text_for_send(&self) -> Option<MetadataText<'_>> {
         Some(self.data.text())
@@ -3109,10 +3152,6 @@ unsafe impl MetadataParts for MetadataFrame {
 
     fn metadata_timecode(&self) -> Timecode {
         self.timecode
-    }
-
-    fn metadata_raw(&self) -> NDIlib_metadata_frame_t {
-        self.to_raw()
     }
 }
 
@@ -3142,7 +3181,7 @@ impl<'a> MetadataText<'a> {
     pub(crate) fn from_cstr(metadata: &'a CStr) -> Result<Self> {
         let with_nul = metadata.to_bytes_with_nul();
         validate_metadata_len_with_nul(with_nul.len())?;
-        let with_nul = str::from_utf8(with_nul).map_err(|e| Error::InvalidUtf8(e.to_string()))?;
+        let with_nul = str::from_utf8(with_nul).map_err(Error::InvalidUtf8)?;
         Ok(Self { with_nul })
     }
 
@@ -3211,17 +3250,15 @@ pub(crate) unsafe fn validate_metadata_layout(
     let bytes = unsafe { slice::from_raw_parts(raw.p_data.cast::<u8>(), len_with_nul) };
     let Some((&0, payload)) = bytes.split_last() else {
         return Err(Error::InvalidFrame(
-            "Metadata frame length does not include a trailing NUL terminator".into(),
+            crate::FrameDefect::MetadataMissingTerminator,
         ));
     };
     if payload.contains(&0) {
-        return Err(Error::InvalidFrame(
-            "Metadata frame contains an interior NUL byte".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::MetadataInteriorNul));
     }
 
     // The bytes end in their only NUL and are within the cap.
-    let with_nul = str::from_utf8(bytes).map_err(|err| Error::InvalidUtf8(err.to_string()))?;
+    let with_nul = str::from_utf8(bytes).map_err(Error::InvalidUtf8)?;
     Ok(Some(MetadataText { with_nul }))
 }
 
@@ -3255,10 +3292,9 @@ pub(crate) unsafe fn validate_sender_metadata(
 /// validation reads a pointer. Zero retains the SDK's lengthless sentinel.
 fn validate_metadata_prefix(raw: &NDIlib_metadata_frame_t) -> Result<usize> {
     if raw.length < 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Metadata frame has negative length: {}",
-            raw.length
-        )));
+        return Err(Error::InvalidFrame(
+            crate::FrameDefect::MetadataNegativeLength { length: raw.length },
+        ));
     }
 
     if raw.length == 0 {
@@ -3266,13 +3302,11 @@ fn validate_metadata_prefix(raw: &NDIlib_metadata_frame_t) -> Result<usize> {
     }
 
     if raw.p_data.is_null() {
-        return Err(Error::InvalidFrame(
-            "Metadata frame has non-zero length with null data pointer".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::MetadataNullData));
     }
 
     let len_with_nul = usize::try_from(raw.length).map_err(|_| {
-        Error::InvalidFrame(format!("Invalid metadata length value: {}", raw.length))
+        Error::InvalidFrame(crate::FrameDefect::MetadataInvalidLength { length: raw.length })
     })?;
     validate_metadata_len_with_nul(len_with_nul)?;
     Ok(len_with_nul)
@@ -3280,16 +3314,13 @@ fn validate_metadata_prefix(raw: &NDIlib_metadata_frame_t) -> Result<usize> {
 
 fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
     if len_with_nul == 0 {
-        return Err(Error::InvalidFrame(
-            "Metadata length must include a trailing NUL terminator".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::MetadataEmpty));
     }
 
     if len_with_nul > MAX_METADATA_BYTES {
-        return Err(Error::InvalidFrame(format!(
-            "Metadata exceeds maximum size: {} bytes > {} bytes",
-            len_with_nul, MAX_METADATA_BYTES
-        )));
+        return Err(Error::InvalidFrame(crate::FrameDefect::MetadataTooLarge {
+            length: len_with_nul,
+        }));
     }
 
     metadata_len_to_i32(len_with_nul)
@@ -3297,9 +3328,9 @@ fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
 
 fn metadata_len_to_i32(len_with_nul: usize) -> Result<i32> {
     i32::try_from(len_with_nul).map_err(|_| {
-        Error::InvalidFrame(format!(
-            "Metadata length {len_with_nul} exceeds SDK i32 range"
-        ))
+        Error::InvalidFrame(crate::FrameDefect::MetadataSdkLength {
+            length: len_with_nul,
+        })
     })
 }
 
@@ -3457,9 +3488,9 @@ impl TerminatedText {
     }
 
     fn validate_and_terminate(text: &mut String) -> Result<()> {
-        let len_with_nul = text.len().checked_add(1).ok_or_else(|| {
-            Error::InvalidFrame("Frame metadata length overflow while adding terminator".into())
-        })?;
+        let len_with_nul = text.len().checked_add(1).ok_or(Error::InvalidFrame(
+            crate::FrameDefect::MetadataLengthOverflow,
+        ))?;
         validate_metadata_len_with_nul(len_with_nul)?;
         if text.as_bytes().contains(&0) {
             return Err(Error::InvalidCString(
@@ -3493,10 +3524,6 @@ impl TerminatedText {
     pub(crate) fn into_string(mut self) -> String {
         self.inner.pop();
         self.inner
-    }
-
-    pub(crate) fn as_ptr(&self) -> *const c_char {
-        self.inner.as_ptr().cast()
     }
 
     fn copied(text: MetadataText<'_>) -> Self {
@@ -3638,16 +3665,16 @@ pub(crate) unsafe fn validate_frame_metadata<'a>(
 
     // SAFETY: forwarded to the caller's obligation for a non-null pointer.
     let Some(payload) = (unsafe { bounded_sdk_text(p_metadata, MAX_METADATA_BYTES) }) else {
-        return Err(Error::InvalidFrame(format!(
-            "Frame metadata is missing a NUL terminator within {MAX_METADATA_BYTES} bytes"
-        )));
+        return Err(Error::InvalidFrame(
+            crate::FrameDefect::MetadataUnterminated,
+        ));
     };
     // SAFETY: the scan just read these bytes and the NUL after them, all
     // within the cap, from the non-null `p_metadata`, which the caller keeps
     // live and unchanged for `'a`; `u8` needs no alignment.
     let bytes = unsafe { slice::from_raw_parts(p_metadata.cast::<u8>(), payload.len() + 1) };
     // The bytes end in their only NUL, found below the cap.
-    let with_nul = str::from_utf8(bytes).map_err(|err| Error::InvalidUtf8(err.to_string()))?;
+    let with_nul = str::from_utf8(bytes).map_err(Error::InvalidUtf8)?;
     Ok(Some(MetadataText { with_nul }))
 }
 
@@ -3688,12 +3715,13 @@ pub(crate) const MAX_SDK_STRING_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// `text` must be non-null and readable byte-by-byte until either its first
 /// NUL or [`MAX_SDK_STRING_BYTES`] bytes have been read.
-pub(crate) unsafe fn copy_sdk_string(text: *const c_char, operation: &str) -> Result<String> {
+pub(crate) unsafe fn copy_sdk_string(
+    text: *const c_char,
+    operation: &'static str,
+) -> Result<String> {
     // SAFETY: forwarded to the caller's obligation.
-    let bytes = unsafe { bounded_sdk_text(text, MAX_SDK_STRING_BYTES) }.ok_or_else(|| {
-        Error::UnexpectedSdkResult(format!(
-            "{operation} returned a string longer than the 4 MiB one string may be"
-        ))
+    let bytes = unsafe { bounded_sdk_text(text, MAX_SDK_STRING_BYTES) }.ok_or({
+        Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedText { operation })
     })?;
     Ok(String::from_utf8_lossy(bytes).into_owned())
 }
@@ -3880,7 +3908,7 @@ impl ValidatedVideoLayout {
         Self::new_uncompressed_checked(pixel_format, width, height, line_stride).map_err(Into::into)
     }
 
-    fn new_uncompressed_checked(
+    pub(crate) fn new_uncompressed_checked(
         pixel_format: PixelFormat,
         width: u32,
         height: u32,
@@ -4064,9 +4092,7 @@ pub(crate) fn validate_video_frame(
     raw: &NDIlib_video_frame_v2_t,
 ) -> Result<(ValidatedVideoLayout, VideoHeader)> {
     if raw.p_data.is_null() {
-        return Err(Error::InvalidFrame(
-            "Video frame has null data pointer".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::NullVideoData));
     }
 
     let header = VideoHeader::from_sdk(raw)?;
@@ -4085,7 +4111,10 @@ pub(crate) fn validate_video_frame(
 /// these reasons; API and capture paths format them only when returning Error.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum LayoutError {
-    Message(&'static str),
+    VideoZeroSize,
+    VideoBufferOverflow,
+    VideoPayloadOverflow,
+    AudioStrideRange,
     VideoWidth(i64),
     VideoOddWidth(i64),
     VideoHeight(i64),
@@ -4111,7 +4140,7 @@ pub(crate) enum LayoutError {
     AudioRate(i64),
     AudioCount {
         value: i64,
-        kind: &'static str,
+        kind: crate::AudioCountKind,
     },
     AudioStride(i64),
     AudioStrideAlignment(usize),
@@ -4134,85 +4163,129 @@ pub(crate) enum LayoutError {
 
 pub(crate) type LayoutResult<T> = std::result::Result<T, LayoutError>;
 
+impl From<LayoutError> for crate::FrameDefect {
+    fn from(reason: LayoutError) -> Self {
+        match reason {
+            LayoutError::VideoWidth(value) => Self::VideoWidth(value.into()),
+            LayoutError::VideoOddWidth(value) => Self::VideoOddWidth(value.into()),
+            LayoutError::VideoHeight(value) => Self::VideoHeight(value.into()),
+            LayoutError::VideoSdkStride(value) => Self::VideoSdkStride(value),
+            LayoutError::VideoShortStride {
+                stride,
+                minimum,
+                format,
+                width,
+            } => Self::VideoShortStride {
+                detail: crate::CompactDiagnostic::new(crate::VideoStrideDefect {
+                    stride,
+                    minimum,
+                    format,
+                    width,
+                }),
+            },
+            LayoutError::VideoStrideOverflow { format, width } => {
+                Self::VideoStrideOverflow { format, width }
+            }
+            LayoutError::VideoBytes(value) => Self::VideoBytes(value),
+            LayoutError::VideoPlanar420 { height, stride } => {
+                Self::VideoPlanar420 { height, stride }
+            }
+            LayoutError::VideoSemiPlanar420(value) => Self::VideoSemiPlanar420(value),
+            LayoutError::VideoUyvaStride(value) => Self::VideoUyvaStride(value),
+            LayoutError::PictureAspectRatio(value) => Self::PictureAspectRatio(value),
+            LayoutError::AudioRate(value) => Self::AudioRate(value.into()),
+            LayoutError::AudioCount { value, kind } => Self::AudioCount {
+                value: value.into(),
+                kind,
+            },
+            LayoutError::AudioStride(value) => Self::AudioStride(value.into()),
+            LayoutError::AudioStrideAlignment(value) => Self::AudioStrideAlignment(value),
+            LayoutError::AudioShortStride { stride, minimum } => {
+                Self::AudioShortStride { stride, minimum }
+            }
+            LayoutError::AudioStrideOverflow(value) => Self::AudioStrideOverflow(value),
+            LayoutError::AudioChannelOffset { channels, stride } => {
+                Self::AudioChannelOffset { channels, stride }
+            }
+            LayoutError::AudioSampleCount { offset, samples } => {
+                Self::AudioSampleCount { offset, samples }
+            }
+            LayoutError::AudioByteSize(value) => Self::AudioByteSize(value),
+            LayoutError::AudioBytes(value) => Self::AudioBytes(value),
+            LayoutError::VideoZeroSize => Self::VideoZeroSize,
+            LayoutError::VideoBufferOverflow => Self::VideoBufferOverflow,
+            LayoutError::VideoPayloadOverflow => Self::VideoPayloadOverflow,
+            LayoutError::AudioStrideRange => Self::AudioStrideRange,
+        }
+    }
+}
+
+impl From<LayoutError> for crate::InputDefect {
+    fn from(reason: LayoutError) -> Self {
+        match reason {
+            LayoutError::VideoWidth(value) => Self::VideoWidth(value.into()),
+            LayoutError::VideoOddWidth(value) => Self::VideoOddWidth(value.into()),
+            LayoutError::VideoHeight(value) => Self::VideoHeight(value.into()),
+            LayoutError::VideoSdkStride(value) => Self::VideoSdkStride(value),
+            LayoutError::VideoShortStride {
+                stride,
+                minimum,
+                format,
+                width,
+            } => Self::VideoShortStride {
+                detail: crate::CompactDiagnostic::new(crate::VideoStrideDefect {
+                    stride,
+                    minimum,
+                    format,
+                    width,
+                }),
+            },
+            LayoutError::VideoStrideOverflow { format, width } => {
+                Self::VideoStrideOverflow { format, width }
+            }
+            LayoutError::VideoBytes(value) => Self::VideoBytes(value),
+            LayoutError::VideoPlanar420 { height, stride } => {
+                Self::VideoPlanar420 { height, stride }
+            }
+            LayoutError::VideoSemiPlanar420(value) => Self::VideoSemiPlanar420(value),
+            LayoutError::VideoUyvaStride(value) => Self::VideoUyvaStride(value),
+            LayoutError::PictureAspectRatio(value) => Self::PictureAspectRatio(value),
+            LayoutError::AudioRate(value) => Self::AudioRate(value.into()),
+            LayoutError::AudioCount { value, kind } => Self::AudioCount {
+                value: value.into(),
+                kind,
+            },
+            LayoutError::AudioStride(value) => Self::AudioStride(value.into()),
+            LayoutError::AudioStrideAlignment(value) => Self::AudioStrideAlignment(value),
+            LayoutError::AudioShortStride { stride, minimum } => {
+                Self::AudioShortStride { stride, minimum }
+            }
+            LayoutError::AudioStrideOverflow(value) => Self::AudioStrideOverflow(value),
+            LayoutError::AudioChannelOffset { channels, stride } => {
+                Self::AudioChannelOffset { channels, stride }
+            }
+            LayoutError::AudioSampleCount { offset, samples } => {
+                Self::AudioSampleCount { offset, samples }
+            }
+            LayoutError::AudioByteSize(value) => Self::AudioByteSize(value),
+            LayoutError::AudioBytes(value) => Self::AudioBytes(value),
+            LayoutError::VideoZeroSize => Self::VideoZeroSize,
+            LayoutError::VideoBufferOverflow => Self::VideoBufferOverflow,
+            LayoutError::VideoPayloadOverflow => Self::VideoPayloadOverflow,
+            LayoutError::AudioStrideRange => Self::AudioStrideRange,
+        }
+    }
+}
+
 impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::Message(message) => f.write_str(message),
-            Self::VideoWidth(width) => write!(f, "Video frame has invalid width: {width}"),
-            Self::VideoOddWidth(width) => {
-                write!(f, "NDI video frames require even width, got {width}")
-            }
-            Self::VideoHeight(height) => write!(f, "Video frame has invalid height: {height}"),
-            Self::VideoSdkStride(stride) => write!(
-                f,
-                "Uncompressed video frame has invalid line_stride_in_bytes: {stride}"
-            ),
-            Self::VideoShortStride { stride, minimum, format, width } => write!(
-                f,
-                "Video line_stride_in_bytes {stride} is smaller than minimum row size {minimum} for {format:?} width {width}"
-            ),
-            Self::VideoStrideOverflow { format, width } => {
-                write!(f, "Video line stride overflow for {format:?} width {width}")
-            }
-            Self::VideoBytes(bytes) => write!(
-                f,
-                "Video frame exceeds maximum size: {bytes} bytes > {MAX_VIDEO_BYTES} bytes"
-            ),
-            Self::VideoPlanar420 { height, stride } => write!(
-                f,
-                "Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height {height} and stride {stride}"
-            ),
-            Self::VideoSemiPlanar420(height) => write!(
-                f,
-                "Semi-planar 4:2:0 (NV12) video frames require even height, got {height}"
-            ),
-            Self::VideoUyvaStride(stride) => {
-                write!(f, "UYVA video frames require even line stride, got {stride}")
-            }
-            Self::PictureAspectRatio(ratio) => {
-                write!(f, "Video frame has invalid picture aspect ratio: {ratio}")
-            }
-            Self::AudioRate(rate) => write!(f, "Invalid sample rate: {rate}"),
-            Self::AudioCount { value, kind } => write!(f, "Invalid number of {kind}: {value}"),
-            Self::AudioStride(stride) => write!(f, "Invalid channel_stride_in_bytes: {stride}"),
-            Self::AudioStrideAlignment(stride) => write!(
-                f,
-                "channel_stride_in_bytes must be a multiple of {}, got {stride}",
-                size_of::<f32>()
-            ),
-            Self::AudioShortStride { stride, minimum } => write!(
-                f,
-                "channel_stride_in_bytes {stride} is smaller than one channel of audio samples {minimum}"
-            ),
-            Self::AudioStrideOverflow(samples) => write!(
-                f,
-                "Audio channel stride overflow: {samples} samples × {} bytes",
-                size_of::<f32>()
-            ),
-            Self::AudioChannelOffset { channels, stride } => write!(
-                f,
-                "Audio channel offset overflow: {channels} channels × {stride} stride samples"
-            ),
-            Self::AudioSampleCount { offset, samples } => write!(
-                f,
-                "Audio backing sample count overflow: channel offset {offset} + {samples} samples"
-            ),
-            Self::AudioByteSize(samples) => write!(
-                f,
-                "Audio byte size overflow: {samples} samples × {} bytes",
-                size_of::<f32>()
-            ),
-            Self::AudioBytes(bytes) => write!(
-                f,
-                "Audio frame exceeds maximum size: {bytes} bytes > {MAX_AUDIO_BYTES} bytes"
-            ),
-        }
+        fmt::Display::fmt(&crate::FrameDefect::from(*self), f)
     }
 }
 
 impl From<LayoutError> for Error {
     fn from(reason: LayoutError) -> Self {
-        Self::InvalidFrame(reason.to_string())
+        Self::InvalidFrame(reason.into())
     }
 }
 
@@ -4243,17 +4316,17 @@ fn validate_video_width(width: i64) -> LayoutResult<()> {
 /// Require supplied pixels to fill `layout` exactly.
 fn check_video_data_len(layout: &ValidatedVideoLayout, len: usize) -> Result<()> {
     if len != layout.data_len_bytes {
-        return Err(Error::InvalidFrame(format!(
-            "Video data length {len}, expected {} bytes for validated layout",
-            layout.data_len_bytes
-        )));
+        return Err(Error::InvalidFrame(crate::FrameDefect::VideoDataLength {
+            actual: len,
+            expected: layout.data_len_bytes,
+        }));
     }
     Ok(())
 }
 
 fn validate_video_data_len(data_len_bytes: usize) -> LayoutResult<()> {
     if data_len_bytes == 0 {
-        return Err(LayoutError::Message("Video frame has zero calculated size"));
+        return Err(LayoutError::VideoZeroSize);
     }
 
     if data_len_bytes > MAX_VIDEO_BYTES {
@@ -4381,11 +4454,11 @@ fn video_plane_layouts(
         storage = row_stride
             .checked_mul(row_count)
             .and_then(|n| storage.checked_add(n))
-            .ok_or(LayoutError::Message("Video buffer size overflow"))?;
+            .ok_or(LayoutError::VideoBufferOverflow)?;
         payload = active_row_bytes
             .checked_mul(row_count)
             .and_then(|n| payload.checked_add(n))
-            .ok_or(LayoutError::Message("Video payload size overflow"))?;
+            .ok_or(LayoutError::VideoPayloadOverflow)?;
     }
     Ok((planes, count, storage, payload))
 }
@@ -4567,9 +4640,7 @@ impl ValidatedAudioLayout {
             .ok_or(LayoutError::AudioStrideOverflow(no_samples))?;
         let stride = channel_stride.unwrap_or(minimum);
         if i32::try_from(stride).is_err() {
-            return Err(LayoutError::Message(
-                "Audio channel stride exceeds i32 range",
-            ));
+            return Err(LayoutError::AudioStrideRange);
         }
         if stride == 0 {
             return Err(LayoutError::AudioStride(0));
@@ -4704,10 +4775,14 @@ fn validate_outbound_audio_layout(
 /// Require supplied samples to fill the packed `layout` exactly.
 fn check_audio_data_len(layout: &ValidatedAudioLayout, len: usize) -> Result<()> {
     if len != layout.sample_count {
-        return Err(Error::InvalidFrame(format!(
-            "Audio data length {len}, expected {} samples ({} channels x {} samples) for validated layout",
-            layout.sample_count, layout.no_channels, layout.no_samples
-        )));
+        return Err(Error::InvalidFrame(crate::FrameDefect::AudioDataLength {
+            detail: crate::CompactDiagnostic::new(crate::AudioLengthDefect {
+                actual: len,
+                expected: layout.sample_count,
+                channels: layout.no_channels as u32,
+                samples: layout.no_samples as u32,
+            }),
+        }));
     }
     Ok(())
 }
@@ -4726,15 +4801,15 @@ fn validate_positive_audio_counts(
     no_channels: i64,
     no_samples: i64,
 ) -> LayoutResult<(usize, usize)> {
-    let count = |value: i64, kind: &'static str| {
+    let count = |value: i64, kind: crate::AudioCountKind| {
         usize::try_from(value)
             .ok()
             .filter(|&count| count > 0)
             .ok_or(LayoutError::AudioCount { value, kind })
     };
     Ok((
-        count(no_channels, "channels")?,
-        count(no_samples, "samples")?,
+        count(no_channels, crate::AudioCountKind::Channels)?,
+        count(no_samples, crate::AudioCountKind::Samples)?,
     ))
 }
 
@@ -4792,19 +4867,18 @@ fn checked_audio_extent(
 /// [`validate_returned_audio`] accepts one.
 pub(crate) fn validate_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<ValidatedAudioLayout> {
     if raw.no_samples == 0 {
-        return Err(Error::InvalidFrame("Invalid number of samples: 0".into()));
+        return Err(Error::InvalidFrame(crate::FrameDefect::AudioCount {
+            value: 0.into(),
+            kind: crate::AudioCountKind::Samples,
+        }));
     }
 
     if raw.p_data.is_null() {
-        return Err(Error::InvalidFrame(
-            "Audio frame has null data pointer".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::NullAudioData));
     }
 
     if !raw.p_data.cast::<f32>().is_aligned() {
-        return Err(Error::InvalidFrame(
-            "Audio data pointer is not aligned for f32".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::AudioMisaligned));
     }
 
     let format = validate_audio_format(raw.FourCC)?;
@@ -4853,23 +4927,20 @@ pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<R
     }
 
     if !raw.p_data.is_null() {
-        return Err(Error::InvalidFrame(
-            "Zero-length audio frame has non-null data pointer".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::EmptyAudioHasData));
     }
 
     if raw.sample_rate < 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Invalid sample rate: {}",
-            raw.sample_rate
+        return Err(Error::InvalidFrame(crate::FrameDefect::AudioRate(
+            raw.sample_rate.into(),
         )));
     }
 
     if raw.no_channels < 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Invalid number of channels: {}",
-            raw.no_channels
-        )));
+        return Err(Error::InvalidFrame(crate::FrameDefect::AudioCount {
+            value: raw.no_channels.into(),
+            kind: crate::AudioCountKind::Channels,
+        }));
     }
 
     // SAFETY: both members of the descriptor's union are `int`s at the same
@@ -4879,10 +4950,9 @@ pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<R
     // buffer size, so the value must be zero whatever its meaning.
     let channel_stride_in_bytes = unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes };
     if channel_stride_in_bytes != 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Zero-length audio frame has non-zero channel_stride_in_bytes: {}",
-            channel_stride_in_bytes
-        )));
+        return Err(Error::InvalidFrame(crate::FrameDefect::EmptyAudioStride {
+            stride: channel_stride_in_bytes,
+        }));
     }
 
     // Both were just checked nonnegative, so zero is the only value that
@@ -4902,10 +4972,10 @@ pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<R
             Some(AudioInputFormat::new(sample_rate, num_channels))
         }
         _ => {
-            return Err(Error::InvalidFrame(format!(
-                "Invalid zero-length audio state: sample_rate={}, no_channels={}",
-                raw.sample_rate, raw.no_channels
-            )))
+            return Err(Error::InvalidFrame(crate::FrameDefect::EmptyAudioFormat {
+                sample_rate: raw.sample_rate,
+                channels: raw.no_channels,
+            }))
         }
     };
 
@@ -4917,10 +4987,9 @@ fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioForm
         sys::bindings::NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => {
             Ok(AudioFormat::Fltp)
         }
-        _ => Err(Error::InvalidFrame(format!(
-            "Unknown audio format FourCC: 0x{:08X}",
-            fourcc
-        ))),
+        _ => Err(Error::InvalidFrame(
+            crate::FrameDefect::UnknownAudioFormat { fourcc },
+        )),
     }
 }
 
@@ -5522,7 +5591,7 @@ macro_rules! borrowed_video_methods {
             ///
             /// The copy makes no SDK call. It runs wherever this reference may be
             /// used: a receiver frame can be copied on a scoped worker thread, while a
-            /// FrameSync frame stays on its capture thread. The destination is an
+            /// synchronizer frame stays on its capture thread. The destination is an
             /// ordinary owned frame either way.
             pub fn copy_into(&self, destination: &mut VideoFrame) {
                 self.frame.copy_into_owned(destination);
@@ -5632,6 +5701,12 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
         let frame = unsafe { ValidatedAudio::audio(guard)? };
         Ok(Self { frame })
     }
+
+    /// Wrap audio already validated while its guard retains the native loan.
+    #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_av_sync)))]
+    pub(crate) fn from_validated(frame: ValidatedAudio<Guard<'a, S>>) -> Self {
+        Self { frame }
+    }
 }
 
 // Specialize methods on the public aliases so rustdoc shows their full API
@@ -5679,7 +5754,7 @@ macro_rules! borrowed_audio_methods {
             ///
             /// The copy makes no SDK call. It runs wherever this reference may be
             /// used: a receiver frame can be copied on a scoped worker thread, while a
-            /// FrameSync frame stays on its capture thread. The destination is an
+            /// synchronizer frame stays on its capture thread. The destination is an
             /// ordinary owned frame either way.
             pub fn copy_into(&self, destination: &mut AudioFrame) {
                 self.frame.copy_into_owned(destination);
@@ -5689,9 +5764,13 @@ macro_rules! borrowed_audio_methods {
 }
 borrowed_audio_methods!(AudioFrameRef);
 borrowed_audio_methods!(FrameSyncAudioRef);
+#[cfg(feature = "advanced")]
+borrowed_audio_methods!(AvSyncAudioRef);
 
 impl AudioSource for AudioFrameRef<'_> {}
 impl AudioSource for FrameSyncAudioRef<'_> {}
+#[cfg(feature = "advanced")]
+impl AudioSource for AvSyncAudioRef<'_> {}
 
 // SAFETY: The validated frame holds a Guard that keeps the SDK allocation
 // alive until matching release. All parts delegate to that one validated
@@ -5730,8 +5809,8 @@ macro_rules! borrowed_audio_accessors {
                 /// [`Timecode::SYNTHESIZE`].
             }
             timestamp {
-                /// It is `None` when the SDK does not know it. FrameSync audio
-                /// also treats its zero timestamp marker as unknown; that
+                /// It is `None` when the SDK does not know it. FrameSync and
+                /// AV-sync audio also treat their zero marker as unknown; that
                 /// marker alone does not identify synthesized silence.
             }
             channel_stride_bytes {
@@ -5743,6 +5822,8 @@ macro_rules! borrowed_audio_accessors {
 }
 borrowed_audio_accessors!(AudioFrameRef, AudioKind);
 borrowed_audio_accessors!(FrameSyncAudioRef, FrameSyncAudioFree);
+#[cfg(feature = "advanced")]
+borrowed_audio_accessors!(AvSyncAudioRef, AvSyncAudioFree);
 
 impl<'rx> AudioRef<'rx, AudioKind> {
     /// Create a borrowed audio frame from a receiver RAII guard, validated
@@ -6224,7 +6305,7 @@ mod tests {
             other => panic!("expected InvalidFrame, got {other:?}"),
         };
         for rate in [0u32, 1 << 31, u32::MAX] {
-            let expected = format!("Invalid sample rate: {rate}");
+            let expected = crate::FrameDefect::AudioRate(rate.into());
             assert_eq!(
                 message(
                     validate_audio_sample_rate(rate.into())
@@ -6267,7 +6348,7 @@ mod tests {
             };
             assert_eq!(
                 message(validate_audio_layout(&raw).map(|_| ())),
-                format!("Invalid sample rate: {rate}")
+                crate::FrameDefect::AudioRate(rate.into())
             );
         }
         assert_eq!(validate_audio_sample_rate(1).unwrap(), 1);
@@ -7171,9 +7252,8 @@ mod tests {
             }
             if !accepted && height % 2 == 0 {
                 let msg = format.info().buffer_len(stride, height).unwrap_err();
-                let msg = msg.to_string();
                 assert!(
-                    msg.contains(&stride.to_string()) && msg.contains("4:2:0"),
+                    matches!(msg, Error::InvalidFrame(crate::FrameDefect::VideoPlanar420 {stride:found,..}) if found==stride),
                     "{label}: {msg}"
                 );
             }
@@ -7563,7 +7643,10 @@ mod tests {
 
         if let Err(Error::InvalidFrame(ref msg)) = result {
             assert!(
-                msg.contains("0xDEADBEEF"),
+                matches!(
+                    msg,
+                    crate::FrameDefect::UnknownPixelFormat { fourcc: 0xDEADBEEF }
+                ),
                 "Error message should include FourCC: {}",
                 msg
             );
@@ -7645,7 +7728,10 @@ mod tests {
 
         if let Err(Error::InvalidFrame(ref msg)) = result {
             assert!(
-                msg.contains("0x0BADC0DE"),
+                matches!(
+                    msg,
+                    crate::FrameDefect::UnknownAudioFormat { fourcc: 0x0BADC0DE }
+                ),
                 "Error message should include FourCC: {}",
                 msg
             );
@@ -8161,7 +8247,7 @@ mod tests {
     fn validated_metadata_reuses_storage_and_copies_once() {
         let text = "é".repeat(550);
         let frame = MetadataFrame::new(text).unwrap();
-        let expected = frame.data.as_ptr() as *mut c_char;
+        let expected = frame.data.text().as_ptr() as *mut c_char;
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
             for _ in 0..100 {
                 let raw = frame.metadata_raw();
@@ -8396,7 +8482,7 @@ mod tests {
 
         assert_eq!(raw.length, 4);
         assert_eq!(raw.timecode, 101);
-        assert_eq!(raw.p_data, frame.data.as_ptr() as *mut c_char);
+        assert_eq!(raw.p_data, frame.data.text().as_ptr() as *mut c_char);
         assert_eq!(frame.data.inner.as_bytes(), b"abc\0");
     }
 
@@ -8751,7 +8837,7 @@ mod tests {
 
         let mut audio = AudioFrame::builder().metadata("").build().unwrap();
         assert_eq!(audio.metadata(), Some(""));
-        assert!(!audio.to_raw().p_metadata.is_null());
+        assert!(!audio.audio_descriptor().p_metadata.is_null());
         audio.set_metadata("audio meta").unwrap();
         assert_eq!(audio.metadata(), Some("audio meta"));
 
@@ -8813,7 +8899,7 @@ mod tests {
             assert_eq!(video.metadata(), None);
             assert_eq!(audio.metadata(), None);
             assert!(video.as_test_raw().p_metadata.is_null());
-            assert!(audio.to_raw().p_metadata.is_null());
+            assert!(audio.audio_descriptor().p_metadata.is_null());
         }
     }
 
@@ -8848,7 +8934,22 @@ mod tests {
         if let Err(Error::InvalidFrame(msg)) = result {
             // Accept either overflow or size limit error - both are correct guards
             assert!(
-                msg.contains("overflow") || msg.contains("exceeds maximum size"),
+                matches!(
+                    msg,
+                    crate::FrameDefect::AudioChannelOffset { .. }
+                        | crate::FrameDefect::AudioSampleCount { .. }
+                        | crate::FrameDefect::AudioByteSize(_)
+                        | crate::FrameDefect::AudioBytes(_)
+                        | crate::FrameDefect::VideoStrideOverflow { .. }
+                        | crate::FrameDefect::VideoBufferOverflow
+                        | crate::FrameDefect::VideoPayloadOverflow
+                        | crate::FrameDefect::VideoBytes(_)
+                        | crate::FrameDefect::ImageScratchOverflow
+                        | crate::FrameDefect::ImageDimensionOverflow
+                ) || matches!(
+                    msg,
+                    crate::FrameDefect::VideoBytes(_) | crate::FrameDefect::AudioBytes(_)
+                ),
                 "Error message should mention overflow or size limit, got: {msg}"
             );
         } else {
@@ -8971,7 +9072,10 @@ mod tests {
         );
         let audio = AudioFrame::builder().num_samples(1).build().unwrap();
         assert_eq!(audio.timecode(), Timecode::SYNTHESIZE);
-        assert_eq!(audio.to_raw().timecode, NDIlib_send_timecode_synthesize);
+        assert_eq!(
+            audio.audio_descriptor().timecode,
+            NDIlib_send_timecode_synthesize
+        );
         assert_eq!(
             MetadataFrame::new("<x/>").unwrap().timecode(),
             Timecode::SYNTHESIZE
@@ -8993,7 +9097,7 @@ mod tests {
                 .timecode(zero)
                 .build()
                 .unwrap()
-                .to_raw()
+                .audio_descriptor()
                 .timecode,
             0
         );
@@ -9257,7 +9361,7 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("null data pointer"),
+                matches!(msg, crate::FrameDefect::NullVideoData),
                 "Error should mention null pointer, got: {msg}"
             );
         } else {
@@ -9292,7 +9396,7 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("invalid line_stride_in_bytes"),
+                matches!(msg, crate::FrameDefect::VideoSdkStride(_)),
                 "Error should mention invalid stride, got: {msg}"
             );
         } else {
@@ -9406,7 +9510,7 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("invalid height"),
+                matches!(msg, crate::FrameDefect::VideoHeight(_)),
                 "Error should mention invalid height, got: {msg}"
             );
         } else {
@@ -9445,7 +9549,10 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("exceeds maximum size"),
+                matches!(
+                    msg,
+                    crate::FrameDefect::VideoBytes(_) | crate::FrameDefect::AudioBytes(_)
+                ),
                 "Error should mention size limit, got: {msg}"
             );
         } else {
@@ -9667,7 +9774,13 @@ mod tests {
         for raw in [NDIlib_audio_frame_v3_t::default(), format_only] {
             match validate_audio_layout(&raw) {
                 Err(Error::InvalidFrame(message)) => {
-                    assert_eq!(message, "Invalid number of samples: 0");
+                    assert_eq!(
+                        message,
+                        crate::FrameDefect::AudioCount {
+                            value: 0.into(),
+                            kind: crate::AudioCountKind::Samples
+                        }
+                    );
                 }
                 other => panic!("expected InvalidFrame, got {other:?}"),
             }
@@ -9783,7 +9896,7 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("null data pointer"),
+                matches!(msg, crate::FrameDefect::NullAudioData),
                 "Error should mention null pointer, got: {msg}"
             );
         } else {
@@ -9815,7 +9928,13 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("Invalid number of samples"),
+                matches!(
+                    msg,
+                    crate::FrameDefect::AudioCount {
+                        kind: crate::AudioCountKind::Samples,
+                        ..
+                    }
+                ),
                 "Error should mention invalid samples, got: {msg}"
             );
         } else {
@@ -9850,7 +9969,22 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("overflow") || msg.contains("exceeds maximum size"),
+                matches!(
+                    msg,
+                    crate::FrameDefect::AudioChannelOffset { .. }
+                        | crate::FrameDefect::AudioSampleCount { .. }
+                        | crate::FrameDefect::AudioByteSize(_)
+                        | crate::FrameDefect::AudioBytes(_)
+                        | crate::FrameDefect::VideoStrideOverflow { .. }
+                        | crate::FrameDefect::VideoBufferOverflow
+                        | crate::FrameDefect::VideoPayloadOverflow
+                        | crate::FrameDefect::VideoBytes(_)
+                        | crate::FrameDefect::ImageScratchOverflow
+                        | crate::FrameDefect::ImageDimensionOverflow
+                ) || matches!(
+                    msg,
+                    crate::FrameDefect::VideoBytes(_) | crate::FrameDefect::AudioBytes(_)
+                ),
                 "Error should mention overflow or size limit, got: {msg}"
             );
         } else {

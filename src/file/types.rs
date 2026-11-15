@@ -94,9 +94,9 @@ impl std::fmt::Display for StateError {
 /// [`Error::InvalidInput`] naming `what` when `value` is empty and
 /// `allow_empty` is false, and [`Error::InvalidCString`] when it contains a
 /// NUL.
-fn cstring(value: &str, what: &str, allow_empty: bool) -> Result<CString> {
+fn cstring(value: &str, what: &'static str, allow_empty: bool) -> Result<CString> {
     if !allow_empty && value.is_empty() {
-        return Err(Error::InvalidInput(format!("{what} must not be empty")));
+        return Err(Error::InvalidInput(crate::InputDefect::Empty { what }));
     }
     Ok(CString::new(value)?)
 }
@@ -258,6 +258,13 @@ pub(super) struct ResolvedPlayerOptions {
 /// collisions at preflight; native creation after that check depends on the
 /// platform and SDK. See [`Self::Exact`] for the tested exclusive-open
 /// behavior and the limits of this check.
+///
+/// Every absolute output path must fit exactly in the recorder's event field:
+/// at most 4094 UTF-8 bytes with the current SDK. Preflight reserves at least
+/// 20 digits for each index token, including future rollovers, and refuses
+/// longer paths with [`Error::InvalidInput`]. It also refuses a resolved path
+/// that is not lossless UTF-8, including a relative pattern resolved against
+/// a non-UTF-8 current directory.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum FileNaming {
@@ -525,9 +532,7 @@ impl RecorderOptions {
         crate::to_ms_checked(self.drop_wait)?;
         if self.tracks.is_empty() {
             return Err(Error::InvalidInput(
-                "a recorder must record video, audio or metadata; an empty track selection \
-                 would record all three"
-                    .into(),
+                crate::InputDefect::EmptyRecordingTracks,
             ));
         }
         // The SDK is given no pattern for its own indexed default.
@@ -543,18 +548,12 @@ impl RecorderOptions {
         if naming.is_exact() {
             if self.format_change_rollover == Some(true) {
                 return Err(Error::InvalidInput(
-                    "a recorder with an exact file name cannot roll over at a format change, \
-                     because the next file would have the same name; use a filename pattern \
-                     with {index}, or leave format-change rollover unset"
-                        .into(),
+                    crate::InputDefect::ExactNameFormatRollover,
                 ));
             }
             if self.rollover_size > 0 {
                 return Err(Error::InvalidInput(
-                    "a recorder with an exact file name cannot roll over at a size limit, \
-                     because the next file would have the same name; use a filename pattern \
-                     with {index}"
-                        .into(),
+                    crate::InputDefect::ExactNameSizeRollover,
                 ));
             }
         }
@@ -582,6 +581,10 @@ const DEFAULT_PATTERN: &str = "{prefix}_{index:03}.mkv";
 /// The pattern that names each file exactly as its target says.
 const EXACT_PATTERN: &str = "{prefix}";
 
+// A terminated string filling the event field could have been truncated.
+const RECORDER_PATH_LIMIT: usize = NDIlib_file_recorder_event_path_max_size as usize - 2;
+const INDEX_DIGITS: usize = u64::MAX.ilog10() as usize + 1;
+
 /// One part of a filename pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PatternPart<'a> {
@@ -593,7 +596,7 @@ enum PatternPart<'a> {
 
 /// The literal text and tokens of a filename pattern, in order.
 fn pattern_parts(pattern: &str) -> Result<Vec<PatternPart<'_>>> {
-    let unmatched = || Error::InvalidInput("unmatched filename-pattern brace".into());
+    let unmatched = || Error::InvalidInput(crate::InputDefect::FilenamePatternBrace);
     let mut parts = Vec::new();
     let mut rest = pattern;
     while let Some(start) = rest.find(['{', '}']) {
@@ -618,9 +621,11 @@ fn pattern_parts(pattern: &str) -> Result<Vec<PatternPart<'_>>> {
             _ => match token.strip_prefix("index:").and_then(width) {
                 Some(width) => PatternPart::Index(usize::from(width)),
                 None => {
-                    return Err(Error::InvalidInput(format!(
-                        "unsupported filename-pattern token {{{token}}}"
-                    )))
+                    return Err(Error::InvalidInput(
+                        crate::InputDefect::FilenamePatternToken {
+                            token: token.into(),
+                        },
+                    ))
                 }
             },
         });
@@ -638,18 +643,29 @@ pub(super) struct NamePattern {
     pattern: String,
     /// The pattern has no index, so each target names exactly one file.
     exact: bool,
+    /// Extra digits beyond index 1, reserving the full range of a u64 index.
+    index_digits_reserved: usize,
 }
 
 impl NamePattern {
     /// Parse `pattern`, failing with [`Error::InvalidInput`] when it is
     /// malformed.
     fn new(pattern: &str) -> Result<Self> {
-        let exact = !pattern_parts(pattern)?
+        let parts = pattern_parts(pattern)?;
+        let exact = !parts
             .iter()
             .any(|part| matches!(part, PatternPart::Index(_)));
+        let index_digits_reserved = parts
+            .iter()
+            .filter_map(|part| match part {
+                PatternPart::Index(width) => Some(INDEX_DIGITS.saturating_sub((*width).max(1))),
+                _ => None,
+            })
+            .fold(0usize, usize::saturating_add);
         Ok(Self {
             pattern: pattern.to_owned(),
             exact,
+            index_digits_reserved,
         })
     }
 
@@ -682,14 +698,32 @@ impl NamePattern {
     }
 
     /// Confirm that the SDK can create the file this pattern gives `target`:
-    /// that its directory exists and can be written to, and, for an exact
-    /// name, that the file does not exist yet.
+    /// that its longest path can be reported exactly, its directory exists
+    /// and can be written to, and, for an exact name, the file does not exist.
     ///
     /// The SDK accepts a rollover to a file it cannot create and then ends
     /// the whole session, so the mistake is caught here, while the session
     /// can still go on. Nothing is created.
     pub(super) fn check(&self, target: &RecordingTarget) -> Result<()> {
         let file = self.first_file(target)?;
+        let longest_bytes = file
+            .to_str()
+            .ok_or({
+                Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
+                    what: "recording file path",
+                })
+            })?
+            .len()
+            .saturating_add(self.index_digits_reserved);
+        if longest_bytes > RECORDER_PATH_LIMIT {
+            return Err(Error::InvalidInput(
+                crate::InputDefect::RecordingPathTooLong {
+                    maximum_bytes: RECORDER_PATH_LIMIT,
+                    longest_bytes,
+                    index_digits_reserved: self.index_digits_reserved,
+                },
+            ));
+        }
         check_directory(file.parent().unwrap_or(&file))?;
         if self.exact && std::fs::symlink_metadata(&file).is_ok() {
             return Err(Error::Io(std::io::Error::new(
@@ -776,13 +810,15 @@ impl RecordingTarget {
 /// [`Error::InvalidInput`] naming `what` when the path is empty or is not
 /// UTF-8, [`Error::InvalidCString`] when it contains a NUL, and
 /// [`Error::Io`] when the operating system cannot resolve a relative path.
-pub(super) fn resolve_path(path: &Path, what: &str) -> Result<(PathBuf, CString)> {
+pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<(PathBuf, CString)> {
     if path.as_os_str().is_empty() {
-        return Err(Error::InvalidInput(format!("{what} must not be empty")));
+        return Err(Error::InvalidInput(crate::InputDefect::Empty { what }));
     }
     let text = path
         .to_str()
-        .ok_or_else(|| Error::InvalidInput(format!("{what} is not lossless UTF-8")))?;
+        .ok_or(Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
+            what,
+        }))?;
     // Windows path resolution rejects NULs as an I/O error. Keep the SDK
     // string error consistent with absolute paths and the other platforms.
     if text.contains('\0') {
@@ -797,7 +833,9 @@ pub(super) fn resolve_path(path: &Path, what: &str) -> Result<(PathBuf, CString)
     };
     let text = absolute
         .to_str()
-        .ok_or_else(|| Error::InvalidInput(format!("{what} is not lossless UTF-8")))?;
+        .ok_or(Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
+            what,
+        }))?;
     let text = cstring(text, what, false)?;
     Ok((absolute, text))
 }
@@ -883,7 +921,7 @@ impl FilePosition {
         let ticks = duration.as_nanos() / 100;
         u64::try_from(ticks)
             .map(Self)
-            .map_err(|_| Error::InvalidInput("file position exceeds 64-bit ticks".into()))
+            .map_err(|_| Error::InvalidInput(crate::InputDefect::FilePositionOverflow))
     }
 
     /// Native 100ns ticks.
@@ -926,7 +964,7 @@ impl SessionTimecode {
     pub fn new(timecode: Timecode) -> Result<Self> {
         if timecode == Timecode::SYNTHESIZE {
             return Err(Error::InvalidInput(
-                "a recording start cannot use Timecode::SYNTHESIZE; choose an explicit start such as zero".into(),
+                crate::InputDefect::SynthesizeRecordingStart,
             ));
         }
         Ok(Self(timecode))
@@ -1448,11 +1486,9 @@ impl RecorderStats {
 }
 
 /// A quantity the SDK reports as a signed integer, which must not be negative.
-fn non_negative(value: i32, what: &str) -> Result<u32> {
+fn non_negative(value: i32, what: &'static str) -> Result<u32> {
     u32::try_from(value).map_err(|_| {
-        Error::UnexpectedSdkResult(format!(
-            "the source format reports a negative {what}: {value}"
-        ))
+        Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeFormatCount { what, value })
     })
 }
 
@@ -1538,14 +1574,13 @@ impl SourceFormat {
     /// The format the SDK's `raw` describes.
     pub(super) fn from_sdk(raw: &NDIlib_file_source_format_t) -> Result<Self> {
         let count = usize::try_from(raw.video_track_count).map_err(|_| {
-            Error::UnexpectedSdkResult("video track count does not fit usize".into())
+            Error::UnexpectedSdkResult(crate::SdkResultDefect::FileTrackCountOverflow)
         })?;
-        let tracks = raw.video_tracks.get(..count).ok_or_else(|| {
-            Error::UnexpectedSdkResult(format!(
-                "source format reports {} video tracks; the SDK layout holds {}",
-                raw.video_track_count,
-                raw.video_tracks.len()
-            ))
+        let tracks = raw.video_tracks.get(..count).ok_or({
+            Error::UnexpectedSdkResult(crate::SdkResultDefect::FileTrackCount {
+                count: raw.video_track_count,
+                capacity: raw.video_tracks.len(),
+            })
         })?;
         Ok(Self {
             video_tracks: tracks
@@ -1657,7 +1692,10 @@ mod tests {
     fn session_timecodes_refuse_only_the_send_sentinel() {
         for timecode in [Timecode::SYNTHESIZE, Timecode::default()] {
             let error = SessionTimecode::new(timecode).unwrap_err();
-            assert!(matches!(error, Error::InvalidInput(ref message) if message.contains("zero")));
+            assert!(matches!(
+                error,
+                Error::InvalidInput(crate::InputDefect::SynthesizeRecordingStart)
+            ));
         }
         for ticks in [i64::MIN, -1, 0, 360_000_000_000, i64::MAX - 1] {
             let timecode = Timecode::from_ticks(ticks);
@@ -1717,7 +1755,7 @@ mod tests {
         assert_eq!(recording.last_metadata_pts().ticks(), 15);
     }
 
-    fn invalid_text<T: std::fmt::Debug>(result: Result<T>) -> String {
+    fn invalid_cause<T: std::fmt::Debug>(result: Result<T>) -> crate::InputDefect {
         match result {
             Err(Error::InvalidInput(text)) => text,
             other => panic!("expected InvalidInput, got {other:?}"),
@@ -1736,12 +1774,14 @@ mod tests {
     fn path_errors_name_what_the_path_is() {
         let empty = Path::new("");
         assert_eq!(
-            invalid_text(path_string(empty)),
-            "file path must not be empty"
+            invalid_cause(path_string(empty)),
+            crate::InputDefect::Empty { what: "file path" }
         );
         assert_eq!(
-            invalid_text(RecordingTarget::new(empty)),
-            "recording target must not be empty"
+            invalid_cause(RecordingTarget::new(empty)),
+            crate::InputDefect::Empty {
+                what: "recording target"
+            }
         );
     }
 
@@ -1780,12 +1820,14 @@ mod tests {
         use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
         let path = Path::new(OsStr::from_bytes(b"/take-\xff.mkv"));
         assert_eq!(
-            invalid_text(path_string(path)),
-            "file path is not lossless UTF-8"
+            invalid_cause(path_string(path)),
+            crate::InputDefect::PathNotUtf8 { what: "file path" }
         );
         assert_eq!(
-            invalid_text(RecordingTarget::new(path)),
-            "recording target is not lossless UTF-8"
+            invalid_cause(RecordingTarget::new(path)),
+            crate::InputDefect::PathNotUtf8 {
+                what: "recording target"
+            }
         );
     }
 
@@ -1894,8 +1936,10 @@ mod tests {
             .groups
             .is_none());
         assert_eq!(
-            invalid_text(PlayerOptions::new("").resolve()),
-            "player name must not be empty"
+            invalid_cause(PlayerOptions::new("").resolve()),
+            crate::InputDefect::Empty {
+                what: "player name"
+            }
         );
     }
 
@@ -1908,12 +1952,13 @@ mod tests {
             .drop_wait(crate::MAX_TIMEOUT)
             .resolve()
             .unwrap();
-        assert!(invalid_text(
-            options
-                .drop_wait(crate::MAX_TIMEOUT + Duration::from_millis(1))
-                .resolve()
-        )
-        .contains("MAX_TIMEOUT"));
+        let requested = crate::MAX_TIMEOUT + Duration::from_millis(1);
+        assert_eq!(
+            invalid_cause(options.drop_wait(requested).resolve()),
+            crate::InputDefect::TimeoutTooLong {
+                requested: requested.into()
+            }
+        );
     }
 
     #[test]
@@ -1922,7 +1967,10 @@ mod tests {
         assert_eq!(options.tracks, MediaTypes::ALL);
         assert!(options.resolve().is_ok());
         let empty = options.clone().tracks(MediaTypes::NONE);
-        assert!(invalid_text(empty.resolve()).contains("empty track selection"));
+        assert_eq!(
+            invalid_cause(empty.resolve()),
+            crate::InputDefect::EmptyRecordingTracks
+        );
         let some = options.tracks(MediaTypes::AUDIO | MediaTypes::METADATA);
         assert_eq!(some.tracks, MediaTypes::AUDIO | MediaTypes::METADATA);
         assert!(some.resolve().is_ok());
@@ -1951,19 +1999,37 @@ mod tests {
                 .as_deref(),
             Some("{prefix}_{index:03}.mkv")
         );
-        for pattern in [
-            "",
-            "{prefix",
-            "prefix}",
-            "{unknown}",
-            "{index:0}",
-            "{index:2000}",
+        for (pattern, cause) in [
+            (
+                "",
+                crate::InputDefect::Empty {
+                    what: "filename pattern",
+                },
+            ),
+            ("{prefix", crate::InputDefect::FilenamePatternBrace),
+            ("prefix}", crate::InputDefect::FilenamePatternBrace),
+            (
+                "{unknown}",
+                crate::InputDefect::FilenamePatternToken {
+                    token: "unknown".into(),
+                },
+            ),
+            (
+                "{index:0}",
+                crate::InputDefect::FilenamePatternToken {
+                    token: "index:0".into(),
+                },
+            ),
+            (
+                "{index:2000}",
+                crate::InputDefect::FilenamePatternToken {
+                    token: "index:2000".into(),
+                },
+            ),
         ] {
-            assert!(
-                matches!(
-                    sdk_pattern(FileNaming::Pattern(pattern.into())),
-                    Err(Error::InvalidInput(_))
-                ),
+            assert_eq!(
+                invalid_cause(sdk_pattern(FileNaming::Pattern(pattern.into()))),
+                cause,
                 "{pattern:?}"
             );
         }
@@ -2006,7 +2072,7 @@ mod tests {
         RecorderOptions::new(SourceSpec::new("camera").unwrap())
     }
 
-    fn refused(options: RecorderOptions) -> String {
+    fn refused(options: RecorderOptions) -> crate::InputDefect {
         match options.resolve() {
             Err(Error::InvalidInput(reason)) => reason,
             Err(other) => panic!("expected the options to be refused as input: {other}"),
@@ -2106,17 +2172,16 @@ mod tests {
                 .format_change_rollover(true)
                 .naming(FileNaming::Pattern("{prefix}.mkv".into())),
         ] {
-            let reason = refused(options);
-            assert!(reason.contains("format change"), "{reason}");
-            assert!(reason.contains("{index}"), "{reason}");
+            assert_eq!(
+                refused(options),
+                crate::InputDefect::ExactNameFormatRollover
+            );
         }
         for options in [
             options().naming(FileNaming::Exact).rollover_size(1 << 20),
             options().rollover_size(1 << 20).naming(FileNaming::Exact),
         ] {
-            let reason = refused(options);
-            assert!(reason.contains("size limit"), "{reason}");
-            assert!(reason.contains("{index}"), "{reason}");
+            assert_eq!(refused(options), crate::InputDefect::ExactNameSizeRollover);
         }
         // Indexed names may roll over either way.
         options()
@@ -2189,6 +2254,127 @@ mod tests {
         indexed.check(&target).unwrap();
         assert_eq!(std::fs::read(directory.join("take.mkv")).unwrap(), b"kept");
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn recording_path_preflight_reserves_every_indexs_full_width() {
+        let target_at_length = |length: usize| {
+            let directory = std::env::temp_dir().join("grafton-ndi-absent-path-limit");
+            let directory = directory.to_str().unwrap();
+            RecordingTarget::new(format!(
+                "{directory}/{}",
+                "x".repeat(length - directory.len() - 1)
+            ))
+            .unwrap()
+        };
+        let exact = NamePattern::new(EXACT_PATTERN).unwrap();
+        assert!(matches!(
+            exact.check(&target_at_length(RECORDER_PATH_LIMIT)),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            exact.check(&target_at_length(RECORDER_PATH_LIMIT + 1)),
+            Err(Error::InvalidInput(_))
+        ));
+
+        let indexed = NamePattern::new(DEFAULT_PATTERN).unwrap();
+        let first_suffix = "_001.mkv".len();
+        assert_eq!(indexed.index_digits_reserved, 17);
+        assert!(matches!(
+            indexed.check(&target_at_length(4077 - first_suffix)),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            indexed.check(&target_at_length(4078 - first_suffix)),
+            Err(Error::InvalidInput(_))
+        ));
+
+        // Every index token counts; padding wider than u64 needs no growth.
+        let multiple = NamePattern::new("{prefix}_{index}_{index:03}_{index:24}").unwrap();
+        assert_eq!(multiple.index_digits_reserved, 19 + 17);
+        let suffix = "_1_001_000000000000000000000001".len();
+        let boundary = RECORDER_PATH_LIMIT - multiple.index_digits_reserved - suffix;
+        assert!(matches!(
+            multiple.check(&target_at_length(boundary)),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            multiple.check(&target_at_length(boundary + 1)),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn recording_path_limit_counts_utf8_bytes() {
+        let directory = std::env::temp_dir().join("grafton-ndi-absent-utf8-path-limit");
+        let base = directory.to_str().unwrap().len() + 1;
+        let remaining = RECORDER_PATH_LIMIT - base;
+        let name = format!("{}{}", "é".repeat(remaining / 2), "x".repeat(remaining % 2));
+        let exact = NamePattern::new(EXACT_PATTERN).unwrap();
+        assert!(matches!(
+            exact.check(&RecordingTarget::new(directory.join(&name)).unwrap()),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            exact.check(&RecordingTarget::new(directory.join(format!("{name}x"))).unwrap()),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    // This reproducer needs Linux's byte-oriented directory names. The macOS
+    // CI filesystem rejects the invalid UTF-8 name before a process can use it.
+    #[cfg(target_os = "linux")]
+    fn non_utf8_output_paths_are_refused_without_panicking() {
+        const CHILD: &str = "GRAFTON_NDI_TEST_NON_UTF8_RECORDING_CWD";
+        if std::env::var_os(CHILD).is_some() {
+            let target = RecordingTarget::new("/grafton-ndi-valid-target").unwrap();
+            assert!(matches!(
+                NamePattern::new("take_{index}.mkv").unwrap().check(&target),
+                Err(Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
+                    what: "recording file path"
+                }))
+            ));
+            return;
+        }
+
+        // Changing the working directory only in a child avoids racing other
+        // tests. A pattern omitting {prefix} resolves relative to that directory.
+        use std::os::unix::ffi::OsStringExt;
+        let directory = scratch("non-utf8-output");
+        let non_utf8 = directory.join(std::ffi::OsString::from_vec(vec![0xff]));
+        std::fs::create_dir(&non_utf8).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "file::types::tests::non_utf8_output_paths_are_refused_without_panicking",
+            ])
+            .env(CHILD, "1")
+            .current_dir(non_utf8)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    fn recorder_path_limit_matches_the_events_exact_text_capacity() {
+        let mut buffer = NDIlib_file_recorder_event_t::default().p_path;
+        assert_eq!(
+            buffer.len(),
+            NDIlib_file_recorder_event_path_max_size as usize
+        );
+        buffer[..RECORDER_PATH_LIMIT].fill(b'x' as c_char);
+        let exact = EventText::from_buffer(&buffer);
+        assert_eq!(exact.as_bytes().len(), RECORDER_PATH_LIMIT);
+        assert!(exact.is_terminated());
+        assert!(!exact.is_possibly_truncated());
+        buffer[RECORDER_PATH_LIMIT] = b'x' as c_char;
+        let ambiguous = EventText::from_buffer(&buffer);
+        assert_eq!(ambiguous.as_bytes().len(), RECORDER_PATH_LIMIT + 1);
+        assert!(ambiguous.is_terminated());
+        assert!(ambiguous.is_possibly_truncated());
     }
 
     #[test]
@@ -2331,7 +2517,12 @@ mod tests {
         };
         assert!(matches!(
             SourceFormat::from_sdk(&raw),
-            Err(Error::UnexpectedSdkResult(_))
+            Err(Error::UnexpectedSdkResult(
+                crate::SdkResultDefect::FileTrackCount {
+                    count: 3,
+                    capacity: 2
+                }
+            ))
         ));
         raw.video_track_count = 2;
         raw.video_tracks[0].is_high_quality = true;
@@ -2393,22 +2584,41 @@ mod tests {
             frame_rate_d: 1,
             ..Default::default()
         };
-        for broken in [
-            NDIlib_file_video_track_format_t { xres: -1, ..track },
-            NDIlib_file_video_track_format_t { yres: -1, ..track },
-            NDIlib_file_video_track_format_t {
-                frame_rate_n: -30,
-                ..track
-            },
-            NDIlib_file_video_track_format_t {
-                frame_rate_d: -1,
-                ..track
-            },
+        for (broken, what, value) in [
+            (
+                NDIlib_file_video_track_format_t { xres: -1, ..track },
+                "width",
+                -1,
+            ),
+            (
+                NDIlib_file_video_track_format_t { yres: -1, ..track },
+                "height",
+                -1,
+            ),
+            (
+                NDIlib_file_video_track_format_t {
+                    frame_rate_n: -30,
+                    ..track
+                },
+                "frame-rate numerator",
+                -30,
+            ),
+            (
+                NDIlib_file_video_track_format_t {
+                    frame_rate_d: -1,
+                    ..track
+                },
+                "frame-rate denominator",
+                -1,
+            ),
         ] {
-            assert!(matches!(
-                VideoTrack::from_sdk(&broken),
-                Err(Error::UnexpectedSdkResult(_))
-            ));
+            let Err(Error::UnexpectedSdkResult(cause)) = VideoTrack::from_sdk(&broken) else {
+                panic!("the negative {what} was not refused");
+            };
+            assert_eq!(
+                cause,
+                crate::SdkResultDefect::NegativeFormatCount { what, value }
+            );
         }
         let format = NDIlib_file_source_format_t {
             audio_sample_rate: 48_000,
@@ -2427,24 +2637,36 @@ mod tests {
             ),
             (48_000, 2, 1_600, 32)
         );
-        for broken in [
-            NDIlib_file_source_format_t {
-                audio_sample_rate: -1,
-                ..format
-            },
-            NDIlib_file_source_format_t {
-                audio_no_channels: -1,
-                ..format
-            },
-            NDIlib_file_source_format_t {
-                audio_no_samples: -1,
-                ..format
-            },
+        for (broken, what) in [
+            (
+                NDIlib_file_source_format_t {
+                    audio_sample_rate: -1,
+                    ..format
+                },
+                "audio sample rate",
+            ),
+            (
+                NDIlib_file_source_format_t {
+                    audio_no_channels: -1,
+                    ..format
+                },
+                "audio channel count",
+            ),
+            (
+                NDIlib_file_source_format_t {
+                    audio_no_samples: -1,
+                    ..format
+                },
+                "audio sample count",
+            ),
         ] {
-            assert!(matches!(
-                SourceFormat::from_sdk(&broken),
-                Err(Error::UnexpectedSdkResult(_))
-            ));
+            let Err(Error::UnexpectedSdkResult(cause)) = SourceFormat::from_sdk(&broken) else {
+                panic!("the negative {what} was not refused");
+            };
+            assert_eq!(
+                cause,
+                crate::SdkResultDefect::NegativeFormatCount { what, value: -1 }
+            );
         }
     }
 

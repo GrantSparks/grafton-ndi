@@ -5,7 +5,7 @@ fn retain(state: &CallbackState, id: u64) -> usize {
     let bytes = pixels.retained_bytes();
     let frame = QueuedVideoFrame::from(pixels).authorize_for_test(None);
     let mut locked = state.state.lock().unwrap();
-    let admitted = locked.admit(frame, bytes).unwrap();
+    let admitted = locked.admit(frame, bytes, &state.protocol_error).unwrap();
     assert_eq!(admitted.id.get(), id);
     admitted.lent.descriptor().p_data as usize
 }
@@ -109,8 +109,9 @@ fn scatter_keys_and_concurrent_completions_preserve_allocations() {
             "authorization retains capabilities without allocating"
         );
         let mut locked = state.state.lock().unwrap();
-        let (admitted, allocations) =
-            crate::test_alloc::allocation_count(|| locked.admit(frame, bytes));
+        let (admitted, allocations) = crate::test_alloc::allocation_count(|| {
+            locked.admit(frame, bytes, &state.protocol_error)
+        });
         let admitted = admitted.unwrap();
         assert_eq!(
             allocations, 0,
