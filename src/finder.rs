@@ -11,7 +11,7 @@ use std::{
     fmt::{self, Display, Formatter},
     net::IpAddr,
     ptr,
-    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -193,13 +193,100 @@ unsafe impl Sync for FindInstance {}
 pub struct Finder {
     instance: FindInstance,
     // SDK snapshots and their strings expire on the next snapshot call.
-    sources_lock: Mutex<()>,
+    sources_lock: parking_lot::Mutex<FindInstance>,
     changes: ChangeFeed,
     _groups: Option<CString>,    // Hold ownership of CStrings
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
     _ndi: Ndi,
+}
+
+// The mutex guards a native snapshot's lifetime, not mutable Rust state. A
+// panic releases it without poisoning, and a later snapshot replaces all SDK
+// buffers before reading them. No partially updated Rust invariant survives.
+impl std::panic::RefUnwindSafe for Finder {}
+
+pub(crate) mod snapshot_sealed {
+    pub trait Sealed {}
+}
+
+/// One SDK snapshot entry point and its bounded descriptor copier.
+///
+/// # Safety
+///
+/// For a live finder, `fetch` returns null or the initialized descriptor array
+/// whose length it writes. The descriptors and their non-null strings remain
+/// readable through their NUL or the SDK string bound until the next snapshot
+/// call on that finder. `copy` reads only those descriptor fields and returns
+/// owned values; it neither replaces nor retains the native snapshot.
+pub(crate) unsafe trait FinderSnapshot: snapshot_sealed::Sealed {
+    type Descriptor;
+    type Item;
+
+    /// # Safety
+    /// `instance` is live and no snapshot call can overlap the fetch and copy.
+    unsafe fn fetch(
+        &self,
+        instance: NDIlib_find_instance_t,
+        count: &mut u32,
+    ) -> *const Self::Descriptor;
+
+    /// # Safety
+    /// `source` comes from this entry point's still-live snapshot.
+    unsafe fn copy(
+        &self,
+        source: &Self::Descriptor,
+        budget: &mut SnapshotBudget,
+    ) -> Result<Option<Self::Item>>;
+}
+
+impl snapshot_sealed::Sealed for sys::Core {}
+
+// SAFETY: the v1 SDK snapshot follows FinderSnapshot's contract, and its copier
+// produces owned source names and addresses within the shared byte budget.
+unsafe impl FinderSnapshot for sys::Core {
+    type Descriptor = NDIlib_source_t;
+    type Item = Source;
+
+    unsafe fn fetch(
+        &self,
+        instance: NDIlib_find_instance_t,
+        count: &mut u32,
+    ) -> *const Self::Descriptor {
+        // SAFETY: the guard supplies a live serialized finder instance.
+        unsafe { self.NDIlib_find_get_current_sources(instance, count) }
+    }
+
+    unsafe fn copy(
+        &self,
+        source: &Self::Descriptor,
+        budget: &mut SnapshotBudget,
+    ) -> Result<Option<Self::Item>> {
+        // SAFETY: FinderSnapshot's caller keeps this snapshot's strings live.
+        unsafe { snapshot_entry(source, budget) }
+    }
+}
+
+/// An acquired snapshot lock and the exact native handle it guards. Fetching
+/// gets its instance from this guard, never from a separate Finder argument.
+struct SnapshotGuard<'finder> {
+    instance: parking_lot::MutexGuard<'finder, FindInstance>,
+}
+
+impl SnapshotGuard<'_> {
+    fn snapshot<S: FinderSnapshot>(&self, snapshot: &S) -> Result<Vec<S::Item>> {
+        let mut count = 0;
+        // SAFETY: this private guard keeps its own finder's handle serialized
+        // until all copying completes. The sealed entry point supplies the
+        // array and string lifetimes required by the bounded copy kernel.
+        unsafe {
+            let descriptors = snapshot.fetch(self.instance.0, &mut count);
+            budget::copy_snapshot(descriptors, count, |source, budget| {
+                snapshot.copy(source, budget)
+            })
+        }
+    }
 }
 
 /// One consumer's cursor over a finder's source-list changes.
@@ -399,7 +486,7 @@ impl Finder {
         }
         Ok(Self {
             instance: FindInstance(instance),
-            sources_lock: Mutex::new(()),
+            sources_lock: parking_lot::Mutex::new(FindInstance(instance)),
             changes: ChangeFeed::default(),
             _groups: groups,
             _extra_ips: extra_ips,
@@ -409,52 +496,21 @@ impl Finder {
         })
     }
 
-    /// The one snapshot loop: while no other snapshot can be taken, `fetch`
-    /// the SDK's array of descriptors from this finder's instance and `copy`
-    /// each one, leaving out those `copy` rejects.
-    ///
-    /// The SDK owns a snapshot, the array and its strings, until the next
-    /// snapshot call on the same finder, so the fetch and every copy stay in
-    /// one critical section: locking only the SDK call would not be enough.
-    /// A descriptor the SDK should not produce (null strings naming neither a
-    /// source nor an address, or a string longer than the limit) is left
-    /// out, so that one malformed entry does not hide the others.
-    ///
-    /// # Safety
-    ///
-    /// `fetch` must return null, or a live array of at least the count it
-    /// writes, whose descriptors and the C strings they point to stay
-    /// readable until the next snapshot call on this finder.
-    pub(crate) unsafe fn snapshot<D, T>(
-        &self,
-        fetch: impl FnOnce(NDIlib_find_instance_t, &mut u32) -> *const D,
-        copy: impl FnMut(&D, &mut SnapshotBudget) -> Result<Option<T>>,
-    ) -> Result<Vec<T>> {
-        let _snapshot = self
-            .sources_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // SAFETY: this guard excludes replacement of the SDK's buffers through
-        // the entire shared fetch/copy kernel; caller supplies readable strings.
-        unsafe { self.snapshot_locked(_snapshot, fetch, copy) }
+    /// Copy one snapshot through the entry point's shared lifetime contract.
+    /// The guard carries the handle it protects, so fetching cannot pair a
+    /// different finder's instance with this lock.
+    pub(crate) fn snapshot<S: FinderSnapshot>(&self, snapshot: &S) -> Result<Vec<S::Item>> {
+        self.lock_snapshots(None)
+            .expect("an unbounded snapshot lock acquisition succeeds")
+            .snapshot(snapshot)
     }
 
-    /// The shared native fetch and bounded copy, with the lifetime lock held.
-    ///
-    /// # Safety
-    ///
-    /// As for `snapshot`; `snapshot_lock` must guard this finder's sources lock.
-    unsafe fn snapshot_locked<D, T>(
-        &self,
-        _snapshot_lock: MutexGuard<'_, ()>,
-        fetch: impl FnOnce(NDIlib_find_instance_t, &mut u32) -> *const D,
-        copy: impl FnMut(&D, &mut SnapshotBudget) -> Result<Option<T>>,
-    ) -> Result<Vec<T>> {
-        let mut count = 0;
-        let descriptors = fetch(self.instance.0, &mut count);
-        // SAFETY: fetch's contract supplies the array; the lock keeps it
-        // and its strings live until the complete bounded copy returns.
-        unsafe { budget::copy_snapshot(descriptors, count, copy) }
+    fn lock_snapshots(&self, deadline: Option<Deadline>) -> Option<SnapshotGuard<'_>> {
+        let instance = match deadline {
+            Some(deadline) => self.sources_lock.try_lock_until(deadline.end())?,
+            None => self.sources_lock.lock(),
+        };
+        Some(SnapshotGuard { instance })
     }
 
     /// The runtime this finder was created through.
@@ -524,57 +580,15 @@ impl Finder {
     /// # }
     /// ```
     pub fn current_sources(&self) -> Result<Vec<Source>> {
-        let api = self._ndi.api();
-        // SAFETY: `snapshot` hands the fetch the finder's live instance, for
-        // which the SDK returns null or `count` descriptors whose strings stay
-        // valid until the next snapshot call; the snapshot lock excludes that
-        // call until every descriptor has been copied, and each copy reads
-        // only its own descriptor meanwhile.
-        unsafe {
-            self.snapshot(
-                |instance, count| api.core.NDIlib_find_get_current_sources(instance, count),
-                |source, budget| snapshot_entry(source, budget),
-            )
-        }
-    }
-
-    /// Acquire the snapshot lock within a lookup's existing wait budget.
-    ///
-    /// The standard mutex preserves the finder's poisoning and unwind contracts.
-    /// It has no timed lock, so contended attempts sleep for at most one
-    /// millisecond of the remaining budget; zero/expired budgets only try once.
-    fn snapshot_lock_until(&self, deadline: Deadline) -> Option<MutexGuard<'_, ()>> {
-        loop {
-            match self.sources_lock.try_lock() {
-                Ok(guard) => return Some(guard),
-                Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
-                Err(TryLockError::WouldBlock) => {}
-            }
-            let remaining = deadline.remaining();
-            if remaining.is_zero() {
-                return None;
-            }
-            std::thread::sleep(remaining.min(Duration::from_millis(1)));
-        }
+        self.snapshot(&self._ndi.api().core)
     }
 
     /// The lookup's next snapshot, or none when contention exhausts its budget.
     fn current_sources_until(&self, deadline: Deadline) -> Result<Option<Vec<Source>>> {
-        let Some(snapshot_lock) = self.snapshot_lock_until(deadline) else {
+        let Some(guard) = self.lock_snapshots(Some(deadline)) else {
             return Ok(None);
         };
-        let api = self._ndi.api();
-        // SAFETY: the guard excludes snapshot replacement through the same
-        // bounded fetch/copy kernel as `current_sources`; the SDK owns live
-        // descriptors and strings until that guard is released.
-        unsafe {
-            self.snapshot_locked(
-                snapshot_lock,
-                |instance, count| api.core.NDIlib_find_get_current_sources(instance, count),
-                |source, budget| snapshot_entry(source, budget),
-            )
-            .map(Some)
-        }
+        guard.snapshot(&self._ndi.api().core).map(Some)
     }
 
     /// Poll discovery until `accept` selects a value or `timeout` elapses.
@@ -2041,8 +2055,47 @@ mod tests {
     fn concurrent_snapshots_keep_sdk_buffers_exclusive_until_copied() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
-            Barrier, TryLockError,
+            Barrier,
         };
+
+        struct Probe<'a> {
+            finder: &'a Finder,
+            raw: &'a NDIlib_source_t,
+            active: &'a AtomicUsize,
+        }
+        impl snapshot_sealed::Sealed for Probe<'_> {}
+        // SAFETY: the probe borrows its stack descriptor and live C strings
+        // through the entire serialized call and retains no native reference.
+        unsafe impl FinderSnapshot for Probe<'_> {
+            type Descriptor = NDIlib_source_t;
+            type Item = Source;
+
+            unsafe fn fetch(
+                &self,
+                instance: NDIlib_find_instance_t,
+                count: &mut u32,
+            ) -> *const Self::Descriptor {
+                assert_eq!(instance, self.finder.instance.0);
+                assert_eq!(self.active.fetch_add(1, Ordering::SeqCst), 0);
+                assert!(self.finder.sources_lock.try_lock().is_none());
+                *count = 1;
+                std::thread::yield_now();
+                self.raw
+            }
+
+            unsafe fn copy(
+                &self,
+                source: &Self::Descriptor,
+                budget: &mut SnapshotBudget,
+            ) -> Result<Option<Source>> {
+                assert!(self.finder.sources_lock.try_lock().is_none());
+                std::thread::yield_now();
+                // SAFETY: the probe's borrowed C strings remain live.
+                let owned = unsafe { snapshot_entry(source, budget) };
+                assert_eq!(self.active.fetch_sub(1, Ordering::SeqCst), 1);
+                owned
+            }
+        }
 
         let Some(ndi) = crate::test_support::ndi() else {
             return;
@@ -2066,28 +2119,11 @@ mod tests {
                         },
                     };
                     start.wait();
-                    // SAFETY: raw and both C strings stay live through copying;
-                    // this test's snapshot lock serializes their use.
-                    let sources = unsafe { finder.snapshot(
-                        |_, count| {
-                            // Model an SDK snapshot whose buffers remain borrowed
-                            // until conversion finishes, not just until fetch returns.
-                            assert_eq!(active_snapshot.fetch_add(1, Ordering::SeqCst), 0);
-                            assert!(matches!(finder.sources_lock.try_lock(), Err(TryLockError::WouldBlock)));
-                            *count = 1;
-                            std::thread::yield_now();
-                            &raw
-                        },
-                        |source, budget| {
-                            // Deterministically catches releasing the lock before
-                            // copying, even if competing threads are not scheduled.
-                            assert!(matches!(finder.sources_lock.try_lock(), Err(TryLockError::WouldBlock)));
-                            std::thread::yield_now();
-                            let owned = snapshot_entry(source, budget);
-                            assert_eq!(active_snapshot.fetch_sub(1, Ordering::SeqCst), 1);
-                            owned
-                        },
-                    ) }.unwrap();
+                    let sources = finder.snapshot(&Probe {
+                        finder,
+                        raw: &raw,
+                        active: active_snapshot,
+                    }).unwrap();
                     drop(name);
                     drop(address);
                     assert_eq!(sources[0].name(), format!("Camera {index}"));
@@ -2102,20 +2138,13 @@ mod tests {
         std::thread::scope(|scope| {
             assert!(scope
                 .spawn(|| {
-                    let _guard = finder.sources_lock.lock().unwrap();
+                    let _guard = finder.sources_lock.lock();
                     panic!("interrupted snapshot");
                 })
                 .join()
                 .is_err());
         });
-        assert!(unsafe {
-            finder.snapshot(
-                |_, _| ptr::null::<NDIlib_source_t>(),
-                |_, _| -> Result<Option<Source>> { panic!("empty snapshot must not copy") },
-            )
-        }
-        .unwrap()
-        .is_empty());
+        assert!(finder.current_sources().is_ok());
     }
 
     #[test]
@@ -2313,16 +2342,33 @@ mod tests {
             named(ptr::null()),
             named(c"Last".as_ptr()),
         ];
-        // SAFETY: the array and its strings stay live through the copy.
-        let sources = unsafe {
-            finder.snapshot(
-                |_, count| {
-                    *count = snapshot.len() as u32;
-                    snapshot.as_ptr()
-                },
-                |source, budget| snapshot_entry(source, budget),
-            )
-        };
+        struct SliceSnapshot<'a>(&'a [NDIlib_source_t]);
+        impl snapshot_sealed::Sealed for SliceSnapshot<'_> {}
+        // SAFETY: this fixture is created only below, where its array and all
+        // strings stay live until the guard completes the bounded copy.
+        unsafe impl FinderSnapshot for SliceSnapshot<'_> {
+            type Descriptor = NDIlib_source_t;
+            type Item = Source;
+
+            unsafe fn fetch(
+                &self,
+                _: NDIlib_find_instance_t,
+                count: &mut u32,
+            ) -> *const Self::Descriptor {
+                *count = self.0.len() as u32;
+                self.0.as_ptr()
+            }
+
+            unsafe fn copy(
+                &self,
+                source: &Self::Descriptor,
+                budget: &mut SnapshotBudget,
+            ) -> Result<Option<Source>> {
+                // SAFETY: all fixture strings remain live through this call.
+                unsafe { snapshot_entry(source, budget) }
+            }
+        }
+        let sources = finder.snapshot(&SliceSnapshot(&snapshot));
         let sources = sources.unwrap();
         let names: Vec<_> = sources.iter().map(Source::name).collect();
         assert_eq!(names, ["First", "Last"]);

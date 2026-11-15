@@ -75,6 +75,42 @@ unsafe fn extended_source(
     Ok(Some(ExtendedSource { source, metadata }))
 }
 
+#[cfg(ndi_has_advanced_source_metadata)]
+impl crate::finder::snapshot_sealed::Sealed for SourceMetadata {}
+
+// SAFETY: the SDK's v2 snapshot obeys the same descriptor/string lifetime
+// contract as v1. The copier includes metadata in the shared byte budget.
+#[cfg(ndi_has_advanced_source_metadata)]
+unsafe impl crate::finder::FinderSnapshot for SourceMetadata {
+    type Descriptor = crate::sys::advanced_bindings::NDIlib_source_v2_t;
+    type Item = ExtendedSource;
+
+    unsafe fn fetch(
+        &self,
+        instance: crate::sys::bindings::NDIlib_find_instance_t,
+        count: &mut u32,
+    ) -> *const Self::Descriptor {
+        // SAFETY: the private snapshot guard supplies a live serialized finder.
+        unsafe { self.NDIlib_find_get_current_sources_v2(instance, count) }
+    }
+
+    unsafe fn copy(
+        &self,
+        source: &Self::Descriptor,
+        budget: &mut SnapshotBudget,
+    ) -> Result<Option<ExtendedSource>> {
+        // SAFETY: the guard keeps this snapshot and all its strings live.
+        unsafe {
+            extended_source(
+                source.p_ndi_name,
+                source.p_url_address,
+                source.p_metadata,
+                budget,
+            )
+        }
+    }
+}
+
 impl Finder {
     /// The sources currently known, each with the metadata it advertises.
     ///
@@ -91,19 +127,7 @@ impl Finder {
     pub fn sources_with_metadata(&self) -> Result<Vec<ExtendedSource>> {
         let table = self.runtime().table::<SourceMetadata>()?;
         native!(SourceMetadata, table => {
-            // SAFETY: `snapshot` hands the fetch the finder's live instance,
-            // for which the SDK returns null or `count` descriptors whose
-            // strings stay valid until the next snapshot call; the snapshot
-            // lock excludes that call until every descriptor has been copied,
-            // and each copy reads only its descriptor's strings meanwhile.
-            unsafe {
-                self.snapshot(
-                    |instance, count| table.NDIlib_find_get_current_sources_v2(instance, count),
-                    |source, budget| {
-                        extended_source(source.p_ndi_name, source.p_url_address, source.p_metadata, budget)
-                    },
-                )
-            }
+            self.snapshot(table)
         })
     }
 }

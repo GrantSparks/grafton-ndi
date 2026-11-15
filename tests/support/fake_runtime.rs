@@ -92,6 +92,10 @@ fn log(operation: &str) {
     let Some(path) = std::env::var_os("GRAFTON_FAKE_NDI_LOG") else {
         return;
     };
+    // Formatting may use more than one append; keep a complete event and its
+    // newline together when native callbacks and snapshots log concurrently.
+    static LOG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOG.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
