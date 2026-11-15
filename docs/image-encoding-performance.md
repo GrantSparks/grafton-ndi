@@ -86,6 +86,10 @@ harness from `8d79ed7`; typed-plan changes from `4b8b715` precede A. Dependency
 versions were locked: `png` 0.18.1, `jpeg-encoder` 0.7.1, `image-webp` 0.2.4 and
 `libwebpop` 0.1.0.
 
+The exact measurement commits are retained in
+[`benchmarks/issue-213`](https://github.com/GrantSparks/grafton-ndi/tree/benchmarks/issue-213),
+so each encoder and the reference harness can be checked out independently.
+
 The host was Linux x86-64, Intel Xeon w7-2475X, with Rust
 `1.100.0 (0ef1bc386 2026-11-09)`, the default release profile and target settings.
 The test process was pinned to logical CPU 39. Other development work used the
