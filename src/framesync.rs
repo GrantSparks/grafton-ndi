@@ -471,7 +471,11 @@ impl<'a> FrameSyncCapture<'a> {
 
     /// The approximate queued sample count; see [`FrameSync::audio_queue_depth`].
     /// This makes one native query without allocating or waiting for input.
-    pub fn audio_queue_depth(&self) -> u32 {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnexpectedSdkResult`] when the native queue depth is negative.
+    pub fn audio_queue_depth(&self) -> Result<u32> {
         // SAFETY: the view borrows a live synchronizer for the call.
         let depth = unsafe {
             self.resource
@@ -479,9 +483,10 @@ impl<'a> FrameSyncCapture<'a> {
                 ._ndi
                 .api()
                 .core
+                .named()
                 .NDIlib_framesync_audio_queue_depth(self.resource.instance.0)
         };
-        u32::try_from(depth).unwrap_or(0)
+        crate::receiver::native_count(depth).map(|depth| depth as u32)
     }
 }
 
@@ -1011,12 +1016,16 @@ impl FrameSync {
     /// let framesync = FrameSync::new(receiver)?;
     ///
     /// // Check available samples before capture
-    /// let available = framesync.audio_queue_depth();
+    /// let available = framesync.audio_queue_depth()?;
     /// println!("Audio samples available: {}", available);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn audio_queue_depth(&self) -> u32 {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnexpectedSdkResult`] when the native queue depth is negative.
+    pub fn audio_queue_depth(&self) -> Result<u32> {
         FrameSyncCapture {
             resource: &self.resource,
             _thread: std::marker::PhantomData,

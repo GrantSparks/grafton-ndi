@@ -652,7 +652,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// application expects; connection state and a video counter alone do
     /// not establish audio or metadata progress. See the
     /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
-    pub fn connection_stats(&self) -> ConnectionStats {
+    pub fn connection_stats(&self) -> Result<ConnectionStats> {
         self.inner.connection_stats()
     }
 

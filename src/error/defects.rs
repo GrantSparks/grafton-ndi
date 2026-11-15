@@ -929,7 +929,7 @@ pub enum SdkResultDefect {
         /// The operation.
         operation: crate::NativeFunction,
         /// The value.
-        value: i32,
+        value: DiagnosticInteger,
     },
     /// {operation} returned a string longer than the 4 MiB one string may be.
     #[error("{operation} returned a string longer than the 4 MiB one string may be")]

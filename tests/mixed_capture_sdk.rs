@@ -138,7 +138,7 @@ fn combined_capture_receives_single_kinds_and_interleaved_media_after_reconnect(
                 assert!(
                     Instant::now() < deadline,
                     "expected {expected:?}, saw {observed:?}, epoch {epoch}, stats {:?}",
-                    receiver.connection_stats()
+                    receiver.connection_stats().unwrap()
                 );
             }
         }

@@ -207,7 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Print progress every 10 frames
         if video_frames > 0 && video_frames % 10 == 0 {
-            let queue_depth = framesync.audio_queue_depth();
+            let queue_depth = framesync.audio_queue_depth()?;
             println!(
                 "Progress: {video_frames}/{frame_count} frames, audio queue: {queue_depth} samples"
             );

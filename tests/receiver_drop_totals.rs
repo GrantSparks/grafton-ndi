@@ -58,7 +58,7 @@ fn audio_queue_drops_are_part_of_received_total() {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut observed_progress = false;
         loop {
-            let stats = receiver.connection_stats();
+            let stats = receiver.connection_stats().unwrap();
             let received = stats.audio_frames_received();
             let dropped = stats.audio_frames_dropped();
             if received > 0 {

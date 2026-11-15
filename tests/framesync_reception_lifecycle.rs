@@ -65,10 +65,16 @@ fn audio_reception_distinguishes_silent_input_from_starvation_and_recovers() {
         );
     };
     wait_until(
-        || framesync.receiver().connection_stats().is_connected(),
+        || {
+            framesync
+                .receiver()
+                .connection_stats()
+                .unwrap()
+                .is_connected()
+        },
         "receiver did not connect before audio",
     );
-    let initial = framesync.receiver().connection_stats();
+    let initial = framesync.receiver().connection_stats().unwrap();
     assert_eq!(initial.audio_frames_received(), 0);
     assert_eq!(
         monitor.observe(true, initial.audio_frames_received(), Instant::now()),
@@ -110,7 +116,7 @@ fn audio_reception_distinguishes_silent_input_from_starvation_and_recovers() {
         wait_until(
             || {
                 capture();
-                let stats = framesync.receiver().connection_stats();
+                let stats = framesync.receiver().connection_stats().unwrap();
                 monitor.observe(
                     stats.is_connected(),
                     stats.audio_frames_received(),
@@ -124,6 +130,7 @@ fn audio_reception_distinguishes_silent_input_from_starvation_and_recovers() {
             framesync
                 .receiver()
                 .connection_stats()
+                .unwrap()
                 .video_frames_received(),
             0
         );
@@ -131,7 +138,7 @@ fn audio_reception_distinguishes_silent_input_from_starvation_and_recovers() {
         wait_until(
             || {
                 capture();
-                let stats = framesync.receiver().connection_stats();
+                let stats = framesync.receiver().connection_stats().unwrap();
                 monitor.observe(
                     stats.is_connected(),
                     stats.audio_frames_received(),
@@ -144,7 +151,7 @@ fn audio_reception_distinguishes_silent_input_from_starvation_and_recovers() {
         monitor.reset();
         wait_until(
             || {
-                let stats = framesync.receiver().connection_stats();
+                let stats = framesync.receiver().connection_stats().unwrap();
                 monitor.observe(
                     stats.is_connected(),
                     stats.audio_frames_received(),
@@ -156,10 +163,16 @@ fn audio_reception_distinguishes_silent_input_from_starvation_and_recovers() {
         framesync.receiver().reconnect();
         monitor.reset();
         wait_until(
-            || framesync.receiver().connection_stats().is_connected(),
+            || {
+                framesync
+                    .receiver()
+                    .connection_stats()
+                    .unwrap()
+                    .is_connected()
+            },
             "receiver did not reconnect",
         );
-        let stats = framesync.receiver().connection_stats();
+        let stats = framesync.receiver().connection_stats().unwrap();
         assert_eq!(
             monitor.observe(
                 stats.is_connected(),
@@ -173,7 +186,7 @@ fn audio_reception_distinguishes_silent_input_from_starvation_and_recovers() {
         wait_until(
             || {
                 capture();
-                let stats = framesync.receiver().connection_stats();
+                let stats = framesync.receiver().connection_stats().unwrap();
                 monitor.observe(
                     stats.is_connected(),
                     stats.audio_frames_received(),
@@ -187,7 +200,7 @@ fn audio_reception_distinguishes_silent_input_from_starvation_and_recovers() {
     drop(sender);
     wait_until(
         || {
-            let stats = framesync.receiver().connection_stats();
+            let stats = framesync.receiver().connection_stats().unwrap();
             monitor.observe(
                 stats.is_connected(),
                 stats.audio_frames_received(),
@@ -222,6 +235,7 @@ fn retained_video_output_does_not_advance_received_counter() {
             framesync
                 .receiver()
                 .connection_stats()
+                .unwrap()
                 .video_frames_received()
                 > 0
         },
@@ -232,6 +246,7 @@ fn retained_video_output_does_not_advance_received_counter() {
     let mut previous = framesync
         .receiver()
         .connection_stats()
+        .unwrap()
         .video_frames_received();
     let mut stable_since = Instant::now();
     wait_until(
@@ -239,6 +254,7 @@ fn retained_video_output_does_not_advance_received_counter() {
             let now = framesync
                 .receiver()
                 .connection_stats()
+                .unwrap()
                 .video_frames_received();
             if now != previous {
                 previous = now;
@@ -251,6 +267,7 @@ fn retained_video_output_does_not_advance_received_counter() {
     let before = framesync
         .receiver()
         .connection_stats()
+        .unwrap()
         .video_frames_received();
     let first = framesync
         .capture_video_ref(ScanType::Progressive)
@@ -263,6 +280,7 @@ fn retained_video_output_does_not_advance_received_counter() {
     let after = framesync
         .receiver()
         .connection_stats()
+        .unwrap()
         .video_frames_received();
     eprintln!("retained video output: first={first}, second={second}, received={before}");
     assert_eq!(before, after);

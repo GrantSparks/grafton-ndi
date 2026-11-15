@@ -604,7 +604,7 @@ mod full_diagnostic_tests {
         for (error, expected) in [
             (Error::InvalidFrame(FrameDefect::Layout(crate::LayoutDefect::AudioRate(0.into()))), "Invalid frame data: Invalid sample rate: 0"),
             (Error::InvalidInput(InputDefect::RelativeLibraryPath), "Invalid input: an explicit NDI library path must be absolute"),
-            (Error::UnexpectedSdkResult(SdkResultDefect::NegativeCount {operation: crate::sys::table::for_test((), c"NDIlib_send_get_no_connections").function(),value:-1}), "Unexpected NDI SDK result: NDIlib_send_get_no_connections returned a negative count: -1"),
+            (Error::UnexpectedSdkResult(SdkResultDefect::NegativeCount {operation: crate::sys::table::for_test((), c"NDIlib_send_get_no_connections").function(),value:(-1).into()}), "Unexpected NDI SDK result: NDIlib_send_get_no_connections returned a negative count: -1"),
             (Error::UnexpectedSdkResult(SdkResultDefect::UnexpectedFrameType {operation: crate::sys::table::for_test((), c"NDIlib_send_capture").function(),kind:17}), "Failed to capture frame: NDIlib_send_capture returned 17"),
             (Error::ConnectionLost, "Failed to capture frame: the SDK returned an error frame: the connection was lost"),
             (Error::InitializationFailed(InitializationFailure::NotStarted), "Failed to initialize the NDI runtime: NDIlib_initialize returned false on a CPU the runtime reports as supported"),

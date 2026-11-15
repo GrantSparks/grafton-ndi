@@ -217,7 +217,7 @@ fn sdk_result_defect_diagnostics_preserve_their_text() {
         ("DiscoveryAllocation", SdkResultDefect::DiscoveryAllocation, "could not reserve memory for discovery results"),
         ("UnknownCompletion", SdkResultDefect::UnknownCompletion, "native completion protocol failed; use QueuedSender::close to recover retained frames"),
         ("FileTrackCountOverflow", SdkResultDefect::FileTrackCountOverflow, "video track count does not fit usize"),
-        ("NegativeCount", SdkResultDefect::NegativeCount { operation: crate::sys::table::for_test((), c"native operation").function(), value: -3 }, "native operation returned a negative count: -3"),
+        ("NegativeCount", SdkResultDefect::NegativeCount { operation: crate::sys::table::for_test((), c"native operation").function(), value: (-3).into() }, "native operation returned a negative count: -3"),
         ("UnterminatedText", SdkResultDefect::UnterminatedText { operation: crate::sys::table::for_test((), c"native operation").function() }, "native operation returned a string longer than the 4 MiB one string may be"),
         ("InvalidReceiveDelay", SdkResultDefect::InvalidReceiveDelay { millis: -3 }, "SDK returned invalid receive delay: -3 ms"),
         ("NegativeFormatCount", SdkResultDefect::NegativeFormatCount { what: "file path", value: -3 }, "the source format reports a negative file path: -3"),

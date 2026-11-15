@@ -23,7 +23,7 @@
 //! }
 //! // Query connection state even when no status event arrived.
 //! println!("Connected: {}", receiver.is_connected());
-//! println!("Active connections: {}", receiver.connection_stats().connections());
+//! println!("Active connections: {}", receiver.connection_stats()?.connections());
 //! # Ok(())
 //! # }
 //! ```
@@ -37,7 +37,7 @@ use std::{
     os::raw::c_char,
     ptr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -131,6 +131,62 @@ fn receiver_delay(millis: i32) -> Result<Duration> {
         .ok_or({
             Error::UnexpectedSdkResult(crate::SdkResultDefect::InvalidReceiveDelay { millis })
         })
+}
+
+/// Reject a signed native count while keeping its exact producing entry point.
+/// The returned u64 covers both the SDK's i32 counts and i64 performance totals.
+pub(crate) fn native_count<T: Into<i64>>(count: sys::table::Called<T>) -> Result<u64> {
+    let (value, operation) = count.into_parts();
+    let value = value.into();
+    u64::try_from(value).map_err(|_| {
+        Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
+            operation,
+            value: value.into(),
+        })
+    })
+}
+
+/// A coalesced status invalidation and its publication generation.
+/// Validation completes before a compare/exchange consumes that generation;
+/// failed validation or a newer publication therefore leaves status pending.
+#[derive(Default)]
+struct PendingStatus(AtomicUsize);
+
+impl PendingStatus {
+    fn publish(&self) {
+        let mut observed = self.0.load(Ordering::Acquire);
+        loop {
+            match self.0.compare_exchange_weak(
+                observed,
+                observed.wrapping_add(2) | 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_pending(&self) -> bool {
+        self.0.load(Ordering::Acquire) & 1 != 0
+    }
+
+    fn take_with<T>(&self, snapshot: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+        let observed = self.0.load(Ordering::Acquire);
+        if observed & 1 == 0 {
+            return Ok(None);
+        }
+        let status = snapshot()?;
+        // A failed CAS means another consumer took it or a new generation was
+        // published while validating. Neither case may consume that newer event.
+        Ok(self
+            .0
+            .compare_exchange(observed, observed & !1, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| status))
+    }
 }
 
 /// The SDK's millisecond count for a receive delay, rounded up by the one
@@ -615,7 +671,7 @@ impl ReceiverOptions {
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// println!("Connected: {}", receiver.is_connected());
-    /// println!("Active connections: {}", receiver.connection_stats().connections());
+    /// println!("Active connections: {}", receiver.connection_stats()?.connections());
     /// # Ok(())
     /// # }
     /// ```
@@ -1015,7 +1071,7 @@ pub(crate) struct ReceiverCore {
     /// snapshots never take it and therefore never wait for a capture or a queued
     /// connection change. Writers hold this lock only to replace the value.
     target: RwLock<ConnectionTarget>,
-    pending_status: AtomicBool,
+    pending_status: PendingStatus,
     pending_source: AtomicBool,
     pending_unknown: Mutex<Option<u32>>,
     source_query_guard: Mutex<()>,
@@ -1135,7 +1191,7 @@ impl Receiver {
                     source: options.source.clone(),
                     raw: Box::new(_source),
                 }),
-                pending_status: AtomicBool::new(false),
+                pending_status: PendingStatus::default(),
                 pending_source: AtomicBool::new(false),
                 pending_unknown: Mutex::new(None),
                 source_query_guard: Mutex::new(()),
@@ -1506,6 +1562,8 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Ok(())
     /// # }
     /// ```
+    /// A negative native count reports no established connection; use
+    /// [`Self::connection_stats`] to inspect that SDK contract error.
     pub fn is_connected(&self) -> bool {
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -1593,6 +1651,10 @@ impl<M: ReceiverMode> Receiver<M> {
     /// connection changes; see [`ConnectionStats`] and the
     /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
     ///
+    /// # Errors
+    ///
+    /// [`Error::UnexpectedSdkResult`] when any native count is negative.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -1600,7 +1662,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
     /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
-    /// let stats = receiver.connection_stats();
+    /// let stats = receiver.connection_stats()?;
     /// println!("Connections: {connections}", connections = stats.connections());
     /// println!("Video frames: {received} (dropped: {dropped})",
     ///          received = stats.video_frames_received(),
@@ -1610,12 +1672,13 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn connection_stats(&self) -> ConnectionStats {
+    pub fn connection_stats(&self) -> Result<ConnectionStats> {
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
         let connections = unsafe {
             self.core
                 .sdk()
+                .named()
                 .NDIlib_recv_get_no_connections(self.core.instance.0)
         };
 
@@ -1623,35 +1686,36 @@ impl<M: ReceiverMode> Receiver<M> {
         let mut dropped = NDIlib_recv_performance_t::default();
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
-        unsafe {
-            self.core.sdk().NDIlib_recv_get_performance(
+        let performance = unsafe {
+            self.core.sdk().named().NDIlib_recv_get_performance(
                 self.core.instance.0,
                 &mut total,
                 &mut dropped,
-            );
-        }
+            )
+        };
 
         let mut queue = NDIlib_recv_queue_t::default();
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
-        unsafe {
+        let queued = unsafe {
             self.core
                 .sdk()
-                .NDIlib_recv_get_queue(self.core.instance.0, &mut queue);
-        }
+                .named()
+                .NDIlib_recv_get_queue(self.core.instance.0, &mut queue)
+        };
 
-        ConnectionStats {
-            connections: connections.max(0) as u32,
-            video_frames_received: total.video_frames.max(0) as u64,
-            audio_frames_received: total.audio_frames.max(0) as u64,
-            metadata_frames_received: total.metadata_frames.max(0) as u64,
-            video_frames_dropped: dropped.video_frames.max(0) as u64,
-            audio_frames_dropped: dropped.audio_frames.max(0) as u64,
-            metadata_frames_dropped: dropped.metadata_frames.max(0) as u64,
-            video_frames_queued: queue.video_frames.max(0) as u32,
-            audio_frames_queued: queue.audio_frames.max(0) as u32,
-            metadata_frames_queued: queue.metadata_frames.max(0) as u32,
-        }
+        Ok(ConnectionStats {
+            connections: native_count(connections)? as u32,
+            video_frames_received: native_count(performance.map(|()| total.video_frames))?,
+            audio_frames_received: native_count(performance.map(|()| total.audio_frames))?,
+            metadata_frames_received: native_count(performance.map(|()| total.metadata_frames))?,
+            video_frames_dropped: native_count(performance.map(|()| dropped.video_frames))?,
+            audio_frames_dropped: native_count(performance.map(|()| dropped.audio_frames))?,
+            metadata_frames_dropped: native_count(performance.map(|()| dropped.metadata_frames))?,
+            video_frames_queued: native_count(queued.map(|()| queue.video_frames))? as u32,
+            audio_frames_queued: native_count(queued.map(|()| queue.audio_frames))? as u32,
+            metadata_frames_queued: native_count(queued.map(|()| queue.metadata_frames))? as u32,
+        })
     }
 }
 
@@ -1679,7 +1743,8 @@ impl<M: EventMode> Receiver<M> {
     ///
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
     /// (~49.7 days), and [`Error::ConnectionLost`] when the SDK reports a lost
-    /// connection.
+    /// connection, or [`Error::UnexpectedSdkResult`] when a status snapshot
+    /// contains a negative native connection count. Its invalidation stays pending.
     pub fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
         self.poll_event_until(Deadline::after(timeout)?, NeverStop)
     }
@@ -1842,7 +1907,7 @@ impl ReceiverCore {
         mut convert: impl FnMut(S::Media<'rx>) -> Result<T>,
     ) -> Result<Option<T>> {
         capture_within(deadline, stop, |attempt| {
-            if let Some(pending) = self.take_pending_event() {
+            if let Some(pending) = self.take_pending_event()? {
                 return Ok(Some(event(pending)));
             }
             let lock = self.capture_lock(attempt);
@@ -1862,7 +1927,9 @@ impl ReceiverCore {
     ) -> Result<Option<T>> {
         match delivered {
             Delivered::Media(media) => convert(media).map(Some),
-            Delivered::Notification(notification) => Ok(self.event(notification).map(event)),
+            Delivered::Notification(notification) => {
+                self.event(notification).map(|item| item.map(event))
+            }
         }
     }
 
@@ -1883,52 +1950,49 @@ impl ReceiverCore {
     /// typed capture retained during this wait, then consume one. A pending
     /// event returned before the native wait never comes through this path
     /// and is never published again.
-    fn event(&self, notification: Notification) -> Option<ReceiverEvent> {
+    fn event(&self, notification: Notification) -> Result<Option<ReceiverEvent>> {
         self.retain(notification);
         self.take_pending_event()
     }
 
-    fn take_pending_status(&self) -> Option<ReceiverStatus> {
-        // Atomic swap linearizes competing pollers with capture publication.
-        // A store after this take remains pending; no load/store pair can erase it.
-        self.pending_status
-            .swap(false, Ordering::AcqRel)
-            .then(|| self.current_status())
+    fn take_pending_status(&self) -> Result<Option<ReceiverStatus>> {
+        self.pending_status.take_with(|| self.current_status())
     }
 
-    fn current_status(&self) -> ReceiverStatus {
-        ReceiverStatus {
-            // SAFETY: the receiver instance is live for this borrow, and every pointer
-            // passed outlives the synchronous call.
-            connections: unsafe {
-                self.sdk()
-                    .NDIlib_recv_get_no_connections(self.instance.0)
-                    .max(0) as u32
-            },
-        }
+    fn current_status(&self) -> Result<ReceiverStatus> {
+        // SAFETY: the receiver is live for this nonblocking native query.
+        let count = unsafe {
+            self.sdk()
+                .named()
+                .NDIlib_recv_get_no_connections(self.instance.0)
+        };
+        Ok(ReceiverStatus {
+            connections: native_count(count)? as u32,
+        })
     }
 
     /// Keep a notification a capture reported for [`Receiver::poll_event`].
     fn retain(&self, notification: Notification) {
         match notification {
             Notification::None => {}
-            Notification::StatusChanged => self.pending_status.store(true, Ordering::Release),
+            Notification::StatusChanged => self.pending_status.publish(),
             Notification::SourceChanged => self.pending_source.store(true, Ordering::Release),
             Notification::Unknown(value) => *self.pending_unknown.lock() = Some(value),
         }
     }
 
-    fn take_pending_event(&self) -> Option<ReceiverEvent> {
-        if let Some(status) = self.take_pending_status() {
-            return Some(ReceiverEvent::StatusChanged(status));
+    fn take_pending_event(&self) -> Result<Option<ReceiverEvent>> {
+        if let Some(status) = self.take_pending_status()? {
+            return Ok(Some(ReceiverEvent::StatusChanged(status)));
         }
         if self.pending_source.swap(false, Ordering::AcqRel) {
-            return Some(ReceiverEvent::SourceChanged);
+            return Ok(Some(ReceiverEvent::SourceChanged));
         }
-        self.pending_unknown
+        Ok(self
+            .pending_unknown
             .lock()
             .take()
-            .map(ReceiverEvent::Unknown)
+            .map(ReceiverEvent::Unknown))
     }
 
     /// The one implementation of [`Receiver::poll_source_name_change`], also
@@ -2781,7 +2845,7 @@ mod tests {
             assert_eq!(actual, expected);
         }
         assert_eq!(native_capture_calls::take(), 0);
-        assert_eq!(receiver.core.take_pending_event(), None);
+        assert_eq!(receiver.core.take_pending_event().unwrap(), None);
     }
 
     #[test]
@@ -2859,14 +2923,14 @@ mod tests {
         }
         receiver.core.retain(Notification::classify(987).unwrap());
         assert!(matches!(
-            receiver.core.take_pending_event(),
+            receiver.core.take_pending_event().unwrap(),
             Some(ReceiverEvent::SourceChanged)
         ));
         assert!(matches!(
-            receiver.core.take_pending_event(),
+            receiver.core.take_pending_event().unwrap(),
             Some(ReceiverEvent::Unknown(987))
         ));
-        assert!(receiver.core.take_pending_event().is_none());
+        assert!(receiver.core.take_pending_event().unwrap().is_none());
         assert!(receiver
             .core
             .capture_result::<VideoKind>(CaptureResult::Notification(Notification::Unknown(988)))
@@ -2876,11 +2940,11 @@ mod tests {
             Notification::classify(NDIlib_frame_type_e_NDIlib_frame_type_source_change).unwrap(),
         );
         assert!(matches!(
-            receiver.core.take_pending_event(),
+            receiver.core.take_pending_event().unwrap(),
             Some(ReceiverEvent::SourceChanged)
         ));
         assert!(matches!(
-            receiver.core.take_pending_event(),
+            receiver.core.take_pending_event().unwrap(),
             Some(ReceiverEvent::Unknown(988))
         ));
     }
@@ -3276,10 +3340,10 @@ mod tests {
                     .unwrap()
                     .is_none());
                 assert!(matches!(
-                    receiver.core.take_pending_event(),
+                    receiver.core.take_pending_event().unwrap(),
                     Some(ReceiverEvent::StatusChanged(_))
                 ));
-                assert!(receiver.core.take_pending_event().is_none());
+                assert!(receiver.core.take_pending_event().unwrap().is_none());
             });
             assert_eq!(allocations, 0);
         }
@@ -3289,19 +3353,103 @@ mod tests {
     }
 
     #[test]
+    fn native_counts_preserve_signed_evidence_without_allocating() {
+        for value in [0, 7, -1, i64::MIN] {
+            let (result, allocations) = crate::test_alloc::allocation_count(|| {
+                native_count(sys::table::for_test(value, c"native count"))
+            });
+            assert_eq!(allocations, 0);
+            if value < 0 {
+                assert!(
+                    matches!(result, Err(Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount { operation, value: evidence }))
+                    if operation == c"native count" && evidence.get() == value)
+                );
+            } else {
+                assert_eq!(result.unwrap(), value as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn pending_status_keeps_failed_and_newer_publications() {
+        let pending = PendingStatus::default();
+        pending.publish();
+        assert!(matches!(
+            pending.take_with::<()>(|| Err(Error::ConnectionLost)),
+            Err(Error::ConnectionLost)
+        ));
+        assert!(pending.is_pending());
+        assert_eq!(
+            pending
+                .take_with(|| {
+                    pending.publish();
+                    Ok(1)
+                })
+                .unwrap(),
+            None
+        );
+        assert!(
+            pending.is_pending(),
+            "a publication during validation must survive"
+        );
+        assert_eq!(pending.take_with(|| Ok(2)).unwrap(), Some(2));
+        assert!(!pending.is_pending());
+        pending.publish();
+        assert!(pending
+            .take_with::<()>(|| {
+                pending.publish();
+                Err(Error::ConnectionLost)
+            })
+            .is_err());
+        assert!(pending.is_pending());
+        assert_eq!(pending.take_with(|| Ok(3)).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn pending_status_validation_has_one_competing_consumer() {
+        let pending = PendingStatus::default();
+        pending.publish();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        pending
+                            .take_with(|| {
+                                barrier.wait();
+                                Ok(())
+                            })
+                            .unwrap()
+                            .is_some()
+                    })
+                })
+                .collect();
+            assert_eq!(
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .filter(|taken| *taken)
+                    .count(),
+                1
+            );
+        });
+        assert!(!pending.is_pending());
+    }
+
+    #[test]
     fn pending_status_survives_an_invalid_poll_event_timeout() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        receiver.core.pending_status.store(true, Ordering::Release);
+        receiver.core.pending_status.publish();
         assert!(receiver.poll_event(Duration::MAX).is_err());
-        assert!(receiver.core.pending_status.load(Ordering::Acquire));
+        assert!(receiver.core.pending_status.is_pending());
         assert!(matches!(
             receiver.poll_event(Duration::ZERO).unwrap(),
             Some(ReceiverEvent::StatusChanged(_))
         ));
-        assert!(!receiver.core.pending_status.load(Ordering::Acquire));
+        assert!(!receiver.core.pending_status.is_pending());
     }
 
     #[test]
@@ -3330,7 +3478,7 @@ mod tests {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        receiver.core.pending_status.store(true, Ordering::Release);
+        receiver.core.pending_status.publish();
         let barrier = std::sync::Barrier::new(3);
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..2)
@@ -3339,7 +3487,7 @@ mod tests {
                     let barrier = &barrier;
                     scope.spawn(move || {
                         barrier.wait();
-                        receiver.core.take_pending_status().is_some()
+                        receiver.core.take_pending_status().unwrap().is_some()
                     })
                 })
                 .collect();
@@ -3352,8 +3500,8 @@ mod tests {
                 1
             );
         });
-        receiver.core.pending_status.store(true, Ordering::Release);
-        assert!(receiver.core.take_pending_status().is_some());
+        receiver.core.pending_status.publish();
+        assert!(receiver.core.take_pending_status().unwrap().is_some());
     }
 
     #[test]
@@ -3495,7 +3643,7 @@ mod tests {
             Some(ReceiverItemRef::Event(ReceiverEvent::SourceChanged))
         ));
         assert!(
-            receiver.core.take_pending_event().is_none(),
+            receiver.core.take_pending_event().unwrap().is_none(),
             "same invalidation must not replay"
         );
         receiver.core.retain(Notification::Unknown(987));
@@ -3503,7 +3651,7 @@ mod tests {
             deliver(Notification::None).unwrap(),
             Some(ReceiverItemRef::Event(ReceiverEvent::Unknown(987)))
         ));
-        assert!(receiver.core.take_pending_event().is_none());
+        assert!(receiver.core.take_pending_event().unwrap().is_none());
     }
 
     #[test]
@@ -3572,7 +3720,7 @@ mod tests {
             .core
             .capture_result::<AudioKind>(CaptureResult::Notification(Notification::StatusChanged))
             .unwrap();
-        assert!(receiver.core.take_pending_status().is_some());
+        assert!(receiver.core.take_pending_status().unwrap().is_some());
 
         // Publishing a pending notification needs no local connection lock.
         let _exclusive = receiver.core.lock_connection();
@@ -3593,16 +3741,16 @@ mod tests {
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         let original_core = Arc::as_ptr(&receiver.core);
-        receiver.core.pending_status.store(true, Ordering::Release);
+        receiver.core.pending_status.publish();
         let fs = crate::FrameSync::new(receiver).unwrap();
-        assert!(fs.receiver().core.pending_status.load(Ordering::Acquire));
+        assert!(fs.receiver().core.pending_status.is_pending());
         assert_eq!(Arc::as_ptr(&fs.receiver().core), original_core);
         let receiver = fs.into_receiver();
         assert!(matches!(
             receiver.poll_event(Duration::ZERO).unwrap(),
             Some(ReceiverEvent::StatusChanged(_))
         ));
-        assert!(!receiver.core.pending_status.load(Ordering::Acquire));
+        assert!(!receiver.core.pending_status.is_pending());
         assert_eq!(Arc::as_ptr(&receiver.core), original_core);
         assert_eq!(
             std::mem::size_of::<Receiver>(),

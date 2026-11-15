@@ -2356,12 +2356,8 @@ impl<M: SenderMode> Sender<M> {
                 .NDIlib_send_get_no_connections(self.inner.instance.0, timeout_ms)
         };
 
-        u32::try_from(*count.value()).map_err(|_| {
-            Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
-                operation: count.function(),
-                value: *count.value(),
-            })
-        })
+        // The SDK count is i32, so every nonnegative value fits u32.
+        crate::receiver::native_count(count).map(|count| count as u32)
     }
 
     /// Remove all metadata registered for delivery to each new connection.

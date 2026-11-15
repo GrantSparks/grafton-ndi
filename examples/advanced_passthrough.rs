@@ -125,7 +125,7 @@ fn main() -> Result<(), Error> {
             Some(_) => {}
         }
     }
-    let stats = receiver.receiver().connection_stats();
+    let stats = receiver.receiver().connection_stats()?;
     println!(
         "Relayed {video} video and {audio} audio packets; {} video frames dropped",
         stats.video_frames_dropped()

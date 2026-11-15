@@ -219,7 +219,8 @@ controls through `controls()` without allowing the receiver to be replaced.
 
 ### Monitor reception of the expected media
 
-Poll `connection_stats()` on a diagnostics path, selecting
+Poll `connection_stats()?` on a diagnostics path, handling an SDK count error
+without treating it as a counter reset, and selecting
 `audio_frames_received()`, `video_frames_received()` or
 `metadata_frames_received()` for the expected media. Audio totals count packets,
 not samples played. Received totals include receiver queue/processing drops;

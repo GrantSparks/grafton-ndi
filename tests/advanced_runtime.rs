@@ -79,7 +79,7 @@ fn link<M: ReceiverMode>(receiver: &Receiver<M>) -> String {
     format!(
         "the receiver of {:?} reports {:?}{}",
         receiver.connection_target(),
-        receiver.connection_stats(),
+        receiver.connection_stats().unwrap(),
         tcp_table(&receiver.connection_target())
     )
 }
@@ -236,7 +236,7 @@ fn advanced_native_constructors_controls_and_queue() {
     {
         let receiver = av.receiver();
         receiver.set_tally(Tally::new(true, false));
-        let _ = receiver.connection_stats();
+        let _ = receiver.connection_stats().unwrap();
         let _ = receiver.ptz().is_supported();
         receiver.request_keyframe().unwrap();
         let _ = receiver.metadata().capture(Duration::ZERO).unwrap();
@@ -2084,7 +2084,7 @@ fn share_controls<M: grafton_ndi::ReceiverMode>(receiver: &Receiver<M>) {
             scope.spawn(|| {
                 for _ in 0..50 {
                     assert!(receiver.is_connected());
-                    assert!(receiver.connection_stats().connections() >= 1);
+                    assert!(receiver.connection_stats().unwrap().connections() >= 1);
                     receiver.set_tally(Tally::new(true, false));
                     let _ = receiver.poll_source_name_change(Duration::ZERO).unwrap();
                 }
@@ -3788,7 +3788,7 @@ fn borrowed_packet_payload_stays_in_external_allocator_memory() {
         !freed.load(Ordering::Acquire),
         "held reference keeps its allocation alive"
     );
-    receiver.receiver().connection_stats();
+    receiver.receiver().connection_stats().unwrap();
     drop(held);
     let deadline = Instant::now() + PATIENCE;
     while !freed.load(Ordering::Acquire) {

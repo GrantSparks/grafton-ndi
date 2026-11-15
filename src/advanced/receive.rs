@@ -466,7 +466,7 @@ mod tests {
         };
         assert_eq!(
             status.connections(),
-            receiver.connection_stats().connections()
+            receiver.connection_stats().unwrap().connections()
         );
         for (notification, expected) in [
             (Notification::SourceChanged, ReceiverEvent::SourceChanged),

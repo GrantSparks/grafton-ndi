@@ -247,11 +247,44 @@ stub! {
 #[path = "fake_capture.rs"]
 mod capture;
 
+// Contract-breach modes let receive wrappers reject negative native counts.
+fn negative_count() -> String {
+    std::env::var("GRAFTON_FAKE_NEGATIVE_COUNT").unwrap_or_default()
+}
+
+export! {
+    fn NDIlib_recv_get_no_connections(_p_instance: NDIlib_recv_instance_t) -> ::std::os::raw::c_int {
+        if negative_count() == "connections" { -1 } else { 0 }
+    }
+    fn NDIlib_recv_get_performance(_p_instance: NDIlib_recv_instance_t, p_total: *mut NDIlib_recv_performance_t, p_dropped: *mut NDIlib_recv_performance_t) {
+        let selected = negative_count();
+        let mut total = NDIlib_recv_performance_t::default();
+        let mut dropped = NDIlib_recv_performance_t::default();
+        match selected.as_str() {
+            "received-video" => total.video_frames = i64::MIN,
+            "received-audio" => total.audio_frames = i64::MIN,
+            "received-metadata" => total.metadata_frames = i64::MIN,
+            "dropped-video" => dropped.video_frames = i64::MIN,
+            "dropped-audio" => dropped.audio_frames = i64::MIN,
+            "dropped-metadata" => dropped.metadata_frames = i64::MIN,
+            _ => {}
+        }
+        unsafe { *p_total = total; *p_dropped = dropped; }
+    }
+    fn NDIlib_recv_get_queue(_p_instance: NDIlib_recv_instance_t, p_total: *mut NDIlib_recv_queue_t) {
+        let mut queue = NDIlib_recv_queue_t::default();
+        match negative_count().as_str() {
+            "queued-video" => queue.video_frames = -1,
+            "queued-audio" => queue.audio_frames = -1,
+            "queued-metadata" => queue.metadata_frames = -1,
+            _ => {}
+        }
+        unsafe { *p_total = queue; }
+    }
+}
+
 stub! {
     fn NDIlib_recv_send_metadata(p_instance: NDIlib_recv_instance_t, p_metadata: *const NDIlib_metadata_frame_t) -> bool;
-    fn NDIlib_recv_get_performance(p_instance: NDIlib_recv_instance_t, p_total: *mut NDIlib_recv_performance_t, p_dropped: *mut NDIlib_recv_performance_t);
-    fn NDIlib_recv_get_queue(p_instance: NDIlib_recv_instance_t, p_total: *mut NDIlib_recv_queue_t);
-    fn NDIlib_recv_get_no_connections(p_instance: NDIlib_recv_instance_t) -> ::std::os::raw::c_int;
     fn NDIlib_recv_ptz_is_supported(p_instance: NDIlib_recv_instance_t) -> bool;
     fn NDIlib_recv_ptz_zoom(p_instance: NDIlib_recv_instance_t, zoom_value: f32) -> bool;
     fn NDIlib_recv_ptz_zoom_speed(p_instance: NDIlib_recv_instance_t, zoom_speed: f32) -> bool;

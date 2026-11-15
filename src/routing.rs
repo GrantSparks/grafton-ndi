@@ -27,7 +27,7 @@
 use crate::{
     finder::RawSource,
     sys::{self, bindings::*},
-    to_ms_checked, Error, Ndi, Result, Source,
+    to_ms_checked, Ndi, Result, Source,
 };
 use std::{ffi::CString, fmt, ptr, time::Duration};
 
@@ -165,11 +165,11 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnsupportedCapability`] when the selected runtime has no
+    /// Returns [`crate::Error::UnsupportedCapability`] when the selected runtime has no
     /// [routing support](crate::capabilities::RuntimeFeature::Routing), or the
     /// options carry an Advanced configuration that the runtime or this build
-    /// cannot take; [`Error::InvalidCString`] when the name or groups contain a
-    /// NUL byte; and [`Error::NativeOperationFailed`] when the SDK creates no
+    /// cannot take; [`crate::Error::InvalidCString`] when the name or groups contain a
+    /// NUL byte; and [`crate::Error::NativeOperationFailed`] when the SDK creates no
     /// source.
     pub fn new(ndi: &Ndi, options: &RouterOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
@@ -252,8 +252,8 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCString`] when the source name or address
-    /// contains a NUL byte, and [`Error::NativeOperationFailed`] when the SDK
+    /// Returns [`crate::Error::InvalidCString`] when the source name or address
+    /// contains a NUL byte, and [`crate::Error::NativeOperationFailed`] when the SDK
     /// rejects the change.
     pub fn change(&mut self, source: &Source) -> Result<()> {
         let raw = Box::new(source.to_raw()?);
@@ -280,7 +280,7 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NativeOperationFailed`] when the SDK rejects the change.
+    /// Returns [`crate::Error::NativeOperationFailed`] when the SDK rejects the change.
     pub fn clear(&mut self) -> Result<()> {
         // SAFETY: the router instance is live for this borrow.
         let cleared = unsafe { self.routing.named().NDIlib_routing_clear(self.instance.0) };
@@ -300,8 +300,8 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidInput`] when `timeout` exceeds
-    /// [`crate::MAX_TIMEOUT`], and [`Error::UnexpectedSdkResult`] when the SDK
+    /// Returns [`crate::Error::InvalidInput`] when `timeout` exceeds
+    /// [`crate::MAX_TIMEOUT`], and [`crate::Error::UnexpectedSdkResult`] when the SDK
     /// reports a negative count.
     pub fn connection_count(&self, timeout: Duration) -> Result<u32> {
         let timeout = to_ms_checked(timeout)?;
@@ -311,21 +311,17 @@ impl Router {
                 .named()
                 .NDIlib_routing_get_no_connections(self.instance.0, timeout)
         };
-        u32::try_from(*count.value()).map_err(|_| {
-            Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
-                operation: count.function(),
-                value: *count.value(),
-            })
-        })
+        // The SDK count is i32, so every nonnegative value fits u32.
+        crate::receiver::native_count(count).map(|count| count as u32)
     }
     /// The source descriptor this router is advertised under, which receivers
     /// connect to.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NativeOperationFailed`] when the SDK supplies no
+    /// Returns [`crate::Error::NativeOperationFailed`] when the SDK supplies no
     /// descriptor, or one that names neither a source nor an address, and
-    /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
+    /// [`crate::Error::UnexpectedSdkResult`] when its name or address is longer than
     /// the 4 MiB one SDK string may be.
     pub fn source(&self) -> Result<Source> {
         // SAFETY: the router is live, and the descriptor the SDK returns stays

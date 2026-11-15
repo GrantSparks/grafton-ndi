@@ -45,6 +45,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   with `NativeFunction`. Compare it with a C string or inspect `name()`; File
   failures now name the actual SDK function, including timecoded starts.
 
+- Reject negative receiver statistics, status-event connection counts and
+  FrameSync audio queue depths with typed `NegativeCount` evidence. Numeric
+  getters now return `Result`; boolean connection predicates remain total.
+
 - `InvalidFrame`, `InvalidInput` and `UnexpectedSdkResult` carry typed
   `FrameDefect`, `InputDefect` and `SdkResultDefect` causes. Shared layout
   refusals use one nested `LayoutDefect` in both frame and input causes. Receiver capture

@@ -45,7 +45,7 @@ fn query_change<M: ReceiverMode>(sender: &Sender, receiver: &Receiver<M>) -> Res
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(receiver.is_connected());
-    assert!(receiver.connection_stats().connections() > 0);
+    assert!(receiver.connection_stats().unwrap().connections() > 0);
     Ok(())
 }
 

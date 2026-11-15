@@ -20,7 +20,7 @@ fn framesync(sync: &mut FrameSync) -> Result<()> {
     session.key_down(0xffe1)?;
     let _ = capture.capture_video(ScanType::Progressive)?;
     let _ = capture.audio_input_format()?;
-    let _ = capture.audio_queue_depth();
+    let _ = capture.audio_queue_depth().unwrap();
     session.release_all()?;
     drop((video, audio, metadata));
     drop(session);
