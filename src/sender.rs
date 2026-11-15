@@ -3055,6 +3055,9 @@ mod tests {
             .unwrap();
         sender.send_video_async_copy(&present).unwrap();
         sender.send_video_async_copy(&present).unwrap();
+        // Exclusive async sends do not lock the state. Warm this test's
+        // inspection lock, whose first use may allocate on some platforms.
+        drop(sender.native.video.state.lock().unwrap());
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
             for _ in 0..4 {
                 for (source, expected) in [
