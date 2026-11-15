@@ -113,6 +113,11 @@
 //!   and the session goes on; a file that cannot be opened for another reason
 //!   still ends it. An exact file name cannot roll over by itself at all; see
 //!   [`FileNaming::Exact`].
+//! * **Recording paths must be reportable exactly.** Start and rollover
+//!   preflight refuse absolute output paths above 4094 UTF-8 bytes with the
+//!   current SDK, reserving at least 20 digits for each index token's growth.
+//!   This keeps closure events unambiguous, so a finalized session can close
+//!   and another session can start.
 //!
 //! # Threads
 //!

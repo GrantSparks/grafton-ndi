@@ -258,6 +258,11 @@ pub(super) struct ResolvedPlayerOptions {
 /// collisions at preflight; native creation after that check depends on the
 /// platform and SDK. See [`Self::Exact`] for the tested exclusive-open
 /// behavior and the limits of this check.
+///
+/// Every absolute output path must fit exactly in the recorder's event field:
+/// at most 4094 UTF-8 bytes with the current SDK. Preflight reserves at least
+/// 20 digits for each index token, including future rollovers, and refuses
+/// longer paths with [`Error::InvalidInput`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum FileNaming {
@@ -582,6 +587,10 @@ const DEFAULT_PATTERN: &str = "{prefix}_{index:03}.mkv";
 /// The pattern that names each file exactly as its target says.
 const EXACT_PATTERN: &str = "{prefix}";
 
+// A terminated string filling the event field could have been truncated.
+const RECORDER_PATH_LIMIT: usize = NDIlib_file_recorder_event_path_max_size as usize - 2;
+const INDEX_DIGITS: usize = u64::MAX.ilog10() as usize + 1;
+
 /// One part of a filename pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PatternPart<'a> {
@@ -638,18 +647,29 @@ pub(super) struct NamePattern {
     pattern: String,
     /// The pattern has no index, so each target names exactly one file.
     exact: bool,
+    /// Extra digits beyond index 1, reserving the full range of a u64 index.
+    index_digits_reserved: usize,
 }
 
 impl NamePattern {
     /// Parse `pattern`, failing with [`Error::InvalidInput`] when it is
     /// malformed.
     fn new(pattern: &str) -> Result<Self> {
-        let exact = !pattern_parts(pattern)?
+        let parts = pattern_parts(pattern)?;
+        let exact = !parts
             .iter()
             .any(|part| matches!(part, PatternPart::Index(_)));
+        let index_digits_reserved = parts
+            .iter()
+            .filter_map(|part| match part {
+                PatternPart::Index(width) => Some(INDEX_DIGITS.saturating_sub((*width).max(1))),
+                _ => None,
+            })
+            .fold(0usize, usize::saturating_add);
         Ok(Self {
             pattern: pattern.to_owned(),
             exact,
+            index_digits_reserved,
         })
     }
 
@@ -682,14 +702,26 @@ impl NamePattern {
     }
 
     /// Confirm that the SDK can create the file this pattern gives `target`:
-    /// that its directory exists and can be written to, and, for an exact
-    /// name, that the file does not exist yet.
+    /// that its longest path can be reported exactly, its directory exists
+    /// and can be written to, and, for an exact name, the file does not exist.
     ///
     /// The SDK accepts a rollover to a file it cannot create and then ends
     /// the whole session, so the mistake is caught here, while the session
     /// can still go on. Nothing is created.
     pub(super) fn check(&self, target: &RecordingTarget) -> Result<()> {
         let file = self.first_file(target)?;
+        let longest_bytes = file
+            .to_str()
+            .expect("validated UTF-8")
+            .len()
+            .saturating_add(self.index_digits_reserved);
+        if longest_bytes > RECORDER_PATH_LIMIT {
+            return Err(Error::InvalidInput(format!(
+                "recording file path may reach {longest_bytes} UTF-8 bytes, exceeding the \
+                 {RECORDER_PATH_LIMIT}-byte event path limit ({} digits reserved for index growth)",
+                self.index_digits_reserved
+            )));
+        }
         check_directory(file.parent().unwrap_or(&file))?;
         if self.exact && std::fs::symlink_metadata(&file).is_ok() {
             return Err(Error::Io(std::io::Error::new(
@@ -2189,6 +2221,90 @@ mod tests {
         indexed.check(&target).unwrap();
         assert_eq!(std::fs::read(directory.join("take.mkv")).unwrap(), b"kept");
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn recording_path_preflight_reserves_every_indexs_full_width() {
+        let target_at_length = |length: usize| {
+            let directory = std::env::temp_dir().join("grafton-ndi-absent-path-limit");
+            let directory = directory.to_str().unwrap();
+            RecordingTarget::new(format!(
+                "{directory}/{}",
+                "x".repeat(length - directory.len() - 1)
+            ))
+            .unwrap()
+        };
+        let exact = NamePattern::new(EXACT_PATTERN).unwrap();
+        assert!(matches!(
+            exact.check(&target_at_length(RECORDER_PATH_LIMIT)),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            exact.check(&target_at_length(RECORDER_PATH_LIMIT + 1)),
+            Err(Error::InvalidInput(_))
+        ));
+
+        let indexed = NamePattern::new(DEFAULT_PATTERN).unwrap();
+        let first_suffix = "_001.mkv".len();
+        assert_eq!(indexed.index_digits_reserved, 17);
+        assert!(matches!(
+            indexed.check(&target_at_length(4077 - first_suffix)),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            indexed.check(&target_at_length(4078 - first_suffix)),
+            Err(Error::InvalidInput(_))
+        ));
+
+        // Every index token counts; padding wider than u64 needs no growth.
+        let multiple = NamePattern::new("{prefix}_{index}_{index:03}_{index:24}").unwrap();
+        assert_eq!(multiple.index_digits_reserved, 19 + 17);
+        let suffix = "_1_001_000000000000000000000001".len();
+        let boundary = RECORDER_PATH_LIMIT - multiple.index_digits_reserved - suffix;
+        assert!(matches!(
+            multiple.check(&target_at_length(boundary)),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            multiple.check(&target_at_length(boundary + 1)),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn recording_path_limit_counts_utf8_bytes() {
+        let directory = std::env::temp_dir().join("grafton-ndi-absent-utf8-path-limit");
+        let base = directory.to_str().unwrap().len() + 1;
+        let remaining = RECORDER_PATH_LIMIT - base;
+        let name = format!("{}{}", "é".repeat(remaining / 2), "x".repeat(remaining % 2));
+        let exact = NamePattern::new(EXACT_PATTERN).unwrap();
+        assert!(matches!(
+            exact.check(&RecordingTarget::new(directory.join(&name)).unwrap()),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            exact.check(&RecordingTarget::new(directory.join(format!("{name}x"))).unwrap()),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn recorder_path_limit_matches_the_events_exact_text_capacity() {
+        let mut buffer = NDIlib_file_recorder_event_t::default().p_path;
+        assert_eq!(
+            buffer.len(),
+            NDIlib_file_recorder_event_path_max_size as usize
+        );
+        buffer[..RECORDER_PATH_LIMIT].fill(b'x' as c_char);
+        let exact = EventText::from_buffer(&buffer);
+        assert_eq!(exact.as_bytes().len(), RECORDER_PATH_LIMIT);
+        assert!(exact.is_terminated());
+        assert!(!exact.is_possibly_truncated());
+        buffer[RECORDER_PATH_LIMIT] = b'x' as c_char;
+        let ambiguous = EventText::from_buffer(&buffer);
+        assert_eq!(ambiguous.as_bytes().len(), RECORDER_PATH_LIMIT + 1);
+        assert!(ambiguous.is_terminated());
+        assert!(ambiguous.is_possibly_truncated());
     }
 
     #[test]

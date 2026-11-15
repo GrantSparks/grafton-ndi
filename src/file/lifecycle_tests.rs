@@ -902,6 +902,40 @@ fn io_kind<T: std::fmt::Debug>(result: Result<T>) -> std::io::ErrorKind {
 }
 
 #[test]
+fn unreportable_recording_paths_never_reach_native_start_or_rollover() {
+    let directory = Directory::new("path-limit");
+    let device = mock::Recorder::new(Closing::AtStop);
+    device.install();
+    let mut recorder = mock::recorder_api().create_recorder(&exact()).unwrap();
+    let base = directory.0.to_str().unwrap();
+    let path_bytes = sys::bindings::NDIlib_file_recorder_event_path_max_size as usize - 1;
+    let too_long = RecordingTarget::new(format!(
+        "{base}/{}",
+        "x".repeat(path_bytes - base.len() - 1)
+    ))
+    .unwrap();
+    assert!(matches!(
+        recorder.start(&too_long, RecordingTimecode::Preserve),
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(device.starts.load(Ordering::Acquire), 0);
+    recorder
+        .start(&directory.target("take.mkv"), RecordingTimecode::Preserve)
+        .unwrap();
+    assert!(matches!(
+        recorder.rollover(&too_long),
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(device.starts.load(Ordering::Acquire), 1);
+    assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
+    assert_eq!(recorder.state(), RecorderState::Recording);
+    assert!(matches!(
+        recorder.finish(Duration::ZERO).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+}
+
+#[test]
 fn conflicting_options_are_refused_before_the_sdk_creates_anything() {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
