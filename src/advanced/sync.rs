@@ -103,6 +103,10 @@ impl AvSyncRequest {
     fn raw(self) -> NDIlib_audio_frame_v3_t {
         // Lossless: construction keeps both at or below i32::MAX.
         let field = |value: Option<u32>| value.map_or(0, |value| value as i32);
+        // Keep the SDK's default channel field: it does not constrain the
+        // source's channels, even when a rate is stated. The native regression
+        // `avsync_states_rates_for_non_stereo_sources` pins this for mono and
+        // four-channel sources on Advanced 6.3.2 and 6.4.
         NDIlib_audio_frame_v3_t {
             sample_rate: field(self.sample_rate),
             no_samples: field(self.num_samples),
@@ -1289,12 +1293,14 @@ mod tests {
         let planar_float = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP;
         let automatic = AvSyncRequest::automatic().raw();
         assert_eq!(automatic.FourCC, planar_float);
+        assert_eq!(automatic.no_channels, 2);
         assert_eq!((automatic.no_samples, automatic.sample_rate), (0, 0));
         assert_eq!(automatic.timecode, NDIlib_send_timecode_synthesize);
         assert!(automatic.p_data.is_null() && automatic.p_metadata.is_null());
 
         let explicit = AvSyncRequest::new(Some(44_100), Some(1601)).unwrap().raw();
         assert_eq!(explicit.FourCC, planar_float);
+        assert_eq!(explicit.no_channels, 2);
         assert_eq!((explicit.no_samples, explicit.sample_rate), (1601, 44_100));
 
         // What the SDK returns for a successful request validates as audio.

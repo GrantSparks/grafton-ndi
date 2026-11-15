@@ -2483,6 +2483,120 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
     drop(sync.into_receiver());
 }
 
+/// A stated rate must work for non-stereo sources as well as stereo. The SDK
+/// headers mention channels in the format comparison, while the manual names
+/// only the rate; pin both synchronization entry paths against real peers.
+#[test]
+fn avsync_states_rates_for_non_stereo_sources() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    for (rate, channels, samples) in [(44_100, 1, 1470), (48_000, 4, 1600)] {
+        let sender = Sender::new(
+            &ndi,
+            &SenderOptions::new(common::unique_name("avsync-non-stereo"))
+                .clock_video(true)
+                .clock_audio(false),
+        )
+        .unwrap();
+        let receiver = Receiver::new(
+            &ndi,
+            &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap()),
+        )
+        .unwrap();
+        let sync = AvSync::new(receiver).unwrap();
+        let video = VideoFrame::builder()
+            .resolution(64, 32)
+            .frame_rate(FrameRate::new(30, 1).unwrap())
+            .build()
+            .unwrap();
+        let values: Vec<f32> = (0..channels)
+            .flat_map(|channel| std::iter::repeat_n((channel + 1) as f32 / 8.0, samples as usize))
+            .collect();
+        let audio = AudioFrame::builder()
+            .sample_rate(rate)
+            .num_channels(channels)
+            .num_samples(samples)
+            .data(values)
+            .build()
+            .unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let _stop = StopOnDrop(&stop);
+            scope.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    sender.send_video(&video).unwrap();
+                    sender.send_audio(&audio);
+                }
+            });
+            let requests = [
+                ("automatic", AvSyncRequest::automatic(), Pass::Captured),
+                (
+                    "stated rate and count",
+                    AvSyncRequest::new(Some(rate), Some(samples)).unwrap(),
+                    Pass::Captured,
+                ),
+                (
+                    "count only",
+                    AvSyncRequest::new(None, Some(samples)).unwrap(),
+                    Pass::Captured,
+                ),
+                (
+                    "queued stated rate",
+                    AvSyncRequest::new(Some(rate), Some(480)).unwrap(),
+                    Pass::Nothing,
+                ),
+            ];
+            for (label, request, pass) in requests {
+                let deadline = Instant::now() + PATIENCE;
+                loop {
+                    let returned = synchronized_audio(&sync, request, pass, 1);
+                    let (frame, adjusted) = &returned[0];
+                    assert_eq!(
+                        (frame.sample_rate(), frame.num_channels()),
+                        (rate, channels),
+                        "{label}"
+                    );
+                    if matches!(pass, Pass::Nothing) {
+                        assert_eq!((frame.num_samples(), *adjusted), (480, false));
+                    }
+                    // Initial audio may contain alignment silence. Wait for a
+                    // full source frame, then require every channel's value.
+                    if frame.channels().enumerate().all(|(channel, samples)| {
+                        !samples.is_empty()
+                            && samples
+                                .iter()
+                                .all(|sample| (*sample - (channel + 1) as f32 / 8.0).abs() < 0.001)
+                    }) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "{label} did not preserve {rate} Hz, {channels}-channel samples"
+                    );
+                }
+            }
+            let different_rate = if rate == 48_000 { 44_100 } else { 48_000 };
+            let video = sync
+                .receiver()
+                .video()
+                .capture(PATIENCE)
+                .unwrap()
+                .expect("a frame within the wait");
+            assert!(matches!(
+                sync.synchronize(
+                    stamped(&video),
+                    AvSyncRequest::new(Some(different_rate), Some(samples)).unwrap()
+                )
+                .unwrap(),
+                AvSyncOutcome::FormatChanged { sample_rate, num_channels }
+                    if sample_rate == rate && num_channels == channels
+            ));
+        });
+    }
+}
+
 /// A synchronizer works on threads other than the one that created it: it
 /// returns a source's audio, sample for sample, on a thread it was moved to,
 /// and is destroyed on a third while the source is still sending.
