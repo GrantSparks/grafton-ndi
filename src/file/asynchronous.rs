@@ -1889,6 +1889,8 @@ impl AsyncFileRecorder {
     }
     /// Start a session; see [`FileRecorder::start`]. Generated starts carry a
     /// [`SessionTimecode`](super::SessionTimecode), validated before queuing.
+    /// Events left by an earlier refused start are delivered through
+    /// [`next_event`](Self::next_event) before the new session begins.
     pub fn start(
         &self,
         target: &RecordingTarget,

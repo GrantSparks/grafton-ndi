@@ -410,7 +410,6 @@ impl<R: FinishReply> FinishWaiters<R> {
         if self.waiters.is_empty() {
             return drained;
         }
-        let had_waiters = true;
         self.notify_cleanup |= closing();
         if self
             .waiters
@@ -456,7 +455,7 @@ impl<R: FinishReply> FinishWaiters<R> {
                 index += 1;
             }
         }
-        self.notify_cleanup |= had_waiters && closing();
+        self.notify_cleanup |= closing();
         drained
     }
 }
@@ -1003,6 +1002,8 @@ impl FileRecorder {
     ///   does not exist or cannot be written to, or, with an exact file name,
     ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
     ///   that file exists. The SDK is not called.
+    /// * [`Error::UnexpectedSdkResult`] when a stale event cannot be read
+    ///   before the new session starts. The native start is not called.
     /// * [`Error::NativeOperationFailed`] when the SDK cannot start the source
     ///   or open the first file. `Processing.NDI.Lib.File.Recorder.h` specifies
     ///   an open-failed event for an output-file open failure; source-start
