@@ -172,14 +172,14 @@ fn write_image(plan: Plan<'_>, out: &mut dyn Write, workspace: &mut ImageWorkspa
     let mut out = KeepError { out, error: None };
     let result = match plan.codec {
         Codec::Png {
-            depth,
+            shape,
             compression,
             cicp,
-        } => match depth {
+        } => match shape.depth {
             SampleDepth::Eight => plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
                 png::encode(
                     pixels,
-                    plan.shape,
+                    shape,
                     compression,
                     cicp,
                     &mut out,
@@ -189,7 +189,7 @@ fn write_image(plan: Plan<'_>, out: &mut dyn Write, workspace: &mut ImageWorkspa
             SampleDepth::Sixteen => plan.with_pixels::<u16, _>(&mut workspace.sums16, |pixels| {
                 png::encode(
                     pixels,
-                    plan.shape,
+                    shape,
                     compression,
                     cicp,
                     &mut out,
@@ -199,18 +199,9 @@ fn write_image(plan: Plan<'_>, out: &mut dyn Write, workspace: &mut ImageWorkspa
         },
         Codec::Jpeg {
             quality,
-            width,
-            height,
+            dimensions,
         } => plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
-            jpeg::encode(
-                pixels,
-                quality,
-                width,
-                height,
-                plan.shape.row_bytes,
-                &mut workspace.row,
-                &mut out,
-            )
+            jpeg::encode(pixels, quality, dimensions, &mut workspace.row, &mut out)
         }),
         Codec::WebpLossless { shape } => plan
             .with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
@@ -314,7 +305,6 @@ pub(crate) fn encode_data_url(source: Source<'_>, options: &ImageOptions) -> Res
 struct Plan<'a> {
     source: &'a Source<'a>,
     codec: Codec,
-    shape: ImageShape,
     matrix: YuvMatrix,
     range: YuvRange,
     alpha: bool,
@@ -350,12 +340,13 @@ struct ImageShape {
     width: u32,
     height: u32,
     channels: Channels,
+    depth: SampleDepth,
     row_bytes: usize,
 }
 
 impl ImageShape {
-    fn new(width: usize, height: usize, channels: Channels, sample_bytes: usize) -> Result<Self> {
-        let row_bytes = packed_len(width, 1, channels.count() * sample_bytes)?;
+    fn new(width: usize, height: usize, channels: Channels, depth: SampleDepth) -> Result<Self> {
+        let row_bytes = packed_len(width, 1, channels.count() * depth.bytes())?;
         let dimension = |value| {
             u32::try_from(value)
                 .map_err(|_| Error::InvalidFrame(crate::FrameDefect::ImageDimensionOverflow))
@@ -364,6 +355,7 @@ impl ImageShape {
             width: dimension(width)?,
             height: dimension(height)?,
             channels,
+            depth,
             row_bytes,
         })
     }
@@ -389,23 +381,18 @@ struct BufferedImageShape {
     image_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct JpegQuality(u8);
-
 /// The codec and its settings, valid for the frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Codec {
     Png {
-        depth: SampleDepth,
+        shape: ImageShape,
         compression: PngCompression,
         /// The `cICP` chunk's primaries, transfer, matrix and range flag.
         cicp: Option<[u8; 4]>,
     },
-    /// Quality in 1 to 100, dimensions within JPEG's limit.
     Jpeg {
-        quality: JpegQuality,
-        width: u16,
-        height: u16,
+        quality: jpeg::JpegQuality,
+        dimensions: jpeg::JpegDimensions,
     },
     /// Dimensions within WebP's limit.
     WebpLossless { shape: BufferedImageShape },
@@ -423,22 +410,14 @@ impl<'a> Plan<'a> {
     /// the frame's color description, its HDR transfer, and the image's size.
     fn new(source: &'a Source<'a>, options: &ImageOptions) -> Result<Self> {
         let format = options.format;
-        if let Some((quality, bounds)) = format.quality().zip(format.quality_bounds()) {
-            if !bounds.contains(&quality) {
-                return Err(Error::InvalidInput(crate::InputDefect::ImageQuality {
-                    format: format.name(),
-                    quality,
-                    minimum: *bounds.start(),
-                    maximum: *bounds.end(),
-                }));
-            }
-        }
+        format.validate_quality()?;
+        let depth = options.depth;
         if matches!(format, ImageFormat::WebpLossy(_)) && options.webp_effort > 6 {
             return Err(Error::InvalidInput(crate::InputDefect::WebpEffort {
                 effort: options.webp_effort,
             }));
         }
-        if options.depth == SampleDepth::Sixteen && format != ImageFormat::Png {
+        if depth == SampleDepth::Sixteen && format != ImageFormat::Png {
             return Err(Error::InvalidInput(
                 crate::InputDefect::SixteenBitNeedsPng {
                     format: format.name(),
@@ -487,9 +466,11 @@ impl<'a> Plan<'a> {
                 Channels::from_alpha(alpha)
             }
         };
-        let sample_bytes = match format {
-            ImageFormat::Png => options.depth.bytes(),
-            ImageFormat::Jpeg(_) | ImageFormat::WebpLossless | ImageFormat::WebpLossy(_) => 1,
+        let depth = match format {
+            ImageFormat::Png => depth,
+            ImageFormat::Jpeg(_) | ImageFormat::WebpLossless | ImageFormat::WebpLossy(_) => {
+                SampleDepth::Eight
+            }
         };
         // Preserve codec dimension diagnostics before checking conversion storage.
         match format {
@@ -510,18 +491,16 @@ impl<'a> Plan<'a> {
                 webp::MAX_LOSSY_DIMENSION,
             )?,
         }
-        let shape = ImageShape::new(width, height, channels, sample_bytes)?;
+        let shape = ImageShape::new(width, height, channels, depth)?;
         let codec = match format {
             ImageFormat::Png => Codec::Png {
-                depth: options.depth,
+                shape,
                 compression: options.png_compression,
                 cicp: color.and_then(|color| cicp(&color)),
             },
-            // The dimension gates above establish these exact representations.
             ImageFormat::Jpeg(quality) => Codec::Jpeg {
-                quality: JpegQuality(quality),
-                width: shape.width as u16,
-                height: shape.height as u16,
+                quality: jpeg::JpegQuality::new(quality)?,
+                dimensions: jpeg::JpegDimensions::new(width, height)?,
             },
             ImageFormat::WebpLossless => Codec::WebpLossless {
                 shape: shape.buffered()?,
@@ -534,12 +513,19 @@ impl<'a> Plan<'a> {
             },
         };
         if shift > 0 {
-            packed_len(width, 1, if sample_bytes == 2 { 32 } else { 16 })?;
+            packed_len(
+                width,
+                1,
+                if depth == SampleDepth::Sixteen {
+                    32
+                } else {
+                    16
+                },
+            )?;
         }
         Ok(Self {
             source,
             codec,
-            shape,
             matrix,
             range,
             alpha,
@@ -548,8 +534,17 @@ impl<'a> Plan<'a> {
     }
 
     #[cfg(test)]
+    fn shape(&self) -> ImageShape {
+        match self.codec {
+            Codec::Png { shape, .. } => shape,
+            Codec::Jpeg { dimensions, .. } => dimensions.shape(),
+            Codec::WebpLossless { shape } | Codec::WebpLossy { shape, .. } => shape.rows,
+        }
+    }
+
+    #[cfg(test)]
     fn channels(&self) -> Channels {
-        self.shape.channels
+        self.shape().channels
     }
 
     /// Lend the retained sums to a single encode, restoring them even when

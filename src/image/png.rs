@@ -3,7 +3,7 @@
 
 use std::io::Write;
 
-use super::{color::Sample, options::PngCompression, Channels, ImageShape, Pixels};
+use super::{color::Sample, options::PngCompression, Channels, ImageShape, Pixels, SampleDepth};
 use crate::{Error, Result};
 
 /// Encode `pixels` as a PNG of `channels` channels into `out`, with a `cICP`
@@ -24,10 +24,9 @@ pub(super) fn encode<P: Sample>(
         Channels::Rgba => ::png::ColorType::Rgba,
         Channels::Rgb => ::png::ColorType::Rgb,
     });
-    encoder.set_depth(if P::BYTES == 1 {
-        ::png::BitDepth::Eight
-    } else {
-        ::png::BitDepth::Sixteen
+    encoder.set_depth(match shape.depth {
+        SampleDepth::Eight => ::png::BitDepth::Eight,
+        SampleDepth::Sixteen => ::png::BitDepth::Sixteen,
     });
     encoder.set_compression(match compression {
         PngCompression::Fast => ::png::Compression::Fast,

@@ -2358,7 +2358,7 @@ fn warm_workspace_conversion_does_not_allocate() {
                     for codec in [ImageFormat::WebpLossless, ImageFormat::WebpLossy(75)] {
                         let options = options(codec).alpha(alpha).downscale(reduction);
                         let plan = Plan::new(&source, &options).unwrap();
-                        let shape = plan.shape.buffered().unwrap();
+                        let shape = plan.shape().buffered().unwrap();
                         let mut convert = || {
                             plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
                                 webp::image_with(pixels, shape, &mut workspace.image)?;
@@ -2461,8 +2461,9 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                                 (1, row_len, row_len)
                             );
                             let (_, allocations) = allocation_count(|| {
-                                (0..reduced.1)
-                                    .for_each(|y| pixels.pack_row(y, plan.shape.channels, &mut row))
+                                (0..reduced.1).for_each(|y| {
+                                    pixels.pack_row(y, plan.shape().channels, &mut row)
+                                })
                             });
                             assert_eq!(allocations, 0, "{format:?} {height} {options:?}");
                         } else {
@@ -2473,8 +2474,9 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                             let mut row = row_buffer::<u16>(reduced.0, channels);
                             assert_eq!(row.len(), row_len);
                             let (_, allocations) = allocation_count(|| {
-                                (0..reduced.1)
-                                    .for_each(|y| pixels.pack_row(y, plan.shape.channels, &mut row))
+                                (0..reduced.1).for_each(|y| {
+                                    pixels.pack_row(y, plan.shape().channels, &mut row)
+                                })
                             });
                             assert_eq!(allocations, 0, "{format:?} {height} {options:?}");
                         }
@@ -2491,7 +2493,7 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                         let mut pixels = plan.pixels::<u8>();
                         let ((image, allocations), peak) = peak_bytes(|| {
                             allocation_count(|| {
-                                webp::image(&mut pixels, plan.shape.buffered().unwrap())
+                                webp::image(&mut pixels, plan.shape().buffered().unwrap())
                             })
                         });
                         let len = reduced.0 * reduced.1 * channels;
@@ -2517,7 +2519,7 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                 let plan = Plan::new(&source, &options).unwrap();
                 let mut pixels = plan.pixels::<u8>();
                 let (width, height) = (pixels.width() as u16, pixels.height() as u16);
-                let mut cache = vec![0; plan.shape.row_bytes];
+                let mut cache = vec![0; plan.shape().row_bytes];
                 let rows = jpeg::Rows::new(&mut pixels, width, height, &mut cache);
                 let mut buffers = std::array::from_fn(|_| Vec::with_capacity(reduced.0));
                 let (_, allocations) = allocation_count(|| {
@@ -2612,14 +2614,22 @@ fn workspace_output_growth_resources() {
             self.growths += usize::from(self.bytes.capacity() != capacity);
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     for (width, height) in [(1920, 1080), (3840, 2160)] {
         let rgba = content_rgba("photographic", width, height, None);
         let frame = padded(PixelFormat::Bgra, width as u32, height as u32, &rgba, 16);
-        for format in [ImageFormat::Png, ImageFormat::Jpeg(85), ImageFormat::WebpLossless] {
+        for format in [
+            ImageFormat::Png,
+            ImageFormat::Jpeg(85),
+            ImageFormat::WebpLossless,
+        ] {
             for reduction in [Downscale::Off, Downscale::Eighth] {
-                let options = options(format).png_compression(PngCompression::Fast).downscale(reduction);
+                let options = options(format)
+                    .png_compression(PngCompression::Fast)
+                    .downscale(reduction);
                 let mut workspace = crate::ImageWorkspace::new();
                 let expected = workspace.encode(&frame, &options).unwrap();
                 let mut output = Output::default();
@@ -2627,7 +2637,8 @@ fn workspace_output_growth_resources() {
                 assert_eq!(output.bytes, expected);
                 let retained = workspace.retained_bytes();
                 let start = Instant::now();
-                let ((image, allocations), peak) = peak_bytes(|| allocation_count(|| workspace.encode(&frame, &options).unwrap()));
+                let ((image, allocations), peak) =
+                    peak_bytes(|| allocation_count(|| workspace.encode(&frame, &options).unwrap()));
                 let elapsed = start.elapsed().as_secs_f64() * 1000.0;
                 assert_eq!(image, expected);
                 eprintln!("output-growth,{width},{height},{format:?},{reduction:?},{},{},{},{allocations},{peak},{retained},{elapsed:.3}", image.len(), output.growths, output.bytes.capacity());

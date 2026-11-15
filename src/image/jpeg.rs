@@ -8,24 +8,68 @@ use std::{
 
 use super::{
     read::{Sink, BATCH},
-    JpegQuality, Pixels,
+    Channels, ImageShape, Pixels, SampleDepth,
 };
 use crate::{Error, Result};
 
 /// JPEG's largest width or height.
 pub(super) const MAX_DIMENSION: usize = u16::MAX as usize;
 
+/// Only this module can construct or inspect the checked quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct JpegQuality(u8);
+impl JpegQuality {
+    pub(super) fn new(value: u8) -> Result<Self> {
+        super::ImageFormat::Jpeg(value).validate_quality()?;
+        Ok(Self(value))
+    }
+}
+
+/// JPEG geometry has one representation, narrowed by checked conversions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct JpegDimensions {
+    width: u16,
+    height: u16,
+}
+impl JpegDimensions {
+    pub(super) fn new(width: usize, height: usize) -> Result<Self> {
+        let narrow = |length, dimension| {
+            u16::try_from(length).map_err(|_| {
+                Error::InvalidFrame(crate::FrameDefect::ImageDimension {
+                    codec: crate::ImageCodec::Jpeg,
+                    dimension,
+                    length,
+                    maximum: MAX_DIMENSION,
+                })
+            })
+        };
+        Ok(Self {
+            width: narrow(width, crate::ImageDimension::Width)?,
+            height: narrow(height, crate::ImageDimension::Height)?,
+        })
+    }
+    pub(super) fn shape(self) -> ImageShape {
+        ImageShape {
+            width: self.width.into(),
+            height: self.height.into(),
+            channels: Channels::Rgb,
+            depth: SampleDepth::Eight,
+            row_bytes: usize::from(self.width) * 3,
+        }
+    }
+}
+
 /// Encode `pixels` as a JPEG of `quality` into `out`. The plan checked the
 /// quality and the dimensions.
 pub(super) fn encode(
     pixels: &mut Pixels<'_, u8>,
     quality: JpegQuality,
-    width: u16,
-    height: u16,
-    row_bytes: usize,
+    dimensions: JpegDimensions,
     cache: &mut Vec<u8>,
     out: &mut dyn Write,
 ) -> Result<()> {
+    let JpegDimensions { width, height } = dimensions;
+    let row_bytes = dimensions.shape().row_bytes;
     // Plan validation precedes this function, including metadata/HDR checks.
     // VideoPlane::data exposes only initialized contiguous active pixels;
     // padded native rows must stay on the row path. Both color types ignore
@@ -262,10 +306,10 @@ mod tests {
                     let mut rows = Vec::new();
                     encode_rows(
                         &mut plan.pixels::<u8>(),
-                        JpegQuality(quality),
+                        JpegQuality::new(quality).unwrap(),
                         width,
                         3,
-                        plan.shape.row_bytes,
+                        plan.shape().row_bytes,
                         &mut Vec::new(),
                         &mut rows,
                     )
@@ -292,5 +336,25 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn checked_settings_enforce_jpeg_representation_boundaries() {
+    assert_eq!(JpegDimensions::new(65_535, 65_535).unwrap().width, u16::MAX);
+    for (width, height, dimension) in [
+        (65_536, 1, crate::ImageDimension::Width),
+        (1, 65_536, crate::ImageDimension::Height),
+    ] {
+        assert!(
+            matches!(JpegDimensions::new(width, height), Err(Error::InvalidFrame(crate::FrameDefect::ImageDimension { codec: crate::ImageCodec::Jpeg, dimension: actual, length: 65_536, maximum: 65_535 })) if actual == dimension)
+        );
+    }
+    for value in [1, 85, 100] {
+        assert_eq!(JpegQuality::new(value).unwrap().0, value);
+    }
+    for value in [0, 101, 255] {
+        assert!(JpegQuality::new(value).is_err());
     }
 }

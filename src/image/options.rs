@@ -62,6 +62,22 @@ impl ImageFormat {
         }
     }
 
+    pub(super) fn validate_quality(self) -> crate::Result<()> {
+        if let Some((quality, bounds)) = self.quality().zip(self.quality_bounds()) {
+            if !bounds.contains(&quality) {
+                return Err(crate::Error::InvalidInput(
+                    crate::InputDefect::ImageQuality {
+                        format: self.name(),
+                        quality,
+                        minimum: *bounds.start(),
+                        maximum: *bounds.end(),
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) const fn quality(self) -> Option<u8> {
         match self {
             Self::Png | Self::WebpLossless => None,
