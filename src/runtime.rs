@@ -585,8 +585,10 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
 
                 Phase::Running => {
                     // Runtime is already initialized, just increment refcount
-                    guard.refcount = guard.refcount.checked_add(1).ok_or_else(|| {
-                        Error::InitializationFailed("NDI runtime reference count exhausted".into())
+                    guard.refcount = guard.refcount.checked_add(1).ok_or({
+                        Error::InitializationFailed(
+                            crate::InitializationFailure::HandleCountExhausted,
+                        )
                     })?;
                     return Ok(());
                 }
@@ -603,7 +605,7 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
             Ok(())
         } else if self.backend.is_supported_cpu() {
             Err(Error::InitializationFailed(
-                "NDIlib_initialize returned false on a CPU the runtime reports as supported".into(),
+                crate::InitializationFailure::NotStarted,
             ))
         } else {
             Err(Error::UnsupportedCpu)

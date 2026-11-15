@@ -31,8 +31,7 @@
 //! - Samples per audio block: `cargo run --example NDIlib_Recv_FrameSync -- --audio-samples 512`
 
 use grafton_ndi::{
-    Error, FrameSync, FrameSyncAudioRequest, Ndi, Receiver, ReceiverColorFormat, ReceiverOptions,
-    ScanType,
+    FrameSync, FrameSyncAudioRequest, Ndi, Receiver, ReceiverColorFormat, ReceiverOptions, ScanType,
 };
 
 #[path = "common/arguments.rs"]
@@ -65,13 +64,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--audio-channels" => audio_channels = option_value(&mut arguments, &argument)?,
             "--audio-samples" => audio_samples = option_value(&mut arguments, &argument)?,
             flag if flag.starts_with('-') => {
-                return Err(Error::InvalidInput(format!("unknown option: {flag}")).into());
+                return Err(format!("unknown option: {flag}").into());
             }
             _ => extra_ips.push(argument),
         }
     }
     if frame_count == 0 {
-        return Err(Error::InvalidInput("--frames must be positive".into()).into());
+        return Err("--frames must be positive".into());
     }
     // Validate the requested shape before waiting for a source.
     let audio_request =

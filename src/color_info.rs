@@ -125,7 +125,6 @@ impl TransferFunction {
         }
     }
 
-    #[cfg(feature = "image-encoding")]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Bt601 => "BT.601",
@@ -178,10 +177,9 @@ impl<'a> Metadata<'a> {
             FrameMetadataRef::Text(text) => parse(Some(text.as_str())),
             FrameMetadataRef::Withheld(reason) => {
                 let status = FrameMetadataRef::Withheld(reason).status();
-                Err(Error::InvalidFrame(format!(
-                    "The frame's color description cannot be read because its metadata was withheld \
-                     ({status:?}); ColorPolicy::Override explicitly supplies its color conversion"
-                )))
+                Err(Error::InvalidFrame(
+                    crate::FrameDefect::ColorMetadataWithheld { status },
+                ))
             }
         }
     }
@@ -231,9 +229,12 @@ pub(crate) fn parse(metadata: Option<&str>) -> Result<Option<ColorInfo>> {
             } else if let Some(attributes) = start_tag(tag) {
                 let (info, len) = element(attributes)?;
                 if let Some(earlier) = found.filter(|&earlier| earlier != info) {
-                    return Err(Error::InvalidFrame(format!(
-                        "The frame's metadata holds ndi_color_info elements that differ: {earlier:?} and {info:?}"
-                    )));
+                    return Err(Error::InvalidFrame(
+                        crate::FrameDefect::ConflictingColorMetadata {
+                            first: earlier,
+                            second: info,
+                        },
+                    ));
                 }
                 found = Some(info);
                 1 + ELEMENT.len() + len
@@ -274,44 +275,47 @@ fn element(text: &[u8]) -> Result<(ColorInfo, usize)> {
             return Ok((info, at + 1));
         }
         if rest.is_empty() {
-            return Err(malformed("is not closed"));
+            return Err(malformed(
+                crate::ColorMetadataIssue::UnclosedElement,
+                "is not closed",
+            ));
         }
         let name_len = rest
             .iter()
             .position(|&byte| byte.is_ascii_whitespace() || matches!(byte, b'=' | b'/' | b'>'))
             .unwrap_or(rest.len());
         if name_len == 0 {
-            return Err(malformed(format!(
-                "has {} where an attribute should begin",
-                quoted(&rest[..1])
-            )));
+            return Err(malformed(
+                crate::ColorMetadataIssue::AttributeStart,
+                format!("has {} where an attribute should begin", quoted(&rest[..1])),
+            ));
         }
         let name = &rest[..name_len];
         at += name_len;
         at += whitespace(&text[at..]);
         if text.get(at) != Some(&b'=') {
-            return Err(malformed(format!(
-                "gives attribute {} without a value",
-                quoted(name)
-            )));
+            return Err(malformed(
+                crate::ColorMetadataIssue::MissingValue,
+                format!("gives attribute {} without a value", quoted(name)),
+            ));
         }
         at += 1;
         at += whitespace(&text[at..]);
         let quote = match text.get(at) {
             Some(&quote @ (b'"' | b'\'')) => quote,
             _ => {
-                return Err(malformed(format!(
-                    "gives attribute {} an unquoted value",
-                    quoted(name)
-                )))
+                return Err(malformed(
+                    crate::ColorMetadataIssue::UnquotedValue,
+                    format!("gives attribute {} an unquoted value", quoted(name)),
+                ))
             }
         };
         at += 1;
         let Some(value_len) = text[at..].iter().position(|&byte| byte == quote) else {
-            return Err(malformed(format!(
-                "does not close the value of attribute {}",
-                quoted(name)
-            )));
+            return Err(malformed(
+                crate::ColorMetadataIssue::UnclosedValue,
+                format!("does not close the value of attribute {}", quoted(name)),
+            ));
         };
         let value = &text[at..at + value_len];
         at += value_len + 1;
@@ -351,22 +355,25 @@ fn set<T>(
     read: impl FnOnce(&[u8]) -> Option<T>,
 ) -> Result<()> {
     if slot.is_some() {
-        return Err(malformed(format!("gives attribute {} twice", quoted(name))));
+        return Err(malformed(
+            crate::ColorMetadataIssue::DuplicateAttribute,
+            format!("gives attribute {} twice", quoted(name)),
+        ));
     }
     *slot = Some(read(value).ok_or_else(|| {
-        Error::InvalidFrame(format!(
-            "The frame's ndi_color_info gives attribute {} the value {}, which is not one the NDI SDK defines",
-            quoted(name),
-            quoted(value)
-        ))
+        Error::InvalidFrame(crate::FrameDefect::ColorMetadata { issue: crate::ColorMetadataIssue::UndefinedValue, diagnostic: format!("The frame's ndi_color_info gives attribute {} the value {}, which is not one the NDI SDK defines", quoted(name), quoted(value)).into_boxed_str() })
     })?);
     Ok(())
 }
 
-fn malformed(problem: impl std::fmt::Display) -> Error {
-    Error::InvalidFrame(format!(
-        "The frame's ndi_color_info metadata cannot be read: the element {problem}"
-    ))
+fn malformed(issue: crate::ColorMetadataIssue, problem: impl std::fmt::Display) -> Error {
+    Error::InvalidFrame(crate::FrameDefect::ColorMetadata {
+        issue,
+        diagnostic: format!(
+            "The frame's ndi_color_info metadata cannot be read: the element {problem}"
+        )
+        .into_boxed_str(),
+    })
 }
 
 /// The length of the XML whitespace at the start of `text`.
@@ -396,6 +403,12 @@ fn quoted(text: &[u8]) -> String {
     }
 }
 
+impl std::fmt::Display for TransferFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,7 +429,7 @@ mod tests {
         }
     }
 
-    fn unreadable(text: &str) -> String {
+    fn unreadable(text: &str) -> crate::FrameDefect {
         match read(text) {
             Err(Error::InvalidFrame(message)) => message,
             other => panic!("{text:?} must be refused, got {other:?}"),
@@ -533,7 +546,7 @@ mod tests {
             "<ndi_color_info transfer=\"bt_2100_pq\"/><ndi_color_info transfer=\"bt_2100_hlg\"/>",
             "<ndi_color_info transfer=\"bt_2100_pq\"/><ndi_color_info transfer=\"bt_2100_pq\" primaries=\"bt_2020\"/>",
         ] {
-            assert!(unreadable(text).contains("differ"), "{text:?}");
+            assert!(matches!(unreadable(text),crate::FrameDefect::ConflictingColorMetadata {..}), "{text:?}");
         }
     }
 
@@ -586,16 +599,34 @@ mod tests {
             ),
             ("<ndi_color_info / >", &["\"/\"", "attribute should begin"]),
         ] {
-            let message = unreadable(text);
+            let cause = unreadable(text);
+            let expected_issue = match *needles.last().unwrap() {
+                "twice" => crate::ColorMetadataIssue::DuplicateAttribute,
+                "unquoted" => crate::ColorMetadataIssue::UnquotedValue,
+                "without a value" => crate::ColorMetadataIssue::MissingValue,
+                "does not close" => crate::ColorMetadataIssue::UnclosedValue,
+                "not closed" => crate::ColorMetadataIssue::UnclosedElement,
+                "attribute should begin" => crate::ColorMetadataIssue::AttributeStart,
+                _ => crate::ColorMetadataIssue::UndefinedValue,
+            };
+            let crate::FrameDefect::ColorMetadata { issue, diagnostic } = cause else {
+                panic!("{cause}")
+            };
+            assert_eq!(issue, expected_issue);
+            // The diagnostic still retains the attribute/value excerpt.
             for needle in needles {
-                assert!(message.contains(needle), "{text:?}: {message}");
+                assert!(diagnostic.contains(needle), "{text:?}: {diagnostic}");
             }
         }
         let long = format!("<ndi_color_info matrix=\"{}\"/>", "x".repeat(1000));
-        let message = unreadable(&long);
+        let cause = unreadable(&long);
+        let crate::FrameDefect::ColorMetadata { issue, diagnostic } = cause else {
+            panic!("{cause}")
+        };
+        assert_eq!(issue, crate::ColorMetadataIssue::UndefinedValue);
         assert!(
-            message.contains("(1000 bytes)") && message.len() < 200,
-            "{message}"
+            diagnostic.contains("(1000 bytes)") && diagnostic.len() < 200,
+            "{diagnostic}"
         );
     }
 

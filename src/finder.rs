@@ -684,9 +684,7 @@ impl Finder {
     pub fn find_source_by_name(&self, name: &str, timeout: Duration) -> Result<Option<Source>> {
         to_ms_checked(timeout)?;
         if name.is_empty() || name.contains('\0') {
-            return Err(Error::InvalidInput(
-                "Source name must be nonempty and contain no NUL".into(),
-            ));
+            return Err(Error::InvalidInput(crate::InputDefect::InvalidSourceName));
         }
         self.find_source(timeout, |source| source.name() == name)
     }
@@ -1527,11 +1525,8 @@ impl CachedSources {
         discover: impl FnOnce(HostQuery<'_>) -> Result<Vec<Source>>,
         mut copy: impl FnMut(&[Source]) -> Result<Vec<Source>>,
     ) -> Result<Vec<Source>> {
-        let query = HostQuery::parse(host).ok_or_else(|| {
-            Error::InvalidInput(
-                "Host must be a bare hostname, IP address or NDI machine name".into(),
-            )
-        })?;
+        let query = HostQuery::parse(host)
+            .ok_or(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))?;
         to_ms_checked(timeout)?;
         let key = HostKeyBuffer::new(query);
         let (snapshot, generation) = {
@@ -1844,7 +1839,7 @@ mod tests {
                 cache.clear();
                 assert!(cache
                     .sources_by_host_with(first, Duration::ZERO, |_| Err(Error::InvalidInput(
-                        "discovery failed".into()
+                        crate::InputDefect::InvalidHostQuery
                     )))
                     .is_err());
                 assert!(cache
@@ -2472,11 +2467,12 @@ mod tests {
                 else {
                     panic!("a string longer than the limit must be refused");
                 };
-                assert!(
-                    reason.starts_with("NDIlib_send_get_source_name"),
-                    "{reason}"
+                assert_eq!(
+                    reason,
+                    crate::SdkResultDefect::UnterminatedText {
+                        operation: "NDIlib_send_get_source_name"
+                    }
                 );
-                assert!(reason.contains("4 MiB"), "{reason}");
             }
         }
     }

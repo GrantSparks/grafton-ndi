@@ -11,10 +11,7 @@ use super::{
     MAX_PACKET_BYTES,
 };
 use crate::{
-    sender::{
-        in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans},
-        SendHandle,
-    },
+    sender::in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans, Synchronized},
     sys::{
         advanced::{native, ScatterSend},
         bindings::*,
@@ -94,17 +91,17 @@ impl ScatterStorage {
     /// Check a block list and return its total size in bytes.
     fn total(blocks: &[Vec<u8>]) -> Result<usize> {
         if blocks.is_empty() || blocks.len() > MAX_SCATTER_BLOCKS {
-            return Err(invalid_frame("Invalid scatter block count"));
+            return Err(invalid_frame(crate::FrameDefect::ScatterBlockCount));
         }
         let mut total = 0usize;
         for block in blocks {
             if block.is_empty() {
-                return Err(invalid_frame("Scatter blocks must not be empty"));
+                return Err(invalid_frame(crate::FrameDefect::EmptyScatterBlock));
             }
             total = total
                 .checked_add(block.len())
                 .filter(|total| *total <= MAX_PACKET_BYTES)
-                .ok_or_else(|| invalid_frame("Scatter frame exceeds the packet size limit"))?;
+                .ok_or_else(|| invalid_frame(crate::FrameDefect::ScatterSize))?;
         }
         Ok(total)
     }
@@ -175,9 +172,7 @@ impl ScatterStorage {
 fn first_block(blocks: &[Vec<u8>], header_bytes: usize) -> Result<&[u8]> {
     let first = &blocks[0];
     if first.len() < header_bytes {
-        return Err(invalid_frame(
-            "The first scatter block must hold the frame's complete header",
-        ));
+        return Err(invalid_frame(crate::FrameDefect::ScatterHeader));
     }
     Ok(first)
 }
@@ -470,7 +465,7 @@ pub struct ReclaimedVideo {
 ///
 /// The entry owns all of these, so nothing can read the frame's bytes while
 /// the SDK may still write to them.
-pub(super) enum PendingVideo {
+pub(crate) enum PendingVideo {
     /// A frame submitted with [`CompressedSender::send_video_async`].
     Contiguous(CompressedVideoFrame),
     /// A frame submitted with [`CompressedSender::send_scatter_video_async`].
@@ -523,7 +518,7 @@ impl PendingVideo {
     }
 
     /// The stream the frame is sent on.
-    fn tier(&self) -> StreamTier {
+    pub(crate) fn tier(&self) -> StreamTier {
         match self {
             Self::Contiguous(frame) => frame.format().tier(),
             #[cfg(ndi_has_advanced_scatter_send)]
@@ -593,7 +588,7 @@ struct ScatterKeys {
     spare: Option<super::send_slots::SlotKey>,
 }
 
-struct PendingStreams {
+pub(crate) struct PendingStreams {
     program: InFlight<PendingVideo>,
     preview: InFlight<PendingVideo>,
     #[cfg(ndi_has_advanced_scatter_send)]
@@ -623,12 +618,11 @@ impl PendingStreams {
     }
 
     #[cfg(ndi_has_advanced_scatter_send)]
-    fn submit_scatter(
+    pub(crate) fn prepare_scatter(
         &mut self,
-        sender: SendHandle<'_>,
         mut frame: ScatterVideoFrame,
         table: &'static ScatterSend,
-    ) -> Option<SubmittedVideo> {
+    ) -> PendingVideo {
         let tier = frame.format().tier();
         let keys = match tier {
             StreamTier::Program => &mut self.program_keys,
@@ -658,29 +652,38 @@ impl PendingStreams {
                 assert_ne!(old.as_ptr(), next.as_ptr());
             }
         }
-        let returned = self.submit(sender, pending);
+        pending
+    }
+
+    #[cfg(ndi_has_advanced_scatter_send)]
+    pub(crate) fn advance_scatter(&mut self, tier: StreamTier) {
         let keys = match tier {
             StreamTier::Program => &mut self.program_keys,
             StreamTier::Preview => &mut self.preview_keys,
         };
         std::mem::swap(&mut keys.next, &mut keys.spare);
-        returned
     }
 
-    /// Hand `next` to the SDK through `sender`, then take back the frame it
-    /// replaces on the same stream.
-    fn submit(&mut self, sender: SendHandle<'_>, next: PendingVideo) -> Option<SubmittedVideo> {
-        let tier = next.tier();
-        let slot = match tier {
+    /// Select the retained slot; only its owning protocol can synchronize it.
+    pub(crate) fn slot(&mut self, tier: StreamTier) -> &mut InFlight<PendingVideo> {
+        match tier {
             StreamTier::Program => &mut self.program,
             StreamTier::Preview => &mut self.preview,
-        };
-        let (displaced, synchronized) = slot.submit(sender, next, ());
+        }
+    }
+
+    /// Recover the previous frame with the proof minted by this owner's send.
+    pub(crate) fn reclaim_displaced(
+        &mut self,
+        _tier: StreamTier,
+        displaced: InFlight<PendingVideo>,
+        synchronized: Synchronized,
+    ) -> Option<SubmittedVideo> {
         displaced.release_with(synchronized, |frame, proof| {
             let (frame, _key) = frame.release(super::send_slots::Released::Synchronized(proof));
             #[cfg(ndi_has_advanced_scatter_send)]
             if let Some(key) = _key {
-                let keys = match tier {
+                let keys = match _tier {
                     StreamTier::Program => &mut self.program_keys,
                     StreamTier::Preview => &mut self.preview_keys,
                 };
@@ -710,6 +713,12 @@ impl PendingStreams {
 }
 
 impl Loans for PendingStreams {
+    type Recovered = ReclaimedVideo;
+
+    fn recover(self, destroyed: &Destroyed) -> ReclaimedVideo {
+        self.into_reclaimed(destroyed)
+    }
+
     fn release(self, destroyed: &Destroyed) {
         drop(self.into_reclaimed(destroyed));
     }
@@ -942,7 +951,7 @@ impl CompressedSender {
     /// Destroying the native sender waits for the SDK to finish with every
     /// pending frame, without a timeout.
     pub fn close(self) -> ReclaimedVideo {
-        self.lending.close(PendingStreams::into_reclaimed)
+        self.lending.close()
     }
 }
 
@@ -997,12 +1006,7 @@ impl CompressedVideo<'_> {
         &mut self,
         frame: CompressedVideoFrame,
     ) -> std::result::Result<Option<SubmittedVideo>, Rejected<CompressedVideoFrame>> {
-        if let Err(error) = frame.validate_for_send() {
-            return Err(Rejected::new(error, frame));
-        }
-        Ok(self
-            .pair
-            .with(|pending, sender| pending.submit(sender, PendingVideo::Contiguous(frame))))
+        self.pair.submit_pending(frame)
     }
 
     /// See [`CompressedSender::send_scatter_video`].
@@ -1033,13 +1037,7 @@ impl CompressedVideo<'_> {
         &mut self,
         frame: ScatterVideoFrame,
     ) -> std::result::Result<Option<SubmittedVideo>, Rejected<ScatterVideoFrame>> {
-        let table = match self.pair.sender().runtime().table::<ScatterSend>() {
-            Ok(table) => table,
-            Err(error) => return Err(Rejected::new(error, frame)),
-        };
-        native!(ScatterSend, table => {
-            Ok(self.pair.with(|pending, sender| pending.submit_scatter(sender, frame, table)))
-        })
+        self.pair.submit_scatter(frame)
     }
 }
 
@@ -1197,9 +1195,12 @@ mod tests {
         let speedhq = VideoPacketFormat::new(VideoCodec::SpeedHq422, 1920, 1080).unwrap();
         ScatterVideoFrame::new(speedhq, vec![vec![99, 0, 0, 0], vec![1; 8]]).unwrap();
         let refused = ScatterVideoFrame::new(speedhq, vec![vec![100, 0, 0, 0], vec![1; 8]]);
-        assert!(reason(refused).contains("quality"));
+        assert!(matches!(
+            reason(refused),
+            crate::FrameDefect::SpeedHqQuality
+        ));
         let refused = ScatterVideoFrame::new(speedhq, vec![vec![0, 0, 0], vec![1; 8]]);
-        assert!(reason(refused).contains("complete header"));
+        assert!(matches!(reason(refused), crate::FrameDefect::ScatterHeader));
 
         let (format, bytes) = h264();
         let preview = |width, height| {
@@ -1209,15 +1210,27 @@ mod tests {
             ScatterVideoFrame::new(format, split(&bytes, &[44]))
         };
         preview(640, 640).unwrap();
-        assert!(reason(preview(641, 360)).contains("640 pixels"));
-        assert!(reason(preview(640, 641)).contains("640 pixels"));
-        assert!(reason(ScatterVideoFrame::new(format, split(&bytes, &[43]))).contains("header"));
+        assert!(matches!(
+            reason(preview(641, 360)),
+            crate::FrameDefect::PreviewVideoDimensions
+        ));
+        assert!(matches!(
+            reason(preview(640, 641)),
+            crate::FrameDefect::PreviewVideoDimensions
+        ));
+        assert!(matches!(
+            reason(ScatterVideoFrame::new(format, split(&bytes, &[43]))),
+            crate::FrameDefect::ScatterHeader
+        ));
 
         // A keyframe needs its parameter sets here too.
         let bare =
             PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, &[1, 2, 3], &[]).unwrap();
         let refused = ScatterVideoFrame::new(format, split(&bare, &[44]));
-        assert!(reason(refused).contains("codec configuration"));
+        assert!(matches!(
+            reason(refused),
+            crate::FrameDefect::KeyframeConfigurationMissing
+        ));
     }
 
     #[test]
@@ -1322,20 +1335,35 @@ mod tests {
                 split(packet, &[44, config_at + 1]),
             ))
         };
-        assert!(aac(48_000, 2, 960, &packet).contains("1024 samples"));
-        assert!(aac(44_100, 2, 1024, &packet).contains("sample rate"));
-        assert!(aac(48_000, 1, 1024, &packet).contains("channel layout"));
+        assert!(matches!(
+            aac(48_000, 2, 960, &packet),
+            crate::FrameDefect::AacSampleCount
+        ));
+        assert!(matches!(
+            aac(44_100, 2, 1024, &packet),
+            crate::FrameDefect::AacRateMismatch
+        ));
+        assert!(matches!(
+            aac(48_000, 1, 1024, &packet),
+            crate::FrameDefect::AacChannelsMismatch
+        ));
 
         let mut unflagged = packet.clone();
         unflagged[32..36].copy_from_slice(&0u32.to_ne_bytes());
-        assert!(aac(48_000, 2, 1024, &unflagged).contains("keyframe flag"));
+        assert!(matches!(
+            aac(48_000, 2, 1024, &unflagged),
+            crate::FrameDefect::AacKeyframeMissing
+        ));
 
         let config = aac_config(48_000, 2);
         for config in [&[][..], &config[..1]] {
             let bare =
                 PacketEnvelope::encode(EnvelopeCodec::Aac, 0, 0, true, &[1, 2], config).unwrap();
             let result = scatter_audio(AudioCodec::Aac, 48_000, 2, 1024, split(&bare, &[44]));
-            assert!(reason(result).contains("AudioSpecificConfig"));
+            assert!(matches!(
+                reason(result),
+                crate::FrameDefect::AacConfigurationMissing
+            ));
         }
 
         let opus = |sample_rate, samples| {
@@ -1350,9 +1378,18 @@ mod tests {
         let frame = opus(48_000, 960).unwrap().into_contiguous_copy();
         assert_eq!(frame.data(), &[1, 2]);
         frame.validate_for_send().unwrap();
-        assert!(reason(opus(44_100, 882)).contains("48000 Hz"));
-        assert!(reason(opus(48_000, 1440)).contains("ms of audio"));
-        assert!(reason(opus(0, 960)).contains("1..="));
+        assert!(matches!(
+            reason(opus(44_100, 882)),
+            crate::FrameDefect::OpusSampleRate
+        ));
+        assert!(matches!(
+            reason(opus(48_000, 1440)),
+            crate::FrameDefect::OpusDuration
+        ));
+        assert!(matches!(
+            reason(opus(0, 960)),
+            crate::FrameDefect::CompressedAudioQuantities { .. }
+        ));
     }
 
     #[test]

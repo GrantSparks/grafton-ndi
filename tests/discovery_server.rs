@@ -290,7 +290,10 @@ fn creation_does_not_wait_for_the_server() {
             let Some(Error::InvalidInput(reason)) = error else {
                 panic!("{address:?}: expected a creation failure, got {error:?}");
             };
-            assert!(reason.contains(&format!("{address:?}")), "{reason}");
+            let grafton_ndi::InputDefect::DiscoveryAddressRejected(detail) = reason else {
+                panic!("{reason}")
+            };
+            assert_eq!(&*detail.address, address);
         }
     }
 }

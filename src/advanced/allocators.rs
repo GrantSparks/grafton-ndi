@@ -28,8 +28,8 @@ use crate::sys::bindings::*;
 use crate::{frames::ValidatedAudioLayout, AudioFormat};
 use crate::{
     frames::ValidatedVideoLayout, receiver::PacketAttached, runtime::ProcessLifetimeRuntime,
-    sys::advanced::ReceiveAllocators, Error, FourCc, PixelFormat, RawCapture, Receiver,
-    ReceiverMode, Rejected, Result,
+    sys::advanced::ReceiveAllocators, FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode,
+    Rejected, Result,
 };
 #[cfg(ndi_has_advanced_receive_allocators)]
 use std::ffi::c_void;
@@ -158,30 +158,26 @@ impl AllocatorLimits {
     }
 
     fn validate(self) -> Result<Self> {
-        let limits_error = |reason: &str| crate::Error::InvalidInput(reason.into());
+        let limits_error = |cause| crate::Error::InvalidInput(cause);
         if self.max_generations == 0
             || self.max_allocations == 0
             || self.max_concurrent_calls == 0
             || self.max_allocation_bytes == 0
         {
-            return Err(limits_error("Allocator limits must be positive"));
+            return Err(limits_error(crate::InputDefect::AllocatorPositiveLimits));
         }
         if self.max_allocation_bytes > MAX_ALLOCATION {
-            return Err(limits_error("max_allocation_bytes exceeds 256 MiB"));
+            return Err(limits_error(crate::InputDefect::AllocatorAllocationLimit));
         }
         if self.max_concurrent_calls > self.max_allocations {
-            return Err(limits_error(
-                "max_concurrent_calls exceeds max_allocations, which counts every call in progress",
-            ));
+            return Err(limits_error(crate::InputDefect::AllocatorConcurrentLimit));
         }
         if self
             .max_concurrent_calls
             .checked_mul(self.max_allocation_bytes)
             .is_none_or(|granted| granted > self.max_bytes)
         {
-            return Err(limits_error(
-                "max_bytes is less than max_concurrent_calls allocations of max_allocation_bytes",
-            ));
+            return Err(limits_error(crate::InputDefect::AllocatorByteLimit));
         }
         Ok(self)
     }
@@ -264,44 +260,45 @@ impl AllocationRequest {
     /// the [`capacity_limit`](Self::capacity_limit).
     pub fn with_stride_bytes(self, stride: usize) -> Result<Self> {
         if stride < self.stride {
-            return Err(invalid_input(format!(
-                "Allocator stride {stride} is smaller than the requested stride {}",
-                self.stride
-            )));
+            return Err(invalid_input(crate::InputDefect::AllocatorShortStride {
+                stride,
+                minimum: self.stride,
+            }));
         }
         let bytes = match self.format {
             AllocationFormat::Video(pixel) => {
-                ValidatedVideoLayout::new_uncompressed(pixel, self.width, self.height, Some(stride))
-                    // The layout rules report the frame that breaks them;
-                    // here what breaks them is the caller's stride.
-                    .map_err(|error| match error {
-                        Error::InvalidFrame(reason) => invalid_input(reason),
-                        other => other,
-                    })?
-                    .data_len_bytes()
+                ValidatedVideoLayout::new_uncompressed_checked(
+                    pixel,
+                    self.width,
+                    self.height,
+                    Some(stride),
+                )
+                // This is an input stride refusal, retaining the layout evidence.
+                .map_err(|cause| invalid_input(cause.into()))?
+                .data_len_bytes()
             }
             AllocationFormat::AudioPlanarF32 => {
                 if !stride.is_multiple_of(size_of::<f32>()) {
-                    return Err(invalid_input(format!(
-                        "Audio allocator stride {stride} is not a whole number of samples"
-                    )));
+                    return Err(invalid_input(crate::InputDefect::AllocatorAudioStride {
+                        stride,
+                    }));
                 }
-                stride
-                    .checked_mul(self.height as usize)
-                    .ok_or_else(|| invalid_input("Audio allocator extent overflow"))?
+                stride.checked_mul(self.height as usize).ok_or_else(|| {
+                    invalid_input(crate::InputDefect::AllocatorAudioExtentOverflow)
+                })?
             }
             _ if stride == self.stride => self.bytes,
             _ => {
                 return Err(invalid_input(
-                    "Compressed allocations have a byte size, not a configurable stride",
+                    crate::InputDefect::CompressedAllocationStride,
                 ))
             }
         };
         if bytes > self.capacity_limit {
-            return Err(invalid_input(format!(
-                "An allocation of {bytes} bytes exceeds the capacity limit of {} bytes",
-                self.capacity_limit
-            )));
+            return Err(invalid_input(crate::InputDefect::AllocationTooLarge {
+                bytes,
+                limit: self.capacity_limit,
+            }));
         }
         Ok(Self {
             bytes,
@@ -346,11 +343,10 @@ impl OwnedStorage {
         let layout = Layout::from_size_align(bytes, 64)
             .ok()
             .filter(|layout| layout.size() != 0)
-            .ok_or_else(|| invalid_input(format!("No allocation can hold {bytes} bytes")))?;
+            .ok_or_else(|| invalid_input(crate::InputDefect::AllocationLayout { bytes }))?;
         // SAFETY: the layout was just checked not to be zero-sized.
-        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or_else(|| {
-            invalid_input(format!("The global allocator did not supply {bytes} bytes"))
-        })?;
+        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) })
+            .ok_or_else(|| invalid_input(crate::InputDefect::AllocationFailed { bytes }))?;
         Ok(Self { pointer, layout })
     }
 }
@@ -450,11 +446,11 @@ impl AllocationBuffer {
     ) -> std::result::Result<Self, Rejected<S>> {
         let capacity = storage.capacity();
         let problem = if capacity < request.bytes {
-            Some("External allocation is smaller than the request's minimum")
+            Some(crate::InputDefect::ExternalAllocationTooSmall)
         } else if capacity > request.capacity_limit {
-            Some("External allocation is larger than the request's capacity limit")
+            Some(crate::InputDefect::ExternalAllocationTooLarge)
         } else if !(storage.pointer().as_ptr() as usize).is_multiple_of(64) {
-            Some("External allocation is not aligned to 64 bytes")
+            Some(crate::InputDefect::ExternalAllocationAlignment)
         } else {
             None
         };
@@ -641,7 +637,7 @@ impl Drop for Reservation<'_> {
 
 impl Registry {
     fn new(limits: AllocatorLimits) -> Result<Self> {
-        let unavailable = |_| invalid_input("Unable to reserve bounded allocator lease storage");
+        let unavailable = |_| invalid_input(crate::InputDefect::AllocatorLeaseStorage);
         let mut leases = HashMap::new();
         leases
             .try_reserve(limits.max_allocations)
@@ -721,10 +717,10 @@ impl Registry {
         advance(&self.generations, |count| {
             (count < self.limits.max_generations).then_some(count + 1)
         })
-        .ok_or_else(|| invalid_input("Process allocator generation budget exhausted"))?;
+        .ok_or_else(|| invalid_input(crate::InputDefect::AllocatorGenerationBudget))?;
         advance(&self.next, |token| token.checked_add(1)).ok_or_else(|| {
             self.generations.fetch_sub(1, Ordering::AcqRel);
-            invalid_input("Allocator token space exhausted")
+            invalid_input(crate::InputDefect::AllocatorTokensExhausted)
         })
     }
 
@@ -1032,7 +1028,7 @@ impl AllocatorService {
         };
         if registry.limits != limits {
             return Err(crate::Error::InvalidInput(
-                "Allocator limits differ from the existing process allocator service".into(),
+                crate::InputDefect::AllocatorLimitsDiffer,
             ));
         }
         Ok(Self { runtime })
@@ -1592,6 +1588,7 @@ unsafe extern "C" fn audio_free(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
     use crate::StreamTier;
     #[test]
     fn native_allocation_formats_preserve_protection_and_decoded_formats() {
@@ -1715,7 +1712,9 @@ mod tests {
         let token = registry
             .register(move |_: AllocationRequest| -> Result<AllocationBuffer> {
                 calls.fetch_add(1, Ordering::Relaxed);
-                Err(Error::InvalidInput(String::new()))
+                Err(Error::InvalidInput(
+                    crate::InputDefect::AllocatorLeaseStorage,
+                ))
             })
             .unwrap();
         let video = NDIlib_video_frame_v2_t {
@@ -1967,7 +1966,9 @@ mod tests {
         let registry = Registry::new(limits()).unwrap();
         let token = registry
             .register(|_: AllocationRequest| -> Result<AllocationBuffer> {
-                Err(Error::InvalidInput(String::new()))
+                Err(Error::InvalidInput(
+                    crate::InputDefect::AllocatorLeaseStorage,
+                ))
             })
             .unwrap();
         let (result, allocations) =
@@ -2352,28 +2353,50 @@ mod tests {
             defaults.max_concurrent_calls(0),
             defaults.max_allocation_bytes(0),
         ] {
-            assert!(reason(zero).contains("positive"));
+            assert!(matches!(
+                reason(zero),
+                crate::InputDefect::AllocatorPositiveLimits
+            ));
         }
-        assert!(reason(defaults.max_allocation_bytes(MAX_ALLOCATION + 1)).contains("256 MiB"));
-        assert!(reason(defaults.max_allocations(15)).contains("max_allocations"));
+        assert!(matches!(
+            reason(defaults.max_allocation_bytes(MAX_ALLOCATION + 1)),
+            crate::InputDefect::AllocatorAllocationLimit
+        ));
+        assert!(matches!(
+            reason(defaults.max_allocations(15)),
+            crate::InputDefect::AllocatorConcurrentLimit
+        ));
         // Each of these promises more concurrent calls than the byte budget
         // can grant a largest allocation to.
-        assert!(reason(defaults.max_concurrent_calls(17)).contains("max_bytes"));
-        assert!(reason(defaults.max_allocation_bytes(64 * MIB + 1)).contains("max_bytes"));
-        assert!(reason(defaults.max_bytes(1024 * MIB - 1)).contains("max_bytes"));
-        assert!(reason(
-            defaults
-                .max_concurrent_calls(32)
-                .max_allocation_bytes(MAX_ALLOCATION)
-        )
-        .contains("max_bytes"));
-        assert!(reason(
-            defaults
-                .max_bytes(usize::MAX)
-                .max_allocations(usize::MAX)
-                .max_concurrent_calls(usize::MAX)
-        )
-        .contains("max_bytes"));
+        assert!(matches!(
+            reason(defaults.max_concurrent_calls(17)),
+            crate::InputDefect::AllocatorByteLimit
+        ));
+        assert!(matches!(
+            reason(defaults.max_allocation_bytes(64 * MIB + 1)),
+            crate::InputDefect::AllocatorByteLimit
+        ));
+        assert!(matches!(
+            reason(defaults.max_bytes(1024 * MIB - 1)),
+            crate::InputDefect::AllocatorByteLimit
+        ));
+        assert!(matches!(
+            reason(
+                defaults
+                    .max_concurrent_calls(32)
+                    .max_allocation_bytes(MAX_ALLOCATION)
+            ),
+            crate::InputDefect::AllocatorByteLimit
+        ));
+        assert!(matches!(
+            reason(
+                defaults
+                    .max_bytes(usize::MAX)
+                    .max_allocations(usize::MAX)
+                    .max_concurrent_calls(usize::MAX)
+            ),
+            crate::InputDefect::AllocatorByteLimit
+        ));
 
         // The largest single allocation, with the budget to match: accepted
         // whenever the budget for the calls can be named. On a 32-bit target
@@ -2387,7 +2410,10 @@ mod tests {
                 Some(budget) => {
                     limits.max_bytes(budget).validate().unwrap();
                 }
-                None => assert!(reason(limits.max_bytes(usize::MAX)).contains("max_bytes")),
+                None => assert!(matches!(
+                    reason(limits.max_bytes(usize::MAX)),
+                    crate::InputDefect::AllocatorByteLimit
+                )),
             }
         }
         defaults
@@ -2575,7 +2601,7 @@ mod tests {
         // The generation budget is exhausted.
         let rejected = registry.register(Tagged(3)).unwrap_err();
         assert!(
-            matches!(rejected.error(), Error::InvalidInput(reason) if reason.contains("generation budget"))
+            matches!(rejected.error(), Error::InvalidInput(reason) if matches!(reason, crate::InputDefect::AllocatorGenerationBudget))
         );
         assert_eq!(rejected.into_inner().0, 3);
         assert_eq!(registry.generations.load(Ordering::Acquire), 2);
@@ -2587,7 +2613,10 @@ mod tests {
         assert_eq!(registry.generations.load(Ordering::Acquire), 1);
         registry.next.store(usize::MAX, Ordering::Release);
         let rejected = registry.register(Tagged(4)).unwrap_err();
-        assert!(rejected.error().to_string().contains("token space"));
+        assert!(matches!(
+            rejected.error(),
+            Error::InvalidInput(crate::InputDefect::AllocatorTokensExhausted)
+        ));
         assert_eq!(rejected.into_inner().0, 4);
         assert_eq!(registry.generations.load(Ordering::Acquire), 1);
         assert_eq!(registry.next.load(Ordering::Acquire), usize::MAX);
@@ -2617,25 +2646,32 @@ mod tests {
             capacity_limit: 128,
             ..request()
         };
-        let refused = |storage: OwnedStorage, problem: &str| {
+        let refused = |storage: OwnedStorage, expected: crate::InputDefect| {
             let address = storage.pointer();
             let rejected = AllocationBuffer::from_external(request, storage)
                 .err()
                 .expect("the storage does not fit the request");
-            assert!(
-                matches!(rejected.error(), Error::InvalidInput(reason) if reason.contains(problem))
-            );
+            assert!(matches!(rejected.error(), Error::InvalidInput(reason) if *reason==expected));
             assert_eq!(rejected.into_inner().pointer(), address);
         };
-        refused(OwnedStorage::zeroed(32).unwrap(), "smaller");
-        refused(OwnedStorage::zeroed(192).unwrap(), "larger");
+        refused(
+            OwnedStorage::zeroed(32).unwrap(),
+            crate::InputDefect::ExternalAllocationTooSmall,
+        );
+        refused(
+            OwnedStorage::zeroed(192).unwrap(),
+            crate::InputDefect::ExternalAllocationTooLarge,
+        );
         let rejected = AllocationBuffer::from_external(
             request,
             Misaligned(OwnedStorage::zeroed(128).unwrap()),
         )
         .err()
         .expect("the storage is misaligned");
-        assert!(rejected.error().to_string().contains("aligned"));
+        assert!(matches!(
+            rejected.error(),
+            Error::InvalidInput(crate::InputDefect::ExternalAllocationAlignment)
+        ));
         assert_eq!(rejected.into_inner().0.capacity(), 128);
 
         let buffer =
@@ -2663,16 +2699,28 @@ mod tests {
             (padded.stride_bytes(), padded.minimum_bytes()),
             (32, 32 * 16 * 3 / 2)
         );
-        assert!(input(planar.with_stride_bytes(15)).contains("smaller"));
-        assert!(input(planar.with_stride_bytes(17)).contains("even"));
+        assert!(matches!(
+            input(planar.with_stride_bytes(15)),
+            crate::InputDefect::AllocatorShortStride { .. }
+        ));
+        assert!(matches!(
+            input(planar.with_stride_bytes(17)),
+            crate::InputDefect::VideoPlanar420 { .. }
+        ));
 
         let audio = request();
-        assert!(input(audio.with_stride_bytes(34)).contains("whole number"));
+        assert!(matches!(
+            input(audio.with_stride_bytes(34)),
+            crate::InputDefect::AllocatorAudioStride { .. }
+        ));
         let limited = AllocationRequest {
             capacity_limit: 64,
             ..audio
         };
-        assert!(input(limited.with_stride_bytes(36)).contains("capacity limit"));
+        assert!(matches!(
+            input(limited.with_stride_bytes(36)),
+            crate::InputDefect::AllocationTooLarge { .. }
+        ));
 
         let compressed = AllocationRequest {
             format: AllocationFormat::CompressedAudio(FourCc::from_raw(
@@ -2681,7 +2729,10 @@ mod tests {
             ..audio
         };
         assert_eq!(compressed.with_stride_bytes(32).unwrap(), compressed);
-        assert!(input(compressed.with_stride_bytes(36)).contains("Compressed"));
+        assert!(matches!(
+            input(compressed.with_stride_bytes(36)),
+            crate::InputDefect::CompressedAllocationStride
+        ));
     }
 
     #[test]

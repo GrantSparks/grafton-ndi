@@ -189,8 +189,8 @@ impl PacketItemRef<'_> {
 /// A packet receiver is [`Send`] and [`Sync`], as the [`Receiver`] it holds
 /// is: it can be created on one thread, capture on another and be dropped on a
 /// third. Both capture methods take a shared reference, so packet references
-/// coexist with shared receiver controls. Native captures run under the
-/// receiver's shared capture guard; reconnecting takes the exclusive guard.
+/// coexist with shared receiver controls and connection changes. The receiver
+/// binds each native capture to one instance, runtime and bounded attempt.
 ///
 /// # Examples
 ///
@@ -220,7 +220,8 @@ pub struct PacketReceiver {
     // receiver to a thread: it is created as an ordinary receiver is, with a
     // passthrough color format, and its capture is the receiver's
     // NDIlib_recv_capture_v3, which the SDK lets several threads call at
-    // once (Processing.NDI.Recv.h), under the receiver's capture guard.
+    // once (Processing.NDI.Recv.h). Connection changes may overlap those
+    // calls, as measured beside receiver::CaptureLock.
     // Borrowed results retain their Guard until dropped; its lifetime keeps
     // this owner alive. Owned capture copies through that same borrowed path.
     pub(crate) receiver: Receiver<PacketAttached>,
@@ -299,20 +300,18 @@ impl PacketReceiver {
     /// spends it. The SDK returns early, with neither a frame nor an event,
     /// while a new connection synchronizes; this captures again until
     /// something arrives, and returns `None` only once the whole timeout is
-    /// spent. [`Duration::ZERO`] makes one attempt without waiting. Every SDK
-    /// call holds the receiver's shared capture guard for one attempt of at
-    /// most 100 ms, so none overlaps a reconnect and a reconnect waits for one
-    /// attempt at most; waiting for that guard spends the same timeout.
+    /// spent. [`Duration::ZERO`] makes one attempt without waiting. Each native
+    /// attempt waits at most 100 ms, and connection changes may run concurrently.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when `timeout` exceeds
-    /// [`crate::MAX_TIMEOUT`], [`Error::CaptureFailed`] when the SDK reports a
+    /// [`crate::MAX_TIMEOUT`], [`Error::ConnectionLost`] when the SDK reports a
     /// lost connection, and [`Error::InvalidFrame`] when a delivered frame
     /// fails validation.
     ///
     /// [`Error::InvalidInput`]: crate::Error::InvalidInput
-    /// [`Error::CaptureFailed`]: crate::Error::CaptureFailed
+    /// [`Error::ConnectionLost`]: crate::Error::ConnectionLost
     /// [`Error::InvalidFrame`]: crate::Error::InvalidFrame
     pub fn capture(&self, timeout: Duration) -> Result<Option<PacketItem>> {
         Self::capture_from(&self.receiver, timeout)
@@ -654,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_capture_takes_the_capture_lock_within_its_budget() {
+    fn packet_capture_reaches_the_sdk_while_connection_changes_are_locked() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
@@ -679,13 +678,12 @@ mod tests {
                 }
                 done.send(native_capture_calls::take()).unwrap();
             });
-            // The reconnect lock stays held until the worker has returned: a
-            // wait for it without a bound would not finish.
+            // The connection lock stays held until capture returns. A capture
+            // that took it would stall instead of reaching the SDK.
             let calls = completed.recv_timeout(Duration::from_secs(2));
             drop(reconnect);
             worker.join().unwrap();
-            // Neither capture reached the SDK while a reconnect held the lock.
-            assert_eq!(calls.unwrap(), 0);
+            assert!(calls.unwrap() >= 2);
         });
         PacketReceiver::capture_from(&receiver, Duration::ZERO).unwrap();
         assert_eq!(native_capture_calls::take(), 1);

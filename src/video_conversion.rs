@@ -38,7 +38,7 @@ impl V210Layout {
     pub fn new(width: u32, height: u32) -> Result<Self> {
         let stride = Self::active_words_checked(width)?
             .checked_mul(4)
-            .ok_or_else(|| Error::InvalidFrame("V210 active row size overflow".into()))?;
+            .ok_or(Error::InvalidFrame(crate::FrameDefect::V210RowOverflow))?;
         Self::with_line_stride_bytes(width, height, stride)
     }
 
@@ -54,15 +54,12 @@ impl V210Layout {
         // corresponding two full-height, 16-bit P216 planes.
         ValidatedVideoLayout::new_uncompressed(PixelFormat::P216, width, height, None)?;
         if stride_bytes == 0 || !stride_bytes.is_multiple_of(4) || stride_bytes / 4 < active_words {
-            return Err(Error::InvalidFrame(
-                "V210 stride must be a multiple of four and cover every complete pixel group"
-                    .into(),
-            ));
+            return Err(Error::InvalidFrame(crate::FrameDefect::V210Stride));
         }
         let bytes = stride_bytes
             .checked_mul(height as usize)
             .filter(|bytes| *bytes <= MAX_VIDEO_BYTES)
-            .ok_or_else(|| Error::InvalidFrame("V210 storage exceeds the video limit".into()))?;
+            .ok_or(Error::InvalidFrame(crate::FrameDefect::V210Storage))?;
         Ok(Self {
             width,
             height,
@@ -73,13 +70,11 @@ impl V210Layout {
 
     fn active_words_checked(width: u32) -> Result<usize> {
         if width == 0 || !width.is_multiple_of(6) {
-            return Err(Error::InvalidFrame(
-                "V210 conversion requires a positive width divisible by six".into(),
-            ));
+            return Err(Error::InvalidFrame(crate::FrameDefect::V210Width));
         }
         (width as usize / 6)
             .checked_mul(4)
-            .ok_or_else(|| Error::InvalidFrame("V210 active row size overflow".into()))
+            .ok_or(Error::InvalidFrame(crate::FrameDefect::V210RowOverflow))
     }
 
     /// Pixel width, always a multiple of six.
@@ -112,10 +107,12 @@ impl V210Layout {
 
     fn check_storage(self, words: usize) -> Result<()> {
         if words < self.words {
-            return Err(Error::InvalidFrame(format!(
-                "V210 buffer has {words} words, requires {}",
-                self.words
-            )));
+            return Err(Error::InvalidFrame(
+                crate::FrameDefect::V210BufferTooSmall {
+                    actual: words,
+                    minimum: self.words,
+                },
+            ));
         }
         Ok(())
     }
@@ -126,9 +123,7 @@ impl V210Layout {
             || frame.width() != self.width
             || frame.height() != self.height
         {
-            return Err(Error::InvalidFrame(
-                "P216 frame format and dimensions must match the V210 layout".into(),
-            ));
+            return Err(Error::InvalidFrame(crate::FrameDefect::P216LayoutMismatch));
         }
         Ok(())
     }
@@ -156,10 +151,12 @@ impl V210Layout {
         )?;
         let len = data.len();
         if len != p216.data_len_bytes() {
-            return Err(Error::InvalidFrame(format!(
-                "P216 buffer has {len} bytes, requires {}",
-                p216.data_len_bytes()
-            )));
+            return Err(Error::InvalidFrame(
+                crate::FrameDefect::P216BufferTooSmall {
+                    actual: len,
+                    minimum: p216.data_len_bytes(),
+                },
+            ));
         }
         // BorrowedVideoFrame keeps geometry paired with the validated slice.
         // Conversion needs no metadata and uses the builder's valid header.
@@ -213,11 +210,12 @@ struct P216Output<'a> {
 impl<'a> P216Output<'a> {
     fn new(layout: ValidatedVideoLayout, data: &'a mut [u8]) -> Result<Self> {
         if data.len() != layout.data_len_bytes() {
-            return Err(Error::InvalidFrame(format!(
-                "P216 buffer has {} bytes, requires {}",
-                data.len(),
-                layout.data_len_bytes()
-            )));
+            return Err(Error::InvalidFrame(
+                crate::FrameDefect::P216BufferTooSmall {
+                    actual: data.len(),
+                    minimum: layout.data_len_bytes(),
+                },
+            ));
         }
         Ok(Self {
             layout,

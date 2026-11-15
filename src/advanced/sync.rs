@@ -79,9 +79,7 @@ impl AvSyncRequest {
                 .checked_mul(size_of::<f32>())
                 .is_none_or(|bytes| bytes > MAX_AUDIO_BYTES)
         }) {
-            return Err(invalid_input(
-                "AVSync request exceeds the supported audio storage limit",
-            ));
+            return Err(invalid_input(crate::InputDefect::AvSyncStorageLimit));
         }
         Ok(request)
     }
@@ -463,11 +461,9 @@ impl AvSync {
     ///
     /// One call synchronizes at a time, on the thread that holds this
     /// `AvSync`, which is not `Sync`. Other threads may meanwhile capture
-    /// video or metadata or use the controls through the
-    /// receiver it lends. This does not take the receiver's capture guard, as
-    /// [`FrameSync`](crate::FrameSync) captures do not, so a
-    /// [`reconnect`](Receiver::reconnect) neither waits for it nor holds it
-    /// off.
+    /// video or metadata or use the controls through the receiver it lends.
+    /// Connection changes may overlap synchronization, as the native overlap
+    /// tests also exercise for [`FrameSync`](crate::FrameSync).
     ///
     /// # Errors
     ///
@@ -613,16 +609,11 @@ impl<'a> AvSyncCapture<'a> {
                 // once (Processing.NDI.Recv.h). The AvSyncAttached mode has no
                 // audio capture, so the synchronizer is the only audio consumer.
                 //
-                // The receiver's capture guard is not taken, as FrameSync's
-                // captures do not take it. The guard keeps the crate's own
-                // NDIlib_recv_capture_v3 calls from overlapping
-                // NDIlib_recv_connect. How a synchronizer reads its receiver,
-                // during this call or on its own, is internal to the SDK and not
-                // documented, so a lock around this call could not be shown to
-                // cover it. Processing.NDI.FrameSync.h leaves a frame
-                // synchronizer's receiver usable for its other operations, and a
-                // FrameSync's receiver already reconnects while it captures; this
-                // synchronizer is treated the same way.
+                // Connection changes may overlap raw receiver and synchronizer
+                // captures. The native observations beside receiver::CaptureLock
+                // and tests/receiver_connect_overlap_sdk.rs cover both AV sync
+                // and FrameSync beside local connection changes; remote SDK
+                // connection requests likewise cannot be serialized by Rust.
                 let code = unsafe {
                     table.NDIlib_avsync_synchronize(
                         handle.0,
@@ -696,10 +687,12 @@ unsafe fn outcome<'a>(
                     num_channels,
                 },
                 _ => {
-                    return Err(Error::UnexpectedSdkResult(format!(
-                    "NDIlib_avsync_synchronize reported a format change to {} Hz and {} channels",
-                    audio.frame().sample_rate, audio.frame().no_channels
-                )))
+                    return Err(Error::UnexpectedSdkResult(
+                        crate::SdkResultDefect::AvSyncFormatChange {
+                            sample_rate: audio.frame().sample_rate,
+                            channels: audio.frame().no_channels,
+                        },
+                    ))
                 }
             }
         }
@@ -709,9 +702,12 @@ unsafe fn outcome<'a>(
             });
         }
         Synchronized::Unknown(code) => {
-            return Err(Error::UnexpectedSdkResult(format!(
-                "NDIlib_avsync_synchronize returned unknown status {code}"
-            )));
+            return Err(Error::UnexpectedSdkResult(
+                crate::SdkResultDefect::UnknownStatus {
+                    operation: "NDIlib_avsync_synchronize",
+                    code,
+                },
+            ));
         }
     })
 }
@@ -1112,9 +1108,9 @@ impl AudioClock<'_> {
 /// # Errors
 ///
 /// [`Error::InvalidInput`] otherwise.
-fn quantity(name: &str, value: u32) -> Result<u32> {
+fn quantity(name: &'static str, value: u32) -> Result<u32> {
     sdk_quantity(value)
-        .ok_or_else(|| invalid_input(format!("{name} {value} is not in 1..={}", i32::MAX)))
+        .ok_or_else(|| invalid_input(crate::InputDefect::SdkQuantity { name, value }))
 }
 
 /// The descriptor a video clock reads its timing from.
@@ -1233,7 +1229,7 @@ mod tests {
             // SAFETY: an unknown status never reads a buffer.
             assert!(matches!(
                 unsafe { inspect(Synchronized::Unknown(code), &audio) },
-                Err(Error::UnexpectedSdkResult(message)) if message.contains(&code.to_string())
+                Err(Error::UnexpectedSdkResult(message)) if matches!(message,crate::SdkResultDefect::UnknownStatus {code:found,..} if found==code)
             ));
         }
 

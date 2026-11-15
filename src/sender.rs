@@ -79,7 +79,7 @@ unsafe impl Sync for SendInstance {}
 /// A copy is a borrowed handle, valid while an owner of the native sender
 /// (`Shared` or `Exclusive`) keeps it alive.
 #[derive(Clone, Copy)]
-pub(crate) struct SendHandle<'a> {
+struct SendHandle<'a> {
     instance: SendInstance,
     core: &'static sys::Core,
     _owner: PhantomData<&'a SenderResource>,
@@ -535,6 +535,8 @@ pub(crate) mod in_flight {
     /// The loan storage attached to one exclusive native sender.
     #[cfg(feature = "advanced")]
     pub(crate) trait Loans {
+        type Recovered;
+        fn recover(self, destroyed: &Destroyed) -> Self::Recovered;
         fn release(self, destroyed: &Destroyed);
     }
 
@@ -576,7 +578,7 @@ pub(crate) mod in_flight {
             }
         }
 
-        pub(crate) fn close<R>(self, release: impl FnOnce(L, &Destroyed) -> R) -> R {
+        pub(crate) fn close(self) -> L::Recovered {
             let mut this = mem::ManuallyDrop::new(self);
             // SAFETY: consuming self suppresses Drop, and neither field is
             // accessed after being taken. Loans remain live during destruction.
@@ -584,7 +586,7 @@ pub(crate) mod in_flight {
             let destroyed = destroy(sender);
             // SAFETY: sender destruction returned, and this field is taken once.
             let loans = unsafe { mem::ManuallyDrop::take(&mut this.loans) };
-            release(loans, &destroyed)
+            loans.recover(&destroyed)
         }
     }
 
@@ -605,11 +607,6 @@ pub(crate) mod in_flight {
         pub(crate) fn loans(&self) -> &L {
             &self.loans
         }
-
-        /// Obtain the handle from the same owner that lent this loan view.
-        pub(crate) fn with<R>(&mut self, operation: impl FnOnce(&mut L, SendHandle<'a>) -> R) -> R {
-            operation(&mut self.loans, self.sender.handle())
-        }
     }
 
     #[cfg(feature = "advanced")]
@@ -620,6 +617,79 @@ pub(crate) mod in_flight {
                 sender: self.sender,
                 loans: self.loans,
             }
+        }
+    }
+
+    #[cfg(feature = "advanced")]
+    impl<'a> LoanPair<'a, crate::CompressedAttached, &'a mut crate::advanced::PendingStreams> {
+        /// Validate and submit through the sender that owns these streams.
+        // Rejection returns the caller's complete owned frame without boxing.
+        #[allow(clippy::result_large_err)]
+        pub(crate) fn submit_pending(
+            &mut self,
+            frame: crate::advanced::CompressedVideoFrame,
+        ) -> std::result::Result<
+            Option<crate::advanced::SubmittedVideo>,
+            crate::Rejected<crate::advanced::CompressedVideoFrame>,
+        > {
+            if let Err(error) = frame.validate_for_send() {
+                return Err(crate::Rejected::new(error, frame));
+            }
+            Ok(self.submit_prepared(crate::advanced::PendingVideo::Contiguous(frame)))
+        }
+
+        // Rejection preserves every block of the caller's owned frame.
+        #[allow(clippy::result_large_err)]
+        pub(crate) fn submit_scatter(
+            &mut self,
+            _frame: crate::advanced::ScatterVideoFrame,
+        ) -> std::result::Result<
+            Option<crate::advanced::SubmittedVideo>,
+            crate::Rejected<crate::advanced::ScatterVideoFrame>,
+        > {
+            use crate::sys::advanced::{native, ScatterSend};
+            let table = match self.sender.runtime().table::<ScatterSend>() {
+                Ok(table) => table,
+                Err(error) => return Err(crate::Rejected::new(error, _frame)),
+            };
+            native!(ScatterSend, table => {
+                let tier = _frame.format().tier();
+                let next = self.loans.prepare_scatter(_frame, table);
+                let displaced = self.submit_prepared(next);
+                self.loans.advance_scatter(tier);
+                Ok(displaced)
+            })
+        }
+
+        fn submit_prepared(
+            &mut self,
+            next: crate::advanced::PendingVideo,
+        ) -> Option<crate::advanced::SubmittedVideo> {
+            let tier = next.tier();
+            let (displaced, synchronized) =
+                self.loans.slot(tier).submit(self.sender.handle(), next, ());
+            self.loans.reclaim_displaced(tier, displaced, synchronized)
+        }
+    }
+
+    #[cfg(feature = "advanced")]
+    impl<'a> LoanPair<'a, crate::QueueAttached, &'a crate::advanced::QueueLoans> {
+        /// Admission and native dispatch use this pair's own callback and sender.
+        /// No caller can supply an entry prepared by another queue.
+        pub(crate) fn try_submit_queued(
+            &mut self,
+            frame: impl Into<crate::advanced::QueuedVideoFrame>,
+        ) -> std::result::Result<
+            crate::advanced::SubmissionId,
+            crate::Rejected<crate::advanced::QueuedVideoFrame>,
+        > {
+            let admitted = self.loans.prepare(self.sender, frame.into())?;
+            // SAFETY: this owner pair derived both the live handle and the
+            // admission from its own sender and callback. Admission retains
+            // every descriptor and pointee before dispatch; the callback may
+            // complete synchronously after its state lock has been released.
+            unsafe { admitted.lent.submit(self.sender.handle(), admitted.pointer) };
+            Ok(admitted.id)
         }
     }
 
@@ -696,7 +766,7 @@ pub(crate) mod in_flight {
         /// including metadata, scatter list, arrays and payload, stays allocated
         /// and inaccessible until native synchronization or completion ends
         /// the loan. Any displaced loan stays live through this call's return.
-        pub(crate) unsafe fn submit(
+        pub(super) unsafe fn submit(
             &self,
             sender: SendHandle<'_>,
             descriptor: *const NDIlib_video_frame_v2_t,
@@ -861,7 +931,7 @@ pub(crate) mod in_flight {
         /// Make `next` the frame in flight and lend it to the SDK. Returns
         /// the state it displaced, whose frame the SDK has released, with the
         /// proof of that release.
-        pub(crate) fn submit(
+        pub(super) fn submit(
             &mut self,
             sender: SendHandle<'_>,
             mut next: T,
@@ -885,7 +955,7 @@ pub(crate) mod in_flight {
         /// Wait for the SDK to release the frame in flight by passing a true
         /// NULL frame pointer, the SDK's documented request to drain the
         /// asynchronous buffer.
-        pub(crate) fn flush(&mut self, sender: SendHandle<'_>) -> Synchronized {
+        pub(super) fn flush(&mut self, sender: SendHandle<'_>) -> Synchronized {
             // SAFETY: `sender` is the live sender whose stream this slot
             // holds, and a null frame pointer is the SDK's documented request
             // to drain the async buffer.
@@ -899,7 +969,7 @@ pub(crate) mod in_flight {
 
         /// Send `frame` synchronously. When this returns, the SDK has
         /// finished reading `frame` and has released the frame in flight.
-        pub(crate) fn send(
+        pub(super) fn send(
             &mut self,
             sender: SendHandle<'_>,
             frame: PreparedVideo<'_>,
@@ -945,6 +1015,109 @@ pub(crate) mod in_flight {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Native dispatch is confined to the owner module, whose opaque
+        /// pairs accept fresh frames rather than foreign handles or admissions.
+        #[test]
+        fn native_loan_dispatch_stays_inside_the_sender_owner() {
+            use syn::{ImplItem, Item, Type, Visibility};
+            let file = syn::parse_file(include_str!("sender.rs")).unwrap();
+            let owner = file
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Mod(module) if module.ident == "in_flight" => {
+                        module.content.as_ref().map(|(_, items)| items)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let type_name = |ty: &Type| match ty {
+                Type::Path(path) => path.path.segments.last().unwrap().ident.to_string(),
+                _ => String::new(),
+            };
+            for item in &file.items {
+                if let Item::Struct(handle) = item {
+                    if handle.ident == "SendHandle" {
+                        assert!(matches!(handle.vis, Visibility::Inherited));
+                    }
+                }
+                if let Item::Impl(implementation) = item {
+                    if type_name(&implementation.self_ty) == "Sender" {
+                        for item in &implementation.items {
+                            if let ImplItem::Fn(method) = item {
+                                if method.sig.ident == "handle" {
+                                    assert!(matches!(method.vis, Visibility::Inherited));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let mut primitives = Vec::new();
+            let mut paired = Vec::new();
+            for item in owner {
+                if let Item::Struct(pair) = item {
+                    if pair.ident == "LoanPair" {
+                        assert!(pair
+                            .fields
+                            .iter()
+                            .all(|field| matches!(field.vis, Visibility::Inherited)));
+                    }
+                }
+                let Item::Impl(implementation) = item else {
+                    continue;
+                };
+                let name = type_name(&implementation.self_ty);
+                for item in &implementation.items {
+                    let ImplItem::Fn(method) = item else { continue };
+                    let method_name = method.sig.ident.to_string();
+                    if name == "Lending" && method_name == "close" {
+                        assert_eq!(
+                            method.sig.inputs.len(),
+                            1,
+                            "close must not expose a raw destruction proof to a callback"
+                        );
+                    }
+                    if name == "LoanPair"
+                        && ["submit_pending", "submit_scatter", "try_submit_queued"]
+                            .contains(&method_name.as_str())
+                    {
+                        assert_eq!(
+                            method.sig.inputs.len(),
+                            2,
+                            "paired submission takes only its owner and fresh frame"
+                        );
+                    }
+                    if name == "LoanPair" && ["sender", "loans"].contains(&method_name.as_str()) {
+                        let syn::ReturnType::Type(_, ty) = &method.sig.output else {
+                            panic!("paired accessor must be immutable")
+                        };
+                        let Type::Reference(reference) = &**ty else {
+                            panic!("paired accessor must borrow")
+                        };
+                        assert!(reference.mutability.is_none());
+                    }
+                    if (name == "InFlight"
+                        && ["submit", "send", "flush"].contains(&method_name.as_str()))
+                        || (name == "Lent" && method_name == "submit")
+                    {
+                        let Visibility::Restricted(visibility) = &method.vis else {
+                            panic!("{name}::{method_name} escaped the sender owner");
+                        };
+                        assert!(visibility.path.is_ident("super"));
+                        primitives.push((name.clone(), method_name.clone()));
+                    }
+                    if name == "LoanPair" && !matches!(method.vis, Visibility::Inherited) {
+                        assert!(["sender", "loans", "shared", "submit_pending", "submit_scatter", "try_submit_queued"].contains(&method_name.as_str()),
+                            "new paired operation needs an ownership-contract review: {method_name}");
+                        paired.push(method_name);
+                    }
+                }
+            }
+            assert_eq!(primitives.len(), 4);
+            assert_eq!(paired.len(), 6);
+        }
 
         #[test]
         fn an_unproven_drop_leaks_the_native_loan() {
@@ -1492,12 +1665,13 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
             self.line_stride,
         )?;
         let Some(data) = self.data.get(..layout.data_len_bytes()) else {
-            return Err(Error::InvalidFrame(format!(
-                "Buffer too small for {:?}: got {} bytes, expected at least {}",
-                self.pixel_format,
-                self.data.len(),
-                layout.data_len_bytes(),
-            )));
+            return Err(Error::InvalidFrame(
+                crate::FrameDefect::VideoBufferTooSmall {
+                    format: self.pixel_format,
+                    actual: self.data.len(),
+                    minimum: layout.data_len_bytes(),
+                },
+            ));
         };
         let metadata = self.metadata.map(MetadataText::from_cstr).transpose()?;
         Ok(BorrowedVideoFrame {
@@ -1858,7 +2032,7 @@ impl<M: SenderMode> Sender<M> {
     /// The handle the asynchronous video slots of this sender's owner send
     /// through.
     #[cfg(feature = "advanced")]
-    pub(crate) fn handle(&self) -> SendHandle<'_> {
+    fn handle(&self) -> SendHandle<'_> {
         SendHandle {
             instance: self.inner.instance,
             core: self.inner.core,
@@ -1901,7 +2075,7 @@ impl<M: SenderMode> Sender<M> {
     /// timeout exceeds [`crate::MAX_TIMEOUT`], [`Error::InvalidFrame`] for an
     /// invalid metadata count, a positive count with null data, or a missing
     /// bounded terminator,
-    /// [`Error::InvalidUtf8`] for non-UTF-8 text, and [`Error::CaptureFailed`]
+    /// [`Error::InvalidUtf8`] for non-UTF-8 text, and [`Error::UnexpectedSdkResult`]
     /// when the SDK returns a frame type other than metadata or no frame.
     pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
         let metadata = self._ndi.table::<sys::SenderMetadata>()?;
@@ -1967,9 +2141,12 @@ impl<M: SenderMode> Sender<M> {
         } else if kind == NDIlib_frame_type_e_NDIlib_frame_type_none {
             Ok(None)
         } else {
-            Err(Error::CaptureFailed(format!(
-                "sender metadata capture returned {kind}"
-            )))
+            Err(Error::UnexpectedSdkResult(
+                crate::SdkResultDefect::UnexpectedFrameType {
+                    operation: "sender metadata capture",
+                    kind,
+                },
+            ))
         }
     }
 
@@ -2136,9 +2313,10 @@ impl<M: SenderMode> Sender<M> {
         };
 
         u32::try_from(count).map_err(|_| {
-            Error::UnexpectedSdkResult(format!(
-                "NDIlib_send_get_no_connections returned a negative count: {count}"
-            ))
+            Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
+                operation: "NDIlib_send_get_no_connections",
+                value: count,
+            })
         })
     }
 
@@ -3600,8 +3778,17 @@ mod tests {
         let result = borrowed(&buffer, 1920, 1080, PixelFormat::Bgra);
         assert!(result.is_err());
         if let Err(Error::InvalidFrame(msg)) = result {
-            assert!(msg.contains("Buffer too small"));
-            assert!(msg.contains("Bgra"));
+            assert!(matches!(
+                msg,
+                crate::FrameDefect::VideoBufferTooSmall { .. }
+            ));
+            assert!(matches!(
+                msg,
+                crate::FrameDefect::VideoBufferTooSmall {
+                    format: PixelFormat::Bgra,
+                    ..
+                }
+            ));
         }
     }
 

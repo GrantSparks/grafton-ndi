@@ -66,7 +66,10 @@ fn encode_rows(
 fn encoding_error(error: jpeg_encoder::EncodingError) -> Error {
     match error {
         jpeg_encoder::EncodingError::IoError(error) => Error::Io(error),
-        error => Error::InvalidFrame(format!("JPEG encoding failed: {error}")),
+        error => Error::InvalidFrame(crate::FrameDefect::EncodingFailed {
+            codec: crate::ImageCodec::Jpeg,
+            diagnostic: error.to_string().into_boxed_str(),
+        }),
     }
 }
 

@@ -571,7 +571,15 @@ fn a_pq_tag_reaches_rgb_receivers_and_their_frames_are_refused() {
     assert_eq!(Some(info), p216.color_info().unwrap());
     assert!(info.is_hdr());
     match rgbx.encode_png() {
-        Err(Error::InvalidFrame(message)) => assert!(message.contains("PQ"), "{message}"),
+        Err(Error::InvalidFrame(message)) => assert!(
+            matches!(
+                message,
+                grafton_ndi::FrameDefect::HdrRefused {
+                    transfer: grafton_ndi::TransferFunction::Pq
+                }
+            ),
+            "{message}"
+        ),
         other => panic!("an RGB frame tagged PQ must be refused, got {other:?}"),
     }
 }

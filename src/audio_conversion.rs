@@ -61,10 +61,11 @@ impl AudioShape {
             .filter(|&channels| channels > 0 && len.is_multiple_of(channels))
             .and_then(|channels| u32::try_from(len / channels).ok())
             .filter(|&samples| samples > 0)
-            .ok_or_else(|| {
-                Error::InvalidFrame(format!(
-                    "interleaved audio has {len} samples, which is not a non-zero multiple of {num_channels} channels"
-                ))
+            .ok_or({
+                Error::InvalidFrame(crate::FrameDefect::InterleavedAudioLength {
+                    actual: len,
+                    channels: num_channels,
+                })
             })?;
         Self::new(sample_rate, num_channels, num_samples)
     }
@@ -80,10 +81,12 @@ impl AudioShape {
 
     fn check_output(self, length: usize) -> Result<()> {
         if length < self.0.sample_count() {
-            return Err(Error::InvalidFrame(format!(
-                "audio destination has {length} samples, requires {}",
-                self.0.sample_count()
-            )));
+            return Err(Error::InvalidFrame(
+                crate::FrameDefect::AudioDestinationLength {
+                    actual: length,
+                    minimum: self.0.sample_count(),
+                },
+            ));
         }
         Ok(())
     }
@@ -95,10 +98,7 @@ impl AudioShape {
             || frame.num_channels() != self.0.num_channels()
             || frame.num_samples() != self.0.num_samples()
         {
-            return Err(Error::InvalidFrame(
-                "planar destination rate, channels and samples must match the interleaved source"
-                    .into(),
-            ));
+            return Err(Error::InvalidFrame(crate::FrameDefect::PlanarAudioMismatch));
         }
         Ok(())
     }

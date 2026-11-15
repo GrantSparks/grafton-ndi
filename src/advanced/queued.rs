@@ -99,9 +99,7 @@ impl QueueOptions {
             || self.bytes == 0
             || self.bytes > isize::MAX as usize
         {
-            return Err(Error::InvalidInput(
-                "queue requires 1..=65536 frames and a positive addressable byte limit".into(),
-            ));
+            return Err(Error::InvalidInput(crate::InputDefect::QueueLimits));
         }
         Ok(self)
     }
@@ -205,7 +203,14 @@ impl QueuedVideoFrame {
     fn authorize_for_test(self, scatter: Option<&'static ScatterSend>) -> AuthorizedVideo {
         self.authorize_with(
             |frame| Ok(Sendable::for_test(frame)),
-            || scatter.ok_or_else(|| Error::InvalidInput("scatter table required by test".into())),
+            || {
+                scatter.ok_or(Error::UnsupportedCapability {
+                    feature: crate::RuntimeFeature::ScatterSend,
+                    refusal: crate::CapabilityRefusal::SymbolUnavailable(
+                        c"NDIlib_send_send_video_scatter",
+                    ),
+                })
+            },
         )
         .unwrap()
     }
@@ -363,10 +368,10 @@ const _: () = {
     assert_send_sync::<Entry>();
 };
 
-struct Admitted {
-    id: SubmissionId,
-    lent: Lent,
-    pointer: *const NDIlib_video_frame_v2_t,
+pub(crate) struct Admitted {
+    pub(crate) id: SubmissionId,
+    pub(crate) lent: Lent,
+    pub(crate) pointer: *const NDIlib_video_frame_v2_t,
 }
 
 /// The frames a queue holds. Each is in exactly one place: in flight until
@@ -429,7 +434,7 @@ impl State {
         }
         let Some(next) = self.next.checked_add(1) else {
             return Err(Rejected::new(
-                Error::InvalidInput("queue submission identifiers exhausted".into()),
+                Error::InvalidInput(crate::InputDefect::QueueIdentifiersExhausted),
                 frame.into_frame(),
             ));
         };
@@ -442,9 +447,7 @@ impl State {
             IndexEntry::Occupied(_) => {
                 protocol_error.store(true, Ordering::Release);
                 return Err(Rejected::new(
-                    Error::UnexpectedSdkResult(
-                        "native completion protocol failed; use QueuedSender::close to recover retained frames".into(),
-                    ),
+                    Error::UnexpectedSdkResult(crate::SdkResultDefect::UnknownCompletion),
                     frame.into_frame(),
                 ));
             }
@@ -522,7 +525,7 @@ impl State {
     }
 }
 
-struct CallbackState {
+pub(crate) struct CallbackState {
     // Immutable, so permanent admission failures need neither the state lock
     // nor a native descriptor allocation.
     max_bytes: usize,
@@ -532,6 +535,30 @@ struct CallbackState {
 }
 
 impl CallbackState {
+    /// Validate and retain one entry for this callback's owning sender.
+    pub(crate) fn prepare(
+        &self,
+        sender: &Sender<QueueAttached>,
+        frame: QueuedVideoFrame,
+    ) -> std::result::Result<Admitted, Rejected<QueuedVideoFrame>> {
+        let failure = Rejected::new;
+        let bytes = frame.retained_bytes();
+        let frame = frame.authorize(sender)?;
+        if let Err(error) = self.validate_frame_size(bytes) {
+            return Err(failure(error, frame.into_frame()));
+        }
+        if self.protocol_error.load(Ordering::Acquire) {
+            return Err(failure(
+                Error::UnexpectedSdkResult(crate::SdkResultDefect::UnknownCompletion),
+                frame.into_frame(),
+            ));
+        }
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.admit(frame, bytes, &self.protocol_error)
+        }
+    }
+
     #[cfg(any(test, ndi_has_advanced_send_completion))]
     fn new(options: QueueOptions) -> Result<Box<Self>> {
         let options = options.validate()?;
@@ -584,10 +611,12 @@ impl CallbackState {
 
     fn validate_frame_size(&self, bytes: usize) -> Result<()> {
         if bytes > self.max_bytes {
-            return Err(Error::InvalidInput(format!(
-                "frame retains {bytes} bytes of allocation capacity, exceeding the queue's {} byte limit",
-                self.max_bytes
-            )));
+            return Err(Error::InvalidInput(
+                crate::InputDefect::QueueFrameTooLarge {
+                    bytes,
+                    limit: self.max_bytes,
+                },
+            ));
         }
         Ok(())
     }
@@ -619,6 +648,9 @@ impl CallbackState {
         self.changed.notify_all();
     }
 }
+/// The callback storage paired with an exclusive queue sender.
+pub(crate) type QueueLoans = AliasableBox<CallbackState>;
+
 /// The completion callback the SDK calls, on its own threads, when it has
 /// finished with an asynchronously sent frame.
 #[cfg(any(test, ndi_has_advanced_send_completion))]
@@ -700,6 +732,15 @@ pub struct QueuedSender {
 }
 
 impl Loans for AliasableBox<CallbackState> {
+    type Recovered = Vec<CompletedVideo>;
+
+    fn recover(self, destroyed: &Destroyed) -> Vec<CompletedVideo> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take_retained(destroyed)
+    }
+
     fn release(self, destroyed: &Destroyed) {
         self.state
             .lock()
@@ -773,9 +814,7 @@ impl QueuedSender {
             match sender.into_attached() {
                 Ok((sender, earlier)) => Ok((Self::install(sender, callback, table), earlier)),
                 Err(sender) => Err(Rejected::new(
-                    Error::InvalidInput(
-                        "queued conversion requires a sender without advertiser registrations".into(),
-                    ),
+                    Error::InvalidInput(crate::InputDefect::QueuedSenderRegistered),
                     sender,
                 )),
             }
@@ -921,13 +960,7 @@ impl QueuedSender {
     /// every pending frame. Run this on a blocking thread when using an async
     /// executor. Only the returned collection is allocated.
     pub fn close(self) -> Vec<CompletedVideo> {
-        self.lending.close(|callback, destroyed| {
-            callback
-                .state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take_retained(destroyed)
-        })
+        self.lending.close()
     }
 }
 
@@ -951,38 +984,7 @@ impl QueuedVideo<'_> {
         &mut self,
         frame: impl Into<QueuedVideoFrame>,
     ) -> std::result::Result<SubmissionId, Rejected<QueuedVideoFrame>> {
-        let owner = self.pair.sender();
-        self.pair.with(|callback, sender| {
-            let frame = frame.into();
-            let failure = Rejected::new;
-            let bytes = frame.retained_bytes();
-            let frame = frame.authorize(owner)?;
-            if let Err(error) = callback.validate_frame_size(bytes) {
-                return Err(failure(error, frame.into_frame()));
-            }
-            if callback.protocol_error.load(Ordering::Acquire) {
-                return Err(failure(
-                    Error::UnexpectedSdkResult(
-                        "native completion protocol failed; use QueuedSender::close to recover retained frames".into(),
-                    ),
-                    frame.into_frame(),
-                ));
-            }
-            let admitted = {
-                let mut state = callback
-                    .state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                state.admit(frame, bytes, &callback.protocol_error)?
-            };
-            // The entry is recorded and the lock released before dispatch because
-            // the SDK may complete this submission before the native call returns.
-            // SAFETY: the live sender owns this queue; admission retained the stable
-            // descriptor and all pointees until native completion or destruction.
-            unsafe { admitted.lent.submit(sender, admitted.pointer) };
-            let id = admitted.id;
-            Ok(id)
-        })
+        self.pair.try_submit_queued(frame)
     }
 
     /// See [`QueuedSender::try_take_completed`].
@@ -1015,7 +1017,7 @@ impl QueuedVideo<'_> {
             }
             if self.pair.loans().protocol_error.load(Ordering::Acquire) {
                 return Err(Error::UnexpectedSdkResult(
-                    "native completion protocol failed; use QueuedSender::close to recover retained frames".into(),
+                    crate::SdkResultDefect::UnknownCompletion,
                 ));
             }
             let remaining = deadline.remaining();
@@ -1392,17 +1394,21 @@ mod tests {
     #[test]
     fn permanent_admission_check_needs_no_lock_or_descriptor() {
         let state = CallbackState::new(QueueOptions::default().max_bytes(4)).unwrap();
-        // An occupied lock cannot delay this check. The error's diagnostic
-        // String is its only allocation; there is no descriptor allocation.
+        // An occupied lock cannot delay this allocation-free refusal.
         let _locked = state.state.lock().unwrap();
         let (result, allocations) =
             crate::test_alloc::allocation_count(|| state.validate_frame_size(1024));
         let Error::InvalidInput(message) = result.unwrap_err() else {
             panic!("an oversized frame is not retryable");
         };
-        assert!(message.contains("1024"));
-        assert!(message.contains("4 byte limit"));
-        assert_eq!(allocations, 1);
+        assert_eq!(
+            message,
+            crate::InputDefect::QueueFrameTooLarge {
+                bytes: 1024,
+                limit: 4
+            }
+        );
+        assert_eq!(allocations, 0);
         let (result, allocations) =
             crate::test_alloc::allocation_count(|| state.validate_frame_size(4));
         result.unwrap();

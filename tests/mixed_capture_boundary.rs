@@ -214,7 +214,7 @@ fn exercise(library: std::path::PathBuf) {
     script(6, "error");
     assert!(matches!(
         receiver.capture_any(Duration::ZERO),
-        Err(Error::CaptureFailed(_))
+        Err(Error::ConnectionLost)
     ));
 
     script(7, "none");
@@ -283,7 +283,7 @@ fn exercise_async(ndi: &Ndi) {
         ));
         assert!(matches!(
             receiver.capture_any(Duration::ZERO).await,
-            Err(Error::CaptureFailed(_))
+            Err(Error::ConnectionLost)
         ));
         assert!(matches!(
             receiver.capture_any(Duration::MAX).await,
@@ -623,11 +623,11 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
         .is_none());
     assert!(matches!(
         receiver.video().capture_with(Duration::ZERO, |_| ()).await,
-        Err(Error::CaptureFailed(_))
+        Err(Error::ConnectionLost)
     ));
     assert!(matches!(
         receiver.capture_any_with(Duration::ZERO, |_| ()).await,
-        Err(Error::CaptureFailed(_))
+        Err(Error::ConnectionLost)
     ));
     let calls = captures();
     assert!(matches!(

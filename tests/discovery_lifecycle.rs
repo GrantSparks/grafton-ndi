@@ -59,11 +59,11 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
                 let Some(Error::InvalidInput(reason)) = error else {
                     panic!("{object}: expected null-creation refusal, got {error:?}");
                 };
-                assert!(
-                    reason.contains(&format!("the SDK created no {object}:")),
-                    "{reason}"
-                );
-                assert!(reason.contains(&format!("{SERVER:?}")), "{reason}");
+                let grafton_ndi::InputDefect::DiscoveryAddressRejected(detail) = reason else {
+                    panic!("{reason}")
+                };
+                assert_eq!(detail.object, object);
+                assert_eq!(&*detail.address, SERVER);
             }
             let log = fs::read_to_string(log_path).unwrap_or_default();
             assert!(

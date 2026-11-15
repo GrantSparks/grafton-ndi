@@ -119,7 +119,7 @@ fn test_video_frame_null_data_returns_error() {
         assert!(result.is_err());
         match result {
             Err(Error::InvalidFrame(msg)) => {
-                assert!(msg.contains("null data pointer"));
+                assert!(matches!(msg, crate::FrameDefect::NullVideoData));
             }
             _ => panic!("Expected InvalidFrame error"),
         }
@@ -145,7 +145,7 @@ fn test_video_frame_zero_size_returns_error() {
         assert!(result.is_err());
         match result {
             Err(Error::InvalidFrame(msg)) => {
-                assert!(msg.contains("invalid line_stride_in_bytes"));
+                assert!(matches!(msg, crate::FrameDefect::VideoSdkStride(_)));
             }
             _ => panic!("Expected InvalidFrame error"),
         }
@@ -207,8 +207,12 @@ fn test_audio_frame_builder_data_length_validation() {
     assert!(result.is_err());
     match result.map_err(crate::Rejected::into_error) {
         Err(Error::InvalidFrame(msg)) => {
-            assert!(msg.contains("Audio data length 3"));
-            assert!(msg.contains("expected 6"));
+            assert!(
+                matches!(&msg, crate::FrameDefect::AudioDataLength {detail} if detail.actual==3 && detail.expected==6)
+            );
+            assert!(
+                matches!(&msg, crate::FrameDefect::AudioDataLength {detail} if detail.expected==6)
+            );
         }
         _ => panic!("Expected InvalidFrame error"),
     }
@@ -224,8 +228,12 @@ fn test_audio_frame_builder_data_length_validation() {
     assert!(result.is_err());
     match result.map_err(crate::Rejected::into_error) {
         Err(Error::InvalidFrame(msg)) => {
-            assert!(msg.contains("Audio data length 10"));
-            assert!(msg.contains("expected 6"));
+            assert!(
+                matches!(&msg, crate::FrameDefect::AudioDataLength {detail} if detail.actual==10 && detail.expected==6)
+            );
+            assert!(
+                matches!(&msg, crate::FrameDefect::AudioDataLength {detail} if detail.expected==6)
+            );
         }
         _ => panic!("Expected InvalidFrame error"),
     }
@@ -776,7 +784,7 @@ fn test_video_frame_from_raw_unknown_format_returns_error() {
         assert!(result.is_err());
 
         if let Err(Error::InvalidFrame(msg)) = result {
-            assert!(msg.contains("Unknown pixel format FourCC"));
+            assert!(matches!(msg, crate::FrameDefect::UnknownPixelFormat { .. }));
         } else {
             panic!("Expected InvalidFrame error for unknown pixel format");
         }

@@ -17,8 +17,8 @@
 //! - `CaptureStrategy` privately connects each receiver kind to its slot of
 //!   the SDK capture call and its frame-type discriminant, and copies a
 //!   borrowed frame into an owned one. The capture itself is made only through
-//!   a [`CaptureLock`], the proof that the receiver's shared capture guard is
-//!   held, so no receiver capture can overlap a reconnect. [`capture_raw`]
+//!   a [`CaptureLock`], which fixes the receiver, runtime and remaining wait
+//!   after the mode's permissions have been checked. [`capture_raw`]
 //!   (one kind) and `capture_any` (a sealed set of all media slots or none)
 //!   both go through `Captured`. A delivered frame becomes a guard through
 //!   `Captured::take`, the one place a receiver guard is made. Mixed and
@@ -530,7 +530,7 @@ impl Notification {
     ///
     /// # Errors
     ///
-    /// [`Error::CaptureFailed`] for an error frame, which
+    /// [`Error::ConnectionLost`] for an error frame, which
     /// `Processing.NDI.Recv.h` documents as a lost connection.
     pub(crate) fn classify(frame_type: NDIlib_frame_type_e) -> Result<Self> {
         match frame_type {
@@ -545,9 +545,7 @@ impl Notification {
                 Ok(Self::SourceChanged)
             }
             sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_error => {
-                Err(Error::CaptureFailed(
-                    "the SDK returned an error frame: the connection was lost".into(),
-                ))
+                Err(Error::ConnectionLost)
             }
             value => Ok(Self::Unknown(value)),
         }
@@ -851,10 +849,7 @@ mod tests {
             assert_eq!(Notification::classify(frame_type).unwrap(), expected);
         }
         let error = Notification::classify(NDIlib_frame_type_e_NDIlib_frame_type_error);
-        assert!(
-            matches!(&error, Err(Error::CaptureFailed(reason)) if reason.contains("error frame")),
-            "{error:?}"
-        );
+        assert!(matches!(&error, Err(Error::ConnectionLost)), "{error:?}");
     }
 
     /// A single-kind capture is given no other slot: the SDK could fill one,

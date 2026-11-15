@@ -39,7 +39,7 @@ fn receive_marker(receiver: &Receiver, marker: u8, deadline: Instant, mut send: 
             Ok(Some(frame)) if frame.timecode() == Timecode::from_ticks(i64::from(marker)) => {
                 return
             }
-            Ok(_) | Err(Error::CaptureFailed(_)) => {}
+            Ok(_) | Err(Error::ConnectionLost) => {}
             Err(error) => panic!("capture failed: {error}"),
         }
         assert!(

@@ -103,8 +103,8 @@ Combined capture consumes pending and native receiver events. Typed capture
 retains events for `poll_event` or a combined reader. These consumers compete
 for coalesced invalidations; they receive neither broadcasts nor an ordered
 history. After `SourceChanged`, query `poll_source_name_change` for the connected
-name. The shared wait budget covers reconnect-lock contention and bounded
-native attempts. A queued frame may predate the current wait, and a timeout
+name. The shared wait budget covers bounded native attempts. Connection changes
+may run concurrently. A queued frame may predate the current wait, and a timeout
 alone does not prove disconnection or stale input.
 
 ## Publish sources
@@ -257,8 +257,8 @@ target again, replacing any remote routing.
 
 Enable `tokio` or `smol` and wrap the receiver in the corresponding
 `asynchronous::<runtime>::AsyncReceiver`. It runs blocking SDK work on workers.
-Capture/event timeouts start at the future's first poll and include queue and
-receiver-lock waits; processing can finish after that wait budget. Dropping a
+Capture/event timeouts start at the future's first poll and include worker queue
+delay and native waits; processing can finish after that wait budget. Dropping a
 future skips queued work and stops a started wait before its next attempt.
 The attempt already in flight can still consume a frame/event and execute its
 callback; each native wait lasts at most 100 ms.

@@ -69,6 +69,9 @@ pub(super) fn row_buffer<P: Sample>(width: usize, channels: usize) -> Vec<u8> {
 fn png_error(error: ::png::EncodingError) -> Error {
     match error {
         ::png::EncodingError::IoError(error) => Error::Io(error),
-        error => Error::InvalidFrame(format!("PNG encoding failed: {error}")),
+        error => Error::InvalidFrame(crate::FrameDefect::EncodingFailed {
+            codec: crate::ImageCodec::Png,
+            diagnostic: error.to_string().into_boxed_str(),
+        }),
     }
 }

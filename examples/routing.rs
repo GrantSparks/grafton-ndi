@@ -15,7 +15,7 @@
 
 use grafton_ndi::{
     routing::{Router, RouterOptions},
-    Error, Ndi,
+    Ndi,
 };
 
 use std::{env, thread, time::Duration};
@@ -28,15 +28,13 @@ use finder::finder_with_extra_ips;
 /// How long each source stays routed.
 const DWELL: Duration = Duration::from_secs(5);
 
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut name = String::from("Routing Example");
     let mut extra_ips = Vec::new();
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         if argument == "--name" {
-            name = arguments
-                .next()
-                .ok_or_else(|| Error::InvalidInput("--name needs a value".into()))?;
+            name = arguments.next().ok_or("--name needs a value")?;
         } else {
             extra_ips.push(argument);
         }
