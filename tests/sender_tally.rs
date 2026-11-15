@@ -106,7 +106,19 @@ fn concurrent_tally_pollers_cannot_take_a_waiters_change() {
             let finished = AtomicBool::new(false);
             thread::scope(|scope| {
                 let waiter = scope.spawn(|| {
-                    let result = sender.wait_for_tally_change(Duration::from_secs(2));
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let result = loop {
+                        let Some(remaining) = deadline.checked_duration_since(Instant::now())
+                        else {
+                            break Ok(None);
+                        };
+                        match sender.wait_for_tally_change(remaining) {
+                            // Publication is asynchronous; an earlier state can
+                            // still arrive before the requested change.
+                            Ok(Some(tally)) if tally != next => continue,
+                            result => break result,
+                        }
+                    };
                     finished.store(true, Ordering::Release);
                     result.unwrap()
                 });
