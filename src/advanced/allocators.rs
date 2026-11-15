@@ -253,9 +253,9 @@ impl AllocationRequest {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when the stride is smaller than requested, is
-    /// not one the frame's layout allows (an audio stride is a multiple of
-    /// four bytes; a 4:2:0 or UYVA video stride is even), the frame is
+    /// [`Error::InvalidInput`](crate::Error::InvalidInput) when the stride is
+    /// smaller than requested, is not one the frame's layout allows (an audio
+    /// stride is a multiple of four bytes; a 4:2:0 or UYVA video stride is even), the frame is
     /// compressed (it has no stride to change), or the buffer would exceed
     /// the [`capacity_limit`](Self::capacity_limit).
     pub fn with_stride_bytes(self, stride: usize) -> Result<Self> {
@@ -423,8 +423,8 @@ impl AllocationBuffer {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when the global allocator cannot supply that
-    /// much memory.
+    /// [`Error::InvalidInput`](crate::Error::InvalidInput) when the global
+    /// allocator cannot supply that much memory.
     pub fn zeroed(request: AllocationRequest) -> Result<Self> {
         Ok(Self {
             storage: AllocationStorage::Owned(OwnedStorage::zeroed(request.bytes)?),
@@ -437,9 +437,9 @@ impl AllocationBuffer {
     ///
     /// # Errors
     ///
-    /// Returns the memory with [`Error::InvalidInput`] when it is smaller than
-    /// the request's minimum, larger than its capacity limit, or not aligned
-    /// to 64 bytes, so that a pool gets its buffer back.
+    /// Returns the memory with [`Error::InvalidInput`](crate::Error::InvalidInput)
+    /// when it is smaller than the request's minimum, larger than its capacity
+    /// limit, or not aligned to 64 bytes, so that a pool gets its buffer back.
     pub fn from_external<S: ExternalAllocation>(
         request: AllocationRequest,
         storage: S,
@@ -1258,9 +1258,9 @@ impl AllocatedReceiver {
     ///
     /// # Errors
     ///
-    /// Returns the policy with [`Error::InvalidInput`] when the process already
-    /// has [`AllocatorLimits::max_generations`] policies. The current
-    /// allocator then stays in place.
+    /// Returns the policy with [`Error::InvalidInput`](crate::Error::InvalidInput)
+    /// when the process already has [`AllocatorLimits::max_generations`]
+    /// policies. The current allocator then stays in place.
     pub fn set_video_allocator<P: ReceiveAllocator>(
         &mut self,
         policy: P,
