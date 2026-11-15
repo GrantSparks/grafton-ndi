@@ -65,11 +65,11 @@ pub(super) fn encode(
     pixels: &mut Pixels<'_, u8>,
     quality: JpegQuality,
     dimensions: JpegDimensions,
+    density: Option<super::PixelDensity>,
     cache: &mut Vec<u8>,
     out: &mut dyn Write,
 ) -> Result<()> {
     let JpegDimensions { width, height } = dimensions;
-    let row_bytes = dimensions.shape().row_bytes;
     // Plan validation precedes this function, including metadata/HDR checks.
     // VideoPlane::data exposes only initialized contiguous active pixels;
     // padded native rows must stay on the row path. Both color types ignore
@@ -82,29 +82,44 @@ pub(super) fn encode(
                 } else {
                     jpeg_encoder::ColorType::Bgra
                 };
-                return jpeg_encoder::Encoder::new(out, quality.0)
+                return encoder(out, quality, density)
                     .encode(data, width, height, color)
                     .map_err(encoding_error);
             }
         }
     }
-    encode_rows(pixels, quality, width, height, row_bytes, cache, out)
+    encode_rows(pixels, quality, dimensions, density, cache, out)
 }
 
 fn encode_rows(
     pixels: &mut Pixels<'_, u8>,
     quality: JpegQuality,
-    width: u16,
-    height: u16,
-    row_bytes: usize,
+    dimensions: JpegDimensions,
+    density: Option<super::PixelDensity>,
     cache: &mut Vec<u8>,
     out: &mut dyn Write,
 ) -> Result<()> {
-    super::resize_scratch(cache, row_bytes)?;
+    let JpegDimensions { width, height } = dimensions;
+    super::resize_scratch(cache, dimensions.shape().row_bytes)?;
     let image = Rows::new(pixels, width, height, cache);
-    jpeg_encoder::Encoder::new(out, quality.0)
+    encoder(out, quality, density)
         .encode_image(image)
         .map_err(encoding_error)
+}
+
+fn encoder(
+    out: &mut dyn Write,
+    quality: JpegQuality,
+    density: Option<super::PixelDensity>,
+) -> jpeg_encoder::Encoder<&mut dyn Write> {
+    let mut encoder = jpeg_encoder::Encoder::new(out, quality.0);
+    if let Some(density) = density {
+        encoder.set_density(jpeg_encoder::PixelDensity {
+            density: (density.x, density.y),
+            unit: jpeg_encoder::PixelDensityUnit::PixelAspectRatio,
+        });
+    }
+    encoder
 }
 
 fn encoding_error(error: jpeg_encoder::EncodingError) -> Error {
@@ -307,9 +322,8 @@ mod tests {
                     encode_rows(
                         &mut plan.pixels::<u8>(),
                         JpegQuality::new(quality).unwrap(),
-                        width,
-                        3,
-                        plan.shape().row_bytes,
+                        JpegDimensions::new(width.into(), 3).unwrap(),
+                        None,
                         &mut Vec::new(),
                         &mut rows,
                     )

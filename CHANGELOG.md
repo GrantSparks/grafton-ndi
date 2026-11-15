@@ -142,6 +142,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Added
 
+- Image encoding preserves non-square picture aspect in PNG pHYs and JPEG JFIF
+  relative density tags; square-pixel output is unchanged. WebP remains untagged.
+
 - `AvSync::synchronize_ref` and `queued_audio_ref` lend matched SDK audio
   through `AvSyncOutcomeRef` and `AvSyncAudioRef`. Send and convert it in place,
   retain it with `to_owned`, or reuse owned storage with `copy_into`; owned

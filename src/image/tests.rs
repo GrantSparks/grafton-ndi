@@ -2964,3 +2964,99 @@ fn png_scratch_failure_precedes_every_output_byte() {
         }
     }
 }
+
+#[test]
+fn anamorphic_png_and_jpeg_tags_preserve_display_aspect() {
+    for (width, height) in [(720, 480), (18, 11)] {
+        for aspect in [4.0 / 3.0, 16.0 / 9.0] {
+            // Exercise direct packed RGB JPEG and incremental YUV JPEG.
+            for pixel_format in [PixelFormat::Rgba, PixelFormat::Uyvy] {
+                let frame = VideoFrame::builder()
+                    .resolution(width, height)
+                    .pixel_format(pixel_format)
+                    .picture_aspect_ratio(aspect)
+                    .build()
+                    .unwrap();
+                for reduction in [
+                    Downscale::Off,
+                    Downscale::Half,
+                    Downscale::Quarter,
+                    Downscale::Eighth,
+                ] {
+                    let shape = (
+                        super::reduced(width as usize, reduction.shift()),
+                        super::reduced(height as usize, reduction.shift()),
+                    );
+                    let expected = f64::from(aspect) * shape.1 as f64 / shape.0 as f64;
+                    let png = frame
+                        .encode_image(&options(ImageFormat::Png).downscale(reduction))
+                        .unwrap();
+                    let reader = ::png::Decoder::new(std::io::Cursor::new(&png))
+                        .read_info()
+                        .unwrap();
+                    let density = reader.info().pixel_dims.unwrap();
+                    assert_eq!(density.unit, ::png::Unit::Unspecified);
+                    let actual = f64::from(density.yppu) / f64::from(density.xppu);
+                    assert!(
+                        (actual / expected - 1.0).abs() < 0.001,
+                        "PNG {shape:?} {actual} {expected}"
+                    );
+                    let jpeg = frame
+                        .encode_image(&options(ImageFormat::Jpeg(85)).downscale(reduction))
+                        .unwrap();
+                    assert_eq!(&jpeg[6..11], b"JFIF\0");
+                    assert_eq!(jpeg[13], 0);
+                    let x = u16::from_be_bytes(jpeg[14..16].try_into().unwrap());
+                    let y = u16::from_be_bytes(jpeg[16..18].try_into().unwrap());
+                    let actual = f64::from(y) / f64::from(x);
+                    assert!(
+                        (actual / expected - 1.0).abs() < 0.001,
+                        "JPEG {shape:?} {actual} {expected}"
+                    );
+                    assert_eq!(decode_png(&png).width as usize, shape.0);
+                    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(jpeg));
+                    decoder.decode().unwrap();
+                    let info = decoder.info().unwrap();
+                    assert_eq!((usize::from(info.width), usize::from(info.height)), shape);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn square_pixel_encodes_stay_identical_and_extreme_aspects_remain_positive() {
+    for pixel_format in PixelFormat::ALL {
+        let base = VideoFrame::builder()
+            .resolution(18, 10)
+            .pixel_format(pixel_format)
+            .build()
+            .unwrap();
+        let mut explicit = base.clone();
+        explicit.set_picture_aspect_ratio(1.8).unwrap();
+        for reduction in [
+            Downscale::Off,
+            Downscale::Half,
+            Downscale::Quarter,
+            Downscale::Eighth,
+        ] {
+            for options in every_output() {
+                let options = options.downscale(reduction);
+                assert_eq!(
+                    base.encode_image(&options).unwrap(),
+                    explicit.encode_image(&options).unwrap()
+                );
+            }
+        }
+    }
+    for aspect in [f32::MIN_POSITIVE, f32::MAX] {
+        let frame = VideoFrame::builder()
+            .resolution(2, 2)
+            .picture_aspect_ratio(aspect)
+            .build()
+            .unwrap();
+        let source = Source::new(&frame);
+        let density = super::PixelDensity::for_source(&source, 1, 1).unwrap();
+        assert!(density.x > 0 && density.y > 0);
+    }
+}

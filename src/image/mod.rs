@@ -44,6 +44,7 @@ pub(crate) struct Source<'a> {
     height: usize,
     format: PixelFormat,
     planes: VideoPlanes<'a>,
+    aspect: crate::PictureAspectRatio,
     metadata: color_info::Metadata<'a>,
 }
 
@@ -55,6 +56,7 @@ impl<'a> Source<'a> {
             height: layout.height() as usize,
             format: layout.pixel_format(),
             planes: frame.plane_views(),
+            aspect: frame.header().picture_aspect_ratio(),
             metadata: frame.color_metadata(),
         }
     }
@@ -175,6 +177,7 @@ fn write_image(plan: Plan<'_>, out: &mut dyn Write, workspace: &mut ImageWorkspa
             shape,
             compression,
             cicp,
+            density,
         } => match shape.depth {
             SampleDepth::Eight => plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
                 png::encode(
@@ -182,6 +185,7 @@ fn write_image(plan: Plan<'_>, out: &mut dyn Write, workspace: &mut ImageWorkspa
                     shape,
                     compression,
                     cicp,
+                    density,
                     &mut out,
                     &mut workspace.row,
                 )
@@ -192,6 +196,7 @@ fn write_image(plan: Plan<'_>, out: &mut dyn Write, workspace: &mut ImageWorkspa
                     shape,
                     compression,
                     cicp,
+                    density,
                     &mut out,
                     &mut workspace.row,
                 )
@@ -200,8 +205,16 @@ fn write_image(plan: Plan<'_>, out: &mut dyn Write, workspace: &mut ImageWorkspa
         Codec::Jpeg {
             quality,
             dimensions,
+            density,
         } => plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
-            jpeg::encode(pixels, quality, dimensions, &mut workspace.row, &mut out)
+            jpeg::encode(
+                pixels,
+                quality,
+                dimensions,
+                density,
+                &mut workspace.row,
+                &mut out,
+            )
         }),
         Codec::WebpLossless { shape } => plan
             .with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
@@ -393,6 +406,46 @@ struct BufferedImageShape {
     image_bytes: usize,
 }
 
+/// Positive relative pixel densities. PNG and JFIF both store density, so
+/// physical pixel width/height is y/x. A common u16 bound keeps both outputs
+/// consistent; ratios outside its representable range use the nearest endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PixelDensity {
+    x: u16,
+    y: u16,
+}
+impl PixelDensity {
+    fn for_source(source: &Source<'_>, width: usize, height: usize) -> Option<Self> {
+        let aspect = f64::from(source.aspect.get());
+        // Zero explicitly requests square pixels. Explicit square-pixel ratios
+        // also stay untagged, including rounding from the SDK's f32 field.
+        let source_pixel_aspect = aspect * source.height as f64 / source.width as f64;
+        if aspect == 0.0 || (source_pixel_aspect - 1.0).abs() <= f64::from(f32::EPSILON) {
+            return None;
+        }
+        // Use the actual reduced shape: ceil division can change the stored
+        // width/height ratio when the final reduction block is partial.
+        let pixel_aspect = aspect * height as f64 / width as f64;
+        let maximum = f64::from(u16::MAX);
+        let (x, y) = if pixel_aspect >= 1.0 {
+            (
+                (maximum / pixel_aspect).round().clamp(1.0, maximum) as u16,
+                u16::MAX,
+            )
+        } else {
+            (
+                u16::MAX,
+                (maximum * pixel_aspect).round().clamp(1.0, maximum) as u16,
+            )
+        };
+        let (mut a, mut b) = (x, y);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        Some(Self { x: x / a, y: y / a })
+    }
+}
+
 /// The codec and its settings, valid for the frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Codec {
@@ -401,10 +454,12 @@ enum Codec {
         compression: PngCompression,
         /// The `cICP` chunk's primaries, transfer, matrix and range flag.
         cicp: Option<[u8; 4]>,
+        density: Option<PixelDensity>,
     },
     Jpeg {
         quality: jpeg::JpegQuality,
         dimensions: jpeg::JpegDimensions,
+        density: Option<PixelDensity>,
     },
     /// Dimensions within WebP's limit.
     WebpLossless { shape: BufferedImageShape },
@@ -504,15 +559,18 @@ impl<'a> Plan<'a> {
             )?,
         }
         let shape = ImageShape::new(width, height, channels, depth)?;
+        let density = PixelDensity::for_source(source, width, height);
         let codec = match format {
             ImageFormat::Png => Codec::Png {
                 shape,
                 compression: options.png_compression,
                 cicp: color.and_then(|color| cicp(&color)),
+                density,
             },
             ImageFormat::Jpeg(quality) => Codec::Jpeg {
                 quality: jpeg::JpegQuality::new(quality)?,
                 dimensions: jpeg::JpegDimensions::new(width, height)?,
+                density,
             },
             ImageFormat::WebpLossless => Codec::WebpLossless {
                 shape: shape.buffered()?,

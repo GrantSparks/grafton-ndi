@@ -42,6 +42,20 @@ applications, with an owned frame if the worker outlives the capture borrow.
 Bound active workers and pending snapshots. [Performance guidance](image-encoding-performance.md)
 explains the buffering choices and measurement boundaries.
 
+## Picture aspect
+
+PNG and JPEG carry a frame's non-square picture aspect in PNG pHYs and JPEG
+JFIF relative pixel-density tags. The tags preserve the displayed width/height
+ratio, including after downscaling with a partial final block. Encoders keep the
+stored pixel dimensions and samples; viewers that ignore the tags still display
+those dimensions. A zero aspect or an explicit square-pixel aspect stays
+untagged, with byte-identical output. WebP carries no pixel-shape tag; callers
+needing its display aspect retain `picture_aspect_ratio()` separately.
+
+Both density components are positive integers no larger than 65,535. Ordinary
+ratios are approximated to that precision; extreme ratios clamp to the nearest
+representable endpoint. No resampling to square pixels is performed.
+
 ## Formats
 
 All `PixelFormat` uncompressed variants are accepted; row padding is skipped.
