@@ -486,6 +486,12 @@ impl AllocationBuffer {
 /// including distinct policy-error and contained-panic counts.
 /// Invalid media layouts are declined before calling the policy, including
 /// planar audio requests above capture's 64 MiB frame limit.
+///
+/// A replaced policy is destroyed only after its replacement is installed.
+/// With no outstanding allocations or policy calls, the replacing call drops
+/// it. Otherwise the last call or allocation to release it does, possibly on
+/// an SDK thread inside a free callback. Its destructor must not wait for
+/// frames from that receiver.
 pub trait ReceiveAllocator: Send + Sync + 'static {
     /// Supply memory for one frame.
     ///
@@ -1205,8 +1211,8 @@ enum Stream {
 /// Setting an allocator replaces the previous one for frames allocated from
 /// then on. Frames allocated earlier stay in the memory the earlier policy
 /// supplied, and that policy is kept until the SDK has freed the last of
-/// them. A policy call that is still running when its policy is replaced is
-/// declined.
+/// them. Only a call of the earlier policy still running when the replacement
+/// is installed is declined.
 ///
 /// # Examples
 ///
@@ -1337,23 +1343,17 @@ impl<M: ReceiverMode> Allocation<M> {
     /// and retire the generation it replaces.
     #[cfg(ndi_has_advanced_receive_allocators)]
     fn install(&mut self, stream: Stream, token: Option<usize>) {
-        let registry = registry();
+        let instance = self.receiver().core.instance.0;
+        let table = self.table;
         let slot = match stream {
             Stream::Video => &mut self.video_token,
             Stream::Audio => &mut self.audio_token,
         };
-        let earlier = std::mem::replace(slot, token);
-        if let Some(earlier) = earlier {
-            // From here on a policy call that is still running cannot publish.
-            registry.closing(earlier);
-        }
         let opaque = token.map_or(std::ptr::null_mut(), |token| token as *mut c_void);
-        let instance = self.receiver().core.instance.0;
-        let table = self.table;
         // SAFETY: the receiver is live. The callbacks are functions of this
         // program, which stays loaded, and the opaque value is a token they
         // look up, never a pointer they follow.
-        unsafe {
+        install_with(registry(), slot, token, || unsafe {
             match stream {
                 Stream::Video => table.NDIlib_recv_set_video_allocator(
                     instance,
@@ -1368,7 +1368,7 @@ impl<M: ReceiverMode> Allocation<M> {
                     token.map(|_| audio_free as _),
                 ),
             }
-        }
+        });
     }
 
     // A build without this declaration family cannot create an Allocation.
@@ -1396,6 +1396,23 @@ impl<M: ReceiverMode> Drop for Allocation<M> {
         if self.receiver.is_some() {
             self.reset();
         }
+    }
+}
+
+/// Install the native pair before retiring its predecessor. The setter may
+/// still call the earlier policy; its allocations remain admitted until the
+/// pair has been replaced. Retirement then prevents unfinished calls from
+/// publishing and can destroy a policy only after the SDK has moved on.
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
+fn install_with(
+    registry: &Registry,
+    slot: &mut Option<usize>,
+    token: Option<usize>,
+    set: impl FnOnce(),
+) {
+    set();
+    if let Some(earlier) = std::mem::replace(slot, token) {
+        registry.closing(earlier);
     }
 }
 
@@ -2707,6 +2724,96 @@ mod tests {
         assert_eq!(registry.generations.load(Ordering::Acquire), 1);
         registry.closing(second);
         assert_eq!(registry.generations.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn replacement_is_installed_before_the_earlier_policy_is_destroyed() {
+        struct ObserveDrop {
+            setter_calls: Arc<AtomicUsize>,
+            observed: Arc<AtomicUsize>,
+        }
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                self.observed
+                    .store(self.setter_calls.load(Ordering::Acquire), Ordering::Release);
+            }
+        }
+
+        // Resetting to SDK memory uses the same ordering as replacement.
+        for reset in [false, true] {
+            let registry = Registry::new(limits()).unwrap();
+            let setter_calls = Arc::new(AtomicUsize::new(1));
+            let observed = Arc::new(AtomicUsize::new(0));
+            let observer = ObserveDrop {
+                setter_calls: setter_calls.clone(),
+                observed: observed.clone(),
+            };
+            let earlier = registry
+                .register(move |request| {
+                    let _ = &observer;
+                    AllocationBuffer::zeroed(request)
+                })
+                .unwrap();
+            let replacement =
+                (!reset).then(|| registry.register(AllocationBuffer::zeroed).unwrap());
+            let mut slot = Some(earlier);
+            install_with(&registry, &mut slot, replacement, || {
+                setter_calls.fetch_add(1, Ordering::AcqRel);
+                assert_eq!(observed.load(Ordering::Acquire), 0);
+            });
+            assert_eq!(slot, replacement);
+            assert_eq!(observed.load(Ordering::Acquire), 2);
+            if let Some(replacement) = replacement {
+                registry.closing(replacement);
+            }
+        }
+    }
+
+    #[test]
+    fn setter_allocations_publish_but_calls_still_running_at_retirement_do_not() {
+        let registry = Registry::new(limits()).unwrap();
+        let gate = Arc::new(Gate::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let earlier = registry
+            .register({
+                let gate = gate.clone();
+                move |request| {
+                    if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        gate.enter();
+                    }
+                    AllocationBuffer::zeroed(request)
+                }
+            })
+            .unwrap();
+        let replacement = registry.register(AllocationBuffer::zeroed).unwrap();
+        let mut slot = Some(earlier);
+        std::thread::scope(|scope| {
+            let unfinished = scope.spawn(|| registry.allocate(earlier, request()).is_some());
+            assert!(gate.wait_for(1));
+            let mut published = None;
+            let setter_calls = AtomicUsize::new(0);
+            install_with(&registry, &mut slot, Some(replacement), || {
+                setter_calls.fetch_add(1, Ordering::AcqRel);
+                // The native setter has run, but still has the earlier
+                // callbacks available until it returns.
+                published = registry.allocate(earlier, request());
+                assert!(published.is_some());
+            });
+            assert_eq!(setter_calls.load(Ordering::Acquire), 1);
+            assert_eq!(slot, Some(replacement));
+            assert_eq!(registry.usage().active_generations(), 1);
+            gate.open();
+            assert!(!unfinished.join().unwrap());
+            assert_eq!(
+                registry
+                    .usage()
+                    .declined(AllocationDecline::GenerationUnavailable),
+                1
+            );
+            assert!(registry.free(earlier, published.unwrap().0.as_ptr()));
+        });
+        registry.closing(replacement);
+        assert_eq!(registry.usage().generations(), 0);
     }
 
     #[test]

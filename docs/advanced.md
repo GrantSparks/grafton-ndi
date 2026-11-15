@@ -179,7 +179,12 @@ callback pointers. Applications that do not opt in keep ordinary lifetimes.
 Attach an ordinary or packet receiver, then install video/audio allocation
 policies. Policies execute on SDK threads, potentially concurrently; return
 quickly. An error or contained panic declines the allocation. Replacing a policy
-keeps the old one alive until the SDK releases its outstanding buffers.
+installs the replacement before retiring the old policy, so allocations begun
+by the setter can still use it. Only calls of the old policy still running
+when it is retired are declined. Outstanding buffers keep the old policy
+alive until the SDK releases them. Its destructor runs in the replacing call
+when nothing is outstanding, otherwise in the last releasing call or free
+callback, possibly on an SDK thread. It must not wait for that receiver's frames.
 Process-wide `AllocatorLimits` include those older allocations and are fixed by
 the first service; later services must request identical limits. Use `usage()`
 to inspect retained allocations and decline counters. `declined_allocations()`

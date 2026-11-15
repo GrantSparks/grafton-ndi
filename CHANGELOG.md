@@ -308,6 +308,9 @@ linkage and Rust 1.88 baseline.
 
 ### Fixed
 
+- Receive allocator replacement installs the new native callbacks before
+  retiring the old policy, avoiding dropped frames while the setter runs or
+  the old policy's destructor blocks.
 - FrameSync audio reports no timestamp when the synchronizer supplies its
   zero marker for unknown source timing, including in owned copies.
 
