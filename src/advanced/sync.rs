@@ -501,7 +501,9 @@ impl AvSync {
     /// Fetch whatever audio is currently queued, matched to no video frame.
     ///
     /// With [`AvSyncRequest::automatic`] this takes all the queued audio;
-    /// with a sample count, that many samples. Otherwise as for
+    /// with a sample count, it requests that many samples. Inspect the returned
+    /// frame's sample count: a depleted queue can return a shorter tail even
+    /// when the SDK does not report `samples_adjusted`. Otherwise as for
     /// [`synchronize`](Self::synchronize).
     ///
     /// # Errors

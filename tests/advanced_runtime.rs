@@ -2464,7 +2464,32 @@ fn synchronized_audio(
         let outcome = match pass {
             Pass::Captured => sync.synchronize(stamped(&video), request),
             Pass::Owned => sync.synchronize(stamped(&video.to_owned()), request),
-            Pass::Nothing => sync.queued_audio(request),
+            Pass::Nothing => {
+                if request.num_samples().is_some() {
+                    // A captured video can arrive before its audio, and the
+                    // preceding synchronization can leave only a short tail.
+                    // Establish enough queued input before testing an exact
+                    // queued read, rather than depending on packet arrival.
+                    drop(sync.queued_audio(AvSyncRequest::automatic()).unwrap());
+                    let received = sync
+                        .receiver()
+                        .connection_stats()
+                        .unwrap()
+                        .audio_frames_received();
+                    while sync
+                        .receiver()
+                        .connection_stats()
+                        .unwrap()
+                        .audio_frames_received()
+                        .saturating_sub(received)
+                        < 2
+                    {
+                        assert!(Instant::now() < deadline, "audio did not reach the queue");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                sync.queued_audio(request)
+            }
         };
         match outcome.unwrap() {
             AvSyncOutcome::Audio {
