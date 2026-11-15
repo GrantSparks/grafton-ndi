@@ -96,6 +96,7 @@ fn crate_root_types_keep_their_auto_traits() {
         FormatCategory: Send, Sync, UnwindSafe, RefUnwindSafe;
         FourCc: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameRate: Send, Sync, UnwindSafe, RefUnwindSafe;
+        LayoutDefect: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameMetadataStatus: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameSync: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameSyncAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -108,6 +109,7 @@ fn crate_root_types_keep_their_auto_traits() {
         MetadataFrameRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         MetadataKind: Send, Sync, UnwindSafe, RefUnwindSafe;
         Ndi: Send, Sync, UnwindSafe, RefUnwindSafe;
+        NativeFunction: Send, Sync, UnwindSafe, RefUnwindSafe;
         PixelFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         PixelFormatInfo: Send, Sync, UnwindSafe, RefUnwindSafe;
         ProcessLifetimeRuntime: Send, Sync, UnwindSafe, RefUnwindSafe;
