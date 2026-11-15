@@ -97,11 +97,11 @@ fn cancelling_a_close_releases_executor_state_before_pruning_replies() {
     let control = Arc::new(Control::new());
     let weak = Arc::downgrade(&control);
     let (waker, released) = drop_probe(move || weak.upgrade().unwrap().closing.try_lock().is_ok());
-    let mut future = FileOperation::live(control.request_close_now());
+    let mut future = FileOperation::live(control.request_close_now(|| {}));
     assert!(poll(&mut future, &waker).is_pending());
     drop(waker);
     drop(future);
-    let _next = FileOperation::live(control.request_close_now());
+    let _next = FileOperation::live(control.request_close_now(|| {}));
     assert_released_unlocked(released);
 }
 
@@ -498,6 +498,6 @@ fn owners_whose_callbacks_release_each_others_last_handles_do_not_join_in_a_cycl
         .recv_timeout(Duration::from_secs(1))
         .unwrap();
     block_on(sending).unwrap();
-    block_on(first_control.request_close()).unwrap();
-    block_on(second_control.request_close()).unwrap();
+    block_on(first_control.request_close(|| {})).unwrap();
+    block_on(second_control.request_close(|| {})).unwrap();
 }

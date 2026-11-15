@@ -944,12 +944,12 @@ impl Control {
     /// Ask the owner thread to end, and complete once it has destroyed its
     /// object. Every close, including one made while another is awaited,
     /// completes then.
-    fn request_close(self: &Arc<Self>) -> FileOperation<()> {
+    fn request_close(self: &Arc<Self>, wake: impl FnOnce() + Send + 'static) -> FileOperation<()> {
         let control = Arc::clone(self);
-        FileOperation::deferred(move || control.request_close_now())
+        FileOperation::deferred(move || control.request_close_now(wake))
     }
 
-    fn request_close_now(&self) -> Live<()> {
+    fn request_close_now(&self, wake: impl FnOnce()) -> Live<()> {
         let (reply, future) = operation();
         {
             let mut closing = lock(&self.closing);
@@ -965,7 +965,9 @@ impl Control {
             replies.retain(|reply| !reply.shared.cancelled.load(Ordering::Acquire));
             replies.push(reply);
         }
-        self.request_shutdown();
+        if !self.request_shutdown() {
+            wake();
+        }
         future
     }
 
@@ -1344,6 +1346,11 @@ impl<H: Owner> Drop for Worker<H> {
         // A handle still in its creation response cannot be closed by the
         // caller, so cancellation only requests shutdown and detaches.
         let closing = self.control.request_shutdown();
+        if !closing {
+            // Wake the channel wait without taking an admission place. The
+            // published request remains authoritative if the owner is busy.
+            let _ = self.sender.send(Box::new(|_| {}));
+        }
         let Some(thread) = self.thread.take() else {
             return;
         };
@@ -1461,6 +1468,15 @@ impl<H: Owner> Worker<H> {
     ) -> FileOperation<T> {
         self.submit(false, work)
     }
+
+    fn close(&self) -> FileOperation<()> {
+        let sender = self.sender.clone();
+        self.control.request_close(move || {
+            // This no-op wake bypasses queue admission, so even a full queue
+            // cannot delay shutdown until the next tick.
+            let _ = sender.send(Box::new(|_| {}));
+        })
+    }
 }
 
 /// The shared async-handle implementation lives on the existing worker:
@@ -1504,10 +1520,6 @@ impl<H: HandleOwner> Worker<H> {
 
     fn source_format(&self) -> FileOperation<Option<SourceFormat>> {
         self.call(|owner| owner.source_format())
-    }
-
-    fn close(&self) -> FileOperation<()> {
-        self.control.request_close()
     }
 }
 
@@ -2296,6 +2308,49 @@ mod tests {
     }
 
     #[test]
+    fn close_and_last_handle_drop_wake_the_owner_during_its_command_wait() {
+        for closing in [false, true] {
+            let (sender, receiver) = mpsc::channel();
+            let control = Arc::new(Control::new());
+            let events = Arc::new(EventQueue::new(1));
+            let worker = Arc::new(Worker::<BurstOwner> {
+                sender,
+                admission: Arc::new(Admission::new(1)),
+                control: Arc::clone(&control),
+                events: Arc::clone(&events),
+                thread: OnceLock::new(),
+            });
+            let (entered, waiting) = mpsc::channel();
+            thread::scope(|scope| {
+                scope.spawn(move || {
+                    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+                    if closing {
+                        block_on(worker.close()).unwrap();
+                    } else {
+                        drop(worker);
+                    }
+                });
+                let mut owner = BurstOwner {
+                    remaining: 0,
+                    polls: 0,
+                    fail: false,
+                };
+                run_owner_wait(&mut owner, &control, &events, |wait, _| {
+                    assert!(wait);
+                    entered.send(()).unwrap();
+                    // The long bound is a test deadlock guard. Success requires
+                    // receiving a message, never expiring a scheduling interval.
+                    let message = receiver.recv_timeout(Duration::from_secs(5));
+                    assert!(message.is_ok(), "shutdown published no channel wake");
+                    message
+                });
+                assert!(control.shutdown_requested());
+                control.exit(OwnerExit::Closed, &events);
+            });
+        }
+    }
+
+    #[test]
     fn event_idle_and_error_paths_wait_and_shutdown_ends_continuous_bursts() {
         for fail in [false, true] {
             let mut owner = BurstOwner {
@@ -2551,7 +2606,7 @@ mod tests {
         owner_failed(block_on(failing));
         woken.recv_timeout(Duration::from_secs(1)).unwrap();
         dropped.recv_timeout(Duration::from_secs(1)).unwrap();
-        owner_failed(block_on(worker.control.request_close()));
+        owner_failed(block_on(worker.control.request_close(|| {})));
     }
 
     #[test]
@@ -2661,7 +2716,7 @@ mod tests {
         let (worker, dropped) = local_worker();
         let created = block_on(worker.call(|owner| Ok(owner.created))).unwrap();
         assert_ne!(created, thread::current().id());
-        block_on(worker.control.request_close()).unwrap();
+        block_on(worker.control.request_close(|| {})).unwrap();
         assert_eq!(
             dropped.recv_timeout(Duration::from_secs(1)).unwrap(),
             created
@@ -2903,7 +2958,7 @@ mod tests {
             dropped.recv_timeout(Duration::from_secs(1)).unwrap(),
             created
         );
-        owner_failed(block_on(worker.control.request_close()));
+        owner_failed(block_on(worker.control.request_close(|| {})));
         owner_failed(block_on(worker.call(|_| Ok(()))));
         owner_failed(block_on(worker.submit(true, |_| Ok(()))));
         owner_failed(block_on(worker.events.wait(Duration::from_millis(10))));
@@ -2913,13 +2968,13 @@ mod tests {
     fn ordinary_close_reports_closed_to_later_operations_and_waits() {
         let (worker, dropped) = local_worker();
         let pending_wait = worker.events.wait(Duration::from_secs(30));
-        block_on(worker.control.request_close()).unwrap();
+        block_on(worker.control.request_close(|| {})).unwrap();
         dropped.recv_timeout(Duration::from_secs(1)).unwrap();
         closed(block_on(worker.call(|_| Ok(()))));
         closed(block_on(worker.submit(true, |_| Ok(()))));
         closed(block_on(pending_wait));
         closed(block_on(worker.events.wait(Duration::from_millis(10))));
-        block_on(worker.control.request_close()).unwrap();
+        block_on(worker.control.request_close(|| {})).unwrap();
     }
 
     /// A blocked destructor makes joining observable without timing how long
@@ -3879,7 +3934,7 @@ mod tests {
             let events = Arc::new(EventQueue::<()>::new(1));
             let (mut reply, command) = operation::<()>();
             reply.owner = Some(Arc::clone(&control));
-            let closing = control.request_close().submit();
+            let closing = control.request_close(|| {}).submit();
             control.exit(outcome, &events);
             drop(reply);
             for result in [
@@ -3895,7 +3950,7 @@ mod tests {
                     }
                 ));
             }
-            for result in [block_on(closing), block_on(control.request_close())] {
+            for result in [block_on(closing), block_on(control.request_close(|| {}))] {
                 if outcome == OwnerExit::Failed {
                     assert!(matches!(
                         result,
@@ -3920,8 +3975,9 @@ mod tests {
                         let barrier = Arc::clone(&barrier);
                         scope.spawn(move || {
                             barrier.wait();
-                            let closes: Vec<_> =
-                                (0..8).map(|_| control.request_close().submit()).collect();
+                            let closes: Vec<_> = (0..8)
+                                .map(|_| control.request_close(|| {}).submit())
+                                .collect();
                             for close in closes {
                                 let result = block_on(close);
                                 assert_eq!(result.is_ok(), outcome == OwnerExit::Closed);
@@ -4410,6 +4466,26 @@ mod tests {
     }
 
     #[test]
+    fn close_bypasses_a_full_command_queue_and_its_reserved_stop() {
+        let (device, recorder) =
+            mock_recorder_with(Closing::AtStop, AsyncFileOptions::new().command_capacity(1));
+        let (blocked, release) = block_owner(&recorder.worker);
+        let queued = recorder.is_recording().submit();
+        let stopping = recorder.request_stop().submit();
+        assert_eq!(recorder.worker.admission.state.load(Ordering::Acquire), 3);
+        let closing = recorder.close().submit();
+        assert_eq!(recorder.worker.admission.state.load(Ordering::Acquire), 3);
+        assert!(!closing.is_completed());
+        release.send(()).unwrap();
+        block_on(blocked).unwrap();
+        block_on(closing).unwrap();
+        closed(block_on(queued));
+        closed(block_on(stopping));
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
     fn a_stop_is_carried_out_even_when_the_command_queue_is_full() {
         let options = AsyncFileOptions::new().command_capacity(1);
         let (device, recorder) = mock_recorder_with(Closing::AtStop, options);
@@ -4841,7 +4917,7 @@ mod tests {
     fn closing_wakes_pending_event_future_and_rejects_new_commands() {
         let (worker, dropped) = local_worker();
         let event = worker.events.wait(Duration::from_secs(3));
-        block_on(worker.control.request_close()).unwrap();
+        block_on(worker.control.request_close(|| {})).unwrap();
         assert!(matches!(
             block_on(event),
             Err(Error::InvalidState(StateError::Closed))
