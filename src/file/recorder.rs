@@ -1238,7 +1238,11 @@ impl FileRecorder {
         waiters.register(self, deadline, LocalFinish(&result));
         let mut budget = DrainBudget::new(deadline);
         loop {
-            // Final reports do not need another native call.
+            // A synchronous caller already has this final ledger. Preserve
+            // its queued events for poll_event rather than draining again.
+            if let Some(outcome) = self.settle_wait(false, false) {
+                return Ok(outcome);
+            }
             waiters.settle_at(
                 self,
                 Settlement {

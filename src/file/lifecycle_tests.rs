@@ -730,6 +730,27 @@ fn the_source_can_be_changed_after_a_session_that_ended_unconfirmed() {
 }
 
 #[test]
+fn waiting_on_a_final_report_preserves_queued_out_of_session_events() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    let mut recorder = recording_on(&device);
+    assert!(matches!(
+        recorder.finish(Duration::ZERO).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    device.push(mock::OPEN_FAILED, "later.mkv");
+    let before = device.captures.load(Ordering::Acquire);
+    assert!(matches!(
+        recorder.wait_finished(Duration::ZERO).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    assert_eq!(device.captures.load(Ordering::Acquire), before);
+    assert_eq!(
+        recorder.poll_event(Duration::ZERO).unwrap().unwrap().kind(),
+        RecorderEventKind::OpenFailed
+    );
+}
+
+#[test]
 fn finishing_without_a_wait_reports_a_close_the_stop_already_queued() {
     let device = mock::Recorder::new(Closing::AtStop);
     let mut recorder = recording_on(&device);
