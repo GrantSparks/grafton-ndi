@@ -164,19 +164,29 @@ struct AvResource {
     )]
     receiver: Arc<ReceiverCore>,
     #[cfg(ndi_has_advanced_av_sync)]
-    handle: AvSyncHandle,
+    handle: AvSyncInstance,
     table: &'static AvSyncTable,
 }
+
+#[cfg(ndi_has_advanced_av_sync)]
+#[derive(Clone, Copy)]
+struct AvSyncInstance(AvSyncHandle);
 
 // SAFETY: a synchronizer belongs to no thread. Processing.NDI.AVSync.h and the
 // Advanced SDK manual (25.6.2) have it created from a receiver, used for as
 // long as it is needed and destroyed before that receiver, and state no
 // thread for any of its functions. Moving the handle changes only which
-// thread makes those calls: this resource retains the receiver core it reads
-// through destruction, and AvSync is not Sync, so its calls never overlap. `an_avsync_moves_between_threads` in
-// tests/advanced_runtime.rs creates, synchronizes and destroys one on three
-// threads against each runtime the tests use.
-unsafe impl Send for AvResource {}
+// thread makes those calls. AvResource retains the receiver core through
+// destruction, and AvSync is not Sync, so its calls never overlap.
+// `an_avsync_moves_between_threads` in tests/advanced_runtime.rs creates,
+// synchronizes and destroys one on three threads against each runtime used.
+#[cfg(ndi_has_advanced_av_sync)]
+unsafe impl Send for AvSyncInstance {}
+
+const _: () = {
+    const fn send<T: Send>() {}
+    send::<AvResource>();
+};
 
 impl Drop for AvResource {
     fn drop(&mut self) {
@@ -184,7 +194,7 @@ impl Drop for AvResource {
         // while this resource still owns the receiver it reads.
         native!(AvSync, self.table => {
             // SAFETY: this resource retains the receiver through destruction.
-            unsafe { self.table.NDIlib_avsync_destroy(self.handle) };
+            unsafe { self.table.NDIlib_avsync_destroy(self.handle.0) };
             #[cfg(test)]
             crate::receiver::lifecycle_test_events::record("avsync");
         });
@@ -254,8 +264,9 @@ pub struct AvSync {
     // `synchronize` takes `&self`, so withholding Sync keeps two
     // synchronizations of one synchronizer from running at once, which
     // neither Processing.NDI.AVSync.h nor the Advanced SDK manual (25.6)
-    // documents as safe. The raw handle already withholds Sync; this states
-    // it. Send comes from the fields.
+    // documents as safe. AvSyncInstance withholds Sync when its native
+    // handle is present; this also states it without Advanced declarations.
+    // Send comes from the fields.
     _not_sync: NotSync,
 }
 
@@ -293,7 +304,7 @@ impl AvSync {
                 ));
             }
             Ok(Self {
-                resource: AvResource { handle, table, receiver: Arc::clone(&receiver.core) },
+                resource: AvResource { handle: AvSyncInstance(handle), table, receiver: Arc::clone(&receiver.core) },
                 receiver: receiver.into_mode(),
                 _not_sync: NotSync(PhantomData),
             })
@@ -480,7 +491,7 @@ impl AvSyncCapture<'_> {
                 release: |audio: &mut NDIlib_audio_frame_v3_t| {
                     // SAFETY: the synchronizer that filled the descriptor is live,
                     // and the descriptor is returned to it exactly once.
-                    native!(AvSync, table => unsafe { table.NDIlib_avsync_free_audio(handle, audio) })
+                    native!(AvSync, table => unsafe { table.NDIlib_avsync_free_audio(handle.0, audio) })
                 },
             };
             let status = {
@@ -514,7 +525,7 @@ impl AvSyncCapture<'_> {
                 // synchronizer is treated the same way.
                 let code = unsafe {
                     table.NDIlib_avsync_synchronize(
-                        handle,
+                        handle.0,
                         video.as_ref().map_or(ptr::null(), |video| video),
                         &mut returned.audio,
                     )
@@ -766,12 +777,16 @@ impl ClockSource {
 /// A native genlock, destroyed when dropped.
 struct GenResource {
     #[cfg(ndi_has_advanced_genlock)]
-    handle: GenlockHandle,
+    handle: GenlockInstance,
     table: &'static GenlockTable,
     _ndi: Ndi,
     _source: Option<Box<RawSource>>,
     _config: Option<AdvancedConfig>,
 }
+
+#[cfg(ndi_has_advanced_genlock)]
+#[derive(Clone, Copy)]
+struct GenlockInstance(GenlockHandle);
 
 // SAFETY: a genlock belongs to no thread. Processing.NDI.Genlock.h and the
 // Advanced SDK manual (25.5) state no thread for creating, connecting,
@@ -780,12 +795,13 @@ struct GenResource {
 // Linux x86_64 runtimes, `NDIlib_genlock_connect` hands the source to
 // `NDIlib_recv_connect` on a receiver the genlock owns, a receiver operation
 // that this crate already makes from any thread. Moving the handle changes
-// only which thread makes the calls: the runtime handle it keeps is Send, a
+// only which thread makes the calls. GenResource retains its runtime, a
 // `Genlock` is not Sync, and connecting and destroying take it exclusively,
 // so neither overlaps a wait or a query. `a_genlock_moves_between_threads` in
 // tests/advanced_runtime.rs creates, connects, waits on and destroys one on
 // five threads against each runtime the tests use.
-unsafe impl Send for GenResource {}
+#[cfg(ndi_has_advanced_genlock)]
+unsafe impl Send for GenlockInstance {}
 
 // SAFETY: the SDK allows the video wait and the audio wait to run on separate
 // threads at the same time. Those are the only operations that reach this
@@ -793,13 +809,19 @@ unsafe impl Send for GenResource {}
 // clocks exist they borrow the genlock exclusively, so neither `is_active`,
 // reached through a `Genlock`, which is not Sync, nor connecting or
 // destroying overlaps them.
-unsafe impl Sync for GenResource {}
+#[cfg(ndi_has_advanced_genlock)]
+unsafe impl Sync for GenlockInstance {}
+
+const _: () = {
+    const fn send_and_sync<T: Send + Sync>() {}
+    send_and_sync::<GenResource>();
+};
 
 impl Drop for GenResource {
     fn drop(&mut self) {
         // SAFETY: the handle was created by this table and is destroyed once.
         // This resource still owns the source descriptor and configuration here.
-        native!(Genlock, self.table => unsafe { self.table.NDIlib_genlock_destroy(self.handle) });
+        native!(Genlock, self.table => unsafe { self.table.NDIlib_genlock_destroy(self.handle.0) });
     }
 }
 
@@ -883,7 +905,7 @@ impl Genlock {
             }
             Ok(Self {
                 resource: GenResource {
-                    handle,
+                    handle: GenlockInstance(handle),
                     table,
                     _ndi: ndi.clone(),
                     _source: source,
@@ -911,7 +933,7 @@ impl Genlock {
             // descriptor is stored below before the earlier one is released.
             unsafe {
                 table.NDIlib_genlock_connect(
-                    handle,
+                    handle.0,
                     _source.as_ref().map_or(ptr::null(), |source| source.as_raw()),
                 )
             };
@@ -924,7 +946,7 @@ impl Genlock {
     pub fn is_active(&self) -> bool {
         // SAFETY: the genlock is live for this borrow.
         native!(Genlock, self.resource.table => unsafe {
-            self.resource.table.NDIlib_genlock_is_active(self.resource.handle)
+            self.resource.table.NDIlib_genlock_is_active(self.resource.handle.0)
         })
     }
 
@@ -963,7 +985,7 @@ impl VideoClock<'_> {
             // SAFETY: the genlock outlives this clock, and only this clock waits
             // for video.
             ClockSource::from_active(unsafe {
-                table.NDIlib_genlock_wait_video(handle, &timing)
+                table.NDIlib_genlock_wait_video(handle.0, &timing)
             })
         })
     }
@@ -991,7 +1013,7 @@ impl AudioClock<'_> {
             // SAFETY: the genlock outlives this clock, and only this clock waits
             // for audio.
             Ok(ClockSource::from_active(unsafe {
-                table.NDIlib_genlock_wait_audio(handle, &_timing)
+                table.NDIlib_genlock_wait_audio(handle.0, &_timing)
             }))
         })
     }

@@ -44,19 +44,32 @@ mod scatter_completion_tests;
 struct ScatterStorage {
     blocks: Box<[AliasableVec<u8>]>,
     #[cfg(any(test, ndi_has_advanced_scatter_send))]
-    pointers: AliasableBox<[*const u8]>,
+    pointers: BlockPointers,
     #[cfg(any(test, ndi_has_advanced_scatter_send))]
     sizes: AliasableBox<[i32]>,
     total: usize,
 }
 
-// SAFETY: every pointer in `pointers` refers to a block this value owns, and
-// moving the value moves none of its allocations.
-unsafe impl Send for ScatterStorage {}
-// SAFETY: a shared reference reads the blocks and never follows the stored
-// pointers. They are followed only by the SDK, which is given them through
-// `descriptor`, and that takes the storage exclusively.
-unsafe impl Sync for ScatterStorage {}
+/// Addresses lent to the SDK, never dereferenced by Rust.
+#[cfg(any(test, ndi_has_advanced_scatter_send))]
+#[derive(Debug)]
+struct BlockPointers(AliasableBox<[*const u8]>);
+
+// SAFETY: moving this array moves none of the blocks it describes. Rust never
+// dereferences its pointers; ScatterStorage::descriptor lends them to the SDK
+// only under exclusive access, and the send slot owns the lent frame.
+#[cfg(any(test, ndi_has_advanced_scatter_send))]
+unsafe impl Send for BlockPointers {}
+// SAFETY: shared access only reads the pointer values. The SDK receives them
+// through ScatterStorage::descriptor(&mut self), whose exclusive loan lasts
+// until the slot has synchronized or the sender has been destroyed.
+#[cfg(any(test, ndi_has_advanced_scatter_send))]
+unsafe impl Sync for BlockPointers {}
+
+const _: () = {
+    const fn send_and_sync<T: Send + Sync>() {}
+    send_and_sync::<ScatterStorage>();
+};
 
 impl Clone for ScatterStorage {
     /// Copies of the blocks, with arrays that describe the copies.
@@ -73,7 +86,7 @@ impl ScatterStorage {
         );
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
         let bytes = bytes
-            .saturating_add(self.pointers.len() * size_of::<*const u8>())
+            .saturating_add(self.pointers.0.len() * size_of::<*const u8>())
             .saturating_add(self.sizes.len() * size_of::<i32>());
         bytes
     }
@@ -118,7 +131,7 @@ impl ScatterStorage {
         Self {
             blocks,
             #[cfg(any(test, ndi_has_advanced_scatter_send))]
-            pointers: AliasableBox::new(pointers),
+            pointers: BlockPointers(AliasableBox::new(pointers)),
             #[cfg(any(test, ndi_has_advanced_scatter_send))]
             sizes: AliasableBox::new(sizes),
             total,
@@ -131,7 +144,7 @@ impl ScatterStorage {
     #[cfg(ndi_has_advanced_scatter_send)]
     fn descriptor(&mut self, table: &'static ScatterSend) -> FrameScatter {
         native!(ScatterSend, table => FrameScatter {
-            p_data_blocks: self.pointers.as_ptr().cast(),
+            p_data_blocks: self.pointers.0.as_ptr().cast(),
             p_data_blocks_size: self.sizes.as_ptr().cast(),
         })
     }
@@ -1165,15 +1178,15 @@ mod tests {
         assert!(ScatterVideoFrame::new(format, vec![bytes.clone(), vec![]]).is_err());
         let frame = ScatterVideoFrame::new(format, split(&bytes, &[44, 47])).unwrap();
         assert_eq!(frame.total_bytes(), bytes.len());
-        assert_eq!(frame.storage.pointers.len(), 4);
-        assert!(frame.storage.pointers[3].is_null());
+        assert_eq!(frame.storage.pointers.0.len(), 4);
+        assert!(frame.storage.pointers.0[3].is_null());
         assert_eq!(&*frame.storage.sizes, &[44, 3, 2, 0]);
         let moved = Box::new(frame);
         for (block, pointer) in moved
             .storage
             .blocks
             .iter()
-            .zip(moved.storage.pointers.iter())
+            .zip(moved.storage.pointers.0.iter())
         {
             assert_eq!(block.as_ptr().cast::<u8>(), *pointer);
         }
@@ -1247,14 +1260,18 @@ mod tests {
             (copy.timecode(), copy.metadata()),
             (Timecode::from_ticks(3), Some("<scatter/>"))
         );
-        let blocks = copy.storage.blocks.iter().zip(copy.storage.pointers.iter());
+        let blocks = copy
+            .storage
+            .blocks
+            .iter()
+            .zip(copy.storage.pointers.0.iter());
         for ((block, pointer), original) in blocks.zip(frame.storage.blocks.iter()) {
             assert_eq!(block.as_ptr().cast::<u8>(), *pointer);
             assert_ne!(block.as_ptr(), original.as_ptr());
             assert_eq!(**block, **original);
         }
         assert_eq!(&*copy.storage.sizes, &*frame.storage.sizes);
-        assert!(copy.storage.pointers[3].is_null());
+        assert!(copy.storage.pointers.0[3].is_null());
 
         let mut audio =
             scatter_audio(AudioCodec::Opus, 48_000, 2, 960, vec![vec![1], vec![2]]).unwrap();
@@ -1275,7 +1292,7 @@ mod tests {
     fn a_scatter_frame_the_sdk_has_written_to_is_read_back_and_sendable() {
         let (format, bytes) = h264();
         let frame = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
-        let first = frame.storage.pointers[0].cast_mut();
+        let first = frame.storage.pointers.0[0].cast_mut();
         let moved = Box::new(frame);
         // SAFETY: the pointer was created to be written through, the block
         // holds a complete header, and no reference to it exists.
@@ -1394,7 +1411,7 @@ mod tests {
         };
         let table = ndi.table::<ScatterSend>().unwrap();
         let frame = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
-        let pointers = frame.storage.pointers.as_ptr().cast::<*const u8>();
+        let pointers = frame.storage.pointers.0.as_ptr().cast::<*const u8>();
         let sizes = frame.storage.sizes.as_ptr().cast::<i32>();
         let (slots, mut keys) = super::super::send_slots::DescriptorSlots::new(1).unwrap();
         let mut slot = slots.claim(keys.pop().unwrap());
