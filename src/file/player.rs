@@ -44,6 +44,41 @@ pub struct FilePlayer {
     _thread: PhantomData<Rc<()>>,
 }
 
+/// Checked Rust data and its native family; no native player exists yet.
+pub(super) struct PreparedPlayer {
+    api: FileApi,
+    playback: &'static sys::FilePlayback,
+    resolved: types::ResolvedPlayerOptions,
+    name: String,
+}
+
+impl PreparedPlayer {
+    pub(super) fn create(self) -> Result<FilePlayer> {
+        let Self {
+            api,
+            playback,
+            resolved,
+            name,
+        } = self;
+        let settings = NDIlib_file_player_create_t {
+            p_ndi_send_name: resolved.name.as_ptr(),
+            p_groups: resolved
+                .groups
+                .as_ref()
+                .map_or(std::ptr::null(), |groups| groups.as_ptr()),
+        };
+        // SAFETY: `settings` and the strings it points to are valid for the call.
+        let handle = unsafe { playback.named().NDIlib_file_player_create(&settings) }.created()?;
+        Ok(FilePlayer {
+            playback,
+            handle,
+            name,
+            _api: api,
+            _thread: PhantomData,
+        })
+    }
+}
+
 impl std::fmt::Debug for FilePlayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FilePlayer")
@@ -54,23 +89,17 @@ impl std::fmt::Debug for FilePlayer {
 
 impl FilePlayer {
     pub(super) fn create(api: FileApi, options: &PlayerOptions) -> Result<Self> {
+        Self::prepare(api, options)?.create()
+    }
+
+    pub(super) fn prepare(api: FileApi, options: &PlayerOptions) -> Result<PreparedPlayer> {
         let playback = api.table::<sys::FilePlayback>()?;
         let resolved = options.resolve()?;
-        let settings = NDIlib_file_player_create_t {
-            p_ndi_send_name: resolved.name.as_ptr(),
-            p_groups: resolved
-                .groups
-                .as_ref()
-                .map_or(std::ptr::null(), |groups| groups.as_ptr()),
-        };
-        // SAFETY: `settings` and the strings it points to are valid for the call.
-        let handle = unsafe { playback.named().NDIlib_file_player_create(&settings) }.created()?;
-        Ok(Self {
+        Ok(PreparedPlayer {
+            api,
             playback,
-            handle,
+            resolved,
             name: options.name.clone(),
-            _api: api,
-            _thread: PhantomData,
         })
     }
 

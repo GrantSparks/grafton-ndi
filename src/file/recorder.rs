@@ -9,7 +9,7 @@ use std::{
 
 use super::{
     out_param,
-    types::{track_flags, FileText, NamePattern},
+    types::{track_flags, FileText, NamePattern, ResolvedRecorderOptions},
     EventText, FileApi, RecorderEvent, RecorderEventKind, RecorderOptions, RecorderStats,
     RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec, StateError,
 };
@@ -916,19 +916,49 @@ pub struct FileRecorder {
     _thread: PhantomData<Rc<()>>,
 }
 
-impl std::fmt::Debug for FileRecorder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FileRecorder")
-            .field("state", &self.ledger.state())
-            .field("session", &self.ledger.session_number())
-            .finish_non_exhaustive()
+/// Rust-only creation state: its validation and family check require no
+/// native object, so this value can move to an owner thread before creation.
+pub(super) struct PreparedRecorder {
+    api: FileApi,
+    recording: &'static sys::FileRecording,
+    options: CheckedRecorderOptions,
+}
+
+/// Every option needed for creation, retaining the one resolved naming proof.
+/// Reset can validate this before queueing without retaining another runtime.
+pub(super) struct CheckedRecorderOptions {
+    source: SourceSpec,
+    tracks: MediaTypes,
+    planar_audio: bool,
+    proxy: bool,
+    rollover_size: u64,
+    drop_wait: Duration,
+    resolved: ResolvedRecorderOptions,
+}
+
+impl CheckedRecorderOptions {
+    pub(super) fn new(options: &RecorderOptions) -> Result<Self> {
+        let resolved = options.resolve()?;
+        Ok(Self {
+            source: options.source.clone(),
+            tracks: options.tracks,
+            planar_audio: options.planar_audio,
+            proxy: options.proxy,
+            rollover_size: options.rollover_size,
+            drop_wait: options.drop_wait,
+            resolved,
+        })
     }
 }
 
-impl FileRecorder {
-    pub(super) fn create(api: FileApi, options: &RecorderOptions) -> Result<Self> {
-        let recording = api.table::<sys::FileRecording>()?;
-        let resolved = options.resolve()?;
+impl PreparedRecorder {
+    pub(super) fn create(self) -> Result<FileRecorder> {
+        let Self {
+            api,
+            recording,
+            options,
+        } = self;
+        let resolved = options.resolved;
         let settings = NDIlib_file_recorder_create_t {
             source_to_connect_to: raw_source(&options.source),
             track_flags: track_flags(options.tracks),
@@ -945,17 +975,42 @@ impl FileRecorder {
         // and `resolved`, are valid for the call.
         let handle =
             unsafe { recording.named().NDIlib_file_recorder_create(&settings) }.created()?;
-        Ok(Self {
+        Ok(FileRecorder {
             recording,
             handle,
             tracks: options.tracks,
             cleanup: CleanupBudget::For(options.drop_wait),
-            accepted_source: Some(options.source.clone()),
+            accepted_source: Some(options.source),
             naming: resolved.naming,
             ledger: Ledger::idle(),
             generation: 0,
             _api: api,
             _thread: PhantomData,
+        })
+    }
+}
+
+impl std::fmt::Debug for FileRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileRecorder")
+            .field("state", &self.ledger.state())
+            .field("session", &self.ledger.session_number())
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileRecorder {
+    pub(super) fn create(api: FileApi, options: &RecorderOptions) -> Result<Self> {
+        Self::prepare(api, options)?.create()
+    }
+
+    pub(super) fn prepare(api: FileApi, options: &RecorderOptions) -> Result<PreparedRecorder> {
+        let recording = api.table::<sys::FileRecording>()?;
+        let options = CheckedRecorderOptions::new(options)?;
+        Ok(PreparedRecorder {
+            api,
+            recording,
+            options,
         })
     }
 
@@ -1372,10 +1427,31 @@ impl FileRecorder {
     ///
     /// The errors of [`FileApi::create_recorder`].
     pub fn reset(&mut self, options: &RecorderOptions) -> Result<RecordingReport> {
+        self.reset_with(|recorder| Self::create(recorder._api.clone(), options))
+    }
+
+    pub(super) fn reset_checked(
+        &mut self,
+        options: CheckedRecorderOptions,
+    ) -> Result<RecordingReport> {
+        self.reset_with(|recorder| {
+            PreparedRecorder {
+                api: recorder._api.clone(),
+                recording: recorder.recording,
+                options,
+            }
+            .create()
+        })
+    }
+
+    fn reset_with(
+        &mut self,
+        create: impl FnOnce(&Self) -> Result<Self>,
+    ) -> Result<RecordingReport> {
         let generation = self.generation.checked_add(1).ok_or(Error::InvalidInput(
             crate::InputDefect::RecorderGenerationExhausted,
         ))?;
-        let mut replacement = Self::create(self._api.clone(), options)?;
+        let mut replacement = create(self)?;
         replacement.generation = generation;
         replacement.ledger = Ledger::inheriting(self.report());
         Ok(std::mem::replace(self, replacement).abandon())

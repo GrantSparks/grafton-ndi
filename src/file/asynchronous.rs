@@ -9,7 +9,7 @@
 //! drop requests shutdown without joining another File thread, so notifications
 //! cannot stall behind cleanup or deadlock one another.
 
-use super::recorder::{FinishReply, FinishWaiters, Settlement};
+use super::recorder::{CheckedRecorderOptions, FinishReply, FinishWaiters, Settlement};
 use super::types::resolve_path;
 use super::{
     EventText, FileApi, FileDuration, FileInfo, FilePlayer, FilePosition, FileRecorder,
@@ -127,7 +127,7 @@ impl AsyncFileOptions {
     }
 
     /// Check that both capacities are in range.
-    fn validate(self) -> Result<Self> {
+    fn validate(self) -> Result<ValidatedAsyncFileOptions> {
         for (queue, capacity) in [
             ("command", self.command_capacity),
             ("event", self.event_capacity),
@@ -139,9 +139,11 @@ impl AsyncFileOptions {
                 }));
             }
         }
-        Ok(self)
+        Ok(ValidatedAsyncFileOptions(self))
     }
 }
+
+struct ValidatedAsyncFileOptions(AsyncFileOptions);
 
 /// Executor state kept under a response or event queue's lock. Registration
 /// clones outside that lock and rechecks readiness after the clone, which can
@@ -1093,8 +1095,8 @@ impl RecorderOwner {
             .start_with_sink(target, timecode, &mut |event| events.push(event))
     }
 
-    fn reset(&mut self, options: &RecorderOptions) -> Result<RecordingReport> {
-        let report = self.recorder.reset(options)?;
+    fn reset(&mut self, options: CheckedRecorderOptions) -> Result<RecordingReport> {
+        let report = self.recorder.reset_checked(options)?;
         self.waiters.close();
         Ok(report)
     }
@@ -1207,7 +1209,10 @@ trait HandleOwner: Owner {
     type Options: Clone + Send + 'static;
     const THREAD_NAME: &'static str;
 
-    fn create(api: FileApi, options: &Self::Options) -> Result<Self>
+    type Prepared: Send + 'static;
+
+    fn prepare(api: FileApi, options: &Self::Options) -> Result<Self::Prepared>;
+    fn create(prepared: Self::Prepared) -> Result<Self>
     where
         Self: Sized;
     fn dropped_event_count(&self) -> u64;
@@ -1218,8 +1223,13 @@ impl HandleOwner for FilePlayer {
     type Options = PlayerOptions;
     const THREAD_NAME: &'static str = "ndi-file-player";
 
-    fn create(api: FileApi, options: &Self::Options) -> Result<Self> {
-        api.create_player(options)
+    type Prepared = super::player::PreparedPlayer;
+
+    fn prepare(api: FileApi, options: &Self::Options) -> Result<Self::Prepared> {
+        FilePlayer::prepare(api, options)
+    }
+    fn create(prepared: Self::Prepared) -> Result<Self> {
+        prepared.create()
     }
 
     fn dropped_event_count(&self) -> u64 {
@@ -1235,8 +1245,13 @@ impl HandleOwner for RecorderOwner {
     type Options = RecorderOptions;
     const THREAD_NAME: &'static str = "ndi-file-recorder";
 
-    fn create(api: FileApi, options: &Self::Options) -> Result<Self> {
-        api.create_recorder(options).map(Self::new)
+    type Prepared = super::recorder::PreparedRecorder;
+
+    fn prepare(api: FileApi, options: &Self::Options) -> Result<Self::Prepared> {
+        FileRecorder::prepare(api, options)
+    }
+    fn create(prepared: Self::Prepared) -> Result<Self> {
+        prepared.create().map(Self::new)
     }
 
     fn dropped_event_count(&self) -> u64 {
@@ -1498,12 +1513,22 @@ impl<H: HandleOwner> Worker<H> {
         wrap: impl FnOnce(Arc<Self>) -> T + Send + 'static,
     ) -> FileOperation<T> {
         let (api, options) = (api.clone(), options.clone());
-        spawn_owner(
-            H::THREAD_NAME,
-            move || H::create(api, &options),
-            asynchronous,
-            wrap,
-        )
+        FileOperation::deferred(move || {
+            let asynchronous = match asynchronous.validate() {
+                Ok(options) => options,
+                Err(error) => return Live::failed(error),
+            };
+            let prepared = match H::prepare(api, &options) {
+                Ok(prepared) => prepared,
+                Err(error) => return Live::failed(error),
+            };
+            spawn_prepared_owner_now(
+                H::THREAD_NAME,
+                move || H::create(prepared),
+                asynchronous,
+                wrap,
+            )
+        })
     }
 
     fn next_event(&self, timeout: Duration) -> FileEventFuture<H::Event> {
@@ -1527,6 +1552,7 @@ impl<H: HandleOwner> Worker<H> {
 /// handle `wrap` builds around the worker.
 ///
 /// Options out of range fail the operation before anything is started.
+#[cfg(test)]
 fn spawn_owner<H: Owner, T: Send + 'static>(
     name: &str,
     create: impl FnOnce() -> Result<H> + Send + 'static,
@@ -1537,6 +1563,7 @@ fn spawn_owner<H: Owner, T: Send + 'static>(
     FileOperation::deferred(move || spawn_owner_now(&name, create, options, wrap))
 }
 
+#[cfg(test)]
 fn spawn_owner_now<H: Owner, T: Send + 'static>(
     name: &str,
     create: impl FnOnce() -> Result<H> + Send + 'static,
@@ -1547,6 +1574,16 @@ fn spawn_owner_now<H: Owner, T: Send + 'static>(
         Ok(options) => options,
         Err(error) => return Live::failed(error),
     };
+    spawn_prepared_owner_now(name, create, options, wrap)
+}
+
+fn spawn_prepared_owner_now<H: Owner, T: Send + 'static>(
+    name: &str,
+    create: impl FnOnce() -> Result<H> + Send + 'static,
+    options: ValidatedAsyncFileOptions,
+    wrap: impl FnOnce(Arc<Worker<H>>) -> T + Send + 'static,
+) -> Live<T> {
+    let options = options.0;
     let (sender, receiver) = mpsc::channel();
     let control = Arc::new(Control::new());
     let events = Arc::new(EventQueue::new(options.event_capacity));
@@ -1800,6 +1837,8 @@ impl AsyncFilePlayer {
     ///
     /// The future fails as [`FileApi::create_player`] does. The options are
     /// only read, so they stay with the caller whatever the outcome.
+    /// Options and the required File family are checked at submission, before
+    /// an owner thread starts. Native creation runs on that thread.
     pub fn create(api: &FileApi, options: &PlayerOptions) -> FileOperation<Self> {
         Worker::<FilePlayer>::create(api, options, |worker| Self { worker })
     }
@@ -1808,6 +1847,8 @@ impl AsyncFilePlayer {
     ///
     /// The future fails as [`create`](Self::create) does, and with
     /// [`Error::InvalidInput`] when a queue size is out of range.
+    /// Queue sizes, options and the required File family are checked at
+    /// submission, before an owner thread starts.
     pub fn create_with_options(
         api: &FileApi,
         options: &PlayerOptions,
@@ -1992,6 +2033,8 @@ impl AsyncFileRecorder {
     /// The future fails as [`FileApi::create_recorder`] does, including with
     /// [`Error::InvalidInput`] for options that conflict. The options are
     /// only read, so they stay with the caller whatever the outcome.
+    /// Options and the required File family are checked at submission, before
+    /// an owner thread starts. Native creation runs on that thread.
     pub fn create(api: &FileApi, options: &RecorderOptions) -> FileOperation<Self> {
         Worker::<RecorderOwner>::create(api, options, |worker| Self { worker })
     }
@@ -1999,6 +2042,8 @@ impl AsyncFileRecorder {
     ///
     /// The future fails as [`create`](Self::create) does, and with
     /// [`Error::InvalidInput`] when a queue size is out of range.
+    /// Queue sizes, options and the required File family are checked at
+    /// submission, before an owner thread starts.
     pub fn create_with_options(
         api: &FileApi,
         options: &RecorderOptions,
@@ -2079,9 +2124,16 @@ impl AsyncFileRecorder {
     /// worker's event stream remain available to the caller. A successful reset
     /// ends pending finish waits for the old recorder with [`StateError::Closed`];
     /// a failed reset leaves them waiting on the original session.
+    /// Options are checked at submission, before waiting in the command queue.
     pub fn reset(&self, options: &RecorderOptions) -> FileOperation<RecordingReport> {
         let options = options.clone();
-        self.worker.call(move |recorder| recorder.reset(&options))
+        self.worker.prepare(
+            move || {
+                let options = CheckedRecorderOptions::new(&options)?;
+                Ok(move |recorder: &mut RecorderOwner| recorder.reset(options))
+            },
+            false,
+        )
     }
 
     fn finish_inner(&self, timeout: Duration, stop: bool) -> FileOperation<FinishStatus> {
@@ -5198,6 +5250,110 @@ mod tests {
         fn send_sync_unpin<T: Send + Sync + Unpin>() {}
         send_sync_unpin::<FileEventFuture<RecorderEvent>>();
         send_sync_unpin::<FileEventFuture<PlayerEvent>>();
+    }
+
+    #[test]
+    fn refused_creation_options_and_families_complete_at_submission() {
+        struct NeverCreated;
+        impl Owner for NeverCreated {
+            type Event = ();
+            fn poll_native(&mut self) -> Result<Option<()>> {
+                unreachable!()
+            }
+        }
+        impl HandleOwner for NeverCreated {
+            type Options = RecorderOptions;
+            type Prepared = super::super::recorder::PreparedRecorder;
+            const THREAD_NAME: &'static str = "must-not-create";
+            fn prepare(api: FileApi, options: &Self::Options) -> Result<Self::Prepared> {
+                FileRecorder::prepare(api, options)
+            }
+            fn create(_: Self::Prepared) -> Result<Self> {
+                panic!("the refused owner was created")
+            }
+            fn dropped_event_count(&self) -> u64 {
+                unreachable!()
+            }
+            fn source_format(&self) -> Result<Option<SourceFormat>> {
+                unreachable!()
+            }
+        }
+        let api = mock::recorder_api();
+        for options in [
+            RecorderOptions::new(SourceSpec::new("mock").unwrap())
+                .naming(FileNaming::Exact)
+                .format_change_rollover(true),
+            RecorderOptions::new(SourceSpec::new("mock").unwrap())
+                .naming(FileNaming::Pattern("{prefix}/{index}/clip.mkv".into())),
+        ] {
+            let refused = Worker::<NeverCreated>::create(&api, &options, |worker| worker).submit();
+            assert!(refused.is_completed());
+            assert!(matches!(block_on(refused), Err(Error::InvalidInput(_))));
+            let public = AsyncFileRecorder::create(&api, &options).submit();
+            assert!(public.is_completed());
+            assert!(matches!(block_on(public), Err(Error::InvalidInput(_))));
+        }
+        let bad_player = AsyncFilePlayer::create(&api, &PlayerOptions::new("")).submit();
+        assert!(bad_player.is_completed());
+        assert!(matches!(block_on(bad_player), Err(Error::InvalidInput(_))));
+        let missing = FileApi::with_runtime(crate::sys::FileRuntime::test_double(
+            Err(c"NDIlib_file_player_create"),
+            Err(c"NDIlib_file_recorder_create"),
+        ));
+        let player = AsyncFilePlayer::create(&missing, &PlayerOptions::new("mock")).submit();
+        assert!(player.is_completed());
+        assert!(matches!(
+            block_on(player),
+            Err(Error::FileFamilyUnavailable { .. })
+        ));
+        let options = RecorderOptions::new(SourceSpec::new("mock").unwrap());
+        let recorder = AsyncFileRecorder::create(&missing, &options).submit();
+        assert!(recorder.is_completed());
+        assert!(matches!(
+            block_on(recorder),
+            Err(Error::FileFamilyUnavailable { .. })
+        ));
+        let never = Worker::<NeverCreated>::create(&missing, &options, |worker| worker).submit();
+        assert!(never.is_completed());
+        assert!(matches!(
+            block_on(never),
+            Err(Error::FileFamilyUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn a_refused_create_allocates_only_its_options_validation() {
+        let options = RecorderOptions::new(SourceSpec::new("mock").unwrap())
+            .naming(FileNaming::Exact)
+            .format_change_rollover(true);
+        let (resolved, expected) = crate::test_alloc::allocation_count(|| options.resolve());
+        assert!(resolved.is_err());
+        let operation = AsyncFileRecorder::create(&mock::recorder_api(), &options);
+        let (operation, allocations) = crate::test_alloc::allocation_count(|| operation.submit());
+        assert!(operation.is_completed());
+        assert_eq!(
+            allocations, expected,
+            "no channel, control, event queue or owner thread"
+        );
+        assert!(matches!(block_on(operation), Err(Error::InvalidInput(_))));
+    }
+
+    #[test]
+    fn a_refused_reset_does_not_wait_behind_a_blocked_owner_command() {
+        let (device, recorder) = mock_recorder(Closing::AtStop);
+        let (blocked, release) = block_owner(&recorder.worker);
+        let options = RecorderOptions::new(SourceSpec::new("replacement").unwrap())
+            .naming(FileNaming::Exact)
+            .format_change_rollover(true);
+        let refused = recorder.reset(&options).submit();
+        let immediate = refused.is_completed();
+        let creates = device.creates.load(Ordering::Acquire);
+        release.send(()).unwrap();
+        block_on(blocked).unwrap();
+        assert!(immediate, "invalid reset waited in the command queue");
+        assert_eq!(creates, 1);
+        assert!(matches!(block_on(refused), Err(Error::InvalidInput(_))));
+        block_on(recorder.close()).unwrap();
     }
 
     #[test]
