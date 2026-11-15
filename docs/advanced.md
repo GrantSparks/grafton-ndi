@@ -243,6 +243,15 @@ samples, format changes and absent audio; SDK internal failures return
 These successful absence outcomes do not prove recent reception; use the
 [media-progress monitor](usage.md#monitor-reception-of-the-expected-media).
 
+`synchronize_ref` and `queued_audio_ref` return `AvSyncOutcomeRef`, whose
+matched `AvSyncAudioRef` borrows the native samples and implements `AudioSource`.
+Send or convert them in place, call `to_owned()` to retain a copy, or `copy_into`
+to reuse an existing `AudioFrame` without allocating when its capacity suffices.
+The owned methods delegate to this same capture path. Borrowed audio stays on
+its capture thread, may coexist with later results, and keeps the synchronizer
+borrowed until released. AV-sync's zero unknown timestamp reads as `None`;
+matched sender timestamps read as `Some`.
+
 `AvSync` is `Send` but not `Sync`; synchronization runs on one thread at a
 time. Its shared receiver permits concurrent compatible capture/control work.
 `split()` separates synchronization and exclusive controls for KVM;

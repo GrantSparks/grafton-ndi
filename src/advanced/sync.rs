@@ -6,7 +6,9 @@ use std::{cell::Cell, marker::PhantomData, sync::Arc};
 
 use super::{invalid_input, sdk_quantity, AdvancedConfig, ReceiverControls};
 use crate::{
+    capture::AvSyncAudioFree,
     finder::RawSource,
+    frames::AudioRef,
     frames::MAX_AUDIO_BYTES,
     receiver::{AvSyncAttached, ReceiverCore},
     sys::{
@@ -18,14 +20,17 @@ use crate::{
 };
 
 use super::descriptors;
-#[cfg(any(test, ndi_has_advanced_av_sync))]
-use crate::frames::{AudioPartsExt, ReturnedAudio, ValidatedAudio};
 #[cfg(ndi_has_advanced_av_sync)]
 use crate::sys::advanced::AvSyncHandle;
 #[cfg(ndi_has_advanced_genlock)]
 use crate::sys::advanced::GenlockHandle;
 #[cfg(any(doc, test, ndi_has_advanced_av_sync, ndi_has_advanced_genlock))]
 use crate::Error;
+#[cfg(any(test, ndi_has_advanced_av_sync))]
+use crate::{
+    capture::{AvSyncAudioInstance, Guard},
+    frames::{ReturnedAudio, ValidatedAudio},
+};
 
 /// What audio an [`AvSync::synchronize`] call asks for.
 ///
@@ -141,6 +146,73 @@ pub enum AvSyncOutcome {
     NoAudioStream,
     /// The source sends audio, but none of it matches the video frame's time.
     NoMatchingSamples,
+}
+
+/// Audio borrowed from an [`AvSync`] synchronizer.
+///
+/// The samples and metadata remain in the SDK until this reference is dropped.
+/// It implements [`crate::AudioSource`] and can be sent or converted in place;
+/// `to_owned` retains a copy and `copy_into` reuses owned storage. Like
+/// FrameSync audio references, it stays on its capture thread (`!Send`, `!Sync`).
+/// Several references may be retained across later synchronizations and freed
+/// in any order. The synchronizer remains borrowed until all are released.
+pub type AvSyncAudioRef<'a> = AudioRef<'a, AvSyncAudioFree>;
+
+/// A synchronization outcome whose audio remains borrowed from the SDK.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum AvSyncOutcomeRef<'a> {
+    /// Matched samples, retained until `frame` is dropped.
+    Audio {
+        /// The borrowed samples, timing and metadata.
+        frame: AvSyncAudioRef<'a>,
+        /// Whether the SDK adjusted the requested sample count.
+        samples_adjusted: bool,
+    },
+    /// Synchronization succeeded without samples.
+    Empty {
+        /// Whether the SDK adjusted the requested sample count.
+        samples_adjusted: bool,
+    },
+    /// The source's format differs from the request.
+    FormatChanged {
+        /// The current sample rate in hertz.
+        sample_rate: u32,
+        /// The current channel count.
+        num_channels: u32,
+    },
+    /// The source currently sends no audio.
+    NoAudioStream,
+    /// No audio matches the requested video timestamp.
+    NoMatchingSamples,
+}
+
+impl AvSyncOutcomeRef<'_> {
+    /// Copy matched audio into an independently owned outcome. Status-only
+    /// outcomes allocate nothing.
+    pub fn to_owned(&self) -> AvSyncOutcome {
+        match self {
+            Self::Audio {
+                frame,
+                samples_adjusted,
+            } => AvSyncOutcome::Audio {
+                frame: frame.to_owned(),
+                samples_adjusted: *samples_adjusted,
+            },
+            Self::Empty { samples_adjusted } => AvSyncOutcome::Empty {
+                samples_adjusted: *samples_adjusted,
+            },
+            Self::FormatChanged {
+                sample_rate,
+                num_channels,
+            } => AvSyncOutcome::FormatChanged {
+                sample_rate: *sample_rate,
+                num_channels: *num_channels,
+            },
+            Self::NoAudioStream => AvSyncOutcome::NoAudioStream,
+            Self::NoMatchingSamples => AvSyncOutcome::NoMatchingSamples,
+        }
+    }
 }
 
 /// How the SDK classified one synchronization.
@@ -385,7 +457,9 @@ impl AvSync {
     /// handed to the SDK as the SDK delivered it, and an owned copy of one as
     /// it is, so no pixels are copied. One call makes one native request: a
     /// changed format or missing audio is reported, never retried or
-    /// converted.
+    /// converted. Returning samples allocates their owned buffer, plus metadata
+    /// storage when present. [`Self::synchronize_ref`] borrows those samples
+    /// directly and offers allocation-free copying into reusable storage.
     ///
     /// One call synchronizes at a time, on the thread that holds this
     /// `AvSync`, which is not `Sync`. Other threads may meanwhile capture
@@ -410,7 +484,18 @@ impl AvSync {
         video: AvSyncVideo<'_>,
         request: AvSyncRequest,
     ) -> Result<AvSyncOutcome> {
-        self.capture().synchronize(video, request)
+        Ok(self.synchronize_ref(video, request)?.to_owned())
+    }
+
+    /// Borrow matched audio without allocating or copying samples. Timing,
+    /// statuses and errors are as for [`Self::synchronize`]. The returned
+    /// frame keeps this synchronizer borrowed until it is released.
+    pub fn synchronize_ref(
+        &self,
+        video: AvSyncVideo<'_>,
+        request: AvSyncRequest,
+    ) -> Result<AvSyncOutcomeRef<'_>> {
+        self.capture().synchronize_ref(video, request)
     }
 
     /// Fetch whatever audio is currently queued, matched to no video frame.
@@ -423,7 +508,13 @@ impl AvSync {
     ///
     /// As for [`synchronize`](Self::synchronize).
     pub fn queued_audio(&self, request: AvSyncRequest) -> Result<AvSyncOutcome> {
-        self.capture().queued_audio(request)
+        Ok(self.queued_audio_ref(request)?.to_owned())
+    }
+
+    /// Borrow queued audio without copying; see [`Self::queued_audio`] for
+    /// request semantics and errors.
+    pub fn queued_audio_ref(&self, request: AvSyncRequest) -> Result<AvSyncOutcomeRef<'_>> {
+        self.capture().queued_audio_ref(request)
     }
 
     /// The synchronization view of this owner, which `&self` keeps on its
@@ -442,14 +533,15 @@ impl AvSync {
 /// independently lent receiver while this continues matching audio to video.
 /// Creating or copying it allocates nothing and makes no SDK call. Like a
 /// shared `&AvSync`, it is neither `Send` nor `Sync`: overlapping native
-/// synchronizations are not documented as safe. Results own their audio.
+/// synchronizations are not documented as safe. Borrowed results retain the
+/// synchronizer's borrow even when this view is dropped.
 #[derive(Clone, Copy)]
 pub struct AvSyncCapture<'a> {
     resource: &'a AvResource,
     _thread: PhantomData<*mut ()>,
 }
 
-impl AvSyncCapture<'_> {
+impl<'a> AvSyncCapture<'a> {
     /// Match audio to `video`; see [`AvSync::synchronize`] for timing,
     /// allocation costs, format changes and no-audio results.
     ///
@@ -461,6 +553,16 @@ impl AvSyncCapture<'_> {
         video: AvSyncVideo<'_>,
         request: AvSyncRequest,
     ) -> Result<AvSyncOutcome> {
+        Ok(self.synchronize_ref(video, request)?.to_owned())
+    }
+
+    /// Borrow matched audio; see [`AvSync::synchronize_ref`] for ownership,
+    /// timing and errors. The result borrows the synchronizer itself.
+    pub fn synchronize_ref(
+        &self,
+        video: AvSyncVideo<'_>,
+        request: AvSyncRequest,
+    ) -> Result<AvSyncOutcomeRef<'a>> {
         self.request(Some(video), request)
     }
 
@@ -470,6 +572,11 @@ impl AvSyncCapture<'_> {
     ///
     /// As for [`AvSync::synchronize`].
     pub fn queued_audio(&self, request: AvSyncRequest) -> Result<AvSyncOutcome> {
+        Ok(self.queued_audio_ref(request)?.to_owned())
+    }
+
+    /// Borrow queued audio; see [`AvSync::queued_audio_ref`].
+    pub fn queued_audio_ref(&self, request: AvSyncRequest) -> Result<AvSyncOutcomeRef<'a>> {
         self.request(None, request)
     }
 
@@ -479,21 +586,14 @@ impl AvSyncCapture<'_> {
         &self,
         _video: Option<AvSyncVideo<'_>>,
         _request: AvSyncRequest,
-    ) -> Result<AvSyncOutcome> {
+    ) -> Result<AvSyncOutcomeRef<'a>> {
         native!(AvSync, self.resource.table => {
             // A copy of the frame's descriptor, pointing into the frame's own
             // buffers, which the borrow keeps allocated for the call, and
             // carrying the timestamp `AvSyncVideo::new` checked.
             let video = _video.map(|video| video.descriptor(&self.resource.receiver._ndi)).transpose()?;
             let AvResource { handle, table, .. } = *self.resource;
-            let mut returned = Returned {
-                audio: _request.raw(),
-                release: |audio: &mut NDIlib_audio_frame_v3_t| {
-                    // SAFETY: the synchronizer that filled the descriptor is live,
-                    // and the descriptor is returned to it exactly once.
-                    native!(AvSync, table => unsafe { table.NDIlib_avsync_free_audio(handle.0, audio) })
-                },
-            };
+            let mut audio = _request.raw();
             let status = {
                 // SAFETY: the synchronizer is live, and so is the receiver it
                 // reads, whose owner this view borrows. The video
@@ -527,7 +627,7 @@ impl AvSyncCapture<'_> {
                     table.NDIlib_avsync_synchronize(
                         handle.0,
                         video.as_ref().map_or(ptr::null(), |video| video),
-                        &mut returned.audio,
+                        &mut audio,
                     )
                 };
                 match code {
@@ -550,68 +650,55 @@ impl AvSyncCapture<'_> {
                     other => Synchronized::Unknown(other),
                 }
             };
-            // SAFETY: the SDK owns whatever it returned until `returned` is
-            // dropped, which happens after the copy.
-            unsafe { outcome(status, &returned.audio) }
+            let instance = AvSyncAudioInstance::Native { handle: handle.0, table };
+            // SAFETY: the synchronizer and runtime remain borrowed through
+            // the result; its guard returns this descriptor exactly once.
+            let guard = unsafe { Guard::new(&self.resource.receiver._ndi, instance, audio) };
+            unsafe { outcome(status, guard) }
         })
     }
 }
 
-/// The audio descriptor of one synchronization. Whatever the SDK allocated
-/// for it is handed to `release` when the descriptor is dropped.
-#[cfg(any(test, ndi_has_advanced_av_sync))]
-struct Returned<F: FnMut(&mut NDIlib_audio_frame_v3_t)> {
-    audio: NDIlib_audio_frame_v3_t,
-    release: F,
-}
-
-#[cfg(any(test, ndi_has_advanced_av_sync))]
-impl<F: FnMut(&mut NDIlib_audio_frame_v3_t)> Drop for Returned<F> {
-    fn drop(&mut self) {
-        // Every result, including the failures, can carry SDK allocations.
-        if !self.audio.p_data.is_null() || !self.audio.p_metadata.is_null() {
-            (self.release)(&mut self.audio);
-        }
-    }
-}
-
-/// Turn one synchronization into an owned result.
+/// Validate one synchronization while its guard owns every returned buffer.
 ///
 /// # Safety
 ///
 /// For the two successful statuses, `audio` is a frame descriptor whose data
 /// and metadata pointers are null or valid for the layout it describes.
 #[cfg(any(test, ndi_has_advanced_av_sync))]
-unsafe fn outcome(status: Synchronized, audio: &NDIlib_audio_frame_v3_t) -> Result<AvSyncOutcome> {
+unsafe fn outcome<'a>(
+    status: Synchronized,
+    audio: Guard<'a, AvSyncAudioFree>,
+) -> Result<AvSyncOutcomeRef<'a>> {
     Ok(match status {
         Synchronized::Matched | Synchronized::Adjusted => {
             let samples_adjusted = status == Synchronized::Adjusted;
-            // SAFETY: forwarded to the caller's obligation; the borrow holds
-            // the descriptor through the copy.
+            // SAFETY: forwarded to the caller; the guard retains the native
+            // descriptor and every buffer throughout validation and borrowing.
             match unsafe { ValidatedAudio::returned_audio(audio)? } {
                 // The format of an empty result is not reported.
-                ReturnedAudio::Empty(_) => AvSyncOutcome::Empty { samples_adjusted },
-                ReturnedAudio::Samples(validated) => AvSyncOutcome::Audio {
-                    frame: validated.owned_copy(),
+                ReturnedAudio::Empty(_) => AvSyncOutcomeRef::Empty { samples_adjusted },
+                ReturnedAudio::Samples(validated) => AvSyncOutcomeRef::Audio {
+                    frame: AvSyncAudioRef::from_validated(validated),
                     samples_adjusted,
                 },
             }
         }
-        Synchronized::NoAudioStream => AvSyncOutcome::NoAudioStream,
-        Synchronized::NoMatchingSamples => AvSyncOutcome::NoMatchingSamples,
+        Synchronized::NoAudioStream => AvSyncOutcomeRef::NoAudioStream,
+        Synchronized::NoMatchingSamples => AvSyncOutcomeRef::NoMatchingSamples,
         Synchronized::FormatChanged => {
             match (
-                sdk_quantity(audio.sample_rate),
-                sdk_quantity(audio.no_channels),
+                sdk_quantity(audio.frame().sample_rate),
+                sdk_quantity(audio.frame().no_channels),
             ) {
-                (Some(sample_rate), Some(num_channels)) => AvSyncOutcome::FormatChanged {
+                (Some(sample_rate), Some(num_channels)) => AvSyncOutcomeRef::FormatChanged {
                     sample_rate,
                     num_channels,
                 },
                 _ => {
                     return Err(Error::UnexpectedSdkResult(format!(
                     "NDIlib_avsync_synchronize reported a format change to {} Hz and {} channels",
-                    audio.sample_rate, audio.no_channels
+                    audio.frame().sample_rate, audio.frame().no_channels
                 )))
                 }
             }
@@ -1055,6 +1142,22 @@ fn audio_timing(sample_rate: u32, num_samples: u32) -> Result<NDIlib_audio_frame
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frames::AudioPartsExt;
+
+    unsafe fn inspect(
+        status: Synchronized,
+        audio: &NDIlib_audio_frame_v3_t,
+    ) -> Result<AvSyncOutcome> {
+        // SAFETY: forwarded from each test; the no-op callback owns no storage.
+        let guard = unsafe {
+            Guard::<AvSyncAudioFree>::with_test_free(
+                AvSyncAudioInstance::Synthetic(ptr::null()),
+                *audio,
+                |_, _| {},
+            )
+        };
+        unsafe { outcome(status, guard) }.map(|outcome| outcome.to_owned())
+    }
 
     #[test]
     fn avsync_destroys_before_its_receiver_on_drop_and_recovery() {
@@ -1091,7 +1194,7 @@ mod tests {
     fn distinguishes_native_outcomes() {
         let audio = descriptor();
         // SAFETY: none of these statuses reads the descriptor's buffers.
-        let classify = |status| unsafe { outcome(status, &audio) }.unwrap();
+        let classify = |status| unsafe { inspect(status, &audio) }.unwrap();
         assert!(matches!(
             classify(Synchronized::FormatChanged),
             AvSyncOutcome::FormatChanged {
@@ -1107,7 +1210,7 @@ mod tests {
             };
             // SAFETY: a format change reads no buffer.
             assert!(matches!(
-                unsafe { outcome(Synchronized::FormatChanged, &changed) },
+                unsafe { inspect(Synchronized::FormatChanged, &changed) },
                 Err(Error::UnexpectedSdkResult(_))
             ));
         }
@@ -1121,7 +1224,7 @@ mod tests {
         ));
         // SAFETY: failure statuses never read the descriptor's buffers.
         assert!(matches!(
-            unsafe { outcome(Synchronized::InternalError, &audio) },
+            unsafe { inspect(Synchronized::InternalError, &audio) },
             Err(Error::NativeOperationFailed {
                 operation: "NDIlib_avsync_synchronize"
             })
@@ -1129,7 +1232,7 @@ mod tests {
         for code in [-99, 99] {
             // SAFETY: an unknown status never reads a buffer.
             assert!(matches!(
-                unsafe { outcome(Synchronized::Unknown(code), &audio) },
+                unsafe { inspect(Synchronized::Unknown(code), &audio) },
                 Err(Error::UnexpectedSdkResult(message)) if message.contains(&code.to_string())
             ));
         }
@@ -1142,7 +1245,7 @@ mod tests {
         };
         // SAFETY: an empty frame has no buffers to read.
         assert!(matches!(
-            unsafe { outcome(Synchronized::Adjusted, &empty) }.unwrap(),
+            unsafe { inspect(Synchronized::Adjusted, &empty) }.unwrap(),
             AvSyncOutcome::Empty {
                 samples_adjusted: true
             }
@@ -1207,7 +1310,7 @@ mod tests {
         };
         // SAFETY: an empty frame has no buffers to read.
         assert!(matches!(
-            unsafe { outcome(Synchronized::Matched, &returned) }.unwrap(),
+            unsafe { inspect(Synchronized::Matched, &returned) }.unwrap(),
             AvSyncOutcome::Empty {
                 samples_adjusted: false
             }
@@ -1398,33 +1501,158 @@ mod tests {
         traits::<Genlock>();
     }
 
-    /// The SDK's allocations are returned for every result, including the
-    /// failures and frames that fail validation.
+    /// Every result and validation failure releases through the shared guard.
     #[test]
     fn returned_audio_is_released_whatever_the_result() {
         let released = Cell::new(0);
-        let returned = |audio| Returned {
-            audio,
-            release: |_: &mut NDIlib_audio_frame_v3_t| released.set(released.get() + 1),
-        };
+        let samples = AudioFrame::builder().num_samples(2).build().unwrap();
         for status in [
+            Synchronized::Matched,
+            Synchronized::Adjusted,
+            Synchronized::NoAudioStream,
+            Synchronized::NoMatchingSamples,
             Synchronized::FormatChanged,
             Synchronized::InternalError,
             Synchronized::Unknown(99),
-            // One sample at a misaligned address fails validation.
-            Synchronized::Matched,
         ] {
             let before = released.get();
-            let audio = returned(descriptor());
-            // SAFETY: validation rejects the descriptor before any buffer is read.
-            let result = unsafe { outcome(status, &audio.audio) };
-            assert_eq!(result.is_ok(), status == Synchronized::FormatChanged);
-            drop(audio);
+            let guard = test_guard(samples.audio_descriptor(), &released);
+            let result = unsafe { outcome(status, guard) };
+            if matches!(status, Synchronized::Matched | Synchronized::Adjusted) {
+                assert_eq!(released.get(), before);
+            } else {
+                assert_eq!(released.get(), before + 1);
+            }
+            drop(result);
             assert_eq!(released.get(), before + 1);
         }
+        // A misaligned buffer is rejected before reading but still released.
+        let before = released.get();
+        assert!(
+            unsafe { outcome(Synchronized::Matched, test_guard(descriptor(), &released)) }.is_err()
+        );
+        assert_eq!(released.get(), before + 1);
+        // Empty status may own metadata alone; that allocation is returned too.
+        let raw = NDIlib_audio_frame_v3_t {
+            p_metadata: c"<empty/>".as_ptr(),
+            ..descriptors::audio_frame()
+        };
+        let before = released.get();
+        assert!(matches!(
+            unsafe { outcome(Synchronized::Matched, test_guard(raw, &released)) }.unwrap(),
+            AvSyncOutcomeRef::Empty { .. }
+        ));
+        assert_eq!(released.get(), before + 1);
+        drop(test_guard(NDIlib_audio_frame_v3_t::default(), &released));
+        assert_eq!(released.get(), before + 1);
+    }
 
-        // Nothing was allocated, so nothing is released.
-        drop(returned(NDIlib_audio_frame_v3_t::default()));
-        assert_eq!(released.get(), 4);
+    fn test_guard<'a>(
+        raw: NDIlib_audio_frame_v3_t,
+        released: &'a Cell<usize>,
+    ) -> Guard<'a, AvSyncAudioFree> {
+        unsafe {
+            Guard::<AvSyncAudioFree>::with_test_free(
+                AvSyncAudioInstance::Synthetic(released),
+                raw,
+                |instance, raw| {
+                    let AvSyncAudioInstance::Synthetic(released) = instance else {
+                        unreachable!()
+                    };
+                    if !raw.p_data.is_null() || !raw.p_metadata.is_null() {
+                        (*released).set((*released).get() + 1);
+                    }
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn borrowed_avsync_audio_reuses_owned_storage_without_allocating() {
+        let source = AudioFrame::builder()
+            .num_samples(16)
+            .metadata("<audio/>")
+            .build()
+            .unwrap();
+        let released = Cell::new(0);
+        let result = unsafe {
+            outcome(
+                Synchronized::Matched,
+                test_guard(source.audio_descriptor(), &released),
+            )
+        }
+        .unwrap();
+        let AvSyncOutcomeRef::Audio { frame, .. } = &result else {
+            panic!("matched samples")
+        };
+        assert_eq!(frame.data(), Some(source.data()));
+        let mut destination = frame.to_owned();
+        let ((), allocations) =
+            crate::test_alloc::allocation_count(|| frame.copy_into(&mut destination));
+        assert_eq!(allocations, 0);
+        assert_eq!(destination.data(), source.data());
+        assert_eq!(destination.metadata(), source.metadata());
+        assert_eq!(released.get(), 0);
+        drop(result);
+        assert_eq!(released.get(), 1);
+    }
+
+    #[test]
+    fn avsync_audio_normalizes_its_measured_unknown_timestamp_marker() {
+        let source = AudioFrame::builder().num_samples(2).build().unwrap();
+        let released = Cell::new(0);
+        for timestamp in [0, NDIlib_recv_timestamp_undefined, 12345] {
+            let raw = NDIlib_audio_frame_v3_t {
+                timestamp,
+                ..source.audio_descriptor()
+            };
+            let result =
+                unsafe { outcome(Synchronized::Matched, test_guard(raw, &released)) }.unwrap();
+            let AvSyncOutcomeRef::Audio { frame, .. } = result else {
+                panic!("matched samples")
+            };
+            assert_eq!(
+                frame.timestamp(),
+                if timestamp == 12345 {
+                    Some(SdkTimestamp::from_ticks(12345))
+                } else {
+                    None
+                }
+            );
+        }
+    }
+
+    /// Poisoning the output field distinguishes a native unknown marker
+    /// from the descriptor's default initialization.
+    #[cfg(ndi_has_advanced_av_sync)]
+    #[test]
+    fn avsync_native_unknown_timestamp_overwrites_the_request() {
+        use crate::frames::HoldsDescriptor;
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new(""))).unwrap();
+        let sync = AvSync::new(receiver).unwrap();
+        let AvResource { handle, table, .. } = &sync.resource;
+        let mut raw = AvSyncRequest::automatic().raw();
+        raw.timestamp = 12345;
+        let status = unsafe { table.NDIlib_avsync_synchronize(handle.0, ptr::null(), &mut raw) };
+        assert_eq!(status, crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_no_audio_stream_received);
+        assert_eq!(raw.timestamp, 0);
+        let guard = unsafe {
+            Guard::<AvSyncAudioFree>::new(
+                &ndi,
+                AvSyncAudioInstance::Native {
+                    handle: handle.0,
+                    table,
+                },
+                raw,
+            )
+        };
+        assert_eq!(guard.audio_timestamp(raw.timestamp), None);
+        assert!(matches!(
+            unsafe { outcome(Synchronized::NoAudioStream, guard) }.unwrap(),
+            AvSyncOutcomeRef::NoAudioStream
+        ));
     }
 }

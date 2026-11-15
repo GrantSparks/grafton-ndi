@@ -132,6 +132,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Added
 
+- `AvSync::synchronize_ref` and `queued_audio_ref` lend matched SDK audio
+  through `AvSyncOutcomeRef` and `AvSyncAudioRef`. Send and convert it in place,
+  retain it with `to_owned`, or reuse owned storage with `copy_into`; owned
+  synchronization keeps the same API and shares the borrowed capture path.
 - `PictureAspectRatio` validates finite, nonnegative display ratios, including
   the SDK's square-pixel request. Existing `f32` convenience setters remain.
 - `QueuedSender::close` returns every retained frame with its submission id,

@@ -17,8 +17,8 @@
 use std::{env, time::Duration};
 
 use grafton_ndi::{
-    advanced::{AvSync, AvSyncOutcome, AvSyncRequest, AvSyncVideo},
-    Error, Ndi, Receiver, ReceiverOptions, RuntimeOptions, SdkEdition, Tally,
+    advanced::{AvSync, AvSyncOutcomeRef, AvSyncRequest, AvSyncVideo},
+    AudioFrame, Error, Ndi, Receiver, ReceiverOptions, RuntimeOptions, SdkEdition, Tally,
 };
 
 #[path = "common/finder.rs"]
@@ -49,6 +49,7 @@ fn main() -> Result<(), Error> {
     sync.receiver().set_tally(Tally::new(true, false));
 
     let mut previous_connections = None;
+    let mut retained_audio: Option<AudioFrame> = None;
     for _ in 0..120 {
         // Native synchronization consumes notifications; query current state.
         let connections = sync.receiver().connection_stats().connections();
@@ -72,15 +73,24 @@ fn main() -> Result<(), Error> {
             println!("This frame carries no timestamp to match audio to");
             continue;
         };
-        match sync.synchronize(stamped, AvSyncRequest::automatic())? {
-            AvSyncOutcome::Audio { frame, .. } => println!(
-                "{}x{} video with {} audio samples at {} Hz",
-                video.width(),
-                video.height(),
-                frame.num_samples(),
-                frame.sample_rate()
-            ),
-            AvSyncOutcome::NoAudioStream => println!("The source sends no audio"),
+        match sync.synchronize_ref(stamped, AvSyncRequest::automatic())? {
+            AvSyncOutcomeRef::Audio { frame, .. } => {
+                // Inspect or send the borrowed samples directly. When retaining
+                // a copy, reuse the previous allocation after the first frame.
+                if let Some(destination) = &mut retained_audio {
+                    frame.copy_into(destination);
+                } else {
+                    retained_audio = Some(frame.to_owned());
+                }
+                println!(
+                    "{}x{} video with {} audio samples at {} Hz",
+                    video.width(),
+                    video.height(),
+                    frame.num_samples(),
+                    frame.sample_rate()
+                );
+            }
+            AvSyncOutcomeRef::NoAudioStream => println!("The source sends no audio"),
             other => println!("No audio for this frame: {other:?}"),
         }
     }

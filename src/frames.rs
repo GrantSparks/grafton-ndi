@@ -21,6 +21,9 @@ use crate::{
     Error, FourCc, FrameRate, PictureAspectRatio, Rejected, Result, SdkTimestamp, Timecode,
 };
 
+#[cfg(feature = "advanced")]
+use crate::{advanced::AvSyncAudioRef, capture::AvSyncAudioFree};
+
 /// The uncompressed pixel formats NDI sends and receives.
 ///
 /// Each converts to and from its [`FourCc`].
@@ -1926,7 +1929,7 @@ impl VideoFrameBuilder {
 /// [`audio_accessors!`] generates their public accessors and `Debug`, so each
 /// is written and documented once. Each implementation takes every part from
 /// one value that was validated as a whole; the generic AudioRef
-/// implementation covers both receiver and FrameSync guards.
+/// implementation covers receiver and synchronizer guards.
 ///
 /// # Safety
 ///
@@ -2043,7 +2046,8 @@ impl<T: AudioParts + ?Sized> AudioPartsExt for T {}
 /// A validated planar audio input for synchronous sending and conversion.
 ///
 /// Implemented by [`AudioFrame`], [`BorrowedAudioFrame`], [`AudioFrameRef`] and
-/// [`FrameSyncAudioRef`]. Generic and `dyn AudioSource` consumers can inspect
+/// [`FrameSyncAudioRef`], and Advanced AV-sync audio references. Generic and
+/// `dyn AudioSource` consumers can inspect
 /// validated layouts and channel samples without allocating.
 /// This sealed trait prevents unchecked sample pointers or channel layouts.
 /// Native operations borrow the original samples and channel stride directly,
@@ -5557,7 +5561,7 @@ macro_rules! borrowed_video_methods {
             ///
             /// The copy makes no SDK call. It runs wherever this reference may be
             /// used: a receiver frame can be copied on a scoped worker thread, while a
-            /// FrameSync frame stays on its capture thread. The destination is an
+            /// synchronizer frame stays on its capture thread. The destination is an
             /// ordinary owned frame either way.
             pub fn copy_into(&self, destination: &mut VideoFrame) {
                 self.frame.copy_into_owned(destination);
@@ -5667,6 +5671,12 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
         let frame = unsafe { ValidatedAudio::audio(guard)? };
         Ok(Self { frame })
     }
+
+    /// Wrap audio already validated while its guard retains the native loan.
+    #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_av_sync)))]
+    pub(crate) fn from_validated(frame: ValidatedAudio<Guard<'a, S>>) -> Self {
+        Self { frame }
+    }
 }
 
 // Specialize methods on the public aliases so rustdoc shows their full API
@@ -5714,7 +5724,7 @@ macro_rules! borrowed_audio_methods {
             ///
             /// The copy makes no SDK call. It runs wherever this reference may be
             /// used: a receiver frame can be copied on a scoped worker thread, while a
-            /// FrameSync frame stays on its capture thread. The destination is an
+            /// synchronizer frame stays on its capture thread. The destination is an
             /// ordinary owned frame either way.
             pub fn copy_into(&self, destination: &mut AudioFrame) {
                 self.frame.copy_into_owned(destination);
@@ -5724,9 +5734,13 @@ macro_rules! borrowed_audio_methods {
 }
 borrowed_audio_methods!(AudioFrameRef);
 borrowed_audio_methods!(FrameSyncAudioRef);
+#[cfg(feature = "advanced")]
+borrowed_audio_methods!(AvSyncAudioRef);
 
 impl AudioSource for AudioFrameRef<'_> {}
 impl AudioSource for FrameSyncAudioRef<'_> {}
+#[cfg(feature = "advanced")]
+impl AudioSource for AvSyncAudioRef<'_> {}
 
 // SAFETY: The validated frame holds a Guard that keeps the SDK allocation
 // alive until matching release. All parts delegate to that one validated
@@ -5765,8 +5779,8 @@ macro_rules! borrowed_audio_accessors {
                 /// [`Timecode::SYNTHESIZE`].
             }
             timestamp {
-                /// It is `None` when the SDK does not know it. FrameSync audio
-                /// also treats its zero timestamp marker as unknown; that
+                /// It is `None` when the SDK does not know it. FrameSync and
+                /// AV-sync audio also treat their zero marker as unknown; that
                 /// marker alone does not identify synthesized silence.
             }
             channel_stride_bytes {
@@ -5778,6 +5792,8 @@ macro_rules! borrowed_audio_accessors {
 }
 borrowed_audio_accessors!(AudioFrameRef, AudioKind);
 borrowed_audio_accessors!(FrameSyncAudioRef, FrameSyncAudioFree);
+#[cfg(feature = "advanced")]
+borrowed_audio_accessors!(AvSyncAudioRef, AvSyncAudioFree);
 
 impl<'rx> AudioRef<'rx, AudioKind> {
     /// Create a borrowed audio frame from a receiver RAII guard, validated
