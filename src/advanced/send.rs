@@ -455,7 +455,7 @@ impl SubmittedVideo {
     }
 }
 
-/// Frames reclaimed from a [`CompressedSender`] when it closes.
+/// Frames reclaimed from a [`CompressedSender`] when it finishes or closes.
 ///
 /// The SDK has finished accessing these frames, so their storage can be reused.
 /// Reclaiming them does not report whether they were delivered to a receiver.
@@ -571,6 +571,20 @@ pub(crate) struct PendingStreams {
 }
 
 impl PendingStreams {
+    /// Recover only frames whose native loans have already ended.
+    pub(crate) fn take_retained(&mut self) -> ReclaimedVideo {
+        ReclaimedVideo {
+            program: self
+                .program
+                .take_retained()
+                .map(PendingVideo::into_submitted),
+            preview: self
+                .preview
+                .take_retained()
+                .map(PendingVideo::into_submitted),
+        }
+    }
+
     /// Select the retained slot; only its owning protocol can synchronize it.
     pub(crate) fn slot(&mut self, tier: StreamTier) -> &mut InFlight<PendingVideo> {
         match tier {
@@ -642,6 +656,8 @@ impl Loans for PendingStreams {
 /// exclusively and an asynchronous one takes it, so no reference to a frame's
 /// bytes exists while the SDK may change them, and a frame can be sent again
 /// afterwards.
+/// [`finish_video_async`](Self::finish_video_async) waits for pending video
+/// and returns both streams' frames while keeping the source available.
 ///
 /// ```compile_fail,E0502
 /// use grafton_ndi::advanced::{CompressedSender, CompressedVideoFrame};
@@ -770,6 +786,17 @@ impl CompressedSender {
         self.split().0.send_video_async(frame)
     }
 
+    /// Drain asynchronous video and return both streams' final frames.
+    ///
+    /// One null asynchronous flush waits for the SDK to finish with all
+    /// pending video, without a timeout. The source stays available and can
+    /// send again; the next asynchronous send on either drained stream
+    /// returns `None`. Finishing an empty sender makes no native call.
+    /// Reclamation does not report whether receivers received the frames.
+    pub fn finish_video_async(&mut self) -> ReclaimedVideo {
+        self.split().0.finish_video_async()
+    }
+
     /// Send an audio frame and return when the SDK has finished with it.
     ///
     /// The frame is borrowed exclusively because the SDK writes to its bytes.
@@ -864,6 +891,11 @@ impl CompressedVideo<'_> {
     /// See [`CompressedSender::send_video_async`].
     pub fn send_video_async(&mut self, frame: CompressedVideoFrame) -> Option<SubmittedVideo> {
         self.pair.submit_pending(frame)
+    }
+
+    /// See [`CompressedSender::finish_video_async`].
+    pub fn finish_video_async(&mut self) -> ReclaimedVideo {
+        self.pair.finish()
     }
 
     /// See [`CompressedSender::send_scatter_video`].
@@ -1411,6 +1443,73 @@ mod tests {
             crate::test_alloc::allocation_count(|| ScatterVideoFrame::new(format, blocks).unwrap());
         assert_eq!(allocations, 3, "pointer array, size array and stable list");
         assert_eq!(frame.total_bytes(), bytes.len());
+    }
+
+    #[test]
+    fn finishing_reclaims_both_one_or_no_stream_without_allocating() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        for scatter in [false, true]
+            .into_iter()
+            .filter(|scatter| !scatter || cfg!(ndi_has_advanced_scatter_send))
+        {
+            for active in 0..4 {
+                let mut sender = CompressedSender::new(
+                    &ndi,
+                    &SenderOptions::new(crate::test_support::unique_name("finish-streams"))
+                        .clock_video(false),
+                )
+                .unwrap();
+                let mut expected = [None; 2];
+                for (index, tier) in [StreamTier::Program, StreamTier::Preview]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if active & (1 << index) == 0 {
+                        continue;
+                    }
+                    let format = VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16)
+                        .unwrap()
+                        .with_tier(tier);
+                    expected[index] = Some(if scatter {
+                        let frame =
+                            ScatterVideoFrame::new(format, vec![vec![1; 16], vec![2; 8]]).unwrap();
+                        let pointer = frame.blocks().next().unwrap().as_ptr();
+                        assert!(sender.send_scatter_video_async(frame).unwrap().is_none());
+                        pointer
+                    } else {
+                        let frame = CompressedVideoFrame::new(format, vec![1; 16]).unwrap();
+                        let pointer = frame.data().as_ptr();
+                        assert!(sender.send_video_async(frame).unwrap().is_none());
+                        pointer
+                    });
+                }
+                let (reclaimed, allocations) =
+                    crate::test_alloc::allocation_count(|| sender.finish_video_async());
+                assert_eq!(allocations, 0);
+                for (returned, expected) in [reclaimed.program, reclaimed.preview]
+                    .into_iter()
+                    .zip(expected)
+                {
+                    let pointer = returned.map(|frame| match frame {
+                        SubmittedVideo::Contiguous(frame) => {
+                            assert!(!scatter);
+                            frame.data().as_ptr()
+                        }
+                        SubmittedVideo::Scatter(frame) => {
+                            assert!(scatter);
+                            frame.blocks().next().unwrap().as_ptr()
+                        }
+                    });
+                    assert_eq!(pointer, expected);
+                }
+                let empty = sender.split().0.finish_video_async();
+                assert!(empty.program.is_none() && empty.preview.is_none());
+                let closed = sender.close();
+                assert!(closed.program.is_none() && closed.preview.is_none());
+            }
+        }
     }
 
     /// Each stream keeps its own frame in flight: a submission hands back the

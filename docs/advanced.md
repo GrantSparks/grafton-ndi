@@ -125,8 +125,10 @@ returns the displaced `Option<SubmittedVideo>`. Scatter sends retain their
 fallible runtime capability checks. The frame is reusable afterwards.
 Asynchronous video sends hold a frame until
 the next asynchronous send on the same program/preview stream returns it.
-Audio sends are synchronous. `close()` waits for pending SDK use and returns
-remaining video as `ReclaimedVideo`; reclamation does not confirm delivery.
+Audio sends are synchronous. `finish_video_async()` waits for pending SDK use
+and returns both streams' remaining video as `ReclaimedVideo`, keeping the
+source available for further sends. `close()` removes the source and also
+reclaims remaining video. Reclamation does not confirm delivery.
 Moving owned payloads into this wrapper makes no payload copy in the crate;
 the SDK can still copy internally.
 

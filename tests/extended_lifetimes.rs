@@ -130,6 +130,7 @@ fn native_resource_ownership() {
             "compressed_destroy",
             "retained_router_metadata",
             "compressed_close",
+            "compressed_finish",
             "queue_immediate",
             "queue_backlog",
             "queue_split",
@@ -466,6 +467,51 @@ fn child(case: &str) {
                 reads,
                 [expected.as_str(), expected.as_str(), expected.as_str()]
             );
+        }
+        #[cfg(feature = "advanced")]
+        "compressed_finish" => {
+            use grafton_ndi::{
+                advanced::{
+                    CompressedSender, CompressedVideoFrame, SubmittedVideo, VideoCodec,
+                    VideoPacketFormat,
+                },
+                StreamTier,
+            };
+            std::env::set_var("GRAFTON_FAKE_VALIDATE_COMPRESSED_LOANS", "1");
+            let mut sender =
+                CompressedSender::new(&ndi, &SenderOptions::new("compressed-finish")).unwrap();
+            for (tier, value) in [(StreamTier::Program, 11), (StreamTier::Preview, 22)] {
+                let format = VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16)
+                    .unwrap()
+                    .with_tier(tier);
+                let frame = CompressedVideoFrame::new(format, vec![value; 16]).unwrap();
+                assert!(sender.send_video_async(frame).unwrap().is_none());
+            }
+            let reclaimed = sender.finish_video_async();
+            let events = log();
+            assert_eq!(events.matches("sender-flush\n").count(), 1);
+            assert!(!events.contains("sender-destroy-begin\n"));
+            for value in [11, 22] {
+                assert!(
+                    position(&events, "sender-flush")
+                        < position(&events, &format!("sender-loan-released={value}"))
+                );
+            }
+            let empty = sender.split().0.finish_video_async();
+            assert!(empty.program.is_none() && empty.preview.is_none());
+            assert_eq!(log(), events, "an empty finish makes no native call");
+            for (frame, value) in [
+                (reclaimed.program.unwrap(), 11),
+                (reclaimed.preview.unwrap(), 22),
+            ] {
+                let SubmittedVideo::Contiguous(frame) = frame else {
+                    panic!("contiguous frame");
+                };
+                assert_eq!(frame.data()[0], value);
+                assert!(sender.send_video_async(frame).unwrap().is_none());
+            }
+            drop(sender);
+            assert!(position(&log(), "sender-flush") < position(&log(), "sender-destroy-begin"));
         }
         #[cfg(feature = "advanced")]
         "compressed_destroy" | "compressed_close" => {

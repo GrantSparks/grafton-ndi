@@ -661,6 +661,19 @@ pub(crate) mod in_flight {
                 self.loans.slot(tier).submit(self.sender.handle(), next, ());
             self.loans.reclaim_displaced(tier, displaced, synchronized)
         }
+
+        /// A null asynchronous flush synchronizes this sender's two streams
+        /// together. Keep its one proof inside this paired operation until
+        /// both slots are marked released, then recover their owned frames.
+        pub(crate) fn finish(&mut self) -> crate::advanced::ReclaimedVideo {
+            use crate::StreamTier::{Preview, Program};
+            if self.loans.slot(Program).is_in_flight() || self.loans.slot(Preview).is_in_flight() {
+                let synchronized = self.loans.slot(Program).flush(self.sender.handle());
+                let _ = self.loans.slot(Program).completed_with(&synchronized);
+                let _ = self.loans.slot(Preview).completed_with(&synchronized);
+            }
+            self.loans.take_retained()
+        }
     }
 
     #[cfg(feature = "advanced")]
@@ -829,6 +842,12 @@ pub(crate) mod in_flight {
         /// synchronizing call on this slot's stream made after the frame was
         /// submitted.
         pub(crate) fn completed(&mut self, _synchronized: Synchronized) -> Option<&T> {
+            self.completed_with(&_synchronized)
+        }
+
+        /// Only this module may share a sender-wide synchronization proof
+        /// across the slots belonging to the paired sender that minted it.
+        fn completed_with(&mut self, _synchronized: &Synchronized) -> Option<&T> {
             match mem::take(&mut self.0) {
                 State::InFlight(frame) => {
                     self.0 = State::Retained(frame);
@@ -942,7 +961,7 @@ pub(crate) mod in_flight {
         }
     }
 
-    impl InFlight<Sendable<VideoFrame>> {
+    impl<T> InFlight<T> {
         /// Wait for the SDK to release the frame in flight by passing a true
         /// NULL frame pointer, the SDK's documented request to drain the
         /// asynchronous buffer.
@@ -957,7 +976,9 @@ pub(crate) mod in_flight {
             };
             Synchronized { _private: () }
         }
+    }
 
+    impl InFlight<Sendable<VideoFrame>> {
         /// Send `frame` synchronously. When this returns, the SDK has
         /// finished reading `frame` and has released the frame in flight.
         pub(super) fn send(
@@ -1080,6 +1101,13 @@ pub(crate) mod in_flight {
                             "paired submission takes only its owner and fresh frame"
                         );
                     }
+                    if name == "LoanPair" && method_name == "finish" {
+                        assert_eq!(
+                            method.sig.inputs.len(),
+                            1,
+                            "paired finishing must derive its sender and slots from its owner"
+                        );
+                    }
                     if name == "LoanPair" && ["sender", "loans"].contains(&method_name.as_str()) {
                         let syn::ReturnType::Type(_, ty) = &method.sig.output else {
                             panic!("paired accessor must be immutable")
@@ -1100,14 +1128,14 @@ pub(crate) mod in_flight {
                         primitives.push((name.clone(), method_name.clone()));
                     }
                     if name == "LoanPair" && !matches!(method.vis, Visibility::Inherited) {
-                        assert!(["sender", "loans", "shared", "submit_pending", "submit_scatter", "try_submit_queued"].contains(&method_name.as_str()),
+                        assert!(["sender", "loans", "shared", "submit_pending", "submit_scatter", "finish", "try_submit_queued"].contains(&method_name.as_str()),
                             "new paired operation needs an ownership-contract review: {method_name}");
                         paired.push(method_name);
                     }
                 }
             }
             assert_eq!(primitives.len(), 4);
-            assert_eq!(paired.len(), 6);
+            assert_eq!(paired.len(), 7);
         }
 
         #[test]

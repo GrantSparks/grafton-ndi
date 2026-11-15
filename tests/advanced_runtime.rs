@@ -927,6 +927,75 @@ enum Submission {
     ScatterAsync,
 }
 
+/// A sender-wide drain releases contiguous and scatter loans on both tiers,
+/// and the same source delivers the recovered storage when it is sent again.
+#[test]
+fn compressed_finish_keeps_the_source_and_returns_frames_that_can_be_sent_again() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("compressed-finish")).unwrap();
+    let source = sender.sender().source().unwrap();
+    let mut program = packet_receiver(&ndi, &source, ReceiverBandwidth::Highest);
+    let mut preview = packet_receiver(&ndi, &source, ReceiverBandwidth::Lowest);
+    for (receiver, tier) in [
+        (&mut program, StreamTier::Program),
+        (&mut preview, StreamTier::Preview),
+    ] {
+        connect(
+            receiver,
+            &format!("the {tier:?} drain receiver"),
+            |timecode| {
+                sender
+                    .send_video(&mut keyframe(VideoCodec::H264, tier, timecode))
+                    .unwrap();
+            },
+        );
+    }
+    let mut program_frame = keyframe(VideoCodec::H264, StreamTier::Program, FIRST_TIMECODE + 1);
+    let mut preview_frame = ScatterVideoFrame::new(
+        video_format(VideoCodec::H264, StreamTier::Preview),
+        split(
+            &video_bytes(VideoCodec::H264, FIRST_TIMECODE + 2, true),
+            &[44],
+        ),
+    )
+    .unwrap();
+    preview_frame.set_timecode(Timecode::from_ticks(FIRST_TIMECODE + 2));
+    let program_pointer = program_frame.data().as_ptr();
+    let preview_pointer = preview_frame.blocks().next().unwrap().as_ptr();
+    for pass in 0..2 {
+        let program_timecode = FIRST_TIMECODE + 1 + pass * 10;
+        let preview_timecode = FIRST_TIMECODE + 2 + pass * 10;
+        program_frame.set_timecode(Timecode::from_ticks(program_timecode));
+        preview_frame.set_timecode(Timecode::from_ticks(preview_timecode));
+        assert!(sender.send_video_async(program_frame).unwrap().is_none());
+        assert!(sender
+            .send_scatter_video_async(preview_frame)
+            .unwrap()
+            .is_none());
+        let reclaimed = sender.finish_video_async();
+        let Some(SubmittedVideo::Contiguous(returned_program)) = reclaimed.program else {
+            panic!("the contiguous program frame is recovered");
+        };
+        let Some(SubmittedVideo::Scatter(returned_preview)) = reclaimed.preview else {
+            panic!("the scatter preview frame is recovered");
+        };
+        assert_eq!(returned_program.data().as_ptr(), program_pointer);
+        assert_eq!(
+            returned_preview.blocks().next().unwrap().as_ptr(),
+            preview_pointer
+        );
+        await_video(&mut program, program_timecode);
+        await_video(&mut preview, preview_timecode);
+        assert_eq!(sender.sender().source().unwrap().name(), source.name());
+        program_frame = returned_program;
+        preview_frame = returned_preview;
+    }
+    assert!(sender.close().program.is_none());
+}
+
 /// Every video codec, on both streams, protected and not, arrives exactly as
 /// it was sent, however it was submitted.
 #[test]
