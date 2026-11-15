@@ -1849,6 +1849,10 @@ mod tests {
         )
         .unwrap();
         let buffer = Mutex::new(Some(buffer));
+        // Some platforms allocate a native mutex on its first lock. Initialize
+        // this application policy's pool lock outside the measured callback;
+        // register initializes the registry's own lock before SDK calls begin.
+        drop(lock(&buffer));
         let token = registry
             .register(move |_| Ok(lock(&buffer).take().unwrap()))
             .unwrap();
