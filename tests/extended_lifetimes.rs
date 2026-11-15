@@ -14,7 +14,8 @@ use grafton_ndi::{
         AdvertiserOptions, RecvAdvertisement, RecvAdvertiser, SendAdvertisement, SendAdvertiser,
     },
     runtime::RuntimeOptions,
-    Error, Ndi, Receiver, ReceiverOptions, Sender, SenderOptions, Source, VideoFrame,
+    Error, Ndi, Receiver, ReceiverOptions, Sender, SenderOptions, Source, SourceAddress,
+    VideoFrame,
 };
 use runtime_fixture::FakeRuntime;
 use std::{
@@ -65,6 +66,26 @@ fn sender(ndi: &Ndi) -> Sender {
     Sender::new(ndi, &SenderOptions::new("fixture")).unwrap()
 }
 
+fn retained_source(name: &str, address: &str) -> Source {
+    Source::new(name).with_address(SourceAddress::new(address))
+}
+
+fn assert_retained_reads(kind: &str, expected: &[(&str, &str)]) {
+    let prefix = format!("retained-source:{kind}:");
+    let observed = log()
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
+        .collect::<Vec<_>>();
+    let expected = expected
+        .iter()
+        .map(|(name, address)| format!("{}:{}", hex(name.as_bytes()), hex(address.as_bytes())))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed, expected,
+        "later reads must retain the exact source"
+    );
+}
+
 #[test]
 fn native_resource_ownership() {
     if let Ok(case) = std::env::var("GRAFTON_OWNERSHIP_CHILD") {
@@ -85,6 +106,11 @@ fn native_resource_ownership() {
     }
     .build(&missing_scatter.join("libndi_advanced.so"));
     let mut scenarios = vec![
+        "retained_failover",
+        "retained_registered_failover",
+        "retained_concurrent_failover",
+        "retained_routes",
+        "retained_connection_targets",
         "sender_unregistered",
         "sender_copy_reuse",
         "sender_registration",
@@ -194,7 +220,156 @@ fn child(case: &str) {
             return;
         }
     }
+    if case.starts_with("retained_") {
+        std::env::set_var("GRAFTON_FAKE_RETAIN_SOURCES", "1");
+    }
     match case {
+        "retained_failover" => {
+            let sender = sender(&ndi);
+            sender
+                .set_failover(&retained_source("first failover", "192.0.2.1:5960"))
+                .unwrap();
+            sender
+                .set_failover(&retained_source(
+                    "second failover",
+                    "http://backup.example/ndi",
+                ))
+                .unwrap();
+            sender.clear_failover();
+            sender
+                .set_failover(&retained_source("last failover", "192.0.2.3:5962"))
+                .unwrap();
+            drop(sender);
+            assert_retained_reads(
+                "failover",
+                &[
+                    ("first failover", "192.0.2.1:5960"),
+                    ("second failover", "http://backup.example/ndi"),
+                    ("last failover", "192.0.2.3:5962"),
+                ],
+            );
+        }
+        "retained_registered_failover" => {
+            let sender = sender(&ndi);
+            sender
+                .set_failover(&retained_source("registered failover", "192.0.2.5:5960"))
+                .unwrap();
+            let mut advertiser = SendAdvertiser::new(&ndi, &server()).unwrap();
+            let _registration = advertiser
+                .register(&sender, SendAdvertisement::default())
+                .unwrap();
+            drop(sender);
+            assert!(!log().contains("sender-destroy\n"));
+            assert_retained_reads("failover", &[]);
+            drop(advertiser);
+            assert_retained_reads("failover", &[("registered failover", "192.0.2.5:5960")]);
+            let events = log();
+            assert!(
+                position(&events, "send-advertiser-destroy")
+                    < position(&events, "sender-destroy-begin")
+            );
+        }
+        "retained_concurrent_failover" => {
+            let sender = sender(&ndi);
+            std::thread::scope(|scope| {
+                for worker in 0..4 {
+                    let sender = &sender;
+                    scope.spawn(move || {
+                        for change in 0..20 {
+                            let name = format!("concurrent-{worker}-{change}");
+                            let address = format!("http://example.test/{name}");
+                            sender
+                                .set_failover(&retained_source(&name, &address))
+                                .unwrap();
+                        }
+                    });
+                }
+            });
+            drop(sender);
+            let events = log();
+            let reads = events
+                .lines()
+                .filter_map(|line| line.strip_prefix("retained-source:failover:"))
+                .collect::<Vec<_>>();
+            assert_eq!(reads.len(), 80);
+            for read in reads {
+                assert!(
+                    (0..4).any(|worker| (0..20).any(|change| {
+                        let name = format!("concurrent-{worker}-{change}");
+                        read == format!(
+                            "{}:{}",
+                            hex(name.as_bytes()),
+                            hex(format!("http://example.test/{name}").as_bytes())
+                        )
+                    })),
+                    "a concurrent request must retain its matching name and address: {read}"
+                );
+            }
+        }
+        "retained_routes" => {
+            use grafton_ndi::routing::{Router, RouterOptions};
+            let mut router = Router::new(&ndi, &RouterOptions::new("retained router")).unwrap();
+            for name in ["route A", "route B"] {
+                router
+                    .change(&retained_source(name, "192.0.2.10:5960"))
+                    .unwrap();
+            }
+            std::env::set_var("GRAFTON_FAKE_ROUTING_CHANGE", "refuse");
+            for name in ["refused C", "refused D"] {
+                assert!(router
+                    .change(&retained_source(name, "http://refused.example/ndi"))
+                    .is_err());
+            }
+            std::env::remove_var("GRAFTON_FAKE_ROUTING_CHANGE");
+            router
+                .change(&retained_source("route E", "192.0.2.11:5960"))
+                .unwrap();
+            router.clear().unwrap();
+            router
+                .change(&retained_source("route F", "192.0.2.12:5960"))
+                .unwrap();
+            drop(router);
+            assert_retained_reads(
+                "route",
+                &[
+                    ("route A", "192.0.2.10:5960"),
+                    ("route B", "192.0.2.10:5960"),
+                    ("route B", "192.0.2.10:5960"),
+                    ("route B", "192.0.2.10:5960"),
+                    ("route E", "192.0.2.11:5960"),
+                    ("route F", "192.0.2.12:5960"),
+                ],
+            );
+            assert_retained_reads(
+                "refused-route",
+                &[
+                    ("refused C", "http://refused.example/ndi"),
+                    ("refused D", "http://refused.example/ndi"),
+                ],
+            );
+        }
+        "retained_connection_targets" => {
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+            receiver
+                .connect_to(&retained_source("target A", "192.0.2.20:5960"))
+                .unwrap();
+            receiver.reconnect();
+            receiver
+                .connect_to(&retained_source("target B", "http://target.example/ndi"))
+                .unwrap();
+            receiver.disconnect();
+            receiver.reconnect();
+            drop(receiver);
+            assert_retained_reads(
+                "receiver",
+                &[
+                    ("target A", "192.0.2.20:5960"),
+                    ("target A", "192.0.2.20:5960"),
+                    ("target B", "http://target.example/ndi"),
+                    ("target B", "http://target.example/ndi"),
+                ],
+            );
+        }
         #[cfg(feature = "advanced")]
         "compressed_destroy" | "compressed_close" => {
             use grafton_ndi::{

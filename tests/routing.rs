@@ -3,13 +3,13 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name);
+common_helpers!(runtime, name, loopback, endpoint);
 
 use grafton_ndi::{
     routing::{Router, RouterOptions},
-    Sender, SenderOptions,
+    PixelFormat, Receiver, ReceiverOptions, Sender, SenderOptions, Timecode, VideoFrame,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn a_router_advertises_itself_and_accepts_route_changes() {
@@ -43,4 +43,53 @@ fn a_router_advertises_itself_and_accepts_route_changes() {
     })
     .join()
     .unwrap();
+}
+
+/// The SDK may read the route only after a later receiver connects.
+#[test]
+fn a_receiver_connects_after_the_route_input_is_dropped() {
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    let sender = Sender::new(
+        &ndi,
+        &SenderOptions::new(common::unique_name("retained routing target")).clock_video(false),
+    )
+    .unwrap();
+    let mut router = Router::new(
+        &ndi,
+        &RouterOptions::new(common::unique_name("retained route")),
+    )
+    .unwrap();
+    {
+        let target = common::loopback_source(&ndi, &sender).unwrap();
+        router.change(&target).unwrap();
+    }
+    let route = common::loopback_endpoint(&ndi, router.source().unwrap().name()).unwrap();
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(route)).unwrap();
+    let mut frame = VideoFrame::builder()
+        .resolution(64, 32)
+        .pixel_format(PixelFormat::Bgra)
+        .timecode(Timecode::from_ticks(72))
+        .build()
+        .unwrap();
+    frame.data_mut().fill(72);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        sender.send_video(&frame).unwrap();
+        if let Some(received) = receiver
+            .video()
+            .capture_ref(Duration::from_millis(100))
+            .unwrap()
+        {
+            assert_eq!((received.width(), received.height()), (64, 32));
+            assert_eq!(received.timecode(), Timecode::from_ticks(72));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the receiver never received the retained route"
+        );
+    }
+    router.clear().unwrap();
 }
