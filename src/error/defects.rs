@@ -937,9 +937,6 @@ pub enum SdkResultDefect {
         /// The operation.
         operation: crate::NativeFunction,
     },
-    /// SDK string is missing a NUL terminator within {MAX_METADATA_BYTES} bytes.
-    #[error("SDK string is missing a NUL terminator within {MAX_METADATA_BYTES} bytes")]
-    UnterminatedReceiverText,
     /// SDK returned invalid receive delay: {millis} ms.
     #[error("SDK returned invalid receive delay: {millis} ms")]
     InvalidReceiveDelay {

@@ -3340,12 +3340,25 @@ pub(crate) const MAX_SDK_STRING_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) unsafe fn copy_sdk_string(
     text: crate::sys::table::Called<*const c_char>,
 ) -> Result<String> {
-    let (text, operation) = text.into_parts();
     // SAFETY: forwarded to the caller's obligation.
-    let bytes = unsafe { bounded_sdk_text(text, MAX_SDK_STRING_BYTES) }.ok_or({
-        Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedText { operation })
-    })?;
+    let bytes = unsafe { sdk_text(text) }?;
     Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Read one bounded SDK C string, retaining its producing entry point.
+///
+/// # Safety
+///
+/// The pointer in `text` must be non-null and readable byte-by-byte until its
+/// first NUL or [`MAX_SDK_STRING_BYTES`] bytes, and remain live for `'a`.
+pub(crate) unsafe fn sdk_text<'a>(
+    text: crate::sys::table::Called<*const c_char>,
+) -> Result<&'a [u8]> {
+    let (text, operation) = text.into_parts();
+    // SAFETY: forwarded to the caller's lifetime and readable-bound obligation.
+    unsafe { bounded_sdk_text(text, MAX_SDK_STRING_BYTES) }.ok_or(Error::UnexpectedSdkResult(
+        crate::SdkResultDefect::UnterminatedText { operation },
+    ))
 }
 
 // ============================================================================

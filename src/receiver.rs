@@ -62,27 +62,22 @@ use crate::{
 /// A string the receiver API returned, released when dropped.
 struct RecvStringGuard<'a> {
     core: &'a ReceiverCore,
-    pointer: *const c_char,
+    string: sys::table::Called<*const c_char>,
     strings: &'a sys::ReceiverStrings,
 }
 impl RecvStringGuard<'_> {
     /// The string's bytes before its terminator, or `None` for a null string.
     ///
     /// The scan for the terminator is bounded by
-    /// [`MAX_METADATA_BYTES`](crate::frames::MAX_METADATA_BYTES); a string
+    /// [`MAX_SDK_STRING_BYTES`](crate::frames::MAX_SDK_STRING_BYTES); a string
     /// without one within it is an [`Error::UnexpectedSdkResult`].
     fn bytes(&self) -> Result<Option<&[u8]>> {
-        if self.pointer.is_null() {
+        if self.string.value().is_null() {
             return Ok(None);
         }
         // SAFETY: the SDK returned a readable NUL-terminated string, which
         // this guard keeps allocated for as long as it is borrowed.
-        let bytes = unsafe {
-            crate::frames::bounded_sdk_text(self.pointer, crate::frames::MAX_METADATA_BYTES)
-        }
-        .ok_or(Error::UnexpectedSdkResult(
-            crate::SdkResultDefect::UnterminatedReceiverText,
-        ))?;
+        let bytes = unsafe { crate::frames::sdk_text(self.string) }?;
         Ok(Some(bytes))
     }
 
@@ -108,12 +103,12 @@ impl RecvStringGuard<'_> {
 }
 impl Drop for RecvStringGuard<'_> {
     fn drop(&mut self) {
-        if !self.pointer.is_null() {
+        if !self.string.value().is_null() {
             // SAFETY: the SDK returned this string for this instance and it is
             // released exactly once.
             unsafe {
                 self.strings
-                    .NDIlib_recv_free_string(self.core.instance.0, self.pointer)
+                    .NDIlib_recv_free_string(self.core.instance.0, self.string.into_value())
             };
         }
     }
@@ -1371,7 +1366,11 @@ impl<M: ReceiverMode> Receiver<M> {
         let guard = RecvStringGuard {
             core: &self.core,
             // SAFETY: the receiver instance is live for this borrow.
-            pointer: unsafe { web_control.NDIlib_recv_get_web_control(self.core.instance.0) },
+            string: unsafe {
+                web_control
+                    .named()
+                    .NDIlib_recv_get_web_control(self.core.instance.0)
+            },
             strings,
         };
         guard.copy()
@@ -1972,14 +1971,18 @@ impl ReceiverCore {
             // SAFETY: the receiver instance is live for this borrow and `pointer` is
             // writable storage for the returned string.
             let changed = unsafe {
-                source_name.NDIlib_recv_get_source_name(self.instance.0, &mut pointer, remaining)
+                source_name.named().NDIlib_recv_get_source_name(
+                    self.instance.0,
+                    &mut pointer,
+                    remaining,
+                )
             };
             let guard = RecvStringGuard {
                 core: self,
-                pointer,
+                string: changed.map(|_| pointer),
                 strings,
             };
-            if !changed {
+            if !changed.into_value() {
                 return Ok(None);
             }
             // The SDK reports a change only once, since the previous call, so a
@@ -2979,7 +2982,10 @@ mod tests {
         ] {
             let guard = RecvStringGuard {
                 core: &receiver.core,
-                pointer: CString::new(bytes).unwrap().into_raw(),
+                string: sys::table::for_test(
+                    CString::new(bytes).unwrap().into_raw().cast_const(),
+                    c"NDIlib_recv_get_web_control",
+                ),
                 strings: &strings,
             };
             assert_eq!(guard.copy().is_ok(), valid);
@@ -2987,7 +2993,7 @@ mod tests {
         }
         let empty = RecvStringGuard {
             core: &receiver.core,
-            pointer: ptr::null(),
+            string: sys::table::for_test(ptr::null(), c"NDIlib_recv_get_web_control"),
             strings: &strings,
         };
         assert_eq!(empty.copy().unwrap(), None);
@@ -3006,11 +3012,11 @@ mod tests {
         let strings = sys::ReceiverStrings {
             NDIlib_recv_free_string: keep,
         };
-        let max = crate::frames::MAX_METADATA_BYTES;
+        let max = crate::frames::MAX_SDK_STRING_BYTES;
         let copy = |bytes: &[u8]| {
             RecvStringGuard {
                 core: &receiver.core,
-                pointer: bytes.as_ptr().cast(),
+                string: sys::table::for_test(bytes.as_ptr().cast(), c"NDIlib_recv_get_source_name"),
                 strings: &strings,
             }
             .copy_lossy()
@@ -3025,10 +3031,24 @@ mod tests {
         assert_eq!(copy(&longest).unwrap().unwrap().len(), max - 1);
         // Without one, the scan stops at the bound and reports an error.
         let unterminated = vec![b'x'; max];
-        assert!(matches!(
-            copy(&unterminated),
-            Err(Error::UnexpectedSdkResult(_))
-        ));
+        let (result, allocations) = crate::test_alloc::allocation_count(|| copy(&unterminated));
+        assert!(
+            matches!(result, Err(Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedText { operation }))
+            if operation == c"NDIlib_recv_get_source_name")
+        );
+        assert_eq!(allocations, 0);
+        let guard = RecvStringGuard {
+            core: &receiver.core,
+            string: sys::table::for_test(
+                unterminated.as_ptr().cast(),
+                c"NDIlib_recv_get_web_control",
+            ),
+            strings: &strings,
+        };
+        assert!(
+            matches!(guard.copy(), Err(Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedText { operation }))
+            if operation == c"NDIlib_recv_get_web_control")
+        );
     }
 
     #[test]
