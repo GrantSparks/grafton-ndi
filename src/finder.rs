@@ -534,11 +534,24 @@ impl Finder {
             .snapshot(snapshot)
     }
 
-    fn lock_snapshots<S: Stop>(
-        &self,
+    fn lock_snapshots<'finder, S: Stop>(
+        &'finder self,
         deadline: Option<Deadline>,
         stop: S,
-    ) -> Option<SnapshotGuard<'_>> {
+    ) -> Option<SnapshotGuard<'finder>> {
+        self.lock_snapshots_with(deadline, stop, |remaining| {
+            self.sources_lock.try_lock_for(remaining)
+        })
+    }
+
+    // The acquisition is injectable so cancellation can be tested exactly
+    // when a contended lock becomes available, without scheduler timing.
+    fn lock_snapshots_with<'finder, S: Stop>(
+        &'finder self,
+        deadline: Option<Deadline>,
+        stop: S,
+        mut acquire: impl FnMut(Duration) -> Option<parking_lot::MutexGuard<'finder, FindInstance>>,
+    ) -> Option<SnapshotGuard<'finder>> {
         let instance = if S::CAN_STOP {
             loop {
                 if stop.is_stopped() {
@@ -546,7 +559,12 @@ impl Finder {
                 }
                 let remaining =
                     deadline.map_or(POLL_INTERVAL, |end| end.remaining().min(POLL_INTERVAL));
-                if let Some(instance) = self.sources_lock.try_lock_for(remaining) {
+                if let Some(instance) = acquire(remaining) {
+                    // Cancellation may arrive while the lock is waiting. Do
+                    // not start a new native snapshot after that wait succeeds.
+                    if stop.is_stopped() {
+                        return None;
+                    }
                     break instance;
                 }
                 if deadline.is_some_and(Deadline::is_expired) {
@@ -1856,6 +1874,44 @@ mod tests {
         // One vector, its name, the Arc header, host key and map storage.
         assert_eq!(allocations, 5);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    #[test]
+    fn cancellation_during_successful_snapshot_lock_acquisition_skips_the_snapshot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let finder = Finder::new(&ndi, &FinderOptions::new()).unwrap();
+        for deadline in [None, Some(Deadline::after(Duration::from_secs(3)).unwrap())] {
+            let stop = AtomicBool::new(false);
+            let mut held = Some(finder.sources_lock.lock());
+            let mut acquired = false;
+            let result = finder.lock_snapshots_with(deadline, &stop, |remaining| {
+                assert!(!stop.load(Ordering::Acquire));
+                assert!(remaining > Duration::ZERO && remaining <= POLL_INTERVAL);
+                // Model cancellation arriving while the acquisition waits,
+                // followed by the current holder releasing within this slice.
+                stop.store(true, Ordering::Release);
+                drop(held.take());
+                let instance = finder.sources_lock.try_lock_for(remaining);
+                acquired = instance.is_some();
+                instance
+            });
+            assert!(
+                acquired,
+                "the cancelled wait must exercise a successful acquisition"
+            );
+            assert!(
+                result.is_none(),
+                "cancellation must withhold the native snapshot guard"
+            );
+            assert!(
+                finder.sources_lock.try_lock().is_some(),
+                "the cancelled acquisition must release its lock"
+            );
+        }
     }
 
     #[cfg(any(feature = "tokio", feature = "smol"))]
