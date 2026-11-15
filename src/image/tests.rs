@@ -2414,6 +2414,8 @@ fn image_encoding_resources() {
     let input = |name: &str| std::env::var_os(name).map(|path| std::fs::read(path).unwrap());
     let (photo, graphics) = (input("GRAFTON_NDI_PHOTO"), input("GRAFTON_NDI_GRAPHICS"));
     let selected = std::env::var("GRAFTON_NDI_OUTPUTS").ok();
+    let contents = std::env::var("GRAFTON_NDI_CONTENTS").ok();
+    let formats = std::env::var("GRAFTON_NDI_FORMATS").ok();
     let dump = std::env::var_os("GRAFTON_NDI_IMAGE_DUMP").map(std::path::PathBuf::from);
     if let Some(path) = &dump {
         std::fs::create_dir_all(path).unwrap();
@@ -2428,7 +2430,17 @@ fn image_encoding_resources() {
         .collect();
     eprintln!("source,content,width,height,output,median_ms,peak_encode_bytes,output_bytes");
     for (width, height) in sizes {
-        for (content, input) in [("photographic", &photo), ("graphics", &graphics)] {
+        for (content, input) in [
+            ("photographic", &photo),
+            ("graphics", &graphics),
+            ("graphics-alpha", &graphics),
+        ] {
+            if contents
+                .as_ref()
+                .is_some_and(|selected| !selected.split(',').any(|name| name == content))
+            {
+                continue;
+            }
             let rgba = content_rgba(content, width, height, input.as_deref());
             eprintln!(
                 "input,{content},{width},{height},sha256={:02x?}",
@@ -2445,6 +2457,13 @@ fn image_encoding_resources() {
                 PixelFormat::P216,
                 PixelFormat::Na4g,
             ] {
+                if formats.as_ref().is_some_and(|selected| {
+                    !selected
+                        .split(',')
+                        .any(|name| name.eq_ignore_ascii_case(&format!("{format:?}")))
+                }) {
+                    continue;
+                }
                 let frame = frame_from_rgba(format, width, height, &rgba);
                 let outputs = [
                     (
@@ -2478,6 +2497,42 @@ fn image_encoding_resources() {
                         options(ImageFormat::WebpLossy(75))
                             .webp_effort(0)
                             .webp_sharp_yuv(false),
+                    ),
+                    (
+                        "png-fast-half",
+                        options(ImageFormat::Png)
+                            .png_compression(PngCompression::Fast)
+                            .downscale(Downscale::Half),
+                    ),
+                    (
+                        "jpeg85-half",
+                        options(ImageFormat::Jpeg(85)).downscale(Downscale::Half),
+                    ),
+                    (
+                        "webp-half",
+                        options(ImageFormat::WebpLossless).downscale(Downscale::Half),
+                    ),
+                    (
+                        "webp-lossy75-half",
+                        options(ImageFormat::WebpLossy(75)).downscale(Downscale::Half),
+                    ),
+                    (
+                        "png-fast-eighth",
+                        options(ImageFormat::Png)
+                            .png_compression(PngCompression::Fast)
+                            .downscale(Downscale::Eighth),
+                    ),
+                    (
+                        "jpeg85-eighth",
+                        options(ImageFormat::Jpeg(85)).downscale(Downscale::Eighth),
+                    ),
+                    (
+                        "webp-eighth",
+                        options(ImageFormat::WebpLossless).downscale(Downscale::Eighth),
+                    ),
+                    (
+                        "webp-lossy75-eighth",
+                        options(ImageFormat::WebpLossy(75)).downscale(Downscale::Eighth),
                     ),
                     (
                         "png-fast-quarter",
@@ -2550,7 +2605,7 @@ fn content_rgba(content: &str, width: usize, height: usize, input: Option<&[u8]>
     let mut out = Vec::with_capacity(width * height * 4);
     for y in 0..height {
         for x in 0..width {
-            let pixel: [u8; 4] = match (content, input) {
+            let mut pixel: [u8; 4] = match (content, input) {
                 (_, Some(input)) => {
                     let (sx, sy) = (x * 1920 / width, y * 1080 / height);
                     input[(sy * 1920 + sx) * 4..][..4].try_into().unwrap()
@@ -2574,6 +2629,13 @@ fn content_rgba(content: &str, width: usize, height: usize, input: Option<&[u8]>
                     }
                 }
             };
+            if content == "graphics-alpha" {
+                pixel[3] = match (x / 31 + y / 23) % 4 {
+                    0 => 0,
+                    1 => 255,
+                    _ => ((x * 17 + y * 29) % 256) as u8,
+                };
+            }
             out.extend_from_slice(&pixel);
         }
     }
