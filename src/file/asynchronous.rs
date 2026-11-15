@@ -28,7 +28,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
-        Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak,
     },
     task::{Context, Poll, Waker},
     thread::{self, JoinHandle},
@@ -653,9 +653,7 @@ struct Events<E> {
     queue: VecDeque<Result<E>>,
     capacity: usize,
     dropped: u64,
-    closed: bool,
-    /// The queue closed because the owner thread failed.
-    failed: bool,
+    end: Option<EventEnd>,
     waiter: Option<EventWaiter>,
 }
 
@@ -667,8 +665,7 @@ impl<E> EventQueue<E> {
             queue: VecDeque::new(),
             capacity,
             dropped: 0,
-            closed: false,
-            failed: false,
+            end: None,
             waiter: None,
         }))
     }
@@ -686,14 +683,15 @@ impl<E> EventQueue<E> {
         WakerSlot::wake(wake);
     }
 
-    /// End every wait: nothing more will be pushed. Idempotent. `failed`
-    /// records that the owner thread failed, so waits report that; once
-    /// recorded it stays.
-    fn close(&self, failed: bool) {
+    /// End every wait. A failed end overrides an ordinary stop, including
+    /// one published before a native destructor panicked.
+    fn close(&self, end: EventEnd) {
         let wake = {
             let mut events = lock(&self.0);
-            events.closed = true;
-            events.failed |= failed;
+            events.end = Some(match events.end {
+                Some(EventEnd::Failed) => EventEnd::Failed,
+                _ => end,
+            });
             events.waiter.take().and_then(|mut w| w.waker.take())
         };
         WakerSlot::wake(wake);
@@ -826,8 +824,8 @@ impl<E> Future for FileEventFuture<E> {
             }
             let ready = if let Some(event) = events.queue.pop_front() {
                 Some(event.map(Some))
-            } else if events.closed {
-                Some(Err(stopped(events.failed)))
+            } else if let Some(end) = events.end {
+                Some(Err(stopped(end == EventEnd::Failed)))
             } else if deadline.is_expired() {
                 Some(Ok(None))
             } else {
@@ -879,25 +877,51 @@ impl<E> Drop for FileEventFuture<E> {
     }
 }
 
-struct Closing {
-    complete: bool,
-    failed: bool,
-    /// Every close still awaited. Each completes once the object is gone; a
-    /// close whose future was dropped is forgotten when the next one arrives,
-    /// so this holds at most the closes still awaited.
-    replies: Vec<Reply<()>>,
+/// Why an owner stopped. Failure is published before native cleanup, while
+/// success is known only once destruction completes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnerExit {
+    Closed,
+    Failed,
+}
+
+impl OwnerExit {
+    fn result(self) -> Result<()> {
+        match self {
+            Self::Closed => Ok(()),
+            Self::Failed => Err(stopped(true)),
+        }
+    }
+
+    fn event_end(self) -> EventEnd {
+        match self {
+            Self::Closed => EventEnd::Stopped,
+            Self::Failed => EventEnd::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventEnd {
+    Stopped,
+    Failed,
+}
+
+/// Native cleanup completion is independent of knowing that the owner failed.
+/// A close submitted during failed cleanup still waits for destruction.
+enum Closing {
+    Waiting(Vec<Reply<()>>),
+    Complete,
 }
 
 struct Control {
     /// Creation has returned its handle to the caller. Only a claimed handle
     /// can make its last ordinary drop wait for finalization.
     claimed: AtomicBool,
-    shutdown: AtomicBool,
     /// The first close or last-handle drop starts the one finalization budget.
-    shutdown_at: Mutex<Option<Instant>>,
-    /// The owner thread has failed. Set before the thread's command queue is
-    /// dropped, so a command left in it can tell.
-    failed: AtomicBool,
+    shutdown_at: OnceLock<Instant>,
+    /// The sole owner outcome. A failure is visible before cleanup starts.
+    outcome: OnceLock<OwnerExit>,
     closing: Mutex<Closing>,
 }
 
@@ -911,14 +935,9 @@ impl Control {
     fn new() -> Self {
         Self {
             claimed: AtomicBool::new(false),
-            shutdown: AtomicBool::new(false),
-            shutdown_at: Mutex::new(None),
-            failed: AtomicBool::new(false),
-            closing: Mutex::new(Closing {
-                complete: false,
-                failed: false,
-                replies: Vec::new(),
-            }),
+            shutdown_at: OnceLock::new(),
+            outcome: OnceLock::new(),
+            closing: Mutex::new(Closing::Waiting(Vec::new())),
         }
     }
 
@@ -934,61 +953,58 @@ impl Control {
         let (reply, future) = operation();
         {
             let mut closing = lock(&self.closing);
-            if closing.complete {
-                reply.complete(if closing.failed {
-                    Err(Error::InvalidState(StateError::OwnerFailed))
-                } else {
-                    Ok(())
-                });
+            let Closing::Waiting(replies) = &mut *closing else {
+                let outcome = *self
+                    .outcome
+                    .get()
+                    .expect("completed cleanup has an outcome");
+                drop(closing);
+                reply.complete(outcome.result());
                 return future;
-            }
-            closing
-                .replies
-                .retain(|reply| !reply.shared.cancelled.load(Ordering::Acquire));
-            closing.replies.push(reply);
+            };
+            replies.retain(|reply| !reply.shared.cancelled.load(Ordering::Acquire));
+            replies.push(reply);
         }
         self.request_shutdown();
         future
     }
 
-    /// Record the first shutdown request before publishing it. Return whether
+    /// Publish the request and its budget start as one fact. Return whether
     /// shutdown had already been requested, as last-handle drops need to know.
     fn request_shutdown(&self) -> bool {
-        let mut at = lock(&self.shutdown_at);
-        let requested = at.is_some();
-        at.get_or_insert_with(Instant::now);
-        self.shutdown.store(true, Ordering::Release);
-        requested
+        self.shutdown_at.set(Instant::now()).is_err()
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_at.get().is_some()
     }
 
     fn shutdown_requested_at(&self) -> Option<Instant> {
-        if self.shutdown.load(Ordering::Acquire) {
-            *lock(&self.shutdown_at)
-        } else {
-            None
-        }
+        self.shutdown_at.get().copied()
     }
 
     fn failed(&self) -> bool {
-        self.failed.load(Ordering::Acquire)
+        self.outcome.get() == Some(&OwnerExit::Failed)
     }
 
-    fn completed(&self, failed: bool) {
-        if failed {
-            self.failed.store(true, Ordering::Release);
-        }
+    fn publish_failure(&self) {
+        let _ = self.outcome.set(OwnerExit::Failed);
+    }
+
+    /// Complete the exit only after native destruction. Failure may already
+    /// be recorded, so its early publication cannot complete a close early.
+    fn exit<E>(&self, outcome: OwnerExit, events: &EventQueue<E>) {
+        let outcome = *self.outcome.get_or_init(|| outcome);
+        events.close(outcome.event_end());
         let replies = {
             let mut closing = lock(&self.closing);
-            closing.complete = true;
-            closing.failed = failed;
-            std::mem::take(&mut closing.replies)
+            match std::mem::replace(&mut *closing, Closing::Complete) {
+                Closing::Waiting(replies) => replies,
+                Closing::Complete => return,
+            }
         };
         for reply in replies {
-            reply.complete(if failed {
-                Err(Error::InvalidState(StateError::OwnerFailed))
-            } else {
-                Ok(())
-            });
+            reply.complete(outcome.result());
         }
     }
 }
@@ -1014,6 +1030,9 @@ trait Owner: 'static {
         TICK
     }
 
+    /// Fail registered work before the native cleanup of a panicked owner.
+    fn fail_pending(&mut self) {}
+
     /// Finish registered work and cleanup within the original close budget.
     fn shutdown(
         &mut self,
@@ -1032,10 +1051,10 @@ impl Owner for FilePlayer {
 }
 
 /// Recorder state that belongs to its owner thread, never to the native type.
-/// Drop replies before native cleanup when another command panics.
+/// Failure teardown explicitly resolves replies before native cleanup.
 struct RecorderOwner {
-    waiters: FinishWaiters<Reply<FinishStatus>>,
     recorder: FileRecorder,
+    waiters: FinishWaiters<Reply<FinishStatus>>,
 }
 
 impl FinishReply for Reply<FinishStatus> {
@@ -1094,7 +1113,7 @@ impl RecorderOwner {
                 at,
             },
             &mut |event| events.push(event),
-            || control.shutdown.load(Ordering::Acquire),
+            || control.shutdown_requested(),
             None,
         )
     }
@@ -1150,6 +1169,10 @@ impl Owner for RecorderOwner {
         self.waiters.wait_timeout(TICK)
     }
 
+    fn fail_pending(&mut self) {
+        self.waiters.fail(StateError::OwnerFailed);
+    }
+
     fn shutdown(
         &mut self,
         requested: Instant,
@@ -1159,7 +1182,7 @@ impl Owner for RecorderOwner {
         self.waiters.retain();
         let notify = self.waiters.notifies_cleanup();
         if !notify {
-            events.close(false);
+            events.close(EventEnd::Stopped);
         }
         self.recorder.drain_cleanup(
             requested,
@@ -1170,7 +1193,7 @@ impl Owner for RecorderOwner {
                     events.push(event);
                 }
             },
-            || control.shutdown.load(Ordering::Acquire),
+            || control.shutdown_requested(),
         );
     }
 }
@@ -1307,7 +1330,11 @@ struct Worker<H: Owner> {
     admission: Arc<Admission>,
     control: Arc<Control>,
     events: Arc<EventQueue<H::Event>>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    // JoinHandle's shared return packet is not RefUnwindSafe. This owner
+    // never examines it after unwinding: the handle is installed once, then
+    // taken only with &mut self and consumed by Drop's join. Assert that local
+    // boundary, preserving the handles' existing public unwind auto traits.
+    thread: OnceLock<AssertUnwindSafe<JoinHandle<()>>>,
 }
 
 impl<H: Owner> Drop for Worker<H> {
@@ -1317,7 +1344,7 @@ impl<H: Owner> Drop for Worker<H> {
         // A handle still in its creation response cannot be closed by the
         // caller, so cancellation only requests shutdown and detaches.
         let closing = self.control.request_shutdown();
-        let Some(thread) = lock(&self.thread).take() else {
+        let Some(thread) = self.thread.take() else {
             return;
         };
         // A File thread may release this last handle through an executor's
@@ -1325,7 +1352,7 @@ impl<H: Owner> Drop for Worker<H> {
         // an owner that could join it back while releasing another handle.
         if self.control.claimed.load(Ordering::Acquire) && !closing && !FILE_THREAD.get() {
             // A panic on the owner thread was already reported to its commands.
-            let _ = thread.join();
+            let _ = thread.0.join();
         }
     }
 }
@@ -1383,7 +1410,7 @@ impl<H: Owner> Worker<H> {
             if control.failed() {
                 return Live::failed(stopped(true));
             }
-            if control.shutdown.load(Ordering::Acquire) {
+            if control.shutdown_requested() {
                 return Live::failed(stopped(false));
             }
             let work = match prepare() {
@@ -1404,7 +1431,7 @@ impl<H: Owner> Worker<H> {
         if control.failed() {
             return Live::failed(stopped(true));
         }
-        if control.shutdown.load(Ordering::Acquire) {
+        if control.shutdown_requested() {
             return Live::failed(stopped(false));
         }
         let place = match admission.admit(stop) {
@@ -1516,7 +1543,7 @@ fn spawn_owner_now<H: Owner, T: Send + 'static>(
         admission: Arc::new(Admission::new(options.command_capacity)),
         control: Arc::clone(&control),
         events: Arc::clone(&events),
-        thread: Mutex::new(None),
+        thread: OnceLock::new(),
     });
     let (ready, future) = operation_with_hook(Some(control.clone()));
     let thread_worker = Arc::clone(&worker);
@@ -1524,43 +1551,59 @@ fn spawn_owner_now<H: Owner, T: Send + 'static>(
     let thread_events = Arc::clone(&events);
     let spawned = thread::Builder::new().name(name.into()).spawn(move || {
         mark_file_thread();
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // Creation and use are separate unwind regions so the owner stays
+        // alive while its failure is published and its waiters are resolved.
+        let created = catch_unwind(AssertUnwindSafe(|| {
             if ready.shared.cancelled.load(Ordering::Acquire) {
-                return;
+                return None;
             }
-            let mut owner = match create() {
-                Ok(owner) => owner,
+            match create() {
+                Ok(owner) => Some((ready, owner)),
                 Err(error) => {
                     ready.complete(Err(error));
-                    return;
+                    None
                 }
-            };
-            ready.complete(Ok(wrap(thread_worker)));
-            run_owner(&mut owner, &receiver, &thread_control, &thread_events);
-            if let Some(requested) = thread_control.shutdown_requested_at() {
-                owner.shutdown(requested, &thread_events, &thread_control);
             }
-            // No event is pumped from here on, so waits for one end now
-            // rather than after the destruction below, which for a recorder
-            // can take its whole drop wait.
-            thread_events.close(false);
-            // Destroyed here, before the close is reported complete. `H` need
-            // not be `Send`: it is created, used and dropped on this thread.
-            drop(owner);
         }));
-        // Again for the paths above that return early or panic. The failure
-        // is recorded before `receiver` drops, which drops the commands still
-        // queued: they report it.
-        let failed = outcome.is_err();
-        thread_events.close(failed);
-        thread_control.completed(failed);
+        let mut exit = OwnerExit::Closed;
+        match created {
+            Ok(Some((ready, mut owner))) => {
+                let running = catch_unwind(AssertUnwindSafe(|| {
+                    ready.complete(Ok(wrap(thread_worker)));
+                    run_owner(&mut owner, &receiver, &thread_control, &thread_events);
+                    if let Some(requested) = thread_control.shutdown_requested_at() {
+                        owner.shutdown(requested, &thread_events, &thread_control);
+                    }
+                    thread_events.close(EventEnd::Stopped);
+                }));
+                if running.is_err() {
+                    exit = OwnerExit::Failed;
+                    thread_control.publish_failure();
+                    // A second failure cannot skip event closure or destruction.
+                    let _ = catch_unwind(AssertUnwindSafe(|| owner.fail_pending()));
+                    thread_events.close(EventEnd::Failed);
+                }
+                // H need not be Send: every native operation and destruction
+                // remain on this thread, after failure notification.
+                if catch_unwind(AssertUnwindSafe(|| drop(owner))).is_err() {
+                    exit = OwnerExit::Failed;
+                    thread_control.publish_failure();
+                }
+            }
+            Ok(None) => {}
+            Err(_) => exit = OwnerExit::Failed,
+        }
+        // The outcome is recorded before queued commands drop; awaited closes
+        // complete here, only once the native object has been destroyed.
+        thread_control.exit(exit, &thread_events);
         drop(receiver);
     });
     match spawned {
-        Ok(thread) => *lock(&worker.thread) = Some(thread),
+        Ok(thread) => {
+            let _ = worker.thread.set(AssertUnwindSafe(thread));
+        }
         Err(error) => {
-            events.close(true);
-            control.completed(true);
+            control.exit(OwnerExit::Failed, &events);
             return Live::failed(Error::Io(error));
         }
     }
@@ -1593,7 +1636,7 @@ fn run_owner_wait<H: Owner>(
     events: &EventQueue<H::Event>,
     mut command: impl FnMut(bool, Duration) -> std::result::Result<Job<H>, RecvTimeoutError>,
 ) {
-    while !control.shutdown.load(Ordering::Acquire) {
+    while !control.shutdown_requested() {
         // Limit each drain burst so a busy source cannot starve commands.
         let mut full = true;
         let mut drained = false;
@@ -1613,7 +1656,7 @@ fn run_owner_wait<H: Owner>(
             }
         }
         owner.after_events(drained, events, control);
-        if control.shutdown.load(Ordering::Acquire) {
+        if control.shutdown_requested() {
             break;
         }
         // A full burst may have left a backlog. Service commands without
@@ -1621,7 +1664,7 @@ fn run_owner_wait<H: Owner>(
         // the timed wait to avoid spinning.
         match command(!full, owner.wait_timeout()) {
             Ok(job) => {
-                if control.shutdown.load(Ordering::Acquire) {
+                if control.shutdown_requested() {
                     break;
                 }
                 job(owner);
@@ -2280,7 +2323,7 @@ mod tests {
             commands += 1;
             let control = Arc::clone(&control);
             Ok(Box::new(move |_: &mut BurstOwner| {
-                control.shutdown.store(true, Ordering::Release);
+                control.request_shutdown();
             }))
         });
         assert_eq!(commands, 1);
@@ -3151,7 +3194,7 @@ mod tests {
         drop(commands);
         drop(recorder.request_stop());
         drop(recorder.finish(Duration::ZERO));
-        assert!(!recorder.worker.control.shutdown.load(Ordering::Acquire));
+        assert!(!recorder.worker.control.shutdown_requested());
         assert!(block_on(recorder.is_recording()).unwrap());
         assert_eq!(device.source_changes.load(Ordering::Acquire), 0);
         assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
@@ -3604,7 +3647,7 @@ mod tests {
             .poll(&mut Context::from_waker(&waker))
             .is_pending());
         owner.after_events(true, &events, &control);
-        assert!(control.shutdown.load(Ordering::Acquire));
+        assert!(control.shutdown_requested());
         assert!(matches!(
             block_on(finishing).unwrap(),
             FinishStatus::Indeterminate(_)
@@ -3827,6 +3870,187 @@ mod tests {
             FinishStatus::Closed(_)
         ));
         block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
+    fn an_owner_exit_answers_commands_events_and_every_close_with_one_outcome() {
+        for outcome in [OwnerExit::Closed, OwnerExit::Failed] {
+            let control = Arc::new(Control::new());
+            let events = Arc::new(EventQueue::<()>::new(1));
+            let (mut reply, command) = operation::<()>();
+            reply.owner = Some(Arc::clone(&control));
+            let closing = control.request_close().submit();
+            control.exit(outcome, &events);
+            drop(reply);
+            for result in [
+                block_on(FileOperation::live(command)),
+                block_on(events.wait(Duration::from_secs(30))).map(|_| ()),
+            ] {
+                assert!(matches!(
+                    result,
+                    Err(Error::InvalidState(error)) if error == if outcome == OwnerExit::Failed {
+                        StateError::OwnerFailed
+                    } else {
+                        StateError::Closed
+                    }
+                ));
+            }
+            for result in [block_on(closing), block_on(control.request_close())] {
+                if outcome == OwnerExit::Failed {
+                    assert!(matches!(
+                        result,
+                        Err(Error::InvalidState(StateError::OwnerFailed))
+                    ));
+                } else {
+                    assert!(result.is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn closes_racing_an_owner_exit_are_never_lost() {
+        for outcome in [OwnerExit::Closed, OwnerExit::Failed] {
+            for _ in 0..32 {
+                let control = Arc::new(Control::new());
+                let barrier = Arc::new(std::sync::Barrier::new(5));
+                thread::scope(|scope| {
+                    for _ in 0..4 {
+                        let control = Arc::clone(&control);
+                        let barrier = Arc::clone(&barrier);
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let closes: Vec<_> =
+                                (0..8).map(|_| control.request_close().submit()).collect();
+                            for close in closes {
+                                let result = block_on(close);
+                                assert_eq!(result.is_ok(), outcome == OwnerExit::Closed);
+                            }
+                        });
+                    }
+                    barrier.wait();
+                    control.exit(outcome, &EventQueue::<()>::new(1));
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_recorder_reports_failure_before_cleanup_but_closes_after_destruction() {
+        let (device, recorder) = mock_recorder_with_drop_wait(
+            Closing::WhenTold,
+            AsyncFileOptions::new(),
+            Duration::from_secs(5),
+        );
+        block_on(recorder.next_event(Duration::from_secs(1)))
+            .unwrap()
+            .unwrap();
+        let finishing = recorder.finish(Duration::from_secs(30)).submit();
+        await_finish(&recorder);
+        let mut event = Box::pin(recorder.next_event(Duration::from_secs(30)));
+        assert!(event
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        let command = recorder
+            .worker
+            .call(|_| -> Result<()> { panic!("owner failure window") })
+            .submit();
+        let event_result = block_on(event);
+        let finish_result = block_on(finishing);
+        let destroys_before = device.destroys.load(Ordering::Acquire);
+        let refused = recorder.report().submit();
+        let refused_immediately = refused.is_completed();
+        let closing = recorder.close().submit();
+        let close_waited = !closing.is_completed();
+        device.close();
+        let close_result = block_on(closing);
+        assert_eq!(destroys_before, 0);
+        assert!(refused_immediately);
+        assert!(
+            close_waited,
+            "failure publication completed close before destruction"
+        );
+        for result in [
+            event_result.map(|_| ()),
+            finish_result.map(|_| ()),
+            block_on(command),
+            block_on(refused).map(|_| ()),
+            close_result,
+        ] {
+            assert!(matches!(
+                result,
+                Err(Error::InvalidState(StateError::OwnerFailed))
+            ));
+        }
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_failed_player_delivers_its_event_failure_before_native_destruction() {
+        static DESTROYS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn create(
+            _: *const crate::sys::bindings::NDIlib_file_player_create_t,
+        ) -> crate::sys::bindings::NDIlib_file_player_instance_t {
+            std::ptr::NonNull::dangling().as_ptr()
+        }
+        unsafe extern "C" fn destroy(_: crate::sys::bindings::NDIlib_file_player_instance_t) {
+            DESTROYS.fetch_add(1, Ordering::Release);
+        }
+        struct FailureWake {
+            event: Mutex<FileEventFuture<PlayerEvent>>,
+            observed: Sender<(bool, usize)>,
+        }
+        impl Wake for FailureWake {
+            fn wake(self: Arc<Self>) {
+                let failed = matches!(
+                    Pin::new(&mut *lock(&self.event)).poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Err(Error::InvalidState(StateError::OwnerFailed)))
+                );
+                let _ = self
+                    .observed
+                    .send((failed, DESTROYS.load(Ordering::Acquire)));
+            }
+        }
+        let api = FileApi::with_tables(
+            crate::sys::FilePlayback {
+                NDIlib_file_player_create: create,
+                NDIlib_file_player_destroy: destroy,
+                ..mock::playback()
+            },
+            mock::recording(),
+        );
+        let player = block_on(AsyncFilePlayer::create(
+            &api,
+            &PlayerOptions::new("failed player"),
+        ))
+        .unwrap();
+        let (observed, receive) = mpsc::channel();
+        let task = Arc::new(FailureWake {
+            event: Mutex::new(player.next_event(Duration::from_secs(30))),
+            observed,
+        });
+        let waker = Waker::from(Arc::clone(&task));
+        assert!(Pin::new(&mut *lock(&task.event))
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        let failed = player
+            .worker
+            .call(|_| -> Result<()> { panic!("player owner failure") })
+            .submit();
+        assert_eq!(
+            receive.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (true, 0)
+        );
+        assert!(matches!(
+            block_on(failed),
+            Err(Error::InvalidState(StateError::OwnerFailed))
+        ));
+        assert!(matches!(
+            block_on(player.close()),
+            Err(Error::InvalidState(StateError::OwnerFailed))
+        ));
+        assert_eq!(DESTROYS.load(Ordering::Acquire), 1);
     }
 
     #[test]

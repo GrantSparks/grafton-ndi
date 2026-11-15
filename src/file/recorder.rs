@@ -385,10 +385,12 @@ impl<R: FinishReply> FinishWaiters<R> {
     }
 
     pub(super) fn close(&mut self) {
+        self.fail(StateError::Closed);
+    }
+
+    pub(super) fn fail(&mut self, error: StateError) {
         for waiter in self.waiters.drain(..) {
-            waiter
-                .reply
-                .complete(Err(Error::InvalidState(StateError::Closed)));
+            waiter.reply.complete(Err(Error::InvalidState(error)));
         }
     }
 
