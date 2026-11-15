@@ -660,12 +660,12 @@ impl<'rx> Captured<'rx> {
     }
 }
 
-/// Capture a frame of kind `K` from the receiver `lock` holds the capture
-/// guard of, within what is left of the lock's attempt.
+/// Capture a frame of kind `K` from the receiver and within the remaining
+/// attempt identified by the [`CaptureLock`] proof `lock`.
 ///
 /// Gives `NDIlib_recv_capture_v3` the slot of kind `K` alone; any other
 /// result is classified by [`Notification::classify`]. The frame's guard
-/// borrows the receiver for `'rx`, as the lock does, and outlives the lock.
+/// borrows the receiver for `'rx`, as the proof does, and can outlive the proof.
 pub(crate) fn capture_raw<'rx, K: CaptureKind>(
     lock: &CaptureLock<'rx>,
 ) -> Result<CaptureResult<'rx, K>> {
@@ -739,8 +739,8 @@ pub(crate) enum Delivered<'rx, S: SlotSet> {
     Notification(Notification),
 }
 
-/// Capture with slot set `S` from the receiver `lock` holds the capture
-/// guard of, within what is left of the lock's attempt.
+/// Capture with slot set `S` from the receiver and within the remaining
+/// attempt identified by the [`CaptureLock`] proof `lock`.
 ///
 /// Any delivered media is wrapped in the guard of its kind, as
 /// [`capture_raw`] does for one kind; any other result is classified by

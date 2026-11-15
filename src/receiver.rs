@@ -1054,8 +1054,9 @@ pub(crate) struct RecvInstance(pub(crate) NDIlib_recv_instance_t);
 
 // SAFETY: the SDK gives receivers no thread affinity and permits concurrent
 // captures (Processing.NDI.Recv.h). CaptureLock records the native implementation
-// observations and tests supporting concurrent connection changes. The core's
-// connection lock serializes those changes; its query lock protects SDK strings.
+// observations and tests supporting concurrent connection changes. The core
+// serializes local connection changes with one another, and source-name waits
+// with one another.
 // Every native use retains the core; its other fields determine its auto traits.
 unsafe impl Send for RecvInstance {}
 // SAFETY: as above; receiver modes reserve the media paths used by synchronizers.

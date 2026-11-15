@@ -289,9 +289,10 @@ impl private::Spawn for Smol {
 /// # Thread Safety
 ///
 /// The underlying [`Receiver`] is shared through an [`Arc`]. The SDK documents
-/// concurrent capture calls in `Processing.NDI.Recv.h`; the crate's capture
-/// guard serializes connection changes against them. Receiver queries with
-/// invalidatable SDK strings have their own query lock.
+/// concurrent capture calls in `Processing.NDI.Recv.h`. Local connection
+/// changes serialize with one another and may overlap captures, as described
+/// by [`Receiver::reconnect`]. Source-name waits serialize with one another;
+/// waiting for another poller counts against the caller's wait budget.
 ///
 /// # Events and controls
 ///
@@ -479,9 +480,9 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// without these payload allocations and copies.
     ///
     /// The wait budget starts at first poll and includes blocking-pool queue
-    /// delay, receiver-lock contention and SDK waits. A spent or zero budget
-    /// makes one non-waiting attempt. Scheduling and copying can finish after
-    /// the budget. Events compete with all other event and combined consumers;
+    /// delay and SDK waits. A spent or zero budget makes one non-waiting
+    /// attempt. Scheduling and copying can finish after the budget.
+    /// Events compete with all other event and combined consumers;
     /// see [`Receiver::capture_any_ref`] for their coalescing contract.
     ///
     /// # Errors
@@ -503,10 +504,10 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// blocking worker, without copying its payload into an owned item.
     ///
     /// `process` synchronously borrows the validated [`ReceiverItemRef`]. It
-    /// runs once for a delivered item, after internal capture locks have been
-    /// released; timeouts and capture errors do not call it. The wrapper keeps
-    /// the native frame guard until the callback returns (or unwinds), then
-    /// frees it on the same worker. Only the returned `T` crosses the task
+    /// runs once for a delivered item; timeouts and capture errors do not
+    /// call it. The wrapper keeps the native frame guard until the callback
+    /// returns (or unwinds), then frees it on the same worker. Only the
+    /// returned `T` crosses the task
     /// boundary. Borrowed frames, planes, rows, channels and text cannot escape.
     /// Use an owned result, or explicitly call [`ReceiverItemRef::to_owned`],
     /// to retain data across awaits.
@@ -807,10 +808,10 @@ where
     /// Process a validated borrowed frame on the blocking worker without
     /// copying its payload into an owned frame.
     ///
-    /// `process` runs synchronously once for a delivered frame, after internal
-    /// capture locks have been released. Timeouts and capture errors do not
-    /// call it. The wrapper retains the guard throughout the callback and frees
-    /// it on that worker before returning `T`, including on callback panic.
+    /// `process` runs synchronously once for a delivered frame.
+    /// Timeouts and capture errors do not call it. The wrapper retains the
+    /// guard throughout the callback and frees it on that worker before
+    /// returning `T`, including on callback panic.
     /// Borrowed frames, planes, rows, channels and metadata text cannot escape.
     /// The callback, its captures and its result must be `Send + 'static`.
     /// Return a small summary for immediate inspection, or explicitly copy
