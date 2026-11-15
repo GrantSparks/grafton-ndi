@@ -182,9 +182,12 @@ impl Drop for AvResource {
     fn drop(&mut self) {
         // SAFETY: the handle was created by this table and is destroyed once,
         // while this resource still owns the receiver it reads.
-        native!(AvSync, self.table => unsafe { self.table.NDIlib_avsync_destroy(self.handle) });
-        #[cfg(test)]
-        crate::receiver::lifecycle_test_events::record("avsync");
+        native!(AvSync, self.table => {
+            // SAFETY: this resource retains the receiver through destruction.
+            unsafe { self.table.NDIlib_avsync_destroy(self.handle) };
+            #[cfg(test)]
+            crate::receiver::lifecycle_test_events::record("avsync");
+        });
     }
 }
 
@@ -768,7 +771,7 @@ struct GenResource {
     handle: GenlockHandle,
     table: &'static GenlockTable,
     _ndi: Ndi,
-    source: Option<Box<RawSource>>,
+    _source: Option<Box<RawSource>>,
     _config: Option<AdvancedConfig>,
 }
 
@@ -885,7 +888,7 @@ impl Genlock {
                     handle,
                     table,
                     _ndi: ndi.clone(),
-                    source,
+                    _source: source,
                     _config: _config.cloned(),
                 },
                 _not_sync: NotSync(PhantomData),
@@ -914,7 +917,7 @@ impl Genlock {
                     _source.as_ref().map_or(ptr::null(), |source| &source.raw),
                 )
             };
-            self.resource.source = _source;
+            self.resource._source = _source;
             Ok(())
         })
     }
