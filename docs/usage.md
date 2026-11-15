@@ -11,7 +11,8 @@ Create `Finder::new(&ndi, &options)` with `FinderOptions` containing the groups
 and extra IPs your application needs. Choose discovery by purpose:
 
 - `current_sources()` returns the currently known snapshot.
-- `wait_for_sources(timeout)` waits for a source-list change; one change can
+- `watch()` gives each consumer a `SourceWatch`: use its `current_sources()`
+  and `wait_for_change(timeout)` together to monitor changes. One change can
   represent only part of a staggered discovery response.
 - `find_sources(timeout)` observes the full window and returns distinct
   descriptors seen during it.
@@ -21,7 +22,9 @@ and extra IPs your application needs. Choose discovery by purpose:
 
 Selection and enumeration include snapshot-lock waits in their timeout budget.
 Concurrent waits on the same finder share each reported change, so every
-lookup can inspect the updated list promptly.
+lookup can inspect the updated list promptly. Keep one watch per consumer:
+its cursor remembers reports published by other lookups between snapshots and
+waits, including when polling with a zero timeout.
 A zero timeout makes one non-waiting attempt, which can miss a busy snapshot
 lock. Native snapshot work, copying and caller predicates can finish after the
 budget. `current_sources()` uses ordinary blocking serialization. Discovery

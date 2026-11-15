@@ -17,14 +17,15 @@ pub fn wait_for_first_source(
     finder: &Finder,
     should_stop: impl Fn() -> bool,
 ) -> Result<Option<Vec<Source>>> {
+    let mut watch = finder.watch();
     loop {
         if should_stop() {
             return Ok(None);
         }
-        let sources = finder.current_sources()?;
+        let sources = watch.current_sources()?;
         if !sources.is_empty() {
             return Ok(Some(sources));
         }
-        finder.wait_for_sources(Duration::from_secs(1))?;
+        watch.wait_for_change(Duration::from_secs(1))?;
     }
 }

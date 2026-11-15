@@ -112,8 +112,9 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
     let name = sender.source().unwrap().name().to_owned();
     let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut watch = finder.watch();
     let source = 'found: loop {
-        for source in finder.current_sources().unwrap() {
+        for source in watch.current_sources().unwrap() {
             if source.name() == name {
                 if let Some(SourceAddress::Ip(address)) = source.address() {
                     let port = address.rsplit(':').next().unwrap();
@@ -126,7 +127,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             Instant::now() < deadline,
             "local scatter sender was not discovered"
         );
-        finder.wait_for_sources(Duration::from_millis(100)).unwrap();
+        watch.wait_for_change(Duration::from_millis(100)).unwrap();
     };
     let receiver =
         PacketReceiver::new(&ndi, &ReceiverOptions::new(source), PassthroughPreset::H264).unwrap();

@@ -217,7 +217,12 @@ fn exercise(cache: &SourceCache, gate: &Gate) {
     gate.write("hold-wait");
     thread::scope(|scope| {
         let release = Release(gate);
-        scope.spawn(|| finder.wait_for_sources(Duration::from_secs(5)).unwrap());
+        scope.spawn(|| {
+            finder
+                .watch()
+                .wait_for_change(Duration::from_secs(5))
+                .unwrap()
+        });
         gate.wait("waiting");
         let (tx, rx) = mpsc::channel();
         scope.spawn(move || {

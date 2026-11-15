@@ -50,7 +50,7 @@
 //! fn main() -> Result<(), grafton_ndi::Error> {
 //!     let ndi = Ndi::new()?;
 //!     let finder = Finder::new(&ndi, &FinderOptions::default())?;
-//!     finder.wait_for_sources(Duration::from_secs(1))?;
+//!     finder.watch().wait_for_change(Duration::from_secs(1))?;
 //!     let sources = finder.current_sources()?;
 //!
 //!     let options = ReceiverOptions::new(sources[0].clone());

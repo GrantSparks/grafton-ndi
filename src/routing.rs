@@ -14,7 +14,7 @@
 //! let mut router = Router::new(&ndi, &RouterOptions::new("Program"))?;
 //!
 //! let finder = Finder::new(&ndi, &FinderOptions::default())?;
-//! finder.wait_for_sources(Duration::from_secs(2))?;
+//! finder.watch().wait_for_change(Duration::from_secs(2))?;
 //! if let Some(camera) = finder.current_sources()?.first() {
 //!     router.change(camera)?;
 //! }

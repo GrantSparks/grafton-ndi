@@ -39,8 +39,9 @@ pub fn loopback_finder(ndi: &Ndi) -> grafton_ndi::Result<Finder> {
 /// [`advertised_endpoint`], through `finder`, which the caller keeps.
 pub fn advertised_endpoint_by(finder: &Finder, name: &str) -> grafton_ndi::Result<(Source, u16)> {
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut watch = finder.watch();
     loop {
-        for source in finder.current_sources()? {
+        for source in watch.current_sources()? {
             if source.name() == name {
                 if let Some(SourceAddress::Ip(address)) = source.address() {
                     let port = address
@@ -56,6 +57,6 @@ pub fn advertised_endpoint_by(finder: &Finder, name: &str) -> grafton_ndi::Resul
             Instant::now() < deadline,
             "local sender endpoint not discovered: {name}"
         );
-        finder.wait_for_sources(Duration::from_millis(100))?;
+        watch.wait_for_change(Duration::from_millis(100))?;
     }
 }

@@ -2692,6 +2692,7 @@ fn a_finder_is_told_the_metadata_a_sender_advertises() {
 
     let sources = [described.source().unwrap(), undescribed.source().unwrap()];
     let deadline = Instant::now() + PATIENCE;
+    let mut watch = finder.watch();
     let metadata = loop {
         let found_sources = finder.sources_with_metadata().unwrap();
         let found: Vec<_> = sources
@@ -2711,7 +2712,7 @@ fn a_finder_is_told_the_metadata_a_sender_advertises() {
             "the finder was told of {} of the two senders",
             found.len()
         );
-        finder.wait_for_sources(SLICE).unwrap();
+        watch.wait_for_change(SLICE).unwrap();
     };
     assert_eq!(
         metadata,

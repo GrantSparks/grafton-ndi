@@ -5377,7 +5377,7 @@ macro_rules! borrowed_video_accessors {
  # use std::time::Duration;
  # let ndi = Ndi::new()?;
  # let finder = Finder::new(&ndi, &FinderOptions::default())?;
- # finder.wait_for_sources(Duration::from_secs(1))?;
+ # finder.watch().wait_for_change(Duration::from_secs(1))?;
  # let Some(source) = finder.current_sources()?.into_iter().next() else { return Ok(()) };
  # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
  # let Some(frame) = receiver.video().capture_ref(Duration::from_secs(5))? else { return Ok(()) };") {

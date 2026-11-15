@@ -570,7 +570,7 @@ impl ReceiverOptions {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let ndi = Ndi::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(Duration::from_secs(1))?;
+    /// # finder.watch().wait_for_change(Duration::from_secs(1))?;
     /// # let sources = finder.current_sources()?;
     /// let options = ReceiverOptions::snapshot_preset(sources[0].clone()).name("Snapshot Receiver");
     /// let receiver = Receiver::new(&ndi, &options)?;
@@ -607,7 +607,7 @@ impl ReceiverOptions {
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(Duration::from_secs(1))?;
+    /// # finder.watch().wait_for_change(Duration::from_secs(1))?;
     /// # let sources = finder.current_sources()?;
     /// let options =
     ///     ReceiverOptions::high_quality_preset(sources[0].clone()).name("High Quality Receiver");
@@ -647,7 +647,7 @@ impl ReceiverOptions {
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(Duration::from_secs(1))?;
+    /// # finder.watch().wait_for_change(Duration::from_secs(1))?;
     /// # let sources = finder.current_sources()?;
     /// let options = ReceiverOptions::monitoring_preset(sources[0].clone()).name("Status Monitor");
     /// let receiver = Receiver::new(&ndi, &options)?;

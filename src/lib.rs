@@ -105,7 +105,7 @@ pub use {
     },
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
     error::*,
-    finder::{Finder, FinderOptions, Source, SourceAddress, SourceCache},
+    finder::{Finder, FinderOptions, Source, SourceAddress, SourceCache, SourceWatch},
     frames::{
         AudioChannels, AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout,
         AudioSource, BorrowedAudioFrame, BorrowedAudioFrameBuilder, FormatCategory,

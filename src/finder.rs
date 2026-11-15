@@ -5,6 +5,7 @@ mod budget;
 pub(crate) use budget::SnapshotBudget;
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     ffi::{c_char, CString},
     fmt::{self, Display, Formatter},
@@ -179,8 +180,9 @@ unsafe impl Sync for FindInstance {}
 /// let finder = Finder::new(&ndi, &FinderOptions::new())?;
 ///
 /// // Wait for initial discovery
-/// if finder.wait_for_sources(Duration::from_secs(5))? {
-///     let sources = finder.current_sources()?;
+/// let mut watch = finder.watch();
+/// if watch.wait_for_change(Duration::from_secs(5))? {
+///     let sources = watch.current_sources()?;
 ///     for source in sources {
 ///         println!("Found: {}", source);
 ///     }
@@ -198,6 +200,73 @@ pub struct Finder {
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
     _ndi: Ndi,
+}
+
+/// One consumer's cursor over a finder's source-list changes.
+///
+/// Take snapshots and wait through the same watch, so reports published by
+/// concurrent lookups between those operations cannot be missed. A report
+/// during a snapshot remains visible to the next wait. Each consumer must
+/// create its own watch; a watch can move between threads but is not `Sync`.
+///
+/// ```no_run
+/// # use grafton_ndi::{Finder, FinderOptions, Ndi};
+/// # use std::time::Duration;
+/// # fn main() -> grafton_ndi::Result<()> {
+/// # let ndi = Ndi::new()?;
+/// # let finder = Finder::new(&ndi, &FinderOptions::new())?;
+/// let mut watch = finder.watch();
+/// println!("{:?}", watch.current_sources()?);
+/// while watch.wait_for_change(Duration::from_secs(5))? {
+///     println!("{:?}", watch.current_sources()?);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub struct SourceWatch<'finder> {
+    finder: &'finder Finder,
+    // Cell makes a cursor Send but not Sync: one consumer advances it.
+    observed: Cell<u64>,
+}
+
+impl SourceWatch<'_> {
+    /// Copy the currently known sources and record the generation before
+    /// copying, preserving any report that arrives during the snapshot.
+    pub fn current_sources(&mut self) -> Result<Vec<Source>> {
+        self.observed.set(self.finder.changes.generation());
+        self.finder.current_sources()
+    }
+
+    /// Wait for a report newer than this consumer's last snapshot or wait.
+    ///
+    /// Returns `true` immediately if another lookup already published a report.
+    /// A zero timeout reads such reports even while another native waiter is
+    /// active; otherwise it makes one nonblocking native query. Returns `false`
+    /// when the timeout expires without a report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    pub fn wait_for_change(&mut self, timeout: Duration) -> Result<bool> {
+        Ok(self.wait_until(Deadline::after(timeout)?))
+    }
+
+    fn current_sources_until(&mut self, deadline: Deadline) -> Result<Option<Vec<Source>>> {
+        self.observed.set(self.finder.changes.generation());
+        self.finder.current_sources_until(deadline)
+    }
+
+    fn wait_until(&mut self, deadline: Deadline) -> bool {
+        if self
+            .finder
+            .wait_for_sources_since(self.observed.get(), deadline)
+        {
+            self.observed.set(self.finder.changes.generation());
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// One entry of a [`Finder::current_sources`] snapshot, or `None` for a
@@ -394,45 +463,17 @@ impl Finder {
         &self._ndi
     }
 
-    /// Waits for the source list to change.
+    /// Monitor this finder's source list with a cursor for one consumer.
     ///
-    /// This method blocks until the list of discovered sources changes or the
-    /// timeout expires. Use this to efficiently monitor for source changes.
-    /// Concurrent waiters all observe a reported change. A zero timeout while
-    /// another thread waits only reads reports that thread has already
-    /// published; otherwise it makes one nonblocking native query.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Maximum time to wait ([`Duration::ZERO`] = no wait).
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// `true` if the source list changed, `false` if the timeout expired.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{Ndi, FinderOptions, Finder};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = Ndi::new()?;
-    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// // Wait up to 5 seconds for changes
-    /// if finder.wait_for_sources(Duration::from_secs(5))? {
-    ///     println!("Source list changed!");
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn wait_for_sources(&self, timeout: Duration) -> Result<bool> {
-        let deadline = Deadline::after(timeout)?;
-        Ok(self.wait_for_sources_since(self.changes.generation(), deadline))
+    /// Every consumer needs its own watch. Reports observed by a concurrent
+    /// lookup remain visible to this watch until it snapshots or waits again.
+    /// Creating a watch records the current generation without allocating.
+    #[must_use]
+    pub fn watch(&self) -> SourceWatch<'_> {
+        SourceWatch {
+            finder: self,
+            observed: Cell::new(self.changes.generation()),
+        }
     }
 
     /// Share one native report with every observer of the earlier generation.
@@ -541,7 +582,7 @@ impl Finder {
     /// After each source-list snapshot, `accept` is handed the current sources
     /// and may return `Some` to stop immediately; otherwise this blocks on the
     /// next source-list change and retries until the deadline. A single
-    /// [`wait_for_sources`](Self::wait_for_sources) returns on the *first*
+    /// [`SourceWatch::wait_for_change`] returns on the *first*
     /// change, yielding only a partial snapshot when discovery is staggered
     /// (unicast / IP-hint-only networks where responders trickle in across
     /// several notifications); polling to the deadline makes resolution robust
@@ -557,9 +598,9 @@ impl Finder {
         // Validate up front so an over-long timeout is rejected even when the
         // first snapshot already satisfies `accept`.
         let deadline = Deadline::after(timeout)?;
+        let mut watch = self.watch();
         loop {
-            let generation = self.changes.generation();
-            let Some(sources) = self.current_sources_until(deadline)? else {
+            let Some(sources) = watch.current_sources_until(deadline)? else {
                 return Ok(None);
             };
             if let Some(selected) = accept(sources)? {
@@ -571,7 +612,7 @@ impl Finder {
             // Block until the source list changes or the window ends; either
             // way the next iteration re-snapshots. The wait is rounded up, so
             // the last one lasts until the deadline rather than polling.
-            self.wait_for_sources_since(generation, deadline);
+            watch.wait_until(deadline);
         }
     }
 
@@ -630,7 +671,7 @@ impl Finder {
     /// Discovers sources for up to `timeout`, returning the complete set.
     ///
     /// This honors the full `timeout` window and returns every source observed
-    /// within it. Unlike a single [`wait_for_sources`](Self::wait_for_sources)
+    /// within it. Unlike a single [`SourceWatch::wait_for_change`]
     /// followed by a snapshot — which returns on the *first* source-list change
     /// and so can miss responders that announce late on staggered or unicast
     /// (IP-hint-only) networks — enumeration here retains each source observed
