@@ -3019,6 +3019,81 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_recorder_pump_makes_only_capture_calls_and_allocates_nothing() {
+        for completed_session in [false, true] {
+            let device = mock::Recorder::new(Closing::AtStop);
+            device.install();
+            let mut recorder = mock::recorder_api()
+                .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
+                .unwrap();
+            if completed_session {
+                recorder
+                    .start(
+                        &RecordingTarget::new(std::env::temp_dir().join("mock-idle-pump")).unwrap(),
+                        RecordingTimecode::Preserve,
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    recorder.finish(Duration::ZERO).unwrap(),
+                    FinishStatus::Closed(_)
+                ));
+                assert!(recorder.report().last_closed_path().is_some());
+            }
+            let mut owner = RecorderOwner::new(recorder);
+            let events = EventQueue::new(16);
+            let control = Control::new();
+            let before = device.captures.load(Ordering::Acquire);
+            device.recording_queries.store(0, Ordering::Release);
+            device.dropped_queries.store(0, Ordering::Release);
+            let (_, allocations) = crate::test_alloc::allocation_count(|| {
+                for _ in 0..100 {
+                    assert!(owner.poll_native().unwrap().is_none());
+                    owner.after_events(true, &events, &control);
+                }
+            });
+            assert_eq!(allocations, 0);
+            assert_eq!(device.captures.load(Ordering::Acquire) - before, 100);
+            assert_eq!(device.recording_queries.load(Ordering::Acquire), 0);
+            assert_eq!(device.dropped_queries.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn recording_and_stopping_pumps_keep_sampling_live_session_evidence() {
+        for stopping in [false, true] {
+            let device = mock::Recorder::new(Closing::WhenTold);
+            device.install();
+            let mut recorder = mock::recorder_api()
+                .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
+                .unwrap();
+            recorder
+                .start(
+                    &RecordingTarget::new(std::env::temp_dir().join("mock-active-pump")).unwrap(),
+                    RecordingTimecode::Preserve,
+                )
+                .unwrap();
+            recorder.poll_event(Duration::ZERO).unwrap();
+            if stopping {
+                recorder.request_stop();
+            }
+            let mut owner = RecorderOwner::new(recorder);
+            let events = EventQueue::new(16);
+            let control = Control::new();
+            let before = device.captures.load(Ordering::Acquire);
+            device.recording_queries.store(0, Ordering::Release);
+            device.dropped_queries.store(0, Ordering::Release);
+            for _ in 0..100 {
+                assert!(owner.poll_native().unwrap().is_none());
+                owner.after_events(true, &events, &control);
+            }
+            assert_eq!(device.captures.load(Ordering::Acquire) - before, 100);
+            assert_eq!(device.recording_queries.load(Ordering::Acquire), 100);
+            assert_eq!(device.dropped_queries.load(Ordering::Acquire), 100);
+            owner.recorder.abandon();
+        }
+    }
+
+    #[test]
     fn an_expired_close_spends_its_final_drain_once_including_drop() {
         let device = mock::Recorder::new(Closing::Never);
         device.install();

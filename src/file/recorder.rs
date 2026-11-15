@@ -407,8 +407,11 @@ impl<R: FinishReply> FinishWaiters<R> {
             at,
         } = batch;
         self.retain();
-        let had_waiters = !self.waiters.is_empty();
-        self.notify_cleanup |= had_waiters && closing();
+        if self.waiters.is_empty() {
+            return drained;
+        }
+        let had_waiters = true;
+        self.notify_cleanup |= closing();
         if self
             .waiters
             .iter()
@@ -1131,13 +1134,17 @@ impl FileRecorder {
     /// [`Error::UnexpectedSdkResult`] when the SDK's event is malformed.
     fn poll_event_ms(&mut self, wait_ms: u32) -> Result<Option<RecorderEvent>> {
         let event = self.capture(wait_ms);
-        self.ledger.dropped(self.dropped_event_count());
+        if self.ledger.session_open() {
+            self.ledger.dropped(self.dropped_event_count());
+        }
         let Some(event) = event.inspect_err(|_| self.ledger.mark_uncertain())? else {
             // This empty-capture/recording check relies on open-before-close
             // rollover events, pinned by the native File test
             // `rollovers_open_the_next_file_before_closing_the_previous_file`.
-            if let Some(stop) = self.ledger.drained(self.is_recording()) {
-                self.stop_native(stop);
+            if self.ledger.session_open() {
+                if let Some(stop) = self.ledger.drained(self.is_recording()) {
+                    self.stop_native(stop);
+                }
             }
             return Ok(None);
         };
