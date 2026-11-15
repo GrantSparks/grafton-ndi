@@ -384,6 +384,8 @@ struct State {
     bytes: usize,
     next: u64,
     options: QueueOptions,
+    // Free keys are the frame capacity. A lease dropped while unwinding
+    // retires its key, so the queue may have fewer usable slots than requested.
     free: Vec<SlotKey>,
     // A fallibly reserved submission-thread workspace for rebuilding a map
     // whose deletion tombstones have consumed its insertion capacity.
@@ -426,25 +428,27 @@ impl State {
                 frame.into_frame(),
             ));
         };
-        if self.retained() >= self.options.frames {
+        debug_assert!(self.free.len() + self.retained() <= self.options.frames);
+        let Some(slot_key) = self.free.pop() else {
             return Err(Rejected::new(
                 Error::QueueFull(QueueLimit::Frames),
                 frame.into_frame(),
             ));
-        }
+        };
         let Some(next) = self.next.checked_add(1) else {
+            self.free.push(slot_key);
             return Err(Rejected::new(
                 Error::InvalidInput(crate::InputDefect::QueueIdentifiersExhausted),
                 frame.into_frame(),
             ));
         };
-        debug_assert_eq!(self.free.len() + self.retained(), self.options.frames);
         if self.in_flight.capacity() == self.in_flight.len() {
             self.rebuild_index();
         }
         let entry = match self.in_flight.entry(key) {
             IndexEntry::Vacant(entry) => entry,
             IndexEntry::Occupied(_) => {
+                self.free.push(slot_key);
                 protocol_error.store(true, Ordering::Release);
                 return Err(Rejected::new(
                     Error::UnexpectedSdkResult(crate::SdkResultDefect::UnknownCompletion),
@@ -452,10 +456,6 @@ impl State {
                 ));
             }
         };
-        let slot_key = self
-            .free
-            .pop()
-            .expect("admission leaves a descriptor slot free");
         let mut slot = slot_key.claim();
         let mut frame = frame.retain(&mut slot);
         // Frame-bound authorization makes descriptor construction infallible;
@@ -510,7 +510,6 @@ impl State {
             release(completed);
             self.free.push(key);
         }
-        assert_eq!(self.free.len(), self.options.frames);
         self.bytes = 0;
     }
 
@@ -1492,6 +1491,122 @@ mod tests {
         let admitted = state.admit(frame, bytes, &callback.protocol_error).unwrap();
         assert_eq!(admitted.id.get(), id);
         admitted.lent.descriptor().p_data as usize
+    }
+
+    #[test]
+    fn a_retired_slot_reduces_capacity_and_collection_still_allows_retry() {
+        let callback = CallbackState::new(QueueOptions::default().max_frames(3)).unwrap();
+        drop(callback.state.lock().unwrap().free.pop().unwrap().claim());
+        let first = insert(&callback, 1);
+        insert(&callback, 2);
+        let frame = VideoFrame::builder().resolution(2, 2).build().unwrap();
+        let pointer = frame.data().as_ptr();
+        let bytes = frame.retained_bytes();
+        let rejected = callback
+            .state
+            .lock()
+            .unwrap()
+            .admit(
+                QueuedVideoFrame::from(frame).authorize_for_test(None),
+                bytes,
+                &callback.protocol_error,
+            )
+            .err()
+            .unwrap();
+        assert!(matches!(
+            rejected.error(),
+            Error::QueueFull(QueueLimit::Frames)
+        ));
+        let QueuedVideoFrame::Pixels(frame) = rejected.into_parts().1 else {
+            panic!("the refused frame keeps its storage");
+        };
+        assert_eq!(frame.data().as_ptr(), pointer);
+        callback.complete(first);
+        let mut state = callback.state.lock().unwrap();
+        assert_eq!(take_completed(&mut state).unwrap().id().get(), 1);
+        let admitted = state
+            .admit(
+                QueuedVideoFrame::from(frame).authorize_for_test(None),
+                bytes,
+                &callback.protocol_error,
+            )
+            .unwrap();
+        assert_eq!(admitted.id.get(), 3);
+        assert_eq!(admitted.lent.descriptor().p_data.cast_const(), pointer);
+        assert!(state.free.is_empty());
+    }
+
+    #[test]
+    fn retired_slots_preserve_byte_frame_and_identifier_refusal_order() {
+        let callback = CallbackState::new(QueueOptions::default().max_frames(1)).unwrap();
+        let frame = || VideoFrame::builder().resolution(2, 2).build().unwrap();
+        let mut state = callback.state.lock().unwrap();
+        state.next = u64::MAX;
+        let original_bytes = state.options.bytes;
+        state.options.bytes = 0;
+        let input = frame();
+        let bytes = input.retained_bytes();
+        let reject = |state: &mut State, input: VideoFrame| {
+            state
+                .admit(
+                    QueuedVideoFrame::from(input).authorize_for_test(None),
+                    bytes,
+                    &callback.protocol_error,
+                )
+                .err()
+                .unwrap()
+                .into_parts()
+                .0
+        };
+        assert!(matches!(
+            reject(&mut state, input),
+            Error::QueueFull(QueueLimit::Bytes)
+        ));
+        state.options.bytes = original_bytes;
+        assert!(matches!(
+            reject(&mut state, frame()),
+            Error::InvalidInput(crate::InputDefect::QueueIdentifiersExhausted)
+        ));
+        assert_eq!(state.free.len(), 1, "refusal returns the unused key");
+        drop(state.free.pop().unwrap().claim());
+        assert!(matches!(
+            reject(&mut state, frame()),
+            Error::QueueFull(QueueLimit::Frames)
+        ));
+    }
+
+    #[test]
+    fn a_retired_slot_does_not_panic_on_close_or_drop() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        for close in [true, false] {
+            let queue = QueuedSender::new(
+                &ndi,
+                &SenderOptions::new(crate::test_support::unique_name("retired-slot-teardown")),
+                QueueOptions::default().max_frames(4),
+            )
+            .unwrap();
+            let callback = queue.lending.loans();
+            drop(callback.state.lock().unwrap().free.pop().unwrap().claim());
+            let first = insert(callback, 1);
+            insert(callback, 2);
+            let third = insert(callback, 3);
+            callback.complete(third);
+            callback.complete(first);
+            if close {
+                assert_eq!(
+                    queue
+                        .close()
+                        .iter()
+                        .map(|done| done.id().get())
+                        .collect::<Vec<_>>(),
+                    [3, 1, 2]
+                );
+            } else {
+                drop(queue);
+            }
+        }
     }
 
     #[test]
