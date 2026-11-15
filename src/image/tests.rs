@@ -1476,6 +1476,59 @@ fn sixteen_bit_png_keeps_high_bit_depth_precision() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn every_transfer_agrees_on_hdr_refusal_and_png_color_code() {
+    for transfer in crate::TransferFunction::ALL {
+        let sdk_name = match transfer {
+            crate::TransferFunction::Bt601 => "bt_601",
+            crate::TransferFunction::Bt709 => "bt_709",
+            crate::TransferFunction::Bt2020 => "bt_2020",
+            crate::TransferFunction::Hlg => "bt_2100_hlg",
+            crate::TransferFunction::Pq => "bt_2100_pq",
+        };
+        let metadata = format!("<ndi_color_info transfer=\"{sdk_name}\" primaries=\"bt_2020\"/>");
+        let frame = VideoFrame::builder()
+            .resolution(2, 2)
+            .metadata(metadata.as_str())
+            .build()
+            .unwrap();
+        let color = frame.color_info().unwrap().unwrap();
+        assert_eq!(color.is_hdr(), transfer.is_hdr());
+        assert_eq!(super::hdr_transfer(&color).is_some(), transfer.is_hdr());
+        assert_eq!(matches!(transfer.h273_code(), 16 | 18), transfer.is_hdr());
+        for format in [
+            ImageFormat::Png,
+            ImageFormat::Jpeg(85),
+            ImageFormat::WebpLossless,
+            ImageFormat::WebpLossy(75),
+        ] {
+            assert_eq!(
+                Plan::new(&Source::new(&frame), &options(format)).is_err(),
+                transfer.is_hdr(),
+                "{transfer:?} {format:?}"
+            );
+        }
+        let png = frame
+            .encode_image(&options(ImageFormat::Png).hdr(HdrPolicy::CodeValues))
+            .unwrap();
+        let chunks = png_chunks(&png);
+        let (_, tag) = chunks.iter().find(|(kind, _)| kind == b"cICP").unwrap();
+        assert_eq!(tag, &[9, transfer.h273_code(), 0, 1]);
+    }
+}
+
+#[test]
+fn every_image_format_has_its_documented_quality_bounds() {
+    for (format, expected) in [
+        (ImageFormat::Png, None),
+        (ImageFormat::Jpeg(85), Some(1..=100)),
+        (ImageFormat::WebpLossless, None),
+        (ImageFormat::WebpLossy(75), Some(0..=100)),
+    ] {
+        assert_eq!(format.quality_bounds(), expected);
+    }
+}
+
+#[test]
 fn hdr_frames_are_refused_by_default_in_every_format() {
     for format in PixelFormat::ALL {
         for (transfer, name) in [("bt_2100_pq", "PQ"), ("bt_2100_hlg", "HLG")] {

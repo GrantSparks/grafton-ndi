@@ -54,6 +54,21 @@ impl ImageFormat {
         }
     }
 
+    pub(super) fn quality_bounds(self) -> Option<std::ops::RangeInclusive<u8>> {
+        match self {
+            Self::Png | Self::WebpLossless => None,
+            Self::Jpeg(_) => Some(1..=100),
+            Self::WebpLossy(_) => Some(0..=100),
+        }
+    }
+
+    pub(super) const fn quality(self) -> Option<u8> {
+        match self {
+            Self::Png | Self::WebpLossless => None,
+            Self::Jpeg(quality) | Self::WebpLossy(quality) => Some(quality),
+        }
+    }
+
     /// The format's media type, for a data URL.
     pub(super) const fn media_type(self) -> &'static str {
         match self {
@@ -423,6 +438,15 @@ pub enum SampleDepth {
     Sixteen,
 }
 
+impl SampleDepth {
+    pub(super) const fn bytes(self) -> usize {
+        match self {
+            Self::Eight => 1,
+            Self::Sixteen => 2,
+        }
+    }
+}
+
 /// Whether a PNG or WebP image has an alpha channel.
 ///
 /// This enum is marked `#[non_exhaustive]` so that modes can be added without
@@ -436,6 +460,15 @@ pub enum AlphaMode {
     Keep,
     /// Write RGB, dropping any alpha.
     Discard,
+}
+
+impl AlphaMode {
+    pub(super) const fn keeps_alpha(self) -> bool {
+        match self {
+            Self::Keep => true,
+            Self::Discard => false,
+        }
+    }
 }
 
 /// What happens to a frame whose `ndi_color_info` gives the PQ or HLG

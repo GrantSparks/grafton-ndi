@@ -175,43 +175,51 @@ fn write_image(
     let mut out = KeepError { out, error: None };
     let result = match plan.codec {
         Codec::Png {
-            depth: SampleDepth::Sixteen,
+            depth,
             compression,
             cicp,
-        } => plan.with_pixels::<u16, _>(source, &mut workspace.sums16, |pixels| {
-            png::encode(
-                pixels,
-                plan.channels(),
-                compression,
-                cicp,
-                &mut out,
-                &mut workspace.row,
-            )
+        } => match depth {
+            SampleDepth::Eight => {
+                plan.with_pixels::<u8, _>(source, &mut workspace.sums8, |pixels| {
+                    png::encode(
+                        pixels,
+                        plan.channels(),
+                        compression,
+                        cicp,
+                        &mut out,
+                        &mut workspace.row,
+                    )
+                })
+            }
+            SampleDepth::Sixteen => {
+                plan.with_pixels::<u16, _>(source, &mut workspace.sums16, |pixels| {
+                    png::encode(
+                        pixels,
+                        plan.channels(),
+                        compression,
+                        cicp,
+                        &mut out,
+                        &mut workspace.row,
+                    )
+                })
+            }
+        },
+        Codec::Jpeg { quality } => {
+            plan.with_pixels::<u8, _>(source, &mut workspace.sums8, |pixels| {
+                jpeg::encode(pixels, quality, &mut out)
+            })
+        }
+        Codec::WebpLossless => plan.with_pixels::<u8, _>(source, &mut workspace.sums8, |pixels| {
+            webp::encode_lossless(pixels, plan.channels(), &mut out, &mut workspace.image)
         }),
-        codec => plan.with_pixels::<u8, _>(source, &mut workspace.sums8, |pixels| match codec {
-            Codec::Png {
-                compression, cicp, ..
-            } => png::encode(
-                pixels,
-                plan.channels(),
-                compression,
-                cicp,
-                &mut out,
-                &mut workspace.row,
-            ),
-            Codec::Jpeg { quality } => jpeg::encode(pixels, quality, &mut out),
-            Codec::WebpLossless => {
-                webp::encode_lossless(pixels, plan.channels(), &mut out, &mut workspace.image)
-            }
-            Codec::WebpLossy {
-                quality,
-                effort,
-                sharp_yuv,
-            } => {
-                let image =
-                    webp::encode_lossy(pixels, quality, effort, sharp_yuv, &mut workspace.image)?;
-                out.write_all(&image).map_err(Error::Io)
-            }
+        Codec::WebpLossy {
+            quality,
+            effort,
+            sharp_yuv,
+        } => plan.with_pixels::<u8, _>(source, &mut workspace.sums8, |pixels| {
+            let image =
+                webp::encode_lossy(pixels, quality, effort, sharp_yuv, &mut workspace.image)?;
+            out.write_all(&image).map_err(Error::Io)
         }),
     };
     let result = result.and_then(|()| out.flush().map_err(Error::Io));
@@ -330,16 +338,13 @@ impl Plan {
     /// the frame's color description, its HDR transfer, and the image's size.
     fn new(source: &Source<'_>, options: &ImageOptions) -> Result<Self> {
         let format = options.format;
-        let quality_range = match format {
-            ImageFormat::Jpeg(quality) => Some((quality, 1)),
-            ImageFormat::WebpLossy(quality) => Some((quality, 0)),
-            _ => None,
-        };
-        if let Some((quality, min)) = quality_range {
-            if !(min..=100).contains(&quality) {
+        if let Some((quality, bounds)) = format.quality().zip(format.quality_bounds()) {
+            if !bounds.contains(&quality) {
                 return Err(Error::InvalidInput(format!(
-                    "{} quality must be in {min}..=100, got {quality}",
-                    format.name()
+                    "{} quality must be in {}..={}, got {quality}",
+                    format.name(),
+                    bounds.start(),
+                    bounds.end()
                 )));
             }
         }
@@ -415,21 +420,18 @@ impl Plan {
                 }
             }
         };
-        let alpha = options.alpha == AlphaMode::Keep && !matches!(codec, Codec::Jpeg { .. });
+        let alpha = options.alpha.keeps_alpha() && !matches!(codec, Codec::Jpeg { .. });
         let channels = if alpha { 4 } else { 3 };
-        let wide = matches!(
-            codec,
-            Codec::Png {
-                depth: SampleDepth::Sixteen,
-                ..
-            }
-        );
+        let sample_bytes = match codec {
+            Codec::Png { depth, .. } => depth.bytes(),
+            Codec::Jpeg { .. } | Codec::WebpLossless | Codec::WebpLossy { .. } => 1,
+        };
         // Check conversion geometry before any codec can write a header.
         // In particular, 16-bit PNG rows can exceed the source row size on
         // 32-bit targets. Row codecs must not require a whole-image product.
         match codec {
             Codec::Png { .. } => {
-                packed_len(width, 1, channels * if wide { 2 } else { 1 })?;
+                packed_len(width, 1, channels * sample_bytes)?;
             }
             Codec::WebpLossless => {
                 packed_len(width, height, channels)?;
@@ -440,7 +442,7 @@ impl Plan {
             Codec::Jpeg { .. } => {}
         }
         if shift > 0 {
-            packed_len(width, 1, if wide { 32 } else { 16 })?;
+            packed_len(width, 1, if sample_bytes == 2 { 32 } else { 16 })?;
         }
         Ok(Self {
             codec,
@@ -499,11 +501,10 @@ impl Plan {
 
 /// The PQ or HLG transfer of a color description, named for messages.
 fn hdr_transfer(color: &ColorInfo) -> Option<&'static str> {
-    match color.transfer()? {
-        TransferFunction::Pq => Some("PQ"),
-        TransferFunction::Hlg => Some("HLG"),
-        _ => None,
-    }
+    color
+        .transfer()
+        .filter(|transfer| transfer.is_hdr())
+        .map(TransferFunction::name)
 }
 
 /// The `cICP` chunk of a PNG whose colors an untagged viewer would show
@@ -516,17 +517,8 @@ fn hdr_transfer(color: &ColorInfo) -> Option<&'static str> {
 /// curve. The matrix is 0, the only one PNG allows for RGB, and the range
 /// flag 1, because the RGB written is full range.
 fn cicp(color: &ColorInfo) -> Option<[u8; 4]> {
-    let transfer = match color.transfer() {
-        Some(TransferFunction::Pq) => 16,
-        Some(TransferFunction::Hlg) => 18,
-        _ => 1,
-    };
-    let primaries = match color.primaries() {
-        Some(ColorPrimaries::Bt709) => 1,
-        Some(ColorPrimaries::Bt601) => 6,
-        Some(ColorPrimaries::Bt2020) => 9,
-        None => 2,
-    };
+    let transfer = color.transfer().map_or(1, TransferFunction::h273_code);
+    let primaries = color.primaries().map_or(2, ColorPrimaries::h273_code);
     (primaries == 9 || color.is_hdr()).then_some([primaries, transfer, 0, 1])
 }
 
