@@ -55,6 +55,54 @@ inert_table! {
     }
 }
 
+/// A player that delivers an Ended event with an unreadable audio format,
+/// and a probe that returns useful information with an unreadable track count.
+pub(super) fn playback_with_unreadable_formats() -> sys::FilePlayback {
+    unsafe extern "C" fn create(
+        _: *const NDIlib_file_player_create_t,
+    ) -> NDIlib_file_player_instance_t {
+        std::ptr::NonNull::dangling().as_ptr()
+    }
+    unsafe extern "C" fn capture(
+        _: NDIlib_file_player_instance_t,
+        out: *mut NDIlib_file_player_event_t,
+        _: u32,
+    ) -> NDIlib_file_player_event_type_e {
+        let mut event = NDIlib_file_player_event_t {
+            type_: NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_ended,
+            first_pts_100ns: 42,
+            ..Default::default()
+        };
+        event.p_path[0] = b'p' as std::ffi::c_char;
+        event.source_format.audio_no_samples = -1;
+        let kind = event.type_;
+        // SAFETY: the player capture wrapper supplies writable guarded storage.
+        unsafe { out.write(event) };
+        kind
+    }
+    unsafe extern "C" fn probe(
+        _: *const std::ffi::c_char,
+        out: *mut NDIlib_file_player_file_info_t,
+    ) -> bool {
+        let mut info = NDIlib_file_player_file_info_t {
+            duration_100ns: 123,
+            duration_is_final: true,
+            track_count: 4,
+            ..Default::default()
+        };
+        info.source_format.video_track_count = 3;
+        // SAFETY: the probe wrapper supplies writable guarded storage.
+        unsafe { out.write(info) };
+        true
+    }
+    sys::FilePlayback {
+        NDIlib_file_player_create: create,
+        NDIlib_file_player_capture_event: capture,
+        NDIlib_file_player_probe_file: probe,
+        ..playback()
+    }
+}
+
 inert_table! {
     /// Recording entry points that do nothing.
     fn recording() -> FileRecording {

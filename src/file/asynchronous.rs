@@ -750,10 +750,12 @@ impl<E: Send> Expire for EventQueue<E> {
 /// # Errors
 ///
 /// Besides those above, [`Error::InvalidInput`] when the timeout exceeds
-/// [`crate::MAX_TIMEOUT`], [`Error::UnexpectedSdkResult`] for an event the
-/// SDK delivered malformed, and [`Error::Io`] when the wait has to be
+/// [`crate::MAX_TIMEOUT`], [`Error::UnexpectedSdkResult`] for a whole-event
+/// layout or type mismatch, and [`Error::Io`] when the wait has to be
 /// timed and the timer thread cannot be started; a later wait tries to start
 /// it again.
+/// An unreadable format is withheld through [`PlayerEvent::source_format`]
+/// or [`RecorderEvent::source_format`] while the event is delivered.
 ///
 /// # Panics
 ///
@@ -2092,9 +2094,10 @@ impl AsyncFileRecorder {
     /// [`StateError::Closed`] instead of [`FinishStatus::TimedOut`], because
     /// the recorder is being destroyed and cannot be waited on again.
     ///
-    /// Events taken during the wait go to [`next_event`](Self::next_event)
-    /// as the recorder's thread delivers any other, a malformed one as
-    /// [`Error::UnexpectedSdkResult`]; it does not end the wait.
+    /// Events taken during the wait go to [`next_event`](Self::next_event).
+    /// An unreadable format is withheld through [`RecorderEvent::source_format`]
+    /// while the event is delivered. A whole-event layout or type mismatch is
+    /// delivered as [`Error::UnexpectedSdkResult`]; it does not end the wait.
     ///
     /// # Errors
     ///
@@ -5067,6 +5070,40 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_player_and_probe_formats_are_delivered_through_async_handles() {
+        let api = FileApi::with_tables(mock::playback_with_unreadable_formats(), mock::recording());
+        let player = block_on(AsyncFilePlayer::create(
+            &api,
+            &PlayerOptions::new("mock player"),
+        ))
+        .unwrap();
+        let event = block_on(player.next_event(Duration::from_secs(5)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.kind(), super::super::PlayerEventKind::Ended);
+        assert_eq!(event.path().to_str().unwrap(), "p");
+        assert_eq!(event.first_pts().ticks(), 42);
+        assert_eq!(
+            event.source_format(),
+            Err(crate::SdkResultDefect::NegativeFormatCount {
+                what: "audio sample count",
+                value: -1
+            })
+        );
+        block_on(player.close()).unwrap();
+        let info = block_on(AsyncFilePlayer::probe(&api, "mock.mkv")).unwrap();
+        assert_eq!(info.duration().value().ticks(), 123);
+        assert_eq!(info.track_count(), 4);
+        assert_eq!(
+            info.source_format(),
+            Err(crate::SdkResultDefect::FileTrackCount {
+                count: 3,
+                capacity: 2
+            })
+        );
+    }
+
+    #[test]
     fn an_async_finish_delivers_a_malformed_event_it_takes_to_the_event_stream() {
         let (device, recorder) = mock_recorder_with(Closing::Never, AsyncFileOptions::new());
         let finishing = recorder.finish(Duration::from_secs(5)).submit();
@@ -5084,18 +5121,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(started.kind(), RecorderEventKind::Started);
-        let malformed = block_on(recorder.next_event(Duration::ZERO));
-        assert!(
-            matches!(
-                malformed,
-                Err(Error::UnexpectedSdkResult(
-                    crate::SdkResultDefect::FileTrackCount {
-                        count: 3,
-                        capacity: 2
-                    }
-                ))
-            ),
-            "{malformed:?}"
+        let malformed = block_on(recorder.next_event(Duration::ZERO))
+            .unwrap()
+            .unwrap();
+        assert_eq!(malformed.kind(), RecorderEventKind::FileClosed);
+        assert_eq!(malformed.path().to_str().unwrap(), mock::TAKE);
+        assert_eq!(
+            malformed.source_format(),
+            Err(crate::SdkResultDefect::FileTrackCount {
+                count: 3,
+                capacity: 2,
+            })
         );
         block_on(recorder.close()).unwrap();
     }

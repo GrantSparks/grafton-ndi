@@ -341,6 +341,8 @@ impl FileApi {
     /// Read a recording's duration and track layout.
     ///
     /// Nothing is played and no NDI source is advertised.
+    /// An unreadable format payload does not discard the other information;
+    /// [`FileInfo::source_format`] reports the typed cause instead.
     ///
     /// # Errors
     ///
@@ -362,7 +364,7 @@ impl FileApi {
                     .NDIlib_file_player_probe_file(path.as_ptr(), info)
             }
         })?;
-        FileInfo::from_sdk(&info)
+        Ok(FileInfo::from_sdk(&info))
     }
 
     /// Create a player and advertise its NDI source.

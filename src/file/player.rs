@@ -6,11 +6,9 @@ use super::{
     out_param, types, FileApi, FileDuration, FilePosition, PlayerEvent, PlayerOptions, PlayerStats,
     SourceFormat,
 };
-#[cfg(doc)]
-use crate::Error;
 use crate::{
     sys::{self, bindings::*},
-    Result, Source, Timecode,
+    Error, Result, Source, Timecode,
 };
 
 /// An NDI source that plays recordings.
@@ -148,11 +146,14 @@ impl FilePlayer {
 
     /// Take the next queued event, waiting up to `timeout` for one, or
     /// `None` when none arrives in time.
+    /// An unreadable format is withheld through [`PlayerEvent::source_format`]
+    /// while the rest of the event is delivered.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
-    /// and [`Error::UnexpectedSdkResult`] when the SDK's event is malformed.
+    /// and [`Error::UnexpectedSdkResult`] when the SDK's event does not match
+    /// this crate's structure layout or its returned event type.
     pub fn poll_event(&mut self, timeout: Duration) -> Result<Option<PlayerEvent>> {
         let timeout = crate::to_ms_checked(timeout)?;
         out_param::capture_event(
@@ -170,9 +171,8 @@ impl FilePlayer {
             |event| event.type_,
             NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_none,
             "the player returned one event type and stored another",
-        )?
-        .map(|event| PlayerEvent::from_sdk(&event))
-        .transpose()
+        )
+        .map(|event| event.map(|event| PlayerEvent::from_sdk(&event)))
     }
 
     /// How many events the SDK has discarded since the player was created
@@ -341,7 +341,7 @@ impl FilePlayer {
                     .NDIlib_file_player_get_source_format(self.handle.as_ptr(), format)
             }
         })?
-        .map(|format| SourceFormat::from_sdk(&format))
+        .map(|format| SourceFormat::from_sdk(&format).map_err(Error::UnexpectedSdkResult))
         .transpose()
     }
 

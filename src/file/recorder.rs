@@ -1187,7 +1187,10 @@ impl FileRecorder {
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
-    /// and [`Error::UnexpectedSdkResult`] when the SDK's event is malformed.
+    /// and [`Error::UnexpectedSdkResult`] when the SDK's event does not match
+    /// this crate's structure layout or its returned event type. An unreadable
+    /// format is withheld through [`RecorderEvent::source_format`] while the
+    /// rest of the event is delivered.
     pub fn poll_event(&mut self, timeout: Duration) -> Result<Option<RecorderEvent>> {
         self.poll_event_ms(crate::to_ms_checked(timeout)?)
     }
@@ -1196,7 +1199,7 @@ impl FileRecorder {
     ///
     /// # Errors
     ///
-    /// [`Error::UnexpectedSdkResult`] when the SDK's event is malformed.
+    /// [`Error::UnexpectedSdkResult`] for a whole-event layout or type mismatch.
     fn poll_event_ms(&mut self, wait_ms: u32) -> Result<Option<RecorderEvent>> {
         let event = self.capture(wait_ms);
         if self.ledger.session_open() {
@@ -1221,7 +1224,7 @@ impl FileRecorder {
         }
         // Decoded after the ledger is updated, so that a malformed payload
         // cannot hide the event that closes a file.
-        Ok(Some(RecorderEvent::from_sdk(&event)?))
+        Ok(Some(RecorderEvent::from_sdk(&event)))
     }
 
     /// Take the next native event, or `None` when the queue stays empty for
@@ -1660,7 +1663,7 @@ impl FileRecorder {
                     .NDIlib_file_recorder_get_source_format(self.handle.as_ptr(), format)
             }
         })?
-        .map(|format| SourceFormat::from_sdk(&format))
+        .map(|format| SourceFormat::from_sdk(&format).map_err(Error::UnexpectedSdkResult))
         .transpose()
     }
 }

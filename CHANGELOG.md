@@ -221,6 +221,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - The optional `file-io` feature: source recording, file playback, probing,
   thumbnails and executor-independent async handles. Recording reports expose
   finalization; async operations submit on first poll or through `submit()`.
+  Events and probe results survive an unreadable optional format;
+  `source_format()` returns its typed refusal while preserving the other fields.
   Submitted stop/finish/close operations retain their cancellation guarantees.
   The feature is independent of `advanced`; native library requirements are
   platform-specific. See [File API](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/file-io.md).

@@ -430,8 +430,8 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
         .unwrap();
     assert_eq!(session, 1);
     let first = await_event(&mut recorder, RecorderEventKind::FirstFrame);
-    assert_eq!(first.source_format().video_tracks().len(), 1);
-    assert_live_video(&first.source_format().video_tracks()[0]);
+    assert_eq!(first.source_format().unwrap().video_tracks().len(), 1);
+    assert_live_video(&first.source_format().unwrap().video_tracks()[0]);
     assert!(first.tracks().is_empty());
     assert_eq!(
         recorder.reported_current_file().unwrap().as_bytes(),
@@ -456,7 +456,7 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
 
     let info = api.probe(&file).unwrap();
     assert_eq!(info.video_track_count(), 1);
-    assert_live_video(&info.source_format().video_tracks()[0]);
+    assert_live_video(&info.source_format().unwrap().video_tracks()[0]);
     assert!(info.duration().is_final());
     assert!(info.duration().value().ticks() > 0);
     assert!(matches!(

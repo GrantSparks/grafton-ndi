@@ -274,14 +274,55 @@ fn a_malformed_close_event_still_closes_the_session() {
     let mut event = mock::recorder_event(FILE_CLOSED, TAKE);
     event.source_format_payload.video_track_count = 3;
     device.push_event(event);
-    while recorder
-        .poll_event(Duration::ZERO)
-        .is_ok_and(|event| event.is_some())
-    {}
+    let mut closed = None;
+    while let Some(event) = recorder.poll_event(Duration::ZERO).unwrap() {
+        if event.kind() == RecorderEventKind::FileClosed {
+            closed = Some(event);
+        }
+    }
+    let event = closed.expect("the format must not hide the close event");
+    assert_eq!(event.path().to_str().unwrap(), TAKE);
+    assert_eq!(
+        event.source_format(),
+        Err(crate::SdkResultDefect::FileTrackCount {
+            count: 3,
+            capacity: 2
+        })
+    );
     assert!(matches!(
         recorder.wait_finished(Duration::from_millis(50)).unwrap(),
         FinishStatus::Closed(_)
     ));
+}
+
+#[test]
+fn an_unreadable_player_format_preserves_its_ended_event_and_probe_information() {
+    let api = FileApi::with_tables(mock::playback_with_unreadable_formats(), mock::recording());
+    let mut player = api
+        .create_player(&PlayerOptions::new("mock player"))
+        .unwrap();
+    let event = player.poll_event(Duration::ZERO).unwrap().unwrap();
+    assert_eq!(event.kind(), PlayerEventKind::Ended);
+    assert_eq!(event.path().to_str().unwrap(), "p");
+    assert_eq!(event.first_pts().ticks(), 42);
+    assert_eq!(
+        event.source_format(),
+        Err(crate::SdkResultDefect::NegativeFormatCount {
+            what: "audio sample count",
+            value: -1
+        })
+    );
+    let info = api.probe("mock.mkv").unwrap();
+    assert_eq!(info.duration().value().ticks(), 123);
+    assert!(info.duration().is_final());
+    assert_eq!(info.track_count(), 4);
+    assert_eq!(
+        info.source_format(),
+        Err(crate::SdkResultDefect::FileTrackCount {
+            count: 3,
+            capacity: 2
+        })
+    );
 }
 
 #[test]

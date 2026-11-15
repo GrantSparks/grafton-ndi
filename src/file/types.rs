@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     sys::{self, bindings::*},
-    Error, FourCc, FrameRate, MediaTypes, Result, ScanType, StreamTier, Timecode,
+    Error, FourCc, FrameRate, MediaTypes, Result, ScanType, SdkResultDefect, StreamTier, Timecode,
 };
 
 /// Why an operation is not permitted in the current state, carried by
@@ -1187,7 +1187,7 @@ pub struct FileInfo {
     pub(super) video_track_count: u32,
     pub(super) audio_track_count: u32,
     pub(super) metadata_track_count: u32,
-    pub(super) source_format: SourceFormat,
+    pub(super) source_format: std::result::Result<SourceFormat, SdkResultDefect>,
 }
 
 impl FileInfo {
@@ -1212,8 +1212,14 @@ impl FileInfo {
         self.metadata_track_count
     }
     /// Owned codec/layout information.
-    pub fn source_format(&self) -> &SourceFormat {
-        &self.source_format
+    /// An unreadable format is withheld with its cause; the remaining event
+    /// or probe fields are still delivered.
+    ///
+    /// # Errors
+    ///
+    /// The typed SDK-result defect that prevented decoding the format.
+    pub fn source_format(&self) -> std::result::Result<&SourceFormat, SdkResultDefect> {
+        self.source_format.as_ref().map_err(|cause| *cause)
     }
 }
 
@@ -1266,7 +1272,7 @@ pub struct PlayerEvent {
     pub(super) first_pts: FilePosition,
     pub(super) last_pts: FilePosition,
     pub(super) source_timecode: Option<Timecode>,
-    pub(super) source_format: SourceFormat,
+    pub(super) source_format: std::result::Result<SourceFormat, SdkResultDefect>,
 }
 
 impl PlayerEvent {
@@ -1296,8 +1302,14 @@ impl PlayerEvent {
         self.source_timecode
     }
     /// Source format snapshot; zero/empty fields may mean inapplicable.
-    pub fn source_format(&self) -> &SourceFormat {
-        &self.source_format
+    /// An unreadable format is withheld with its cause; the remaining event
+    /// or probe fields are still delivered.
+    ///
+    /// # Errors
+    ///
+    /// The typed SDK-result defect that prevented decoding the format.
+    pub fn source_format(&self) -> std::result::Result<&SourceFormat, SdkResultDefect> {
+        self.source_format.as_ref().map_err(|cause| *cause)
     }
 }
 
@@ -1381,7 +1393,7 @@ pub struct RecorderEvent {
     pub(super) first_pts: FilePosition,
     pub(super) last_pts: FilePosition,
     pub(super) format_text: EventText,
-    pub(super) source_format: SourceFormat,
+    pub(super) source_format: std::result::Result<SourceFormat, SdkResultDefect>,
 }
 
 impl RecorderEvent {
@@ -1419,8 +1431,14 @@ impl RecorderEvent {
         &self.format_text
     }
     /// Structured format description.
-    pub fn source_format(&self) -> &SourceFormat {
-        &self.source_format
+    /// An unreadable format is withheld with its cause; the remaining event
+    /// or probe fields are still delivered.
+    ///
+    /// # Errors
+    ///
+    /// The typed SDK-result defect that prevented decoding the format.
+    pub fn source_format(&self) -> std::result::Result<&SourceFormat, SdkResultDefect> {
+        self.source_format.as_ref().map_err(|cause| *cause)
     }
 }
 
@@ -1545,10 +1563,8 @@ impl RecorderStats {
 }
 
 /// A quantity the SDK reports as a signed integer, which must not be negative.
-fn non_negative(value: i32, what: &'static str) -> Result<u32> {
-    u32::try_from(value).map_err(|_| {
-        Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeFormatCount { what, value })
-    })
+fn non_negative(value: i32, what: &'static str) -> std::result::Result<u32, SdkResultDefect> {
+    u32::try_from(value).map_err(|_| SdkResultDefect::NegativeFormatCount { what, value })
 }
 
 /// The scan type a File SDK frame format names, if it names one.
@@ -1605,7 +1621,9 @@ fn tracks(flags: NDIlib_file_recorder_track_flags_e) -> MediaTypes {
 
 impl VideoTrack {
     /// The track the SDK's `raw` describes.
-    pub(super) fn from_sdk(raw: &NDIlib_file_video_track_format_t) -> Result<Self> {
+    pub(super) fn from_sdk(
+        raw: &NDIlib_file_video_track_format_t,
+    ) -> std::result::Result<Self, SdkResultDefect> {
         let ratio = raw.picture_aspect_ratio;
         Ok(Self {
             tier: if raw.is_high_quality {
@@ -1631,21 +1649,22 @@ impl VideoTrack {
 
 impl SourceFormat {
     /// The format the SDK's `raw` describes.
-    pub(super) fn from_sdk(raw: &NDIlib_file_source_format_t) -> Result<Self> {
-        let count = usize::try_from(raw.video_track_count).map_err(|_| {
-            Error::UnexpectedSdkResult(crate::SdkResultDefect::FileTrackCountOverflow)
-        })?;
+    pub(super) fn from_sdk(
+        raw: &NDIlib_file_source_format_t,
+    ) -> std::result::Result<Self, SdkResultDefect> {
+        let count = usize::try_from(raw.video_track_count)
+            .map_err(|_| SdkResultDefect::FileTrackCountOverflow)?;
         let tracks = raw.video_tracks.get(..count).ok_or({
-            Error::UnexpectedSdkResult(crate::SdkResultDefect::FileTrackCount {
+            SdkResultDefect::FileTrackCount {
                 count: raw.video_track_count,
                 capacity: raw.video_tracks.len(),
-            })
+            }
         })?;
         Ok(Self {
             video_tracks: tracks
                 .iter()
                 .map(VideoTrack::from_sdk)
-                .collect::<Result<_>>()?,
+                .collect::<std::result::Result<_, _>>()?,
             audio_sample_rate: non_negative(raw.audio_sample_rate, "audio sample rate")?,
             audio_num_channels: non_negative(raw.audio_no_channels, "audio channel count")?,
             audio_num_samples: non_negative(raw.audio_no_samples, "audio sample count")?,
@@ -1657,8 +1676,8 @@ impl SourceFormat {
 
 impl FileInfo {
     /// The information the SDK's `raw` reports.
-    pub(super) fn from_sdk(raw: &NDIlib_file_player_file_info_t) -> Result<Self> {
-        Ok(Self {
+    pub(super) fn from_sdk(raw: &NDIlib_file_player_file_info_t) -> Self {
+        Self {
             duration: FileDuration {
                 position: FilePosition::from_ticks(raw.duration_100ns),
                 is_final: raw.duration_is_final,
@@ -1667,15 +1686,15 @@ impl FileInfo {
             video_track_count: raw.video_track_count,
             audio_track_count: raw.audio_track_count,
             metadata_track_count: raw.metadata_track_count,
-            source_format: SourceFormat::from_sdk(&raw.source_format)?,
-        })
+            source_format: SourceFormat::from_sdk(&raw.source_format),
+        }
     }
 }
 
 impl PlayerEvent {
     /// The event the SDK's `raw` reports.
-    pub(super) fn from_sdk(raw: &NDIlib_file_player_event_t) -> Result<Self> {
-        Ok(Self {
+    pub(super) fn from_sdk(raw: &NDIlib_file_player_event_t) -> Self {
+        Self {
             kind: PlayerEventKind::from_raw(raw.type_),
             path: EventText::from_buffer(&raw.p_path),
             message: EventText::from_buffer(&raw.p_message),
@@ -1684,15 +1703,15 @@ impl PlayerEvent {
             source_timecode: raw
                 .has_source_timecode
                 .then(|| Timecode::from_ticks(raw.source_timecode_100ns)),
-            source_format: SourceFormat::from_sdk(&raw.source_format)?,
-        })
+            source_format: SourceFormat::from_sdk(&raw.source_format),
+        }
     }
 }
 
 impl RecorderEvent {
     /// The event the SDK's `raw` reports.
-    pub(super) fn from_sdk(raw: &NDIlib_file_recorder_event_t) -> Result<Self> {
-        Ok(Self {
+    pub(super) fn from_sdk(raw: &NDIlib_file_recorder_event_t) -> Self {
+        Self {
             kind: RecorderEventKind::from_raw(raw.type_),
             path: EventText::from_buffer(&raw.p_path),
             message: EventText::from_buffer(&raw.p_message),
@@ -1701,8 +1720,8 @@ impl RecorderEvent {
             first_pts: FilePosition::from_ticks(raw.first_pts_100ns),
             last_pts: FilePosition::from_ticks(raw.last_pts_100ns),
             format_text: EventText::from_buffer(&raw.source_format),
-            source_format: SourceFormat::from_sdk(&raw.source_format_payload)?,
-        })
+            source_format: SourceFormat::from_sdk(&raw.source_format_payload),
+        }
     }
 }
 
@@ -2625,15 +2644,12 @@ mod tests {
             track_flags: NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_audio,
             ..Default::default()
         };
-        assert_eq!(
-            RecorderEvent::from_sdk(&raw).unwrap().tracks(),
-            MediaTypes::AUDIO
-        );
+        assert_eq!(RecorderEvent::from_sdk(&raw).tracks(), MediaTypes::AUDIO);
         let other = NDIlib_file_recorder_event_t {
             type_: NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_started,
             ..Default::default()
         };
-        assert!(RecorderEvent::from_sdk(&other).unwrap().tracks().is_empty());
+        assert!(RecorderEvent::from_sdk(&other).tracks().is_empty());
     }
 
     #[test]
@@ -2643,10 +2659,10 @@ mod tests {
             source_timecode_100ns: -100,
             ..Default::default()
         };
-        assert_eq!(PlayerEvent::from_sdk(&raw).unwrap().source_timecode(), None);
+        assert_eq!(PlayerEvent::from_sdk(&raw).source_timecode(), None);
         raw.has_source_timecode = true;
         assert_eq!(
-            PlayerEvent::from_sdk(&raw).unwrap().source_timecode(),
+            PlayerEvent::from_sdk(&raw).source_timecode(),
             Some(Timecode::from_ticks(-100))
         );
     }
@@ -2659,12 +2675,10 @@ mod tests {
         };
         assert!(matches!(
             SourceFormat::from_sdk(&raw),
-            Err(Error::UnexpectedSdkResult(
-                crate::SdkResultDefect::FileTrackCount {
-                    count: 3,
-                    capacity: 2
-                }
-            ))
+            Err(crate::SdkResultDefect::FileTrackCount {
+                count: 3,
+                capacity: 2
+            })
         ));
         raw.video_track_count = 2;
         raw.video_tracks[0].is_high_quality = true;
@@ -2754,7 +2768,7 @@ mod tests {
                 -1,
             ),
         ] {
-            let Err(Error::UnexpectedSdkResult(cause)) = VideoTrack::from_sdk(&broken) else {
+            let Err(cause) = VideoTrack::from_sdk(&broken) else {
                 panic!("the negative {what} was not refused");
             };
             assert_eq!(
@@ -2802,7 +2816,7 @@ mod tests {
                 "audio sample count",
             ),
         ] {
-            let Err(Error::UnexpectedSdkResult(cause)) = SourceFormat::from_sdk(&broken) else {
+            let Err(cause) = SourceFormat::from_sdk(&broken) else {
                 panic!("the negative {what} was not refused");
             };
             assert_eq!(
@@ -2813,13 +2827,147 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_formats_preserve_every_other_event_and_probe_field() {
+        let mut format = NDIlib_file_source_format_t {
+            video_track_count: 1,
+            audio_sample_rate: 48_000,
+            audio_no_channels: 2,
+            audio_no_samples: 1_600,
+            ..Default::default()
+        };
+        format.video_tracks[0] = NDIlib_file_video_track_format_t {
+            xres: 1920,
+            yres: 1080,
+            frame_rate_n: 30,
+            frame_rate_d: 1,
+            ..Default::default()
+        };
+        let info = NDIlib_file_player_file_info_t {
+            duration_100ns: 123,
+            duration_is_final: true,
+            track_count: 4,
+            video_track_count: 1,
+            audio_track_count: 2,
+            metadata_track_count: 1,
+            source_format: format,
+        };
+        let mut player = NDIlib_file_player_event_t {
+            type_: NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_ended,
+            first_pts_100ns: 17,
+            last_pts_100ns: 19,
+            has_source_timecode: true,
+            source_timecode_100ns: -13,
+            source_format: format,
+            ..Default::default()
+        };
+        player.p_path[0] = b'p' as c_char;
+        player.p_message[0] = b'm' as c_char;
+        let mut recorder = NDIlib_file_recorder_event_t {
+            type_: NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_file_closed,
+            dropped_packet_count: 23,
+            first_pts_100ns: 29,
+            last_pts_100ns: 31,
+            source_format_payload: format,
+            ..Default::default()
+        };
+        recorder.p_path[0] = b'r' as c_char;
+        recorder.p_message[0] = b'd' as c_char;
+        recorder.source_format[0] = b'f' as c_char;
+        let expected_info = FileInfo::from_sdk(&info);
+        let expected_player = PlayerEvent::from_sdk(&player);
+        let expected_recorder = RecorderEvent::from_sdk(&recorder);
+        assert_eq!(
+            expected_info.source_format().unwrap().audio_num_channels(),
+            2
+        );
+        let mut broken = Vec::new();
+        for (index, what) in [
+            "width",
+            "height",
+            "frame-rate numerator",
+            "frame-rate denominator",
+            "audio sample rate",
+            "audio channel count",
+            "audio sample count",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut raw = format;
+            match index {
+                0 => raw.video_tracks[0].xres = -1,
+                1 => raw.video_tracks[0].yres = -1,
+                2 => raw.video_tracks[0].frame_rate_n = -1,
+                3 => raw.video_tracks[0].frame_rate_d = -1,
+                4 => raw.audio_sample_rate = -1,
+                5 => raw.audio_no_channels = -1,
+                _ => raw.audio_no_samples = -1,
+            }
+            broken.push((
+                raw,
+                SdkResultDefect::NegativeFormatCount { what, value: -1 },
+            ));
+        }
+        broken.push((
+            NDIlib_file_source_format_t {
+                video_track_count: 3,
+                ..format
+            },
+            SdkResultDefect::FileTrackCount {
+                count: 3,
+                capacity: 2,
+            },
+        ));
+        for (format, defect) in broken {
+            let mut decoded_info = FileInfo::from_sdk(&NDIlib_file_player_file_info_t {
+                source_format: format,
+                ..info
+            });
+            let mut decoded_player = PlayerEvent::from_sdk(&NDIlib_file_player_event_t {
+                source_format: format,
+                ..player
+            });
+            let mut decoded_recorder = RecorderEvent::from_sdk(&NDIlib_file_recorder_event_t {
+                source_format_payload: format,
+                ..recorder
+            });
+            for result in [
+                decoded_info.source_format(),
+                decoded_player.source_format(),
+                decoded_recorder.source_format(),
+            ] {
+                assert_eq!(result, Err(defect));
+            }
+            decoded_info.source_format = expected_info.source_format.clone();
+            decoded_player.source_format = expected_player.source_format.clone();
+            decoded_recorder.source_format = expected_recorder.source_format.clone();
+            assert_eq!(decoded_info, expected_info);
+            assert_eq!(decoded_player, expected_player);
+            assert_eq!(decoded_recorder, expected_recorder);
+        }
+    }
+
+    #[test]
+    fn withholding_a_format_adds_no_decode_allocation() {
+        let good = NDIlib_file_player_event_t::default();
+        let mut bad = good;
+        bad.source_format.video_track_count = 3;
+        let (_, good_allocations) =
+            crate::test_alloc::allocation_count(|| PlayerEvent::from_sdk(&good));
+        let (event, bad_allocations) =
+            crate::test_alloc::allocation_count(|| PlayerEvent::from_sdk(&bad));
+        assert!(event.source_format().is_err());
+        assert!(bad_allocations <= good_allocations);
+    }
+
+    #[test]
     fn malformed_event_text_does_not_hide_file_closed() {
         let mut raw = NDIlib_file_recorder_event_t {
             type_: NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_file_closed,
             ..Default::default()
         };
         raw.p_path.fill(0xff_u8 as c_char);
-        let event = RecorderEvent::from_sdk(&raw).unwrap();
+        let event = RecorderEvent::from_sdk(&raw);
         assert_eq!(event.kind(), RecorderEventKind::FileClosed);
         assert!(!event.path().is_terminated());
         assert!(event.path().to_str().is_err());
