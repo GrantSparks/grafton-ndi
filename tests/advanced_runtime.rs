@@ -175,7 +175,7 @@ fn advanced_native_constructors_controls_and_queue() {
         sender.quality_plan(h264, false),
         Err(Error::InvalidInput(_))
     ));
-    let router = grafton_ndi::routing::Router::new(
+    let mut router = grafton_ndi::routing::Router::new(
         &ndi,
         &grafton_ndi::routing::RouterOptions::new(format!(
             "grafton-local-{}-router",
@@ -3857,4 +3857,50 @@ fn avsync_borrows_two_results_and_releases_them_out_of_order() {
         assert_eq!(first.channel_data(0), first_samples.channel_data(0));
         drop(first);
     });
+}
+
+#[test]
+fn router_connection_metadata_survives_the_registered_input() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let sender = Sender::new(&ndi, &options("router-metadata-source")).unwrap();
+    let mut router = grafton_ndi::routing::Router::new(
+        &ndi,
+        &grafton_ndi::routing::RouterOptions::new(common::unique_name("router metadata")),
+    )
+    .unwrap();
+    router
+        .change(&loopback(&ndi, &sender.source().unwrap()))
+        .unwrap();
+    let text = "<router-registration/>";
+    router
+        .add_connection_metadata(
+            &MetadataFrame::new(text)
+                .unwrap()
+                .with_timecode(Timecode::from_ticks(22)),
+        )
+        .unwrap();
+    let receiver = Receiver::new(
+        &ndi,
+        &ReceiverOptions::new(loopback(&ndi, &router.source().unwrap())),
+    )
+    .unwrap();
+    let frame = video();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        sender.send_video(&frame).unwrap();
+        if let Some(metadata) = receiver.metadata().capture_ref(SLICE).unwrap() {
+            if metadata.data() == text {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "router connection metadata was not delivered; {}",
+            link(&receiver)
+        );
+    }
+    router.clear_connection_metadata().unwrap();
 }

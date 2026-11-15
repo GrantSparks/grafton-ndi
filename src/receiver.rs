@@ -50,6 +50,7 @@ use crate::{
         capture_any, capture_raw, AllSlots, AudioKind, CaptureKind, CaptureResult, CaptureStrategy,
         Delivered, Media, MetadataKind, NoSlots, Notification, SlotSet, VideoKind,
     },
+    connection_metadata::ConnectionMetadata,
     finder::{RawSource, Source},
     frames::MetadataPartsExt,
     sys::{self, bindings::*},
@@ -1020,6 +1021,7 @@ pub(crate) struct ReceiverCore {
     pending_source: AtomicBool,
     pending_unknown: Mutex<Option<u32>>,
     source_query_guard: Mutex<()>,
+    connection_metadata: Mutex<ConnectionMetadata>,
     _name: Option<CString>,
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
@@ -1141,6 +1143,7 @@ impl Receiver {
                 pending_source: AtomicBool::new(false),
                 pending_unknown: Mutex::new(None),
                 source_query_guard: Mutex::new(()),
+                connection_metadata: Mutex::new(ConnectionMetadata::default()),
                 _name,
                 #[cfg(feature = "advanced")]
                 _config: config,
@@ -1334,21 +1337,26 @@ impl<M: ReceiverMode> Receiver<M> {
 
     /// Add validated metadata sent immediately and again on each connection.
     ///
-    /// Accepts owned or captured metadata. The SDK copies the text during
-    /// this call, so the input need not outlive the registration.
+    /// Accepts owned or captured metadata. The receiver keeps its own copy,
+    /// so the input need not outlive the registration.
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let table = self.core.connection_metadata()?;
-        let raw = metadata.metadata_raw();
-        // SAFETY: The metadata C string remains live for the synchronous SDK call.
-        unsafe { table.NDIlib_recv_add_connection_metadata(self.core.instance.0, &raw) };
+        let mut registrations = self.core.connection_metadata.lock();
+        let raw = registrations.add(metadata);
+        // SAFETY: the locked collection owns this stable descriptor and its
+        // text until clear returns or after the native receiver is destroyed.
+        unsafe { table.NDIlib_recv_add_connection_metadata(self.core.instance.0, raw) };
         Ok(())
     }
 
     /// Clear metadata registered for subsequent receiver connections.
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.core.connection_metadata()?;
-        // SAFETY: the receiver instance is live for this borrow.
+        let mut registrations = self.core.connection_metadata.lock();
+        // SAFETY: the receiver and every registered descriptor remain live
+        // until the native clear returns under the same registration lock.
         unsafe { table.NDIlib_recv_clear_connection_metadata(self.core.instance.0) };
+        registrations.clear();
         Ok(())
     }
 

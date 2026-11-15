@@ -69,3 +69,46 @@ fn reused_metadata_reaches_receiver_with_its_timecode() -> Result<(), grafton_nd
         );
     }
 }
+
+#[test]
+fn receiver_connection_metadata_survives_its_input_and_reconnect() -> Result<(), grafton_ndi::Error>
+{
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
+    let sender = Sender::new(
+        &ndi,
+        &SenderOptions::new(common::unique_name("receiver connection metadata")).clock_video(false),
+    )?;
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(grafton_ndi::Source::new("")))?;
+    let text = "<receiver-registration/>";
+    receiver.add_connection_metadata(
+        &MetadataFrame::new(text)?.with_timecode(Timecode::from_ticks(21)),
+    )?;
+    let target = common::loopback_source(&ndi, &sender)?;
+    receiver.connect_to(&target)?;
+    let video = VideoFrame::builder().resolution(16, 16).build()?;
+    for attempt in 0..2 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            sender.send_video(&video)?;
+            receiver.video().capture_ref(Duration::from_millis(10))?;
+            if let Some(metadata) = sender.capture_metadata(Duration::from_millis(100))? {
+                if metadata.data() == text {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "receiver registration missing on connection {attempt}"
+            );
+        }
+        if attempt == 0 {
+            while sender.capture_metadata(Duration::ZERO)?.is_some() {}
+            receiver.disconnect();
+            receiver.reconnect();
+        }
+    }
+    receiver.clear_connection_metadata()?;
+    Ok(())
+}

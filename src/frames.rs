@@ -3095,10 +3095,10 @@ impl<T: MetadataParts + ?Sized> MetadataPartsExt for T {}
 ///
 /// Implemented by [`MetadataFrame`] and [`MetadataFrameRef`]. Both can be sent
 /// directly, including through `&dyn MetadataSource`, without a wrapper string
-/// allocation or copy in synchronous operations. The SDK copies the text during
-/// the call, so a captured frame can be released as soon as the operation
-/// returns, even when registering metadata for future connections. Async
-/// recording copies the text immediately into its deferred command. The
+/// allocation or copy in synchronous sends. For connection registrations, the
+/// receiver or router retains its own copy; senders use the SDK's documented
+/// copy. A captured input may be released as soon as the operation returns.
+/// Async recording copies the text immediately into its deferred command. The
 /// source's timecode is preserved in every operation.
 ///
 /// This trait is sealed: applications cannot supply unchecked native pointers.

@@ -134,6 +134,8 @@ pub struct Router {
     route: Option<Box<RawSource>>,
     refused_route: Option<Box<RawSource>>,
     #[cfg(feature = "advanced")]
+    pub(crate) connection_metadata: crate::connection_metadata::ConnectionMetadata,
+    #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
     _ndi: Ndi,
 }
@@ -223,6 +225,8 @@ impl Router {
             _groups: groups,
             route: None,
             refused_route: None,
+            #[cfg(feature = "advanced")]
+            connection_metadata: crate::connection_metadata::ConnectionMetadata::default(),
             #[cfg(feature = "advanced")]
             _config: config,
             _ndi: ndi.clone(),

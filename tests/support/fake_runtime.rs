@@ -373,9 +373,25 @@ mod objects {
         }
     }
 
+    #[derive(Default)]
+    struct RetainedMetadata(Vec<*const NDIlib_metadata_frame_t>);
+
+    impl RetainedMetadata {
+        unsafe fn read(&self, kind: &str) {
+            if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_none() {
+                return;
+            }
+            for pointer in &self.0 {
+                let frame = unsafe { &**pointer };
+                log(&format!("retained-metadata:{kind}:{}:{}", unsafe { bytes(frame.p_data) }, frame.timecode));
+            }
+        }
+    }
+
     struct Receiver {
         source: RetainedSource,
         name: *const c_char,
+        metadata: RetainedMetadata,
     }
 
     impl Receiver {
@@ -389,7 +405,7 @@ mod objects {
     pub(super) unsafe fn connect_source(instance: NDIlib_recv_instance_t, source: *const NDIlib_source_t) {
         if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_some() {
             let receiver = unsafe { &mut *instance.cast::<Receiver>() };
-            unsafe { receiver.source.read("receiver"); receiver.read_name(); };
+            unsafe { receiver.source.read("receiver"); receiver.read_name(); receiver.metadata.read("receiver"); };
             receiver.source = RetainedSource(source);
         }
     }
@@ -444,6 +460,7 @@ mod objects {
         source: NDIlib_source_t,
         route: RetainedSource,
         refused: RetainedSource,
+        metadata: RetainedMetadata,
     }
 
     /// Allocate a distinct non-null handle of pointer type `T`.
@@ -472,13 +489,25 @@ mod objects {
             Box::into_raw(Box::new(Receiver {
                 source: RetainedSource::default(),
                 name: unsafe { (*_p_create_settings).p_ndi_recv_name },
+                metadata: RetainedMetadata::default(),
             })).cast()
         }
 
         fn NDIlib_recv_destroy(p_instance: NDIlib_recv_instance_t) {
             let receiver = unsafe { Box::from_raw(p_instance.cast::<Receiver>()) };
-            unsafe { receiver.source.read("receiver"); receiver.read_name(); };
+            unsafe { receiver.source.read("receiver"); receiver.read_name(); receiver.metadata.read("receiver"); };
             log("receiver-destroy");
+        }
+
+        fn NDIlib_recv_add_connection_metadata(p_instance: NDIlib_recv_instance_t, p_metadata: *const NDIlib_metadata_frame_t) {
+            let receiver = unsafe { &mut *p_instance.cast::<Receiver>() };
+            receiver.metadata.0.push(p_metadata);
+        }
+
+        fn NDIlib_recv_clear_connection_metadata(p_instance: NDIlib_recv_instance_t) {
+            let receiver = unsafe { &mut *p_instance.cast::<Receiver>() };
+            unsafe { receiver.metadata.read("receiver") };
+            receiver.metadata.0.clear();
         }
 
         fn NDIlib_send_create(_p_create_settings: *const NDIlib_send_create_t) -> NDIlib_send_instance_t {
@@ -647,13 +676,14 @@ mod objects {
                 source,
                 route: RetainedSource::default(),
                 refused: RetainedSource::default(),
+                metadata: RetainedMetadata::default(),
             })).cast()
         }
 
         fn NDIlib_routing_destroy(p_instance: NDIlib_routing_instance_t) {
             let router = unsafe { Box::from_raw(p_instance.cast::<Router>()) };
             unsafe { router.route.read("route") };
-            unsafe { router.refused.read("refused-route") };
+            unsafe { router.refused.read("refused-route"); router.metadata.read("router"); };
             log("router-destroy");
         }
 
@@ -661,6 +691,7 @@ mod objects {
             let name = unsafe { CStr::from_ptr((*p_source).p_ndi_name) };
             log(&format!("router-change {}", name.to_string_lossy()));
             let router = unsafe { &mut *p_instance.cast::<Router>() };
+            unsafe { router.metadata.read("router") };
             unsafe { router.route.read("route") };
             unsafe { router.refused.read("refused-route") };
             let refuse = std::env::var_os("GRAFTON_FAKE_ROUTING_CHANGE").is_some_and(|mode| mode == "refuse");
@@ -695,6 +726,21 @@ mod objects {
             &router.source
         }
     }
+    #[cfg(fake_advanced)]
+    #[no_mangle]
+    pub unsafe extern "C" fn NDIlib_routing_add_connection_metadata(p_instance: NDIlib_routing_instance_t, p_metadata: *const NDIlib_metadata_frame_t) {
+        let router = unsafe { &mut *p_instance.cast::<Router>() };
+        router.metadata.0.push(p_metadata);
+    }
+
+    #[cfg(fake_advanced)]
+    #[no_mangle]
+    pub unsafe extern "C" fn NDIlib_routing_clear_connection_metadata(p_instance: NDIlib_routing_instance_t) {
+        let router = unsafe { &mut *p_instance.cast::<Router>() };
+        unsafe { router.metadata.read("router") };
+        router.metadata.0.clear();
+    }
+
 }
 
 #[cfg(fake_discovery)]

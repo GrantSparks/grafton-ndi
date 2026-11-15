@@ -61,6 +61,7 @@
 mod capture;
 mod change_feed;
 mod color_info;
+mod connection_metadata;
 mod error;
 #[cfg(any(ndi_has_advanced_keyframe_demand, all(test, feature = "advanced")))]
 mod keyframe_changes;
