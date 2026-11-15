@@ -27,9 +27,11 @@ use crate::sys::bindings::*;
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use crate::{frames::ValidatedAudioLayout, AudioFormat};
 use crate::{
-    frames::ValidatedVideoLayout, receiver::PacketAttached, runtime::ProcessLifetimeRuntime,
-    sys::advanced::ReceiveAllocators, FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode,
-    Rejected, Result,
+    frames::ValidatedVideoLayout,
+    receiver::{PacketAttached, ReceiverCore},
+    runtime::ProcessLifetimeRuntime,
+    sys::advanced::ReceiveAllocators,
+    FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode, Rejected, Result,
 };
 #[cfg(ndi_has_advanced_receive_allocators)]
 use std::ffi::c_void;
@@ -879,13 +881,6 @@ impl Registry {
 
 static REGISTRY: OnceLock<Registry> = OnceLock::new();
 
-/// The registry, which exists once any [`AllocatorService`] has been created.
-fn registry() -> &'static Registry {
-    REGISTRY
-        .get()
-        .expect("an allocator service exists before anything uses the registry")
-}
-
 /// Permission to give receivers custom allocators.
 ///
 /// The SDK may call an allocator's free function long after the receiver's
@@ -901,6 +896,7 @@ fn registry() -> &'static Registry {
 #[derive(Clone, Copy)]
 pub struct AllocatorService {
     runtime: ProcessLifetimeRuntime,
+    registry: &'static Registry,
 }
 
 /// Why a custom receive allocation was declined and the SDK dropped its frame.
@@ -1031,8 +1027,8 @@ impl AllocatorService {
             None => {
                 // Reserve off the SDK's threads. If another caller initializes
                 // first, its limits win and the comparison below is unchanged.
-                let _ = REGISTRY.set(Registry::new(limits)?);
-                registry()
+                let candidate = Registry::new(limits)?;
+                REGISTRY.get_or_init(|| candidate)
             }
         };
         if registry.limits != limits {
@@ -1040,14 +1036,14 @@ impl AllocatorService {
                 crate::InputDefect::AllocatorLimitsDiffer,
             ));
         }
-        Ok(Self { runtime })
+        Ok(Self { runtime, registry })
     }
 
     /// A consistent snapshot of retained storage, active calls and decline
     /// counters across the process. Counter updates allocate no storage and
     /// run under the same lock that accounts for retained allocations.
     pub fn usage(self) -> AllocatorUsage {
-        registry().usage()
+        self.registry.usage()
     }
 
     /// Take a receiver so that its allocators can be set.
@@ -1087,13 +1083,16 @@ impl AllocatorService {
     ) -> std::result::Result<Allocation<M>, Rejected<Receiver<M>>> {
         match self.runtime.ndi().table::<ReceiveAllocators>() {
             Ok(table) => Ok(Allocation {
-                receiver: Some(receiver),
-                table,
-                #[cfg(ndi_has_advanced_receive_allocators)]
-                video_token: None,
-                #[cfg(ndi_has_advanced_receive_allocators)]
-                audio_token: None,
-                _service: self,
+                registration: Registration {
+                    core: receiver.core.clone(),
+                    table,
+                    #[cfg(ndi_has_advanced_receive_allocators)]
+                    video_token: None,
+                    #[cfg(ndi_has_advanced_receive_allocators)]
+                    audio_token: None,
+                    service: self,
+                },
+                receiver,
             }),
             Err(error) => Err(Rejected::new(error, receiver)),
         }
@@ -1106,9 +1105,9 @@ impl AllocatorService {
 /// receiver back. [`receiver`](Self::receiver) reaches the receiver's
 /// controls, as [`PacketReceiver::receiver`] does, and
 /// [`controls`](Self::controls) reaches exclusive stream controls and KVM.
-/// There is no `receiver_mut`: the allocators are installed on this
-/// receiver's native instance, so it is never lent out mutably, where it
-/// could be swapped for another packet receiver's.
+/// The receiver is lent mutably only inside `ReceiverControls`, which prevents
+/// replacement. Its allocator registration keeps its own reference to the
+/// original receiver core, so resetting always reaches that native instance.
 ///
 /// # Threading
 ///
@@ -1314,51 +1313,74 @@ impl AllocatedReceiver {
 /// allocations it still holds are then freed through the token-keyed registry,
 /// which outlives every receiver.
 struct Allocation<M: ReceiverMode> {
-    // `None` only once `into_receiver` has taken it.
-    receiver: Option<Receiver<M>>,
-    table: &'static ReceiveAllocators,
-    #[cfg(ndi_has_advanced_receive_allocators)]
-    video_token: Option<usize>,
-    #[cfg(ndi_has_advanced_receive_allocators)]
-    audio_token: Option<usize>,
-    // The promise that the runtime outlives every callback registered here.
-    _service: AllocatorService,
+    registration: Registration,
+    receiver: Receiver<M>,
 }
 
 impl<M: ReceiverMode> Allocation<M> {
     fn receiver(&self) -> &Receiver<M> {
-        self.receiver.as_ref().expect("receiver owned")
+        &self.receiver
     }
-
     fn receiver_mut(&mut self) -> &mut Receiver<M> {
-        self.receiver.as_mut().expect("receiver owned")
+        &mut self.receiver
     }
-
     fn set_allocator<P: ReceiveAllocator>(
         &mut self,
         stream: Stream,
         policy: P,
     ) -> std::result::Result<(), Rejected<P>> {
-        let token = registry().register(policy)?;
-        self.install(stream, Some(token));
+        let token = self.registration.service.registry.register(policy)?;
+        self.registration.install(stream, Some(token));
         Ok(())
     }
+    fn install(&mut self, stream: Stream, token: Option<usize>) {
+        self.registration.install(stream, token);
+    }
+    fn into_receiver(self) -> Receiver<M> {
+        let Self {
+            registration,
+            receiver,
+        } = self;
+        drop(registration);
+        receiver
+    }
+}
 
+/// Owns the exact receiver and runtime needed to uninstall both callback pairs.
+/// Its own Drop keeps reset before native destruction independent of field order.
+struct Registration {
+    #[cfg_attr(
+        not(ndi_has_advanced_receive_allocators),
+        expect(
+            dead_code,
+            reason = "the uninhabited table prevents registrations without declarations"
+        )
+    )]
+    core: Arc<ReceiverCore>,
+    table: &'static ReceiveAllocators,
+    #[cfg(ndi_has_advanced_receive_allocators)]
+    video_token: Option<usize>,
+    #[cfg(ndi_has_advanced_receive_allocators)]
+    audio_token: Option<usize>,
+    service: AllocatorService,
+}
+impl Registration {
     /// Register generation `token` (or the SDK's own allocator) for `stream`
     /// and retire the generation it replaces.
     #[cfg(ndi_has_advanced_receive_allocators)]
     fn install(&mut self, stream: Stream, token: Option<usize>) {
-        let instance = self.receiver().core.instance.0;
+        let instance = self.core.instance.0;
         let table = self.table;
         let slot = match stream {
             Stream::Video => &mut self.video_token,
             Stream::Audio => &mut self.audio_token,
         };
         let opaque = token.map_or(std::ptr::null_mut(), |token| token as *mut c_void);
-        // SAFETY: the receiver is live. The callbacks are functions of this
+        // SAFETY: the registration owns the original receiver core, so that native
+        // instance stays live through installation and reset. The callbacks are functions of this
         // program, which stays loaded, and the opaque value is a token they
         // look up, never a pointer they follow.
-        install_with(registry(), slot, token, || unsafe {
+        install_with(self.service.registry, slot, token, || unsafe {
             match stream {
                 Stream::Video => table.NDIlib_recv_set_video_allocator(
                     instance,
@@ -1382,25 +1404,11 @@ impl<M: ReceiverMode> Allocation<M> {
     fn install(&mut self, _: Stream, _: Option<usize>) {
         match *self.table {}
     }
-
-    /// Return to the SDK's own memory and give the receiver back.
-    fn into_receiver(mut self) -> Receiver<M> {
-        self.reset();
-        self.receiver.take().expect("receiver owned")
-    }
-
-    /// Return to the SDK's own memory for both streams.
-    fn reset(&mut self) {
+}
+impl Drop for Registration {
+    fn drop(&mut self) {
         self.install(Stream::Video, None);
         self.install(Stream::Audio, None);
-    }
-}
-
-impl<M: ReceiverMode> Drop for Allocation<M> {
-    fn drop(&mut self) {
-        if self.receiver.is_some() {
-            self.reset();
-        }
     }
 }
 

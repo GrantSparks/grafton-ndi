@@ -25,10 +25,11 @@ use crate::{
 
 /// Exclusive controls for a receiver held by another resource.
 ///
-/// FrameSync, AVSync and allocator registrations depend on one particular
-/// native receiver. Their `controls()` methods lend this view instead of a
-/// mutable receiver, so the receiver cannot be replaced while those resources
-/// exist. Ordinary shared controls remain available through the owner's
+/// FrameSync and AVSync depend on one particular native receiver. Their
+/// `controls()` methods lend this view instead of a mutable receiver, so it
+/// cannot be replaced while those resources exist. Allocator owners lend this
+/// view too; their registrations independently retain the original receiver core.
+/// Ordinary shared controls remain available through the owner's
 /// `receiver()` method, or [`Self::receiver`].
 ///
 /// The view allocates nothing and stays on its borrowing thread (`!Send` and

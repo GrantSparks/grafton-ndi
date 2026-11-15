@@ -280,6 +280,7 @@ fn advanced(ndi: &Ndi, modern: bool) {
         return;
     }
     synchronizer_lifetimes(ndi);
+    allocator_lifetimes(ndi);
     for (color, bandwidth, feature) in [
         (
             ReceiverColorFormat::Best444,
@@ -435,4 +436,66 @@ fn synchronizer_lifetimes(ndi: &Ndi) {
         .unwrap();
     drop(genlock);
     assert!(events().contains(r#"genlock-destroy:genlock-reconnected:{"marker":"alive"}"#));
+}
+
+#[cfg(feature = "advanced")]
+fn allocator_lifetimes(ndi: &Ndi) {
+    use grafton_ndi::advanced::{
+        AllocationBuffer, AllocatorLimits, AllocatorService, PacketReceiver, PassthroughPreset,
+    };
+    if let Err(error) = ndi.require_feature(RuntimeFeature::ReceiveAllocators) {
+        common::skip(
+            common::Requirement::Advanced,
+            &format!("allocator fixture needs declarations: {error}"),
+        );
+        return;
+    }
+    let service =
+        AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default()).unwrap();
+    for packets in [false, true] {
+        for recover in [false, true] {
+            let start = events().len();
+            let options = ReceiverOptions::new(Source::new("allocator lifetime fixture"));
+            if packets {
+                let receiver = PacketReceiver::new(ndi, &options, PassthroughPreset::Hevc).unwrap();
+                let mut receiver = service.attach_packets(receiver).unwrap();
+                receiver
+                    .set_video_allocator(AllocationBuffer::zeroed)
+                    .unwrap();
+                receiver
+                    .set_audio_allocator(AllocationBuffer::zeroed)
+                    .unwrap();
+                if recover {
+                    drop(receiver.into_packet_receiver());
+                } else {
+                    drop(receiver);
+                }
+            } else {
+                let receiver = Receiver::new(ndi, &options).unwrap();
+                let mut receiver = service.attach(receiver).unwrap();
+                receiver
+                    .set_video_allocator(AllocationBuffer::zeroed)
+                    .unwrap();
+                receiver
+                    .set_audio_allocator(AllocationBuffer::zeroed)
+                    .unwrap();
+                if recover {
+                    drop(receiver.into_receiver());
+                } else {
+                    drop(receiver);
+                }
+            }
+            let trace = events();
+            let trace = &trace[start..];
+            assert_eq!(trace.matches("receiver-destroy").count(), 1, "{trace}");
+            for stream in ["video", "audio"] {
+                let install = format!("{stream}-allocator-install");
+                let reset = format!("{stream}-allocator-reset");
+                assert_eq!(trace.matches(&install).count(), 1, "{trace}");
+                assert_eq!(trace.matches(&reset).count(), 1, "{trace}");
+                assert!(trace.find(&install).unwrap() < trace.find(&reset).unwrap());
+                assert!(trace.find(&reset).unwrap() < trace.find("receiver-destroy").unwrap());
+            }
+        }
+    }
 }
