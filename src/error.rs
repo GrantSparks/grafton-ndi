@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn capability_errors_display_the_recorded_evidence() {
-        let required = crate::SdkVersion::parse("6.4.0.0").unwrap();
+        let required = RuntimeFeature::Planar444Video.minimum_version().unwrap();
         for refusal in [
             CapabilityRefusal::SymbolUnavailable(c"NDIlib_routing_create"),
             CapabilityRefusal::BuildAbiUnavailable(c"NDIlib_routing_create_v2"),

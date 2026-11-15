@@ -180,7 +180,7 @@ macro_rules! runtime_features {
         None
     };
     (@minimum $minimum:ident) => {
-        Some($minimum)
+        Some(&$minimum)
     };
     (@ungated $edition:ident) => {
         false
@@ -296,7 +296,7 @@ macro_rules! runtime_features {
             /// those objects that were fixed in 6.3.2 and again in 6.4.0. An object
             /// created with Advanced configuration is destroyed the same way, so its
             /// capability requires the core one and reports that one's version gate.
-            pub(crate) const fn minimum_version(self) -> Option<SdkVersion> {
+            pub(crate) const fn minimum_version(self) -> Option<&'static SdkVersion> {
                 match self {
                     $(Self::$Variant => runtime_features!(@minimum $($minimum)?),)+
                     #[cfg(feature = "advanced")]
@@ -485,6 +485,8 @@ impl fmt::Display for CapabilityUnavailable {
 ///
 /// Detection records this value once. Capability queries and operation errors
 /// carry that same value, including when another capability requires it.
+/// Required versions borrow immutable registry values so this evidence stays
+/// small and allocation-free on both 32-bit and 64-bit targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CapabilityRefusal {
@@ -497,12 +499,12 @@ pub enum CapabilityRefusal {
     /// The runtime predates the required semantic version.
     RuntimeTooOld {
         /// The first version that may safely implement this capability.
-        required: SdkVersion,
+        required: &'static SdkVersion,
     },
     /// The runtime version cannot establish the required semantics.
     RuntimeVersionUnknown {
         /// The first version that may safely implement this capability.
-        required: SdkVersion,
+        required: &'static SdkVersion,
     },
 }
 
@@ -614,7 +616,7 @@ impl Capabilities {
     ) -> Self {
         let versioned = |feature: RuntimeFeature| match (feature.minimum_version(), version) {
             (None, _) => Ok(()),
-            (Some(required), Some(version)) if version >= required => Ok(()),
+            (Some(required), Some(version)) if version >= *required => Ok(()),
             (Some(required), Some(_)) => Err(CapabilityRefusal::RuntimeTooOld { required }),
             (Some(required), None) => Err(CapabilityRefusal::RuntimeVersionUnknown { required }),
         };
@@ -941,11 +943,11 @@ mod tests {
         {
             assert_eq!(
                 old.capabilities.decision(feature),
-                Err(CapabilityRefusal::RuntimeTooOld { required: NDI_6_4 })
+                Err(CapabilityRefusal::RuntimeTooOld { required: &NDI_6_4 })
             );
             assert_eq!(
                 unknown.capabilities.decision(feature),
-                Err(CapabilityRefusal::RuntimeVersionUnknown { required: NDI_6_4 })
+                Err(CapabilityRefusal::RuntimeVersionUnknown { required: &NDI_6_4 })
             );
             assert!(current.capabilities.supports(feature));
         }
