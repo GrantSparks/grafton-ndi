@@ -602,8 +602,6 @@ struct PendingStreams {
     program: InFlight<PendingVideo>,
     preview: InFlight<PendingVideo>,
     #[cfg(ndi_has_advanced_scatter_send)]
-    scatter_slots: std::sync::Arc<super::send_slots::DescriptorSlots>,
-    #[cfg(ndi_has_advanced_scatter_send)]
     program_keys: ScatterKeys,
     #[cfg(ndi_has_advanced_scatter_send)]
     preview_keys: ScatterKeys,
@@ -612,12 +610,10 @@ struct PendingStreams {
 impl PendingStreams {
     fn new() -> Result<Self> {
         #[cfg(ndi_has_advanced_scatter_send)]
-        let (scatter_slots, mut keys) = super::send_slots::DescriptorSlots::new(4)?;
+        let mut keys = super::send_slots::DescriptorSlots::new(4)?;
         Ok(Self {
             program: InFlight::default(),
             preview: InFlight::default(),
-            #[cfg(ndi_has_advanced_scatter_send)]
-            scatter_slots,
             #[cfg(ndi_has_advanced_scatter_send)]
             program_keys: ScatterKeys {
                 next: keys.pop(),
@@ -647,7 +643,7 @@ impl PendingStreams {
             .next
             .take()
             .expect("a stream keeps one alternate scatter key");
-        let mut slot = self.scatter_slots.claim(key);
+        let mut slot = key.claim();
         slot.bind_sender(sender.identity());
         let list = slot.into_scatter(frame.storage.descriptor(table));
         let pending = PendingVideo::Scatter { frame, list, table };
@@ -1413,8 +1409,8 @@ mod tests {
         let frame = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
         let pointers = frame.storage.pointers.0.as_ptr().cast::<*const u8>();
         let sizes = frame.storage.sizes.as_ptr().cast::<i32>();
-        let (slots, mut keys) = super::super::send_slots::DescriptorSlots::new(1).unwrap();
-        let mut slot = slots.claim(keys.pop().unwrap());
+        let mut keys = super::super::send_slots::DescriptorSlots::new(1).unwrap();
+        let mut slot = keys.pop().unwrap().claim();
         let (mut pending, allocations) = crate::test_alloc::allocation_count(|| {
             PendingVideo::scatter_in(frame, table, &mut slot)
         });

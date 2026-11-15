@@ -374,7 +374,6 @@ struct State {
     next: u64,
     options: QueueOptions,
     sender: Option<usize>,
-    slots: std::sync::Arc<DescriptorSlots>,
     free: Vec<SlotKey>,
     // A fallibly reserved submission-thread workspace for rebuilding a map
     // whose deletion tombstones have consumed its insertion capacity.
@@ -420,7 +419,7 @@ impl State {
             .free
             .pop()
             .expect("admission leaves a descriptor slot free");
-        let mut slot = self.slots.claim(key);
+        let mut slot = key.claim();
         if let Some(sender) = self.sender {
             slot.bind_sender(sender);
         }
@@ -524,7 +523,7 @@ impl CallbackState {
         rehash
             .try_reserve_exact(options.frames)
             .map_err(unavailable)?;
-        let (slots, free) = DescriptorSlots::new(options.frames)?;
+        let free = DescriptorSlots::new(options.frames)?;
         let state = Box::new(Self {
             max_bytes: options.bytes,
             state: Mutex::new(State {
@@ -534,7 +533,6 @@ impl CallbackState {
                 next: 1,
                 options,
                 sender: None,
-                slots,
                 free,
                 rehash,
             }),
