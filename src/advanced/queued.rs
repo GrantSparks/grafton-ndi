@@ -15,7 +15,7 @@ use std::ffi::c_void;
 
 use super::{
     send::PendingVideo,
-    send_slots::{DescriptorLease, DescriptorSlots, Released, SlotKey},
+    send_slots::{DescriptorLease, Released, SlotKey},
     CompressedVideoFrame, ScatterVideoFrame, SubmittedVideo,
 };
 use crate::{
@@ -30,6 +30,8 @@ use crate::{
 };
 
 use super::aliasable::AliasableBox;
+#[cfg(any(test, ndi_has_advanced_send_completion))]
+use super::send_slots::DescriptorSlots;
 
 /// Limits on what a [`QueuedSender`] holds at once.
 ///
