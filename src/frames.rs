@@ -3272,7 +3272,7 @@ fn metadata_len_to_i32(len_with_nul: usize) -> Result<i32> {
     })
 }
 
-/// The state of optional per-frame metadata attached to video or audio.
+/// The state of optional per-frame metadata on decoded or compressed video/audio.
 ///
 /// Unreadable metadata does not discard otherwise valid media. Its text is
 /// withheld from [`VideoSource::metadata`] and [`AudioSource::metadata`], from
@@ -3347,7 +3347,7 @@ impl<'a> FrameMetadataRef<'a> {
 /// Cached validation of one optional metadata pointer. Only readable text
 /// carries a length; the other states cannot accidentally reborrow bytes.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct FrameMetadataState(MetadataScan);
+struct FrameMetadataState(MetadataScan);
 
 #[derive(Debug, Clone, Copy)]
 enum MetadataScan {
@@ -3363,7 +3363,7 @@ impl FrameMetadataState {
     ///
     /// A non-null pointer must be readable through its first NUL or the
     /// metadata cap, whichever comes first.
-    pub(crate) unsafe fn scan(pointer: *const c_char) -> Self {
+    unsafe fn scan(pointer: *const c_char) -> Self {
         if pointer.is_null() {
             return Self(MetadataScan::Absent);
         }
@@ -3395,7 +3395,7 @@ impl FrameMetadataState {
     ///
     /// `pointer` must name the same bytes used to construct this state, live
     /// and unchanged for `'a`, including the measured terminal NUL.
-    pub(crate) unsafe fn view<'a>(self, pointer: *const c_char) -> FrameMetadataRef<'a> {
+    unsafe fn view<'a>(self, pointer: *const c_char) -> FrameMetadataRef<'a> {
         match self.0 {
             MetadataScan::Absent => FrameMetadataRef::Absent,
             MetadataScan::Withheld(reason) => FrameMetadataRef::Withheld(reason),
@@ -4826,22 +4826,34 @@ fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioForm
 // SDK frames validated as a whole
 // ============================================================================
 
-/// An SDK frame descriptor that a [`ValidatedFrame`] holds: where it keeps
-/// its metadata text.
+/// The metadata pointer and optional timestamp of a held SDK descriptor.
 pub(crate) trait SdkDescriptor {
     /// The descriptor's metadata text pointer, null for none.
     fn metadata_pointer(&self) -> *const c_char;
+
+    /// Standalone metadata has no SDK submission timestamp.
+    fn timestamp(&self) -> Option<i64> {
+        None
+    }
 }
 
 impl SdkDescriptor for NDIlib_video_frame_v2_t {
     fn metadata_pointer(&self) -> *const c_char {
         self.p_metadata
     }
+
+    fn timestamp(&self) -> Option<i64> {
+        Some(self.timestamp)
+    }
 }
 
 impl SdkDescriptor for NDIlib_audio_frame_v3_t {
     fn metadata_pointer(&self) -> *const c_char {
         self.p_metadata
+    }
+
+    fn timestamp(&self) -> Option<i64> {
+        Some(self.timestamp)
     }
 }
 
@@ -4898,8 +4910,8 @@ impl<D: SdkDescriptor> HoldsDescriptor for &D {
 ///
 /// Only the validation functions construct one, each from the one descriptor
 /// its holder holds: [`ValidatedVideo::video`], [`ValidatedAudio::audio`],
-/// [`ValidatedAudio::returned_audio`] and
-/// [`ValidatedMetadata::metadata_frame`]. A layout or text validated from
+/// [`ValidatedAudio::returned_audio`], [`ValidatedMetadata::metadata_frame`]
+/// and [`ValidatedFrame::validate`] for compressed packet parts. A layout or text validated from
 /// another descriptor therefore cannot be paired with it, and every view and
 /// owned copy of a received frame takes its parts from here.
 ///
@@ -4925,6 +4937,35 @@ pub(crate) type ValidatedAudio<F> = ValidatedFrame<F, ValidatedAudioLayout>;
 pub(crate) type ValidatedMetadata<F> = ValidatedFrame<F, ()>;
 
 impl<F: HoldsDescriptor, V> ValidatedFrame<F, V> {
+    /// Validate parts from the one held descriptor, then scan its metadata.
+    ///
+    /// # Safety
+    ///
+    /// `frame` must retain this descriptor and every allocation the returned
+    /// parts describe, initialized and unchanged until it is dropped. The
+    /// validator must establish those parts from the descriptor it receives.
+    /// A non-null metadata pointer must remain readable through its first NUL
+    /// or [`MAX_METADATA_BYTES`], whichever comes first.
+    pub(crate) unsafe fn validate(
+        frame: F,
+        validate: impl FnOnce(&F::Descriptor) -> Result<V>,
+    ) -> Result<Self> {
+        let validated = validate(frame.descriptor())?;
+        // SAFETY: the caller retains the exact descriptor and its metadata.
+        unsafe { Self::with_frame_metadata(frame, validated) }
+    }
+
+    /// Parts validated from this exact held descriptor.
+    #[cfg(feature = "advanced")]
+    pub(crate) fn parts(&self) -> &V {
+        &self.validated
+    }
+
+    /// Normalize the held descriptor's timestamp for its capture family.
+    pub(crate) fn timestamp(&self) -> Option<SdkTimestamp> {
+        self.frame.audio_timestamp(self.descriptor().timestamp()?)
+    }
+
     /// Pair `frame` with `validated`, which the caller validated from its
     /// descriptor, and the per-frame metadata text the descriptor points to.
     ///
@@ -4979,9 +5020,8 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_video_frame_v2_t>> ValidatedVideo<F>
     /// [`MAX_METADATA_BYTES`], all live and unchanged. Row padding need not
     /// be initialized.
     pub(crate) unsafe fn video(frame: F) -> Result<Self> {
-        let validated = validate_video_frame(frame.descriptor())?;
-        // SAFETY: forwarded to the caller.
-        unsafe { Self::with_frame_metadata(frame, validated) }
+        // SAFETY: forwarded to the caller for this held video descriptor.
+        unsafe { Self::validate(frame, validate_video_frame) }
     }
 }
 
@@ -4997,9 +5037,8 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> ValidatedAudio<F>
     /// or readable up to its first NUL or [`MAX_METADATA_BYTES`], all live
     /// and unchanged. Padding between channels need not be initialized.
     pub(crate) unsafe fn audio(frame: F) -> Result<Self> {
-        let validated = validate_audio_layout(frame.descriptor())?;
-        // SAFETY: forwarded to the caller.
-        unsafe { Self::with_frame_metadata(frame, validated) }
+        // SAFETY: forwarded to the caller for this held audio descriptor.
+        unsafe { Self::validate(frame, validate_audio_layout) }
     }
 
     /// Validate audio the SDK returned where no samples is a valid answer:
@@ -5068,7 +5107,7 @@ unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_video_frame_v2_t>> VideoParts
 
     #[inline]
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
-        SdkTimestamp::from_sdk(self.descriptor().timestamp)
+        self.timestamp()
     }
 }
 
@@ -5089,7 +5128,7 @@ unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> AudioParts
     }
     #[inline]
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
-        self.frame.audio_timestamp(self.descriptor().timestamp)
+        self.timestamp()
     }
     #[inline]
     fn samples(&self) -> *const f32 {

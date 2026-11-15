@@ -728,14 +728,20 @@ impl FrameExtras {
     /// `metadata` is null or readable through its first NUL or the metadata cap.
     #[cfg(test)]
     unsafe fn received(timecode: i64, timestamp: i64, metadata: *const c_char) -> Result<Self> {
-        Ok(Self {
-            timecode: Timecode::from_ticks(timecode),
-            timestamp: SdkTimestamp::from_sdk(timestamp),
-            // SAFETY: forwarded to the caller's obligation.
-            metadata: OwnedFrameMetadata::copied(unsafe {
-                crate::frames::FrameMetadataState::scan(metadata).view(metadata)
-            }),
-        })
+        let descriptor = NDIlib_video_frame_v2_t {
+            p_metadata: metadata,
+            ..Default::default()
+        };
+        // SAFETY: only metadata is inspected; the caller retains its bounded
+        // readable text while this synthetic descriptor is borrowed.
+        let frame = unsafe { crate::frames::ValidatedFrame::validate(&descriptor, |_| Ok(()))? };
+        let mut extras = Self::default();
+        extras.copy_received(
+            Timecode::from_ticks(timecode),
+            SdkTimestamp::from_sdk(timestamp),
+            frame.frame_metadata(),
+        );
+        Ok(extras)
     }
 
     /// Reuse storage while copying the borrowed frame's one metadata value.

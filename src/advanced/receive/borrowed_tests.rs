@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     advanced::{EnvelopeCodec, PacketEnvelope, VideoPacketFormat},
-    FrameMetadataStatus,
+    FrameMetadataStatus, SdkTimestamp,
 };
 use std::{
     ptr,
@@ -238,4 +238,50 @@ fn decoded_packet_fallback_borrows_the_original_pixels_without_allocating() {
     };
     assert_eq!(frame.data().unwrap().as_ptr(), source.data().as_ptr());
     assert_eq!(frame.metadata(), source.metadata());
+}
+
+#[test]
+fn borrowed_packets_normalize_timestamps_through_their_held_capture() {
+    let format = VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap();
+    let mut video = CompressedVideoFrame::new(
+        format,
+        PacketEnvelope::encode(EnvelopeCodec::H264, 1, 0, true, &[1, 2, 3], &[4]).unwrap(),
+    )
+    .unwrap();
+    let mut audio =
+        CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1, 2, 3, 4]).unwrap();
+    for (ticks, expected) in [
+        (NDIlib_recv_timestamp_undefined, None),
+        (0, Some(0)),
+        (123, Some(123)),
+    ] {
+        let raw_video = NDIlib_video_frame_v2_t {
+            timestamp: ticks,
+            ..video.raw()
+        };
+        let raw_audio = NDIlib_audio_frame_v3_t {
+            timestamp: ticks,
+            ..audio.raw()
+        };
+        // SAFETY: both source frames retain their immutable packet allocations;
+        // these synthetic guards only count the lifetime and free nothing.
+        let video_ref = CompressedVideoRef::new(unsafe {
+            Guard::with_test_free(ptr::null_mut(), raw_video, |_, _| {})
+        })
+        .unwrap();
+        let audio_ref = CompressedAudioRef::new(unsafe {
+            Guard::with_test_free(ptr::null_mut(), raw_audio, |_, _| {})
+        })
+        .unwrap();
+        assert_eq!(video_ref.timestamp().map(SdkTimestamp::ticks), expected);
+        assert_eq!(audio_ref.timestamp().map(SdkTimestamp::ticks), expected);
+        assert_eq!(
+            video_ref.to_owned().timestamp().map(SdkTimestamp::ticks),
+            expected
+        );
+        assert_eq!(
+            audio_ref.to_owned().timestamp().map(SdkTimestamp::ticks),
+            expected
+        );
+    }
 }
