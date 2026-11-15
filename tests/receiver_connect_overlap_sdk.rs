@@ -2,9 +2,9 @@
 //! connection path. Each executable runs inside the CI loopback-only runner.
 //!
 //! `GRAFTON_NDI_OVERLAP_SECONDS=120`, `GRAFTON_NDI_OVERLAP_THREADS=16` and
-//! `GRAFTON_NDI_OVERLAP_HD=1` select the longer 1080p evidence workload. A build
-//! with `--cfg ndi_test_connect_overlap` bypasses the Rust capture gate, so the
-//! same raw-capture test measures the native combination directly.
+//! `GRAFTON_NDI_OVERLAP_HD=1` select the longer 1080p evidence workload. Captures
+//! and connection changes may overlap in the production receiver, so this
+//! exercises the same native combination as ordinary applications.
 
 #[macro_use]
 #[path = "common/mod.rs"]
@@ -501,6 +501,10 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
         },
         RuntimeFeature, SourceNameChange,
     };
+    // The child shares this test executable's network namespace. Hold the
+    // parent's turn across its lifetime, so other parent cases do not compete
+    // with its discovery/transport setup. The child has its own process mutex.
+    let _turn = sockets();
     // Remote commands carry names, not the loopback endpoint we give local
     // connections. Its native internal finder needs a loopback discovery hint,
     // installed before the child initializes the SDK's process configuration.
@@ -547,7 +551,6 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
         );
         return;
     };
-    let _turn = sockets();
     let server = common::discovery_server::Server::start(&binary);
     let peers = Peers::new(&ndi);
     let options = AdvertiserOptions::new().servers(server.endpoint());

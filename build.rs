@@ -38,7 +38,6 @@ fn main() {
         "ndi_link_static",
         "ndi_has_advanced_header",
         "ndi_test_capture_permissions",
-        "ndi_test_connect_overlap",
         "ndi_test_finder_snapshot_guard",
         "ndi_test_foreign_snapshot_guard",
     ] {

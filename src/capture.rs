@@ -17,8 +17,8 @@
 //! - `CaptureStrategy` privately connects each receiver kind to its slot of
 //!   the SDK capture call and its frame-type discriminant, and copies a
 //!   borrowed frame into an owned one. The capture itself is made only through
-//!   a [`CaptureLock`], the proof that the receiver's shared capture guard is
-//!   held, so no receiver capture can overlap a reconnect. [`capture_raw`]
+//!   a [`CaptureLock`], which fixes the receiver, runtime and remaining wait
+//!   after the mode's permissions have been checked. [`capture_raw`]
 //!   (one kind) and `capture_any` (a sealed set of all media slots or none)
 //!   both go through `Captured`. A delivered frame becomes a guard through
 //!   `Captured::take`, the one place a receiver guard is made. Mixed and

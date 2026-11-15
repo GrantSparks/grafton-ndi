@@ -659,6 +659,8 @@ impl FrameSync {
     /// source with `poll_source_name_change()` and connection state with
     /// `is_connected()` or `connection_stats()`.
     /// Tally control publishes state upstream; it does not query incoming tally.
+    /// Local connection changes may run while FrameSync captures; the native
+    /// overlap tests exercise recovery and valid output through those changes.
     ///
     /// This receiver mode has no raw video or audio capture, because the
     /// synchronizer takes the receiver's video and audio: raw audio capture

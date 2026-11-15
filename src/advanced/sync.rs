@@ -461,11 +461,9 @@ impl AvSync {
     ///
     /// One call synchronizes at a time, on the thread that holds this
     /// `AvSync`, which is not `Sync`. Other threads may meanwhile capture
-    /// video or metadata or use the controls through the
-    /// receiver it lends. This does not take the receiver's capture guard, as
-    /// [`FrameSync`](crate::FrameSync) captures do not, so a
-    /// [`reconnect`](Receiver::reconnect) neither waits for it nor holds it
-    /// off.
+    /// video or metadata or use the controls through the receiver it lends.
+    /// Connection changes may overlap synchronization, as the native overlap
+    /// tests also exercise for [`FrameSync`](crate::FrameSync).
     ///
     /// # Errors
     ///
@@ -611,16 +609,11 @@ impl<'a> AvSyncCapture<'a> {
                 // once (Processing.NDI.Recv.h). The AvSyncAttached mode has no
                 // audio capture, so the synchronizer is the only audio consumer.
                 //
-                // The receiver's capture guard is not taken, as FrameSync's
-                // captures do not take it. The guard keeps the crate's own
-                // NDIlib_recv_capture_v3 calls from overlapping
-                // NDIlib_recv_connect. How a synchronizer reads its receiver,
-                // during this call or on its own, is internal to the SDK and not
-                // documented, so a lock around this call could not be shown to
-                // cover it. Processing.NDI.FrameSync.h leaves a frame
-                // synchronizer's receiver usable for its other operations, and a
-                // FrameSync's receiver already reconnects while it captures; this
-                // synchronizer is treated the same way.
+                // Connection changes may overlap raw receiver and synchronizer
+                // captures. The native observations beside receiver::CaptureLock
+                // and tests/receiver_connect_overlap_sdk.rs cover both AV sync
+                // and FrameSync beside local connection changes; remote SDK
+                // connection requests likewise cannot be serialized by Rust.
                 let code = unsafe {
                     table.NDIlib_avsync_synchronize(
                         handle.0,
