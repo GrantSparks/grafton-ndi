@@ -323,9 +323,9 @@ pub struct SourceWatch<'finder> {
 impl SourceWatch<'_> {
     /// Copy the currently known sources and record the generation before
     /// copying, preserving any report that arrives during the snapshot.
+    /// A failed snapshot leaves the cursor unchanged.
     pub fn current_sources(&mut self) -> Result<Vec<Source>> {
-        self.observed.set(self.finder.changes.generation());
-        self.finder.current_sources()
+        self.snapshot(Finder::current_sources, |_| true)
     }
 
     /// Wait for a report newer than this consumer's last snapshot or wait.
@@ -343,8 +343,25 @@ impl SourceWatch<'_> {
     }
 
     fn current_sources_until(&mut self, deadline: Deadline) -> Result<Option<Vec<Source>>> {
-        self.observed.set(self.finder.changes.generation());
-        self.finder.current_sources_until(deadline)
+        self.snapshot(
+            |finder| finder.current_sources_until(deadline),
+            Option::is_some,
+        )
+    }
+
+    // Capture the generation before copying, but acknowledge it only when the
+    // caller receives a snapshot. Reports during copying remain outstanding.
+    fn snapshot<T>(
+        &mut self,
+        snapshot: impl FnOnce(&Finder) -> Result<T>,
+        completed: impl FnOnce(&T) -> bool,
+    ) -> Result<T> {
+        let observed = self.finder.changes.generation();
+        let value = snapshot(self.finder)?;
+        if completed(&value) {
+            self.observed.set(observed);
+        }
+        Ok(value)
     }
 
     fn wait_until(&mut self, deadline: Deadline) -> bool {

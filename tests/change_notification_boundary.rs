@@ -73,6 +73,8 @@ fn shared_native_change_reports() {
             "cursor" => cursor(&ndi, || unsafe { publish() }),
             "snapshot" => snapshot_ordering(&ndi, || unsafe { publish() }),
             "cold-watch" => cold_watch(&ndi),
+            "failed-snapshot" => failed_snapshot(&ndi, || unsafe { publish() }, true),
+            "failed-snapshot-pending" => failed_snapshot(&ndi, || unsafe { publish() }, false),
             #[cfg(feature = "advanced")]
             "keyframe" => keyframe(&ndi, false),
             #[cfg(feature = "advanced")]
@@ -101,6 +103,8 @@ fn shared_native_change_reports() {
         "cursor",
         "snapshot",
         "cold-watch",
+        "failed-snapshot",
+        "failed-snapshot-pending",
     ];
     if cfg!(feature = "advanced") {
         cases.extend(["keyframe", "keyframe-cleared"]);
@@ -263,6 +267,34 @@ fn cursor(ndi: &Ndi, publish: impl Fn()) {
         assert!(!watch.wait_for_change(Duration::ZERO).unwrap());
     });
     no_overlapping_waits("finder");
+}
+
+// A failed snapshot must acknowledge neither a report another consumer already
+// published nor a report still waiting in the SDK.
+fn failed_snapshot(ndi: &Ndi, publish: impl Fn(), consumed: bool) {
+    let finder = Finder::new(ndi, &FinderOptions::new()).unwrap();
+    let mut watch = finder.watch();
+    assert_eq!(watch.current_sources().unwrap().len(), 1);
+    publish();
+    if consumed {
+        assert!(finder.watch().wait_for_change(Duration::ZERO).unwrap());
+    }
+    let directory =
+        PathBuf::from(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).with_extension("gate");
+    fs::create_dir(&directory).unwrap();
+    std::env::set_var("GRAFTON_FAKE_FINDER_GATE", &directory);
+    fs::write(directory.join("fail-snapshot"), b"").unwrap();
+    assert!(matches!(
+        watch.current_sources(),
+        Err(grafton_ndi::Error::UnexpectedSdkResult(
+            grafton_ndi::SdkResultDefect::MalformedDiscoveryData(
+                grafton_ndi::DiscoveryDefect::NullArray
+            )
+        ))
+    ));
+    assert!(watch.wait_for_change(Duration::ZERO).unwrap());
+    assert_eq!(watch.current_sources().unwrap().len(), 2);
+    assert!(!watch.wait_for_change(Duration::ZERO).unwrap());
 }
 
 // Publish and consume a native report while the snapshot itself is blocked.
