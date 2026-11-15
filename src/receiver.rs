@@ -93,7 +93,7 @@ impl RecvStringGuard<'_> {
             .map(|bytes| {
                 std::str::from_utf8(bytes)
                     .map(str::to_owned)
-                    .map_err(|error| Error::InvalidUtf8(error.to_string()))
+                    .map_err(|error| Error::InvalidUtf8(error))
             })
             .transpose()
     }

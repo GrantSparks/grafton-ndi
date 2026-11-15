@@ -27,6 +27,18 @@ pub enum SpawnFailure {
     TaskCancelled,
 }
 
+/// Why the selected native runtime could not initialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum InitializationFailure {
+    /// The SDK refused initialization on a supported CPU.
+    #[error("NDIlib_initialize returned false on a CPU the runtime reports as supported")]
+    NotStarted,
+    /// Another runtime handle would overflow the reference count.
+    #[error("NDI runtime reference count exhausted")]
+    HandleCountExhausted,
+}
+
 /// Every error this crate reports, from the core API, the `advanced` module
 /// and the File API alike.
 ///
@@ -142,7 +154,7 @@ pub enum Error {
     /// [`Error::RuntimeLoadFailed`] instead, and one that does not start
     /// because of the CPU as [`Error::UnsupportedCpu`].
     #[error("Failed to initialize the NDI runtime: {0}")]
-    InitializationFailed(String),
+    InitializationFailed(InitializationFailure),
 
     /// The selected NDI runtime cannot run on this CPU.
     ///
@@ -169,7 +181,7 @@ pub enum Error {
     /// [`crate::FrameMetadataStatus`] instead. Text a peer advertises through a Discovery Server is
     /// decoded lossily instead.
     #[error("Invalid UTF-8 string in data: {0}")]
-    InvalidUtf8(String),
+    InvalidUtf8(std::str::Utf8Error),
 
     /// Text passed to the SDK contains a NUL byte, which a C string cannot
     /// hold.
@@ -513,5 +525,40 @@ mod tests {
                 format!("Queue full: {text}")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod initialization_failure_tests {
+    use super::*;
+
+    #[test]
+    fn initialization_causes_preserve_their_diagnostics() {
+        for (cause, expected) in [
+            (
+                InitializationFailure::NotStarted,
+                "NDIlib_initialize returned false on a CPU the runtime reports as supported",
+            ),
+            (
+                InitializationFailure::HandleCountExhausted,
+                "NDI runtime reference count exhausted",
+            ),
+        ] {
+            assert_eq!(cause.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn utf8_errors_keep_the_offset_and_incomplete_sequence() {
+        let bytes = [b'a', 0xe2, 0x82];
+        let cause = std::str::from_utf8(&bytes).unwrap_err();
+        let error = Error::InvalidUtf8(cause);
+        assert!(
+            matches!(error, Error::InvalidUtf8(found) if found.valid_up_to() == 1 && found.error_len().is_none())
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("Invalid UTF-8 string in data: {cause}")
+        );
     }
 }

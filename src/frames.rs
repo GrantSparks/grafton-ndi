@@ -3142,7 +3142,7 @@ impl<'a> MetadataText<'a> {
     pub(crate) fn from_cstr(metadata: &'a CStr) -> Result<Self> {
         let with_nul = metadata.to_bytes_with_nul();
         validate_metadata_len_with_nul(with_nul.len())?;
-        let with_nul = str::from_utf8(with_nul).map_err(|e| Error::InvalidUtf8(e.to_string()))?;
+        let with_nul = str::from_utf8(with_nul).map_err(|e| Error::InvalidUtf8(e))?;
         Ok(Self { with_nul })
     }
 
@@ -3221,7 +3221,7 @@ pub(crate) unsafe fn validate_metadata_layout(
     }
 
     // The bytes end in their only NUL and are within the cap.
-    let with_nul = str::from_utf8(bytes).map_err(|err| Error::InvalidUtf8(err.to_string()))?;
+    let with_nul = str::from_utf8(bytes).map_err(|err| Error::InvalidUtf8(err))?;
     Ok(Some(MetadataText { with_nul }))
 }
 
@@ -3647,7 +3647,7 @@ pub(crate) unsafe fn validate_frame_metadata<'a>(
     // live and unchanged for `'a`; `u8` needs no alignment.
     let bytes = unsafe { slice::from_raw_parts(p_metadata.cast::<u8>(), payload.len() + 1) };
     // The bytes end in their only NUL, found below the cap.
-    let with_nul = str::from_utf8(bytes).map_err(|err| Error::InvalidUtf8(err.to_string()))?;
+    let with_nul = str::from_utf8(bytes).map_err(|err| Error::InvalidUtf8(err))?;
     Ok(Some(MetadataText { with_nul }))
 }
 
