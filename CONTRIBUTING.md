@@ -19,7 +19,8 @@ and explain the change in behavior. Keep native ownership and synchronization
 arguments beside unsafe operations.
 
 Update API documentation and examples when behavior changes, and add migration
-notes when callers must change. Keep issue investigations, implementation plans,
+notes when callers must change. Follow the [public API conventions](docs/api-conventions.md)
+for names, signatures, traits, ownership and documentation. Keep issue investigations, implementation plans,
 audit reports and measured results on the relevant GitHub issue. Include the
 workload, environment and limits with performance results; repository docs
 should explain how to use and maintain the library.

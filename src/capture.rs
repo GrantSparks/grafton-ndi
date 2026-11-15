@@ -155,6 +155,7 @@ pub(crate) trait CaptureStrategy:
 }
 
 /// Marker type for video frame capture operations.
+#[derive(Debug)]
 pub struct VideoKind;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
@@ -191,6 +192,7 @@ impl CaptureStrategy for VideoKind {
 }
 
 /// Marker type for audio frame capture operations.
+#[derive(Debug)]
 pub struct AudioKind;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
@@ -227,6 +229,7 @@ impl CaptureStrategy for AudioKind {
 }
 
 /// Marker type for metadata frame capture operations.
+#[derive(Debug)]
 pub struct MetadataKind;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
@@ -265,6 +268,7 @@ impl CaptureStrategy for MetadataKind {
 /// Free strategy for video frames captured through [`FrameSync`](crate::FrameSync).
 ///
 /// Frees via `NDIlib_framesync_free_video`.
+#[derive(Debug)]
 pub struct FrameSyncVideoFree;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
@@ -282,6 +286,7 @@ unsafe impl FrameFree for FrameSyncVideoFree {
 /// Free strategy for audio frames captured through [`FrameSync`](crate::FrameSync).
 ///
 /// Frees via `NDIlib_framesync_free_audio_v2`.
+#[derive(Debug)]
 pub struct FrameSyncAudioFree;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
@@ -301,6 +306,7 @@ unsafe impl FrameFree for FrameSyncAudioFree {
 
 /// Free strategy for audio borrowed from [`AvSync`](crate::advanced::AvSync).
 #[cfg(feature = "advanced")]
+#[derive(Debug)]
 pub struct AvSyncAudioFree;
 
 /// The native owner and already-authorized table of one AV-sync audio loan.

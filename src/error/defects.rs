@@ -5,27 +5,34 @@ use std::time::Duration;
 use thiserror::Error;
 
 /// The syntactic defect in an `ndi_color_info` element.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum ColorMetadataIssue {
     /// The element is not closed.
+    #[error("the element is not closed")]
     UnclosedElement,
     /// An attribute cannot start at this byte.
+    #[error("an attribute cannot start at this byte")]
     AttributeStart,
     /// An attribute has no value.
+    #[error("an attribute has no value")]
     MissingValue,
     /// An attribute value is not quoted.
+    #[error("an attribute value is not quoted")]
     UnquotedValue,
     /// An attribute value has no closing quote.
+    #[error("an attribute value has no closing quote")]
     UnclosedValue,
     /// An attribute occurs twice.
+    #[error("an attribute occurs twice")]
     DuplicateAttribute,
     /// A color attribute has an undefined value.
+    #[error("a color attribute has an undefined value")]
     UndefinedValue,
 }
 
 /// The image encoder that refused output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum ImageCodec {
     /// PNG.
@@ -40,25 +47,19 @@ pub enum ImageCodec {
 }
 
 /// The rejected native Discovery Server address, retained only for diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Error)]
+#[error(
+    "the SDK created no {object}: it does not accept {address:?} as a Discovery Server address"
+)]
 pub struct DiscoveryAddressFailure {
     /// The kind of object the SDK refused to create.
     pub object: &'static str,
     /// The address the caller supplied.
     pub address: Box<str>,
 }
-impl std::fmt::Display for DiscoveryAddressFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the SDK created no {}: it does not accept {:?} as a Discovery Server address",
-            self.object, self.address
-        )
-    }
-}
 
 /// The malformed native discovery data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum DiscoveryDefect {
     /// An array's span overflows.
@@ -235,6 +236,12 @@ pub enum LayoutDefect {
 #[derive(Debug, Clone, PartialEq, Error)]
 #[non_exhaustive]
 pub enum FrameDefect {
+    /// A FourCC does not identify a supported packet-envelope codec.
+    #[error("Unknown packet envelope codec FourCC: 0x{fourcc:08X}")]
+    UnknownEnvelopeCodec {
+        /// The unrecognized FourCC value.
+        fourcc: u32,
+    },
     /// A refusal of the shared media layout or value checks.
     #[error(transparent)]
     Layout(LayoutDefect),
@@ -601,6 +608,14 @@ pub enum InputDefect {
     /// Source name must be nonempty and contain no NUL.
     #[error("Source name must be nonempty and contain no NUL")]
     InvalidSourceName,
+    /// A list element is empty, contains a comma, or contains a NUL.
+    #[error("{setting} element {index} must be nonempty and contain neither a comma nor a NUL")]
+    ListElement {
+        /// The setting that contains the invalid element.
+        setting: &'static str,
+        /// The zero-based position in the list.
+        index: usize,
+    },
     /// Host must be a bare hostname, IP address or NDI machine name.
     #[error("Host must be a bare hostname, IP address or NDI machine name")]
     InvalidHostQuery,
@@ -909,7 +924,7 @@ pub enum InputDefect {
 ///
 /// Ordinary causes retain their evidence inline without allocating. Boxed
 /// diagnostic fields retain caller or SDK text only for the documented exceptions.
-#[derive(Debug, Clone, PartialEq, Error, Copy, Eq)]
+#[derive(Debug, Clone, PartialEq, Error, Copy, Eq, Hash)]
 #[non_exhaustive]
 pub enum SdkResultDefect {
     /// could not reserve memory for discovery results.
@@ -1012,7 +1027,7 @@ pub enum SdkResultDefect {
 }
 
 /// The image axis that exceeded an encoder limit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum ImageDimension {
     /// Width.
@@ -1028,7 +1043,7 @@ pub enum ImageDimension {
 /// Only the wide cold-path causes use this holder. Boxing on 32-bit targets
 /// preserves the existing compact `Error` budget while keeping every diagnostic
 /// value. Common layout, timeout, HDR and withheld-metadata causes stay inline.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CompactDiagnostic<T> {
     #[cfg(target_pointer_width = "64")]
     value: T,
@@ -1072,7 +1087,7 @@ impl<T: std::fmt::Display> std::fmt::Display for CompactDiagnostic<T> {
 }
 
 /// The audio count that failed validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum AudioCountKind {
     /// Channel count.
@@ -1084,46 +1099,28 @@ pub enum AudioCountKind {
 }
 
 /// Exact values reported by `FrameRate`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[error("Invalid frame rate {numerator}/{denominator}: both parts must be in 1..=2147483647")]
 pub struct FrameRateDefect {
     /// The numerator.
     pub numerator: i64,
     /// The denominator.
     pub denominator: i64,
 }
-impl std::fmt::Display for FrameRateDefect {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            numerator,
-            denominator,
-        } = self;
-        write!(
-            f,
-            "Invalid frame rate {numerator}/{denominator}: both parts must be in 1..=2147483647"
-        )
-    }
-}
 
 /// Exact values reported by `CompressedVideoDimensions`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[error("Compressed video dimensions {width}x{height} must each be in 1..=2147483647")]
 pub struct VideoDimensionsDefect {
     /// The width.
     pub width: i64,
     /// The height.
     pub height: i64,
 }
-impl std::fmt::Display for VideoDimensionsDefect {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self { width, height } = self;
-        write!(
-            f,
-            "Compressed video dimensions {width}x{height} must each be in 1..=2147483647"
-        )
-    }
-}
 
 /// Exact values reported by `AudioDataLength`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[error("Audio data length {actual}, expected {expected} samples ({channels} channels x {samples} samples) for validated layout")]
 pub struct AudioLengthDefect {
     /// The actual.
     pub actual: usize,
@@ -1134,20 +1131,10 @@ pub struct AudioLengthDefect {
     /// The samples.
     pub samples: u32,
 }
-impl std::fmt::Display for AudioLengthDefect {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            actual,
-            expected,
-            channels,
-            samples,
-        } = self;
-        write!(f, "Audio data length {actual}, expected {expected} samples ({channels} channels x {samples} samples) for validated layout")
-    }
-}
 
 /// Exact values reported by `CompressedAudioQuantities`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[error("Compressed audio of {sample_rate} Hz, {channels} channels and {samples} samples per channel: each must be in 1..=2147483647")]
 pub struct CompressedAudioDefect {
     /// The sample rate.
     pub sample_rate: i64,
@@ -1156,19 +1143,10 @@ pub struct CompressedAudioDefect {
     /// The samples.
     pub samples: i64,
 }
-impl std::fmt::Display for CompressedAudioDefect {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            sample_rate,
-            channels,
-            samples,
-        } = self;
-        write!(f, "Compressed audio of {sample_rate} Hz, {channels} channels and {samples} samples per channel: each must be in 1..=2147483647")
-    }
-}
 
 /// Exact values reported by `PtzValue`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Error)]
+#[error("{name} must be finite and within {minimum}..={maximum}")]
 pub struct PtzDefect {
     /// The name.
     pub name: &'static str,
@@ -1176,16 +1154,6 @@ pub struct PtzDefect {
     pub minimum: f32,
     /// The maximum.
     pub maximum: f32,
-}
-impl std::fmt::Display for PtzDefect {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            name,
-            minimum,
-            maximum,
-        } = self;
-        write!(f, "{name} must be finite and within {minimum}..={maximum}")
-    }
 }
 
 /// An exact signed 64-bit diagnostic value with 32-bit alignment.

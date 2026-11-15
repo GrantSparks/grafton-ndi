@@ -32,7 +32,7 @@ use crate::{
 use std::{ffi::CString, fmt, ptr, time::Duration};
 
 /// A router's advertised name and optional discovery groups.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RouterOptions {
     name: String,
     groups: Option<String>,
@@ -171,6 +171,8 @@ impl Router {
     /// cannot take; [`crate::Error::InvalidCString`] when the name or groups contain a
     /// NUL byte; and [`crate::Error::NativeOperationFailed`] when the SDK creates no
     /// source.
+    #[doc(alias = "NDIlib_routing_create")]
+    #[doc(alias = "NDIlib_routing_create_v2")]
     pub fn new(ndi: &Ndi, options: &RouterOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
         if let Some(config) = &options.config {
@@ -255,6 +257,7 @@ impl Router {
     /// Returns [`crate::Error::InvalidCString`] when the source name or address
     /// contains a NUL byte, and [`crate::Error::NativeOperationFailed`] when the SDK
     /// rejects the change.
+    #[doc(alias = "NDIlib_routing_change")]
     pub fn change(&mut self, source: &Source) -> Result<()> {
         let raw = Box::new(source.to_raw()?);
         // SAFETY: the boxed descriptor and its strings stay owned by this
@@ -281,6 +284,7 @@ impl Router {
     /// # Errors
     ///
     /// Returns [`crate::Error::NativeOperationFailed`] when the SDK rejects the change.
+    #[doc(alias = "NDIlib_routing_clear")]
     pub fn clear(&mut self) -> Result<()> {
         // SAFETY: the router instance is live for this borrow.
         let cleared = unsafe { self.routing.named().NDIlib_routing_clear(self.instance.0) };
@@ -303,6 +307,7 @@ impl Router {
     /// Returns [`crate::Error::InvalidInput`] when `timeout` exceeds
     /// [`crate::MAX_TIMEOUT`], and [`crate::Error::UnexpectedSdkResult`] when the SDK
     /// reports a negative count.
+    #[doc(alias = "NDIlib_routing_get_no_connections")]
     pub fn connection_count(&self, timeout: Duration) -> Result<u32> {
         let timeout = to_ms_checked(timeout)?;
         // SAFETY: the router instance is live for this borrow.
@@ -323,6 +328,7 @@ impl Router {
     /// descriptor, or one that names neither a source nor an address, and
     /// [`crate::Error::UnexpectedSdkResult`] when its name or address is longer than
     /// the 4 MiB one SDK string may be.
+    #[doc(alias = "NDIlib_routing_get_source_name")]
     pub fn source(&self) -> Result<Source> {
         // SAFETY: the router is live, and the descriptor the SDK returns stays
         // valid until the router is destroyed, after this copy completes.

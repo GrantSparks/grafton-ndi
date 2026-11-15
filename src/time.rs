@@ -90,6 +90,7 @@ impl Ndi {
     ///
     /// Requires the NDI 6.4 timestamp helper. Missing capability is an error;
     /// this never falls back to `SystemTime` or `Instant`.
+    #[doc(alias = "NDIlib_util_get_timestamp")]
     pub fn timestamp(&self) -> Result<SdkTimestamp> {
         let timestamp = self.table::<crate::sys::Timestamp>()?;
         // SAFETY: the query takes no arguments, and this handle keeps the

@@ -71,7 +71,7 @@ fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
 /// capacity must be from 1 through 4096; the `create_with_options`
 /// functions of [`AsyncFilePlayer`] and [`AsyncFileRecorder`] refuse any
 /// other with [`Error::InvalidInput`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AsyncFileOptions {
     command_capacity: usize,
     event_capacity: usize,
@@ -310,16 +310,23 @@ impl<T> Unpin for FileOperation<T> {}
 
 impl<T> std::fmt::Debug for FileOperation<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let stage = lock(&self.stage);
-        let submitted = !matches!(*stage, Stage::Deferred(_));
-        let completed = match &*stage {
-            Stage::Deferred(_) => false,
-            Stage::Live(Live::Waiting(shared)) => !matches!(*lock(&shared.slot), Slot::Pending(_)),
-            Stage::Live(Live::Immediate(_)) | Stage::Done => true,
-        };
+        // Formatting never waits for an operation or its response slot.
+        let state = self.stage.try_lock().ok().map(|stage| {
+            let submitted = !matches!(*stage, Stage::Deferred(_));
+            let completed = match &*stage {
+                Stage::Deferred(_) => Some(false),
+                Stage::Live(Live::Waiting(shared)) => shared
+                    .slot
+                    .try_lock()
+                    .ok()
+                    .map(|slot| !matches!(*slot, Slot::Pending(_))),
+                Stage::Live(Live::Immediate(_)) | Stage::Done => Some(true),
+            };
+            (submitted, completed)
+        });
         f.debug_struct("FileOperation")
-            .field("submitted", &submitted)
-            .field("completed", &completed)
+            .field("submitted", &state.map(|(submitted, _)| submitted))
+            .field("completed", &state.and_then(|(_, completed)| completed))
             .finish_non_exhaustive()
     }
 }
@@ -773,6 +780,15 @@ pub struct FileEventFuture<E> {
     /// This wait's registration with the deadline timer, while it has one.
     timer: Option<TimerKey>,
     taken: bool,
+}
+
+impl<E> std::fmt::Debug for FileEventFuture<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileEventFuture")
+            .field("timeout", &self.budget)
+            .field("completed", &self.taken)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<E> FileEventFuture<E> {
@@ -1834,6 +1850,14 @@ pub struct AsyncFilePlayer {
     worker: Arc<Worker<FilePlayer>>,
 }
 
+impl std::fmt::Debug for AsyncFilePlayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncFilePlayer")
+            .field("mode", &"playback")
+            .finish_non_exhaustive()
+    }
+}
+
 impl AsyncFilePlayer {
     /// Create a player and advertise its source, with the default queue sizes.
     ///
@@ -1841,6 +1865,7 @@ impl AsyncFilePlayer {
     /// only read, so they stay with the caller whatever the outcome.
     /// Options and the required File family are checked at submission, before
     /// an owner thread starts. Native creation runs on that thread.
+    #[doc(alias = "NDIlib_file_player_create")]
     pub fn create(api: &FileApi, options: &PlayerOptions) -> FileOperation<Self> {
         Worker::<FilePlayer>::create(api, options, |worker| Self { worker })
     }
@@ -1851,6 +1876,7 @@ impl AsyncFilePlayer {
     /// [`Error::InvalidInput`] when a queue size is out of range.
     /// Queue sizes, options and the required File family are checked at
     /// submission, before an owner thread starts.
+    #[doc(alias = "NDIlib_file_player_create")]
     pub fn create_with_options(
         api: &FileApi,
         options: &PlayerOptions,
@@ -1877,12 +1903,14 @@ impl AsyncFilePlayer {
     /// thread is not running and cannot be started; the next probe tries to
     /// start it again. [`Error::InvalidState`] with [`StateError::OwnerFailed`]
     /// when the probe panicked; the thread goes on with the next one.
+    #[doc(alias = "NDIlib_file_player_probe_file")]
     pub fn probe(api: &FileApi, path: impl AsRef<Path>) -> FileOperation<FileInfo> {
         let (api, path) = (api.clone(), path.as_ref().to_path_buf());
         FileOperation::deferred(move || PROBES.probe(&api, &path))
     }
 
     /// Play a file; see [`FilePlayer::start`].
+    #[doc(alias = "NDIlib_file_player_start")]
     pub fn start(&self, path: impl AsRef<Path>) -> FileOperation<()> {
         let path = path.as_ref().to_path_buf();
         self.worker.prepare(
@@ -1896,6 +1924,7 @@ impl AsyncFilePlayer {
     }
     /// Stop the current file; the source stays advertised. The stop runs even
     /// if the future is dropped after its first poll or explicit submission.
+    #[doc(alias = "NDIlib_file_player_stop")]
     pub fn stop(&self) -> FileOperation<()> {
         self.worker.submit(true, |p| {
             p.stop();
@@ -1903,14 +1932,17 @@ impl AsyncFilePlayer {
         })
     }
     /// Whether a file is playing.
+    #[doc(alias = "NDIlib_file_player_is_running")]
     pub fn is_running(&self) -> FileOperation<bool> {
         self.worker.call(|p| Ok(p.is_running()))
     }
     /// Wait up to `timeout` for the player's next event.
+    #[doc(alias = "NDIlib_file_player_capture_event")]
     pub fn next_event(&self, timeout: Duration) -> FileEventFuture<PlayerEvent> {
         self.worker.next_event(timeout)
     }
     /// How many events the SDK discarded before the player's thread took them.
+    #[doc(alias = "NDIlib_file_player_get_dropped_event_count")]
     pub fn dropped_event_count(&self) -> FileOperation<u64> {
         self.worker.dropped_event_count()
     }
@@ -1920,19 +1952,23 @@ impl AsyncFilePlayer {
         self.worker.notification_dropped_count()
     }
     /// Counters for the current or most recent file.
+    #[doc(alias = "NDIlib_file_player_get_stats")]
     pub fn stats(&self) -> FileOperation<Option<PlayerStats>> {
         self.worker.call(|p| p.stats())
     }
     /// Seek to a position on the file's timeline; see [`FilePlayer::seek`].
+    #[doc(alias = "NDIlib_file_player_seek_to_time")]
     pub fn seek(&self, position: FilePosition) -> FileOperation<()> {
         self.worker.call(move |p| p.seek(position))
     }
     /// Seek to an approximate frame index; see
     /// [`FilePlayer::seek_frame_approximate`].
+    #[doc(alias = "NDIlib_file_player_seek_to_frame")]
     pub fn seek_frame_approximate(&self, frame: u64) -> FileOperation<()> {
         self.worker.call(move |p| p.seek_frame_approximate(frame))
     }
     /// Pause or resume the current file.
+    #[doc(alias = "NDIlib_file_player_set_paused")]
     pub fn set_paused(&self, paused: bool) -> FileOperation<()> {
         self.worker.call(move |p| {
             p.set_paused(paused);
@@ -1940,11 +1976,13 @@ impl AsyncFilePlayer {
         })
     }
     /// Whether the current file is paused.
+    #[doc(alias = "NDIlib_file_player_get_paused")]
     pub fn is_paused(&self) -> FileOperation<bool> {
         self.worker.call(|p| Ok(p.is_paused()))
     }
     /// Set whether playback restarts at the end of a file. The setting is
     /// kept across files.
+    #[doc(alias = "NDIlib_file_player_set_loop")]
     pub fn set_looping(&self, looping: bool) -> FileOperation<()> {
         self.worker.call(move |p| {
             p.set_looping(looping);
@@ -1952,26 +1990,32 @@ impl AsyncFilePlayer {
         })
     }
     /// Whether playback restarts at the end of a file.
+    #[doc(alias = "NDIlib_file_player_get_loop")]
     pub fn is_looping(&self) -> FileOperation<bool> {
         self.worker.call(|p| Ok(p.is_looping()))
     }
     /// The current file's best-known duration, and whether it is final.
+    #[doc(alias = "NDIlib_file_player_get_current_duration")]
     pub fn duration(&self) -> FileOperation<Option<FileDuration>> {
         self.worker.call(|p| Ok(p.duration()))
     }
     /// The position of the frame sent last.
+    #[doc(alias = "NDIlib_file_player_get_current_position")]
     pub fn position(&self) -> FileOperation<Option<FilePosition>> {
         self.worker.call(|p| Ok(p.position()))
     }
     /// The recorded source timecode of the frame sent last.
+    #[doc(alias = "NDIlib_file_player_get_current_source_timecode")]
     pub fn source_timecode(&self) -> FileOperation<Option<Timecode>> {
         self.worker.call(|p| Ok(p.source_timecode()))
     }
     /// The track layout of the current file.
+    #[doc(alias = "NDIlib_file_player_get_source_format")]
     pub fn source_format(&self) -> FileOperation<Option<SourceFormat>> {
         self.worker.source_format()
     }
     /// The NDI source this player advertises.
+    #[doc(alias = "NDIlib_file_player_get_advertised_source")]
     pub fn advertised_source(&self) -> FileOperation<Source> {
         self.worker.call(|p| p.advertised_source())
     }
@@ -1991,6 +2035,7 @@ impl AsyncFilePlayer {
     ///
     /// [`Error::InvalidState`] with [`StateError::OwnerFailed`] when the
     /// object's thread failed.
+    #[doc(alias = "NDIlib_file_player_destroy")]
     pub fn close(&self) -> FileOperation<()> {
         self.worker.close()
     }
@@ -2029,6 +2074,14 @@ pub struct AsyncFileRecorder {
     worker: Arc<Worker<RecorderOwner>>,
 }
 
+impl std::fmt::Debug for AsyncFileRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncFileRecorder")
+            .field("mode", &"recording")
+            .finish_non_exhaustive()
+    }
+}
+
 impl AsyncFileRecorder {
     /// Create a recorder with the default queue sizes.
     ///
@@ -2037,6 +2090,7 @@ impl AsyncFileRecorder {
     /// only read, so they stay with the caller whatever the outcome.
     /// Options and the required File family are checked at submission, before
     /// an owner thread starts. Native creation runs on that thread.
+    #[doc(alias = "NDIlib_file_recorder_create")]
     pub fn create(api: &FileApi, options: &RecorderOptions) -> FileOperation<Self> {
         Worker::<RecorderOwner>::create(api, options, |worker| Self { worker })
     }
@@ -2046,6 +2100,7 @@ impl AsyncFileRecorder {
     /// [`Error::InvalidInput`] when a queue size is out of range.
     /// Queue sizes, options and the required File family are checked at
     /// submission, before an owner thread starts.
+    #[doc(alias = "NDIlib_file_recorder_create")]
     pub fn create_with_options(
         api: &FileApi,
         options: &RecorderOptions,
@@ -2059,6 +2114,8 @@ impl AsyncFileRecorder {
     /// [`SessionTimecode`](super::SessionTimecode), validated before queuing.
     /// Events left by an earlier refused start are delivered through
     /// [`next_event`](Self::next_event) before the new session begins.
+    #[doc(alias = "NDIlib_file_recorder_start")]
+    #[doc(alias = "NDIlib_file_recorder_start_with_timecode")]
     pub fn start(
         &self,
         target: &RecordingTarget,
@@ -2071,6 +2128,7 @@ impl AsyncFileRecorder {
     }
     /// Ask the SDK to stop the session. Once submitted by polling or calling
     /// [`FileOperation::submit`], the request runs even if its future is dropped.
+    #[doc(alias = "NDIlib_file_recorder_stop")]
     pub fn request_stop(&self) -> FileOperation<StopRequest> {
         self.worker.submit(true, |r| Ok(r.request_stop()))
     }
@@ -2103,6 +2161,8 @@ impl AsyncFileRecorder {
     ///
     /// Those of [`FileRecorder::finish`], and those every
     /// [`FileOperation`] can fail with.
+    #[doc(alias = "NDIlib_file_recorder_stop")]
+    #[doc(alias = "NDIlib_file_recorder_capture_event")]
     pub fn finish(&self, timeout: Duration) -> FileOperation<FinishStatus> {
         self.finish_inner(timeout, true)
     }
@@ -2118,6 +2178,7 @@ impl AsyncFileRecorder {
     ///
     /// Those of [`FileRecorder::wait_finished`], and those every
     /// [`FileOperation`] can fail with.
+    #[doc(alias = "NDIlib_file_recorder_capture_event")]
     pub fn wait_finished(&self, timeout: Duration) -> FileOperation<FinishStatus> {
         self.finish_inner(timeout, false)
     }
@@ -2128,6 +2189,8 @@ impl AsyncFileRecorder {
     /// ends pending finish waits for the old recorder with [`StateError::Closed`];
     /// a failed reset leaves them waiting on the original session.
     /// Options are checked at submission, before waiting in the command queue.
+    #[doc(alias = "NDIlib_file_recorder_destroy")]
+    #[doc(alias = "NDIlib_file_recorder_create")]
     pub fn reset(&self, options: &RecorderOptions) -> FileOperation<RecordingReport> {
         let options = options.clone();
         self.worker.prepare(
@@ -2154,10 +2217,12 @@ impl AsyncFileRecorder {
 
     /// Wait up to `timeout` for the recorder's next event. Dropping the
     /// future does not affect the recording.
+    #[doc(alias = "NDIlib_file_recorder_capture_event")]
     pub fn next_event(&self, timeout: Duration) -> FileEventFuture<RecorderEvent> {
         self.worker.next_event(timeout)
     }
     /// How many events the SDK discarded before the recorder's thread took them.
+    #[doc(alias = "NDIlib_file_recorder_get_dropped_event_count")]
     pub fn dropped_event_count(&self) -> FileOperation<u64> {
         self.worker.dropped_event_count()
     }
@@ -2175,10 +2240,12 @@ impl AsyncFileRecorder {
         self.worker.call(|r| Ok(r.report()))
     }
     /// Whether the SDK is recording or waiting for frames.
+    #[doc(alias = "NDIlib_file_recorder_is_recording")]
     pub fn is_recording(&self) -> FileOperation<bool> {
         self.worker.call(|r| Ok(r.is_recording()))
     }
     /// Switch to recording another source; see [`FileRecorder::set_source`].
+    #[doc(alias = "NDIlib_file_recorder_set_source")]
     pub fn set_source(&self, source: &SourceSpec) -> FileOperation<()> {
         let source = source.clone();
         self.worker.call(move |r| r.set_source(&source))
@@ -2194,6 +2261,7 @@ impl AsyncFileRecorder {
     }
     /// Close the current file and continue in a new one; see
     /// [`FileRecorder::rollover`].
+    #[doc(alias = "NDIlib_file_recorder_rollover")]
     pub fn rollover(&self, target: &RecordingTarget) -> FileOperation<()> {
         let target = target.clone();
         self.worker.call(move |r| r.rollover(&target))
@@ -2205,15 +2273,18 @@ impl AsyncFileRecorder {
     /// retaining the copy until the deferred worker command runs or is
     /// discarded. Accepts owned and captured metadata without retaining a
     /// native frame or borrowing the source through the command's lifetime.
+    #[doc(alias = "NDIlib_file_recorder_inject_metadata")]
     pub fn inject_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> FileOperation<()> {
         let metadata = MetadataSource::to_owned(metadata);
         self.worker.call(move |r| r.inject_metadata(&metadata))
     }
     /// The recorder's running counters.
+    #[doc(alias = "NDIlib_file_recorder_get_stats")]
     pub fn stats(&self) -> FileOperation<Option<RecorderStats>> {
         self.worker.call(|r| r.stats())
     }
     /// The format of the source, once the recorder has seen audio or video.
+    #[doc(alias = "NDIlib_file_recorder_get_source_format")]
     pub fn source_format(&self) -> FileOperation<Option<SourceFormat>> {
         self.worker.source_format()
     }
@@ -2240,6 +2311,7 @@ impl AsyncFileRecorder {
     ///
     /// [`Error::InvalidState`] with [`StateError::OwnerFailed`] when the
     /// object's thread failed.
+    #[doc(alias = "NDIlib_file_recorder_destroy")]
     pub fn close(&self) -> FileOperation<()> {
         self.worker.close()
     }
@@ -2261,6 +2333,21 @@ mod tests {
         *,
     };
     use std::{rc::Rc, task::Wake};
+
+    #[test]
+    fn formatting_an_operation_does_not_wait_for_its_stage_lock() {
+        let operation = Arc::new(FileOperation::<()>::live(Live::Immediate(Ok(()))));
+        let stage = lock(&operation.stage);
+        let (sender, receiver) = mpsc::channel();
+        let other = Arc::clone(&operation);
+        let thread = thread::spawn(move || sender.send(format!("{other:?}")).unwrap());
+        let formatted = receiver.recv_timeout(Duration::from_secs(1));
+        drop(stage);
+        thread.join().unwrap();
+        let formatted = formatted.expect("Debug waited for an operation's stage lock");
+        assert!(formatted.starts_with("FileOperation {"));
+        assert!(formatted.contains("submitted: None"));
+    }
 
     struct Signal(Mutex<bool>, Condvar);
     impl Wake for Signal {

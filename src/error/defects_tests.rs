@@ -55,6 +55,7 @@ fn check_cases<E: std::fmt::Display>(name: &str, cases: &[(&str, E, &str)]) {
 #[test]
 fn frame_defect_diagnostics_preserve_their_text() {
     let cases = [
+        ("UnknownEnvelopeCodec", FrameDefect::UnknownEnvelopeCodec { fourcc: 1094861636 }, "Unknown packet envelope codec FourCC: 0x41424344"),
         ("Layout", FrameDefect::Layout(LayoutDefect::VideoZeroSize), "Video frame has zero calculated size"),
         ("ImageScratchAllocation", FrameDefect::ImageScratchAllocation(reserve_capacity_error()), "image scratch allocation failed: memory allocation failed because the computed capacity exceeded the collection's maximum"),
         ("ImageScratchOverflow", FrameDefect::ImageScratchOverflow, "image scratch size overflow"),
@@ -142,6 +143,7 @@ fn input_defect_diagnostics_preserve_their_text() {
     let cases = [
         ("Layout", InputDefect::Layout(LayoutDefect::VideoZeroSize), "Video frame has zero calculated size"),
         ("InvalidSourceName", InputDefect::InvalidSourceName, "Source name must be nonempty and contain no NUL"),
+        ("ListElement", InputDefect::ListElement { setting: "groups", index: 2 }, "groups element 2 must be nonempty and contain neither a comma nor a NUL"),
         ("InvalidHostQuery", InputDefect::InvalidHostQuery, "Host must be a bare hostname, IP address or NDI machine name"),
         ("PtzPreset", InputDefect::PtzPreset, "PTZ preset must be within 0..=99"),
         ("RelativeLibraryPath", InputDefect::RelativeLibraryPath, "an explicit NDI library path must be absolute"),

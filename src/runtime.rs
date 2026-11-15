@@ -147,7 +147,7 @@ use crate::{
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct RuntimeOptions {
     pub(crate) library_path: Option<PathBuf>,
     pub(crate) edition: Option<SdkEdition>,
@@ -384,6 +384,7 @@ impl Runtime {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_is_supported_CPU")]
     pub fn is_supported_cpu(&self) -> bool {
         is_supported_cpu(&self.selected.gates.api().core)
     }
@@ -423,6 +424,7 @@ impl Runtime {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_initialize")]
     pub fn initialize(&self) -> Result<Ndi> {
         self.selected.lifecycle.acquire()?;
         Ok(Ndi { runtime: *self })
@@ -433,7 +435,7 @@ impl fmt::Debug for Runtime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Runtime")
             .field("info", self.info())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -443,9 +445,17 @@ impl fmt::Debug for Runtime {
 /// reference permanently. Dropping this token does not reverse that choice.
 /// This is intended for native callbacks whose completion cannot be bounded by a
 /// normal sender/receiver lifetime. It does not grant an SDK license entitlement.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct ProcessLifetimeRuntime {
     ndi: &'static Ndi,
+}
+
+impl fmt::Debug for ProcessLifetimeRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcessLifetimeRuntime")
+            .field("info", self.ndi.info())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProcessLifetimeRuntime {
@@ -667,7 +677,9 @@ pub struct Ndi {
 
 impl fmt::Debug for Ndi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Ndi").finish_non_exhaustive()
+        f.debug_struct("Ndi")
+            .field("info", self.info())
+            .finish_non_exhaustive()
     }
 }
 
@@ -703,6 +715,7 @@ impl Ndi {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_initialize")]
     pub fn new() -> Result<Self> {
         Self::with_options(&RuntimeOptions::default())
     }
@@ -730,6 +743,7 @@ impl Ndi {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_initialize")]
     pub fn with_options(options: &RuntimeOptions) -> Result<Self> {
         Runtime::select(options)?.initialize()
     }

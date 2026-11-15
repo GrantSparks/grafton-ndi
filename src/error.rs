@@ -16,7 +16,7 @@ pub use loading::{
 
 use thiserror::Error;
 
-use std::{ffi::NulError, fmt};
+use std::ffi::NulError;
 
 use crate::capabilities::{CapabilityRefusal, RuntimeFeature};
 
@@ -24,7 +24,7 @@ use crate::capabilities::{CapabilityRefusal, RuntimeFeature};
 ///
 /// Panics are resumed on the awaiting task rather than reported as spawn
 /// failures. This discriminator does not depend on diagnostic text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum SpawnFailure {
     /// The Tokio operation was polled outside a Tokio runtime.
@@ -36,7 +36,7 @@ pub enum SpawnFailure {
 }
 
 /// Why the selected native runtime could not initialize.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum InitializationFailure {
     /// The SDK refused initialization on a supported CPU.
@@ -414,70 +414,56 @@ const _: () = {
 /// [`Error::ResourceLimit`]. Byte budgets cover native data inspected and owned
 /// storage retained, as documented by the operation. Match this value rather
 /// than diagnostic text; additional budgets may be introduced in 3.x.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum ResourceKind {
     /// Source descriptors in one plain or Advanced Finder snapshot; the limit
     /// is a number of sources.
+    #[error("Finder snapshot sources")]
     FinderSnapshotSources,
     /// Aggregate bytes scanned or copied for one plain or Advanced Finder
     /// snapshot; the limit is in bytes.
+    #[error("Finder snapshot bytes")]
     FinderSnapshotBytes,
     /// Distinct sources retained over one Finder discovery window; the limit
     /// is a number of sources.
+    #[error("Finder discovery sources")]
     FinderDiscoverySources,
     /// Aggregate owned storage retained over one Finder discovery window;
     /// the limit is in bytes.
+    #[error("Finder discovery bytes")]
     FinderDiscoveryBytes,
     /// Aggregate bytes scanned or copied for one Discovery Server snapshot or
     /// event batch, including nested arrays and strings; the limit is in bytes.
+    #[error("Discovery Server snapshot or event batch bytes")]
     DiscoveryServerCopyBytes,
-}
-
-impl fmt::Display for ResourceKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::FinderSnapshotSources => "Finder snapshot sources",
-            Self::FinderSnapshotBytes => "Finder snapshot bytes",
-            Self::FinderDiscoverySources => "Finder discovery sources",
-            Self::FinderDiscoveryBytes => "Finder discovery bytes",
-            Self::DiscoveryServerCopyBytes => "Discovery Server snapshot or event batch bytes",
-        })
-    }
 }
 
 /// Which bounded queue was full, carried by [`Error::QueueFull`].
 ///
 /// Its `Display` text is for diagnostics; match on the variant rather than
 /// the text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum QueueLimit {
     /// An Advanced `QueuedSender` already holds as many frames as its
     /// `QueueOptions::max_frames` allows.
+    #[error("queued video frame limit reached")]
     Frames,
     /// The frames an Advanced `QueuedSender` retains leave too little room
     /// within `QueueOptions::max_bytes` for this frame. The frame itself fits
     /// the limit, so collecting completions makes room.
+    #[error("queued video byte limit reached")]
     Bytes,
     /// An async File handle already has as many commands waiting as its
     /// `AsyncFileOptions::command_capacity` allows, and, for a request to
     /// stop, another request to stop waits beyond them.
+    #[error("File command queue is full")]
     FileCommands,
     /// The 64 async File probes that may wait for the process's probe thread
     /// are already waiting.
+    #[error("File probe queue is full")]
     FileProbes,
-}
-
-impl fmt::Display for QueueLimit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Frames => "queued video frame limit reached",
-            Self::Bytes => "queued video byte limit reached",
-            Self::FileCommands => "File command queue is full",
-            Self::FileProbes => "File probe queue is full",
-        })
-    }
 }
 
 /// Why a listener refused to send a receiver request.
@@ -493,6 +479,50 @@ fn request_refusal(advertised: &bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_payloads_have_the_common_error_traits() {
+        fn error<T: std::error::Error + std::fmt::Debug + Clone + PartialEq>() {}
+        fn value<T: Copy + Eq + std::hash::Hash>() {}
+
+        error::<SelectionFailure>();
+        error::<LoadFailure>();
+        error::<LoadRefusal>();
+        error::<DiscoveryAddressFailure>();
+        error::<InputDefect>();
+        error::<FrameDefect>();
+        error::<LayoutDefect>();
+        error::<SdkResultDefect>();
+        error::<CapabilityRefusal>();
+        error::<crate::CapabilityUnavailable>();
+        error::<QueueLimit>();
+        error::<ResourceKind>();
+        error::<SelectionConflict>();
+        error::<LibraryKind>();
+        error::<ColorMetadataIssue>();
+        error::<FrameRateDefect>();
+        error::<VideoDimensionsDefect>();
+        error::<AudioLengthDefect>();
+        error::<CompressedAudioDefect>();
+        error::<PtzDefect>();
+        error::<SpawnFailure>();
+        error::<InitializationFailure>();
+
+        value::<SdkResultDefect>();
+        value::<CapabilityRefusal>();
+        value::<crate::CapabilityUnavailable>();
+        value::<QueueLimit>();
+        value::<ResourceKind>();
+        value::<SelectionConflict>();
+        value::<LibraryKind>();
+        value::<ColorMetadataIssue>();
+        value::<FrameRateDefect>();
+        value::<VideoDimensionsDefect>();
+        value::<AudioLengthDefect>();
+        value::<CompressedAudioDefect>();
+        value::<SpawnFailure>();
+        value::<InitializationFailure>();
+    }
 
     #[test]
     fn capability_errors_display_the_recorded_evidence() {

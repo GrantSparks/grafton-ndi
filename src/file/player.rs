@@ -116,6 +116,7 @@ impl FilePlayer {
     /// [`Error::NativeOperationFailed`] when the SDK cannot open the file,
     /// [`Error::InvalidInput`] when the path is empty or is not UTF-8, and
     /// [`Error::InvalidCString`] when it contains a NUL.
+    #[doc(alias = "NDIlib_file_player_start")]
     pub fn start(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = types::path_string(path.as_ref())?;
         // SAFETY: the player is live and `path` is a NUL-terminated string
@@ -129,6 +130,7 @@ impl FilePlayer {
     }
 
     /// Stop the current file. The source stays advertised.
+    #[doc(alias = "NDIlib_file_player_stop")]
     pub fn stop(&mut self) {
         // SAFETY: the player is live for this borrow.
         unsafe { self.playback.NDIlib_file_player_stop(self.handle.as_ptr()) };
@@ -136,6 +138,7 @@ impl FilePlayer {
 
     /// Whether a file is playing. False after [`stop`](Self::stop) and once
     /// playback reaches the end of a file that does not loop.
+    #[doc(alias = "NDIlib_file_player_is_running")]
     pub fn is_running(&self) -> bool {
         // SAFETY: the player is live for this borrow.
         unsafe {
@@ -154,6 +157,7 @@ impl FilePlayer {
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
     /// and [`Error::UnexpectedSdkResult`] when the SDK's event does not match
     /// this crate's structure layout or its returned event type.
+    #[doc(alias = "NDIlib_file_player_capture_event")]
     pub fn poll_event(&mut self, timeout: Duration) -> Result<Option<PlayerEvent>> {
         let timeout = crate::to_ms_checked(timeout)?;
         out_param::capture_event(
@@ -177,6 +181,7 @@ impl FilePlayer {
 
     /// How many events the SDK has discarded since the player was created
     /// because they were not taken in time.
+    #[doc(alias = "NDIlib_file_player_get_dropped_event_count")]
     pub fn dropped_event_count(&self) -> u64 {
         // SAFETY: the player is live for this borrow.
         unsafe {
@@ -193,6 +198,7 @@ impl FilePlayer {
     ///
     /// [`Error::UnexpectedSdkResult`] when the SDK's structure does not match this
     /// crate's layout.
+    #[doc(alias = "NDIlib_file_player_get_stats")]
     pub fn stats(&self) -> Result<Option<PlayerStats>> {
         out_param::checked_fill(|stats| {
             // SAFETY: the player is live and the helper keeps guarded stats
@@ -213,6 +219,7 @@ impl FilePlayer {
     /// # Errors
     ///
     /// [`Error::NativeOperationFailed`] when the SDK refuses the seek.
+    #[doc(alias = "NDIlib_file_player_seek_to_time")]
     pub fn seek(&mut self, position: FilePosition) -> Result<()> {
         // SAFETY: the player is live for this borrow.
         let sought = unsafe {
@@ -231,6 +238,7 @@ impl FilePlayer {
     /// # Errors
     ///
     /// [`Error::NativeOperationFailed`] when the SDK refuses the seek.
+    #[doc(alias = "NDIlib_file_player_seek_to_frame")]
     pub fn seek_frame_approximate(&mut self, frame: u64) -> Result<()> {
         // SAFETY: the player is live for this borrow.
         let sought = unsafe {
@@ -242,6 +250,7 @@ impl FilePlayer {
     }
 
     /// Pause or resume the current file. Has no effect when no file is open.
+    #[doc(alias = "NDIlib_file_player_set_paused")]
     pub fn set_paused(&mut self, paused: bool) {
         // SAFETY: the player is live for this borrow.
         unsafe {
@@ -252,6 +261,7 @@ impl FilePlayer {
 
     /// Whether the current file is paused. Every [`start`](Self::start) resets
     /// this to false.
+    #[doc(alias = "NDIlib_file_player_get_paused")]
     pub fn is_paused(&self) -> bool {
         // SAFETY: the player is live for this borrow.
         unsafe {
@@ -265,6 +275,7 @@ impl FilePlayer {
     /// Looping belongs to the player, not the file: it is kept across
     /// [`start`](Self::start) and [`stop`](Self::stop). A looping file never
     /// raises [`PlayerEventKind::Ended`](super::PlayerEventKind::Ended).
+    #[doc(alias = "NDIlib_file_player_set_loop")]
     pub fn set_looping(&mut self, looping: bool) {
         // SAFETY: the player is live for this borrow.
         unsafe {
@@ -274,6 +285,7 @@ impl FilePlayer {
     }
 
     /// Whether playback restarts at the end of a file.
+    #[doc(alias = "NDIlib_file_player_get_loop")]
     pub fn is_looping(&self) -> bool {
         // SAFETY: the player is live for this borrow.
         unsafe {
@@ -285,6 +297,7 @@ impl FilePlayer {
     /// The current file's best-known duration, and whether it is final.
     ///
     /// A file that is still being recorded reports a provisional duration.
+    #[doc(alias = "NDIlib_file_player_get_current_duration")]
     pub fn duration(&self) -> Option<FileDuration> {
         let (mut ticks, mut is_final) = (0, false);
         // SAFETY: the player is live and both pointers are writable.
@@ -303,6 +316,7 @@ impl FilePlayer {
 
     /// The position of the frame sent last: the main video track's, or the
     /// audio track's in a file without video.
+    #[doc(alias = "NDIlib_file_player_get_current_position")]
     pub fn position(&self) -> Option<FilePosition> {
         let mut ticks = 0;
         // SAFETY: the player is live and the pointer is writable.
@@ -315,6 +329,7 @@ impl FilePlayer {
 
     /// The recorded source timecode of the frame sent last. Unlike the
     /// position it is editorial and need not increase.
+    #[doc(alias = "NDIlib_file_player_get_current_source_timecode")]
     pub fn source_timecode(&self) -> Option<Timecode> {
         let mut ticks = 0;
         // SAFETY: the player is live and the pointer is writable.
@@ -332,6 +347,7 @@ impl FilePlayer {
     /// # Errors
     ///
     /// [`Error::UnexpectedSdkResult`] when the SDK's structure is malformed.
+    #[doc(alias = "NDIlib_file_player_get_source_format")]
     pub fn source_format(&self) -> Result<Option<SourceFormat>> {
         out_param::checked_fill(|format| {
             // SAFETY: the player is live and the helper keeps guarded format
@@ -354,6 +370,7 @@ impl FilePlayer {
     /// that names neither a source nor an address, and
     /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
     /// the 4 MiB one SDK string may be.
+    #[doc(alias = "NDIlib_file_player_get_advertised_source")]
     pub fn advertised_source(&self) -> Result<Source> {
         // SAFETY: the player is live. The descriptor the SDK returns, and its
         // strings, stay valid until the player is destroyed, which this borrow
@@ -371,6 +388,7 @@ impl FilePlayer {
     ///
     /// Equivalent to dropping the player; provided so the intent is visible at
     /// the call site.
+    #[doc(alias = "NDIlib_file_player_destroy")]
     pub fn close(self) {
         drop(self);
     }

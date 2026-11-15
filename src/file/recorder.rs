@@ -1081,6 +1081,8 @@ impl FileRecorder {
     ///   failure need not queue one. [`poll_event`](Self::poll_event) can return
     ///   that event, counted in no session's report. Retrying `start` discards
     ///   queued events before asking the SDK to start again.
+    #[doc(alias = "NDIlib_file_recorder_start")]
+    #[doc(alias = "NDIlib_file_recorder_start_with_timecode")]
     pub fn start(&mut self, target: &RecordingTarget, timecode: RecordingTimecode) -> Result<u64> {
         self.start_with_sink(target, timecode, &mut |_| {})
     }
@@ -1153,6 +1155,7 @@ impl FileRecorder {
     /// The SDK then finalizes the open file and reports it closed; this call
     /// alone does not show that it has. Use [`finish`](Self::finish) or
     /// [`wait_finished`](Self::wait_finished) to find out.
+    #[doc(alias = "NDIlib_file_recorder_stop")]
     pub fn request_stop(&mut self) -> StopRequest {
         match self.state() {
             RecorderState::Idle => StopRequest::NotStarted,
@@ -1191,6 +1194,7 @@ impl FileRecorder {
     /// this crate's structure layout or its returned event type. An unreadable
     /// format is withheld through [`RecorderEvent::source_format`] while the
     /// rest of the event is delivered.
+    #[doc(alias = "NDIlib_file_recorder_capture_event")]
     pub fn poll_event(&mut self, timeout: Duration) -> Result<Option<RecorderEvent>> {
         self.poll_event_ms(crate::to_ms_checked(timeout)?)
     }
@@ -1270,6 +1274,8 @@ impl FileRecorder {
     /// [`StateError::StopNotRequested`] when no session was started. Neither
     /// is returned once the wait has begun: whatever the SDK's events hold,
     /// the outcome is a [`FinishStatus`].
+    #[doc(alias = "NDIlib_file_recorder_stop")]
+    #[doc(alias = "NDIlib_file_recorder_capture_event")]
     pub fn finish(&mut self, timeout: Duration) -> Result<FinishStatus> {
         // Checked here, so that a timeout out of range leaves the session
         // recording; the budget itself starts after the stop, in
@@ -1294,6 +1300,7 @@ impl FileRecorder {
     /// [`StateError::StopNotRequested`] when no session was started or the
     /// session has not been asked to stop. Neither is returned once the wait
     /// has begun.
+    #[doc(alias = "NDIlib_file_recorder_capture_event")]
     pub fn wait_finished(&mut self, timeout: Duration) -> Result<FinishStatus> {
         self.wait_until(Deadline::after(timeout)?)
     }
@@ -1408,6 +1415,7 @@ impl FileRecorder {
     /// finalize an open file, and return what was known about the session.
     ///
     /// The file of a session that had not ended may be left truncated.
+    #[doc(alias = "NDIlib_file_recorder_destroy")]
     pub fn abandon(mut self) -> RecordingReport {
         self.cleanup = CleanupBudget::Skip;
         self.report()
@@ -1429,6 +1437,8 @@ impl FileRecorder {
     /// # Errors
     ///
     /// The errors of [`FileApi::create_recorder`].
+    #[doc(alias = "NDIlib_file_recorder_destroy")]
+    #[doc(alias = "NDIlib_file_recorder_create")]
     pub fn reset(&mut self, options: &RecorderOptions) -> Result<RecordingReport> {
         self.reset_with(|recorder| Self::create(recorder._api.clone(), options))
     }
@@ -1462,6 +1472,7 @@ impl FileRecorder {
 
     /// Whether the SDK is recording or waiting for frames. False once a stop
     /// has taken effect; this alone does not show that a file was finalized.
+    #[doc(alias = "NDIlib_file_recorder_is_recording")]
     pub fn is_recording(&self) -> bool {
         // SAFETY: the recorder is live for this borrow.
         unsafe {
@@ -1472,6 +1483,7 @@ impl FileRecorder {
 
     /// How many events the SDK has discarded since the recorder was created
     /// because they were not taken in time.
+    #[doc(alias = "NDIlib_file_recorder_get_dropped_event_count")]
     pub fn dropped_event_count(&self) -> u64 {
         // SAFETY: the recorder is live for this borrow.
         unsafe {
@@ -1508,6 +1520,7 @@ impl FileRecorder {
     ///   SDK does not say which source is then in effect, so
     ///   [`last_accepted_source`](Self::last_accepted_source) returns `None`
     ///   until a later change succeeds.
+    #[doc(alias = "NDIlib_file_recorder_set_source")]
     pub fn set_source(&mut self, source: &SourceSpec) -> Result<()> {
         if self.naming.is_exact() && self.ledger.session_open() {
             return Err(Error::InvalidState(StateError::ExactFileName));
@@ -1581,6 +1594,7 @@ impl FileRecorder {
     ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
     ///   that file exists. The SDK is not called and the session goes on.
     /// * [`Error::NativeOperationFailed`] when the SDK refuses the target.
+    #[doc(alias = "NDIlib_file_recorder_rollover")]
     pub fn rollover(&mut self, target: &RecordingTarget) -> Result<()> {
         if self.state() != RecorderState::Recording {
             return Err(Error::InvalidState(StateError::NotRecording));
@@ -1609,6 +1623,7 @@ impl FileRecorder {
     /// session is recording, and [`Error::NativeOperationFailed`] when the
     /// SDK refuses it, for example because the metadata track is not being
     /// recorded.
+    #[doc(alias = "NDIlib_file_recorder_inject_metadata")]
     pub fn inject_metadata<S: MetadataSource + ?Sized>(&mut self, metadata: &S) -> Result<()> {
         if self.state() != RecorderState::Recording {
             return Err(Error::InvalidState(StateError::NotRecording));
@@ -1637,6 +1652,7 @@ impl FileRecorder {
     ///
     /// [`Error::UnexpectedSdkResult`] when the SDK's structure does not match this
     /// crate's layout.
+    #[doc(alias = "NDIlib_file_recorder_get_stats")]
     pub fn stats(&self) -> Result<Option<RecorderStats>> {
         out_param::checked_fill(|stats| {
             // SAFETY: the recorder is live and the helper keeps guarded stats
@@ -1654,6 +1670,7 @@ impl FileRecorder {
     /// # Errors
     ///
     /// [`Error::UnexpectedSdkResult`] when the SDK's structure is malformed.
+    #[doc(alias = "NDIlib_file_recorder_get_source_format")]
     pub fn source_format(&self) -> Result<Option<SourceFormat>> {
         out_param::checked_fill(|format| {
             // SAFETY: the recorder is live and the helper keeps guarded

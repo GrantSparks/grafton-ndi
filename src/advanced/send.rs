@@ -731,6 +731,7 @@ impl CompressedSender {
     /// As for [`Sender::new`], and
     /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
     /// without an Advanced runtime (or in a build without the Advanced SDK).
+    #[doc(alias = "NDIlib_send_create_v2")]
     pub fn new(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
         let config = AdvancedConfig::or_empty(options.config.as_ref());
         let pending = PendingStreams::default();
@@ -778,6 +779,7 @@ impl CompressedSender {
     /// Send a video frame and return when the SDK has finished with it.
     ///
     /// The frame is borrowed exclusively because the SDK writes to its bytes.
+    #[doc(alias = "NDIlib_send_send_video_v2")]
     pub fn send_video(&mut self, frame: &mut CompressedVideoFrame) {
         self.split().0.send_video(frame)
     }
@@ -787,6 +789,7 @@ impl CompressedSender {
     /// The sender keeps the frame until the next asynchronous send on the same
     /// stream, and returns the frame that this one replaces. The call can
     /// still block while the SDK applies back-pressure.
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
     pub fn send_video_async(&mut self, frame: CompressedVideoFrame) -> Option<SubmittedVideo> {
         self.split().0.send_video_async(frame)
     }
@@ -798,6 +801,7 @@ impl CompressedSender {
     /// send again; the next asynchronous send on either drained stream
     /// returns `None`. Finishing an empty sender makes no native call.
     /// Reclamation does not report whether receivers received the frames.
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
     pub fn finish_video_async(&mut self) -> ReclaimedVideo {
         self.split().0.finish_video_async()
     }
@@ -805,6 +809,7 @@ impl CompressedSender {
     /// Send an audio frame and return when the SDK has finished with it.
     ///
     /// The frame is borrowed exclusively because the SDK writes to its bytes.
+    #[doc(alias = "NDIlib_send_send_audio_v3")]
     pub fn send_audio(&mut self, frame: &mut CompressedAudioFrame) {
         self.split().1.send_audio(frame)
     }
@@ -818,8 +823,9 @@ impl CompressedSender {
     ///
     /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
     /// when the runtime has no scatter sending.
-    pub fn send_scatter_video(&mut self, _frame: &mut ScatterVideoFrame) -> Result<()> {
-        self.split().0.send_scatter_video(_frame)
+    #[doc(alias = "NDIlib_send_send_video_scatter")]
+    pub fn send_scatter_video(&mut self, frame: &mut ScatterVideoFrame) -> Result<()> {
+        self.split().0.send_scatter_video(frame)
     }
 
     /// Submit a video frame held in several blocks without waiting for it to
@@ -828,6 +834,7 @@ impl CompressedSender {
     /// # Errors
     ///
     /// Returns the frame when the runtime has no scatter sending.
+    #[doc(alias = "NDIlib_send_send_video_scatter_async")]
     pub fn send_scatter_video_async(
         &mut self,
         frame: ScatterVideoFrame,
@@ -844,14 +851,16 @@ impl CompressedSender {
     ///
     /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
     /// when the runtime has no scatter sending.
-    pub fn send_scatter_audio(&mut self, _frame: &mut ScatterAudioFrame) -> Result<()> {
-        self.split().1.send_scatter_audio(_frame)
+    #[doc(alias = "NDIlib_send_send_audio_scatter")]
+    pub fn send_scatter_audio(&mut self, frame: &mut ScatterAudioFrame) -> Result<()> {
+        self.split().1.send_scatter_audio(frame)
     }
 
     /// Destroy the sender and take back the frames it still held.
     ///
     /// Destroying the native sender waits for the SDK to finish with every
     /// pending frame, without a timeout.
+    #[doc(alias = "NDIlib_send_destroy")]
     pub fn close(self) -> ReclaimedVideo {
         self.lending.close()
     }
@@ -881,6 +890,7 @@ impl CompressedVideo<'_> {
     }
 
     /// See [`CompressedSender::send_video`].
+    #[doc(alias = "NDIlib_send_send_video_v2")]
     pub fn send_video(&mut self, frame: &mut CompressedVideoFrame) {
         let descriptor = frame.raw();
         // SAFETY: the sender is live, and the descriptor lends `frame`, which
@@ -894,11 +904,13 @@ impl CompressedVideo<'_> {
     }
 
     /// See [`CompressedSender::send_video_async`].
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
     pub fn send_video_async(&mut self, frame: CompressedVideoFrame) -> Option<SubmittedVideo> {
         self.pair.submit_pending(frame)
     }
 
     /// See [`CompressedSender::finish_video_async`].
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
     pub fn finish_video_async(&mut self) -> ReclaimedVideo {
         self.pair.finish()
     }
@@ -908,11 +920,12 @@ impl CompressedVideo<'_> {
     /// # Errors
     ///
     /// As for [`CompressedSender::send_scatter_video`].
-    pub fn send_scatter_video(&mut self, _frame: &mut ScatterVideoFrame) -> Result<()> {
+    #[doc(alias = "NDIlib_send_send_video_scatter")]
+    pub fn send_scatter_video(&mut self, frame: &mut ScatterVideoFrame) -> Result<()> {
         let table = self.pair.sender().runtime().table::<ScatterSend>()?;
-        native!(ScatterSend, table => {
-            let descriptor = _frame.descriptor();
-            let scatter = _frame.storage.descriptor();
+        native!(ScatterSend, table, uses(frame) => {
+            let descriptor = frame.descriptor();
+            let scatter = frame.storage.descriptor();
             // SAFETY: the sender is live, and both descriptors lend `frame`, which
             // is borrowed exclusively for longer than this synchronous call.
             unsafe {
@@ -927,6 +940,7 @@ impl CompressedVideo<'_> {
     /// # Errors
     ///
     /// As for [`CompressedSender::send_scatter_video_async`].
+    #[doc(alias = "NDIlib_send_send_video_scatter_async")]
     pub fn send_scatter_video_async(
         &mut self,
         frame: ScatterVideoFrame,
@@ -942,6 +956,7 @@ impl CompressedAudio<'_> {
     }
 
     /// See [`CompressedSender::send_audio`].
+    #[doc(alias = "NDIlib_send_send_audio_v3")]
     pub fn send_audio(&mut self, frame: &mut CompressedAudioFrame) {
         self.sender.send_compressed_audio(frame);
     }
@@ -951,6 +966,7 @@ impl CompressedAudio<'_> {
     /// # Errors
     ///
     /// As for [`CompressedSender::send_scatter_audio`].
+    #[doc(alias = "NDIlib_send_send_audio_scatter")]
     pub fn send_scatter_audio(&mut self, frame: &mut ScatterAudioFrame) -> Result<()> {
         self.sender.send_scatter_audio(frame)
     }
@@ -961,6 +977,7 @@ impl<M: CompressedAudioSendMode> Sender<M> {
     /// video. The frame is borrowed exclusively because the SDK writes to its
     /// envelope. The compressed or queued mode proves runtime availability;
     /// the frame's type proves send admission.
+    #[doc(alias = "NDIlib_send_send_audio_v3")]
     pub fn send_compressed_audio(&self, frame: &mut CompressedAudioFrame) {
         let descriptor = frame.raw();
         // SAFETY: this live Advanced sender lends the exclusively borrowed
@@ -978,11 +995,12 @@ impl<M: CompressedAudioSendMode> Sender<M> {
     ///
     /// [`crate::Error::UnsupportedCapability`] when scatter sending is
     /// unavailable in the selected runtime or build headers.
-    pub fn send_scatter_audio(&self, _frame: &mut ScatterAudioFrame) -> Result<()> {
+    #[doc(alias = "NDIlib_send_send_audio_scatter")]
+    pub fn send_scatter_audio(&self, frame: &mut ScatterAudioFrame) -> Result<()> {
         let table = self.runtime().table::<ScatterSend>()?;
-        native!(ScatterSend, table => {
-            let descriptor = _frame.descriptor();
-            let scatter = _frame.storage.descriptor();
+        native!(ScatterSend, table, uses(frame) => {
+            let descriptor = frame.descriptor();
+            let scatter = frame.storage.descriptor();
             // SAFETY: both descriptors point only into this exclusively
             // borrowed frame, retained until the synchronous call returns.
             unsafe {
@@ -990,6 +1008,30 @@ impl<M: CompressedAudioSendMode> Sender<M> {
             };
             Ok(())
         })
+    }
+}
+
+impl std::fmt::Debug for CompressedSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompressedSender")
+            .field("sender", self.sender())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for CompressedVideo<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompressedVideo")
+            .field("sender", self.pair.sender())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for CompressedAudio<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompressedAudio")
+            .field("sender", self.sender)
+            .finish_non_exhaustive()
     }
 }
 

@@ -468,7 +468,7 @@ impl ReceiverBandwidth {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReceiverOptions {
     source: Source,
     color_format: ReceiverColorFormat,
@@ -1012,6 +1012,18 @@ pub struct Receiver<M: ReceiverMode = RawCapture> {
     _mode: PhantomData<M>,
 }
 
+impl<M: ReceiverMode> std::fmt::Debug for Receiver<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Receiver")
+            .field(
+                "name",
+                &self.core._name.as_ref().map(|name| name.to_string_lossy()),
+            )
+            .field("mode", &std::any::type_name::<M>())
+            .finish_non_exhaustive()
+    }
+}
+
 // Preserve the owned receiver's pre-Arc unwind contract. Its private core keeps
 // a valid native handle throughout every operation; Rust locks are released on
 // unwind, pending notifications are individually committed, and no public method
@@ -1156,6 +1168,7 @@ impl Receiver {
     /// [`Error::ConnectionLost`] when the SDK reports a lost connection, and
     /// the same frame-validation errors as typed borrowed capture. Rejected
     /// frames are freed through their matching native free operation.
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<ReceiverItemRef<'_>>> {
         self.capture_any_ref_until(Deadline::after(timeout)?, NeverStop)
     }
@@ -1173,6 +1186,7 @@ impl Receiver {
     /// # Errors
     ///
     /// The errors of [`Self::capture_any_ref`].
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any(&self, timeout: Duration) -> Result<Option<ReceiverItem>> {
         self.capture_any_until(Deadline::after(timeout)?)
     }
@@ -1186,6 +1200,7 @@ impl Receiver {
     /// runtime or this build cannot take; [`Error::InvalidCString`] for a name
     /// or source that contains a NUL byte; and [`Error::NativeOperationFailed`]
     /// when the SDK creates no receiver.
+    #[doc(alias = "NDIlib_recv_create_v3")]
     pub fn new(ndi: &Ndi, options: &ReceiverOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
         if let Some(config) = &options.config {
@@ -1415,6 +1430,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// [`Error::InvalidInput`] for a delay above two seconds, and
     /// [`Error::UnsupportedCapability`] without
     /// [`RuntimeFeature::ReceiveDelay`](crate::RuntimeFeature::ReceiveDelay).
+    #[doc(alias = "NDIlib_recv_set_video_delay")]
     pub fn set_video_delay(&self, delay: Duration) -> Result<SettingChange> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
@@ -1430,6 +1446,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// [`Error::UnsupportedCapability`] without
     /// [`RuntimeFeature::ReceiveDelay`](crate::RuntimeFeature::ReceiveDelay), and [`Error::UnexpectedSdkResult`]
     /// when the SDK reports a delay outside 0 to 2000 ms.
+    #[doc(alias = "NDIlib_recv_get_video_delay")]
     pub fn video_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
         // SAFETY: the receiver instance is live for this borrow.
@@ -1444,6 +1461,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Errors
     ///
     /// As for [`Self::set_video_delay`].
+    #[doc(alias = "NDIlib_recv_set_audio_delay")]
     pub fn set_audio_delay(&self, delay: Duration) -> Result<SettingChange> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
@@ -1457,6 +1475,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Errors
     ///
     /// As for [`Self::video_delay`].
+    #[doc(alias = "NDIlib_recv_get_audio_delay")]
     pub fn audio_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
         // SAFETY: the receiver instance is live for this borrow.
@@ -1467,6 +1486,7 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Accepts owned or captured metadata. The receiver keeps its own copy,
     /// so the input need not outlive the registration.
+    #[doc(alias = "NDIlib_recv_add_connection_metadata")]
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let table = self.core.connection_metadata()?;
         let mut registrations = self.core.connection_metadata.lock();
@@ -1478,6 +1498,7 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 
     /// Clear metadata registered for subsequent receiver connections.
+    #[doc(alias = "NDIlib_recv_clear_connection_metadata")]
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.core.connection_metadata()?;
         let mut registrations = self.core.connection_metadata.lock();
@@ -1489,6 +1510,7 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 
     /// Copy the optional device web-control URL. This does not open the URL.
+    #[doc(alias = "NDIlib_recv_get_web_control")]
     pub fn web_control_url(&self) -> Result<Option<String>> {
         // The query comes with the function that releases what it returns.
         let (web_control, strings) = self
@@ -1517,6 +1539,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// The SDK reports each change once, so a name that is not valid UTF-8 is
     /// not an error: invalid sequences are replaced with U+FFFD, as
     /// [`Finder`](crate::Finder) does for discovered source names.
+    #[doc(alias = "NDIlib_recv_get_source_name")]
     pub fn poll_source_name_change(&self, timeout: Duration) -> Result<Option<SourceNameChange>> {
         self.core
             .poll_source_name_change_until(Deadline::after(timeout)?, NeverStop)
@@ -1530,6 +1553,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Success means the request was issued, not that the source is available.
     /// Invalid input leaves the target unchanged. Existing FrameSync ownership
     /// remains.
+    #[doc(alias = "NDIlib_recv_connect")]
     pub fn connect_to(&self, source: &Source) -> Result<()> {
         self.connect_target(ConnectionTarget::new(source)?);
         Ok(())
@@ -1544,6 +1568,7 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Serializes with other local connection changes, as [`Self::reconnect`]
     /// does, while captures may continue.
+    #[doc(alias = "NDIlib_recv_connect")]
     pub fn disconnect(&self) {
         self.core.lock_connection().disconnect();
     }
@@ -1553,6 +1578,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// The SDK keeps the state and sends it to every source the receiver
     /// connects to, so it can be set before a connection and survives a
     /// reconnect.
+    #[doc(alias = "NDIlib_recv_set_tally")]
     pub fn set_tally(&self, tally: Tally) {
         // `Processing.NDI.Recv.h`: the flag is false when nothing is
         // connected, and the state is sent the moment something connects, so
@@ -1575,6 +1601,7 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// [`Error::NotConnected`] when the receiver is connected to no source,
     /// so nothing was sent.
+    #[doc(alias = "NDIlib_recv_send_metadata")]
     pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let raw = metadata.metadata_raw();
         // SAFETY: the receiver instance is live for this borrow, and the
@@ -1640,6 +1667,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// ```
     /// A negative native count reports no established connection; use
     /// [`Self::connection_stats`] to inspect that SDK contract error.
+    #[doc(alias = "NDIlib_recv_get_no_connections")]
     pub fn is_connected(&self) -> bool {
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -1685,6 +1713,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// `NDIlib_recv_connect` reports no status: returning means the request was
     /// issued, not that the feed recovered. Confirm recovery through
     /// [`Self::connection_stats`].
+    #[doc(alias = "NDIlib_recv_connect")]
     pub fn reconnect(&self) {
         self.core.lock_connection().reconnect();
     }
@@ -1748,6 +1777,9 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_recv_get_no_connections")]
+    #[doc(alias = "NDIlib_recv_get_performance")]
+    #[doc(alias = "NDIlib_recv_get_queue")]
     pub fn connection_stats(&self) -> Result<ConnectionStats> {
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -1821,6 +1853,7 @@ impl<M: EventMode> Receiver<M> {
     /// (~49.7 days), and [`Error::ConnectionLost`] when the SDK reports a lost
     /// connection, or [`Error::UnexpectedSdkResult`] when a status snapshot
     /// contains a negative native connection count. Its invalidation stays pending.
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
         self.poll_event_until(Deadline::after(timeout)?, NeverStop)
     }
@@ -2243,8 +2276,6 @@ pub(crate) mod native_capture_calls {
     }
 }
 
-/// Publish one event immediately after a test prepares a capture attempt, so
-/// its second pending-event check can be tested without a scheduling race.
 /// A typed view over a [`Receiver`] for capturing frames of one kind.
 ///
 /// Created by [`Receiver::video`], [`Receiver::audio`], and
@@ -2285,6 +2316,14 @@ pub struct Capture<'rx, K: CaptureKind> {
     _kind: PhantomData<K>,
 }
 
+impl<K: CaptureKind> std::fmt::Debug for Capture<'_, K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Capture")
+            .field("kind", &std::any::type_name::<K>())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'rx, K: CaptureKind> Capture<'rx, K> {
     fn new<M: Permits<K>>(rx: &'rx Receiver<M>) -> Self {
         Self {
@@ -2308,6 +2347,7 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
     /// (~49.7 days), [`Error::ConnectionLost`] when the SDK reports a lost
     /// connection, and the errors of validating and copying the frame.
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
         Ok(self.capture_ref(timeout)?.as_ref().map(K::ref_to_owned))
     }
@@ -2327,6 +2367,7 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
     /// (~49.7 days), [`Error::ConnectionLost`] when the SDK reports a lost
     /// connection, and the errors of validating the frame.
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_ref(&self, timeout: Duration) -> Result<Option<K::Ref<'rx>>> {
         // Bind through `'rx` so the returned borrow is tied to the receiver, not
         // to this short-lived view.
@@ -2346,9 +2387,21 @@ pub struct Ptz<'rx> {
     core: &'rx ReceiverCore,
 }
 
+impl std::fmt::Debug for Ptz<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ptz")
+            .field(
+                "receiver_name",
+                &self.core._name.as_ref().map(|name| name.to_string_lossy()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 impl Ptz<'_> {
     /// Whether the connected source accepts PTZ commands.
     #[must_use]
+    #[doc(alias = "NDIlib_recv_ptz_is_supported")]
     pub fn is_supported(&self) -> bool {
         // SAFETY: the receiver instance is live for the handle's borrow.
         unsafe {
@@ -2363,6 +2416,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_recall_preset")]
     pub fn recall_preset(&self, preset: u8, speed: f32) -> Result<()> {
         let preset = validate_ptz_preset(preset)?;
         validate_ptz_value("speed", speed, 0.0, 1.0)?;
@@ -2374,6 +2428,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_store_preset")]
     pub fn store_preset(&self, preset: u8) -> Result<()> {
         let preset = validate_ptz_preset(preset)?;
         ptz_command!(self, NDIlib_recv_ptz_store_preset, preset)
@@ -2385,6 +2440,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_zoom")]
     pub fn zoom(&self, zoom: f32) -> Result<()> {
         validate_ptz_value("zoom", zoom, 0.0, 1.0)?;
         ptz_command!(self, NDIlib_recv_ptz_zoom, zoom)
@@ -2396,6 +2452,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_zoom_speed")]
     pub fn zoom_speed(&self, speed: f32) -> Result<()> {
         validate_ptz_value("zoom speed", speed, -1.0, 1.0)?;
         ptz_command!(self, NDIlib_recv_ptz_zoom_speed, speed)
@@ -2407,6 +2464,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_pan_tilt")]
     pub fn pan_tilt(&self, pan: f32, tilt: f32) -> Result<()> {
         validate_ptz_value("pan", pan, -1.0, 1.0)?;
         validate_ptz_value("tilt", tilt, -1.0, 1.0)?;
@@ -2419,6 +2477,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_pan_tilt_speed")]
     pub fn pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> Result<()> {
         validate_ptz_value("pan speed", pan_speed, -1.0, 1.0)?;
         validate_ptz_value("tilt speed", tilt_speed, -1.0, 1.0)?;
@@ -2430,6 +2489,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_auto_focus")]
     pub fn auto_focus(&self) -> Result<()> {
         ptz_command!(self, NDIlib_recv_ptz_auto_focus)
     }
@@ -2440,6 +2500,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_focus")]
     pub fn focus(&self, focus: f32) -> Result<()> {
         validate_ptz_value("focus", focus, 0.0, 1.0)?;
         ptz_command!(self, NDIlib_recv_ptz_focus, focus)
@@ -2451,6 +2512,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_focus_speed")]
     pub fn focus_speed(&self, speed: f32) -> Result<()> {
         validate_ptz_value("focus speed", speed, -1.0, 1.0)?;
         ptz_command!(self, NDIlib_recv_ptz_focus_speed, speed)
@@ -2461,6 +2523,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_white_balance_auto")]
     pub fn white_balance_auto(&self) -> Result<()> {
         ptz_command!(self, NDIlib_recv_ptz_white_balance_auto)
     }
@@ -2470,6 +2533,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_white_balance_indoor")]
     pub fn white_balance_indoor(&self) -> Result<()> {
         ptz_command!(self, NDIlib_recv_ptz_white_balance_indoor)
     }
@@ -2479,6 +2543,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_white_balance_outdoor")]
     pub fn white_balance_outdoor(&self) -> Result<()> {
         ptz_command!(self, NDIlib_recv_ptz_white_balance_outdoor)
     }
@@ -2488,6 +2553,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_white_balance_oneshot")]
     pub fn white_balance_oneshot(&self) -> Result<()> {
         ptz_command!(self, NDIlib_recv_ptz_white_balance_oneshot)
     }
@@ -2497,6 +2563,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_white_balance_manual")]
     pub fn white_balance_manual(&self, red: f32, blue: f32) -> Result<()> {
         validate_ptz_value("red", red, 0.0, 1.0)?;
         validate_ptz_value("blue", blue, 0.0, 1.0)?;
@@ -2508,6 +2575,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_exposure_auto")]
     pub fn exposure_auto(&self) -> Result<()> {
         ptz_command!(self, NDIlib_recv_ptz_exposure_auto)
     }
@@ -2517,6 +2585,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_exposure_manual")]
     pub fn exposure_manual(&self, level: f32) -> Result<()> {
         validate_ptz_value("exposure level", level, 0.0, 1.0)?;
         ptz_command!(self, NDIlib_recv_ptz_exposure_manual, level)
@@ -2528,6 +2597,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_exposure_manual_v2")]
     pub fn exposure_manual_detailed(&self, iris: f32, gain: f32, shutter_speed: f32) -> Result<()> {
         validate_ptz_value("iris", iris, 0.0, 1.0)?;
         validate_ptz_value("gain", gain, 0.0, 1.0)?;

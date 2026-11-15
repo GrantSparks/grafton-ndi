@@ -229,6 +229,14 @@ pub struct PacketReceiver {
     pub(crate) receiver: Receiver<PacketAttached>,
 }
 
+impl std::fmt::Debug for PacketReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketReceiver")
+            .field("mode", &std::any::type_name::<PacketAttached>())
+            .finish_non_exhaustive()
+    }
+}
+
 impl PacketReceiver {
     /// Create a receiver that passes through the formats `preset` names,
     /// with the options' Advanced SDK
@@ -247,6 +255,7 @@ impl PacketReceiver {
     ///
     /// [`Error::UnsupportedCapability`]: crate::Error::UnsupportedCapability
     /// [`RuntimeFeature::Passthrough`]: crate::capabilities::RuntimeFeature::Passthrough
+    #[doc(alias = "NDIlib_recv_create_v4")]
     pub fn new(ndi: &Ndi, options: &ReceiverOptions, preset: PassthroughPreset) -> Result<Self> {
         let options = creation_options(options, ndi.passthrough_format(preset)?);
         let config = AdvancedConfig::or_empty(options.config.as_ref());
@@ -314,6 +323,7 @@ impl PacketReceiver {
     /// [`Error::InvalidInput`]: crate::Error::InvalidInput
     /// [`Error::ConnectionLost`]: crate::Error::ConnectionLost
     /// [`Error::InvalidFrame`]: crate::Error::InvalidFrame
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture(&self, timeout: Duration) -> Result<Option<PacketItem>> {
         Self::capture_from(&self.receiver, timeout)
     }
@@ -328,6 +338,7 @@ impl PacketReceiver {
     /// # Errors
     ///
     /// As for [`Self::capture`].
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_ref(&self, timeout: Duration) -> Result<Option<PacketItemRef<'_>>> {
         Self::capture_ref_from(&self.receiver, timeout)
     }

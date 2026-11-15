@@ -33,6 +33,15 @@ pub(crate) use super::advanced_bindings::NDIlib_genlock_instance_t as GenlockHan
 /// Compile a native expression only when its entire declaration family exists.
 /// Otherwise its table is uninhabited, proving the expression unreachable.
 macro_rules! native {
+    ($Family:ident, $table:expr, uses($($binding:ident),* $(,)?) => $body:expr) => {
+        $crate::sys::advanced::declared! { $Family {{
+            let _: &'static $crate::sys::advanced::$Family = $table;
+            $body
+        }} else {{
+            let _ = ($(&$binding,)*);
+            match *$table {}
+        }}}
+    };
     ($Family:ident, $table:expr => $body:expr) => {
         $crate::sys::advanced::declared! { $Family {{
             let _: &'static $crate::sys::advanced::$Family = $table;

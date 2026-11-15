@@ -10,6 +10,8 @@ With --rustdoc, GitHub Pages API URLs and current-version docs.rs URLs are
 checked against generated HTML.
 Documented dependency features and the README feature table are checked against
 Cargo.toml so removed or renamed features cannot remain in install instructions.
+Native table entry points need public SDK search aliases or an explicit internal
+classification. Generated declarations also reject underscore-prefixed parameters.
 """
 import argparse
 from collections import Counter
@@ -32,6 +34,338 @@ REPOSITORY = 'https://github.com/GrantSparks/grafton-ndi'
 API_SITE = 'https://grantsparks.github.io/grafton-ndi/'
 FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})([^\n]*)$')
 HEADING = re.compile(r'^ {0,3}#{1,6}\s+(.*?)\s*#*\s*$')
+RUST_RAW_STRING = re.compile(r'(?:br|cr|r)(#*)"')
+RUST_QUOTED_STRING = re.compile(r'(?:b|c)?"')
+RUST_CHARACTER = re.compile(r"(?:b)?'(?:[^'\\\n]|\\(?:.|u\{[0-9a-fA-F_]+\}))'")
+RUST_IDENTIFIER = re.compile(r'(?:r#)?[A-Za-z_][A-Za-z_0-9]*')
+
+# These entry points have no public operation: ownership releases resources
+# automatically, while selection caches the native version before exposing info.
+# Exact names keep a new entry point from inheriting an exception accidentally.
+INTERNAL_SDK_ENTRY_POINTS = {
+    'NDIlib_version': 'runtime selection caches the version in RuntimeInfo',
+    'NDIlib_destroy': 'the runtime initialization owner releases initialization on drop',
+    'NDIlib_find_destroy': 'Finder releases its instance on drop',
+    'NDIlib_recv_destroy': 'Receiver releases its instance on drop',
+    'NDIlib_send_destroy': 'Sender releases its instance on drop',
+    'NDIlib_framesync_destroy': 'FrameSync releases its instance on drop',
+    'NDIlib_avsync_destroy': 'AvSync releases its instance on drop',
+    'NDIlib_genlock_destroy': 'Genlock releases its instance on drop',
+    'NDIlib_routing_destroy': 'Router releases its instance on drop',
+    'NDIlib_send_advertiser_destroy': 'SendAdvertiser releases its instance on drop',
+    'NDIlib_recv_advertiser_destroy': 'RecvAdvertiser releases its instance on drop',
+    'NDIlib_send_listener_destroy': 'SendListener releases its instance on drop',
+    'NDIlib_recv_listener_destroy': 'RecvListener releases its instance on drop',
+    'NDIlib_file_player_destroy': 'FilePlayer releases its instance on its owner thread',
+    'NDIlib_file_recorder_destroy': 'FileRecorder releases its instance on its owner thread',
+    'NDIlib_recv_free_video_v2': 'the receiver video guard releases its frame on drop',
+    'NDIlib_recv_free_audio_v3': 'the receiver audio guard releases its frame on drop',
+    'NDIlib_recv_free_metadata': 'the receiver metadata guard releases its frame on drop',
+    'NDIlib_recv_free_string': 'the internal returned-string guard releases SDK text',
+    'NDIlib_send_free_metadata': 'the sender metadata guard releases its frame on drop',
+    'NDIlib_framesync_free_video': 'the FrameSync video guard releases its frame on drop',
+    'NDIlib_framesync_free_audio_v2': 'the FrameSync audio guard releases its frame on drop',
+    'NDIlib_avsync_free_audio': 'the AV sync audio guard releases its frame on drop',
+    'NDIlib_send_listener_free_events': 'the internal sender event-batch guard releases its array',
+    'NDIlib_recv_listener_free_events': 'the internal receiver event-batch guard releases its array',
+}
+
+
+def rust_tokens(text):
+    """Tokenize enough Rust to distinguish declarations/attributes from examples.
+
+    Comments may nest; ordinary, byte, C and raw strings are indivisible tokens,
+    so commented-out declarations or strings containing fake attributes cannot
+    satisfy native coverage. Offsets retain actionable source line numbers.
+    """
+    tokens, index = [], 0
+    while index < len(text):
+        if text[index].isspace():
+            index += 1
+            continue
+        if text.startswith('//', index):
+            end = text.find('\n', index)
+            index = len(text) if end < 0 else end + 1
+            continue
+        if text.startswith('/*', index):
+            depth, index = 1, index + 2
+            while index < len(text) and depth:
+                if text.startswith('/*', index):
+                    depth, index = depth + 1, index + 2
+                elif text.startswith('*/', index):
+                    depth, index = depth - 1, index + 2
+                else:
+                    index += 1
+            continue
+        raw = RUST_RAW_STRING.match(text, index)
+        if raw:
+            ending = '"' + raw.group(1)
+            end = text.find(ending, raw.end())
+            end = len(text) if end < 0 else end + len(ending)
+            tokens.append((text[index:end], index))
+            index = end
+            continue
+        quoted = RUST_QUOTED_STRING.match(text, index)
+        if quoted:
+            end = quoted.end()
+            while end < len(text):
+                if text[end] == '\\':
+                    end += 2
+                elif text[end] == '"':
+                    end += 1
+                    break
+                else:
+                    end += 1
+            tokens.append((text[index:end], index))
+            index = end
+            continue
+        character = RUST_CHARACTER.match(text, index)
+        if character:
+            tokens.append((character.group(), index))
+            index = character.end()
+            continue
+        identifier = RUST_IDENTIFIER.match(text, index)
+        if identifier:
+            tokens.append((identifier.group(), index))
+            index = identifier.end()
+            continue
+        tokens.append((text[index], index))
+        index += 1
+    return tokens
+
+
+def native_sdk_entries(root):
+    """Discover registered calls from native macro invocations, including new files."""
+    found = {}
+    registries = {'native_table', 'optional_tables', 'advanced_tables', 'file_families'}
+    for path in sorted((root / 'src/sys').rglob('*.rs')):
+        text = path.read_text(encoding='utf-8')
+        if not re.search(r'\b(?:native_table|optional_tables|advanced_tables|file_families)\s*!', text):
+            continue
+        tokens = rust_tokens(text)
+        for index in range(len(tokens) - 2):
+            if tokens[index][0] not in registries or tokens[index + 1][0] != '!':
+                continue
+            if tokens[index + 2][0] not in {'{', '(', '['}:
+                continue
+            opening = tokens[index + 2][0]
+            closing = {'{': '}', '(': ')', '[': ']'}[opening]
+            depth, cursor = 1, index + 3
+            while cursor < len(tokens) and depth:
+                word = tokens[cursor][0]
+                depth += (word == opening) - (word == closing)
+                if (depth and word == 'fn' and cursor + 2 < len(tokens)
+                        and re.fullmatch(r'NDIlib_\w+', tokens[cursor + 1][0])
+                        and tokens[cursor + 2][0] == '('):
+                    name, offset = tokens[cursor + 1]
+                    found.setdefault(name, (path, text.count('\n', 0, offset) + 1))
+                cursor += 1
+    return found
+
+
+def token_group_end(words, start):
+    """Return the token after a balanced Rust group."""
+    pairs, stack = {'(': ')', '[': ']', '{': '}'}, []
+    for index in range(start, len(words)):
+        word = words[index]
+        if word in pairs:
+            stack.append(pairs[word])
+        elif stack and word == stack[-1]:
+            stack.pop()
+            if not stack:
+                return index + 1
+    return len(words)
+
+
+def token_arguments(words):
+    """Split a macro's arguments without splitting its nested groups."""
+    result, start, index = [], 0, 0
+    while index < len(words):
+        if words[index] in {'(', '[', '{'}:
+            index = token_group_end(words, index)
+        elif words[index] == ',':
+            result.append(words[start:index])
+            start = index = index + 1
+        else:
+            index += 1
+    if start < len(words):
+        result.append(words[start:])
+    return result
+
+
+def token_attributes(words, start):
+    attributes = []
+    while words[start:start + 2] == ['#', '[']:
+        end = token_group_end(words, start + 1)
+        attributes.append(words[start + 2:end - 1])
+        start = end
+    return attributes, start
+
+
+def attribute_aliases(attributes):
+    return {attribute[4][1:-1] for attribute in attributes
+            if (len(attribute) == 6 and attribute[:4] == ['doc', '(', 'alias', '=']
+                and attribute[-1] == ')' and re.fullmatch(r'"NDIlib_\w+"', attribute[4]))}
+
+
+def public_function_at(words, start):
+    if words[start:start + 1] != ['pub']:
+        return False
+    start += 1
+    # A restricted visibility is not part of the published API.
+    if words[start:start + 1] == ['(']:
+        return False
+    while start < len(words) and words[start] in {'async', 'unsafe', 'const', 'extern'}:
+        modifier = words[start]
+        start += 1
+        if modifier == 'extern' and start < len(words) and words[start].startswith('"'):
+            start += 1
+    return words[start:start + 1] == ['fn']
+
+
+def production_words(words):
+    """Exclude inline #[cfg(test)] items as well as separate test source files."""
+    result, index = [], 0
+    while index < len(words):
+        attributes, after = token_attributes(words, index)
+        if ['cfg', '(', 'test', ')'] in attributes:
+            index = after
+            while index < len(words) and words[index] not in {'{', ';'}:
+                index += 1
+            if index < len(words):
+                index = token_group_end(words, index) if words[index] == '{' else index + 1
+        else:
+            result.extend(words[index:after] if after > index else words[index:index + 1])
+            index = after if after > index else index + 1
+    return result
+
+
+def macro_public_attribute_slots(words):
+    """Prove which metadata arguments a local macro forwards to public methods.
+
+    The common wrapper form is `$(#[$attr:meta])* $method:ident` in the
+    matcher and `$(#[$attr])* pub fn $method` in the expansion. Matching both
+    metavariables prevents an ignored or privately forwarded alias from
+    satisfying coverage. Ordinary literal attributes on generated public
+    declarations are handled by public_function_at directly.
+    """
+    result = {}
+    for index in range(len(words) - 4):
+        if words[index:index + 2] != ['macro_rules', '!'] or words[index + 3] != '{':
+            continue
+        matcher = index + 4
+        if words[matcher] not in {'(', '[', '{'}:
+            continue
+        after = token_group_end(words, matcher)
+        if words[after:after + 3] != ['=', '>', '{']:
+            continue
+        expansion_end = token_group_end(words, after + 2)
+        expansion = words[after + 3:expansion_end - 1]
+        slots = set()
+        for slot, argument in enumerate(token_arguments(words[matcher + 1:after - 1])):
+            if (len(argument) == 15 and argument[:5] == ['$', '(', '#', '[', '$']
+                    and argument[6:12] == [':', 'meta', ']', ')', '*', '$']
+                    and argument[13:] == [':', 'ident']):
+                attr, method = argument[5], argument[12]
+                forwarded = ['$', '(', '#', '[', '$', attr, ']', ')', '*', 'pub', 'fn', '$', method]
+                if any(expansion[cursor:cursor + len(forwarded)] == forwarded
+                       for cursor in range(len(expansion) - len(forwarded) + 1)):
+                    slots.add(slot)
+        if slots:
+            result[words[index + 2]] = slots
+    return result
+
+
+def public_sdk_aliases(words):
+    aliases = set()
+    words = production_words(words)
+    macros = macro_public_attribute_slots(words)
+    for index in range(len(words)):
+        attributes, after = token_attributes(words, index)
+        if attributes and public_function_at(words, after):
+            aliases.update(attribute_aliases(attributes))
+        if words[index] not in macros or words[index + 1:index + 2] != ['!']:
+            continue
+        opening = index + 2
+        if words[opening:opening + 1] not in [['('], ['{'], ['[']]:
+            continue
+        end = token_group_end(words, opening)
+        for slot, argument in enumerate(token_arguments(words[opening + 1:end - 1])):
+            if slot not in macros[words[index]]:
+                continue
+            attrs, tail = token_attributes(argument, 0)
+            if len(argument[tail:]) == 1 and RUST_IDENTIFIER.fullmatch(argument[tail]):
+                aliases.update(attribute_aliases(attrs))
+    return aliases
+
+
+def sdk_alias_violations(root):
+    """Every registered SDK call is publicly searchable or explicitly internal."""
+    entries, aliases = native_sdk_entries(root), set()
+    for path in sorted((root / 'src').rglob('*.rs')):
+        if (path.is_relative_to(root / 'src/sys') or path.stem.endswith('_tests')
+                or 'test_support' in path.parts or path.stem in {'tests', 'test_support'}):
+            continue
+        text = path.read_text(encoding='utf-8')
+        if re.search(r'\bdoc\s*\(\s*alias', text):
+            aliases.update(public_sdk_aliases([word for word, _ in rust_tokens(text)]))
+    found = []
+    for name, (path, line) in sorted(entries.items()):
+        if name not in aliases and name not in INTERNAL_SDK_ENTRY_POINTS:
+            found.append(f'{path.relative_to(root)}:{line}: SDK entry point {name} '
+                         'needs a public doc(alias) or an explicit internal reason')
+    return found
+
+
+class HtmlDeclarations(HTMLParser):
+    """Read declarations, excluding prose, examples and dependency source HTML."""
+
+    def __init__(self):
+        super().__init__()
+        self.depth = 0
+        self.parts = []
+        self.found = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}:
+            return
+        classes = dict(attrs).get('class', '').split()
+        if self.depth:
+            self.depth += 1
+        elif (tag == 'pre' and 'item-decl' in classes) or (tag == 'h4' and 'code-header' in classes):
+            self.depth, self.parts = 1, []
+
+    def handle_endtag(self, tag):
+        if tag in {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}:
+            return
+        if self.depth:
+            self.depth -= 1
+            if not self.depth:
+                self.found.append(''.join(self.parts))
+
+    def handle_data(self, data):
+        if self.depth:
+            self.parts.append(data)
+
+
+def parameter_name_violations(root, directory):
+    """Check the actual published signatures, including macro-generated methods."""
+    found = []
+    for path in sorted((directory / 'grafton_ndi').rglob('*.html')):
+        parser = HtmlDeclarations()
+        parser.feed(path.read_text(encoding='utf-8'))
+        for declaration in parser.found:
+            # Derived and external trait implementations also have code-header
+            # blocks. Their compiler-chosen names are not authored public API.
+            # Inherent methods say `pub`; a public trait item-decl includes its
+            # required/default method signatures although they omit `pub`.
+            if not (re.search(r'\bpub\s+(?:(?:async|unsafe|const)\s+)*fn\s+', declaration)
+                    or re.search(r'\bpub\s+(?:unsafe\s+)?trait\s+', declaration)):
+                continue
+            for name in sorted(set(re.findall(r'(?<![\w\'])\b(_\w*)\s*:', declaration))):
+                found.append(f'{path.relative_to(directory)}: public parameter {name} '
+                             'starts with an underscore')
+    return found
 
 
 @dataclass(frozen=True)
@@ -443,8 +777,10 @@ def main():
     args = parser.parse_args()
     found, snippets = check(ROOT)
     found.extend(readme_link_violations(ROOT))
+    found.extend(sdk_alias_violations(ROOT))
     if args.rustdoc:
         found.extend(rustdoc_violations(ROOT, args.rustdoc))
+        found.extend(parameter_name_violations(ROOT, args.rustdoc))
     if not found and args.compile:
         found.extend(compile_snippets(ROOT, snippets))
     for message in found:

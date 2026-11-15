@@ -119,7 +119,7 @@ listener_api!(
 ///
 /// Without an explicit server the SDK uses the Discovery Server from the NDI
 /// configuration. If that names none either, the listener cannot be created.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ListenerOptions {
     server: Option<String>,
     #[cfg(feature = "advanced")]
@@ -691,12 +691,16 @@ const _: () = {
 
 impl fmt::Debug for SendListener {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SendListener").finish_non_exhaustive()
+        f.debug_struct("SendListener")
+            .field("server", &self.inner.0._url)
+            .finish_non_exhaustive()
     }
 }
 impl fmt::Debug for RecvListener {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RecvListener").finish_non_exhaustive()
+        f.debug_struct("RecvListener")
+            .field("server", &self.inner.0._url)
+            .finish_non_exhaustive()
     }
 }
 
@@ -705,6 +709,8 @@ macro_rules! listener_methods {
         /// Whether the listener is connected to its Discovery Server right
         /// now. A listener that is not connected keeps trying. This reports
         /// registry connectivity, not progress of any receiver media.
+        #[doc(alias = "NDIlib_send_listener_is_connected")]
+        #[doc(alias = "NDIlib_recv_listener_is_connected")]
         pub fn is_connected(&self) -> bool {
             self.inner.is_connected()
         }
@@ -720,6 +726,8 @@ macro_rules! listener_methods {
         /// caller of this getter would have to handle. Bytes that are not
         /// UTF-8 are replaced with U+FFFD, as in the other text a listener
         /// reports.
+        #[doc(alias = "NDIlib_send_listener_get_server_url")]
+        #[doc(alias = "NDIlib_recv_listener_get_server_url")]
         pub fn server_url(&self) -> Option<String> {
             self.inner.server_url()
         }
@@ -729,11 +737,15 @@ macro_rules! listener_methods {
         ///
         /// Returns [`Error::InvalidInput`] when `timeout` exceeds
         /// [`crate::MAX_TIMEOUT`].
+        #[doc(alias = "NDIlib_send_listener_wait_for_senders")]
+        #[doc(alias = "NDIlib_recv_listener_wait_for_receivers")]
         pub fn wait_for_changes(&mut self, timeout: Duration) -> Result<bool> {
             self.inner.wait_for_changes(timeout)
         }
         /// Ask to receive the events of the peer `id` names. The next snapshot
         /// reports whether the subscription is active.
+        #[doc(alias = "NDIlib_send_listener_subscribe_events")]
+        #[doc(alias = "NDIlib_recv_listener_subscribe_events")]
         pub fn subscribe(&mut self, id: &$Id) {
             self.inner.subscription(id, true)
         }
@@ -745,6 +757,8 @@ macro_rules! listener_methods {
         /// defect the crate cannot prevent. Dropping the listener ends its
         /// subscriptions without that risk. See the
         /// [module documentation](super#sdk-defects-that-remain-in-64).
+        #[doc(alias = "NDIlib_send_listener_unsubscribe_events")]
+        #[doc(alias = "NDIlib_recv_listener_unsubscribe_events")]
         pub fn unsubscribe(&mut self, id: &$Id) {
             self.inner.subscription(id, false)
         }
@@ -763,6 +777,8 @@ macro_rules! listener_methods {
         /// [`Error::UnexpectedSdkResult`] when the top-level batch array is
         /// malformed or storage cannot be reserved. The SDK has already
         /// handed a rejected batch over, so it is freed and its events are lost.
+        #[doc(alias = "NDIlib_send_listener_get_events")]
+        #[doc(alias = "NDIlib_recv_listener_get_events")]
         pub fn capture_events(&mut self, timeout: Duration) -> Result<Vec<ListenerEvent<$Id>>> {
             self.inner.capture_events(timeout)
         }
@@ -786,6 +802,8 @@ impl SendListener {
     /// NDI configuration supplies none.
     ///
     /// [sender discovery]: crate::capabilities::RuntimeFeature::SenderDiscovery
+    #[doc(alias = "NDIlib_send_listener_create")]
+    #[doc(alias = "NDIlib_send_listener_create_ex")]
     pub fn new(ndi: &Ndi, options: &ListenerOptions) -> Result<Self> {
         Ok(Self {
             inner: Listener::new(ndi, options)?,
@@ -804,6 +822,7 @@ impl SendListener {
     /// Returns [`Error::ResourceLimit`] when copying would exceed the 16 MiB
     /// budget, and [`Error::UnexpectedSdkResult`] when the top-level snapshot
     /// array is malformed or storage cannot be reserved.
+    #[doc(alias = "NDIlib_send_listener_get_senders")]
     pub fn snapshot(&mut self) -> Result<Vec<AdvertisedSender>> {
         let mut budget = copy_budget();
         let raw = self.inner.entries(&mut budget)?;
@@ -844,6 +863,8 @@ impl RecvListener {
     /// NDI configuration supplies none.
     ///
     /// [receiver discovery]: crate::capabilities::RuntimeFeature::ReceiverDiscovery
+    #[doc(alias = "NDIlib_recv_listener_create")]
+    #[doc(alias = "NDIlib_recv_listener_create_ex")]
     pub fn new(ndi: &Ndi, options: &ListenerOptions) -> Result<Self> {
         Ok(Self {
             inner: Listener::new(ndi, options)?,
@@ -862,6 +883,7 @@ impl RecvListener {
     /// Returns [`Error::ResourceLimit`] when copying would exceed the 16 MiB
     /// budget, and [`Error::UnexpectedSdkResult`] when the top-level snapshot
     /// array is malformed or storage cannot be reserved.
+    #[doc(alias = "NDIlib_recv_listener_get_receivers")]
     pub fn snapshot(&mut self) -> Result<Vec<AdvertisedReceiver>> {
         let mut budget = copy_budget();
         let raw = self.inner.entries(&mut budget)?;
@@ -916,6 +938,7 @@ impl RecvListener {
     /// array; and [`Error::ResourceLimit`] when that array and the target's
     /// commands exceed the 16 MiB inspection budget. Unrelated fields are
     /// neither scanned nor copied and cannot spend that budget.
+    #[doc(alias = "NDIlib_recv_listener_send_connect")]
     pub fn request_connect(&mut self, id: &ReceiverId, source: &str) -> Result<()> {
         self.request(id, Some(source))
     }
@@ -929,6 +952,7 @@ impl RecvListener {
     /// # Errors
     ///
     /// As for [`Self::request_connect`], without the NUL check.
+    #[doc(alias = "NDIlib_recv_listener_send_connect")]
     pub fn request_disconnect(&mut self, id: &ReceiverId) -> Result<()> {
         self.request(id, None)
     }

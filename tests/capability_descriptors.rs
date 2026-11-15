@@ -255,9 +255,7 @@ fn receiving(ndi: &Ndi, modern: bool) {
     let malformed = ReceiverOptions::new(Source::new("fixture\0name"))
         .color_format(ReceiverColorFormat::Best444);
     let before = calls("receiver-create");
-    let error = Receiver::new(ndi, &malformed)
-        .err()
-        .expect("invalid source name");
+    let error = Receiver::new(ndi, &malformed).expect_err("invalid source name");
     if modern {
         assert!(matches!(error, Error::InvalidCString(_)));
     } else {

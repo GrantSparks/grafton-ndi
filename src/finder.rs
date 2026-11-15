@@ -45,7 +45,7 @@ use crate::{
 /// // Also query hosts that discovery does not reach
 /// let options = FinderOptions::new().extra_ips("192.168.1.100,10.0.0.100");
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FinderOptions {
     show_local_sources: bool,
     groups: Option<String>,
@@ -206,6 +206,15 @@ pub struct Finder {
     _ndi: Ndi,
 }
 
+impl fmt::Debug for Finder {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Finder")
+            .field("groups", &self._groups)
+            .field("extra_ips", &self._extra_ips)
+            .finish_non_exhaustive()
+    }
+}
+
 // The mutex guards a native snapshot's lifetime, not mutable Rust state. A
 // panic releases it without poisoning, and a later snapshot replaces all SDK
 // buffers before reading them. No partially updated Rust invariant survives.
@@ -320,6 +329,14 @@ pub struct SourceWatch<'finder> {
     observed: Cell<u64>,
 }
 
+impl fmt::Debug for SourceWatch<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceWatch")
+            .field("finder", &self.finder)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SourceWatch<'_> {
     /// Copy the currently known sources and record the generation before
     /// copying, preserving any report that arrives during the snapshot.
@@ -338,6 +355,7 @@ impl SourceWatch<'_> {
     /// # Errors
     ///
     /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub fn wait_for_change(&mut self, timeout: Duration) -> Result<bool> {
         Ok(self.wait_until(Deadline::after(timeout)?, NeverStop))
     }
@@ -457,6 +475,8 @@ impl Finder {
     /// carry an Advanced configuration that the runtime or this build cannot
     /// take, and [`Error::NativeOperationFailed`] when the SDK creates no
     /// finder.
+    #[doc(alias = "NDIlib_find_create_v2")]
+    #[doc(alias = "NDIlib_find_create_v3")]
     pub fn new(ndi: &Ndi, options: &FinderOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
         if let Some(config) = &options.config {
@@ -664,6 +684,7 @@ impl Finder {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_find_get_current_sources")]
     pub fn current_sources(&self) -> Result<Vec<Source>> {
         self.snapshot(&self._ndi.api().core)
     }
@@ -1482,6 +1503,14 @@ impl Display for Source {
 pub struct SourceCache {
     finder: Finder,
     entries: CachedSources,
+}
+
+impl fmt::Debug for SourceCache {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceCache")
+            .field("finder", &self.finder)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Default)]

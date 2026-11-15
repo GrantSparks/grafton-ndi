@@ -44,6 +44,7 @@
 //! See the [user guides](https://github.com/GrantSparks/grafton-ndi/blob/main/README.md#guides-and-examples)
 //! for setup, platform support, examples, limitations and migration instructions.
 
+#![deny(missing_debug_implementations)]
 #![warn(clippy::return_self_not_must_use)]
 // Android has no native thread-locals, so std expands `thread_local!` through
 // its OS-key implementation, which wraps even a `const { .. }` initializer in

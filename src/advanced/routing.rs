@@ -17,14 +17,15 @@ impl Router {
     ///
     /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
     /// without an Advanced runtime (or in a build without the Advanced SDK).
+    #[doc(alias = "NDIlib_routing_add_connection_metadata")]
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(
         &mut self,
-        _metadata: &S,
+        metadata: &S,
     ) -> Result<()> {
         let table = self.runtime().table::<RouterConnectionMetadata>()?;
-        native!(RouterConnectionMetadata, table => {
+        native!(RouterConnectionMetadata, table, uses(metadata) => {
             let router = self.native_instance();
-            let metadata = self.connection_metadata.add(_metadata);
+            let metadata = self.connection_metadata.add(metadata);
             // SAFETY: the router owns this stable descriptor and its text
             // until native clear returns or after native destruction.
             unsafe { table.NDIlib_routing_add_connection_metadata(router, metadata) };
@@ -38,6 +39,7 @@ impl Router {
     /// # Errors
     ///
     /// As for [`add_connection_metadata`](Self::add_connection_metadata).
+    #[doc(alias = "NDIlib_routing_clear_connection_metadata")]
     pub fn clear_connection_metadata(&mut self) -> Result<()> {
         let table = self.runtime().table::<RouterConnectionMetadata>()?;
         native!(RouterConnectionMetadata, table => {

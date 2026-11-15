@@ -17,40 +17,49 @@ use crate::{
 ///
 /// Its `Display` text describes the state for diagnostics; match on the
 /// variant rather than the text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
 pub enum StateError {
     /// A session is recording or stopping, so another cannot start. Finish
     /// it, or keep taking events until it has ended.
+    #[error("finish the previous session before starting another")]
     PreviousSessionOpen,
     /// Events from an earlier session kept arriving, so a new session was not
     /// started.
+    #[error("the recorder keeps producing events from an earlier session")]
     EarlierSessionEvents,
     /// Waiting for a session to end needs a session that has been asked to
     /// stop, or that the SDK is ending.
+    #[error("request a stop before waiting for the session to end")]
     StopNotRequested,
     /// The session is stopping.
+    #[error("the session is stopping")]
     Stopping,
     /// The operation needs a session that is recording.
+    #[error("the operation needs a session that is recording")]
     NotRecording,
     /// The recorder names its files exactly, so it cannot switch to a new file
     /// during a session: the next file would have the same name. Use a
     /// filename pattern with `{index}`.
+    #[error("a recorder with an exact file name cannot switch to a new file during a session")]
     ExactFileName,
     /// Another event future is already waiting on the async handle, which
     /// delivers each event to one waiter. A close never reports this: closes
     /// made while one is awaited complete with it.
+    #[error("another File event waiter is already pending")]
     WaiterPending,
     /// The async handle's object has been closed, or its thread stopped
     /// normally before it carried out the operation. A thread that failed
     /// reports [`OwnerFailed`](Self::OwnerFailed) instead.
     /// Also returned by an in-flight async finish or wait when a concurrent
     /// close's remaining finalization budget ends without a settled outcome.
+    #[error("File owner has closed")]
     Closed,
     /// The async handle's thread failed, for example by panicking. The
     /// operation it was running, every command queued behind it, every later
     /// command, every event wait and the close report this, not
     /// [`Closed`](Self::Closed).
+    #[error("File owner thread failed")]
     OwnerFailed,
 }
 
@@ -64,26 +73,6 @@ impl StateError {
     /// session, or never, for a handle that is closed.
     pub fn is_retryable(self) -> bool {
         matches!(self, Self::WaiterPending)
-    }
-}
-
-impl std::fmt::Display for StateError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::PreviousSessionOpen => "finish the previous session before starting another",
-            Self::EarlierSessionEvents => {
-                "the recorder keeps producing events from an earlier session"
-            }
-            Self::StopNotRequested => "request a stop before waiting for the session to end",
-            Self::Stopping => "the session is stopping",
-            Self::NotRecording => "the operation needs a session that is recording",
-            Self::ExactFileName => {
-                "a recorder with an exact file name cannot switch to a new file during a session"
-            }
-            Self::WaiterPending => "another File event waiter is already pending",
-            Self::Closed => "File owner has closed",
-            Self::OwnerFailed => "File owner thread failed",
-        })
     }
 }
 
@@ -206,7 +195,7 @@ impl TryFrom<&crate::Source> for SourceSpec {
 /// [`FileApi::create_player`](super::FileApi::create_player) or
 /// [`AsyncFilePlayer::create`](super::AsyncFilePlayer::create): the name must
 /// not be empty, and neither the name nor the groups may contain a NUL.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PlayerOptions {
     pub(super) name: String,
     groups: Option<String>,
@@ -364,7 +353,7 @@ pub enum FileNaming {
 /// [`AsyncFileRecorder::create`](super::AsyncFileRecorder::create). The
 /// options are then checked against each other, so the order of the setter
 /// calls does not matter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RecorderOptions {
     pub(super) source: SourceSpec,
     pub(super) tracks: MediaTypes,

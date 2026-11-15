@@ -457,33 +457,24 @@ runtime_features! {
 }
 
 /// Why a capability cannot safely be used in this process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
 pub enum CapabilityUnavailable {
     /// The SDK version text is unrecognized, so new enum semantics cannot be assumed.
+    #[error("the selected runtime's version is not recognized")]
     RuntimeVersionUnknown,
     /// The selected runtime predates this capability.
+    #[error("the selected runtime is too old")]
     RuntimeTooOld,
     /// At least one required native function is absent.
+    #[error("the selected library does not export a required function")]
     SymbolUnavailable,
     /// This build lacks the locally generated ABI required by the optional feature.
+    #[error("this build was made without the Advanced SDK declarations")]
     BuildAbiUnavailable,
     /// The selected native SDK edition does not implement this API family.
+    #[error("the selected runtime is not an Advanced SDK runtime")]
     WrongEdition,
-}
-
-impl fmt::Display for CapabilityUnavailable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::RuntimeVersionUnknown => "the selected runtime's version is not recognized",
-            Self::RuntimeTooOld => "the selected runtime is too old",
-            Self::SymbolUnavailable => "the selected library does not export a required function",
-            Self::BuildAbiUnavailable => {
-                "this build was made without the Advanced SDK declarations"
-            }
-            Self::WrongEdition => "the selected runtime is not an Advanced SDK runtime",
-        })
-    }
 }
 
 /// The evidence that prevents a capability from being used.
@@ -492,7 +483,8 @@ impl fmt::Display for CapabilityUnavailable {
 /// carry that same value, including when another capability requires it.
 /// Required versions borrow immutable registry values so this evidence stays
 /// small and allocation-free on both 32-bit and 64-bit targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[error("{}", CapabilityRefusalDiagnostic(self))]
 #[non_exhaustive]
 pub enum CapabilityRefusal {
     /// The selected library does not export this required entry point.
@@ -526,19 +518,24 @@ impl CapabilityRefusal {
     }
 }
 
-impl fmt::Display for CapabilityRefusal {
+struct CapabilityRefusalDiagnostic<'a>(&'a CapabilityRefusal);
+
+impl fmt::Display for CapabilityRefusalDiagnostic<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.reason())?;
-        match self {
-            Self::SymbolUnavailable(symbol) => write!(f, ": {}", symbol.to_string_lossy()),
-            Self::BuildAbiUnavailable(symbol) => {
+        write!(f, "{}", self.0.reason())?;
+        match self.0 {
+            CapabilityRefusal::SymbolUnavailable(symbol) => {
+                write!(f, ": {}", symbol.to_string_lossy())
+            }
+            CapabilityRefusal::BuildAbiUnavailable(symbol) => {
                 write!(f, ": it does not declare {}", symbol.to_string_lossy())
             }
-            Self::WrongEdition(Some(symbol)) => {
+            CapabilityRefusal::WrongEdition(Some(symbol)) => {
                 write!(f, ": it does not export {}", symbol.to_string_lossy())
             }
-            Self::WrongEdition(None) => Ok(()),
-            Self::RuntimeTooOld { required } | Self::RuntimeVersionUnknown { required } => {
+            CapabilityRefusal::WrongEdition(None) => Ok(()),
+            CapabilityRefusal::RuntimeTooOld { required }
+            | CapabilityRefusal::RuntimeVersionUnknown { required } => {
                 write!(f, ": it needs NDI {required} or later")
             }
         }

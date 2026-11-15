@@ -20,7 +20,7 @@ use std::{
 ///
 /// Without explicit servers the SDK uses the Discovery Server from the NDI
 /// configuration. If that names none either, the advertiser cannot be created.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AdvertiserOptions {
     servers: Option<String>,
     #[cfg(feature = "advanced")]
@@ -82,7 +82,7 @@ impl AdvertiserOptions {
     }
 }
 /// How a sender is advertised. Monitoring is disabled unless explicitly enabled.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct SendAdvertisement {
     monitoring: bool,
 }
@@ -106,7 +106,7 @@ impl SendAdvertisement {
 }
 /// How a receiver is advertised. Monitoring and remote source control are
 /// disabled unless explicitly enabled.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RecvAdvertisement {
     monitoring: bool,
     controlling: bool,
@@ -476,6 +476,7 @@ pub struct RecvRegistration(u64);
 impl fmt::Debug for SendAdvertiser {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SendAdvertiser")
+            .field("server", &self.inner.server._url)
             .field("registrations", &self.inner.members.len())
             .finish_non_exhaustive()
     }
@@ -483,6 +484,7 @@ impl fmt::Debug for SendAdvertiser {
 impl fmt::Debug for RecvAdvertiser {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecvAdvertiser")
+            .field("server", &self.inner.server._url)
             .field("registrations", &self.inner.members.len())
             .finish_non_exhaustive()
     }
@@ -506,6 +508,8 @@ impl SendAdvertiser {
     /// when `options` name no server and the NDI configuration supplies none.
     ///
     /// [sender advertising]: crate::capabilities::RuntimeFeature::SenderAdvertising
+    #[doc(alias = "NDIlib_send_advertiser_create")]
+    #[doc(alias = "NDIlib_send_advertiser_create_ex")]
     pub fn new(ndi: &Ndi, options: &AdvertiserOptions) -> Result<Self> {
         Ok(Self {
             inner: Advertiser::new(ndi, options)?,
@@ -535,6 +539,7 @@ impl SendAdvertiser {
     /// Returns [`Error::InvalidInput`] when this advertiser already
     /// advertises the sender, and [`Error::NativeOperationFailed`] when the SDK
     /// refuses the registration.
+    #[doc(alias = "NDIlib_send_advertiser_add_sender")]
     pub fn register(
         &mut self,
         sender: &Sender,
@@ -556,6 +561,7 @@ impl SendAdvertiser {
     /// nothing because it does not know the sender; the registration then
     /// stays in effect, and keeps the sender alive, until it is removed or
     /// the advertiser is dropped.
+    #[doc(alias = "NDIlib_send_advertiser_del_sender")]
     pub fn unregister(
         &mut self,
         registration: SendRegistration,
@@ -581,6 +587,8 @@ impl RecvAdvertiser {
     /// when `options` name no server and the NDI configuration supplies none.
     ///
     /// [receiver advertising]: crate::capabilities::RuntimeFeature::ReceiverAdvertising
+    #[doc(alias = "NDIlib_recv_advertiser_create")]
+    #[doc(alias = "NDIlib_recv_advertiser_create_ex")]
     pub fn new(ndi: &Ndi, options: &AdvertiserOptions) -> Result<Self> {
         Ok(Self {
             inner: Advertiser::new(ndi, options)?,
@@ -606,6 +614,7 @@ impl RecvAdvertiser {
     /// NUL byte, [`Error::InvalidInput`] when this advertiser already
     /// advertises the receiver, and [`Error::NativeOperationFailed`] when the
     /// SDK refuses the registration.
+    #[doc(alias = "NDIlib_recv_advertiser_add_receiver")]
     pub fn register<M: ReceiverMode>(
         &mut self,
         receiver: &Receiver<M>,
@@ -638,6 +647,7 @@ impl RecvAdvertiser {
     /// nothing because it does not know the receiver; the registration then
     /// stays in effect, and keeps the receiver alive, until it is removed or
     /// the advertiser is dropped.
+    #[doc(alias = "NDIlib_recv_advertiser_del_receiver")]
     pub fn unregister(
         &mut self,
         registration: RecvRegistration,

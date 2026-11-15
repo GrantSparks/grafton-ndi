@@ -213,13 +213,14 @@ pub struct AudioConverter {
 }
 
 macro_rules! conversions {
-    ($input:ident, $sample:ty, $raw:ident, $to:ident, $from:ident, $to_method:ident, $from_method:ident, $into_method:ident $(, $reference:ident)?) => {
+    ($input:ident, $sample:ty, $raw:ident, $to:ident, $from:ident, $(#[$to_attr:meta])* $to_method:ident, $(#[$from_attr:meta])* $from_method:ident, $(#[$into_attr:meta])* $into_method:ident $(, $reference:ident)?) => {
         /// Convert FLTP samples into the active prefix of reusable interleaved storage.
         /// Returns the number of elements written; excess destination elements are
         /// untouched. Integer output can clip depending on the explicit reference
         /// level. On native failure the active prefix may be partially modified.
         /// Accepts every [`AudioSource`], preserving the original channel stride
         /// without allocating or first copying captured samples into owned FLTP.
+        $(#[$to_attr])*
         pub fn $to_method(&self, source: &(impl AudioSource + ?Sized), destination: &mut [$sample] $(, $reference: AudioReferenceLevel)?) -> Result<usize> {
             let shape = AudioShape::from_planar(source);
             shape.check_output(destination.len())?;
@@ -239,6 +240,7 @@ macro_rules! conversions {
         /// Allocate a tightly packed FLTP frame with the source timecode.
         /// Interleaved headers have no metadata or timestamp; those output fields
         /// use the ordinary AudioFrame defaults.
+        $(#[$from_attr])*
         pub fn $from_method(&self, source: &$input<'_>) -> Result<AudioFrame> {
             let mut destination = source.shape.allocate(source.timecode)?;
             self.$into_method(source, &mut destination)?;
@@ -248,6 +250,7 @@ macro_rules! conversions {
         /// Replace samples in an existing FLTP frame with matching dimensions and
         /// sample rate. Its timecode, metadata and timestamp remain unchanged.
         /// On native failure sample storage may be partially modified.
+        $(#[$into_attr])*
         pub fn $into_method(&self, source: &$input<'_>, destination: &mut AudioFrame) -> Result<()> {
             source.shape.check_planar(destination)?;
             let source = source.raw();
@@ -259,6 +262,14 @@ macro_rules! conversions {
             Ok(())
         }
     };
+}
+
+impl std::fmt::Debug for AudioConverter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioConverter")
+            .field("runtime", self._ndi.info())
+            .finish_non_exhaustive()
+    }
 }
 
 impl AudioConverter {
@@ -281,8 +292,11 @@ impl AudioConverter {
         NDIlib_audio_frame_interleaved_16s_t,
         NDIlib_util_audio_to_interleaved_16s_v3,
         NDIlib_util_audio_from_interleaved_16s_v3,
+        #[doc(alias = "NDIlib_util_audio_to_interleaved_16s_v3")]
         to_interleaved_i16,
+        #[doc(alias = "NDIlib_util_audio_from_interleaved_16s_v3")]
         from_interleaved_i16,
+        #[doc(alias = "NDIlib_util_audio_from_interleaved_16s_v3")]
         from_interleaved_i16_into,
         reference_level
     );
@@ -292,8 +306,11 @@ impl AudioConverter {
         NDIlib_audio_frame_interleaved_32s_t,
         NDIlib_util_audio_to_interleaved_32s_v3,
         NDIlib_util_audio_from_interleaved_32s_v3,
+        #[doc(alias = "NDIlib_util_audio_to_interleaved_32s_v3")]
         to_interleaved_i32,
+        #[doc(alias = "NDIlib_util_audio_from_interleaved_32s_v3")]
         from_interleaved_i32,
+        #[doc(alias = "NDIlib_util_audio_from_interleaved_32s_v3")]
         from_interleaved_i32_into,
         reference_level
     );
@@ -303,14 +320,17 @@ impl AudioConverter {
         NDIlib_audio_frame_interleaved_32f_t,
         NDIlib_util_audio_to_interleaved_32f_v3,
         NDIlib_util_audio_from_interleaved_32f_v3,
+        #[doc(alias = "NDIlib_util_audio_to_interleaved_32f_v3")]
         to_interleaved_f32,
+        #[doc(alias = "NDIlib_util_audio_from_interleaved_32f_v3")]
         from_interleaved_f32,
+        #[doc(alias = "NDIlib_util_audio_from_interleaved_32f_v3")]
         from_interleaved_f32_into
     );
 }
 
 macro_rules! send_interleaved {
-    ($method:ident, $input:ident, $send:ident) => {
+    ($(#[$attr:meta])* $method:ident, $input:ident, $send:ident) => {
         /// Synchronously send validated interleaved audio using the selected SDK.
         /// Source samples may be reused when this method returns. The interleaved
         /// SDK descriptors do not carry metadata or receive timestamps.
@@ -319,6 +339,7 @@ macro_rules! send_interleaved {
         ///
         /// Returns [`Error::UnsupportedCapability`] when the runtime does not
         /// provide the complete interleaved-audio send group.
+        $(#[$attr])*
         pub fn $method(&self, frame: &$input<'_>) -> Result<()> {
             let ndi = self.runtime();
             let send = ndi.table::<sys::InterleavedSend>()?;
@@ -335,16 +356,19 @@ macro_rules! send_interleaved {
 /// sends uncompressed audio has it.
 impl<M: AudioSendMode> Sender<M> {
     send_interleaved!(
+        #[doc(alias = "NDIlib_util_send_send_audio_interleaved_16s")]
         send_audio_interleaved_i16,
         InterleavedAudioI16,
         NDIlib_util_send_send_audio_interleaved_16s
     );
     send_interleaved!(
+        #[doc(alias = "NDIlib_util_send_send_audio_interleaved_32s")]
         send_audio_interleaved_i32,
         InterleavedAudioI32,
         NDIlib_util_send_send_audio_interleaved_32s
     );
     send_interleaved!(
+        #[doc(alias = "NDIlib_util_send_send_audio_interleaved_32f")]
         send_audio_interleaved_f32,
         InterleavedAudioF32,
         NDIlib_util_send_send_audio_interleaved_32f

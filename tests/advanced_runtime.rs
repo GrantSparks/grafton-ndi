@@ -506,8 +506,7 @@ fn failed_constructors_hand_back_what_they_were_given() {
     let sender = Sender::new(&ndi, &options("handback")).unwrap();
     let source = sender.source().unwrap();
     let rejected = QueuedSender::from_sender(sender, QueueOptions::default().max_frames(0))
-        .err()
-        .expect("zero frames is not a valid queue limit");
+        .expect_err("zero frames is not a valid queue limit");
     assert!(matches!(
         rejected.error(),
         Error::InvalidInput(_) | Error::UnsupportedCapability { .. }

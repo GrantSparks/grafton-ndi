@@ -1,5 +1,7 @@
 //! Structured causes for native library selection failures.
 
+use thiserror::Error;
+
 use std::{
     ffi::CStr,
     fmt,
@@ -7,18 +9,23 @@ use std::{
 };
 
 /// Why an irreversible runtime or File selection cannot meet a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum SelectionConflict {
     /// The request names a different library from the one selected.
+    #[error("a different library is already selected")]
     DifferentLibrary,
     /// The selected runtime does not meet the requested SDK edition.
+    #[error("the selected runtime does not meet the requested SDK edition")]
     EditionNotMet,
     /// A library path cannot replace the implementation linked into the program.
+    #[error("a linked implementation cannot be replaced")]
     LinkedImplementation,
     /// Native loading re-entered selection on its own loading thread.
+    #[error("native loading re-entered selection")]
     ReentrantSelection,
     /// The selected runtime is Standard, but the File library needs Advanced.
+    #[error("the File library needs the Advanced SDK runtime")]
     FileNeedsAdvancedRuntime,
     /// The process's global symbol scope contains another NDI runtime.
     ///
@@ -27,16 +34,19 @@ pub enum SelectionConflict {
     /// runtime other than the selected core. Both checks run before opening
     /// the candidate. Select the runtime named in the diagnostic, or stop
     /// linking or preloading the other runtime.
+    #[error("another NDI runtime is in the global symbol scope")]
     ForeignRuntimeInScope,
 }
 
 /// Which native library a failed selection sought.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum LibraryKind {
     /// The NDI runtime.
+    #[error("NDI runtime")]
     Runtime,
     /// The separately loaded NDI File library.
+    #[error("NDI File library")]
     File,
 }
 
@@ -45,10 +55,11 @@ pub enum LibraryKind {
 /// The payload is boxed so adding diagnostic context does not enlarge
 /// [`crate::Error`] on capture and send paths. Use the accessors for decisions
 /// and [`Display`](fmt::Display) for diagnostic text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Error)]
+#[error("{0}")]
 pub struct SelectionFailure(Box<SelectionData>);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum SelectionData {
     #[cfg_attr(ndi_link_static, allow(dead_code))]
     DifferentLibrary {
@@ -206,9 +217,9 @@ impl SelectionFailure {
     }
 }
 
-impl fmt::Display for SelectionFailure {
+impl fmt::Display for SelectionData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &*self.0 {
+        match self {
             SelectionData::DifferentLibrary { selected, requested, .. } => write!(f, "{} is already selected; it cannot be switched to {}", selected.display(), requested.display()),
             SelectionData::EditionNotMet { .. } => f.write_str("the selected NDI implementation is not an Advanced SDK"),
             SelectionData::LinkedImplementation { library: LibraryKind::Runtime, requested } => write!(f, "the NDI SDK is linked into this program, so {} cannot be loaded instead", requested.display()),
@@ -256,7 +267,8 @@ impl fmt::Display for LoadOrigin {
 ///
 /// This is a structured diagnostic, not a promise that the platform loader
 /// can distinguish an absent bare name from every other loading failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Error)]
+#[error("{}", LoadRefusalDiagnostic(self))]
 #[non_exhaustive]
 pub enum LoadRefusal {
     /// No file exists at an exact directory candidate.
@@ -327,14 +339,16 @@ pub enum LoadRefusal {
     RelativeRuntimeDirectory,
 }
 
-impl fmt::Display for LoadRefusal {
+struct LoadRefusalDiagnostic<'a>(&'a LoadRefusal);
+
+impl fmt::Display for LoadRefusalDiagnostic<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Absent => f.write_str("not found"),
-            Self::PlatformLoader { detail } | Self::NotIdentifiable { detail }
-                | Self::UnreadableVersion { detail } => f.write_str(detail),
-            Self::ResolvedToAnotherFile { resolved } => write!(f, "the loader resolved it to {}", resolved.display()),
-            Self::MissingEntryPoint { symbol, required, detail } => {
+        match self.0 {
+            LoadRefusal::Absent => f.write_str("not found"),
+            LoadRefusal::PlatformLoader { detail } | LoadRefusal::NotIdentifiable { detail }
+                | LoadRefusal::UnreadableVersion { detail } => f.write_str(detail),
+            LoadRefusal::ResolvedToAnotherFile { resolved } => write!(f, "the loader resolved it to {}", resolved.display()),
+            LoadRefusal::MissingEntryPoint { symbol, required, detail } => {
                 let symbol = symbol.to_string_lossy();
                 if *required {
                     write!(f, "it does not export the required entry point {symbol}")?;
@@ -344,21 +358,21 @@ impl fmt::Display for LoadRefusal {
                 if let Some(detail) = detail { write!(f, ": {detail}")?; }
                 Ok(())
             }
-            Self::EntryPointOutsideModule { symbol, module } => write!(f, "{} resolves outside {}", symbol.to_string_lossy(), module.display()),
-            Self::EditionNotMet => f.write_str("it does not export the Advanced SDK entry points"),
-            Self::AlreadyRefused { path, refusal } => write!(f,
+            LoadRefusal::EntryPointOutsideModule { symbol, module } => write!(f, "{} resolves outside {}", symbol.to_string_lossy(), module.display()),
+            LoadRefusal::EditionNotMet => f.write_str("it does not export the Advanced SDK entry points"),
+            LoadRefusal::AlreadyRefused { path, refusal } => write!(f,
                 "the platform loader returned {}, which is already loaded and was rejected ({refusal}); no other library of that name can be found by name in this process, so remove or fix that file or pass an explicit library path", path.display()),
-            Self::NoCompleteFileFamily { first_missing } => write!(f, "it provides no family of NDI File entry points (it does not export {})", first_missing.to_string_lossy()),
-            Self::BoundToAnotherRuntime => f.write_str("it is bound to an NDI runtime other than the selected one"),
-            Self::ForeignRuntimeInScope { module } => write!(f,
+            LoadRefusal::NoCompleteFileFamily { first_missing } => write!(f, "it provides no family of NDI File entry points (it does not export {})", first_missing.to_string_lossy()),
+            LoadRefusal::BoundToAnotherRuntime => f.write_str("it is bound to an NDI runtime other than the selected one"),
+            LoadRefusal::ForeignRuntimeInScope { module } => write!(f,
                 "the process's global symbol scope already holds another NDI runtime ({}); select that runtime or stop linking or preloading it", module.display()),
-            Self::RelativeRuntimeDirectory => f.write_str("the runtime directory must be absolute"),
+            LoadRefusal::RelativeRuntimeDirectory => f.write_str("the runtime directory must be absolute"),
         }
     }
 }
 
 /// One refused native library location, in the order it was tried.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LoadAttempt {
     location: PathBuf,
     origin: LoadOrigin,
@@ -432,10 +446,11 @@ impl fmt::Display for LoadAttempt {
 /// The aggregate is boxed so enriching selection diagnostics does not enlarge
 /// [`crate::Error`] on capture and send paths. Match [`LoadRefusal`] rather
 /// than parsing the text produced by `Display`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Error)]
+#[error("{0}")]
 pub struct LoadFailure(Box<FailureData>);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FailureData {
     library: LibraryKind,
     description: Option<String>,
@@ -490,12 +505,12 @@ impl LoadFailure {
     }
 }
 
-impl fmt::Display for LoadFailure {
+impl fmt::Display for FailureData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(description) = &self.0.description {
+        if let Some(description) = &self.description {
             write!(f, "no usable {description}; tried ")?;
         }
-        for (index, attempt) in self.0.attempts.iter().enumerate() {
+        for (index, attempt) in self.attempts.iter().enumerate() {
             if index != 0 {
                 f.write_str("; ")?;
             }
@@ -504,8 +519,6 @@ impl fmt::Display for LoadFailure {
         Ok(())
     }
 }
-
-impl std::error::Error for LoadFailure {}
 
 #[cfg(test)]
 mod tests {

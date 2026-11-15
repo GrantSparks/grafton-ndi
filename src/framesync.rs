@@ -408,12 +408,21 @@ pub struct FrameSyncCapture<'a> {
     _thread: std::marker::PhantomData<*mut ()>,
 }
 
+impl fmt::Debug for FrameSyncCapture<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FrameSyncCapture")
+            .field("mode", &"FrameSyncAttached")
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> FrameSyncCapture<'a> {
     /// Capture an owned clocked video frame; see [`FrameSync::capture_video`].
     ///
     /// # Errors
     ///
     /// As for [`FrameSync::capture_video_ref`].
+    #[doc(alias = "NDIlib_framesync_capture_video")]
     pub fn capture_video(&self, scan_type: ScanType) -> Result<Option<VideoFrame>> {
         Ok(self
             .capture_video_ref(scan_type)?
@@ -426,6 +435,7 @@ impl<'a> FrameSyncCapture<'a> {
     /// # Errors
     ///
     /// As for [`FrameSync::capture_video_ref`].
+    #[doc(alias = "NDIlib_framesync_capture_video")]
     pub fn capture_video_ref(&self, scan_type: ScanType) -> Result<Option<FrameSyncVideoRef<'a>>> {
         let Some(guard) = self.resource.capture_video(scan_type) else {
             return Ok(None);
@@ -438,6 +448,7 @@ impl<'a> FrameSyncCapture<'a> {
     /// # Errors
     ///
     /// As for [`FrameSync::capture_audio_ref`].
+    #[doc(alias = "NDIlib_framesync_capture_audio_v2")]
     pub fn capture_audio(&self, request: FrameSyncAudioRequest) -> Result<AudioFrame> {
         Ok(self.capture_audio_ref(request)?.to_owned())
     }
@@ -448,6 +459,7 @@ impl<'a> FrameSyncCapture<'a> {
     /// # Errors
     ///
     /// As for [`FrameSync::capture_audio_ref`].
+    #[doc(alias = "NDIlib_framesync_capture_audio_v2")]
     pub fn capture_audio_ref(
         &self,
         request: FrameSyncAudioRequest,
@@ -462,6 +474,7 @@ impl<'a> FrameSyncCapture<'a> {
     /// # Errors
     ///
     /// As for [`FrameSync::audio_input_format`].
+    #[doc(alias = "NDIlib_framesync_capture_audio_v2")]
     pub fn audio_input_format(&self) -> Result<Option<AudioInputFormat>> {
         let guard = self.resource.capture_audio(AudioCall::InputFormat);
         input_format(guard.frame())
@@ -473,7 +486,10 @@ impl<'a> FrameSyncCapture<'a> {
     /// # Errors
     ///
     /// [`Error::UnexpectedSdkResult`] when the native queue depth is negative.
+    #[doc(alias = "NDIlib_framesync_audio_queue_depth")]
     pub fn audio_queue_depth(&self) -> Result<u32> {
+        #[cfg(test)]
+        audio_test_calls::query();
         // SAFETY: the view borrows a live synchronizer for the call.
         let depth = unsafe {
             self.resource
@@ -628,6 +644,7 @@ impl FrameSync {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_framesync_create")]
     pub fn new(receiver: Receiver) -> std::result::Result<Self, Rejected<Receiver>> {
         // SAFETY: The owned receiver retains a live SDK resource through creation;
         // successful creation transfers both resources into the ordered owners.
@@ -796,6 +813,7 @@ impl FrameSync {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_framesync_capture_video")]
     pub fn capture_video(&self, scan_type: ScanType) -> Result<Option<VideoFrame>> {
         Ok(self
             .capture_video_ref(scan_type)?
@@ -819,6 +837,7 @@ impl FrameSync {
     /// format or malformed frame descriptor, including invalid dimensions,
     /// stride, or buffers. Unreadable per-frame metadata is withheld; inspect
     /// [`VideoSource::metadata_status`](crate::VideoSource::metadata_status).
+    #[doc(alias = "NDIlib_framesync_capture_video")]
     pub fn capture_video_ref(&self, scan_type: ScanType) -> Result<Option<FrameSyncVideoRef<'_>>> {
         FrameSyncCapture {
             resource: &self.resource,
@@ -881,6 +900,7 @@ impl FrameSync {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_framesync_capture_audio_v2")]
     pub fn capture_audio(&self, request: FrameSyncAudioRequest) -> Result<AudioFrame> {
         Ok(self.capture_audio_ref(request)?.to_owned())
     }
@@ -936,6 +956,7 @@ impl FrameSync {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_framesync_capture_audio_v2")]
     pub fn capture_audio_ref(
         &self,
         request: FrameSyncAudioRequest,
@@ -989,6 +1010,7 @@ impl FrameSync {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_framesync_capture_audio_v2")]
     pub fn audio_input_format(&self) -> Result<Option<AudioInputFormat>> {
         FrameSyncCapture {
             resource: &self.resource,
@@ -1031,6 +1053,7 @@ impl FrameSync {
     /// # Errors
     ///
     /// [`Error::UnexpectedSdkResult`] when the native queue depth is negative.
+    #[doc(alias = "NDIlib_framesync_audio_queue_depth")]
     pub fn audio_queue_depth(&self) -> Result<u32> {
         FrameSyncCapture {
             resource: &self.resource,
@@ -1043,9 +1066,8 @@ impl FrameSync {
 impl fmt::Debug for FrameSync {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrameSync")
-            .field("instance", &self.resource.instance.0)
-            .field("audio_queue_depth", &self.audio_queue_depth())
-            .finish()
+            .field("mode", &"FrameSyncAttached")
+            .finish_non_exhaustive()
     }
 }
 
@@ -1091,6 +1113,13 @@ pub(crate) mod audio_test_calls {
     use std::cell::Cell;
     std::thread_local! {
         static CALLS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+        static QUERIES: Cell<usize> = const { Cell::new(0) };
+    }
+    pub(super) fn query() {
+        QUERIES.with(|queries| queries.set(queries.get() + 1));
+    }
+    pub(super) fn take_queries() -> usize {
+        QUERIES.with(|queries| queries.replace(0))
     }
     pub(super) fn capture() {
         CALLS.with(|calls| {
@@ -1112,6 +1141,30 @@ pub(crate) mod audio_test_calls {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_makes_no_native_calls_or_exposes_pointers() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver =
+            Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
+        let sync = FrameSync::new(receiver).unwrap();
+        audio_test_calls::take_queries();
+        assert_eq!(
+            format!("{sync:?}"),
+            "FrameSync { mode: \"FrameSyncAttached\", .. }"
+        );
+        let capture = FrameSyncCapture {
+            resource: &sync.resource,
+            _thread: std::marker::PhantomData,
+        };
+        assert_eq!(
+            format!("{capture:?}"),
+            "FrameSyncCapture { mode: \"FrameSyncAttached\", .. }"
+        );
+        assert_eq!(audio_test_calls::take_queries(), 0);
+    }
 
     #[cfg(feature = "advanced")]
     #[test]

@@ -66,6 +66,15 @@ pub struct AsyncFinder<R: AsyncRuntime, D: Discovery = Finder> {
     _runtime: PhantomData<R>,
 }
 
+impl<R: AsyncRuntime, D: Discovery> std::fmt::Debug for AsyncFinder<R, D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncFinder")
+            .field("owner", &std::any::type_name::<D>())
+            .field("runtime", &std::any::type_name::<R>())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<R: AsyncRuntime, D: Discovery> Clone for AsyncFinder<R, D> {
     fn clone(&self) -> Self {
         Self {
@@ -113,6 +122,8 @@ impl<R: AsyncRuntime, D: Discovery> AsyncFinder<R, D> {
     ///
     /// Invalid timeouts are refused before submitting work. Snapshot and resource
     /// errors propagate; [`crate::Error::SpawnFailed`] reports dispatch failure.
+    #[doc(alias = "NDIlib_find_get_current_sources")]
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub async fn find_source(
         &self,
         timeout: Duration,
@@ -131,6 +142,8 @@ impl<R: AsyncRuntime, D: Discovery> AsyncFinder<R, D> {
     ///
     /// Invalid timeouts and empty or NUL-containing names are refused, in that
     /// order, before submitting work. Other errors match [`Self::find_source`].
+    #[doc(alias = "NDIlib_find_get_current_sources")]
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub async fn find_source_by_name(
         &self,
         name: &str,
@@ -153,6 +166,8 @@ impl<R: AsyncRuntime, D: Discovery> AsyncFinder<R, D> {
     ///
     /// Invalid timeouts are refused before submitting work. Bounded snapshot
     /// and accumulated-result errors propagate, as does dispatch failure.
+    #[doc(alias = "NDIlib_find_get_current_sources")]
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub async fn find_sources(&self, timeout: Duration) -> Result<Vec<Source>> {
         let inner = Arc::clone(&self.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
@@ -180,6 +195,8 @@ impl<R: AsyncRuntime> AsyncFinder<R, SourceCache> {
     /// Invalid timeouts and hosts outside [`Source::matches_host`]'s grammar
     /// are refused, in that order, before submitting work. Discovery, bounded
     /// result-copy and dispatch errors propagate.
+    #[doc(alias = "NDIlib_find_get_current_sources")]
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub async fn sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
         let deadline = Deadline::after(timeout)?;
         validate_host_query(host)?;
@@ -206,6 +223,15 @@ pub struct AsyncSourceWatch<R: AsyncRuntime, D: Discovery = Finder> {
     _runtime: PhantomData<R>,
 }
 
+impl<R: AsyncRuntime, D: Discovery> std::fmt::Debug for AsyncSourceWatch<R, D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncSourceWatch")
+            .field("owner", &std::any::type_name::<D>())
+            .field("runtime", &std::any::type_name::<R>())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<R: AsyncRuntime, D: Discovery> AsyncSourceWatch<R, D> {
     /// Copy current sources and acknowledge the generation read before copying.
     ///
@@ -217,6 +243,7 @@ impl<R: AsyncRuntime, D: Discovery> AsyncSourceWatch<R, D> {
     ///
     /// Snapshot, resource and dispatch errors propagate. Failure leaves this
     /// cursor unchanged.
+    #[doc(alias = "NDIlib_find_get_current_sources")]
     pub async fn current_sources(&mut self) -> Result<Vec<Source>> {
         let inner = Arc::clone(&self.inner);
         let (generation, sources) = R::spawn_stoppable(private::Token, move |stop| {
@@ -242,6 +269,7 @@ impl<R: AsyncRuntime, D: Discovery> AsyncSourceWatch<R, D> {
     ///
     /// Invalid timeouts are refused before submitting work; dispatch failure is
     /// [`crate::Error::SpawnFailed`]. Failure leaves this cursor unchanged.
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub async fn wait_for_change(&mut self, timeout: Duration) -> Result<bool> {
         let observed = self.observed.get();
         let inner = Arc::clone(&self.inner);

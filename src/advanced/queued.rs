@@ -42,7 +42,7 @@ use super::send_slots::DescriptorSlots;
 /// and 512 MiB. Construction reserves one stable frame descriptor per frame.
 /// Scatter frames own their scatter-list descriptors. Completed frames retain
 /// their slots until collected.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct QueueOptions {
     frames: usize,
     bytes: usize,
@@ -760,11 +760,12 @@ impl QueuedSender {
     /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
     /// build without the Advanced SDK), [`Error::InvalidInput`] for
     /// limits outside their range, and the errors of [`Sender::new`].
-    pub fn new(ndi: &Ndi, _options: &SenderOptions, _limits: QueueOptions) -> Result<Self> {
+    #[doc(alias = "NDIlib_send_set_video_async_completion")]
+    pub fn new(ndi: &Ndi, options: &SenderOptions, limits: QueueOptions) -> Result<Self> {
         let table = ndi.table::<SendCompletion>()?;
-        native!(SendCompletion, table => {
-            let callback = CallbackState::new(_limits)?;
-            let sender = Sender::open(ndi, _options)?;
+        native!(SendCompletion, table, uses(options, limits) => {
+            let callback = CallbackState::new(limits)?;
+            let sender = Sender::open(ndi, options)?;
             Ok(Self::install(sender, callback, table))
         })
     }
@@ -782,16 +783,17 @@ impl QueuedSender {
     /// limits outside their range or a sender that is registered with an
     /// advertiser (a registration keeps the native sender alive after this
     /// value is dropped, when the completion state no longer exists).
+    #[doc(alias = "NDIlib_send_set_video_async_completion")]
     pub fn from_sender(
         sender: Sender,
-        _limits: QueueOptions,
+        limits: QueueOptions,
     ) -> std::result::Result<(Self, Option<VideoFrame>), Rejected<Sender>> {
         let table = match sender.runtime().table::<SendCompletion>() {
             Ok(table) => table,
             Err(error) => return Err(Rejected::new(error, sender)),
         };
-        native!(SendCompletion, table => {
-            let callback = match CallbackState::new(_limits) {
+        native!(SendCompletion, table, uses(limits) => {
+            let callback = match CallbackState::new(limits) {
                 Ok(callback) => callback,
                 Err(error) => return Err(Rejected::new(error, sender)),
             };
@@ -893,6 +895,8 @@ impl QueuedSender {
     /// with [`Error::UnsupportedCapability`] when the runtime lacks scatter
     /// sending or cannot send an uncompressed frame's pixel format
     /// (as [`Sender::send_video`] checks).
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
+    #[doc(alias = "NDIlib_send_send_video_scatter_async")]
     pub fn try_submit(
         &mut self,
         frame: impl Into<QueuedVideoFrame>,
@@ -946,6 +950,7 @@ impl QueuedSender {
     /// Native destruction waits without a timeout for the SDK to finish with
     /// every pending frame. Run this on a blocking thread when using an async
     /// executor. Only the returned collection is allocated.
+    #[doc(alias = "NDIlib_send_destroy")]
     pub fn close(self) -> Vec<CompletedVideo> {
         self.lending.close()
     }
@@ -967,6 +972,8 @@ impl QueuedVideo<'_> {
     /// # Errors
     ///
     /// As for [`QueuedSender::try_submit`].
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
+    #[doc(alias = "NDIlib_send_send_video_scatter_async")]
     pub fn try_submit(
         &mut self,
         frame: impl Into<QueuedVideoFrame>,
@@ -1781,3 +1788,19 @@ mod tests {
 #[cfg(test)]
 #[path = "queued_boundary_tests.rs"]
 mod boundary_tests;
+
+impl std::fmt::Debug for QueuedSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueuedSender")
+            .field("sender", self.sender())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for QueuedVideo<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueuedVideo")
+            .field("sender", self.pair.sender())
+            .finish_non_exhaustive()
+    }
+}

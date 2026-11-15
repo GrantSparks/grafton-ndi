@@ -196,3 +196,84 @@ fn advanced_configuration_is_borrowed_without_native_capability() {
         (3, 2048)
     );
 }
+
+#[test]
+fn options_equality_compares_independently_constructed_settings() {
+    macro_rules! compare {
+        ($base:expr, $changed:expr) => {{
+            assert_eq!($base, $base);
+            assert_ne!($base, $changed);
+        }};
+    }
+    compare!(
+        FinderOptions::new(),
+        FinderOptions::new().show_local_sources(false)
+    );
+    compare!(SenderOptions::new("program"), SenderOptions::new("backup"));
+    compare!(
+        ReceiverOptions::new(Source::new("camera")),
+        ReceiverOptions::new(Source::new("camera")).allow_video_fields(false)
+    );
+    compare!(RouterOptions::new("route"), RouterOptions::new("other"));
+    compare!(
+        RuntimeOptions::new(),
+        RuntimeOptions::new().edition(SdkEdition::Advanced)
+    );
+    compare!(
+        AdvertiserOptions::new(),
+        AdvertiserOptions::new().servers("studio")
+    );
+    compare!(
+        ListenerOptions::new(),
+        ListenerOptions::new().server("studio")
+    );
+    compare!(
+        SendAdvertisement::new(),
+        SendAdvertisement::new().allow_monitoring(true)
+    );
+    compare!(
+        RecvAdvertisement::new(),
+        RecvAdvertisement::new().allow_controlling(true)
+    );
+
+    #[cfg(feature = "advanced")]
+    {
+        use grafton_ndi::advanced::{AdvancedConfig, AllocatorLimits, QueueOptions};
+        compare!(QueueOptions::new(), QueueOptions::new().max_frames(3));
+        compare!(
+            AllocatorLimits::new(),
+            AllocatorLimits::new().max_generations(3)
+        );
+        assert_eq!(
+            AdvancedConfig::parse(r#"{"mode":"studio"}"#).unwrap(),
+            AdvancedConfig::parse(r#"{"mode":"studio"}"#).unwrap()
+        );
+    }
+    #[cfg(feature = "file-io")]
+    {
+        use grafton_ndi::file::{
+            AsyncFileOptions, FileRuntimeOptions, PlayerOptions, RecorderOptions, SourceSpec,
+        };
+        compare!(
+            FileRuntimeOptions::new(),
+            FileRuntimeOptions::new().library_path("/tmp/file.so")
+        );
+        compare!(PlayerOptions::new("program"), PlayerOptions::new("backup"));
+        compare!(
+            RecorderOptions::new(SourceSpec::new("camera").unwrap()),
+            RecorderOptions::new(SourceSpec::new("camera").unwrap()).proxy(false)
+        );
+        compare!(
+            AsyncFileOptions::new(),
+            AsyncFileOptions::new().command_capacity(7)
+        );
+    }
+    #[cfg(feature = "image-encoding")]
+    {
+        use grafton_ndi::{ImageFormat, ImageOptions};
+        compare!(
+            ImageOptions::new(ImageFormat::Png),
+            ImageOptions::new(ImageFormat::Jpeg(80))
+        );
+    }
+}

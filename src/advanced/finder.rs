@@ -124,6 +124,7 @@ impl Finder {
     /// [`crate::Error::ResourceLimit`] when the descriptor count or total work
     /// exceeds the limits of [`Self::current_sources`]. Advertised metadata
     /// is included in that same byte budget, including lossy UTF-8 expansion.
+    #[doc(alias = "NDIlib_find_get_current_sources_v2")]
     pub fn sources_with_metadata(&self) -> Result<Vec<ExtendedSource>> {
         let table = self.runtime().table::<SourceMetadata>()?;
         native!(SourceMetadata, table => {

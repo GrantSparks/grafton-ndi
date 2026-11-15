@@ -1194,8 +1194,7 @@ fn child(case: &str) {
                 .unwrap();
             // A registered sender cannot become a queue: it comes back as it was.
             let sender = QueuedSender::from_sender(sender, QueueOptions::default())
-                .err()
-                .expect("a registered sender is refused")
+                .expect_err("a registered sender is refused")
                 .into_inner();
             sender.send_video(&frame()).unwrap();
             drop(sender);

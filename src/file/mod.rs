@@ -216,8 +216,14 @@ impl FileFamily {
     }
 }
 
+impl std::fmt::Display for FileFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// How the File library is located. Creating this value loads nothing.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FileRuntimeOptions {
     library_path: Option<PathBuf>,
 }
@@ -354,6 +360,7 @@ impl FileApi {
     /// does not provide [`FileFamily::Playback`].
     /// [`Error::UnexpectedSdkResult`] when the library's file information
     /// does not match this crate's structure layout.
+    #[doc(alias = "NDIlib_file_player_probe_file")]
     pub fn probe(&self, path: impl AsRef<Path>) -> Result<FileInfo> {
         let playback = self.table::<sys::FilePlayback>()?;
         let path = types::path_string(path.as_ref())?;
@@ -382,6 +389,7 @@ impl FileApi {
     /// [`Error::NativeOperationFailed`] when the SDK cannot create the player
     /// and [`Error::FileFamilyUnavailable`] when the library does not provide
     /// [`FileFamily::Playback`].
+    #[doc(alias = "NDIlib_file_player_create")]
     pub fn create_player(&self, options: &PlayerOptions) -> Result<FilePlayer> {
         FilePlayer::create(self.clone(), options)
     }
@@ -403,6 +411,7 @@ impl FileApi {
     /// [`Error::NativeOperationFailed`] when the SDK cannot create the
     /// recorder and [`Error::FileFamilyUnavailable`] when the library does not
     /// provide [`FileFamily::Recording`].
+    #[doc(alias = "NDIlib_file_recorder_create")]
     pub fn create_recorder(&self, options: &RecorderOptions) -> Result<FileRecorder> {
         FileRecorder::create(self.clone(), options)
     }

@@ -123,6 +123,7 @@ mod private {
     /// A bound on [`AsyncRuntime`](super::AsyncRuntime) makes [`Spawn::spawn_blocking`]
     /// reachable from other crates even though they cannot name [`Spawn`];
     /// they cannot name this type either, so they cannot call it.
+    #[derive(Debug)]
     pub struct Token;
 
     /// How a runtime runs blocking work on its thread pool.
@@ -343,6 +344,15 @@ pub struct AsyncReceiver<R: AsyncRuntime> {
     _runtime: PhantomData<R>,
 }
 
+impl<R: AsyncRuntime> std::fmt::Debug for AsyncReceiver<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncReceiver")
+            .field("receiver", &self.inner)
+            .field("runtime", &std::any::type_name::<R>())
+            .finish_non_exhaustive()
+    }
+}
+
 // Starts the budget on the future's first poll, so that blocking-pool queue
 // delay is spent from it.
 async fn with_timeout_budget<R, F, T>(timeout: Duration, operation: F) -> Result<T>
@@ -496,6 +506,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// Dropping the future skips queued work and stops a started wait before
     /// its next attempt. The attempt already in flight can still consume an
     /// item whose result is discarded; each native wait lasts at most 100 ms.
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub async fn capture_any(&self, timeout: Duration) -> Result<Option<ReceiverItem>> {
         self.capture_any_with(timeout, |item| item.to_owned()).await
     }
@@ -533,6 +544,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// A callback or blocking-operation panic is resumed on the awaiting task
     /// with its original payload, after the native frame is freed on the worker.
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub async fn capture_any_with<F, T>(&self, timeout: Duration, process: F) -> Result<Option<T>>
     where
         F: for<'frame> FnOnce(&ReceiverItemRef<'frame>) -> T + Send + 'static,
@@ -579,6 +591,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// Dropping the future skips queued work and stops a started wait before
     /// its next attempt. The attempt already in flight can still consume an
     /// event whose result is discarded; each native wait lasts at most 100 ms.
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub async fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
         let receiver = Arc::clone(&self.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
@@ -621,6 +634,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// its next attempt. The attempt already in flight can still consume a
     /// change whose result is discarded; each native wait lasts at most 100 ms.
     /// The SDK reports each change once.
+    #[doc(alias = "NDIlib_recv_get_source_name")]
     pub async fn poll_source_name_change(
         &self,
         timeout: Duration,
@@ -643,6 +657,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// A cheap, non-blocking SDK query, so it runs inline rather than on
     /// the blocking pool.
+    #[doc(alias = "NDIlib_recv_get_no_connections")]
     pub fn is_connected(&self) -> bool {
         self.inner.is_connected()
     }
@@ -655,6 +670,9 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// application expects; connection state and a video counter alone do
     /// not establish audio or metadata progress. See the
     /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
+    #[doc(alias = "NDIlib_recv_get_no_connections")]
+    #[doc(alias = "NDIlib_recv_get_performance")]
+    #[doc(alias = "NDIlib_recv_get_queue")]
     pub fn connection_stats(&self) -> Result<ConnectionStats> {
         self.inner.connection_stats()
     }
@@ -684,6 +702,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// cancellation flag at its entry gate. After passing that gate, the
     /// connection change continues, including waiting for earlier connection changes,
     /// and may take effect after this future is dropped.
+    #[doc(alias = "NDIlib_recv_connect")]
     pub async fn connect_to(&self, source: &Source) -> Result<()> {
         let target = ConnectionTarget::new(source)?;
         let receiver = Arc::clone(&self.inner);
@@ -708,6 +727,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// cancellation flag at its entry gate. After passing that gate,
     /// disconnect continues, including waiting for earlier connection changes, and may
     /// disconnect after this future is dropped.
+    #[doc(alias = "NDIlib_recv_connect")]
     pub async fn disconnect(&self) -> Result<()> {
         let receiver = Arc::clone(&self.inner);
         R::spawn_blocking(private::Token, move || receiver.disconnect()).await
@@ -732,6 +752,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// cancellation flag at its entry gate. After passing that gate, reconnect
     /// continues, including waiting for earlier connection changes, and may reconnect
     /// after this future is dropped.
+    #[doc(alias = "NDIlib_recv_connect")]
     pub async fn reconnect(&self) -> Result<()> {
         let receiver = Arc::clone(&self.inner);
         R::spawn_blocking(private::Token, move || receiver.reconnect()).await
@@ -763,6 +784,15 @@ impl<R: AsyncRuntime> Clone for AsyncReceiver<R> {
 pub struct AsyncCapture<'rx, R: AsyncRuntime, K: CaptureKind> {
     recv: &'rx AsyncReceiver<R>,
     _kind: PhantomData<K>,
+}
+
+impl<R: AsyncRuntime, K: CaptureKind> std::fmt::Debug for AsyncCapture<'_, R, K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncCapture")
+            .field("receiver", &self.recv)
+            .field("kind", &std::any::type_name::<K>())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'rx, R: AsyncRuntime, K: CaptureKind> AsyncCapture<'rx, R, K>
@@ -803,6 +833,7 @@ where
     /// Dropping the future skips queued work and stops a started wait before
     /// its next attempt. The attempt already in flight can still consume a
     /// frame whose result is discarded; each native wait lasts at most 100 ms.
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub async fn capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
         self.capture_with(timeout, K::ref_to_owned).await
     }
@@ -854,6 +885,7 @@ where
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub async fn capture_with<F, T>(&self, timeout: Duration, process: F) -> Result<Option<T>>
     where
         F: for<'frame> FnOnce(&K::Ref<'frame>) -> T + Send + 'static,

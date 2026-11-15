@@ -150,6 +150,14 @@ mod ownership {
     // unwinding cannot leave a dangling native source descriptor.
     impl std::panic::RefUnwindSafe for SenderResource {}
 
+    impl fmt::Debug for SenderResource {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("SenderResource")
+                .field("name", &self._name)
+                .finish_non_exhaustive()
+        }
+    }
+
     impl SenderResource {
         /// The native sender this token keeps alive.
         pub(crate) fn instance(&self) -> NDIlib_send_instance_t {
@@ -340,7 +348,6 @@ impl CompressedAudioSendMode for QueueAttached {}
 /// `send_video_async`, `send_video_async_copy` and `finish_video_async`, which
 /// take `&mut self`. Tally polls preserve changes for a waiting thread;
 /// concurrent tally waits serialize and each change is consumed once.
-#[derive(Debug)]
 pub struct Sender<M: SenderMode = RawSend> {
     inner: Inner,
     // The owner of the native sender, with the video pipeline of a mode that
@@ -1209,10 +1216,11 @@ pub(crate) mod in_flight {
 
 use in_flight::InFlight;
 
-impl fmt::Debug for Inner {
+impl<M: SenderMode> fmt::Debug for Sender<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Inner")
-            .field("instance", &self.instance.0)
+        f.debug_struct("Sender")
+            .field("name", &self.native.resource()._name)
+            .field("mode", &std::any::type_name::<M>())
             .finish_non_exhaustive()
     }
 }
@@ -1552,7 +1560,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
 
 /// Builder for a [`BorrowedVideoFrame`], reached through
 /// [`BorrowedVideoFrame::builder`]. No pixels or metadata are copied.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct BorrowedVideoFrameBuilder<'buf> {
     data: &'buf [u8],
     width: u32,
@@ -1819,6 +1827,7 @@ impl Sender {
     /// NUL byte, [`Error::UnsupportedCapability`] when the options carry an
     /// Advanced configuration that the runtime or this build cannot take, and
     /// [`Error::NativeOperationFailed`] when the SDK creates no sender.
+    #[doc(alias = "NDIlib_send_create")]
     pub fn new(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
         Self::open(ndi, options)
     }
@@ -1921,6 +1930,7 @@ impl Sender {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_send_send_video_v2")]
     pub fn send_video(&self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
         let authorized = Sendable::borrowed(frame, &self._ndi)?;
         self.native.video.send(authorized)
@@ -1946,6 +1956,7 @@ impl Sender {
     /// formats need
     /// [`RuntimeFeature::Planar444Video`](crate::RuntimeFeature::Planar444Video)).
     /// No pending send is changed.
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
     pub fn send_video_async(
         &mut self,
         frame: VideoFrame,
@@ -1959,6 +1970,7 @@ impl Sender {
     /// Frames submitted through either owned or copied sending are returned.
     /// Any spare storage retained for copying is released. Repeated calls
     /// return `None`.
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
     pub fn finish_video_async(&mut self) -> Option<VideoFrame> {
         self.native.video.finish()
     }
@@ -1981,6 +1993,7 @@ impl Sender {
     /// Returns [`Error::UnsupportedCapability`] if this sender's runtime
     /// cannot send the frame's pixel format, checked before anything is
     /// copied. No pending send is changed on failure.
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
     pub fn send_video_async_copy(&mut self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
         let authorized = Sendable::borrowed(frame, &self._ndi)?;
         self.native.video.copy(authorized);
@@ -1996,6 +2009,7 @@ impl Sender {
     /// After this returns, the SDK has released the pending buffer. The sender
     /// retains the frame; use [`Self::finish_video_async`] or an owned
     /// submission through [`Self::send_video_async`] to recover it without copying.
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
     pub fn flush_async_blocking(&self) {
         self.native.video.flush();
     }
@@ -2045,6 +2059,7 @@ impl<M: AudioSendMode> Sender<M> {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_send_send_audio_v3")]
     pub fn send_audio(&self, audio_frame: &(impl AudioSource + ?Sized)) {
         // SAFETY: the sender instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -2117,6 +2132,7 @@ impl<M: SenderMode> Sender<M> {
     /// bounded terminator,
     /// [`Error::InvalidUtf8`] for non-UTF-8 text, and [`Error::UnexpectedSdkResult`]
     /// when the SDK returns a frame type other than metadata or no frame.
+    #[doc(alias = "NDIlib_send_capture")]
     pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
         let metadata = self._ndi.table::<sys::SenderMetadata>()?;
         let deadline = Deadline::after(timeout)?;
@@ -2198,6 +2214,7 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// Accepts owned or captured metadata without copying its text in the
     /// wrapper. The SDK copies the text before returning.
+    #[doc(alias = "NDIlib_send_send_metadata")]
     pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata_frame: &S) {
         let raw = metadata_frame.metadata_raw();
         // The borrowed C string remains live through this synchronous SDK call.
@@ -2234,6 +2251,7 @@ impl<M: SenderMode> Sender<M> {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_send_get_tally")]
     pub fn tally(&self) -> Tally {
         let state = &self.inner.tally;
         let Some(_query) = state.query.try_lock() else {
@@ -2280,6 +2298,7 @@ impl<M: SenderMode> Sender<M> {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_send_get_tally")]
     pub fn wait_for_tally_change(&self, timeout: Duration) -> Result<Option<Tally>> {
         let deadline = Deadline::after(timeout)?;
         let state = &self.inner.tally;
@@ -2346,6 +2365,7 @@ impl<M: SenderMode> Sender<M> {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_send_get_no_connections")]
     pub fn connection_count(&self, timeout: Duration) -> Result<u32> {
         let timeout_ms = to_ms_checked(timeout)?;
         // SAFETY: the sender instance is live for this borrow, and every pointer
@@ -2362,6 +2382,7 @@ impl<M: SenderMode> Sender<M> {
     }
 
     /// Remove all metadata registered for delivery to each new connection.
+    #[doc(alias = "NDIlib_send_clear_connection_metadata")]
     pub fn clear_connection_metadata(&self) {
         // SAFETY: the sender instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -2376,6 +2397,7 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// Accepts owned or captured metadata. The SDK retains its own copy, so
     /// the input can be released as soon as this method returns.
+    #[doc(alias = "NDIlib_send_add_connection_metadata")]
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata_frame: &S) {
         let raw = metadata_frame.metadata_raw();
         // The borrowed C string remains live through this synchronous SDK call.
@@ -2393,6 +2415,7 @@ impl<M: SenderMode> Sender<M> {
     /// # Errors
     ///
     /// Returns an error if source conversion fails.
+    #[doc(alias = "NDIlib_send_set_failover")]
     pub fn set_failover(&self, source: &Source) -> Result<()> {
         let raw_source = Box::new(source.to_raw()?);
         let mut failover = self.native.resource().failover.lock();
@@ -2410,6 +2433,7 @@ impl<M: SenderMode> Sender<M> {
     }
 
     /// Clear the failover source previously configured with [`Self::set_failover`].
+    #[doc(alias = "NDIlib_send_set_failover")]
     pub fn clear_failover(&self) {
         let mut failover = self.native.resource().failover.lock();
         // SAFETY: the sender is live, and the previous descriptor stays owned
@@ -2444,6 +2468,7 @@ impl<M: SenderMode> Sender<M> {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_send_get_source_name")]
     pub fn source(&self) -> Result<Source> {
         // SAFETY: the sender instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -2475,7 +2500,7 @@ impl<M: SenderMode> Sender<M> {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SenderOptions {
     name: String,
     groups: Option<String>,

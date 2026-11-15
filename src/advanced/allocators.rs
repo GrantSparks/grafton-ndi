@@ -496,6 +496,19 @@ impl AllocationStorage {
     }
 }
 
+impl std::fmt::Debug for AllocationBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let storage = match &self.storage {
+            AllocationStorage::Owned(_) => "owned",
+            AllocationStorage::External(_) => "external",
+            AllocationStorage::Pool(_) => "pool",
+        };
+        f.debug_struct("AllocationBuffer")
+            .field("storage", &storage)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AllocationBuffer {
     /// Allocate zeroed, 64-byte-aligned memory of the request's minimum size.
     ///
@@ -1136,6 +1149,14 @@ impl AllocatorUsage {
     }
 }
 
+impl std::fmt::Debug for AllocatorService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AllocatorService")
+            .field("limits", &self.registry.limits)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AllocatorService {
     /// Enable custom allocation with these process-wide limits.
     ///
@@ -1251,6 +1272,14 @@ pub struct AllocatedPacketReceiver {
     inner: Allocation<PacketAttached>,
 }
 
+impl std::fmt::Debug for AllocatedPacketReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AllocatedPacketReceiver")
+            .field("mode", &std::any::type_name::<PacketAttached>())
+            .finish_non_exhaustive()
+    }
+}
+
 impl AllocatedPacketReceiver {
     /// Wait up to `timeout` for the next frame or event; see
     /// [`PacketReceiver::capture`].
@@ -1258,6 +1287,7 @@ impl AllocatedPacketReceiver {
     /// # Errors
     ///
     /// As for [`PacketReceiver::capture`].
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture(&self, timeout: std::time::Duration) -> Result<Option<PacketItem>> {
         PacketReceiver::capture_from(self.inner.receiver(), timeout)
     }
@@ -1269,6 +1299,7 @@ impl AllocatedPacketReceiver {
     /// # Errors
     ///
     /// As for [`PacketReceiver::capture_ref`].
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_ref(&self, timeout: std::time::Duration) -> Result<Option<PacketItemRef<'_>>> {
         PacketReceiver::capture_ref_from(self.inner.receiver(), timeout)
     }
@@ -1291,6 +1322,7 @@ impl AllocatedPacketReceiver {
     /// # Errors
     ///
     /// As for [`AllocatedReceiver::set_video_allocator`].
+    #[doc(alias = "NDIlib_recv_set_video_allocator")]
     pub fn set_video_allocator<P: ReceiveAllocator>(
         &mut self,
         policy: P,
@@ -1304,6 +1336,7 @@ impl AllocatedPacketReceiver {
     /// # Errors
     ///
     /// As for [`AllocatedReceiver::set_audio_allocator`].
+    #[doc(alias = "NDIlib_recv_set_audio_allocator")]
     pub fn set_audio_allocator<P: ReceiveAllocator>(
         &mut self,
         policy: P,
@@ -1312,11 +1345,13 @@ impl AllocatedPacketReceiver {
     }
 
     /// Return to the SDK's own video memory.
+    #[doc(alias = "NDIlib_recv_set_video_allocator")]
     pub fn reset_video_allocator(&mut self) {
         self.inner.install(Stream::Video, None);
     }
 
     /// Return to the SDK's own audio memory.
+    #[doc(alias = "NDIlib_recv_set_audio_allocator")]
     pub fn reset_audio_allocator(&mut self) {
         self.inner.install(Stream::Audio, None);
     }
@@ -1373,6 +1408,14 @@ pub struct AllocatedReceiver {
     inner: Allocation<RawCapture>,
 }
 
+impl std::fmt::Debug for AllocatedReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AllocatedReceiver")
+            .field("mode", &std::any::type_name::<RawCapture>())
+            .finish_non_exhaustive()
+    }
+}
+
 impl AllocatedReceiver {
     /// The receiver, for capturing and control.
     pub fn receiver(&self) -> &Receiver {
@@ -1393,6 +1436,7 @@ impl AllocatedReceiver {
     /// Returns the policy with [`Error::InvalidInput`](crate::Error::InvalidInput)
     /// when the process already has [`AllocatorLimits::max_generations`]
     /// policies. The current allocator then stays in place.
+    #[doc(alias = "NDIlib_recv_set_video_allocator")]
     pub fn set_video_allocator<P: ReceiveAllocator>(
         &mut self,
         policy: P,
@@ -1405,6 +1449,7 @@ impl AllocatedReceiver {
     /// # Errors
     ///
     /// As for [`set_video_allocator`](Self::set_video_allocator).
+    #[doc(alias = "NDIlib_recv_set_audio_allocator")]
     pub fn set_audio_allocator<P: ReceiveAllocator>(
         &mut self,
         policy: P,
@@ -1413,11 +1458,13 @@ impl AllocatedReceiver {
     }
 
     /// Return to the SDK's own video memory.
+    #[doc(alias = "NDIlib_recv_set_video_allocator")]
     pub fn reset_video_allocator(&mut self) {
         self.inner.install(Stream::Video, None);
     }
 
     /// Return to the SDK's own audio memory.
+    #[doc(alias = "NDIlib_recv_set_audio_allocator")]
     pub fn reset_audio_allocator(&mut self) {
         self.inner.install(Stream::Audio, None);
     }
@@ -1841,8 +1888,7 @@ mod tests {
             // SAFETY: these intentionally invalid descriptors all fail validation
             // before a loan is accepted; none is accessed, published or released.
             let rejected = unsafe { AllocationBuffer::from_pool(request, &pool, block) }
-                .err()
-                .expect("invalid block must be refused");
+                .expect_err("invalid block must be refused");
             assert!(matches!(rejected.error(), Error::InvalidInput(actual) if actual == &expected));
             assert_eq!(rejected.into_inner(), block);
             assert_eq!(pool.releases.load(Ordering::Relaxed), 0);
@@ -3038,8 +3084,7 @@ mod tests {
         let refused = |storage: OwnedStorage, expected: crate::InputDefect| {
             let address = storage.pointer();
             let rejected = AllocationBuffer::from_external(request, storage)
-                .err()
-                .expect("the storage does not fit the request");
+                .expect_err("the storage does not fit the request");
             assert!(matches!(rejected.error(), Error::InvalidInput(reason) if *reason==expected));
             assert_eq!(rejected.into_inner().pointer(), address);
         };
@@ -3055,8 +3100,7 @@ mod tests {
             request,
             Misaligned(OwnedStorage::zeroed(128).unwrap()),
         )
-        .err()
-        .expect("the storage is misaligned");
+        .expect_err("the storage is misaligned");
         assert!(matches!(
             rejected.error(),
             Error::InvalidInput(crate::InputDefect::ExternalAllocationAlignment)
