@@ -391,10 +391,12 @@ mod tests {
 
     #[test]
     fn p216_output_reports_initialized_storage_without_extra_room() {
-        let layout =
-            ValidatedVideoLayout::new_uncompressed(PixelFormat::P216, 12, 4, None).unwrap();
-        let mut bytes = vec![0; layout.data_len_bytes()];
-        let output = P216Output::new(layout, &mut bytes).unwrap();
+        let mut frame = VideoFrame::builder()
+            .resolution(12, 4)
+            .pixel_format(PixelFormat::P216)
+            .build()
+            .unwrap();
+        let output = P216Output::new(&mut frame);
         assert_eq!(
             output.initialized(),
             crate::frames::Initialized::Storage { room_after: 0 }
