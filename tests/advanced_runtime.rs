@@ -7,6 +7,9 @@
 //! build: the Advanced API is the same with and without the SDK's headers.
 #![cfg(feature = "advanced")]
 
+#[path = "support/hx_fixture.rs"]
+mod hx_fixture;
+
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
@@ -3064,7 +3067,7 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
             .color_format(grafton_ndi::ReceiverColorFormat::Best444),
     )
     .unwrap();
-    let bitstream = include_bytes!("data/chroma-444.hevc");
+    let bitstream = hx_fixture::hevc();
     // This encoder emits VPS, SPS and PPS before the IDR. A NAL header's type
     // is its first byte's bits 1 to 6, and types below 32 are slices.
     let parameter_sets = parameter_sets(bitstream, |header| ((header >> 1) & 0x3f) < 32);
@@ -3108,7 +3111,7 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
 }
 
 /// The H.264 test picture's quadrants as (luma, Cb, Cr): top left, top right,
-/// bottom left, bottom right. `tests/data/generate.py` states the same.
+/// bottom left, bottom right. `tests/support/generate_hx.py` states the same.
 const H264_QUADRANTS: [[u8; 3]; 4] = [[48, 96, 176], [96, 176, 96], [160, 64, 128], [208, 160, 64]];
 
 /// H.264 is the NDI|HX codec the Advanced SDK manual documents as decoded
@@ -3137,7 +3140,7 @@ fn h264_420_decodes_to_the_original_quadrants() {
             .color_format(ReceiverColorFormat::UyvyBgra),
     )
     .unwrap();
-    let bitstream = include_bytes!("data/quadrants-420.h264");
+    let bitstream = hx_fixture::h264();
     // x264 emits SPS and PPS before the IDR. A NAL header's type is its first
     // byte's low five bits, and types 1 to 5 are slices.
     let parameter_sets = parameter_sets(bitstream, |header| matches!(header & 0x1f, 1..=5));
@@ -3203,7 +3206,7 @@ fn concurrent_keyframe_waiters_observe_the_same_request() {
     let format = VideoPacketFormat::new(VideoCodec::H264, 64, 64)
         .unwrap()
         .with_frame_rate(FrameRate::new(30, 1).unwrap());
-    let bitstream = include_bytes!("data/quadrants-420.h264");
+    let bitstream = hx_fixture::h264();
     let parameter_sets = parameter_sets(bitstream, |header| matches!(header & 0x1f, 1..=5));
     let bytes =
         PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, bitstream, parameter_sets).unwrap();
@@ -3862,7 +3865,7 @@ fn borrowed_packet_capture_decodes_formats_outside_its_preset() {
         PassthroughPreset::SpeedHq,
     )
     .unwrap();
-    let bitstream = include_bytes!("data/quadrants-420.h264");
+    let bitstream = hx_fixture::h264();
     let config = parameter_sets(bitstream, |header| matches!(header & 0x1f, 1..=5));
     let format = VideoPacketFormat::new(VideoCodec::H264, 64, 64)
         .unwrap()

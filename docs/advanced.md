@@ -273,48 +273,17 @@ outstanding SDK allocations still retain their policies. See
 [`advanced_allocator`](../examples/advanced_allocator.rs), including the
 explicit process-lifetime opt-in and padded-stride policy.
 
-### Pool cycle overhead, November 2026
-
-The ignored `custom_allocation_cycle_cost` harness compares buffers constructed
-inside the policy with `from_external` and `from_pool`, plus a preboxed reference.
-It ran 100,000 cycles per case for a 1920×1080 UYVY request, using sixteen aligned
-backing blocks allocated before timing. The same-thread case measures allocation
-through free; the other cases include an eight-entry bounded channel from one
-or four allocating threads to one freeing thread, and measure each allocation's
-start through completed release. Those patterns include queueing and registry
-contention, rather than isolating a function-call cost. The preboxed reference
-prepares its handle before each cycle's clock, excluding both pool claim and
-boxing; it establishes bookkeeping overhead, not an end-to-end policy cost.
-
-The host was Linux x86-64, Intel Xeon w7-2475X, Rust 1.100.0, locked dependencies
-and the default release profile. Concurrent development work shared the host;
-these are two runs' median and 99th-percentile nanoseconds, with no affinity or
-core isolation. Run-to-run variation is visible; they do not establish a general
-timing advantage. Unit tests
-separately establish zero allocations when a pool policy constructs its buffer
-inside the callback, versus one allocation for an arbitrary external handle.
+The ignored allocation-cycle harness compares pool and external-handle paths
+under same-thread and concurrent callback/free workloads:
 
 ```sh
 cargo test --release --locked --features advanced --lib \
   custom_allocation_cycle_cost -- --ignored --nocapture
 ```
 
-| Path | Thread pattern | Median ns, runs 1 / 2 | p99 ns, runs 1 / 2 |
-| --- | --- | ---: | ---: |
-| External | same-thread | 241 / 308 | 281 / 360 |
-| External | one-to-one | 5660 / 6758 | 10711 / 11267 |
-| External | four-to-one | 20224 / 19561 | 49735 / 44490 |
-| Pool | same-thread | 222 / 288 | 500 / 342 |
-| Pool | one-to-one | 5125 / 4900 | 16406 / 11305 |
-| Pool | four-to-one | 19669 / 19793 | 44083 / 42089 |
-| Preboxed | same-thread | 210 / 209 | 248 / 268 |
-| Preboxed | one-to-one | 5581 / 5653 | 10484 / 10341 |
-| Preboxed | four-to-one | 19097 / 19945 | 45143 / 46074 |
-
-The allocation-free pool constructor avoids one global-allocator call and free
-per frame without changing registry locking. Its Arc still incurs reference
-count traffic. Measure representative callback/free concurrency before drawing
-latency or throughput conclusions.
+Measure representative callback/free concurrency before drawing latency or
+throughput conclusions. The [pool-constructor issue](https://github.com/GrantSparks/grafton-ndi/issues/246#issuecomment-6901596756)
+retains the historical measurements and their limits.
 
 ## Synchronization
 

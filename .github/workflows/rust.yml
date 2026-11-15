@@ -337,6 +337,16 @@ jobs:
         run: |
           if (!(Test-Path 'C:\Program Files\LLVM\bin\clang.exe')) { choco install llvm --version=20.1.8 -y }
           'LIBCLANG_PATH=C:\Program Files\LLVM\bin' | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: NDI HX fixture encoder
+        if: contains(matrix.package, 'advanced')
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            case "$RUNNER_OS" in
+              Linux) sudo apt-get install --yes --no-install-recommends ffmpeg ;;
+              macOS) brew install ffmpeg ;;
+              Windows) choco install ffmpeg --no-progress -y ;;
+            esac
+          fi
       # The only step that is given the acquisition secrets. It exports
       # NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 for the steps that follow, and copies
       # a row's `hx-driver` beside that runtime. The compatibility runs' baseline
