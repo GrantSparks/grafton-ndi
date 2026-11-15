@@ -1022,28 +1022,32 @@ pub unsafe extern "C" fn NDIlib_send_send_audio_scatter(
 ) {}
 
 /// Export the Advanced entry points that create an object from its settings
-/// and a configuration. Each logs its call and creates nothing.
+/// and a configuration. Each logs its call; `fake_configured_success` delegates
+/// to the plain object constructor, while other variants create nothing.
 #[cfg(fake_configured_creation)]
 macro_rules! configured_creation {
-    ($($name:ident($Settings:ty) -> $Instance:ty;)+) => {$(
+    ($($name:ident($Settings:ty) -> $Instance:ty = $plain:path;)+) => {$(
         #[no_mangle]
         pub unsafe extern "C" fn $name(
             _p_create_settings: *const $Settings,
             _p_config_data: *const c_char,
         ) -> $Instance {
             log(stringify!($name));
-            std::ptr::null_mut()
+            #[cfg(fake_configured_success)]
+            { unsafe { $plain(_p_create_settings) } }
+            #[cfg(not(fake_configured_success))]
+            { std::ptr::null_mut() }
         }
     )+};
 }
 
 #[cfg(fake_configured_creation)]
 configured_creation! {
-    NDIlib_routing_create_v2(NDIlib_routing_create_t) -> NDIlib_routing_instance_t;
-    NDIlib_send_advertiser_create_ex(NDIlib_send_advertiser_create_t) -> NDIlib_send_advertiser_instance_t;
-    NDIlib_recv_advertiser_create_ex(NDIlib_recv_advertiser_create_t) -> NDIlib_recv_advertiser_instance_t;
-    NDIlib_send_listener_create_ex(NDIlib_send_listener_create_t) -> NDIlib_send_listener_instance_t;
-    NDIlib_recv_listener_create_ex(NDIlib_recv_listener_create_t) -> NDIlib_recv_listener_instance_t;
+    NDIlib_routing_create_v2(NDIlib_routing_create_t) -> NDIlib_routing_instance_t = objects::NDIlib_routing_create;
+    NDIlib_send_advertiser_create_ex(NDIlib_send_advertiser_create_t) -> NDIlib_send_advertiser_instance_t = objects::NDIlib_send_advertiser_create;
+    NDIlib_recv_advertiser_create_ex(NDIlib_recv_advertiser_create_t) -> NDIlib_recv_advertiser_instance_t = objects::NDIlib_recv_advertiser_create;
+    NDIlib_send_listener_create_ex(NDIlib_send_listener_create_t) -> NDIlib_send_listener_instance_t = discovery::NDIlib_send_listener_create;
+    NDIlib_recv_listener_create_ex(NDIlib_recv_listener_create_t) -> NDIlib_recv_listener_instance_t = discovery::NDIlib_recv_listener_create;
 }
 
 #[cfg(not(fake_finder))]

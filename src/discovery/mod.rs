@@ -183,13 +183,275 @@ fn not_created(object: &str, server: Option<&str>) -> crate::Error {
     })
 }
 
-/// A native object handle, which is null when the SDK created nothing.
-trait Handle: Copy {
+/// A native Discovery Server identity. Handles move between threads, while
+/// their owners determine every other auto trait and serialize native calls.
+trait Handle: Copy + Send {
     fn is_null(self) -> bool;
 }
 
-impl<T> Handle for *mut T {
-    fn is_null(self) -> bool {
-        <*mut T>::is_null(self)
+trait ServerOptions {
+    fn server(&self) -> Option<&str>;
+    #[cfg(feature = "advanced")]
+    fn config(&self) -> Option<&crate::advanced::AdvancedConfig>;
+}
+
+impl ServerOptions for AdvertiserOptions {
+    fn server(&self) -> Option<&str> {
+        self.configured_servers()
+    }
+    #[cfg(feature = "advanced")]
+    fn config(&self) -> Option<&crate::advanced::AdvancedConfig> {
+        self.configured_config()
+    }
+}
+
+impl ServerOptions for ListenerOptions {
+    fn server(&self) -> Option<&str> {
+        self.configured_server()
+    }
+    #[cfg(feature = "advanced")]
+    fn config(&self) -> Option<&crate::advanced::AdvancedConfig> {
+        self.configured_config()
+    }
+}
+
+/// The shared native lifecycle of all four Discovery Server object kinds.
+trait ServerApi: crate::sys::Table + Sync {
+    type Instance: Handle;
+    type Settings;
+    type Options: ServerOptions;
+    const OBJECT: &'static str;
+    const SINGLE_ENDPOINT: bool;
+    #[cfg(feature = "advanced")]
+    type Configured: crate::sys::Table;
+    #[cfg(feature = "advanced")]
+    const CONFIGURED: &'static str;
+
+    fn settings(url: *const std::ffi::c_char) -> Self::Settings;
+    /// # Safety
+    /// Settings point to a null URL or a terminated string kept alive through
+    /// native destruction. The result is null or a fresh, exclusively owned object.
+    unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance;
+    /// # Safety
+    /// As for `create`; configuration is terminated and also remains live
+    /// through destruction, and `table` belongs to the same runtime.
+    #[cfg(feature = "advanced")]
+    unsafe fn create_configured(
+        table: &'static Self::Configured,
+        settings: *const Self::Settings,
+        config: *const std::ffi::c_char,
+    ) -> Self::Instance;
+    /// # Safety
+    /// The instance was created through this table, remains live, and is never
+    /// used after this call. No native call on the instance overlaps destruction.
+    unsafe fn destroy(&self, instance: Self::Instance);
+}
+
+macro_rules! server_api {
+    ($Table:ty, $Handle:ident, $Raw:ty, $Settings:ident, $Options:ty,
+     $object:literal, $single:literal, $create:ident, $destroy:ident,
+     $Configured:ident::$configured:ident) => {
+        #[derive(Clone, Copy)]
+        struct $Handle($Raw);
+        // SAFETY: Discovery Server objects have no thread affinity. Their
+        // ServerObject has one owner and this raw handle withholds Sync, so
+        // membership calls and destruction cannot overlap. Ownership of Rust
+        // state remains checked separately by the compiler.
+        unsafe impl Send for $Handle {}
+        impl Handle for $Handle {
+            fn is_null(self) -> bool { self.0.is_null() }
+        }
+        impl ServerApi for $Table {
+            type Instance = $Handle;
+            type Settings = $Settings;
+            type Options = $Options;
+            const OBJECT: &'static str = $object;
+            const SINGLE_ENDPOINT: bool = $single;
+            #[cfg(feature = "advanced")]
+            type Configured = crate::sys::advanced::$Configured;
+            #[cfg(feature = "advanced")]
+            const CONFIGURED: &'static str = stringify!($configured);
+            fn settings(url: *const std::ffi::c_char) -> Self::Settings {
+                $Settings { p_url_address: url }
+            }
+            unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance {
+                // SAFETY: forwarded to the caller's lifecycle contract.
+                $Handle(unsafe { self.$create(settings) })
+            }
+            #[cfg(feature = "advanced")]
+            unsafe fn create_configured(
+                table: &'static Self::Configured,
+                _settings: *const Self::Settings,
+                _config: *const std::ffi::c_char,
+            ) -> Self::Instance {
+                crate::sys::advanced::native!($Configured, table => {
+                    // SAFETY: forwarded to the caller's lifecycle contract.
+                    $Handle(unsafe { table.$configured(_settings, _config) })
+                })
+            }
+            unsafe fn destroy(&self, instance: Self::Instance) {
+                // SAFETY: forwarded to the caller's lifecycle contract.
+                unsafe { self.$destroy(instance.0) }
+            }
+        }
+    };
+}
+
+use crate::sys::{self, bindings::*};
+server_api!(
+    sys::SenderAdvertising,
+    SendAdvertiserInstance,
+    NDIlib_send_advertiser_instance_t,
+    NDIlib_send_advertiser_create_t,
+    AdvertiserOptions,
+    "advertiser",
+    false,
+    NDIlib_send_advertiser_create,
+    NDIlib_send_advertiser_destroy,
+    SenderAdvertiserConfiguration::NDIlib_send_advertiser_create_ex
+);
+server_api!(
+    sys::ReceiverAdvertising,
+    RecvAdvertiserInstance,
+    NDIlib_recv_advertiser_instance_t,
+    NDIlib_recv_advertiser_create_t,
+    AdvertiserOptions,
+    "advertiser",
+    false,
+    NDIlib_recv_advertiser_create,
+    NDIlib_recv_advertiser_destroy,
+    ReceiverAdvertiserConfiguration::NDIlib_recv_advertiser_create_ex
+);
+server_api!(
+    sys::SenderDiscovery,
+    SendListenerInstance,
+    NDIlib_send_listener_instance_t,
+    NDIlib_send_listener_create_t,
+    ListenerOptions,
+    "listener",
+    true,
+    NDIlib_send_listener_create,
+    NDIlib_send_listener_destroy,
+    SenderListenerConfiguration::NDIlib_send_listener_create_ex
+);
+server_api!(
+    sys::ReceiverDiscovery,
+    RecvListenerInstance,
+    NDIlib_recv_listener_instance_t,
+    NDIlib_recv_listener_create_t,
+    ListenerOptions,
+    "listener",
+    true,
+    NDIlib_recv_listener_create,
+    NDIlib_recv_listener_destroy,
+    ReceiverListenerConfiguration::NDIlib_recv_listener_create_ex
+);
+
+/// Own every value the SDK may retain until its object is destroyed.
+struct ServerObject<A: ServerApi> {
+    instance: Option<A::Instance>,
+    api: &'static A,
+    _url: Option<std::ffi::CString>,
+    #[cfg(feature = "advanced")]
+    _config: Option<crate::advanced::AdvancedConfig>,
+    _ndi: crate::Ndi,
+}
+
+impl<A: ServerApi> ServerObject<A> {
+    fn new(ndi: &crate::Ndi, options: &A::Options) -> crate::Result<Self> {
+        #[cfg(feature = "advanced")]
+        if let Some(config) = options.config() {
+            use crate::advanced::Configurable;
+            // SAFETY: the configured entry point obeys the shared lifecycle.
+            return unsafe {
+                Self::configured(
+                    ndi,
+                    options,
+                    A::CONFIGURED,
+                    config,
+                    |table: &'static A::Configured, settings, text| {
+                        A::create_configured(table, settings, text)
+                    },
+                )
+            };
+        }
+        // SAFETY: the plain entry point obeys the shared lifecycle.
+        unsafe {
+            Self::create(
+                ndi,
+                options,
+                #[cfg(feature = "advanced")]
+                None,
+                |api, settings| api.create(settings),
+            )
+        }
+    }
+
+    /// # Safety
+    /// `create` obeys ServerApi's fresh-instance and settings lifetime contract.
+    unsafe fn create(
+        ndi: &crate::Ndi,
+        options: &A::Options,
+        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
+        create: impl FnOnce(&'static A, &A::Settings) -> A::Instance,
+    ) -> crate::Result<Self> {
+        // Configured gates run first and include this table's own capability.
+        let api = ndi.table::<A>()?;
+        let server = options.server();
+        if A::SINGLE_ENDPOINT && server.is_some_and(|s| s.contains(',')) {
+            return Err(crate::Error::InvalidInput(
+                "a listener accepts one Discovery Server endpoint".into(),
+            ));
+        }
+        let url = server.map(std::ffi::CString::new).transpose()?;
+        let settings = A::settings(url.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()));
+        let instance = create(api, &settings);
+        if instance.is_null() {
+            return Err(not_created(A::OBJECT, server));
+        }
+        Ok(Self {
+            instance: Some(instance),
+            api,
+            _url: url,
+            #[cfg(feature = "advanced")]
+            _config: config,
+            _ndi: ndi.clone(),
+        })
+    }
+
+    fn instance(&self) -> A::Instance {
+        // Only teardown consumes the handle, after the owner's last operation.
+        self.instance.expect("live Discovery Server object")
+    }
+
+    fn destroy(&mut self) {
+        if let Some(instance) = self.instance.take() {
+            // SAFETY: this owner destroys its object once, while all retained
+            // creation storage and the selected runtime are still alive.
+            unsafe { self.api.destroy(instance) };
+        }
+    }
+}
+
+#[cfg(feature = "advanced")]
+impl<A: ServerApi> crate::advanced::Configurable for ServerObject<A> {
+    type Options = A::Options;
+    type Settings = A::Settings;
+    type Instance = A::Instance;
+    unsafe fn create_with(
+        ndi: &crate::Ndi,
+        options: &Self::Options,
+        _operation: &'static str,
+        config: crate::advanced::AdvancedConfig,
+        create: impl FnOnce(&Self::Settings) -> Self::Instance,
+    ) -> crate::Result<Self> {
+        // SAFETY: forwarded to the caller's fresh-instance obligation.
+        unsafe { Self::create(ndi, options, Some(config), |_, settings| create(settings)) }
+    }
+}
+
+impl<A: ServerApi> Drop for ServerObject<A> {
+    fn drop(&mut self) {
+        self.destroy();
     }
 }
