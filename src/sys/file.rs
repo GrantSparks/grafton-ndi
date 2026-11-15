@@ -422,12 +422,16 @@ mod tests {
         for lacking in std::iter::once(None).chain(every_symbol.map(Some)) {
             let library = library(|name| Some(name) != lacking).unwrap();
             for family in FileFamily::ALL {
-                let refused = match family {
-                    FileFamily::Playback => refusal(library.table::<FilePlayback>()),
-                    FileFamily::Recording => refusal(library.table::<FileRecording>()),
-                };
+                let ((refused, status), allocations) = crate::test_alloc::allocation_count(|| {
+                    let refused = match family {
+                        FileFamily::Playback => refusal(library.table::<FilePlayback>()),
+                        FileFamily::Recording => refusal(library.table::<FileRecording>()),
+                    };
+                    (refused, library.status(family))
+                });
                 let context = format!("{family:?} lacking {lacking:?}");
-                match library.status(family) {
+                assert_eq!(allocations, 0, "{context}");
+                match status {
                     CapabilityStatus::Available => assert_eq!(refused, None, "{context}"),
                     CapabilityStatus::Unavailable(reason) => {
                         let (refused_family, detail) = refused.expect(&context);

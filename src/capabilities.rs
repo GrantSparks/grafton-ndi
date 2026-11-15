@@ -1018,6 +1018,24 @@ mod tests {
                         fixture.capabilities.decision(required)
                     );
                 }
+
+                // Both fail: the capability's own missing symbol must win
+                // over a required family's symbol or version refusal.
+                let both_refused = Fixture::new(
+                    |name| {
+                        name.as_bytes() != missing.to_bytes()
+                            && (!name.starts_with("NDIlib_routing_") || name.ends_with("_v2"))
+                    },
+                    Some("6.1.1.0"),
+                    SdkEdition::Advanced,
+                );
+                assert!(both_refused.capabilities.decision(required).is_err());
+                if AdvancedApi::declares(feature) {
+                    assert_eq!(
+                        refusal(both_refused.evidence().require(feature)),
+                        Err((feature, CapabilityRefusal::SymbolUnavailable(missing)))
+                    );
+                }
             }
         }
         for preset in PassthroughPreset::ALL {
@@ -1062,22 +1080,52 @@ mod tests {
     }
 
     #[test]
-    fn capability_refusals_allocate_nothing() {
-        let fixture = Fixture::new(
-            |name| name != "NDIlib_routing_create",
-            Some("6.4.0.2"),
-            SdkEdition::Standard,
-        );
-        let (error, allocations) = crate::test_alloc::allocation_count(|| {
-            fixture.evidence().require(RuntimeFeature::Routing)
-        });
-        assert_eq!(allocations, 0);
-        assert!(matches!(
-            error,
-            Err(Error::UnsupportedCapability {
-                refusal: CapabilityRefusal::SymbolUnavailable(_),
-                ..
-            })
-        ));
+    fn capability_status_and_every_gate_allocate_nothing() {
+        // Build the fixture and feature list before tracking. Exercise real
+        // refusal paths, including declarations, edition, symbols and versions,
+        // rather than only constructing the public refusal enum.
+        let features = every_feature();
+        let mut total_refused = 0;
+        for (version, edition) in [
+            (Some("6.4.0.2"), SdkEdition::Advanced),
+            (Some("6.4.0.2"), SdkEdition::Standard),
+            (Some("6.1.1.0"), SdkEdition::Advanced),
+            (None, SdkEdition::Advanced),
+        ] {
+            for missing in [
+                None,
+                Some("NDIlib_routing_create"),
+                Some("NDIlib_recv_create_v4"),
+            ] {
+                let fixture = Fixture::new(|name| Some(name) != missing, version, edition);
+                let (refused, allocations) = crate::test_alloc::allocation_count(|| {
+                    let evidence = fixture.evidence();
+                    let mut refused = 0;
+                    for &feature in &features {
+                        refused += usize::from(evidence.require(feature).is_err());
+                        let _ = fixture.capabilities.status(feature);
+                    }
+                    for &(_, _, gate) in Api::GATES {
+                        let _ = gate(evidence);
+                    }
+                    let _ = crate::sys::Planar444Video::within(evidence);
+                    let _ = crate::sys::ReceiveBest444::within(evidence);
+                    let _ = crate::sys::ReceiveVideoOnly::within(evidence);
+                    #[cfg(feature = "advanced")]
+                    {
+                        for &(_, _, gate) in crate::sys::advanced::GATES {
+                            let _ = gate(evidence);
+                        }
+                        for preset in PassthroughPreset::ALL {
+                            let _ = evidence.passthrough_format(preset);
+                        }
+                    }
+                    refused
+                });
+                assert_eq!(allocations, 0, "{version:?} {edition:?} {missing:?}");
+                total_refused += refused;
+            }
+        }
+        assert!(total_refused > 0);
     }
 }
