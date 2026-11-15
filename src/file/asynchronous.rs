@@ -1010,7 +1010,10 @@ impl RecorderOwner {
         events: &EventQueue<RecorderEvent>,
     ) -> Result<u64> {
         self.recorder
-            .start_with_sink(target, timecode, &mut |event| events.push(event))
+            .start_with_sink(target, timecode, &mut |event| {
+                events.push(event);
+                Ok(())
+            })
     }
 
     fn reset(&mut self, options: &RecorderOptions) -> Result<RecordingReport> {
@@ -1041,17 +1044,38 @@ impl RecorderOwner {
     }
 }
 
-impl std::ops::Deref for RecorderOwner {
-    type Target = FileRecorder;
-
-    fn deref(&self) -> &Self::Target {
-        &self.recorder
+// Commands are explicit so a worker closure cannot accidentally call a
+// blocking FileRecorder method or bypass the owner's reset bookkeeping.
+impl RecorderOwner {
+    fn request_stop(&mut self) -> StopRequest {
+        self.recorder.request_stop()
     }
-}
-
-impl std::ops::DerefMut for RecorderOwner {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.recorder
+    fn state(&self) -> RecorderState {
+        self.recorder.state()
+    }
+    fn report(&self) -> RecordingReport {
+        self.recorder.report()
+    }
+    fn is_recording(&self) -> bool {
+        self.recorder.is_recording()
+    }
+    fn set_source(&mut self, source: &SourceSpec) -> Result<()> {
+        self.recorder.set_source(source)
+    }
+    fn last_accepted_source(&self) -> Option<&SourceSpec> {
+        self.recorder.last_accepted_source()
+    }
+    fn reported_current_file(&self) -> Option<&EventText> {
+        self.recorder.reported_current_file()
+    }
+    fn rollover(&mut self, target: &RecordingTarget) -> Result<()> {
+        self.recorder.rollover(target)
+    }
+    fn inject_metadata<S: MetadataSource + ?Sized>(&mut self, metadata: &S) -> Result<()> {
+        self.recorder.inject_metadata(metadata)
+    }
+    fn stats(&self) -> Result<Option<RecorderStats>> {
+        self.recorder.stats()
     }
 }
 
@@ -3125,6 +3149,69 @@ mod tests {
         let (reply, finishing) = operation();
         owner.finish(deadline, true, reply);
         (device, owner, finishing)
+    }
+
+    #[test]
+    fn reset_identity_ends_waiters_without_the_owners_explicit_drain() {
+        let deadline = Deadline::after(Duration::from_secs(30)).unwrap();
+        let (_device, mut owner, finishing) = local_finishing_recorder(deadline);
+        let replacement = mock::Recorder::new(Closing::AtStop);
+        replacement.install();
+        // Deliberately bypass RecorderOwner::reset: the generation mismatch
+        // alone must prevent following the inherited report or a new session.
+        owner
+            .recorder
+            .reset(&RecorderOptions::new(
+                SourceSpec::new("replacement").unwrap(),
+            ))
+            .unwrap();
+        owner.settle_at(
+            false,
+            &EventQueue::new(16),
+            &Control::new(),
+            false,
+            Instant::now(),
+        );
+        assert!(matches!(
+            block_on(finishing),
+            Err(Error::InvalidState(StateError::Closed))
+        ));
+    }
+
+    #[test]
+    fn failed_inner_reset_keeps_waiters_on_the_original_identity() {
+        let deadline = Deadline::after(Duration::from_secs(30)).unwrap();
+        let (device, mut owner, finishing) = local_finishing_recorder(deadline);
+        let replacement = mock::Recorder::new(Closing::AtStop);
+        replacement.refuse_creation.store(true, Ordering::Release);
+        replacement.install();
+        assert!(owner
+            .recorder
+            .reset(&RecorderOptions::new(
+                SourceSpec::new("replacement").unwrap()
+            ))
+            .is_err());
+        owner.settle_at(
+            false,
+            &EventQueue::new(16),
+            &Control::new(),
+            false,
+            Instant::now(),
+        );
+        assert!(!lock(&finishing.response).completed);
+        device.close();
+        while owner.poll_native().unwrap().is_some() {}
+        owner.settle_at(
+            true,
+            &EventQueue::new(16),
+            &Control::new(),
+            false,
+            Instant::now(),
+        );
+        assert!(matches!(
+            block_on(finishing).unwrap(),
+            FinishStatus::Closed(_)
+        ));
     }
 
     #[test]

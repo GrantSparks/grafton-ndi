@@ -332,9 +332,16 @@ pub(super) trait FinishReply {
     fn complete(self, result: Result<FinishStatus>);
 }
 
+/// A recording session belongs to exactly one native recorder generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionId {
+    recorder: u64,
+    session: u64,
+}
+
 struct FinishWaiter<R> {
     deadline: Deadline,
-    session: u64,
+    session: SessionId,
     reply: R,
 }
 
@@ -368,7 +375,7 @@ impl<R: FinishReply> FinishWaiters<R> {
         } else if !reply.cancelled() {
             self.waiters.push(FinishWaiter {
                 deadline,
-                session: recorder.ledger.report.session,
+                session: recorder.session_id(),
                 reply,
             });
         }
@@ -425,7 +432,7 @@ impl<R: FinishReply> FinishWaiters<R> {
             }
             drained = true;
         }
-        let session = recorder.ledger.report.session;
+        let session = recorder.session_id();
         let mut index = 0;
         while index < self.waiters.len() {
             let waiter = &self.waiters[index];
@@ -765,6 +772,7 @@ pub struct FileRecorder {
     /// How the recorder names its files.
     naming: NamePattern,
     ledger: Ledger,
+    generation: u64,
     /// The SDK has not yet been told to stop the session started last. It
     /// needs to be, even when it ended that session itself: until then it
     /// refuses to start another.
@@ -822,6 +830,7 @@ impl FileRecorder {
             accepted_source: Some(options.source.clone()),
             naming: resolved.naming,
             ledger: Ledger::idle(),
+            generation: 0,
             native_stop_owed: false,
             _api: api,
             _thread: PhantomData,
@@ -840,6 +849,13 @@ impl FileRecorder {
     /// What the events taken so far have shown about the current session.
     pub fn report(&self) -> RecordingReport {
         self.ledger.report.clone()
+    }
+
+    fn session_id(&self) -> SessionId {
+        SessionId {
+            recorder: self.generation,
+            session: self.ledger.report.session,
+        }
     }
 
     /// Start a session writing to `target`, and return its number.
@@ -880,14 +896,14 @@ impl FileRecorder {
     ///   that event, counted in no session's report. Retrying `start` discards
     ///   queued events before asking the SDK to start again.
     pub fn start(&mut self, target: &RecordingTarget, timecode: RecordingTimecode) -> Result<u64> {
-        self.start_with_sink(target, timecode, &mut |_| {})
+        self.start_with_sink(target, timecode, &mut |event| event.map(|_| ()))
     }
 
     pub(super) fn start_with_sink(
         &mut self,
         target: &RecordingTarget,
         timecode: RecordingTimecode,
-        sink: &mut impl FnMut(Result<RecorderEvent>),
+        sink: &mut impl FnMut(Result<RecorderEvent>) -> Result<()>,
     ) -> Result<u64> {
         if self.ledger.cleanup_pending() {
             return Err(Error::InvalidState(StateError::PreviousSessionOpen));
@@ -931,10 +947,20 @@ impl FileRecorder {
 
     /// Take events until the queue is empty, so that none from an earlier
     /// session is attributed to the next one.
-    fn discard_stale_events(&mut self, sink: &mut impl FnMut(Result<RecorderEvent>)) -> Result<()> {
+    fn discard_stale_events(
+        &mut self,
+        sink: &mut impl FnMut(Result<RecorderEvent>) -> Result<()>,
+    ) -> Result<()> {
         let mut budget = DrainBudget::late();
         for _ in 0..STALE_EVENT_LIMIT {
-            if self.pump(&mut budget, Duration::ZERO, sink).drained {
+            let mut error = None;
+            let polled = self.pump(&mut budget, Duration::ZERO, &mut |event| {
+                error = sink(event).err();
+            });
+            if let Some(error) = error {
+                return Err(error);
+            }
+            if polled.drained {
                 return Ok(());
             }
         }
@@ -1209,7 +1235,7 @@ impl FileRecorder {
         }
         // No new polls after this budget was spent. Resolve anything still
         // pending as a timeout (or Closed for an async close).
-        let session = self.ledger.report.session;
+        let session = self.session_id();
         for waiter in waiters.waiters.drain(..) {
             let outcome = if waiter.session != session || closing() {
                 Err(Error::InvalidState(StateError::Closed))
@@ -1248,7 +1274,12 @@ impl FileRecorder {
     ///
     /// The errors of [`FileApi::create_recorder`].
     pub fn reset(&mut self, options: &RecorderOptions) -> Result<RecordingReport> {
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("the recorder generation is exhausted".into()))?;
         let mut replacement = Self::create(self._api.clone(), options)?;
+        replacement.generation = generation;
         replacement.ledger = Ledger::inheriting(self.report());
         Ok(std::mem::replace(self, replacement).abandon())
     }

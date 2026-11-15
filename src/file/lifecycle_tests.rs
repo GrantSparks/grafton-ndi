@@ -620,6 +620,25 @@ fn finishing_a_session_the_sdk_is_ending_itself_still_tells_it_to_stop() {
 }
 
 #[test]
+fn a_malformed_stale_event_refuses_sync_start_before_the_native_call() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    device.install();
+    let mut recorder = mock::recorder_api()
+        .create_recorder(&RecorderOptions::new(
+            SourceSpec::new("mock source").unwrap(),
+        ))
+        .unwrap();
+    device.push(mock::OPEN_FAILED, "old.mkv");
+    device.oversize_next_event.store(true, Ordering::Release);
+    assert!(matches!(
+        recorder.start(&target("malformed-stale"), RecordingTimecode::Preserve),
+        Err(Error::UnexpectedSdkResult(_))
+    ));
+    assert_eq!(device.starts.load(Ordering::Acquire), 0);
+    assert_eq!(recorder.state(), RecorderState::Idle);
+}
+
+#[test]
 fn a_refused_start_is_not_counted_in_any_session() {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
