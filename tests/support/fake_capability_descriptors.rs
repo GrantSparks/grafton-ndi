@@ -42,3 +42,54 @@ pub unsafe extern "C" fn NDIlib_avsync_free_audio(
 ) {
     log("avsync-free-audio");
 }
+
+#[cfg(fake_advanced)]
+struct GenlockState {
+    source: *const NDIlib_source_t,
+    config: *const std::ffi::c_char,
+}
+
+#[cfg(fake_advanced)]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_genlock_create(
+    source: *const NDIlib_source_t,
+    config: *const std::ffi::c_char,
+) -> *mut std::ffi::c_void {
+    log("genlock-create");
+    Box::into_raw(Box::new(GenlockState { source, config })).cast()
+}
+
+#[cfg(fake_advanced)]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_genlock_destroy(instance: *mut std::ffi::c_void) {
+    let state = unsafe { Box::from_raw(instance.cast::<GenlockState>()) };
+    let source = unsafe { &*state.source };
+    let name = unsafe { std::ffi::CStr::from_ptr(source.p_ndi_name) };
+    let config = unsafe { std::ffi::CStr::from_ptr(state.config) };
+    log(&format!("genlock-destroy:{}:{}", name.to_string_lossy(), config.to_string_lossy()));
+}
+
+#[cfg(fake_advanced)]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_genlock_connect(
+    instance: *mut std::ffi::c_void,
+    source: *const NDIlib_source_t,
+) {
+    unsafe { (*instance.cast::<GenlockState>()).source = source };
+}
+
+#[cfg(fake_advanced)]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_genlock_is_active(_instance: *mut std::ffi::c_void) -> bool { false }
+
+#[cfg(fake_advanced)]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_genlock_wait_video(
+    _instance: *mut std::ffi::c_void, _frame: *const NDIlib_video_frame_v2_t,
+) -> bool { false }
+
+#[cfg(fake_advanced)]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_genlock_wait_audio(
+    _instance: *mut std::ffi::c_void, _frame: *const NDIlib_audio_frame_v3_t,
+) -> bool { false }

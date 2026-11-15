@@ -2,13 +2,13 @@
 
 #[cfg(any(test, ndi_has_advanced_av_sync, ndi_has_advanced_genlock))]
 use std::ptr;
-use std::{cell::Cell, marker::PhantomData};
+use std::{cell::Cell, marker::PhantomData, sync::Arc};
 
 use super::{invalid_input, sdk_quantity, AdvancedConfig, ReceiverControls};
 use crate::{
     finder::RawSource,
     frames::MAX_AUDIO_BYTES,
-    receiver::AvSyncAttached,
+    receiver::{AvSyncAttached, ReceiverCore},
     sys::{
         advanced::{native, AvSync as AvSyncTable, Genlock as GenlockTable},
         bindings::*,
@@ -162,7 +162,7 @@ struct AvResource {
         not(ndi_has_advanced_av_sync),
         expect(dead_code, reason = "runtime authorizes native AV sync descriptors")
     )]
-    ndi: crate::Ndi,
+    receiver: Arc<ReceiverCore>,
     #[cfg(ndi_has_advanced_av_sync)]
     handle: AvSyncHandle,
     table: &'static AvSyncTable,
@@ -172,9 +172,8 @@ struct AvResource {
 // Advanced SDK manual (25.6.2) have it created from a receiver, used for as
 // long as it is needed and destroyed before that receiver, and state no
 // thread for any of its functions. Moving the handle changes only which
-// thread makes those calls: the receiver it reads is Send and moves with it,
-// inside the same AvSync, which destroys the synchronizer first, and AvSync is
-// not Sync, so its calls never overlap. `an_avsync_moves_between_threads` in
+// thread makes those calls: this resource retains the receiver core it reads
+// through destruction, and AvSync is not Sync, so its calls never overlap. `an_avsync_moves_between_threads` in
 // tests/advanced_runtime.rs creates, synchronizes and destroys one on three
 // threads against each runtime the tests use.
 unsafe impl Send for AvResource {}
@@ -182,8 +181,10 @@ unsafe impl Send for AvResource {}
 impl Drop for AvResource {
     fn drop(&mut self) {
         // SAFETY: the handle was created by this table and is destroyed once,
-        // while the receiver it reads from is still alive.
+        // while this resource still owns the receiver it reads.
         native!(AvSync, self.table => unsafe { self.table.NDIlib_avsync_destroy(self.handle) });
+        #[cfg(test)]
+        crate::receiver::lifecycle_test_events::record("avsync");
     }
 }
 
@@ -245,7 +246,6 @@ impl Drop for AvResource {
 /// # }
 /// ```
 pub struct AvSync {
-    // Declared first so that it is destroyed before the receiver it reads.
     resource: AvResource,
     receiver: Receiver<AvSyncAttached>,
     // `synchronize` takes `&self`, so withholding Sync keeps two
@@ -290,7 +290,7 @@ impl AvSync {
                 ));
             }
             Ok(Self {
-                resource: AvResource { handle, table, ndi: receiver.core._ndi.clone() },
+                resource: AvResource { handle, table, receiver: Arc::clone(&receiver.core) },
                 receiver: receiver.into_mode(),
                 _not_sync: NotSync(PhantomData),
             })
@@ -320,9 +320,8 @@ impl AvSync {
     /// }
     /// ```
     ///
-    /// The synchronizer reads this receiver's native instance, so the
-    /// receiver is never lent mutably, where it could be swapped for another
-    /// `AvSync`'s. [`controls`](Self::controls) reaches exclusive stream
+    /// The synchronizer retains this receiver's native core through its own
+    /// destruction. [`controls`](Self::controls) lends exclusive stream
     /// controls and KVM; [`split`](Self::split) keeps synchronization usable
     /// while a KVM session holds the receiver borrow.
     pub fn receiver(&self) -> &Receiver<AvSyncAttached> {
@@ -471,7 +470,7 @@ impl AvSyncCapture<'_> {
             // A copy of the frame's descriptor, pointing into the frame's own
             // buffers, which the borrow keeps allocated for the call, and
             // carrying the timestamp `AvSyncVideo::new` checked.
-            let video = _video.map(|video| video.descriptor(&self.resource.ndi)).transpose()?;
+            let video = _video.map(|video| video.descriptor(&self.resource.receiver._ndi)).transpose()?;
             let AvResource { handle, table, .. } = *self.resource;
             let mut returned = Returned {
                 audio: _request.raw(),
@@ -771,6 +770,8 @@ struct GenResource {
     handle: GenlockHandle,
     table: &'static GenlockTable,
     _ndi: Ndi,
+    source: Option<Box<RawSource>>,
+    _config: Option<AdvancedConfig>,
 }
 
 // SAFETY: a genlock belongs to no thread. Processing.NDI.Genlock.h and the
@@ -798,6 +799,7 @@ unsafe impl Sync for GenResource {}
 impl Drop for GenResource {
     fn drop(&mut self) {
         // SAFETY: the handle was created by this table and is destroyed once.
+        // This resource still owns the source descriptor and configuration here.
         native!(Genlock, self.table => unsafe { self.table.NDIlib_genlock_destroy(self.handle) });
     }
 }
@@ -840,10 +842,7 @@ impl Drop for GenResource {
 /// # }
 /// ```
 pub struct Genlock {
-    // Declared first so that it is destroyed before the strings it was given.
     resource: GenResource,
-    _source: Option<Box<RawSource>>,
-    _config: Option<AdvancedConfig>,
     // Through a shared reference only `is_active` is reached, and the SDK
     // documents only the two waits as safe on separate threads at once
     // (Processing.NDI.Genlock.h, Advanced SDK manual 25.5), not concurrent
@@ -888,9 +887,9 @@ impl Genlock {
                     handle,
                     table,
                     _ndi: ndi.clone(),
+                    source,
+                    _config: _config.cloned(),
                 },
-                _source: source,
-                _config: _config.cloned(),
                 _not_sync: NotSync(PhantomData),
             })
         })
@@ -917,7 +916,7 @@ impl Genlock {
                     _source.as_ref().map_or(ptr::null(), |source| &source.raw),
                 )
             };
-            self._source = _source;
+            self.resource.source = _source;
             Ok(())
         })
     }
@@ -1035,6 +1034,27 @@ fn audio_timing(sample_rate: u32, num_samples: u32) -> Result<NDIlib_audio_frame
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avsync_destroys_before_its_receiver_on_drop_and_recovery() {
+        use crate::receiver::lifecycle_test_events::track;
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        for recover in [false, true] {
+            let events = track(|| {
+                let receiver =
+                    Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new(""))).unwrap();
+                let sync = AvSync::new(receiver).unwrap();
+                if recover {
+                    drop(sync.into_receiver());
+                } else {
+                    drop(sync);
+                }
+            });
+            assert_eq!(events, ["avsync", "receiver"]);
+        }
+    }
 
     fn descriptor() -> NDIlib_audio_frame_v3_t {
         NDIlib_audio_frame_v3_t {
