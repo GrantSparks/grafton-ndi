@@ -539,14 +539,14 @@ fn malformed_player_options_are_refused_before_the_sdk_creates_a_player() {
 
 #[test]
 fn a_family_the_library_lacks_is_refused_as_that_capability_by_the_entry_point_it_is_missing() {
-    use crate::capabilities::{CapabilityStatus, CapabilityUnavailable};
+    use crate::capabilities::CapabilityUnavailable;
     let api = FileApi::with_runtime(sys::FileRuntime::test_double(
         Err(c"NDIlib_file_player_seek_to_frame"),
         Ok(mock::recording()),
     ));
     assert_eq!(
-        api.status(FileFamily::Playback),
-        CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+        (api.status(FileFamily::Playback)).reason(),
+        Some(CapabilityUnavailable::SymbolUnavailable)
     );
     assert!(!api.supports(FileFamily::Playback));
     assert!(api.supports(FileFamily::Recording));
@@ -559,11 +559,11 @@ fn a_family_the_library_lacks_is_refused_as_that_capability_by_the_entry_point_i
             .unwrap_err(),
         api.create_player(&PlayerOptions::new("")).unwrap_err(),
     ] {
-        let Error::FileFamilyUnavailable { family, detail } = error else {
+        let Error::FileFamilyUnavailable { family, missing } = error else {
             panic!("expected the playback family to be unavailable: {error}");
         };
         assert_eq!(family, FileFamily::Playback);
-        assert_eq!(detail, "NDIlib_file_player_seek_to_frame");
+        assert_eq!(missing, c"NDIlib_file_player_seek_to_frame");
     }
     // The family the library provides is unaffected.
     let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap());

@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use std::{ffi::NulError, fmt};
 
-use crate::capabilities::{CapabilityUnavailable, RuntimeFeature};
+use crate::capabilities::{CapabilityRefusal, RuntimeFeature};
 
 /// Why an async blocking operation could not run.
 ///
@@ -66,56 +66,28 @@ pub enum Error {
     /// An operation needs a capability this build or the selected runtime
     /// does not provide.
     ///
-    /// `feature` is the capability, and `reason` is the one
-    /// [`Capabilities::status`] reports for it, so a caller can branch on
-    /// either without reading text. Every operation that needs the capability
-    /// is refused this way before anything reaches the SDK, and
-    /// [`Ndi::require_feature`] reports the same error in advance. The
-    /// condition lasts for the life of the process: the runtime is selected
-    /// once, and a build that lacks a declaration has to be rebuilt, with the `advanced` feature
-    /// and with `NDI_SDK_DIR` naming an NDI Advanced SDK whose headers declare
-    /// it.
-    ///
-    /// [`Capabilities::status`]: crate::capabilities::Capabilities::status
-    /// [`Ndi::require_feature`]: crate::Ndi::require_feature
-    #[error(
-        "NDI capability {} is unavailable: {}",
-        .feature.name(),
-        Unavailability(.reason, .detail)
-    )]
+    /// `refusal` is the same typed evidence returned by
+    /// [`Capabilities::status`](crate::Capabilities::status). Every operation
+    /// is refused before reaching the SDK, and [`Ndi::require_feature`](crate::Ndi::require_feature)
+    /// reports the same value in advance. This condition lasts for the process
+    /// lifetime: selecting another runtime or supplying missing build declarations
+    /// requires a new process or build.
+    #[error("NDI capability {} is unavailable: {refusal}", .feature.name())]
     UnsupportedCapability {
         /// The capability, the same whichever operation it gates.
         feature: RuntimeFeature,
-        /// Why it is unavailable.
-        reason: CapabilityUnavailable,
-        /// The evidence: the entry point the runtime lacks (for
-        /// [`SymbolUnavailable`] and [`WrongEdition`]), the version the runtime reports
-        /// against the version required (for [`RuntimeTooOld`] and
-        /// [`RuntimeVersionUnknown`]), or the declaration this build lacks (for
-        /// [`BuildAbiUnavailable`]).
-        ///
-        /// Empty when there is no evidence beyond `reason`: for example, for a
-        /// runtime that exports the capability's entry point but is not an
-        /// Advanced SDK runtime, or a build without the `advanced` feature.
-        ///
-        /// [`SymbolUnavailable`]: CapabilityUnavailable::SymbolUnavailable
-        /// [`WrongEdition`]: CapabilityUnavailable::WrongEdition
-        /// [`RuntimeTooOld`]: CapabilityUnavailable::RuntimeTooOld
-        /// [`RuntimeVersionUnknown`]: CapabilityUnavailable::RuntimeVersionUnknown
-        /// [`BuildAbiUnavailable`]: CapabilityUnavailable::BuildAbiUnavailable
-        detail: String,
+        /// Why it is unavailable, with the evidence recorded during detection.
+        refusal: CapabilityRefusal,
     },
 
-    /// The selected File library does not export every entry point of a
-    /// family an operation needs. `FileApi::status` reports the same family
-    /// unavailable; its status cannot change after selection.
+    /// The selected File library lacks an entry point of the required family.
     #[cfg(feature = "file-io")]
-    #[error("NDI capability {} is unavailable: the selected library does not export a required function: {detail}", .family.name())]
+    #[error("NDI capability {} is unavailable: the selected library does not export a required function: {}", .family.name(), .missing.to_string_lossy())]
     FileFamilyUnavailable {
         /// The family the operation needs.
         family: crate::file::FileFamily,
-        /// The first entry point of the family the library does not export.
-        detail: String,
+        /// The first required entry point the selected library does not export.
+        missing: &'static std::ffi::CStr,
     },
 
     /// Runtime or File library selection conflicts with the process's native
@@ -476,29 +448,6 @@ impl fmt::Display for QueueLimit {
     }
 }
 
-/// Why a capability is unavailable, followed by its evidence when there is any.
-struct Unavailability<'a>(&'a CapabilityUnavailable, &'a str);
-
-impl fmt::Display for Unavailability<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self(reason, detail) = *self;
-        if detail.is_empty() {
-            return write!(f, "{reason}");
-        }
-        match reason {
-            CapabilityUnavailable::WrongEdition => {
-                write!(f, "{reason}: it does not export {detail}")
-            }
-            CapabilityUnavailable::BuildAbiUnavailable => {
-                write!(f, "{reason}: it does not declare {detail}")
-            }
-            CapabilityUnavailable::SymbolUnavailable
-            | CapabilityUnavailable::RuntimeTooOld
-            | CapabilityUnavailable::RuntimeVersionUnknown => write!(f, "{reason}: {detail}"),
-        }
-    }
-}
-
 /// Why a listener refused to send a receiver request.
 fn request_refusal(advertised: &bool) -> &'static str {
     if *advertised {
@@ -513,13 +462,27 @@ fn request_refusal(advertised: &bool) -> &'static str {
 mod tests {
     use super::*;
 
-    fn unsupported(reason: CapabilityUnavailable, detail: &str) -> String {
-        Error::UnsupportedCapability {
-            feature: RuntimeFeature::Routing,
-            reason,
-            detail: detail.into(),
+    #[test]
+    fn capability_errors_display_the_recorded_evidence() {
+        let required = crate::SdkVersion::parse("6.4.0.0").unwrap();
+        for refusal in [
+            CapabilityRefusal::SymbolUnavailable(c"NDIlib_routing_create"),
+            CapabilityRefusal::BuildAbiUnavailable(c"NDIlib_routing_create_v2"),
+            CapabilityRefusal::WrongEdition(Some(c"NDIlib_routing_create_v2")),
+            CapabilityRefusal::WrongEdition(None),
+            CapabilityRefusal::RuntimeTooOld { required },
+            CapabilityRefusal::RuntimeVersionUnknown { required },
+        ] {
+            let error = Error::UnsupportedCapability {
+                feature: RuntimeFeature::Routing,
+                refusal,
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("NDI capability source routing is unavailable: {refusal}")
+            );
+            assert!(!error.to_string().ends_with(": "));
         }
-        .to_string()
     }
 
     #[cfg(feature = "file-io")]
@@ -527,43 +490,9 @@ mod tests {
     fn file_family_errors_name_the_family_and_missing_entry_point() {
         let error = Error::FileFamilyUnavailable {
             family: crate::file::FileFamily::Recording,
-            detail: "NDIlib_file_recorder_rollover".into(),
+            missing: c"NDIlib_file_recorder_rollover",
         };
         assert_eq!(error.to_string(), "NDI capability file recording is unavailable: the selected library does not export a required function: NDIlib_file_recorder_rollover");
-    }
-
-    #[test]
-    fn capability_errors_name_their_evidence_and_never_end_in_empty_punctuation() {
-        use CapabilityUnavailable::*;
-        let prefix = "NDI capability source routing is unavailable: ";
-        for reason in [
-            RuntimeVersionUnknown,
-            RuntimeTooOld,
-            SymbolUnavailable,
-            BuildAbiUnavailable,
-            WrongEdition,
-        ] {
-            assert_eq!(unsupported(reason, ""), format!("{prefix}{reason}"));
-        }
-        assert_eq!(
-            unsupported(SymbolUnavailable, "NDIlib_routing_create"),
-            format!("{prefix}the selected library does not export a required function: NDIlib_routing_create")
-        );
-        assert_eq!(
-            unsupported(WrongEdition, "NDIlib_routing_create_v2"),
-            format!("{prefix}the selected runtime is not an Advanced SDK runtime: it does not export NDIlib_routing_create_v2")
-        );
-        assert_eq!(
-            unsupported(BuildAbiUnavailable, "NDIlib_routing_create_v2"),
-            format!("{prefix}this build was made without the Advanced SDK declarations: it does not declare NDIlib_routing_create_v2")
-        );
-        assert_eq!(
-            unsupported(
-                RuntimeTooOld,
-                "it needs NDI 6.4.0.0 or later and the runtime reports \"6.3.2.0\""
-            ),
-            format!("{prefix}the selected runtime is too old: it needs NDI 6.4.0.0 or later and the runtime reports \"6.3.2.0\"")
-        );
     }
 
     #[test]

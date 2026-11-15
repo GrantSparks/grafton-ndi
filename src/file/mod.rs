@@ -313,7 +313,7 @@ impl FileApi {
     /// Whether the selected library provides `family`.
     ///
     /// [`CapabilityStatus::Unavailable`] with
-    /// [`SymbolUnavailable`](crate::capabilities::CapabilityUnavailable::SymbolUnavailable)
+    /// [`SymbolUnavailable`](crate::capabilities::CapabilityRefusal::SymbolUnavailable)
     /// when it does not export one of the family's entry points. Every
     /// operation that needs the family then fails with
     /// [`Error::FileFamilyUnavailable`], and keeps failing: the library stays

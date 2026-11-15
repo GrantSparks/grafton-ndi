@@ -26,7 +26,7 @@ use super::{
 #[cfg(ndi_link_static)]
 use crate::LoadFailure;
 use crate::{
-    capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeInfo},
+    capabilities::{CapabilityRefusal, CapabilityStatus, RuntimeInfo},
     file::FileFamily,
     Error, LibraryKind, LoadRefusal, Result, SelectionConflict,
 };
@@ -222,7 +222,7 @@ impl FileRuntime {
             .as_ref()
             .map_err(|symbol| Error::FileFamilyUnavailable {
                 family: T::FAMILY,
-                detail: symbol.to_string_lossy().into_owned(),
+                missing: symbol,
             })
     }
 
@@ -231,7 +231,9 @@ impl FileRuntime {
     pub(crate) fn status(&self, family: FileFamily) -> CapabilityStatus {
         match self.families.missing(family) {
             None => CapabilityStatus::Available,
-            Some(_) => CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable),
+            Some(symbol) => {
+                CapabilityStatus::Unavailable(CapabilityRefusal::SymbolUnavailable(symbol))
+            }
         }
     }
 }
@@ -377,6 +379,7 @@ impl FileRuntime {
 mod tests {
     use super::*;
     use crate::sys::table::ExportsWhere;
+    use crate::CapabilityUnavailable;
 
     /// A library that exports the names `exported` accepts.
     fn library(exported: impl Fn(&str) -> bool) -> std::result::Result<FileRuntime, LoadRefusal> {
@@ -388,10 +391,10 @@ mod tests {
     }
 
     /// A refusal's family and missing entry point.
-    fn refusal<T>(result: Result<T>) -> Option<(FileFamily, String)> {
+    fn refusal<T>(result: Result<T>) -> Option<(FileFamily, &'static CStr)> {
         match result {
             Ok(_) => None,
-            Err(Error::FileFamilyUnavailable { family, detail }) => Some((family, detail)),
+            Err(Error::FileFamilyUnavailable { family, missing }) => Some((family, missing)),
             Err(other) => panic!("unexpected error: {other}"),
         }
     }
@@ -405,15 +408,12 @@ mod tests {
         );
         assert!(library.table::<FilePlayback>().is_ok());
         assert_eq!(
-            library.status(FileFamily::Recording),
-            CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+            (library.status(FileFamily::Recording)).reason(),
+            Some(CapabilityUnavailable::SymbolUnavailable)
         );
         assert_eq!(
             refusal(library.table::<FileRecording>()),
-            Some((
-                FileFamily::Recording,
-                "NDIlib_file_recorder_rollover".into()
-            ))
+            Some((FileFamily::Recording, c"NDIlib_file_recorder_rollover"))
         );
     }
 
@@ -440,10 +440,10 @@ mod tests {
                         assert_eq!(refused_family, family, "{context}");
                         assert_eq!(
                             reason,
-                            CapabilityUnavailable::SymbolUnavailable,
+                            CapabilityRefusal::SymbolUnavailable(detail),
                             "{context}"
                         );
-                        assert_eq!(Some(detail.as_str()), lacking, "{context}");
+                        assert_eq!(Some(detail.to_str().unwrap()), lacking, "{context}");
                     }
                 }
             }

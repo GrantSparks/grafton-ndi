@@ -1318,7 +1318,7 @@ mod tests {
                             result,
                             Err(Error::UnsupportedCapability {
                                 feature: crate::RuntimeFeature::Planar444Video,
-                                reason: crate::CapabilityUnavailable::RuntimeTooOld,
+                                refusal: crate::CapabilityRefusal::RuntimeTooOld { .. },
                                 ..
                             })
                         ),

@@ -32,7 +32,7 @@ remove the other runtime's direct link or preload. Matching its version or
 edition does not make two different runtime modules interchangeable. A Standard
 runtime in scope also prevents selecting a separate Advanced runtime.
 
-For `UnsupportedCapability`, inspect its feature and reason, then check
+For `UnsupportedCapability`, inspect its feature and typed `refusal` (`reason()` gives its category), then check
 [runtime capabilities](setup.md#runtime-capabilities). A Cargo feature, SDK
 edition or exported entry point alone does not establish hardware support or
 license entitlement.

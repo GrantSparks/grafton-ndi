@@ -26,7 +26,7 @@ common_helpers!(
 use common::Requirement::{H264Decoder, Hevc444Decoder};
 use grafton_ndi::{
     advanced::*,
-    capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
+    capabilities::{CapabilityStatus, RuntimeFeature, SdkEdition},
     AudioFrame, Error, Finder, FinderOptions, FrameRate, MediaTypes, MetadataFrame, Ndi, Receiver,
     ReceiverBandwidth, ReceiverColorFormat, ReceiverMode, ReceiverOptions, ScanType, Sender,
     SenderMode, SenderOptions, SettingChange, Source, StreamTier, Tally, Timecode, VideoFrame,
@@ -565,26 +565,24 @@ fn operations_report_why_the_advanced_sdk_is_unavailable() {
     // status gives: the runtime for its edition, or the build for the
     // declarations it lacks, which it names. Nothing here is a version gate.
     let unsupported = |expected: RuntimeFeature, error: Error| {
-        let Error::UnsupportedCapability {
-            feature,
-            reason,
-            detail,
-        } = error
-        else {
+        let Error::UnsupportedCapability { feature, refusal } = error else {
             panic!("expected an unsupported capability, got {error:?}");
         };
         assert_eq!(feature, expected);
         assert_eq!(
             ndi.capabilities().status(feature),
-            CapabilityStatus::Unavailable(reason),
+            CapabilityStatus::Unavailable(refusal),
             "{feature:?}"
         );
-        match reason {
-            CapabilityUnavailable::WrongEdition => {
+        match refusal {
+            grafton_ndi::CapabilityRefusal::WrongEdition(_) => {
                 assert_eq!(edition, SdkEdition::Standard, "{feature:?}");
             }
-            CapabilityUnavailable::BuildAbiUnavailable => {
-                assert!(detail.starts_with("NDIlib_"), "{feature:?}: {detail}");
+            grafton_ndi::CapabilityRefusal::BuildAbiUnavailable(symbol) => {
+                assert!(
+                    symbol.to_bytes().starts_with(b"NDIlib_"),
+                    "{feature:?}: {symbol:?}"
+                );
             }
             other => panic!("{feature:?}: unexpected reason {other:?}"),
         }

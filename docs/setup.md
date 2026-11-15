@@ -97,7 +97,7 @@ it does not establish license entitlement.
 
 Cargo features expose Rust APIs; `ndi.capabilities()` reports optional native
 operations. Use `ndi.require_feature(RuntimeFeature::ReceiveDelay)?` to require
-one. `UnsupportedCapability` identifies its feature, reason and detail; see
+one. `UnsupportedCapability` identifies its feature and a typed `CapabilityRefusal`, including the missing symbol or required version. Its `reason()` gives the refusal category; see
 [`CapabilityUnavailable`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/capabilities/enum.CapabilityUnavailable.html).
 Availability does not establish hardware support or license entitlement.
 

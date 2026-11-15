@@ -10,7 +10,7 @@ mod runtime_fixture;
 
 use fixture::FixtureDir;
 use grafton_ndi::{
-    capabilities::{CapabilityStatus, CapabilityUnavailable, SdkEdition},
+    capabilities::{CapabilityUnavailable, SdkEdition},
     file::{FileApi, FileFamily, FileRuntimeOptions, PlayerOptions, RecorderOptions, SourceSpec},
     runtime::RuntimeOptions,
     Error, LibraryKind, LoadFailure, LoadOrigin, LoadRefusal, Ndi, SelectionConflict,
@@ -432,15 +432,15 @@ fn child(name: &str, fixtures: &Fixtures) {
             // A library that lacks one family is selected for the other.
             let api = FileApi::open(&ndi, &explicit(fixtures.file("partial"))).unwrap();
             assert_eq!(
-                api.status(FileFamily::Recording),
-                CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+                (api.status(FileFamily::Recording)).reason(),
+                Some(CapabilityUnavailable::SymbolUnavailable)
             );
             assert!(api.supports(FileFamily::Playback));
             let options = RecorderOptions::new(SourceSpec::new("a source").unwrap());
             match api.create_recorder(&options) {
-                Err(Error::FileFamilyUnavailable { family, detail }) => {
+                Err(Error::FileFamilyUnavailable { family, missing }) => {
                     assert_eq!(family, FileFamily::Recording);
-                    assert_eq!(detail, "NDIlib_file_recorder_rollover");
+                    assert_eq!(missing, c"NDIlib_file_recorder_rollover");
                 }
                 other => panic!("expected recording to be unavailable: {other:?}"),
             }

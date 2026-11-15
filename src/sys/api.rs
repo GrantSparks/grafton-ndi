@@ -6,6 +6,7 @@
 //! capability's gate with it. A wrapper holding a table can therefore call
 //! everything in it without a further check.
 
+#[cfg(test)]
 use std::ffi::CStr;
 
 use super::{
@@ -14,9 +15,7 @@ use super::{
     table::{native_table, Resolver},
 };
 use crate::{
-    capabilities::{
-        Capabilities, CapabilityStatus, CapabilityUnavailable, RuntimeFeature, RuntimeInfo,
-    },
+    capabilities::{Capabilities, CapabilityRefusal, RuntimeFeature},
     Error, LoadRefusal, Result,
 };
 
@@ -147,13 +146,12 @@ pub(crate) struct Evidence<'a> {
     pub(crate) api: &'a Api,
     #[cfg(feature = "advanced")]
     pub(crate) advanced: &'a super::advanced::AdvancedApi,
-    pub(crate) info: &'a RuntimeInfo,
     pub(crate) capabilities: &'a Capabilities,
 }
 
 /// The tables of an optional capability, or the first entry point the
 /// selected implementation lacks.
-struct Optional<T>(std::result::Result<T, &'static CStr>);
+struct Optional<T>(std::result::Result<T, CapabilityRefusal>);
 
 /// What a capability's field of [`Api`] holds, and how it is resolved: its
 /// table, together with a support table when its entry points need one.
@@ -211,6 +209,13 @@ macro_rules! optional_tables {
         }
 
         impl Api {
+            #[cfg(test)]
+            pub(crate) const GATES: &'static [(RuntimeFeature, &'static [&'static CStr], fn(Evidence<'_>) -> Result<()>)] = &[$((
+                RuntimeFeature::$feature,
+                $Table::SYMBOLS,
+                |evidence| <slot!(type $Table $($Support)?)>::within(evidence).map(|_| ()),
+            ),)+];
+
             /// Resolve every table from `resolver`.
             ///
             /// # Errors
@@ -223,8 +228,16 @@ macro_rules! optional_tables {
                 })?;
                 Ok(Self {
                     core,
-                    $($field: Optional(slot!(load resolver $Table $($Support)?)),)+
+                    $($field: Optional(slot!(load resolver $Table $($Support)?).map_err(CapabilityRefusal::SymbolUnavailable)),)+
                 })
+            }
+
+            /// Seal each resolved table with the decision computed from all
+            /// tables, the runtime version and edition. Tables never re-gate.
+            pub(crate) fn apply_capabilities(&mut self, capabilities: &Capabilities) {
+                $(if let Err(refusal) = capabilities.decision(RuntimeFeature::$feature) {
+                    self.$field.0 = Err(refusal);
+                })+
             }
 
             /// The first entry point behind `feature` that the implementation
@@ -232,7 +245,7 @@ macro_rules! optional_tables {
             /// feature with no table here: a core feature gated only by its
             /// version or its requirements, or one that belongs to the
             /// Advanced SDK.
-            pub(crate) fn missing(&self, feature: RuntimeFeature) -> Option<&'static CStr> {
+            pub(crate) fn missing(&self, feature: RuntimeFeature) -> Option<CapabilityRefusal> {
                 // A core feature with no table here, no minimum version and no
                 // requirement would be reported available on every runtime.
                 // The crate does not compile unless each such feature says it
@@ -383,7 +396,6 @@ impl Runtime {
             api: &self.api,
             #[cfg(feature = "advanced")]
             advanced: &self.advanced,
-            info: &self.info,
             capabilities: &self.capabilities,
         }
     }
@@ -399,83 +411,22 @@ impl Runtime {
 }
 
 impl<'a> Evidence<'a> {
-    /// Reject a capability the implementation cannot provide.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::UnsupportedCapability`] for `feature`, with the
-    /// reason its status gives.
+    /// Reject a capability using its one recorded decision.
     pub(crate) fn require(self, feature: RuntimeFeature) -> Result<()> {
-        match self.capabilities.status(feature) {
-            CapabilityStatus::Available => Ok(()),
-            CapabilityStatus::Unavailable(reason) => Err(self.unavailable(feature, reason)),
-        }
+        self.capabilities
+            .decision(feature)
+            .map_err(|refusal| Error::UnsupportedCapability { feature, refusal })
     }
 
-    /// The table behind `feature`, once its status allows it.
-    ///
-    /// A capability's status includes any gate its table cannot express, such
-    /// as a version or an edition, so it is always applied together with the
-    /// table, and both are reported as `feature`.
+    /// The table sealed with its capability's decision at load time.
     pub(in crate::sys) fn capability<T>(
         self,
         feature: RuntimeFeature,
-        table: &'a std::result::Result<T, &'static CStr>,
+        table: &'a std::result::Result<T, CapabilityRefusal>,
     ) -> Result<&'a T> {
-        self.require(feature)?;
-        // The status is derived from the same entry points, so this is
-        // reached only by a table that needs one its status does not check.
         table
             .as_ref()
-            .map_err(|symbol| Error::UnsupportedCapability {
-                feature,
-                reason: CapabilityUnavailable::SymbolUnavailable,
-                detail: symbol.to_string_lossy().into_owned(),
-            })
-    }
-
-    /// The error for `feature`, whose status is `reason`, with the evidence
-    /// for it.
-    pub(in crate::sys) fn unavailable(
-        self,
-        feature: RuntimeFeature,
-        reason: CapabilityUnavailable,
-    ) -> Error {
-        // A status copied from a capability that `feature` requires is
-        // reported with that capability's evidence.
-        let evidence = self.capabilities.refused_by(feature);
-        let detail = match reason {
-            CapabilityUnavailable::RuntimeTooOld | CapabilityUnavailable::RuntimeVersionUnknown => {
-                evidence.minimum_version().map(|minimum| {
-                    format!(
-                        "it needs NDI {minimum} or later and the runtime reports {:?}",
-                        self.info.raw_version
-                    )
-                })
-            }
-            // The feature's table names what it lacks: an entry point the
-            // runtime does not export or, in a build without its Advanced
-            // declarations, a function the build does not declare.
-            CapabilityUnavailable::SymbolUnavailable
-            | CapabilityUnavailable::WrongEdition
-            | CapabilityUnavailable::BuildAbiUnavailable => self
-                .missing(evidence)
-                .map(|symbol| symbol.to_string_lossy().into_owned()),
-        };
-        Error::UnsupportedCapability {
-            feature,
-            reason,
-            detail: detail.unwrap_or_default(),
-        }
-    }
-
-    /// The first function of `feature`'s table that did not resolve.
-    fn missing(self, feature: RuntimeFeature) -> Option<&'static CStr> {
-        #[cfg(feature = "advanced")]
-        if let Some(symbol) = self.advanced.missing(feature) {
-            return Some(symbol);
-        }
-        self.api.missing(feature)
+            .map_err(|&refusal| Error::UnsupportedCapability { feature, refusal })
     }
 }
 
@@ -501,7 +452,9 @@ mod tests {
         ] {
             assert_eq!(
                 api.missing(feature),
-                Some(c"NDIlib_recv_free_string"),
+                Some(CapabilityRefusal::SymbolUnavailable(
+                    c"NDIlib_recv_free_string"
+                )),
                 "{feature:?}"
             );
         }
@@ -510,7 +463,9 @@ mod tests {
         let api = Api::load(&ExportsWhere(|name| name != "NDIlib_recv_get_web_control")).unwrap();
         assert_eq!(
             api.missing(RuntimeFeature::ReceiverWebControl),
-            Some(c"NDIlib_recv_get_web_control")
+            Some(CapabilityRefusal::SymbolUnavailable(
+                c"NDIlib_recv_get_web_control"
+            ))
         );
         assert_eq!(api.missing(RuntimeFeature::ConnectedSourceName), None);
     }

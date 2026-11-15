@@ -564,12 +564,12 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert_eq!(ndi.info().version().unwrap().minor(), 3);
             let capabilities = ndi.capabilities();
             assert_eq!(
-                capabilities.status(RuntimeFeature::ReceiveDelay),
-                CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+                (capabilities.status(RuntimeFeature::ReceiveDelay)).reason(),
+                Some(CapabilityUnavailable::SymbolUnavailable)
             );
             assert_eq!(
-                capabilities.status(RuntimeFeature::Planar444Video),
-                CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeTooOld)
+                (capabilities.status(RuntimeFeature::Planar444Video)).reason(),
+                Some(CapabilityUnavailable::RuntimeTooOld)
             );
             assert!(ndi.runtime().is_supported_cpu());
             assert!(ndi.info().raw_version().contains("6.3.2.0"));
@@ -934,8 +934,8 @@ fn configured_objects_are_refused_for_their_own_capability(ndi: &Ndi) {
         ),
     ] {
         assert_eq!(
-            ndi.capabilities().status(required),
-            CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable),
+            (ndi.capabilities().status(required)).reason(),
+            Some(CapabilityUnavailable::SymbolUnavailable),
             "{required:?}"
         );
         let status = ndi.capabilities().status(feature);
@@ -944,24 +944,20 @@ fn configured_objects_are_refused_for_their_own_capability(ndi: &Ndi) {
         } else {
             CapabilityUnavailable::BuildAbiUnavailable
         };
-        assert_eq!(
-            status,
-            CapabilityStatus::Unavailable(expected),
-            "{feature:?}"
-        );
+        assert_eq!(status.reason(), Some(expected), "{feature:?}");
         for error in [error, ndi.require_feature(feature).err()] {
-            let (refused, reason, detail) = match error {
-                Some(Error::UnsupportedCapability {
-                    feature,
-                    reason,
-                    detail,
-                }) => (feature, reason, detail),
+            let (refused, refusal) = match error {
+                Some(Error::UnsupportedCapability { feature, refusal }) => (feature, refusal),
                 other => panic!("{feature:?}: expected an unsupported capability, got {other:?}"),
             };
-            assert_eq!((refused, reason), (feature, expected));
+            assert_eq!((refused, refusal.reason()), (feature, expected));
+            assert_eq!(status, CapabilityStatus::Unavailable(refusal));
             if declared {
                 // The evidence is the core capability's: its first function.
-                assert_eq!(detail, first_missing, "{feature:?}");
+                assert!(
+                    matches!(refusal, grafton_ndi::CapabilityRefusal::SymbolUnavailable(symbol) if symbol.to_str().unwrap() == first_missing),
+                    "{feature:?}"
+                );
             }
         }
     }

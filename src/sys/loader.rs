@@ -121,9 +121,9 @@ impl Runtime {
         provider: Provider,
         requested: SdkEdition,
     ) -> std::result::Result<Self, LoadRefusal> {
-        let api = Api::load(&provider)?;
+        let mut api = Api::load(&provider)?;
         #[cfg(feature = "advanced")]
-        let advanced_tables = super::advanced::AdvancedApi::load(&provider)?;
+        let mut advanced_tables = super::advanced::AdvancedApi::load(&provider)?;
         let advanced = AdvancedEntryPoints::detect(&provider)?;
         let edition = provider.edition(advanced);
         if !meets(requested, edition) {
@@ -169,6 +169,9 @@ impl Runtime {
         let capabilities = Capabilities::detect(&api, &advanced_tables, version, edition);
         #[cfg(not(feature = "advanced"))]
         let capabilities = Capabilities::detect(&api, version, edition);
+        api.apply_capabilities(&capabilities);
+        #[cfg(feature = "advanced")]
+        advanced_tables.apply_capabilities(&capabilities);
         Ok(Self {
             capabilities,
             api,

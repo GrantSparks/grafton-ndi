@@ -13,9 +13,9 @@ mod fixture;
 mod runtime_fixture;
 
 use grafton_ndi::{
-    capabilities::{CapabilityUnavailable, RuntimeFeature},
-    Error, Ndi, PixelFormat, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions,
-    RuntimeOptions, Sender, SenderOptions, Source, VideoFrame,
+    capabilities::RuntimeFeature, Error, Ndi, PixelFormat, Receiver, ReceiverBandwidth,
+    ReceiverColorFormat, ReceiverOptions, RuntimeOptions, Sender, SenderOptions, Source,
+    VideoFrame,
 };
 #[cfg(feature = "advanced")]
 use std::time::Duration;
@@ -73,7 +73,7 @@ fn calls(prefix: &str) -> usize {
 fn refused(error: &Error, expected: RuntimeFeature) {
     assert!(
         matches!(error, Error::UnsupportedCapability {
-        feature, reason: CapabilityUnavailable::RuntimeTooOld, ..
+        feature, refusal: grafton_ndi::CapabilityRefusal::RuntimeTooOld { .. }, ..
     } if *feature == expected),
         "wrong gate refusal: {error}"
     );

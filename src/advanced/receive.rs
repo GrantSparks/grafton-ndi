@@ -707,10 +707,7 @@ mod tests {
     #[test]
     fn packet_receivers_validate_the_color_format_the_sdk_is_given() {
         use crate::{
-            capabilities::{
-                Capabilities, CapabilityUnavailable, RuntimeFeature, RuntimeInfo, SdkEdition,
-                SdkLinkage, SdkVersion,
-            },
+            capabilities::{Capabilities, RuntimeFeature, SdkEdition, SdkVersion},
             sys::{advanced::AdvancedApi, table::ExportsWhere, Api, Evidence},
             ReceiverColorFormat, Source,
         };
@@ -718,23 +715,17 @@ mod tests {
         // An Advanced 6.3.2 runtime that exports every function the crate
         // knows, gated as the loader gates the runtime it selects.
         let exports = ExportsWhere(|_: &str| true);
-        let (api, advanced) = (
+        let (mut api, mut advanced) = (
             Api::load(&exports).unwrap(),
             AdvancedApi::load(&exports).unwrap(),
         );
         let version = SdkVersion::parse("NDI SDK TEST 6.3.2.0");
         let capabilities = Capabilities::detect(&api, &advanced, version, SdkEdition::Advanced);
-        let info = RuntimeInfo {
-            edition: SdkEdition::Advanced,
-            linkage: SdkLinkage::Shared,
-            library_path: None,
-            raw_version: "NDI SDK TEST 6.3.2.0".into(),
-            version,
-        };
+        api.apply_capabilities(&capabilities);
+        advanced.apply_capabilities(&capabilities);
         let runtime = Evidence {
             api: &api,
             advanced: &advanced,
-            info: &info,
             capabilities: &capabilities,
         };
         let require = |feature| runtime.require(feature);
@@ -744,7 +735,7 @@ mod tests {
                     result,
                     Err(Error::UnsupportedCapability {
                         feature,
-                        reason: CapabilityUnavailable::RuntimeTooOld,
+                        refusal: crate::CapabilityRefusal::RuntimeTooOld { .. },
                         ..
                     }) if feature == wanted
                 ),
@@ -765,7 +756,7 @@ mod tests {
         for preset in PassthroughPreset::ALL {
             let Ok(color_format) = runtime.passthrough_format(preset) else {
                 // Only a preset this build's headers do not declare.
-                assert!(!AdvancedApi::declares(RuntimeFeature::Passthrough(preset)));
+                assert!(!capabilities.supports(RuntimeFeature::Passthrough(preset)));
                 continue;
             };
             let packets = creation_options(&best, color_format);
@@ -787,7 +778,7 @@ mod tests {
         }
         let declared = PassthroughPreset::ALL
             .into_iter()
-            .filter(|&preset| AdvancedApi::declares(RuntimeFeature::Passthrough(preset)))
+            .filter(|&preset| capabilities.supports(RuntimeFeature::Passthrough(preset)))
             .count();
         assert_eq!(checked, declared);
     }

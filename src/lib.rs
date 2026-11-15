@@ -100,8 +100,8 @@ mod image;
 
 pub use {
     capabilities::{
-        Capabilities, CapabilityStatus, CapabilityUnavailable, RuntimeFeature, RuntimeInfo,
-        SdkEdition, SdkLinkage, SdkVersion,
+        Capabilities, CapabilityRefusal, CapabilityStatus, CapabilityUnavailable, RuntimeFeature,
+        RuntimeInfo, SdkEdition, SdkLinkage, SdkVersion,
     },
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
     error::*,
