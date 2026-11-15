@@ -862,15 +862,22 @@ pub(crate) trait VideoPartsExt: VideoParts {
         destination.metadata.copy_from(self.frame_metadata());
         if let Some(data) = replacement {
             let frame = packed_video(self, data, OwnedFrameMetadata::default());
-            destination.data = frame.data;
-            destination.layout = frame.layout;
-            destination.header = frame.header;
-            destination.timestamp = frame.timestamp;
+            *destination = VideoFrame {
+                metadata: std::mem::take(&mut destination.metadata),
+                ..frame
+            };
         } else {
-            let copied = self.copy_active_pixels(&mut destination.data);
-            destination.layout = *copied.layout();
-            destination.header = *copied.header();
-            destination.timestamp = copied.sdk_timestamp();
+            let VideoFrame {
+                layout,
+                header,
+                data,
+                metadata: _,
+                timestamp,
+            } = destination;
+            let copied = self.copy_active_pixels(data);
+            *layout = *copied.layout();
+            *header = *copied.header();
+            *timestamp = copied.sdk_timestamp();
         }
     }
 
@@ -2109,15 +2116,22 @@ pub(crate) trait AudioPartsExt: AudioParts {
         destination.metadata.copy_from(self.frame_metadata());
         if let Some(data) = replacement {
             let frame = packed_audio(self, data, OwnedFrameMetadata::default());
-            destination.data = frame.data;
-            destination.layout = frame.layout;
-            destination.timecode = frame.timecode;
-            destination.timestamp = frame.timestamp;
+            *destination = AudioFrame {
+                metadata: std::mem::take(&mut destination.metadata),
+                ..frame
+            };
         } else {
-            let layout = copy_audio_samples(self, &mut destination.data);
-            destination.layout = layout;
-            destination.timecode = self.audio_timecode();
-            destination.timestamp = self.sdk_timestamp();
+            let AudioFrame {
+                layout,
+                timecode,
+                data,
+                metadata: _,
+                timestamp,
+            } = destination;
+            let copied = copy_audio_samples(self, data);
+            *layout = copied;
+            *timecode = self.audio_timecode();
+            *timestamp = self.sdk_timestamp();
         }
     }
 }
@@ -2402,33 +2416,19 @@ fn copy_audio_samples<P: AudioParts + ?Sized>(
     source: &P,
     data: &mut Vec<f32>,
 ) -> ValidatedAudioLayout {
-    struct Restore<'a> {
-        data: &'a mut Vec<f32>,
-        len: usize,
-    }
-    impl Drop for Restore<'_> {
-        fn drop(&mut self) {
-            // Capacity cannot shrink while the copy only appends samples.
-            self.data.resize(self.len, 0.0);
-        }
-    }
     let packed = source.layout().packed();
-    let previous_len = data.len();
-    let restore = Restore {
+    crate::pixels::refill(
         data,
-        len: previous_len,
-    };
-    restore.data.clear();
-    // The views read channel samples only, never padding between channels.
-    for samples in source.channel_views() {
-        restore.data.extend_from_slice(samples);
-    }
-    assert_eq!(
-        restore.data.len(),
         packed.sample_count(),
-        "packed audio copy must initialize its complete layout"
+        0.0,
+        |_| {},
+        |data| {
+            // The views read channel samples only, never inter-channel padding.
+            for samples in source.channel_views() {
+                data.extend_from_slice(samples);
+            }
+        },
     );
-    std::mem::forget(restore);
     packed
 }
 
@@ -3247,8 +3247,9 @@ pub trait MetadataSource: MetadataParts {
     /// capacity holds the text and trailing NUL, even when the length changes.
     fn copy_into(&self, destination: &mut MetadataFrame) {
         let text = self.metadata_text_for_send().unwrap_or(MetadataText::EMPTY);
-        destination.data.copy_text(text);
-        destination.timecode = self.metadata_timecode();
+        let MetadataFrame { data, timecode } = destination;
+        data.copy_text(text);
+        *timecode = self.metadata_timecode();
     }
 }
 
@@ -9829,20 +9830,32 @@ mod tests {
             self.metadata.retained_bytes()
         }
         fn assert_same(&self, expected: &Self) {
-            assert_eq!(self.data.len(), self.layout.data_len_bytes);
-            let room = crate::pixels::send_room(&self.layout, self.header.scan_type);
-            assert_eq!(self.data.room(), vec![0; room]);
+            let Self {
+                layout,
+                header,
+                data,
+                metadata,
+                timestamp,
+            } = self;
+            let Self {
+                layout: expected_layout,
+                header: expected_header,
+                data: expected_data,
+                metadata: expected_metadata,
+                timestamp: expected_timestamp,
+            } = expected;
+            assert_eq!(data.len(), layout.data_len_bytes);
+            let room = crate::pixels::send_room(layout, header.scan_type);
+            assert_eq!(data.room(), vec![0; room]);
+            assert_eq!(format!("{layout:?}"), format!("{expected_layout:?}"));
+            assert_eq!(format!("{header:?}"), format!("{expected_header:?}"));
+            assert_eq!(data.as_slice(), expected_data.as_slice());
+            assert_eq!(metadata.view().status(), expected_metadata.view().status());
             assert_eq!(
-                format!("{:?}", self.layout),
-                format!("{:?}", expected.layout)
+                metadata.view().text().map(MetadataText::as_str),
+                expected_metadata.view().text().map(MetadataText::as_str)
             );
-            assert_eq!(
-                format!("{:?}", self.header),
-                format!("{:?}", expected.header)
-            );
-            assert_eq!(self.data(), expected.data());
-            assert_eq!(self.metadata(), expected.metadata());
-            assert_eq!(self.timestamp(), expected.timestamp());
+            assert_eq!(timestamp, expected_timestamp);
         }
     }
 
@@ -9864,15 +9877,30 @@ mod tests {
             self.metadata.retained_bytes()
         }
         fn assert_same(&self, expected: &Self) {
-            assert_eq!(self.data.len(), self.layout.sample_count);
+            let Self {
+                layout,
+                timecode,
+                data,
+                metadata,
+                timestamp,
+            } = self;
+            let Self {
+                layout: expected_layout,
+                timecode: expected_timecode,
+                data: expected_data,
+                metadata: expected_metadata,
+                timestamp: expected_timestamp,
+            } = expected;
+            assert_eq!(data.len(), layout.sample_count);
+            assert_eq!(format!("{layout:?}"), format!("{expected_layout:?}"));
+            assert_eq!(timecode, expected_timecode);
+            assert_eq!(data, expected_data);
+            assert_eq!(metadata.view().status(), expected_metadata.view().status());
             assert_eq!(
-                format!("{:?}", self.layout),
-                format!("{:?}", expected.layout)
+                metadata.view().text().map(MetadataText::as_str),
+                expected_metadata.view().text().map(MetadataText::as_str)
             );
-            assert_eq!(self.timecode(), expected.timecode());
-            assert_eq!(self.data(), expected.data());
-            assert_eq!(self.metadata(), expected.metadata());
-            assert_eq!(self.timestamp(), expected.timestamp());
+            assert_eq!(timestamp, expected_timestamp);
         }
     }
 
