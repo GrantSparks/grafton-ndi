@@ -129,6 +129,11 @@ for the code-value contract.
 `Downscale::Half`, `Quarter` and `Eighth` average blocks during conversion.
 Output dimensions round upward; partial edge blocks use their available pixels.
 With alpha retained, colors are weighted by alpha to avoid darkening edges.
+Color channels are treated as straight (not premultiplied by alpha), and PNG
+and WebP output store straight alpha. The [NDI SDK frame-type reference](https://docs.ndi.video/all/developing-with-ndi/sdk/frame-types)
+documents this convention for BGRA and RGBA. That reference does not specify it
+for UYVA, PA16, NB48 or NB4G; the encoder assumes straight color for those formats
+too.
 The reduction operates on code values and does not allocate a full-size RGB
 image. It reduces full-size frames independently of the receiver's bandwidth
 selection; a `snapshot_preset` receiver already requests the preview stream.

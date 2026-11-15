@@ -477,6 +477,12 @@ impl SampleDepth {
 pub enum AlphaMode {
     /// Write RGBA. A source with alpha keeps it, converted to the image's
     /// depth; one without gets alpha 255, or 65535 at 16 bits.
+    /// Colors are treated as straight (not premultiplied by alpha), and PNG
+    /// and WebP store straight alpha. The [SDK frame-type reference] documents
+    /// this for BGRA and RGBA. It does not specify the convention for UYVA,
+    /// PA16, NB48 or NB4G; this encoder assumes straight color for them too.
+    ///
+    /// [SDK frame-type reference]: https://docs.ndi.video/all/developing-with-ndi/sdk/frame-types
     #[default]
     Keep,
     /// Write RGB, dropping any alpha.
@@ -538,6 +544,10 @@ pub enum HdrPolicy {
 /// taken on code values, as previews usually are, and round half up. With
 /// alpha kept, color is weighted by alpha, so transparent pixels do not
 /// darken edges; a block that is transparent throughout takes the plain mean.
+/// Color channels are treated as straight (not premultiplied by alpha), as
+/// the [NDI SDK](https://docs.ndi.video/all/developing-with-ndi/sdk/frame-types)
+/// documents for BGRA and RGBA. This is an encoder assumption for UYVA, PA16,
+/// NB48 and NB4G; see [`AlphaMode::Keep`].
 ///
 /// It serves frames that arrive full size: from a FrameSync, from receivers
 /// with [`ReceiverOptions::high_quality_preset`], and frames being sent. A
