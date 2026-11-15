@@ -34,6 +34,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   no longer reserves descriptor slots or fails to reserve that storage;
   scatter submission continues to allocate nothing.
 
+- Owned metadata constructors and setters return refused text in
+  `Rejected<String>`; owned frame builders expose metadata recovery accessors.
+
 - `InvalidFrame`, `InvalidInput` and `UnexpectedSdkResult` carry typed
   `FrameDefect`, `InputDefect` and `SdkResultDefect` causes. Shared layout
   refusals use one nested `LayoutDefect` in both frame and input causes. Receiver capture

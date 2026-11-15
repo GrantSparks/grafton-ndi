@@ -622,3 +622,93 @@ fn metadata_constructors_seal_the_sole_terminator_and_reuse_storage() {
     assert_eq!(destination.retained_bytes(), capacity);
     assert_eq!(destination.view().text().unwrap().as_str(), "<a/>");
 }
+
+fn expect_original_metadata(
+    text: String,
+    operation: impl FnOnce(String) -> std::result::Result<(), Rejected<String>>,
+) {
+    let pointer = text.as_ptr();
+    let capacity = text.capacity();
+    let oversized = text.len() == MAX_METADATA_BYTES;
+    let (result, allocations) = crate::test_alloc::allocation_count(|| operation(text));
+    assert_eq!(allocations, if oversized { 1 } else { 2 });
+    let (error, text) = result.unwrap_err().into_parts();
+    assert_eq!(text.as_ptr(), pointer);
+    assert_eq!(text.capacity(), capacity);
+    if oversized {
+        assert!(matches!(
+            error,
+            Error::InvalidFrame(crate::FrameDefect::MetadataTooLarge { .. })
+        ));
+        assert_eq!(text.len(), MAX_METADATA_BYTES);
+    } else {
+        let Error::InvalidCString(error) = error else {
+            panic!("expected interior NUL")
+        };
+        assert_eq!(error.nul_position(), 5);
+        assert_eq!(error.into_vec(), b"<ok/>\0");
+        assert_eq!(text, "<ok/>\0tail");
+    }
+}
+
+#[test]
+fn every_owned_metadata_entrypoint_returns_the_original_text_and_keeps_the_frame() {
+    let mut metadata = MetadataFrame::new("previous").unwrap();
+    let mut video = VideoFrame::builder()
+        .resolution(2, 2)
+        .metadata("previous")
+        .build()
+        .unwrap();
+    let mut audio = AudioFrame::builder().metadata("previous").build().unwrap();
+    for text in ["<ok/>\0tail".to_owned(), "x".repeat(MAX_METADATA_BYTES)] {
+        expect_original_metadata(text.clone(), |text| MetadataFrame::new(text).map(drop));
+        expect_original_metadata(text.clone(), |text| metadata.set_data(text));
+        expect_original_metadata(text.clone(), |text| video.set_metadata(text));
+        expect_original_metadata(text, |text| audio.set_metadata(text));
+        assert_eq!(metadata.data(), "previous");
+        assert_eq!(video.metadata(), Some("previous"));
+        assert_eq!(audio.metadata(), Some("previous"));
+        assert_eq!(video.metadata_status(), FrameMetadataStatus::Text);
+        assert_eq!(audio.metadata_status(), FrameMetadataStatus::Text);
+    }
+}
+
+#[test]
+fn rejected_owned_builders_expose_metadata_for_repair_without_copying() {
+    let text = "bad\0text".to_owned();
+    let pointer = text.as_ptr();
+    let capacity = text.capacity();
+    let mut builder = VideoFrame::builder()
+        .resolution(2, 2)
+        .metadata(text)
+        .build()
+        .unwrap_err()
+        .into_inner();
+    assert_eq!(builder.supplied_metadata(), Some("bad\0text"));
+    let mut text = builder.take_metadata().unwrap();
+    assert_eq!(text.as_ptr(), pointer);
+    assert_eq!(text.capacity(), capacity);
+    text.remove(3);
+    assert_eq!(
+        builder.metadata(text).build().unwrap().metadata(),
+        Some("badtext")
+    );
+
+    let text = "bad\0text".to_owned();
+    let pointer = text.as_ptr();
+    let capacity = text.capacity();
+    let mut builder = AudioFrame::builder()
+        .metadata(text)
+        .build()
+        .unwrap_err()
+        .into_inner();
+    assert_eq!(builder.supplied_metadata(), Some("bad\0text"));
+    let mut text = builder.take_metadata().unwrap();
+    assert_eq!(text.as_ptr(), pointer);
+    assert_eq!(text.capacity(), capacity);
+    text.remove(3);
+    assert_eq!(
+        builder.metadata(text).build().unwrap().metadata(),
+        Some("badtext")
+    );
+}

@@ -1660,10 +1660,16 @@ impl VideoFrame {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCString`] if `metadata` contains an interior NUL
+    /// Returns the unchanged text in [`Rejected`]. Its reason is
+    /// [`Error::InvalidCString`] if `metadata` contains an interior NUL
     /// byte, or [`Error::InvalidFrame`] if the emitted C string would exceed
     /// the metadata size cap.
-    pub fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<()> {
+    /// The `NulError` retains only the prefix through the first NUL; use
+    /// [`Rejected::into_inner`] for the whole original string.
+    pub fn set_metadata(
+        &mut self,
+        metadata: impl Into<String>,
+    ) -> std::result::Result<(), Rejected<String>> {
         self.metadata.set(metadata)
     }
 
@@ -1798,6 +1804,8 @@ impl VideoFrameBuilder {
     }
 
     /// Set the metadata text.
+    /// A refused build retains this text; recover it with
+    /// [`Self::supplied_metadata`] or [`Self::take_metadata`] to repair it.
     /// An owned string retains its allocation when there is capacity for
     /// the trailing NUL; invalid metadata leaves a rejected builder unchanged.
     #[must_use]
@@ -1847,6 +1855,17 @@ impl VideoFrameBuilder {
     pub fn clear_data(mut self) -> Self {
         self.data = None;
         self
+    }
+
+    /// The supplied metadata before validation or termination.
+    pub fn supplied_metadata(&self) -> Option<&str> {
+        self.metadata.as_deref()
+    }
+
+    /// Recover metadata while retaining the builder's other settings.
+    /// Its allocation and text are unchanged after a refused build.
+    pub fn take_metadata(&mut self) -> Option<String> {
+        self.metadata.take()
     }
 
     /// Remove metadata, for example to repair a rejected builder.
@@ -2656,10 +2675,16 @@ impl AudioFrame {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCString`] if `metadata` contains an interior NUL
+    /// Returns the unchanged text in [`Rejected`]. Its reason is
+    /// [`Error::InvalidCString`] if `metadata` contains an interior NUL
     /// byte, or [`Error::InvalidFrame`] if the emitted C string would exceed
     /// the metadata size cap.
-    pub fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<()> {
+    /// The `NulError` retains only the prefix through the first NUL; use
+    /// [`Rejected::into_inner`] for the whole original string.
+    pub fn set_metadata(
+        &mut self,
+        metadata: impl Into<String>,
+    ) -> std::result::Result<(), Rejected<String>> {
         self.metadata.set(metadata)
     }
 
@@ -2755,6 +2780,8 @@ impl AudioFrameBuilder {
     }
 
     /// Set the metadata text.
+    /// A refused build retains this text; recover it with
+    /// [`Self::supplied_metadata`] or [`Self::take_metadata`] to repair it.
     /// An owned string retains its allocation when there is capacity for
     /// the trailing NUL; invalid metadata leaves a rejected builder unchanged.
     #[must_use]
@@ -2791,6 +2818,17 @@ impl AudioFrameBuilder {
     pub fn clear_data(mut self) -> Self {
         self.data = None;
         self
+    }
+
+    /// The supplied metadata before validation or termination.
+    pub fn supplied_metadata(&self) -> Option<&str> {
+        self.metadata.as_deref()
+    }
+
+    /// Recover metadata while retaining the builder's other settings.
+    /// Its allocation and text are unchanged after a refused build.
+    pub fn take_metadata(&mut self) -> Option<String> {
+        self.metadata.take()
     }
 
     /// Remove metadata, for example to repair a rejected builder.
@@ -2970,10 +3008,13 @@ impl MetadataFrame {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCString`] if `data` contains an interior NUL byte
+    /// Returns the unchanged text in [`Rejected`]. Its reason is
+    /// [`Error::InvalidCString`] if `data` contains an interior NUL byte
     /// or [`Error::InvalidFrame`] if the SDK metadata length would exceed the
     /// crate's metadata size limit.
-    pub fn new(data: impl Into<String>) -> Result<Self> {
+    /// The `NulError` retains only the prefix through the first NUL; use
+    /// [`Rejected::into_inner`] for the whole original string.
+    pub fn new(data: impl Into<String>) -> std::result::Result<Self, Rejected<String>> {
         Ok(MetadataFrame {
             data: TerminatedText::new(data)?,
             timecode: Timecode::SYNTHESIZE,
@@ -3026,10 +3067,16 @@ impl MetadataFrame {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCString`] if `data` contains an interior NUL byte
+    /// Returns the unchanged text in [`Rejected`]. Its reason is
+    /// [`Error::InvalidCString`] if `data` contains an interior NUL byte
     /// or [`Error::InvalidFrame`] if the SDK metadata length would exceed the
     /// crate's metadata size limit. The frame is unchanged.
-    pub fn set_data(&mut self, data: impl Into<String>) -> Result<()> {
+    /// The `NulError` retains only the prefix through the first NUL; use
+    /// [`Rejected::into_inner`] for the whole original string.
+    pub fn set_data(
+        &mut self,
+        data: impl Into<String>,
+    ) -> std::result::Result<(), Rejected<String>> {
         self.data = TerminatedText::new(data)?;
         Ok(())
     }
@@ -3172,11 +3219,11 @@ pub enum FrameMetadataStatus {
 }
 
 mod metadata;
+#[cfg(test)]
+use metadata::metadata_len_to_i32;
 use metadata::FrameMetadataState;
 #[cfg(test)]
 pub(crate) use metadata::{validate_frame_metadata, MetadataWithheld};
-#[cfg(test)]
-use metadata::metadata_len_to_i32;
 pub(crate) use metadata::{
     validate_metadata_layout, validate_sender_metadata, FrameMetadataRef, MetadataText,
     OwnedFrameMetadata, TerminatedText,
@@ -7549,13 +7596,15 @@ mod tests {
     #[test]
     fn test_metadata_frame_rejects_interior_nul_input() {
         assert!(matches!(
-            MetadataFrame::new("bad\0metadata"),
+            MetadataFrame::new("bad\0metadata").map_err(Rejected::into_error),
             Err(Error::InvalidCString(_))
         ));
 
         let mut frame = MetadataFrame::new("").unwrap();
         assert!(matches!(
-            frame.set_data("bad\0metadata"),
+            frame
+                .set_data("bad\0metadata")
+                .map_err(Rejected::into_error),
             Err(Error::InvalidCString(_))
         ));
     }
@@ -7565,7 +7614,7 @@ mod tests {
         let oversized = "x".repeat(MAX_METADATA_BYTES);
 
         assert!(matches!(
-            MetadataFrame::new(oversized),
+            MetadataFrame::new(oversized).map_err(Rejected::into_error),
             Err(Error::InvalidFrame(_))
         ));
     }
@@ -7661,7 +7710,7 @@ mod tests {
                 .build()
                 .unwrap_err()
                 .into_inner();
-            assert_eq!(builder.metadata.as_deref(), Some(text.as_str()));
+            assert_eq!(builder.supplied_metadata(), Some(text.as_str()));
             assert_eq!(builder.metadata.as_ref().unwrap().as_ptr(), pointer);
             assert_eq!(builder.supplied_data().unwrap().as_ptr(), pixels_pointer);
 
@@ -7678,7 +7727,7 @@ mod tests {
                 .build()
                 .unwrap_err()
                 .into_inner();
-            assert_eq!(builder.metadata.as_deref(), Some(text.as_str()));
+            assert_eq!(builder.supplied_metadata(), Some(text.as_str()));
             assert_eq!(builder.metadata.as_ref().unwrap().as_ptr(), pointer);
             assert_eq!(builder.supplied_data().unwrap().as_ptr(), samples_pointer);
             assert_eq!(builder.supplied_data().unwrap(), [1.0, 3.0, 2.0, 4.0]);
@@ -8197,11 +8246,15 @@ mod tests {
         ));
         video.set_metadata("preserved video").unwrap();
         assert!(matches!(
-            video.set_metadata("bad\0metadata"),
+            video
+                .set_metadata("bad\0metadata")
+                .map_err(Rejected::into_error),
             Err(Error::InvalidCString(_))
         ));
         assert!(matches!(
-            audio.set_metadata("bad\0metadata"),
+            audio
+                .set_metadata("bad\0metadata")
+                .map_err(Rejected::into_error),
             Err(Error::InvalidCString(_))
         ));
 
@@ -8223,11 +8276,13 @@ mod tests {
             Err(Error::InvalidFrame(_))
         ));
         assert!(matches!(
-            video.set_metadata(oversized.clone()),
+            video
+                .set_metadata(oversized.clone())
+                .map_err(Rejected::into_error),
             Err(Error::InvalidFrame(_))
         ));
         assert!(matches!(
-            audio.set_metadata(oversized),
+            audio.set_metadata(oversized).map_err(Rejected::into_error),
             Err(Error::InvalidFrame(_))
         ));
         assert_eq!(video.metadata(), Some("preserved video"));

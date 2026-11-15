@@ -141,7 +141,10 @@ Recover pooled buffers with `into_data()` or `swap_data()`. A rejected owned
 build or replacement returns its supplied storage in `Rejected`; recover it
 with `into_inner()` or `into_parts()` to repair and retry. Owned frames edit
 metadata with `set_metadata` and `clear_metadata`; invalid replacement text
-preserves the old value. [`media_buffers`](../examples/media_buffers.rs) shows
+preserves the old value and returns the original `String` in `Rejected<String>`.
+`MetadataFrame::new` and `set_data` return refused text the same way. A refused
+video or audio builder exposes its text with `supplied_metadata()` and
+`take_metadata()`. [`media_buffers`](../examples/media_buffers.rs) shows
 buffer reuse, borrowed planar audio and checked native video conversion.
 
 Optional per-frame metadata does not prevent reception of valid video or

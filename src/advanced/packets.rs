@@ -779,7 +779,10 @@ impl FrameExtras {
         self.timecode = timecode;
     }
 
-    pub(crate) fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<()> {
+    pub(crate) fn set_metadata(
+        &mut self,
+        metadata: impl Into<String>,
+    ) -> std::result::Result<(), Rejected<String>> {
         self.metadata.set(metadata)
     }
 
@@ -836,10 +839,15 @@ macro_rules! frame_extras_accessors {
         ///
         /// # Errors
         ///
-        /// Returns [`crate::Error::InvalidCString`] for an interior NUL, or
+        /// Returns the unchanged text in [`crate::Rejected`], with
+        /// [`crate::Error::InvalidCString`] for an interior NUL, or
         /// [`crate::Error::InvalidFrame`] when the emitted C string would
-        /// exceed the metadata size cap.
-        pub fn set_metadata(&mut self, metadata: impl Into<String>) -> $crate::Result<()> {
+        /// exceed the metadata size cap. `NulError` retains only the prefix
+        /// through the first NUL; [`crate::Rejected::into_inner`] returns all text.
+        pub fn set_metadata(
+            &mut self,
+            metadata: impl Into<String>,
+        ) -> std::result::Result<(), $crate::Rejected<String>> {
             self.extras.set_metadata(metadata)
         }
 
@@ -2033,7 +2041,9 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            frame.set_metadata("nul\0inside"),
+            frame
+                .set_metadata("nul\0inside")
+                .map_err(Rejected::into_error),
             Err(Error::InvalidCString(_))
         ));
         assert_eq!(frame.format().tier(), StreamTier::Preview);
@@ -2529,5 +2539,49 @@ mod tests {
         // field when it sends.
         assert_eq!(audio.timestamp, NDIlib_recv_timestamp_undefined);
         assert!(audio.p_metadata.is_null());
+    }
+    #[test]
+    fn all_compressed_metadata_setters_return_the_original_text() {
+        macro_rules! check {
+            ($frame:expr) => {{
+                let mut frame = $frame;
+                frame.set_metadata("previous").unwrap();
+                for text in [
+                    "<ok/>\0tail".to_owned(),
+                    "x".repeat(crate::frames::MAX_METADATA_BYTES),
+                ] {
+                    let pointer = text.as_ptr();
+                    let capacity = text.capacity();
+                    let oversized = text.len() == crate::frames::MAX_METADATA_BYTES;
+                    let (result, allocations) =
+                        crate::test_alloc::allocation_count(|| frame.set_metadata(text));
+                    assert_eq!(allocations, if oversized { 1 } else { 2 });
+                    let (error, text) = result.unwrap_err().into_parts();
+                    assert_eq!(text.as_ptr(), pointer);
+                    assert_eq!(text.capacity(), capacity);
+                    assert!(matches!(
+                        error,
+                        Error::InvalidFrame(_) | Error::InvalidCString(_)
+                    ));
+                    assert_eq!(frame.metadata(), Some("previous"));
+                    assert_eq!(frame.metadata_status(), crate::FrameMetadataStatus::Text);
+                }
+            }};
+        }
+        check!(CompressedVideoFrame::new(h264_format(), h264_packet(false, &[])).unwrap());
+        check!(CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1, 2]).unwrap());
+        check!(super::super::send::ScatterVideoFrame::new(
+            h264_format(),
+            vec![h264_packet(false, &[])]
+        )
+        .unwrap());
+        check!(super::super::send::ScatterAudioFrame::new(
+            AudioCodec::Opus,
+            48_000,
+            2,
+            960,
+            vec![vec![1, 2]]
+        )
+        .unwrap());
     }
 }

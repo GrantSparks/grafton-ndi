@@ -1,6 +1,6 @@
 //! Metadata's bounded UTF-8 and sole trailing NUL are established here.
 use super::{bounded_sdk_text, FrameMetadataStatus, MAX_METADATA_BYTES};
-use crate::{sys::bindings::NDIlib_metadata_frame_t, Error, Result};
+use crate::{sys::bindings::NDIlib_metadata_frame_t, Error, Rejected, Result};
 use std::{
     ffi::{CStr, CString},
     fmt,
@@ -332,9 +332,11 @@ pub(crate) struct TerminatedText {
 }
 
 impl TerminatedText {
-    pub(crate) fn new<S: Into<String>>(metadata: S) -> Result<Self> {
+    pub(crate) fn new<S: Into<String>>(metadata: S) -> std::result::Result<Self, Rejected<String>> {
         let mut text = metadata.into();
-        Self::validate_and_terminate(&mut text)?;
+        if let Err(error) = Self::validate_and_terminate(&mut text) {
+            return Err(Rejected::new(error, text));
+        }
         Ok(Self { inner: text })
     }
 
@@ -343,9 +345,10 @@ impl TerminatedText {
             crate::FrameDefect::MetadataLengthOverflow,
         ))?;
         validate_metadata_len_with_nul(len_with_nul)?;
-        if text.as_bytes().contains(&0) {
+        if let Some(position) = text.as_bytes().iter().position(|&byte| byte == 0) {
             return Err(Error::InvalidCString(
-                CString::new(text.as_str()).expect_err("metadata contains an interior NUL"),
+                CString::new(&text.as_bytes()[..=position])
+                    .expect_err("the prefix includes its first NUL"),
             ));
         }
         text.reserve_exact(1);
@@ -443,7 +446,7 @@ impl Default for OwnedFrameMetadata {
 }
 
 impl OwnedFrameMetadata {
-    pub(crate) fn new(metadata: impl Into<String>) -> Result<Self> {
+    pub(crate) fn new(metadata: impl Into<String>) -> std::result::Result<Self, Rejected<String>> {
         Ok(Self::Text(TerminatedText::new(metadata)?))
     }
 
@@ -491,7 +494,10 @@ impl OwnedFrameMetadata {
         }
     }
 
-    pub(crate) fn set(&mut self, text: impl Into<String>) -> Result<()> {
+    pub(crate) fn set(
+        &mut self,
+        text: impl Into<String>,
+    ) -> std::result::Result<(), Rejected<String>> {
         *self = Self::new(text)?;
         Ok(())
     }
