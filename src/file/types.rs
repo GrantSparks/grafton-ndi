@@ -712,7 +712,7 @@ impl NamePattern {
         let file = self.first_file(target)?;
         let longest_bytes = file
             .to_str()
-            .expect("validated UTF-8")
+            .ok_or_else(|| Error::InvalidInput("recording file path is not lossless UTF-8".into()))?
             .len()
             .saturating_add(self.index_digits_reserved);
         if longest_bytes > RECORDER_PATH_LIMIT {
@@ -2286,6 +2286,39 @@ mod tests {
             exact.check(&RecordingTarget::new(directory.join(format!("{name}x"))).unwrap()),
             Err(Error::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_output_paths_are_refused_without_panicking() {
+        const CHILD: &str = "GRAFTON_NDI_TEST_NON_UTF8_RECORDING_CWD";
+        if std::env::var_os(CHILD).is_some() {
+            let target = RecordingTarget::new("/grafton-ndi-valid-target").unwrap();
+            assert!(matches!(
+                NamePattern::new("take_{index}.mkv").unwrap().check(&target),
+                Err(Error::InvalidInput(_))
+            ));
+            return;
+        }
+
+        // Changing the working directory only in a child avoids racing other
+        // tests. A pattern omitting {prefix} resolves relative to that directory.
+        use std::os::unix::ffi::OsStringExt;
+        let directory = scratch("non-utf8-output");
+        let non_utf8 = directory.join(std::ffi::OsString::from_vec(vec![0xff]));
+        std::fs::create_dir(&non_utf8).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "file::types::tests::non_utf8_output_paths_are_refused_without_panicking",
+            ])
+            .env(CHILD, "1")
+            .current_dir(non_utf8)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 
     #[test]
