@@ -15,18 +15,6 @@ mixed-media capture, Advanced SDK operations, recording, playback and image
 encoding. Upgrading from 2.x requires API and deployment changes; follow the
 [2.x to 3.0 migration guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/migration/2.0-to-3.0.md).
 
-### Added
-
-- `ExternalPool`, `PoolBlock` and unsafe `AllocationBuffer::from_pool` lend
-  preallocated receive buffers without boxing a handle on SDK threads.
-
-- `CompressedSender::finish_video_async` and its split video view drain both
-  asynchronous streams and return their frames while keeping the source live.
-
-- Queued senders support AAC and Opus through shared
-  `send_compressed_audio` and `send_scatter_audio` operations, alongside their
-  existing uncompressed audio sends.
-
 ### Breaking changes
 
 - `BorrowedVideoFrame::data()` returns contiguous active bytes as `Option<&[u8]>`.
@@ -179,6 +167,16 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   protection against the SDK's infinite sentinel were already in 2.1.0.
 
 ### Added
+
+- `ExternalPool`, `PoolBlock` and unsafe `AllocationBuffer::from_pool` lend
+  preallocated receive buffers without boxing a handle on SDK threads.
+
+- `CompressedSender::finish_video_async` and its split video view drain both
+  asynchronous streams and return their frames while keeping the source live.
+
+- Queued senders support AAC and Opus through shared
+  `send_compressed_audio` and `send_scatter_audio` operations, alongside their
+  existing uncompressed audio sends.
 
 - Image encoding preserves non-square picture aspect in PNG pHYs and JPEG JFIF
   relative density tags; square-pixel output is unchanged. WebP remains untagged.

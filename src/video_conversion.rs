@@ -420,7 +420,7 @@ mod tests {
             .unwrap();
         let storage = destination.data();
         crate::frames::descriptor_tests::assert_extent(&raw, storage.as_ptr(), storage.len());
-        let raw = layout.p216_descriptor(&ndi, &storage).unwrap();
+        let raw = layout.p216_descriptor(&ndi, storage).unwrap();
         crate::frames::descriptor_tests::assert_extent(&raw, storage.as_ptr(), storage.len());
         assert!(layout
             .p216_descriptor(&ndi, &storage[..storage.len() - 1])
