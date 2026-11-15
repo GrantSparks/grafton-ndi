@@ -1735,7 +1735,17 @@ fn withheld_color_metadata_is_refused_by_every_encoder_before_output() {
         ] {
             let source = || {
                 let mut source = Source::new(&frame);
-                source.metadata = crate::color_info::Metadata::new(status, None);
+                source.metadata = crate::color_info::Metadata::new(
+                    crate::frames::FrameMetadataRef::Withheld(match status {
+                        crate::FrameMetadataStatus::NotUtf8 => {
+                            crate::frames::MetadataWithheld::NotUtf8
+                        }
+                        crate::FrameMetadataStatus::Unterminated => {
+                            crate::frames::MetadataWithheld::Unterminated
+                        }
+                        _ => unreachable!(),
+                    }),
+                );
                 source
             };
             for output_format in [

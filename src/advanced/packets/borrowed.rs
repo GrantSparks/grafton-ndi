@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     capture::{AudioKind, Guard, VideoKind},
-    frames::{FrameMetadataState, MetadataText},
+    frames::{FrameMetadataRef, FrameMetadataState, MetadataText},
     FrameMetadataStatus,
 };
 
@@ -52,18 +52,18 @@ macro_rules! borrowed_extras {
         /// Optional UTF-8 metadata. Unreadable text is withheld without losing
         /// the packet; [`Self::metadata_status`] reports its condition.
         pub fn metadata(&self) -> Option<&str> {
-            self.metadata_text().map(MetadataText::as_str)
+            self.frame_metadata().text().map(MetadataText::as_str)
         }
 
         /// Cached metadata presence or the reason unreadable text was withheld.
         pub fn metadata_status(&self) -> FrameMetadataStatus {
-            self.metadata.status()
+            self.frame_metadata().status()
         }
 
-        fn metadata_text(&self) -> Option<MetadataText<'_>> {
+        fn frame_metadata(&self) -> FrameMetadataRef<'_> {
             // SAFETY: construction scanned this exact pointer, which the guard
             // keeps alive and unchanged until the reference is dropped.
-            unsafe { self.metadata.text(self.frame.frame().p_metadata) }
+            unsafe { self.metadata.view(self.frame.frame().p_metadata) }
         }
     };
 }
@@ -96,10 +96,10 @@ impl<'rx> CompressedVideoRef<'rx> {
     }
 
     /// Copy payload and readable metadata into independently owned storage.
-    /// Unreadable metadata and its status are omitted from the owned copy.
+    /// Withheld metadata keeps its status without retaining unreadable text.
     pub fn to_owned(&self) -> CompressedVideoFrame {
         let mut extras = FrameExtras::default();
-        extras.copy_received(self.timecode(), self.timestamp(), self.metadata_text());
+        extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
         CompressedVideoFrame {
             format: self.format,
             bytes: AliasableVec::new(self.data().to_vec()),
@@ -114,7 +114,7 @@ impl<'rx> CompressedVideoRef<'rx> {
         destination.bytes.copy_from_slice(self.data());
         destination
             .extras
-            .copy_received(self.timecode(), self.timestamp(), self.metadata_text());
+            .copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
         destination.format = self.format;
     }
 }
@@ -170,10 +170,10 @@ impl<'rx> CompressedAudioRef<'rx> {
     }
 
     /// Copy payload and readable metadata into independently owned storage.
-    /// Unreadable metadata and its status are omitted from the owned copy.
+    /// Withheld metadata keeps its status without retaining unreadable text.
     pub fn to_owned(&self) -> CompressedAudioFrame {
         let mut extras = FrameExtras::default();
-        extras.copy_received(self.timecode(), self.timestamp(), self.metadata_text());
+        extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
         CompressedAudioFrame {
             codec: self.codec,
             protected: self.protected,
@@ -189,7 +189,7 @@ impl<'rx> CompressedAudioRef<'rx> {
         destination.bytes.copy_from_slice(self.data());
         destination
             .extras
-            .copy_received(self.timecode(), self.timestamp(), self.metadata_text());
+            .copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
         destination.codec = self.codec;
         destination.protected = self.protected;
         destination.parameters = self.parameters;

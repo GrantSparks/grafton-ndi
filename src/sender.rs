@@ -15,8 +15,8 @@ use std::{
 use crate::{
     finder::Source,
     frames::{
-        AudioSource, MetadataFrame, MetadataSource, MetadataText, PixelFormat, ScanType,
-        SendableVideoLayout, ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts,
+        AudioSource, FrameMetadataRef, MetadataFrame, MetadataSource, MetadataText, PixelFormat,
+        ScanType, SendableVideoLayout, ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts,
         VideoSource,
     },
     pixels::{send_room, Pixels},
@@ -897,8 +897,8 @@ unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
         self.data.as_ptr()
     }
     #[inline]
-    fn metadata_text(&self) -> Option<MetadataText<'_>> {
-        self.metadata
+    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+        FrameMetadataRef::from_text(self.metadata)
     }
     /// A frame built for sending carries no timestamp; [`Self::to_raw`]
     /// sends none.
@@ -948,7 +948,7 @@ impl<'a> PreparedVideo<'a> {
                 layout,
                 pixels: staging,
                 header: frame.header(),
-                metadata: frame.metadata_text(),
+                metadata: frame.frame_metadata(),
                 timestamp: frame.sdk_timestamp(),
             }
             .video_descriptor(authorized)?
@@ -966,7 +966,7 @@ struct StagedVideo<'a> {
     layout: ValidatedVideoLayout,
     pixels: &'a Pixels,
     header: &'a VideoHeader,
-    metadata: Option<MetadataText<'a>>,
+    metadata: FrameMetadataRef<'a>,
     timestamp: Option<crate::SdkTimestamp>,
 }
 
@@ -983,7 +983,7 @@ unsafe impl VideoParts for StagedVideo<'_> {
     fn pixels(&self) -> *const u8 {
         self.pixels.as_ptr()
     }
-    fn metadata_text(&self) -> Option<MetadataText<'_>> {
+    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
         self.metadata
     }
     fn sdk_timestamp(&self) -> Option<crate::SdkTimestamp> {

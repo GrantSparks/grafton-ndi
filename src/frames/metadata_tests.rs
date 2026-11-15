@@ -46,7 +46,7 @@ where
     });
     assert_eq!(allocations, 0);
     let ((), allocations) = crate::test_alloc::allocation_count(|| {
-        assert_eq!(VideoParts::metadata_state(&frame), status);
+        assert_eq!(VideoParts::frame_metadata(&frame).status(), status);
         assert_eq!(VideoSource::metadata_status(&frame), status);
         if matches!(
             status,
@@ -96,11 +96,11 @@ where
     owned
         .set_metadata("replacement metadata with capacity to reuse")
         .unwrap();
-    let metadata_capacity = owned.metadata.inner.capacity();
+    let metadata_capacity = owned.metadata.retained_bytes();
     let ((), allocations) = crate::test_alloc::allocation_count(|| {
         frame.copy_into_owned(&mut owned);
         assert_eq!(owned.metadata_status(), status);
-        assert_eq!(owned.metadata.inner.capacity(), metadata_capacity);
+        assert_eq!(owned.metadata.retained_bytes(), metadata_capacity);
     });
     assert_eq!(allocations, 0);
     assert!(owned.set_metadata("bad\0text").is_err());
@@ -167,7 +167,7 @@ where
     });
     assert_eq!(allocations, 0);
     let ((), allocations) = crate::test_alloc::allocation_count(|| {
-        assert_eq!(AudioParts::metadata_state(&frame), status);
+        assert_eq!(AudioParts::frame_metadata(&frame).status(), status);
         assert_eq!(AudioSource::metadata_status(&frame), status);
         assert_eq!(AudioSource::data(&frame), Some(samples.as_slice()));
         assert_eq!(
@@ -207,11 +207,11 @@ where
     owned
         .set_metadata("replacement metadata with capacity to reuse")
         .unwrap();
-    let metadata_capacity = owned.metadata.inner.capacity();
+    let metadata_capacity = owned.metadata.retained_bytes();
     let ((), allocations) = crate::test_alloc::allocation_count(|| {
         frame.copy_into_owned(&mut owned);
         assert_eq!(owned.metadata_status(), status);
-        assert_eq!(owned.metadata.inner.capacity(), metadata_capacity);
+        assert_eq!(owned.metadata.retained_bytes(), metadata_capacity);
     });
     assert_eq!(allocations, 0);
     assert!(owned.set_metadata("bad\0text").is_err());
@@ -254,7 +254,7 @@ where
         let ReturnedAudio::Samples(returned) = returned else {
             panic!("samples")
         };
-        assert_eq!(returned.metadata_state(), status);
+        assert_eq!(returned.frame_metadata().status(), status);
         assert_eq!(
             returned.audio_descriptor().p_metadata.is_null(),
             status != FrameMetadataStatus::Text
@@ -484,8 +484,8 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
         .unwrap();
     let video_pointer = video.metadata().unwrap().as_ptr();
     let audio_pointer = audio.metadata().unwrap().as_ptr();
-    let video_capacity = video.metadata.inner.capacity();
-    let audio_capacity = audio.metadata.inner.capacity();
+    let video_capacity = video.metadata.retained_bytes();
+    let audio_capacity = audio.metadata.retained_bytes();
     #[cfg(feature = "advanced")]
     let retained = video.retained_bytes();
     let ((), allocations) = crate::test_alloc::allocation_count(|| {
@@ -503,8 +503,8 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
                     audio.to_raw().p_metadata.is_null(),
                     audio_source.metadata().is_none()
                 );
-                assert_eq!(video.metadata.inner.capacity(), video_capacity);
-                assert_eq!(audio.metadata.inner.capacity(), audio_capacity);
+                assert_eq!(video.metadata.retained_bytes(), video_capacity);
+                assert_eq!(audio.metadata.retained_bytes(), audio_capacity);
                 if video_source.metadata().is_some() {
                     assert_eq!(video.metadata().unwrap().as_ptr(), video_pointer);
                     assert_eq!(audio.metadata().unwrap().as_ptr(), audio_pointer);
@@ -514,8 +514,8 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
             }
             video.clear_metadata();
             audio.clear_metadata();
-            assert_eq!(video.metadata.inner.capacity(), video_capacity);
-            assert_eq!(audio.metadata.inner.capacity(), audio_capacity);
+            assert_eq!(video.metadata.retained_bytes(), video_capacity);
+            assert_eq!(audio.metadata.retained_bytes(), audio_capacity);
         }
     });
     assert_eq!(allocations, 0);
@@ -570,4 +570,41 @@ fn audio_timestamp_normalization_depends_on_the_capture_family() {
             },
         );
     }
+}
+
+#[test]
+fn owned_metadata_states_keep_one_observation_and_reuse_their_storage() {
+    let present = MetadataText::from_cstr(c"<present/>").unwrap();
+    let empty = MetadataText::from_cstr(c"").unwrap();
+    let observations = [
+        FrameMetadataRef::Absent,
+        FrameMetadataRef::Text(present),
+        FrameMetadataRef::Withheld(MetadataWithheld::NotUtf8),
+        FrameMetadataRef::Text(empty),
+        FrameMetadataRef::Withheld(MetadataWithheld::Unterminated),
+    ];
+    let mut owned = OwnedFrameMetadata::new("x".repeat(64)).unwrap();
+    let capacity = owned.retained_bytes();
+    let ((), allocations) = crate::test_alloc::allocation_count(|| {
+        for observation in observations.into_iter().cycle().take(25) {
+            owned.copy_from(observation);
+            assert_eq!(owned.view().status(), observation.status());
+            assert_eq!(
+                owned.view().text().map(MetadataText::as_str),
+                observation.text().map(MetadataText::as_str)
+            );
+            assert_eq!(owned.retained_bytes(), capacity);
+            assert_eq!(
+                owned.view().as_ptr().is_null(),
+                observation.text().is_none()
+            );
+        }
+    });
+    assert_eq!(allocations, 0);
+    let status = owned.view().status();
+    assert!(owned.set("bad\0text").is_err());
+    assert_eq!(owned.view().status(), status);
+    owned.clear();
+    assert_eq!(owned.view().status(), FrameMetadataStatus::Absent);
+    assert_eq!(owned.retained_bytes(), capacity);
 }

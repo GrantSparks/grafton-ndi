@@ -654,9 +654,7 @@ impl AvSyncFrame for VideoFrame {}
 impl video_sealed::Sealed for VideoFrameRef<'_> {
     fn descriptor(&self, _: &crate::Ndi) -> crate::Result<NDIlib_video_frame_v2_t> {
         let mut raw = *self.raw();
-        if self.metadata().is_none() {
-            raw.p_metadata = std::ptr::null();
-        }
+        raw.p_metadata = crate::frames::VideoParts::frame_metadata(self).as_ptr();
         Ok(raw)
     }
 

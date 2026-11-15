@@ -9,7 +9,7 @@
 use std::ptr;
 
 use crate::{
-    frames::{MetadataText, ValidatedVideoLayout, VideoHeader, VideoParts, MAX_VIDEO_BYTES},
+    frames::{FrameMetadataRef, ValidatedVideoLayout, VideoHeader, VideoParts, MAX_VIDEO_BYTES},
     sys::{self, bindings::NDIlib_video_frame_v2_t},
     Error, Ndi, PictureAspectRatio, PixelFormat, Result, ScanType, Timecode, VideoFrame,
     VideoSource,
@@ -246,8 +246,8 @@ unsafe impl VideoParts for P216Output<'_> {
     fn pixels(&self) -> *const u8 {
         self.pointer.cast_const()
     }
-    fn metadata_text(&self) -> Option<MetadataText<'_>> {
-        None
+    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+        FrameMetadataRef::Absent
     }
     fn sdk_timestamp(&self) -> Option<crate::SdkTimestamp> {
         None

@@ -686,24 +686,12 @@ pub(crate) unsafe trait VideoParts {
     /// The start of the frame's pixel storage.
     fn pixels(&self) -> *const u8;
 
-    /// The validated metadata text, or `None` when the frame has none.
-    fn metadata_text(&self) -> Option<MetadataText<'_>>;
-
-    /// The cached receive status, or the presence of validated sending text.
-    fn metadata_state(&self) -> FrameMetadataStatus {
-        if self.metadata_text().is_some() {
-            FrameMetadataStatus::Text
-        } else {
-            FrameMetadataStatus::Absent
-        }
-    }
+    /// The frame's one validated metadata observation.
+    fn frame_metadata(&self) -> FrameMetadataRef<'_>;
 
     /// Keep the metadata's status beside its text for a lazy color read.
     fn color_metadata(&self) -> crate::color_info::Metadata<'_> {
-        crate::color_info::Metadata::new(
-            self.metadata_state(),
-            self.metadata_text().map(MetadataText::as_str),
-        )
+        crate::color_info::Metadata::new(self.frame_metadata())
     }
 
     /// The time the sender submitted the frame, when it is known.
@@ -739,9 +727,7 @@ pub(crate) unsafe trait VideoParts {
             __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
                 line_stride_in_bytes: layout.sdk_line_stride(),
             },
-            p_metadata: self
-                .metadata_text()
-                .map_or(ptr::null(), MetadataText::as_ptr),
+            p_metadata: self.frame_metadata().as_ptr(),
             timestamp: SdkTimestamp::to_sdk(self.sdk_timestamp()),
         })
     }
@@ -776,10 +762,7 @@ pub(crate) unsafe trait VideoParts {
     /// metadata allocation when there is metadata.
     fn owned_copy(&self) -> VideoFrame {
         let packed = self.layout().packed();
-        let metadata = self
-            .metadata_text()
-            .map(|text| FrameMetadata::copy_from(text, None))
-            .unwrap_or_default();
+        let metadata = OwnedFrameMetadata::copied(self.frame_metadata());
         let room = crate::pixels::send_room(&packed, self.header().scan_type);
         packed_video(
             self,
@@ -797,7 +780,7 @@ pub(crate) unsafe trait VideoParts {
     /// holds the packed frame and its scan-dependent SDK
     /// [room](PixelFormat::send_tail_room), and otherwise replaced without
     /// copying its old contents; its metadata string is reused as
-    /// [`FrameMetadata::copy_from`] describes.
+    /// [`OwnedFrameMetadata::copy_from`] describes.
     ///
     /// Nothing can fail part-way: any allocation happens while `destination`
     /// is still a whole frame, and the only moment its buffer and layout
@@ -810,10 +793,7 @@ pub(crate) unsafe trait VideoParts {
         let replacement =
             (!destination.data.holds(len, room)).then(|| Pixels::with_room(len, room));
         let mut metadata = std::mem::take(&mut destination.metadata);
-        match self.metadata_text() {
-            Some(text) => metadata.copy_text(text),
-            None => metadata.clear(),
-        }
+        metadata.copy_from(self.frame_metadata());
         let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
         *destination = packed_video(self, packed, data, metadata);
     }
@@ -888,12 +868,12 @@ pub trait VideoSource: VideoParts {
     /// UTF-8 frame metadata; an explicit empty string differs from no metadata.
     /// Unreadable received text is withheld; inspect [`Self::metadata_status`].
     fn metadata(&self) -> Option<&str> {
-        self.metadata_text().map(MetadataText::as_str)
+        self.frame_metadata().text().map(MetadataText::as_str)
     }
 
     /// Whether per-frame metadata is absent, readable, or withheld as unreadable.
     fn metadata_status(&self) -> FrameMetadataStatus {
-        self.metadata_state()
+        self.frame_metadata().status()
     }
 
     /// Read the frame's `ndi_color_info` description without copying metadata.
@@ -959,7 +939,7 @@ fn packed_video<P: VideoParts + ?Sized>(
     source: &P,
     packed: ValidatedVideoLayout,
     mut data: Pixels,
-    metadata: FrameMetadata,
+    metadata: OwnedFrameMetadata,
 ) -> VideoFrame {
     let room = crate::pixels::send_room(&packed, source.header().scan_type);
     source.copy_active_pixels(&mut data, &packed, room);
@@ -969,7 +949,6 @@ fn packed_video<P: VideoParts + ?Sized>(
         header: *source.header(),
         data,
         metadata,
-        metadata_status: source.metadata_state(),
         timestamp: source.sdk_timestamp(),
     }
 }
@@ -1120,7 +1099,7 @@ macro_rules! video_accessors {
             /// [`Self::metadata_status`] to distinguish it from absent text.
             #[inline]
             pub fn metadata(&self) -> Option<&str> {
-                $crate::frames::VideoParts::metadata_text(self)
+                $crate::frames::VideoParts::frame_metadata(self).text()
                     .map($crate::frames::MetadataText::as_str)
             }
 
@@ -1128,7 +1107,7 @@ macro_rules! video_accessors {
             /// was withheld. Querying the cached status allocates nothing.
             #[inline]
             pub fn metadata_status(&self) -> $crate::FrameMetadataStatus {
-                $crate::frames::VideoParts::metadata_state(self)
+                $crate::frames::VideoParts::frame_metadata(self).status()
             }
 
 
@@ -1420,13 +1399,12 @@ pub struct VideoFrame {
     header: VideoHeader,
     /// The pixels, followed by the room required by the layout and scan type.
     data: Pixels,
-    metadata: FrameMetadata,
-    metadata_status: FrameMetadataStatus,
+    metadata: OwnedFrameMetadata,
     timestamp: Option<SdkTimestamp>,
 }
 
 // SAFETY: Pixels owns and initializes the validated layout and scan-dependent
-// SDK tail. FrameMetadata owns bounded terminated text. Immutable borrows keep
+// SDK tail. OwnedFrameMetadata owns bounded terminated text. Immutable borrows keep
 // both allocations unchanged; can_send_direct includes all SDK-readable room.
 unsafe impl VideoParts for VideoFrame {
     #[inline]
@@ -1442,12 +1420,8 @@ unsafe impl VideoParts for VideoFrame {
         self.data.as_ptr()
     }
     #[inline]
-    fn metadata_text(&self) -> Option<MetadataText<'_>> {
-        self.metadata.optional_text()
-    }
-    #[inline]
-    fn metadata_state(&self) -> FrameMetadataStatus {
-        self.metadata_status
+    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+        self.metadata.view()
     }
     #[inline]
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
@@ -1630,7 +1604,7 @@ impl VideoFrame {
 
     #[cfg(test)]
     pub(crate) fn metadata_cstr(&self) -> Option<&CStr> {
-        self.metadata.optional_text().map(|metadata| {
+        self.metadata.view().text().map(|metadata| {
             CStr::from_bytes_with_nul(metadata.with_nul.as_bytes())
                 .expect("owned metadata ends in its only NUL byte")
         })
@@ -1648,16 +1622,13 @@ impl VideoFrame {
     /// byte, or [`Error::InvalidFrame`] if the emitted C string would exceed
     /// the metadata size cap.
     pub fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<()> {
-        self.metadata = FrameMetadata::new(metadata)?;
-        self.metadata_status = FrameMetadataStatus::Text;
-        Ok(())
+        self.metadata.set(metadata)
     }
 
     /// Remove frame metadata, setting [`FrameMetadataStatus::Absent`] and
     /// retaining its allocation for later copies.
     pub fn clear_metadata(&mut self) {
         self.metadata.clear();
-        self.metadata_status = FrameMetadataStatus::Absent;
     }
 
     /// # Safety
@@ -1702,13 +1673,8 @@ impl VideoFrame {
                 crate::pixels::send_room(&layout, ScanType::Progressive),
             ),
             metadata: metadata
-                .map(|text| FrameMetadata::new(text).unwrap())
+                .map(|text| OwnedFrameMetadata::new(text).unwrap())
                 .unwrap_or_default(),
-            metadata_status: if metadata.is_some() {
-                FrameMetadataStatus::Text
-            } else {
-                FrameMetadataStatus::Absent
-            },
             timestamp: None,
         }
     }
@@ -1875,7 +1841,7 @@ impl VideoFrameBuilder {
             }
             // The last fallible check transfers metadata only on success,
             // preserving the complete builder on every rejected input.
-            let metadata = FrameMetadata::take_from(&mut self.metadata)?.unwrap_or_default();
+            let metadata = OwnedFrameMetadata::take_from(&mut self.metadata)?;
             Ok((layout, metadata, picture_aspect_ratio))
         };
         let (layout, metadata, picture_aspect_ratio) = match validate() {
@@ -1897,7 +1863,6 @@ impl VideoFrameBuilder {
                 self.timecode,
             ),
             data,
-            metadata_status: FrameMetadataState::from_text(metadata.optional_text()).status(),
             metadata,
             timestamp: None,
         })
@@ -1937,17 +1902,8 @@ pub(crate) unsafe trait AudioParts {
     /// The start of the frame's sample storage.
     fn samples(&self) -> *const f32;
 
-    /// The validated metadata text, or `None` when the frame has none.
-    fn metadata_text(&self) -> Option<MetadataText<'_>>;
-
-    /// The cached receive status, or the presence of validated sending text.
-    fn metadata_state(&self) -> FrameMetadataStatus {
-        if self.metadata_text().is_some() {
-            FrameMetadataStatus::Text
-        } else {
-            FrameMetadataStatus::Absent
-        }
-    }
+    /// The frame's one validated metadata observation.
+    fn frame_metadata(&self) -> FrameMetadataRef<'_>;
 
     /// Borrow the original validated channel stride, samples and metadata.
     fn audio_descriptor(&self) -> NDIlib_audio_frame_v3_t {
@@ -1962,9 +1918,7 @@ pub(crate) unsafe trait AudioParts {
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: layout.sdk_channel_stride(),
             },
-            p_metadata: self
-                .metadata_text()
-                .map_or(ptr::null(), MetadataText::as_ptr),
+            p_metadata: self.frame_metadata().as_ptr(),
             timestamp: SdkTimestamp::to_sdk(self.sdk_timestamp()),
         }
     }
@@ -1999,10 +1953,7 @@ pub(crate) unsafe trait AudioParts {
     /// metadata allocation when there is metadata.
     fn owned_copy(&self) -> AudioFrame {
         let packed = self.layout().packed();
-        let metadata = self
-            .metadata_text()
-            .map(|text| FrameMetadata::copy_from(text, None))
-            .unwrap_or_default();
+        let metadata = OwnedFrameMetadata::copied(self.frame_metadata());
         packed_audio(
             self,
             packed,
@@ -2018,17 +1969,14 @@ pub(crate) unsafe trait AudioParts {
     /// whatever it held before. Its sample buffer is reused when its capacity
     /// holds the packed samples, and otherwise replaced without copying its
     /// old contents; its metadata string is reused as
-    /// [`FrameMetadata::copy_from`] describes. As for video, any allocation
+    /// [`OwnedFrameMetadata::copy_from`] describes. As for video, any allocation
     /// happens while `destination` is still a whole frame.
     fn copy_into_owned(&self, destination: &mut AudioFrame) {
         let packed = self.layout().packed();
         let len = packed.sample_count();
         let replacement = (destination.data.capacity() < len).then(|| Vec::with_capacity(len));
         let mut metadata = std::mem::take(&mut destination.metadata);
-        match self.metadata_text() {
-            Some(text) => metadata.copy_text(text),
-            None => metadata.clear(),
-        }
+        metadata.copy_from(self.frame_metadata());
         let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
         *destination = packed_audio(self, packed, data, metadata);
     }
@@ -2083,12 +2031,12 @@ pub trait AudioSource: AudioParts {
     /// UTF-8 metadata; an explicit empty string differs from no metadata.
     /// Unreadable received text is withheld; inspect [`Self::metadata_status`].
     fn metadata(&self) -> Option<&str> {
-        self.metadata_text().map(MetadataText::as_str)
+        self.frame_metadata().text().map(MetadataText::as_str)
     }
 
     /// Whether per-frame metadata is absent, readable, or withheld as unreadable.
     fn metadata_status(&self) -> FrameMetadataStatus {
-        self.metadata_state()
+        self.frame_metadata().status()
     }
 
     /// One channel's initialized samples, excluding any inter-channel padding.
@@ -2152,8 +2100,8 @@ unsafe impl AudioParts for BorrowedAudioFrame<'_> {
     fn samples(&self) -> *const f32 {
         self.data.as_ptr()
     }
-    fn metadata_text(&self) -> Option<MetadataText<'_>> {
-        self.metadata
+    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+        FrameMetadataRef::from_text(self.metadata)
     }
 }
 
@@ -2314,7 +2262,7 @@ fn packed_audio<P: AudioParts + ?Sized>(
     source: &P,
     packed: ValidatedAudioLayout,
     mut data: Vec<f32>,
-    metadata: FrameMetadata,
+    metadata: OwnedFrameMetadata,
 ) -> AudioFrame {
     data.clear();
     // The views read channel samples only, never padding between channels.
@@ -2327,7 +2275,6 @@ fn packed_audio<P: AudioParts + ?Sized>(
         timecode: source.audio_timecode(),
         data,
         metadata,
-        metadata_status: source.metadata_state(),
         timestamp: source.sdk_timestamp(),
     }
 }
@@ -2411,14 +2358,14 @@ macro_rules! audio_accessors {
             /// [`Self::metadata_status`] to distinguish it from absent text.
             #[inline]
             pub fn metadata(&self) -> Option<&str> {
-                AudioParts::metadata_text(self).map(MetadataText::as_str)
+                AudioParts::frame_metadata(self).text().map(MetadataText::as_str)
             }
 
             /// The metadata's presence or the reason unreadable received text
             /// was withheld. Querying the cached status allocates nothing.
             #[inline]
             pub fn metadata_status(&self) -> crate::FrameMetadataStatus {
-                AudioParts::metadata_state(self)
+                AudioParts::frame_metadata(self).status()
             }
 
 
@@ -2486,13 +2433,12 @@ pub struct AudioFrame {
     layout: ValidatedAudioLayout,
     timecode: Timecode,
     data: Vec<f32>,
-    metadata: FrameMetadata,
-    metadata_status: FrameMetadataStatus,
+    metadata: OwnedFrameMetadata,
     timestamp: Option<SdkTimestamp>,
 }
 
 // SAFETY: The owned f32 vector covers and initializes the packed layout;
-// FrameMetadata owns bounded terminated text. Both stay unchanged for the
+// OwnedFrameMetadata owns bounded terminated text. Both stay unchanged for the
 // borrow, and the default descriptor addresses only those live allocations.
 unsafe impl AudioParts for AudioFrame {
     #[inline]
@@ -2512,12 +2458,8 @@ unsafe impl AudioParts for AudioFrame {
         self.data.as_ptr()
     }
     #[inline]
-    fn metadata_text(&self) -> Option<MetadataText<'_>> {
-        self.metadata.optional_text()
-    }
-    #[inline]
-    fn metadata_state(&self) -> FrameMetadataStatus {
-        self.metadata_status
+    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+        self.metadata.view()
     }
 }
 
@@ -2643,16 +2585,13 @@ impl AudioFrame {
     /// byte, or [`Error::InvalidFrame`] if the emitted C string would exceed
     /// the metadata size cap.
     pub fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<()> {
-        self.metadata = FrameMetadata::new(metadata)?;
-        self.metadata_status = FrameMetadataStatus::Text;
-        Ok(())
+        self.metadata.set(metadata)
     }
 
     /// Remove frame metadata, setting [`FrameMetadataStatus::Absent`] and
     /// retaining its allocation for later copies.
     pub fn clear_metadata(&mut self) {
         self.metadata.clear();
-        self.metadata_status = FrameMetadataStatus::Absent;
     }
 
     /// Get mutable samples for one channel without allocating.
@@ -2813,7 +2752,7 @@ impl AudioFrameBuilder {
             }
             // Transfer metadata only after every rejection check, before
             // interleaving conversion or changing sample storage.
-            let metadata = FrameMetadata::take_from(&mut self.metadata)?.unwrap_or_default();
+            let metadata = OwnedFrameMetadata::take_from(&mut self.metadata)?;
             Ok((layout, metadata))
         };
         let (audio_layout, metadata) = match validate() {
@@ -2850,7 +2789,6 @@ impl AudioFrameBuilder {
             layout: audio_layout,
             timecode: self.timecode,
             data,
-            metadata_status: FrameMetadataState::from_text(metadata.optional_text()).status(),
             metadata,
             timestamp: None,
         })
@@ -2945,7 +2883,7 @@ pub(crate) const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MetadataFrame {
-    data: FrameMetadata,
+    data: TerminatedText,
     timecode: Timecode,
 }
 
@@ -2962,7 +2900,7 @@ impl MetadataFrame {
     /// crate's metadata size limit.
     pub fn new(data: impl Into<String>) -> Result<Self> {
         Ok(MetadataFrame {
-            data: FrameMetadata::new(data)?,
+            data: TerminatedText::new(data)?,
             timecode: Timecode::SYNTHESIZE,
         })
     }
@@ -3017,7 +2955,7 @@ impl MetadataFrame {
     /// or [`Error::InvalidFrame`] if the SDK metadata length would exceed the
     /// crate's metadata size limit. The frame is unchanged.
     pub fn set_data(&mut self, data: impl Into<String>) -> Result<()> {
-        self.data = FrameMetadata::new(data)?;
+        self.data = TerminatedText::new(data)?;
         Ok(())
     }
 
@@ -3053,7 +2991,7 @@ impl MetadataFrame {
     /// Copy validated metadata text into an owned frame. `None`, the empty
     /// null frame, carries no text; it is empty metadata.
     pub(crate) fn copied(text: Option<MetadataText<'_>>, timecode: Timecode) -> Self {
-        let data = FrameMetadata::copy_from(text.unwrap_or(MetadataText { with_nul: "\0" }), None);
+        let data = TerminatedText::copied(text.unwrap_or(MetadataText { with_nul: "\0" }));
         Self { data, timecode }
     }
 }
@@ -3127,7 +3065,7 @@ pub trait MetadataSource: MetadataParts {
     }
 }
 
-// SAFETY: FrameMetadata owns bounded UTF-8 and its sole terminal NUL. The
+// SAFETY: TerminatedText owns bounded UTF-8 and its sole terminal NUL. The
 // overridden descriptor uses exactly that live initialized string, whose
 // allocation and contents stay unchanged for the borrow.
 unsafe impl MetadataParts for MetadataFrame {
@@ -3353,12 +3291,66 @@ pub enum FrameMetadataStatus {
     Unterminated,
 }
 
-/// Cached validation of one optional per-frame metadata pointer.
-/// Private fields prevent a caller from forging a validated text length.
+/// Why optional metadata was withheld while retaining otherwise valid media.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum MetadataWithheld {
+    NotUtf8,
+    Unterminated,
+}
+
+impl MetadataWithheld {
+    const fn status(self) -> FrameMetadataStatus {
+        match self {
+            Self::NotUtf8 => FrameMetadataStatus::NotUtf8,
+            Self::Unterminated => FrameMetadataStatus::Unterminated,
+        }
+    }
+}
+
+/// One metadata observation: readable text is carried by the state that says
+/// it is readable, so consumers cannot pair `Text` with absent or withheld text.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct FrameMetadataState {
-    status: FrameMetadataStatus,
-    len_with_nul: usize,
+pub(crate) enum FrameMetadataRef<'a> {
+    Absent,
+    Text(MetadataText<'a>),
+    Withheld(MetadataWithheld),
+}
+
+impl<'a> FrameMetadataRef<'a> {
+    pub(crate) fn from_text(text: Option<MetadataText<'a>>) -> Self {
+        text.map_or(Self::Absent, Self::Text)
+    }
+
+    pub(crate) const fn status(self) -> FrameMetadataStatus {
+        match self {
+            Self::Absent => FrameMetadataStatus::Absent,
+            Self::Text(_) => FrameMetadataStatus::Text,
+            Self::Withheld(reason) => reason.status(),
+        }
+    }
+
+    pub(crate) const fn text(self) -> Option<MetadataText<'a>> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Absent | Self::Withheld(_) => None,
+        }
+    }
+
+    pub(crate) fn as_ptr(self) -> *const c_char {
+        self.text().map_or(ptr::null(), MetadataText::as_ptr)
+    }
+}
+
+/// Cached validation of one optional metadata pointer. Only readable text
+/// carries a length; the other states cannot accidentally reborrow bytes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameMetadataState(MetadataScan);
+
+#[derive(Debug, Clone, Copy)]
+enum MetadataScan {
+    Absent,
+    Text { len_with_nul: usize },
+    Withheld(MetadataWithheld),
 }
 
 impl FrameMetadataState {
@@ -3370,124 +3362,98 @@ impl FrameMetadataState {
     /// metadata cap, whichever comes first.
     pub(crate) unsafe fn scan(pointer: *const c_char) -> Self {
         if pointer.is_null() {
-            return Self::from_text(None);
+            return Self(MetadataScan::Absent);
         }
         // SAFETY: the caller guarantees the bounded readable extent.
         let Some(bytes) = (unsafe { bounded_sdk_text(pointer, MAX_METADATA_BYTES) }) else {
-            return Self {
-                status: FrameMetadataStatus::Unterminated,
-                len_with_nul: 0,
-            };
+            return Self(MetadataScan::Withheld(MetadataWithheld::Unterminated));
         };
-        Self {
-            status: if str::from_utf8(bytes).is_ok() {
-                FrameMetadataStatus::Text
-            } else {
-                FrameMetadataStatus::NotUtf8
-            },
-            len_with_nul: bytes.len() + 1,
+        if str::from_utf8(bytes).is_ok() {
+            Self(MetadataScan::Text {
+                len_with_nul: bytes.len() + 1,
+            })
+        } else {
+            Self(MetadataScan::Withheld(MetadataWithheld::NotUtf8))
         }
     }
 
     /// Cache text that was already validated, including standalone metadata.
-    pub(crate) fn from_text(text: Option<MetadataText<'_>>) -> Self {
-        Self {
-            status: if text.is_some() {
-                FrameMetadataStatus::Text
-            } else {
-                FrameMetadataStatus::Absent
-            },
-            len_with_nul: text.map_or(0, MetadataText::len_with_nul),
-        }
+    fn from_text(text: Option<MetadataText<'_>>) -> Self {
+        Self(
+            text.map_or(MetadataScan::Absent, |text| MetadataScan::Text {
+                len_with_nul: text.len_with_nul(),
+            }),
+        )
     }
 
-    pub(crate) const fn status(self) -> FrameMetadataStatus {
-        self.status
-    }
-
-    /// Reborrow validated text without rescanning it.
+    /// Reborrow the one validated metadata observation without rescanning.
     ///
     /// # Safety
     ///
     /// `pointer` must name the same bytes used to construct this state, live
-    /// and unchanged for `'a`. This includes the measured terminal NUL.
-    pub(crate) unsafe fn text<'a>(self, pointer: *const c_char) -> Option<MetadataText<'a>> {
-        if self.status != FrameMetadataStatus::Text {
-            return None;
+    /// and unchanged for `'a`, including the measured terminal NUL.
+    pub(crate) unsafe fn view<'a>(self, pointer: *const c_char) -> FrameMetadataRef<'a> {
+        match self.0 {
+            MetadataScan::Absent => FrameMetadataRef::Absent,
+            MetadataScan::Withheld(reason) => FrameMetadataRef::Withheld(reason),
+            MetadataScan::Text { len_with_nul } => {
+                // SAFETY: construction validated UTF-8 and the terminator;
+                // the caller retains those same bytes for the returned borrow.
+                let with_nul = unsafe {
+                    str::from_utf8_unchecked(slice::from_raw_parts(pointer.cast(), len_with_nul))
+                };
+                FrameMetadataRef::Text(MetadataText { with_nul })
+            }
         }
-        // SAFETY: construction validated UTF-8 and the terminator; the caller
-        // keeps those same bytes live and unchanged for the returned borrow.
-        let with_nul = unsafe {
-            str::from_utf8_unchecked(slice::from_raw_parts(pointer.cast(), self.len_with_nul))
-        };
-        Some(MetadataText { with_nul })
     }
 }
 
-/// Owned video/audio per-frame metadata.
-///
-/// Present text includes its only NUL as its last byte and fits within the
-/// metadata size cap. An empty string buffer means absent metadata while
-/// retaining its capacity; explicit empty text holds its one NUL byte. Keeping its capacity, unlike a `CString`, lets copies
-/// reuse storage when per-frame text changes length. UTF-8 is guaranteed by
-/// `String`; the private constructors preserve termination. `None` on a frame
-/// means a null SDK `p_metadata`; `Some("")` is a non-null empty C string.
-#[derive(Clone, Default, PartialEq, Eq, Hash)]
-pub(crate) struct FrameMetadata {
+/// Always-present owned UTF-8 text, including its sole terminal NUL. Unlike
+/// optional frame metadata this type has no empty-buffer/absent state.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct TerminatedText {
     inner: String,
 }
 
-impl FrameMetadata {
+impl TerminatedText {
     pub(crate) fn new<S: Into<String>>(metadata: S) -> Result<Self> {
-        Ok(Self::take_from(&mut Some(metadata.into()))?
-            .expect("a supplied metadata string produces a value"))
+        let mut text = metadata.into();
+        Self::validate_and_terminate(&mut text)?;
+        Ok(Self { inner: text })
     }
 
-    /// Validate and take an optional owned string, retaining its capacity.
-    /// Failure leaves the original option and text unchanged, so builders
-    /// can return their complete input without copying successful metadata.
-    fn take_from(metadata: &mut Option<String>) -> Result<Option<Self>> {
-        let Some(text) = metadata.as_mut() else {
-            return Ok(None);
-        };
+    fn validate_and_terminate(text: &mut String) -> Result<()> {
         let len_with_nul = text.len().checked_add(1).ok_or_else(|| {
             Error::InvalidFrame("Frame metadata length overflow while adding terminator".into())
         })?;
         validate_metadata_len_with_nul(len_with_nul)?;
         if text.as_bytes().contains(&0) {
-            // Construct the existing owned diagnostic only on the error path;
-            // the builder keeps its original string and capacity.
             return Err(Error::InvalidCString(
                 CString::new(text.as_str()).expect_err("metadata contains an interior NUL"),
             ));
         }
-        // String already guarantees UTF-8; adding its only NUL needs no
-        // CString round trip, allocation shrink or unchecked UTF-8 conversion.
         text.reserve_exact(1);
         text.push('\0');
+        Ok(())
+    }
+
+    /// Failure leaves the builder's text and capacity unchanged.
+    fn take_from(metadata: &mut Option<String>) -> Result<Option<Self>> {
+        let Some(text) = metadata.as_mut() else {
+            return Ok(None);
+        };
+        Self::validate_and_terminate(text)?;
         Ok(metadata.take().map(|inner| Self { inner }))
     }
 
-    /// Present text with its terminator, distinguishing absence from empty text.
-    pub(crate) fn optional_text(&self) -> Option<MetadataText<'_>> {
-        (!self.inner.is_empty()).then_some(MetadataText {
-            with_nul: &self.inner,
-        })
-    }
-
-    /// Mark metadata absent without releasing its reusable allocation.
-    pub(crate) fn clear(&mut self) {
-        self.inner.clear();
-    }
-
-    /// The text of standalone metadata, which always holds its terminal NUL.
     pub(crate) fn text(&self) -> MetadataText<'_> {
-        self.optional_text()
-            .expect("standalone metadata holds terminated text")
+        MetadataText {
+            with_nul: &self.inner,
+        }
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        self.optional_text().map_or("", MetadataText::as_str)
+        self.text().as_str()
     }
 
     pub(crate) fn into_string(mut self) -> String {
@@ -3496,38 +3462,15 @@ impl FrameMetadata {
     }
 
     pub(crate) fn as_ptr(&self) -> *const c_char {
-        if self.inner.is_empty() {
-            ptr::null()
-        } else {
-            self.inner.as_ptr().cast()
+        self.inner.as_ptr().cast()
+    }
+
+    fn copied(text: MetadataText<'_>) -> Self {
+        Self {
+            inner: text.with_nul.to_owned(),
         }
     }
 
-    /// All bytes retained by this metadata, including spare string capacity.
-    #[cfg(feature = "advanced")]
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.inner.capacity()
-    }
-
-    /// Copy validated text into owned metadata, reusing the allocation of
-    /// `storage` when there is one.
-    ///
-    /// Without `storage` this allocates once. With it, it allocates nothing
-    /// when the capacity holds the new text and its terminator.
-    pub(crate) fn copy_from(text: MetadataText<'_>, storage: Option<Self>) -> Self {
-        match storage {
-            Some(mut storage) => {
-                storage.copy_text(text);
-                storage
-            }
-            None => Self {
-                inner: text.with_nul.to_owned(),
-            },
-        }
-    }
-
-    /// Replace validated text, reserving before mutation so any allocation
-    /// happens while the original string is still complete and terminated.
     fn copy_text(&mut self, text: MetadataText<'_>) {
         self.inner
             .reserve_exact(text.len_with_nul().saturating_sub(self.inner.len()));
@@ -3536,11 +3479,103 @@ impl FrameMetadata {
     }
 }
 
-impl fmt::Debug for FrameMetadata {
+impl fmt::Debug for TerminatedText {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("FrameMetadata")
+        f.debug_tuple("TerminatedText")
             .field(&self.as_str())
             .finish()
+    }
+}
+
+/// Owned optional metadata. Each state carries its storage, keeping readable
+/// text terminated by construction while retaining spare capacity in absent
+/// and withheld states for later copies.
+#[derive(Clone, Debug)]
+pub(crate) enum OwnedFrameMetadata {
+    Absent(String),
+    Text(TerminatedText),
+    Withheld {
+        reason: MetadataWithheld,
+        storage: String,
+    },
+}
+
+impl Default for OwnedFrameMetadata {
+    fn default() -> Self {
+        Self::Absent(String::new())
+    }
+}
+
+impl OwnedFrameMetadata {
+    pub(crate) fn new(metadata: impl Into<String>) -> Result<Self> {
+        Ok(Self::Text(TerminatedText::new(metadata)?))
+    }
+
+    fn take_from(metadata: &mut Option<String>) -> Result<Self> {
+        Ok(TerminatedText::take_from(metadata)?.map_or_else(Self::default, Self::Text))
+    }
+
+    pub(crate) fn view(&self) -> FrameMetadataRef<'_> {
+        match self {
+            Self::Absent(_) => FrameMetadataRef::Absent,
+            Self::Text(text) => FrameMetadataRef::Text(text.text()),
+            Self::Withheld { reason, .. } => FrameMetadataRef::Withheld(*reason),
+        }
+    }
+
+    pub(crate) fn copied(view: FrameMetadataRef<'_>) -> Self {
+        let mut metadata = Self::default();
+        metadata.copy_from(view);
+        metadata
+    }
+
+    /// Reserve before mutation, so a failed allocation leaves the original
+    /// metadata complete. Once capacity suffices, every state transition is
+    /// allocation-free, including through absent and withheld observations.
+    pub(crate) fn copy_from(&mut self, view: FrameMetadataRef<'_>) {
+        if let FrameMetadataRef::Text(text) = view {
+            if let Self::Text(current) = self {
+                current.copy_text(text);
+                return;
+            }
+            let storage = match self {
+                Self::Absent(storage) | Self::Withheld { storage, .. } => storage,
+                Self::Text(_) => unreachable!(),
+            };
+            storage.reserve_exact(text.len_with_nul().saturating_sub(storage.len()));
+            storage.clear();
+            storage.push_str(text.with_nul);
+            let inner = std::mem::take(storage);
+            *self = Self::Text(TerminatedText { inner });
+            return;
+        }
+        let mut storage = match std::mem::take(self) {
+            Self::Absent(storage) | Self::Withheld { storage, .. } => storage,
+            Self::Text(text) => text.inner,
+        };
+        storage.clear();
+        *self = match view {
+            FrameMetadataRef::Absent => Self::Absent(storage),
+            FrameMetadataRef::Withheld(reason) => Self::Withheld { reason, storage },
+            FrameMetadataRef::Text(_) => unreachable!(),
+        };
+    }
+
+    pub(crate) fn set(&mut self, text: impl Into<String>) -> Result<()> {
+        *self = Self::new(text)?;
+        Ok(())
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.copy_from(FrameMetadataRef::Absent);
+    }
+
+    #[cfg(any(test, feature = "advanced"))]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Absent(storage) | Self::Withheld { storage, .. } => storage.capacity(),
+            Self::Text(text) => text.inner.capacity(),
+        }
     }
 }
 
@@ -4892,14 +4927,18 @@ impl<F: HoldsDescriptor, V> ValidatedFrame<F, V> {
         self.frame.descriptor()
     }
 
-    /// The validated metadata text, or `None` when the frame has none.
-    pub(crate) fn metadata(&self) -> Option<MetadataText<'_>> {
+    /// Reborrow the observation scanned from this exact held descriptor.
+    pub(crate) fn frame_metadata(&self) -> FrameMetadataRef<'_> {
         // SAFETY: construction scanned this descriptor's pointer; the holder
         // keeps the same bytes allocated and unchanged for this borrow.
         unsafe {
             self.metadata_state
-                .text(self.descriptor().metadata_pointer())
+                .view(self.descriptor().metadata_pointer())
         }
+    }
+
+    pub(crate) fn metadata(&self) -> Option<MetadataText<'_>> {
+        self.frame_metadata().text()
     }
 }
 
@@ -5000,11 +5039,8 @@ unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_video_frame_v2_t>> VideoParts
         self.descriptor().p_data
     }
     #[inline]
-    fn metadata_text(&self) -> Option<MetadataText<'_>> {
-        self.metadata()
-    }
-    fn metadata_state(&self) -> FrameMetadataStatus {
-        self.metadata_state.status()
+    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+        ValidatedFrame::frame_metadata(self)
     }
 
     #[inline]
@@ -5037,11 +5073,8 @@ unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> AudioParts
         self.descriptor().p_data.cast()
     }
     #[inline]
-    fn metadata_text(&self) -> Option<MetadataText<'_>> {
-        self.metadata()
-    }
-    fn metadata_state(&self) -> FrameMetadataStatus {
-        self.metadata_state.status()
+    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+        ValidatedFrame::frame_metadata(self)
     }
 }
 
@@ -5357,11 +5390,8 @@ unsafe impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoParts for Vid
         self.frame.pixels()
     }
     #[inline]
-    fn metadata_text(&self) -> Option<MetadataText<'_>> {
-        self.frame.metadata()
-    }
-    fn metadata_state(&self) -> FrameMetadataStatus {
-        self.frame.metadata_state.status()
+    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+        self.frame.frame_metadata()
     }
 
     #[inline]
@@ -5521,11 +5551,8 @@ unsafe impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioParts for Aud
         self.frame.samples()
     }
     #[inline]
-    fn metadata_text(&self) -> Option<MetadataText<'_>> {
-        self.frame.metadata()
-    }
-    fn metadata_state(&self) -> FrameMetadataStatus {
-        self.frame.metadata_state.status()
+    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+        self.frame.frame_metadata()
     }
 }
 
@@ -7981,9 +8008,8 @@ mod tests {
         });
         assert_eq!(allocations, 0);
 
-        let (copy, allocations) = crate::test_alloc::allocation_count(|| {
-            FrameMetadata::copy_from(frame.data.text(), None)
-        });
+        let (copy, allocations) =
+            crate::test_alloc::allocation_count(|| TerminatedText::copied(frame.data.text()));
         assert_eq!(allocations, 1);
         assert_eq!(copy.as_str(), frame.data());
         let (text, allocations) = crate::test_alloc::allocation_count(|| copy.into_string());
@@ -8015,7 +8041,7 @@ mod tests {
         let (video, allocations) = crate::test_alloc::allocation_count(|| builder.build().unwrap());
         assert_eq!(allocations, 0);
         assert_eq!(video.metadata().unwrap().as_ptr(), pointer);
-        assert_eq!(video.metadata.inner.capacity(), capacity);
+        assert_eq!(video.metadata.retained_bytes(), capacity);
 
         let supplied = text();
         let (pointer, capacity) = (supplied.as_ptr(), supplied.capacity());
@@ -8027,7 +8053,7 @@ mod tests {
         let (audio, allocations) = crate::test_alloc::allocation_count(|| builder.build().unwrap());
         assert_eq!(allocations, 0);
         assert_eq!(audio.metadata().unwrap().as_ptr(), pointer);
-        assert_eq!(audio.metadata.inner.capacity(), capacity);
+        assert_eq!(audio.metadata.retained_bytes(), capacity);
     }
 
     #[test]
@@ -10026,7 +10052,7 @@ mod tests {
             self.metadata()
         }
         fn text_capacity(&self) -> usize {
-            self.metadata.inner.capacity()
+            self.metadata.retained_bytes()
         }
         fn assert_same(&self, expected: &Self) {
             assert_eq!(self.data.len(), self.layout.data_len_bytes);
@@ -10061,7 +10087,7 @@ mod tests {
             self.metadata()
         }
         fn text_capacity(&self) -> usize {
-            self.metadata.inner.capacity()
+            self.metadata.retained_bytes()
         }
         fn assert_same(&self, expected: &Self) {
             assert_eq!(self.data.len(), self.layout.sample_count);

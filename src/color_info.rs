@@ -161,29 +161,28 @@ pub enum YuvMatrix {
 /// The element's name, which every scanned start tag is compared with.
 const ELEMENT: &[u8] = b"ndi_color_info";
 
-/// The optional text and its cached receive status. Retaining both lets an
-/// encoder choose its color policy before trying to read the description.
-pub(crate) struct Metadata<'a> {
-    status: crate::FrameMetadataStatus,
-    text: Option<&'a str>,
-}
+/// The frame's one validated metadata observation, read lazily after an
+/// encoder has chosen its color policy.
+pub(crate) struct Metadata<'a>(crate::frames::FrameMetadataRef<'a>);
 
 impl<'a> Metadata<'a> {
-    pub(crate) fn new(status: crate::FrameMetadataStatus, text: Option<&'a str>) -> Self {
-        Self { status, text }
+    pub(crate) fn new(metadata: crate::frames::FrameMetadataRef<'a>) -> Self {
+        Self(metadata)
     }
 
-    /// Read color only from metadata that was not withheld. Absent metadata
-    /// has no element; withheld text cannot establish that it has no element.
+    /// Absent text has no color element; withheld text cannot establish that.
     pub(crate) fn read(&self) -> Result<Option<ColorInfo>> {
-        match self.status {
-            crate::FrameMetadataStatus::Absent => Ok(None),
-            crate::FrameMetadataStatus::Text => parse(self.text),
-            status @ (crate::FrameMetadataStatus::NotUtf8
-            | crate::FrameMetadataStatus::Unterminated) => Err(Error::InvalidFrame(format!(
-                "The frame's color description cannot be read because its metadata was withheld \
-                 ({status:?}); ColorPolicy::Override explicitly supplies its color conversion"
-            ))),
+        use crate::frames::FrameMetadataRef;
+        match self.0 {
+            FrameMetadataRef::Absent => Ok(None),
+            FrameMetadataRef::Text(text) => parse(Some(text.as_str())),
+            FrameMetadataRef::Withheld(reason) => {
+                let status = FrameMetadataRef::Withheld(reason).status();
+                Err(Error::InvalidFrame(format!(
+                    "The frame's color description cannot be read because its metadata was withheld \
+                     ({status:?}); ColorPolicy::Override explicitly supplies its color conversion"
+                )))
+            }
         }
     }
 }
