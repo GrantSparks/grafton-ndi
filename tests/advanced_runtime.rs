@@ -4037,3 +4037,121 @@ fn router_connection_metadata_survives_the_registered_input() {
     }
     router.clear_connection_metadata().unwrap();
 }
+
+/// Preallocated 1080p blocks are released exactly once after native capture
+/// and receiver teardown, even when callbacks run on other SDK threads.
+#[test]
+fn pool_backed_receive_releases_every_1080p_block() {
+    use std::{
+        alloc::{alloc_zeroed, dealloc, Layout},
+        ptr::NonNull,
+    };
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    struct Pool {
+        blocks: Vec<PoolBlock>,
+        free: Mutex<Vec<usize>>,
+        layout: Layout,
+        loans: AtomicUsize,
+        releases: AtomicUsize,
+    }
+    // SAFETY: each aligned zeroed allocation stays owned by the pool Arc.
+    // Removing a slot grants exclusive SDK access until release returns it.
+    unsafe impl ExternalPool for Pool {
+        unsafe fn release(&self, block: PoolBlock) {
+            assert_eq!(self.blocks[block.tag()], block);
+            self.releases.fetch_add(1, Ordering::AcqRel);
+            self.free.lock().unwrap().push(block.tag());
+        }
+    }
+    impl Drop for Pool {
+        fn drop(&mut self) {
+            assert_eq!(self.free.get_mut().unwrap().len(), self.blocks.len());
+            for block in &self.blocks {
+                // SAFETY: the last pool Arc is gone only after every SDK loan
+                // has released; each allocation is reclaimed once with its Layout.
+                unsafe { dealloc(block.pointer().as_ptr(), self.layout) };
+            }
+        }
+    }
+    let layout = Layout::from_size_align(1920 * 1080 * 2, 64).unwrap();
+    let blocks = (0..16)
+        .map(|tag| {
+            // SAFETY: the positive frame extent and 64-byte alignment are checked.
+            let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).expect("pool allocation");
+            PoolBlock::new(pointer, layout.size(), tag)
+        })
+        .collect();
+    let pool = Arc::new(Pool {
+        blocks,
+        free: Mutex::new((0..16).collect()),
+        layout,
+        loans: AtomicUsize::new(0),
+        releases: AtomicUsize::new(0),
+    });
+    let sender = Sender::new(&ndi, &options("pool-allocation")).unwrap();
+    let receiver = Receiver::new(
+        &ndi,
+        &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap())
+            .color_format(ReceiverColorFormat::UyvyBgra),
+    )
+    .unwrap();
+    let service =
+        AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default()).unwrap();
+    let mut receiver = service.attach(receiver).unwrap();
+    let policy_pool = pool.clone();
+    receiver
+        .set_video_allocator(move |request: AllocationRequest| {
+            let tag = policy_pool
+                .free
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or(Error::InvalidInput(
+                    grafton_ndi::InputDefect::AllocatorLeaseStorage,
+                ))?;
+            let block = policy_pool.blocks[tag];
+            // SAFETY: this slot was removed exclusively from the free list. The
+            // pool owns its initialized aligned memory until this loan is released.
+            match unsafe { AllocationBuffer::from_pool(request, &policy_pool, block) } {
+                Ok(buffer) => {
+                    policy_pool.loans.fetch_add(1, Ordering::AcqRel);
+                    Ok(buffer)
+                }
+                Err(rejected) => {
+                    policy_pool.free.lock().unwrap().push(tag);
+                    Err(rejected.into_error())
+                }
+            }
+        })
+        .unwrap();
+    let frame = VideoFrame::builder()
+        .resolution(1920, 1080)
+        .pixel_format(grafton_ndi::PixelFormat::Uyvy)
+        .build()
+        .unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no pool-backed native 1080p frame"
+        );
+        sender.send_video(&frame).unwrap();
+        if let Some(received) = receiver.receiver().video().capture(SLICE).unwrap() {
+            assert_eq!((received.width(), received.height()), (1920, 1080));
+            if pool.loans.load(Ordering::Acquire) > 0 {
+                break;
+            }
+        }
+    }
+    drop(receiver);
+    drop(sender);
+    assert!(pool.loans.load(Ordering::Acquire) > 0);
+    assert_eq!(
+        pool.loans.load(Ordering::Acquire),
+        pool.releases.load(Ordering::Acquire)
+    );
+    assert_eq!(pool.free.lock().unwrap().len(), pool.blocks.len());
+}

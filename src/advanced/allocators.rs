@@ -333,6 +333,79 @@ pub unsafe trait ExternalAllocation: Send + 'static {
     fn capacity(&self) -> usize;
 }
 
+/// An address, capacity and pool-defined slot tag, without ownership of memory.
+///
+/// Copying this descriptor grants no permission to access or lend its memory.
+/// Each successful [`AllocationBuffer::from_pool`] call establishes one exclusive
+/// loan, and requires the caller to uphold that constructor's safety contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolBlock {
+    pointer: NonNull<u8>,
+    capacity: usize,
+    tag: usize,
+}
+impl PoolBlock {
+    /// Describe a pool slot without accessing or lending its memory.
+    pub const fn new(pointer: NonNull<u8>, capacity: usize, tag: usize) -> Self {
+        Self {
+            pointer,
+            capacity,
+            tag,
+        }
+    }
+    /// The slot's address; this descriptor grants no access to it.
+    pub const fn pointer(self) -> NonNull<u8> {
+        self.pointer
+    }
+    /// The described capacity in bytes.
+    pub const fn capacity(self) -> usize {
+        self.capacity
+    }
+    /// The pool-defined slot identifier returned unchanged at release.
+    pub const fn tag(self) -> usize {
+        self.tag
+    }
+}
+// SAFETY: This is a copyable address descriptor, not a memory view or owning
+// handle. Moving/sharing it never dereferences the address; lending it to the
+// SDK requires from_pool's explicit unsafe per-loan validity/exclusivity proof.
+unsafe impl Send for PoolBlock {}
+// SAFETY: Sharing a descriptor grants no read/write/release operation on memory.
+unsafe impl Sync for PoolBlock {}
+
+/// A pool that reclaims exclusive blocks lent through [`AllocationBuffer::from_pool`].
+///
+/// # Safety
+///
+/// For each valid loan, the pool must keep its initialized, CPU-addressable,
+/// 64-byte-aligned memory stable and valid for the block's capacity until release,
+/// with no other access, remapping or reclamation. Release must not panic. It and
+/// the pool's last destructor may run on any SDK free thread, without registry locks.
+/// See [`ExternalAllocation`] for the equivalent arbitrary-handle contract.
+pub unsafe trait ExternalPool: Send + Sync + 'static {
+    /// Return a block after the SDK's exclusive access has ended.
+    ///
+    /// # Safety
+    ///
+    /// The block must name one unreleased loan from this pool. Its SDK access
+    /// must have ended, and this call must be the only release of that loan.
+    unsafe fn release(&self, block: PoolBlock);
+}
+
+struct PoolStorage {
+    pool: Arc<dyn ExternalPool>,
+    block: PoolBlock,
+}
+impl Drop for PoolStorage {
+    fn drop(&mut self) {
+        // SAFETY: from_pool's caller establishes one valid matching-pool loan.
+        // This storage is moved, never cloned, and dropped exactly once after
+        // SDK access ends or publication is refused. Registry reclamation runs
+        // outside its locks and contains a misbehaving pool's panic.
+        unsafe { self.pool.release(self.block) };
+    }
+}
+
 /// Zeroed memory from the global allocator.
 struct OwnedStorage {
     pointer: NonNull<u8>,
@@ -401,6 +474,7 @@ pub struct AllocationBuffer {
 enum AllocationStorage {
     Owned(OwnedStorage),
     External(Box<dyn ExternalAllocation>),
+    Pool(PoolStorage),
 }
 
 impl AllocationStorage {
@@ -409,6 +483,7 @@ impl AllocationStorage {
         match self {
             Self::Owned(storage) => storage.pointer(),
             Self::External(storage) => storage.pointer(),
+            Self::Pool(storage) => storage.block.pointer,
         }
     }
 
@@ -416,6 +491,7 @@ impl AllocationStorage {
         match self {
             Self::Owned(storage) => storage.capacity(),
             Self::External(storage) => storage.capacity(),
+            Self::Pool(storage) => storage.block.capacity,
         }
     }
 }
@@ -435,7 +511,10 @@ impl AllocationBuffer {
         })
     }
 
-    /// Lend memory from the application's own pool.
+    /// Lend memory through an arbitrary application-owned handle.
+    ///
+    /// Boxes the handle once per buffer. For a pool whose block can be
+    /// described as plain data, [`from_pool`](Self::from_pool) avoids that allocation.
     ///
     /// # Errors
     ///
@@ -446,16 +525,7 @@ impl AllocationBuffer {
         request: AllocationRequest,
         storage: S,
     ) -> std::result::Result<Self, Rejected<S>> {
-        let capacity = storage.capacity();
-        let problem = if capacity < request.bytes {
-            Some(crate::InputDefect::ExternalAllocationTooSmall)
-        } else if capacity > request.capacity_limit {
-            Some(crate::InputDefect::ExternalAllocationTooLarge)
-        } else if !(storage.pointer().as_ptr() as usize).is_multiple_of(64) {
-            Some(crate::InputDefect::ExternalAllocationAlignment)
-        } else {
-            None
-        };
+        let problem = external_problem(request, storage.capacity(), || storage.pointer());
         match problem {
             Some(problem) => Err(Rejected::new(invalid_input(problem), storage)),
             None => Ok(Self {
@@ -466,9 +536,63 @@ impl AllocationBuffer {
         }
     }
 
+    /// Lend a plain pool block without allocating or calling pool accessors.
+    ///
+    /// Clones the pool's `Arc`; the buffer releases the block exactly once on
+    /// drop, including when registry publication refuses it. Constructor failure
+    /// returns the block in [`Rejected`] without releasing it.
+    ///
+    /// # Safety
+    ///
+    /// If validation succeeds, `block` must name an initialized, writable,
+    /// CPU-addressable allocation from `pool`, aligned to 64 bytes and valid
+    /// for its stated capacity. Until `pool.release(block)`, nothing else may
+    /// read, write, free or remap it, or lend another copy of this descriptor.
+    /// The block must remain valid even if the caller drops its own pool Arc.
+    /// A `PoolBlock` is Copy and can be forged; validation checks geometry only,
+    /// so this per-loan ownership obligation cannot be proved by a safe constructor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unchanged block with [`Error::InvalidInput`](crate::Error::InvalidInput)
+    /// for insufficient/excessive capacity or misalignment, as `from_external` does.
+    pub unsafe fn from_pool<P: ExternalPool>(
+        request: AllocationRequest,
+        pool: &Arc<P>,
+        block: PoolBlock,
+    ) -> std::result::Result<Self, Rejected<PoolBlock>> {
+        if let Some(problem) = external_problem(request, block.capacity, || block.pointer) {
+            return Err(Rejected::new(invalid_input(problem), block));
+        }
+        let pool: Arc<dyn ExternalPool> = pool.clone();
+        Ok(Self {
+            storage: AllocationStorage::Pool(PoolStorage { pool, block }),
+            #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+            request,
+        })
+    }
+
     /// The size of the memory in bytes.
     pub fn capacity(&self) -> usize {
         self.storage.capacity()
+    }
+}
+
+/// Shared validation preserves capacity-before-pointer inspection for arbitrary
+/// external handles. Pool storage supplies those same quantities as plain data.
+fn external_problem(
+    request: AllocationRequest,
+    capacity: usize,
+    pointer: impl FnOnce() -> NonNull<u8>,
+) -> Option<crate::InputDefect> {
+    if capacity < request.bytes {
+        Some(crate::InputDefect::ExternalAllocationTooSmall)
+    } else if capacity > request.capacity_limit {
+        Some(crate::InputDefect::ExternalAllocationTooLarge)
+    } else if !(pointer().as_ptr() as usize).is_multiple_of(64) {
+        Some(crate::InputDefect::ExternalAllocationAlignment)
+    } else {
+        None
     }
 }
 
@@ -1607,6 +1731,217 @@ mod tests {
     use super::*;
     use crate::Error;
     use crate::StreamTier;
+    include!("allocators/cycle_cost_tests.rs");
+    /// Reusable initialized aligned blocks; the bounded free list grants one
+    /// exclusive slot per claim and returns it only after lease reclamation.
+    struct TestPool {
+        _storage: Mutex<Vec<OwnedStorage>>,
+        blocks: Vec<PoolBlock>,
+        free: Mutex<std::collections::VecDeque<usize>>,
+        releases: AtomicUsize,
+    }
+    impl TestPool {
+        fn new(count: usize, bytes: usize) -> Arc<Self> {
+            let storage = (0..count)
+                .map(|_| OwnedStorage::zeroed(bytes).unwrap())
+                .collect::<Vec<_>>();
+            let blocks = storage
+                .iter()
+                .enumerate()
+                .map(|(tag, storage)| PoolBlock::new(storage.pointer(), bytes, tag))
+                .collect();
+            Arc::new(Self {
+                _storage: Mutex::new(storage),
+                blocks,
+                free: Mutex::new((0..count).collect()),
+                releases: AtomicUsize::new(0),
+            })
+        }
+        fn claim(&self) -> PoolBlock {
+            self.blocks[lock(&self.free)
+                .pop_front()
+                .expect("benchmark/test has enough exclusive slots")]
+        }
+        fn buffer(self: &Arc<Self>, request: AllocationRequest) -> Result<AllocationBuffer> {
+            let block = self.claim();
+            // SAFETY: claim removes one initialized aligned block from the free
+            // list; this Arc owns its storage until release returns that slot.
+            match unsafe { AllocationBuffer::from_pool(request, self, block) } {
+                Ok(buffer) => Ok(buffer),
+                Err(rejected) => {
+                    let (error, block) = rejected.into_parts();
+                    // SAFETY: refusal returned the same unpublished exclusive loan.
+                    unsafe { self.release(block) };
+                    Err(error)
+                }
+            }
+        }
+    }
+    // SAFETY: storage is owned by this pool, initialized and aligned. The free
+    // list grants exclusive slots, and storage stays live through each Arc loan.
+    unsafe impl ExternalPool for TestPool {
+        unsafe fn release(&self, block: PoolBlock) {
+            assert_eq!(self.blocks[block.tag], block);
+            let mut free = lock(&self.free);
+            assert!(!free.contains(&block.tag), "a block must be released once");
+            free.push_back(block.tag);
+            self.releases.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    struct PoolHandle {
+        pool: Arc<TestPool>,
+        block: PoolBlock,
+    }
+    // SAFETY: a handle owns one exclusively claimed TestPool slot until Drop.
+    unsafe impl ExternalAllocation for PoolHandle {
+        fn pointer(&self) -> NonNull<u8> {
+            self.block.pointer
+        }
+        fn capacity(&self) -> usize {
+            self.block.capacity
+        }
+    }
+    impl Drop for PoolHandle {
+        fn drop(&mut self) {
+            // SAFETY: this non-Clone handle owns the only release of its claim.
+            unsafe { self.pool.release(self.block) };
+        }
+    }
+
+    #[test]
+    fn pool_constructor_returns_refused_blocks_without_releasing_them() {
+        let pool = TestPool::new(1, 64);
+        let original = pool.claim();
+        let request = AllocationRequest {
+            capacity_limit: 64,
+            ..request()
+        };
+        for (block, expected) in [
+            (
+                PoolBlock::new(original.pointer, 63, original.tag),
+                crate::InputDefect::ExternalAllocationTooSmall,
+            ),
+            (
+                PoolBlock::new(original.pointer, 65, original.tag),
+                crate::InputDefect::ExternalAllocationTooLarge,
+            ),
+            (
+                PoolBlock::new(
+                    NonNull::new((original.pointer.as_ptr() as usize + 1) as *mut u8).unwrap(),
+                    64,
+                    original.tag,
+                ),
+                crate::InputDefect::ExternalAllocationAlignment,
+            ),
+        ] {
+            // SAFETY: these intentionally invalid descriptors all fail validation
+            // before a loan is accepted; none is accessed, published or released.
+            let rejected = unsafe { AllocationBuffer::from_pool(request, &pool, block) }
+                .err()
+                .expect("invalid block must be refused");
+            assert!(matches!(rejected.error(), Error::InvalidInput(actual) if actual == &expected));
+            assert_eq!(rejected.into_inner(), block);
+            assert_eq!(pool.releases.load(Ordering::Relaxed), 0);
+        }
+        // SAFETY: the original claim was never lent and is returned once.
+        unsafe { pool.release(original) };
+    }
+
+    #[test]
+    fn pool_policy_constructs_buffers_without_allocating_but_external_handles_box_once() {
+        for external in [false, true] {
+            let registry = Registry::new(limits()).unwrap();
+            let pool = TestPool::new(1, 64);
+            let policy_pool = pool.clone();
+            let token = registry
+                .register(move |request| {
+                    if external {
+                        let block = policy_pool.claim();
+                        Ok(AllocationBuffer::from_external(
+                            request,
+                            PoolHandle {
+                                pool: policy_pool.clone(),
+                                block,
+                            },
+                        )?)
+                    } else {
+                        policy_pool.buffer(request)
+                    }
+                })
+                .unwrap();
+            let (published, allocations) =
+                crate::test_alloc::allocation_count(|| registry.allocate(token, request()));
+            assert_eq!(allocations, usize::from(external));
+            let (pointer, _) = published.unwrap();
+            assert!(registry.free(token, pointer.as_ptr()));
+            assert_eq!(pool.releases.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn pool_blocks_are_released_once_when_publication_refuses_them() {
+        for retired in [false, true] {
+            let registry = Arc::new(Registry::new(limits()).unwrap());
+            let pool = TestPool::new(1, 64);
+            let policy_pool = pool.clone();
+            let weak_registry = Arc::downgrade(&registry);
+            let name = Arc::new(AtomicUsize::new(0));
+            let policy_name = name.clone();
+            let token = registry
+                .register(move |mut request: AllocationRequest| {
+                    if retired {
+                        weak_registry
+                            .upgrade()
+                            .unwrap()
+                            .closing(policy_name.load(Ordering::Relaxed));
+                    } else {
+                        request.width += 1;
+                    } // A buffer for a different layout.
+                    policy_pool.buffer(request)
+                })
+                .unwrap();
+            name.store(token, Ordering::Relaxed);
+            assert!(registry.allocate(token, request()).is_none());
+            assert_eq!(pool.releases.load(Ordering::Relaxed), 1);
+            assert_eq!(registry.usage().retained_allocations(), 0);
+            assert_eq!(
+                registry.usage().declined(if retired {
+                    AllocationDecline::GenerationUnavailable
+                } else {
+                    AllocationDecline::BufferRefused
+                }),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn panicking_pool_release_is_contained_and_keeps_bytes_charged() {
+        struct Panics(Arc<TestPool>);
+        // Intentionally violates the release no-panic rule to test containment.
+        unsafe impl ExternalPool for Panics {
+            unsafe fn release(&self, _: PoolBlock) {
+                panic!("contained pool release");
+            }
+        }
+        let pool = Arc::new(Panics(TestPool::new(1, 64)));
+        let policy_pool = pool.clone();
+        let registry = Registry::new(limits()).unwrap();
+        let token = registry
+            .register(move |request| {
+                let block = policy_pool.0.claim();
+                // SAFETY: the nested pool grants initialized stable exclusive memory;
+                // this test intentionally misbehaves only at release, after SDK use.
+                Ok(unsafe { AllocationBuffer::from_pool(request, &policy_pool, block) }?)
+            })
+            .unwrap();
+        let (pointer, _) = registry.allocate(token, request()).unwrap();
+        assert!(!registry.free(token, pointer.as_ptr()));
+        assert_eq!(registry.usage().retained_bytes(), 64);
+        assert_eq!(registry.usage().in_progress_reclamations(), 1);
+        assert_eq!(registry.usage().retained_allocations(), 1);
+    }
+
     #[test]
     fn every_decline_reason_has_one_counter() {
         let registry = Registry::new(limits()).unwrap();
@@ -1976,7 +2311,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_churn_never_allocates_for_preboxed_external_storage() {
+    fn lease_churn_never_allocates_for_pool_storage() {
         let limit = 16;
         let changes = 1024;
         let registry = Registry::new(AllocatorLimits {
@@ -1985,21 +2320,12 @@ mod tests {
             ..limits()
         })
         .unwrap();
-        // Keeping every allocation alive before the measurement makes every
-        // subsequent address distinct, exercising removal tombstones rather
-        // than repeatedly inserting the same allocator-reused address.
-        let buffers = (0..limit + changes)
-            .map(|_| {
-                AllocationBuffer::from_external(
-                    request(),
-                    OwnedStorage::zeroed(request().minimum_bytes()).unwrap(),
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let buffers = Mutex::new(buffers);
+        // All backing storage exists before tracking. FIFO claims visit distinct
+        // addresses across churn, exercising the bounded map's tombstone rebuild.
+        let pool = TestPool::new(limit + changes, 64);
+        let policy_pool = pool.clone();
         let token = registry
-            .register(move |_| Ok(lock(&buffers).pop().unwrap()))
+            .register(move |request| policy_pool.buffer(request))
             .unwrap();
         let mut held = Vec::with_capacity(limit);
         for _ in 0..limit {
@@ -2017,6 +2343,7 @@ mod tests {
         for pointer in held {
             assert!(registry.free(token, pointer.as_ptr()));
         }
+        assert_eq!(pool.releases.load(Ordering::Relaxed), limit + changes);
     }
 
     #[test]

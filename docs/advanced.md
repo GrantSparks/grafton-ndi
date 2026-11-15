@@ -236,16 +236,81 @@ if let Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(packet))) =
 
 `AllocationBuffer::zeroed(request)` provides zeroed, 64-byte-aligned memory.
 Use `request.with_stride_bytes(stride)` for permitted line/channel padding.
-`AllocationBuffer::from_external` supports a custom pool only under the
-[`ExternalAllocation` unsafe contract](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/trait.ExternalAllocation.html):
-initialized CPU-accessible memory, stable address/capacity, required alignment
-and exclusive SDK access until release. Do not infer these guarantees from a
-buffer's size alone.
+`AllocationBuffer::from_external` supports arbitrary application-owned handles
+under the [`ExternalAllocation` unsafe contract](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/trait.ExternalAllocation.html).
+It boxes the handle once per buffer, on the thread that constructs it.
+
+A preallocated pool can avoid that allocation with
+`unsafe { AllocationBuffer::from_pool(request, &pool, block) }`. Its `Arc<P>`
+implements [`ExternalPool`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/trait.ExternalPool.html),
+and `PoolBlock::new(pointer, capacity, tag)` describes a pool slot. A successful
+construction clones only the Arc and reads the descriptor's plain data; it calls
+no application accessors. The pool's `unsafe release(block)` receives that same
+descriptor once the accepted buffer is dropped, including a publication refusal.
+A constructor refusal instead returns `Rejected<PoolBlock>` without releasing it;
+the caller still owns that claim and must return it to its pool.
+
+Both paths require initialized, writable, CPU-accessible memory with a stable
+address/capacity, at least 64-byte alignment, and exclusive SDK access until
+release. `PoolBlock` is a copyable descriptor, not an ownership token. Copies
+must never be lent concurrently or released twice. Its constructor cannot check
+those facts, so `from_pool` requires an unsafe per-loan proof that the block is
+valid, exclusively claimed, and belongs to that pool. `release` is also unsafe
+to prevent safe early release of a copied descriptor. Do not infer memory
+validity from address, capacity or alignment checks alone.
+
+Release and the pool's final destructor can run on any SDK free thread, outside
+the registry lock. Release must not panic. The registry contains a panic during
+reclamation and leaves that block's count and bytes charged, since cleanup may
+be incomplete.
 
 Recover the receiver with `into_receiver()` or `into_packet_receiver()`;
 outstanding SDK allocations still retain their policies. See
 [`advanced_allocator`](../examples/advanced_allocator.rs), including the
 explicit process-lifetime opt-in and padded-stride policy.
+
+### Pool cycle overhead, November 2026
+
+The ignored `custom_allocation_cycle_cost` harness compares buffers constructed
+inside the policy with `from_external` and `from_pool`, plus a preboxed reference.
+It ran 100,000 cycles per case for a 1920×1080 UYVY request, using sixteen aligned
+backing blocks allocated before timing. The same-thread case measures allocation
+through free; the other cases include an eight-entry bounded channel from one
+or four allocating threads to one freeing thread, and measure each allocation's
+start through completed release. Those patterns include queueing and registry
+contention, rather than isolating a function-call cost. The preboxed reference
+prepares its handle before each cycle's clock, excluding both pool claim and
+boxing; it establishes bookkeeping overhead, not an end-to-end policy cost.
+
+The host was Linux x86-64, Intel Xeon w7-2475X, Rust 1.100.0, locked dependencies
+and the default release profile. Concurrent development work shared the host;
+these are two runs' median and 99th-percentile nanoseconds, with no affinity or
+core isolation. Run-to-run variation is visible; they do not establish a general
+timing advantage. Unit tests
+separately establish zero allocations when a pool policy constructs its buffer
+inside the callback, versus one allocation for an arbitrary external handle.
+
+```sh
+cargo test --release --locked --features advanced --lib \
+  custom_allocation_cycle_cost -- --ignored --nocapture
+```
+
+| Path | Thread pattern | Median ns, runs 1 / 2 | p99 ns, runs 1 / 2 |
+| --- | --- | ---: | ---: |
+| External | same-thread | 241 / 308 | 281 / 360 |
+| External | one-to-one | 5660 / 6758 | 10711 / 11267 |
+| External | four-to-one | 20224 / 19561 | 49735 / 44490 |
+| Pool | same-thread | 222 / 288 | 500 / 342 |
+| Pool | one-to-one | 5125 / 4900 | 16406 / 11305 |
+| Pool | four-to-one | 19669 / 19793 | 44083 / 42089 |
+| Preboxed | same-thread | 210 / 209 | 248 / 268 |
+| Preboxed | one-to-one | 5581 / 5653 | 10484 / 10341 |
+| Preboxed | four-to-one | 19097 / 19945 | 45143 / 46074 |
+
+The allocation-free pool constructor avoids one global-allocator call and free
+per frame without changing registry locking. Its Arc still incurs reference
+count traffic. Measure representative callback/free concurrency before drawing
+latency or throughput conclusions.
 
 ## Synchronization
 

@@ -17,6 +17,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Added
 
+- `ExternalPool`, `PoolBlock` and unsafe `AllocationBuffer::from_pool` lend
+  preallocated receive buffers without boxing a handle on SDK threads.
+
 - `CompressedSender::finish_video_async` and its split video view drain both
   asynchronous streams and return their frames while keeping the source live.
 
@@ -257,7 +260,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   only a queue that fails to drain refuses the next session.
 - Receive allocator replacement installs the new native callbacks before
   retiring the old policy, avoiding dropped frames while the setter runs or
-  the old policy's destructor blocks.
+  the old policy's destructor blocks. Pool-backed buffers avoid per-frame
+  handle boxing; arbitrary external handles remain boxed once per buffer.
 - Cancelling an async File creation whose handle has not reached the caller
   requests cleanup without joining its owner thread, even after delivery.
 - Audio and metadata frame implementations supply only validated accessors;

@@ -272,6 +272,7 @@ fn advanced_modes_types_keep_their_auto_traits() {
 fn advanced_types_keep_their_auto_traits() {
     use grafton_ndi::{advanced::*, RawCapture};
     has! {
+        PoolBlock: Send, Sync, UnwindSafe, RefUnwindSafe;
         AdvancedConfig: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocatedPacketReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocatedReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
