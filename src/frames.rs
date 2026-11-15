@@ -232,11 +232,11 @@ impl PixelFormatInfo {
     /// ```
     pub fn buffer_len(&self, line_stride: usize, height: u32) -> Result<usize> {
         if line_stride == 0 {
-            return Err(Error::InvalidFrame(crate::FrameDefect::VideoZeroStride));
+            return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
+                crate::LayoutDefect::VideoZeroStride,
+            )));
         }
-        if height == 0 {
-            return Err(Error::InvalidFrame(crate::FrameDefect::VideoZeroHeight));
-        }
+        validate_video_height(i64::from(height))?;
 
         let len = calculate_buffer_len_for_info_checked(*self, line_stride, height as usize)?;
         validate_video_data_len(len)?;
@@ -291,9 +291,9 @@ impl PixelFormat {
         layout
             .data_len_bytes
             .checked_add(crate::pixels::send_room(&layout, scan_type))
-            .ok_or(Error::InvalidFrame(
-                crate::FrameDefect::VideoAllocationOverflow,
-            ))
+            .ok_or(Error::InvalidFrame(crate::FrameDefect::Layout(
+                crate::LayoutDefect::VideoAllocationOverflow,
+            )))
     }
 
     /// Get compile-time format properties.
@@ -485,9 +485,9 @@ impl PixelFormat {
         validate_video_width(width.into())?;
         let stride = min_video_line_stride_checked(self, width as usize)?;
         if i32::try_from(stride).is_err() {
-            return Err(Error::InvalidFrame(crate::FrameDefect::VideoStrideRange {
-                stride,
-            }));
+            return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
+                crate::LayoutDefect::VideoStrideRange { stride },
+            )));
         }
         Ok(stride)
     }
@@ -3920,7 +3920,7 @@ impl ValidatedVideoLayout {
         let line_stride = match line_stride {
             None | Some(0) => min_stride,
             Some(stride) if stride < min_stride => {
-                return Err(LayoutError::VideoShortStride {
+                return Err(crate::LayoutDefect::VideoShortStride {
                     stride,
                     minimum: min_stride,
                     format: pixel_format,
@@ -3971,8 +3971,8 @@ impl ValidatedVideoLayout {
         line_stride: i32,
     ) -> LayoutResult<Self> {
         validate_video_dimensions(width.into(), height.into())?;
-        let line_stride =
-            usize::try_from(line_stride).map_err(|_| LayoutError::VideoSdkStride(line_stride))?;
+        let line_stride = usize::try_from(line_stride)
+            .map_err(|_| crate::LayoutDefect::VideoSdkStride(line_stride))?;
         // Both dimensions were just checked positive.
         Self::new_uncompressed_checked(
             pixel_format,
@@ -4107,193 +4107,23 @@ pub(crate) fn validate_video_frame(
     Ok((layout, header))
 }
 
-/// An allocation-free validation failure. Native allocation requests discard
-/// these reasons; API and capture paths format them only when returning Error.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum LayoutError {
-    VideoZeroSize,
-    VideoBufferOverflow,
-    VideoPayloadOverflow,
-    AudioStrideRange,
-    VideoWidth(i64),
-    VideoOddWidth(i64),
-    VideoHeight(i64),
-    VideoSdkStride(i32),
-    VideoShortStride {
-        stride: usize,
-        minimum: usize,
-        format: PixelFormat,
-        width: u32,
-    },
-    VideoStrideOverflow {
-        format: PixelFormat,
-        width: usize,
-    },
-    VideoBytes(usize),
-    VideoPlanar420 {
-        height: usize,
-        stride: usize,
-    },
-    VideoSemiPlanar420(usize),
-    VideoUyvaStride(usize),
-    PictureAspectRatio(f32),
-    AudioRate(i64),
-    AudioCount {
-        value: i64,
-        kind: crate::AudioCountKind,
-    },
-    AudioStride(i64),
-    AudioStrideAlignment(usize),
-    AudioShortStride {
-        stride: usize,
-        minimum: usize,
-    },
-    AudioStrideOverflow(usize),
-    AudioChannelOffset {
-        channels: usize,
-        stride: usize,
-    },
-    AudioSampleCount {
-        offset: usize,
-        samples: usize,
-    },
-    AudioByteSize(usize),
-    AudioBytes(usize),
-}
+pub(crate) type LayoutResult<T> = std::result::Result<T, crate::LayoutDefect>;
 
-pub(crate) type LayoutResult<T> = std::result::Result<T, LayoutError>;
-
-impl From<LayoutError> for crate::FrameDefect {
-    fn from(reason: LayoutError) -> Self {
-        match reason {
-            LayoutError::VideoWidth(value) => Self::VideoWidth(value.into()),
-            LayoutError::VideoOddWidth(value) => Self::VideoOddWidth(value.into()),
-            LayoutError::VideoHeight(value) => Self::VideoHeight(value.into()),
-            LayoutError::VideoSdkStride(value) => Self::VideoSdkStride(value),
-            LayoutError::VideoShortStride {
-                stride,
-                minimum,
-                format,
-                width,
-            } => Self::VideoShortStride {
-                detail: crate::CompactDiagnostic::new(crate::VideoStrideDefect {
-                    stride,
-                    minimum,
-                    format,
-                    width,
-                }),
-            },
-            LayoutError::VideoStrideOverflow { format, width } => {
-                Self::VideoStrideOverflow { format, width }
-            }
-            LayoutError::VideoBytes(value) => Self::VideoBytes(value),
-            LayoutError::VideoPlanar420 { height, stride } => {
-                Self::VideoPlanar420 { height, stride }
-            }
-            LayoutError::VideoSemiPlanar420(value) => Self::VideoSemiPlanar420(value),
-            LayoutError::VideoUyvaStride(value) => Self::VideoUyvaStride(value),
-            LayoutError::PictureAspectRatio(value) => Self::PictureAspectRatio(value),
-            LayoutError::AudioRate(value) => Self::AudioRate(value.into()),
-            LayoutError::AudioCount { value, kind } => Self::AudioCount {
-                value: value.into(),
-                kind,
-            },
-            LayoutError::AudioStride(value) => Self::AudioStride(value.into()),
-            LayoutError::AudioStrideAlignment(value) => Self::AudioStrideAlignment(value),
-            LayoutError::AudioShortStride { stride, minimum } => {
-                Self::AudioShortStride { stride, minimum }
-            }
-            LayoutError::AudioStrideOverflow(value) => Self::AudioStrideOverflow(value),
-            LayoutError::AudioChannelOffset { channels, stride } => {
-                Self::AudioChannelOffset { channels, stride }
-            }
-            LayoutError::AudioSampleCount { offset, samples } => {
-                Self::AudioSampleCount { offset, samples }
-            }
-            LayoutError::AudioByteSize(value) => Self::AudioByteSize(value),
-            LayoutError::AudioBytes(value) => Self::AudioBytes(value),
-            LayoutError::VideoZeroSize => Self::VideoZeroSize,
-            LayoutError::VideoBufferOverflow => Self::VideoBufferOverflow,
-            LayoutError::VideoPayloadOverflow => Self::VideoPayloadOverflow,
-            LayoutError::AudioStrideRange => Self::AudioStrideRange,
-        }
-    }
-}
-
-impl From<LayoutError> for crate::InputDefect {
-    fn from(reason: LayoutError) -> Self {
-        match reason {
-            LayoutError::VideoWidth(value) => Self::VideoWidth(value.into()),
-            LayoutError::VideoOddWidth(value) => Self::VideoOddWidth(value.into()),
-            LayoutError::VideoHeight(value) => Self::VideoHeight(value.into()),
-            LayoutError::VideoSdkStride(value) => Self::VideoSdkStride(value),
-            LayoutError::VideoShortStride {
-                stride,
-                minimum,
-                format,
-                width,
-            } => Self::VideoShortStride {
-                detail: crate::CompactDiagnostic::new(crate::VideoStrideDefect {
-                    stride,
-                    minimum,
-                    format,
-                    width,
-                }),
-            },
-            LayoutError::VideoStrideOverflow { format, width } => {
-                Self::VideoStrideOverflow { format, width }
-            }
-            LayoutError::VideoBytes(value) => Self::VideoBytes(value),
-            LayoutError::VideoPlanar420 { height, stride } => {
-                Self::VideoPlanar420 { height, stride }
-            }
-            LayoutError::VideoSemiPlanar420(value) => Self::VideoSemiPlanar420(value),
-            LayoutError::VideoUyvaStride(value) => Self::VideoUyvaStride(value),
-            LayoutError::PictureAspectRatio(value) => Self::PictureAspectRatio(value),
-            LayoutError::AudioRate(value) => Self::AudioRate(value.into()),
-            LayoutError::AudioCount { value, kind } => Self::AudioCount {
-                value: value.into(),
-                kind,
-            },
-            LayoutError::AudioStride(value) => Self::AudioStride(value.into()),
-            LayoutError::AudioStrideAlignment(value) => Self::AudioStrideAlignment(value),
-            LayoutError::AudioShortStride { stride, minimum } => {
-                Self::AudioShortStride { stride, minimum }
-            }
-            LayoutError::AudioStrideOverflow(value) => Self::AudioStrideOverflow(value),
-            LayoutError::AudioChannelOffset { channels, stride } => {
-                Self::AudioChannelOffset { channels, stride }
-            }
-            LayoutError::AudioSampleCount { offset, samples } => {
-                Self::AudioSampleCount { offset, samples }
-            }
-            LayoutError::AudioByteSize(value) => Self::AudioByteSize(value),
-            LayoutError::AudioBytes(value) => Self::AudioBytes(value),
-            LayoutError::VideoZeroSize => Self::VideoZeroSize,
-            LayoutError::VideoBufferOverflow => Self::VideoBufferOverflow,
-            LayoutError::VideoPayloadOverflow => Self::VideoPayloadOverflow,
-            LayoutError::AudioStrideRange => Self::AudioStrideRange,
-        }
-    }
-}
-
-impl fmt::Display for LayoutError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&crate::FrameDefect::from(*self), f)
-    }
-}
-
-impl From<LayoutError> for Error {
-    fn from(reason: LayoutError) -> Self {
-        Self::InvalidFrame(reason.into())
+impl From<crate::LayoutDefect> for Error {
+    fn from(reason: crate::LayoutDefect) -> Self {
+        Self::InvalidFrame(crate::FrameDefect::Layout(reason))
     }
 }
 
 /// The one dimension check, for values from the API and from the SDK.
 fn validate_video_dimensions(width: i64, height: i64) -> LayoutResult<()> {
     validate_video_width(width)?;
+    validate_video_height(height)
+}
+
+fn validate_video_height(height: i64) -> LayoutResult<()> {
     if height <= 0 {
-        return Err(LayoutError::VideoHeight(height));
+        return Err(crate::LayoutDefect::VideoHeight(height.into()));
     }
 
     Ok(())
@@ -4301,13 +4131,13 @@ fn validate_video_dimensions(width: i64, height: i64) -> LayoutResult<()> {
 
 fn validate_video_width(width: i64) -> LayoutResult<()> {
     if width <= 0 {
-        return Err(LayoutError::VideoWidth(width));
+        return Err(crate::LayoutDefect::VideoWidth(width.into()));
     }
 
     // The SDK uses 4:2:2 internally, including for RGB input/output.
     // https://docs.ndi.video/all/developing-with-ndi/sdk/frame-types
     if width % 2 != 0 {
-        return Err(LayoutError::VideoOddWidth(width));
+        return Err(crate::LayoutDefect::VideoOddWidth(width.into()));
     }
 
     Ok(())
@@ -4326,11 +4156,11 @@ fn check_video_data_len(layout: &ValidatedVideoLayout, len: usize) -> Result<()>
 
 fn validate_video_data_len(data_len_bytes: usize) -> LayoutResult<()> {
     if data_len_bytes == 0 {
-        return Err(LayoutError::VideoZeroSize);
+        return Err(crate::LayoutDefect::VideoZeroSize);
     }
 
     if data_len_bytes > MAX_VIDEO_BYTES {
-        return Err(LayoutError::VideoBytes(data_len_bytes));
+        return Err(crate::LayoutDefect::VideoBytes(data_len_bytes));
     }
 
     Ok(())
@@ -4339,7 +4169,7 @@ fn validate_video_data_len(data_len_bytes: usize) -> LayoutResult<()> {
 fn min_video_line_stride_checked(pixel_format: PixelFormat, width: usize) -> LayoutResult<usize> {
     width
         .checked_mul(pixel_format.info().bytes_per_pixel() as usize)
-        .ok_or(LayoutError::VideoStrideOverflow {
+        .ok_or(crate::LayoutDefect::VideoStrideOverflow {
             format: pixel_format,
             width,
         })
@@ -4415,7 +4245,7 @@ fn video_plane_layouts(
         FormatCategory::Packed => 1,
         FormatCategory::Planar420 => {
             if !height.is_multiple_of(2) || !stride.is_multiple_of(2) {
-                return Err(LayoutError::VideoPlanar420 { height, stride });
+                return Err(crate::LayoutDefect::VideoPlanar420 { height, stride });
             }
             dimensions[1] = (stride / 2, active / 2, height / 2);
             dimensions[2] = dimensions[1];
@@ -4423,14 +4253,14 @@ fn video_plane_layouts(
         }
         FormatCategory::SemiPlanar420 => {
             if !height.is_multiple_of(2) {
-                return Err(LayoutError::VideoSemiPlanar420(height));
+                return Err(crate::LayoutDefect::VideoSemiPlanar420(height));
             }
             dimensions[1] = (stride, active, height / 2);
             2
         }
         FormatCategory::PackedAlpha => {
             if !stride.is_multiple_of(2) {
-                return Err(LayoutError::VideoUyvaStride(stride));
+                return Err(crate::LayoutDefect::VideoUyvaStride(stride));
             }
             dimensions[1] = (stride / 2, active / 2, height);
             2
@@ -4454,11 +4284,11 @@ fn video_plane_layouts(
         storage = row_stride
             .checked_mul(row_count)
             .and_then(|n| storage.checked_add(n))
-            .ok_or(LayoutError::VideoBufferOverflow)?;
+            .ok_or(crate::LayoutDefect::VideoBufferOverflow)?;
         payload = active_row_bytes
             .checked_mul(row_count)
             .and_then(|n| payload.checked_add(n))
-            .ok_or(LayoutError::VideoPayloadOverflow)?;
+            .ok_or(crate::LayoutDefect::VideoPayloadOverflow)?;
     }
     Ok((planes, count, storage, payload))
 }
@@ -4614,7 +4444,7 @@ impl ValidatedAudioLayout {
     ) -> LayoutResult<Self> {
         let stride = channel_stride
             .map(|stride| {
-                usize::try_from(stride).map_err(|_| LayoutError::AudioStride(stride.into()))
+                usize::try_from(stride).map_err(|_| crate::LayoutDefect::AudioStride(stride.into()))
             })
             .transpose()?;
         Self::checked(
@@ -4637,19 +4467,19 @@ impl ValidatedAudioLayout {
         let (no_channels, no_samples) = validate_positive_audio_counts(no_channels, no_samples)?;
         let minimum = no_samples
             .checked_mul(size_of::<f32>())
-            .ok_or(LayoutError::AudioStrideOverflow(no_samples))?;
+            .ok_or(crate::LayoutDefect::AudioStrideOverflow(no_samples))?;
         let stride = channel_stride.unwrap_or(minimum);
         if i32::try_from(stride).is_err() {
-            return Err(LayoutError::AudioStrideRange);
+            return Err(crate::LayoutDefect::AudioStrideRange);
         }
         if stride == 0 {
-            return Err(LayoutError::AudioStride(0));
+            return Err(crate::LayoutDefect::AudioStride(0.into()));
         }
         if !stride.is_multiple_of(size_of::<f32>()) {
-            return Err(LayoutError::AudioStrideAlignment(stride));
+            return Err(crate::LayoutDefect::AudioStrideAlignment(stride));
         }
         if stride < minimum {
-            return Err(LayoutError::AudioShortStride { stride, minimum });
+            return Err(crate::LayoutDefect::AudioShortStride { stride, minimum });
         }
         let channel_stride_samples = stride / size_of::<f32>();
         let sample_count = checked_audio_extent(no_channels, no_samples, channel_stride_samples)?;
@@ -4793,7 +4623,7 @@ fn validate_audio_sample_rate(sample_rate: i64) -> LayoutResult<u32> {
     u32::try_from(sample_rate)
         .ok()
         .filter(|rate| (1..=i32::MAX.unsigned_abs()).contains(rate))
-        .ok_or(LayoutError::AudioRate(sample_rate))
+        .ok_or(crate::LayoutDefect::AudioRate(sample_rate.into()))
 }
 
 /// Require a positive channel and sample count and widen both to `usize`.
@@ -4805,7 +4635,10 @@ fn validate_positive_audio_counts(
         usize::try_from(value)
             .ok()
             .filter(|&count| count > 0)
-            .ok_or(LayoutError::AudioCount { value, kind })
+            .ok_or(crate::LayoutDefect::AudioCount {
+                value: value.into(),
+                kind,
+            })
     };
     Ok((
         count(no_channels, crate::AudioCountKind::Channels)?,
@@ -4825,23 +4658,22 @@ fn checked_audio_extent(
     let last_channel_offset = no_channels
         .checked_sub(1)
         .and_then(|last| last.checked_mul(stride_samples))
-        .ok_or(LayoutError::AudioChannelOffset {
+        .ok_or(crate::LayoutDefect::AudioChannelOffset {
             channels: no_channels,
             stride: stride_samples,
         })?;
-    let sample_count =
-        last_channel_offset
-            .checked_add(no_samples)
-            .ok_or(LayoutError::AudioSampleCount {
-                offset: last_channel_offset,
-                samples: no_samples,
-            })?;
+    let sample_count = last_channel_offset.checked_add(no_samples).ok_or(
+        crate::LayoutDefect::AudioSampleCount {
+            offset: last_channel_offset,
+            samples: no_samples,
+        },
+    )?;
     let byte_size = sample_count
         .checked_mul(std::mem::size_of::<f32>())
-        .ok_or(LayoutError::AudioByteSize(sample_count))?;
+        .ok_or(crate::LayoutDefect::AudioByteSize(sample_count))?;
 
     if byte_size > MAX_AUDIO_BYTES {
-        return Err(LayoutError::AudioBytes(byte_size));
+        return Err(crate::LayoutDefect::AudioBytes(byte_size));
     }
 
     Ok(sample_count)
@@ -4867,10 +4699,12 @@ fn checked_audio_extent(
 /// [`validate_returned_audio`] accepts one.
 pub(crate) fn validate_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<ValidatedAudioLayout> {
     if raw.no_samples == 0 {
-        return Err(Error::InvalidFrame(crate::FrameDefect::AudioCount {
-            value: 0.into(),
-            kind: crate::AudioCountKind::Samples,
-        }));
+        return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
+            crate::LayoutDefect::AudioCount {
+                value: 0.into(),
+                kind: crate::AudioCountKind::Samples,
+            },
+        )));
     }
 
     if raw.p_data.is_null() {
@@ -4931,16 +4765,18 @@ pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<R
     }
 
     if raw.sample_rate < 0 {
-        return Err(Error::InvalidFrame(crate::FrameDefect::AudioRate(
-            raw.sample_rate.into(),
+        return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
+            crate::LayoutDefect::AudioRate(raw.sample_rate.into()),
         )));
     }
 
     if raw.no_channels < 0 {
-        return Err(Error::InvalidFrame(crate::FrameDefect::AudioCount {
-            value: raw.no_channels.into(),
-            kind: crate::AudioCountKind::Channels,
-        }));
+        return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
+            crate::LayoutDefect::AudioCount {
+                value: raw.no_channels.into(),
+                kind: crate::AudioCountKind::Channels,
+            },
+        )));
     }
 
     // SAFETY: both members of the descriptor's union are `int`s at the same
@@ -6305,7 +6141,7 @@ mod tests {
             other => panic!("expected InvalidFrame, got {other:?}"),
         };
         for rate in [0u32, 1 << 31, u32::MAX] {
-            let expected = crate::FrameDefect::AudioRate(rate.into());
+            let expected = crate::FrameDefect::Layout(crate::LayoutDefect::AudioRate(rate.into()));
             assert_eq!(
                 message(
                     validate_audio_sample_rate(rate.into())
@@ -6348,7 +6184,7 @@ mod tests {
             };
             assert_eq!(
                 message(validate_audio_layout(&raw).map(|_| ())),
-                crate::FrameDefect::AudioRate(rate.into())
+                crate::FrameDefect::Layout(crate::LayoutDefect::AudioRate(rate.into()))
             );
         }
         assert_eq!(validate_audio_sample_rate(1).unwrap(), 1);
@@ -7253,7 +7089,7 @@ mod tests {
             if !accepted && height % 2 == 0 {
                 let msg = format.info().buffer_len(stride, height).unwrap_err();
                 assert!(
-                    matches!(msg, Error::InvalidFrame(crate::FrameDefect::VideoPlanar420 {stride:found,..}) if found==stride),
+                    matches!(msg, Error::InvalidFrame(crate::FrameDefect::Layout(crate::LayoutDefect::VideoPlanar420 {stride:found,..})) if found==stride),
                     "{label}: {msg}"
                 );
             }
@@ -8936,19 +8772,22 @@ mod tests {
             assert!(
                 matches!(
                     msg,
-                    crate::FrameDefect::AudioChannelOffset { .. }
-                        | crate::FrameDefect::AudioSampleCount { .. }
-                        | crate::FrameDefect::AudioByteSize(_)
-                        | crate::FrameDefect::AudioBytes(_)
-                        | crate::FrameDefect::VideoStrideOverflow { .. }
-                        | crate::FrameDefect::VideoBufferOverflow
-                        | crate::FrameDefect::VideoPayloadOverflow
-                        | crate::FrameDefect::VideoBytes(_)
+                    crate::FrameDefect::Layout(crate::LayoutDefect::AudioChannelOffset { .. })
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioSampleCount { .. })
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioByteSize(_))
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
+                        | crate::FrameDefect::Layout(
+                            crate::LayoutDefect::VideoStrideOverflow { .. }
+                        )
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoPayloadOverflow)
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
                         | crate::FrameDefect::ImageScratchOverflow
                         | crate::FrameDefect::ImageDimensionOverflow
                 ) || matches!(
                     msg,
-                    crate::FrameDefect::VideoBytes(_) | crate::FrameDefect::AudioBytes(_)
+                    crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
                 ),
                 "Error message should mention overflow or size limit, got: {msg}"
             );
@@ -9396,7 +9235,10 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                matches!(msg, crate::FrameDefect::VideoSdkStride(_)),
+                matches!(
+                    msg,
+                    crate::FrameDefect::Layout(crate::LayoutDefect::VideoSdkStride(_))
+                ),
                 "Error should mention invalid stride, got: {msg}"
             );
         } else {
@@ -9510,7 +9352,10 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                matches!(msg, crate::FrameDefect::VideoHeight(_)),
+                matches!(
+                    msg,
+                    crate::FrameDefect::Layout(crate::LayoutDefect::VideoHeight(_))
+                ),
                 "Error should mention invalid height, got: {msg}"
             );
         } else {
@@ -9551,7 +9396,8 @@ mod tests {
             assert!(
                 matches!(
                     msg,
-                    crate::FrameDefect::VideoBytes(_) | crate::FrameDefect::AudioBytes(_)
+                    crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
                 ),
                 "Error should mention size limit, got: {msg}"
             );
@@ -9776,10 +9622,10 @@ mod tests {
                 Err(Error::InvalidFrame(message)) => {
                     assert_eq!(
                         message,
-                        crate::FrameDefect::AudioCount {
+                        crate::FrameDefect::Layout(crate::LayoutDefect::AudioCount {
                             value: 0.into(),
                             kind: crate::AudioCountKind::Samples
-                        }
+                        })
                     );
                 }
                 other => panic!("expected InvalidFrame, got {other:?}"),
@@ -9930,10 +9776,10 @@ mod tests {
             assert!(
                 matches!(
                     msg,
-                    crate::FrameDefect::AudioCount {
+                    crate::FrameDefect::Layout(crate::LayoutDefect::AudioCount {
                         kind: crate::AudioCountKind::Samples,
                         ..
-                    }
+                    })
                 ),
                 "Error should mention invalid samples, got: {msg}"
             );
@@ -9971,19 +9817,22 @@ mod tests {
             assert!(
                 matches!(
                     msg,
-                    crate::FrameDefect::AudioChannelOffset { .. }
-                        | crate::FrameDefect::AudioSampleCount { .. }
-                        | crate::FrameDefect::AudioByteSize(_)
-                        | crate::FrameDefect::AudioBytes(_)
-                        | crate::FrameDefect::VideoStrideOverflow { .. }
-                        | crate::FrameDefect::VideoBufferOverflow
-                        | crate::FrameDefect::VideoPayloadOverflow
-                        | crate::FrameDefect::VideoBytes(_)
+                    crate::FrameDefect::Layout(crate::LayoutDefect::AudioChannelOffset { .. })
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioSampleCount { .. })
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioByteSize(_))
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
+                        | crate::FrameDefect::Layout(
+                            crate::LayoutDefect::VideoStrideOverflow { .. }
+                        )
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoPayloadOverflow)
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
                         | crate::FrameDefect::ImageScratchOverflow
                         | crate::FrameDefect::ImageDimensionOverflow
                 ) || matches!(
                     msg,
-                    crate::FrameDefect::VideoBytes(_) | crate::FrameDefect::AudioBytes(_)
+                    crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
+                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
                 ),
                 "Error should mention overflow or size limit, got: {msg}"
             );

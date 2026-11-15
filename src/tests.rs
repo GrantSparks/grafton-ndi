@@ -145,7 +145,10 @@ fn test_video_frame_zero_size_returns_error() {
         assert!(result.is_err());
         match result {
             Err(Error::InvalidFrame(msg)) => {
-                assert!(matches!(msg, crate::FrameDefect::VideoSdkStride(_)));
+                assert!(matches!(
+                    msg,
+                    crate::FrameDefect::Layout(crate::LayoutDefect::VideoSdkStride(_))
+                ));
             }
             _ => panic!("Expected InvalidFrame error"),
         }

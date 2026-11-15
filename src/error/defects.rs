@@ -74,13 +74,170 @@ pub enum DiscoveryDefect {
     #[error("SDK discovery array count overflow")]
     ArrayCountOverflow,
 }
+/// A refusal of the shared media layout and value checks.
+///
+/// Frame validation nests this cause in [`FrameDefect::Layout`]. Standalone
+/// aspect ratios, frame rates, compressed video formats and allocation strides
+/// instead use [`InputDefect::Layout`]. Layout validators used by SDK allocator
+/// callbacks construct only allocation-free variants. The two wide diagnostic
+/// variants are constructed only by their standalone value checks.
+#[derive(Debug, Clone, PartialEq, Error)]
+#[non_exhaustive]
+pub enum LayoutDefect {
+    /// Both parts of the frame rate must fit a positive SDK quantity.
+    #[error("{detail}")]
+    FrameRate {
+        /// Exact values, boxed only on 32-bit targets.
+        detail: CompactDiagnostic<FrameRateDefect>,
+    },
+    /// Compressed dimensions must fit positive SDK quantities.
+    #[error("{detail}")]
+    CompressedVideoDimensions {
+        /// Exact values, boxed only on 32-bit targets.
+        detail: CompactDiagnostic<VideoDimensionsDefect>,
+    },
+
+    /// Video line stride must be positive, got 0.
+    #[error("Video line stride must be positive, got 0")]
+    VideoZeroStride,
+    /// Video send allocation size overflow.
+    #[error("Video send allocation size overflow")]
+    VideoAllocationOverflow,
+    /// Video frame has zero calculated size.
+    #[error("Video frame has zero calculated size")]
+    VideoZeroSize,
+    /// Video buffer size overflow.
+    #[error("Video buffer size overflow")]
+    VideoBufferOverflow,
+    /// Video payload size overflow.
+    #[error("Video payload size overflow")]
+    VideoPayloadOverflow,
+    /// Audio channel stride exceeds i32 range.
+    #[error("Audio channel stride exceeds i32 range")]
+    AudioStrideRange,
+    /// Video frame has invalid width: {0}.
+    #[error("Video frame has invalid width: {0}")]
+    VideoWidth(DiagnosticInteger),
+    /// NDI video frames require even width, got {0}.
+    #[error("NDI video frames require even width, got {0}")]
+    VideoOddWidth(DiagnosticInteger),
+    /// Video frame has invalid height: {0}.
+    #[error("Video frame has invalid height: {0}")]
+    VideoHeight(DiagnosticInteger),
+    /// Uncompressed video frame has invalid line_stride_in_bytes: {0}.
+    #[error("Uncompressed video frame has invalid line_stride_in_bytes: {0}")]
+    VideoSdkStride(i32),
+    /// Video line_stride_in_bytes {stride} is smaller than minimum row size {minimum} for {format:?} width {width}.
+    #[error("Video line_stride_in_bytes {stride} is smaller than minimum row size {minimum} for {format:?} width {width}")]
+    VideoShortStride {
+        /// The stride.
+        stride: usize,
+        /// The minimum.
+        minimum: usize,
+        /// The format.
+        format: PixelFormat,
+        /// The width.
+        width: u32,
+    },
+    /// Video line stride overflow for {format:?} width {width}.
+    #[error("Video line stride overflow for {format:?} width {width}")]
+    VideoStrideOverflow {
+        /// The format.
+        format: PixelFormat,
+        /// The width.
+        width: usize,
+    },
+    /// Video frame exceeds maximum size: {0} bytes > {MAX_VIDEO_BYTES} bytes.
+    #[error("Video frame exceeds maximum size: {0} bytes > {MAX_VIDEO_BYTES} bytes")]
+    VideoBytes(usize),
+    /// Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height {height} and stride {stride}.
+    #[error("Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height {height} and stride {stride}")]
+    VideoPlanar420 {
+        /// The height.
+        height: usize,
+        /// The stride.
+        stride: usize,
+    },
+    /// Semi-planar 4:2:0 (NV12) video frames require even height, got {0}.
+    #[error("Semi-planar 4:2:0 (NV12) video frames require even height, got {0}")]
+    VideoSemiPlanar420(usize),
+    /// UYVA video frames require even line stride, got {0}.
+    #[error("UYVA video frames require even line stride, got {0}")]
+    VideoUyvaStride(usize),
+    /// Video frame has invalid picture aspect ratio: {0}.
+    #[error("Video frame has invalid picture aspect ratio: {0}")]
+    PictureAspectRatio(f32),
+    /// Invalid sample rate: {0}.
+    #[error("Invalid sample rate: {0}")]
+    AudioRate(DiagnosticInteger),
+    /// Invalid number of {kind}: {value}.
+    #[error("Invalid number of {kind}: {value}")]
+    AudioCount {
+        /// The value.
+        value: DiagnosticInteger,
+        /// The kind.
+        kind: AudioCountKind,
+    },
+    /// Invalid channel_stride_in_bytes: {0}.
+    #[error("Invalid channel_stride_in_bytes: {0}")]
+    AudioStride(DiagnosticInteger),
+    /// channel_stride_in_bytes must be a multiple of 4, got {0}.
+    #[error("channel_stride_in_bytes must be a multiple of 4, got {0}")]
+    AudioStrideAlignment(usize),
+    /// channel_stride_in_bytes {stride} is smaller than one channel of audio samples {minimum}.
+    #[error(
+        "channel_stride_in_bytes {stride} is smaller than one channel of audio samples {minimum}"
+    )]
+    AudioShortStride {
+        /// The stride.
+        stride: usize,
+        /// The minimum.
+        minimum: usize,
+    },
+    /// Audio channel stride overflow: {0} samples × 4 bytes.
+    #[error("Audio channel stride overflow: {0} samples × 4 bytes")]
+    AudioStrideOverflow(usize),
+    /// Audio channel offset overflow: {channels} channels × {stride} stride samples.
+    #[error("Audio channel offset overflow: {channels} channels × {stride} stride samples")]
+    AudioChannelOffset {
+        /// The channels.
+        channels: usize,
+        /// The stride.
+        stride: usize,
+    },
+    /// Audio backing sample count overflow: channel offset {offset} + {samples} samples.
+    #[error("Audio backing sample count overflow: channel offset {offset} + {samples} samples")]
+    AudioSampleCount {
+        /// The offset.
+        offset: usize,
+        /// The samples.
+        samples: usize,
+    },
+    /// Audio byte size overflow: {0} samples × 4 bytes.
+    #[error("Audio byte size overflow: {0} samples × 4 bytes")]
+    AudioByteSize(usize),
+    /// Audio frame exceeds maximum size: {0} bytes > {MAX_AUDIO_BYTES} bytes.
+    #[error("Audio frame exceeds maximum size: {0} bytes > {MAX_AUDIO_BYTES} bytes")]
+    AudioBytes(usize),
+    /// Video line stride {stride} exceeds i32 range.
+    #[error("Video line stride {stride} exceeds i32 range")]
+    VideoStrideRange {
+        /// The stride.
+        stride: usize,
+    },
+}
+
 /// Typed causes of [`crate::Error::InvalidFrame`].
 ///
+/// Shared layout refusals use [`FrameDefect::Layout`] and [`LayoutDefect`].
 /// Ordinary causes retain their evidence inline without allocating. Boxed
 /// diagnostic fields retain caller or SDK text only for the documented exceptions.
 #[derive(Debug, Clone, PartialEq, Error)]
 #[non_exhaustive]
 pub enum FrameDefect {
+    /// A refusal of the shared media layout or value checks.
+    #[error(transparent)]
+    Layout(LayoutDefect),
     /// A scratch buffer could not be reserved.
     #[error("image scratch allocation failed: {0}")]
     ImageScratchAllocation(std::collections::TryReserveError),
@@ -102,41 +259,6 @@ pub enum FrameDefect {
         /// The codec's maximum.
         maximum: usize,
     },
-
-    /// Both parts of the frame rate must fit a positive SDK quantity.
-    #[error("{detail}")]
-    FrameRate {
-        /// Exact values, boxed only on 32-bit targets.
-        detail: CompactDiagnostic<FrameRateDefect>,
-    },
-    /// Compressed dimensions must fit positive SDK quantities.
-    #[error("{detail}")]
-    CompressedVideoDimensions {
-        /// Exact values, boxed only on 32-bit targets.
-        detail: CompactDiagnostic<VideoDimensionsDefect>,
-    },
-
-    /// Video line stride must be positive, got 0.
-    #[error("Video line stride must be positive, got 0")]
-    VideoZeroStride,
-    /// Video frame height must be positive, got 0.
-    #[error("Video frame height must be positive, got 0")]
-    VideoZeroHeight,
-    /// Video send allocation size overflow.
-    #[error("Video send allocation size overflow")]
-    VideoAllocationOverflow,
-    /// Video frame has zero calculated size.
-    #[error("Video frame has zero calculated size")]
-    VideoZeroSize,
-    /// Video buffer size overflow.
-    #[error("Video buffer size overflow")]
-    VideoBufferOverflow,
-    /// Video payload size overflow.
-    #[error("Video payload size overflow")]
-    VideoPayloadOverflow,
-    /// Audio channel stride exceeds i32 range.
-    #[error("Audio channel stride exceeds i32 range")]
-    AudioStrideRange,
     /// Metadata frame length does not include a trailing NUL terminator.
     #[error("Metadata frame length does not include a trailing NUL terminator")]
     MetadataMissingTerminator,
@@ -283,110 +405,6 @@ pub enum FrameDefect {
     /// Unknown compressed audio FourCC.
     #[error("Unknown compressed audio FourCC")]
     UnknownCompressedAudio,
-    /// Video frame has invalid width: {0}.
-    #[error("Video frame has invalid width: {0}")]
-    VideoWidth(DiagnosticInteger),
-    /// NDI video frames require even width, got {0}.
-    #[error("NDI video frames require even width, got {0}")]
-    VideoOddWidth(DiagnosticInteger),
-    /// Video frame has invalid height: {0}.
-    #[error("Video frame has invalid height: {0}")]
-    VideoHeight(DiagnosticInteger),
-    /// Uncompressed video frame has invalid line_stride_in_bytes: {0}.
-    #[error("Uncompressed video frame has invalid line_stride_in_bytes: {0}")]
-    VideoSdkStride(i32),
-    /// Video line_stride_in_bytes {stride} is smaller than minimum row size {minimum} for {format:?} width {width}.
-    #[error("{detail}")]
-    VideoShortStride {
-        /// Exact values, boxed only on 32-bit targets.
-        detail: CompactDiagnostic<VideoStrideDefect>,
-    },
-    /// Video line stride overflow for {format:?} width {width}.
-    #[error("Video line stride overflow for {format:?} width {width}")]
-    VideoStrideOverflow {
-        /// The format.
-        format: PixelFormat,
-        /// The width.
-        width: usize,
-    },
-    /// Video frame exceeds maximum size: {0} bytes > {MAX_VIDEO_BYTES} bytes.
-    #[error("Video frame exceeds maximum size: {0} bytes > {MAX_VIDEO_BYTES} bytes")]
-    VideoBytes(usize),
-    /// Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height {height} and stride {stride}.
-    #[error("Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height {height} and stride {stride}")]
-    VideoPlanar420 {
-        /// The height.
-        height: usize,
-        /// The stride.
-        stride: usize,
-    },
-    /// Semi-planar 4:2:0 (NV12) video frames require even height, got {0}.
-    #[error("Semi-planar 4:2:0 (NV12) video frames require even height, got {0}")]
-    VideoSemiPlanar420(usize),
-    /// UYVA video frames require even line stride, got {0}.
-    #[error("UYVA video frames require even line stride, got {0}")]
-    VideoUyvaStride(usize),
-    /// Video frame has invalid picture aspect ratio: {0}.
-    #[error("Video frame has invalid picture aspect ratio: {0}")]
-    PictureAspectRatio(f32),
-    /// Invalid sample rate: {0}.
-    #[error("Invalid sample rate: {0}")]
-    AudioRate(DiagnosticInteger),
-    /// Invalid number of {kind}: {value}.
-    #[error("Invalid number of {kind}: {value}")]
-    AudioCount {
-        /// The value.
-        value: DiagnosticInteger,
-        /// The kind.
-        kind: AudioCountKind,
-    },
-    /// Invalid channel_stride_in_bytes: {0}.
-    #[error("Invalid channel_stride_in_bytes: {0}")]
-    AudioStride(DiagnosticInteger),
-    /// channel_stride_in_bytes must be a multiple of 4, got {0}.
-    #[error("channel_stride_in_bytes must be a multiple of 4, got {0}")]
-    AudioStrideAlignment(usize),
-    /// channel_stride_in_bytes {stride} is smaller than one channel of audio samples {minimum}.
-    #[error(
-        "channel_stride_in_bytes {stride} is smaller than one channel of audio samples {minimum}"
-    )]
-    AudioShortStride {
-        /// The stride.
-        stride: usize,
-        /// The minimum.
-        minimum: usize,
-    },
-    /// Audio channel stride overflow: {0} samples × 4 bytes.
-    #[error("Audio channel stride overflow: {0} samples × 4 bytes")]
-    AudioStrideOverflow(usize),
-    /// Audio channel offset overflow: {channels} channels × {stride} stride samples.
-    #[error("Audio channel offset overflow: {channels} channels × {stride} stride samples")]
-    AudioChannelOffset {
-        /// The channels.
-        channels: usize,
-        /// The stride.
-        stride: usize,
-    },
-    /// Audio backing sample count overflow: channel offset {offset} + {samples} samples.
-    #[error("Audio backing sample count overflow: channel offset {offset} + {samples} samples")]
-    AudioSampleCount {
-        /// The offset.
-        offset: usize,
-        /// The samples.
-        samples: usize,
-    },
-    /// Audio byte size overflow: {0} samples × 4 bytes.
-    #[error("Audio byte size overflow: {0} samples × 4 bytes")]
-    AudioByteSize(usize),
-    /// Audio frame exceeds maximum size: {0} bytes > {MAX_AUDIO_BYTES} bytes.
-    #[error("Audio frame exceeds maximum size: {0} bytes > {MAX_AUDIO_BYTES} bytes")]
-    AudioBytes(usize),
-    /// Video line stride {stride} exceeds i32 range.
-    #[error("Video line stride {stride} exceeds i32 range")]
-    VideoStrideRange {
-        /// The stride.
-        stride: usize,
-    },
     /// Unknown scan type: 0x{code:08X}.
     #[error("Unknown scan type: 0x{code:08X}")]
     UnknownScanType {
@@ -568,35 +586,17 @@ pub enum FrameDefect {
 }
 /// Typed causes of [`crate::Error::InvalidInput`].
 ///
+/// [`InputDefect::Layout`] reports standalone aspect ratios, frame rates,
+/// compressed video formats and allocation strides through [`LayoutDefect`].
+///
 /// Ordinary causes retain their evidence inline without allocating. Boxed
 /// diagnostic fields retain caller or SDK text only for the documented exceptions.
 #[derive(Debug, Clone, PartialEq, Error)]
 #[non_exhaustive]
 pub enum InputDefect {
-    /// Video frame has zero calculated size.
-    #[error("Video frame has zero calculated size")]
-    VideoZeroSize,
-    /// Video buffer size overflow.
-    #[error("Video buffer size overflow")]
-    VideoBufferOverflow,
-    /// Video payload size overflow.
-    #[error("Video payload size overflow")]
-    VideoPayloadOverflow,
-    /// Audio channel stride exceeds i32 range.
-    #[error("Audio channel stride exceeds i32 range")]
-    AudioStrideRange,
-    /// Both parts of the frame rate must fit a positive SDK quantity.
-    #[error("{detail}")]
-    FrameRate {
-        /// Exact values, boxed only on 32-bit targets.
-        detail: CompactDiagnostic<FrameRateDefect>,
-    },
-    /// Compressed dimensions must fit positive SDK quantities.
-    #[error("{detail}")]
-    CompressedVideoDimensions {
-        /// Exact values, boxed only on 32-bit targets.
-        detail: CompactDiagnostic<VideoDimensionsDefect>,
-    },
+    /// A refusal of the shared media layout or value checks.
+    #[error(transparent)]
+    Layout(LayoutDefect),
 
     /// Source name must be nonempty and contain no NUL.
     #[error("Source name must be nonempty and contain no NUL")]
@@ -708,110 +708,6 @@ pub enum InputDefect {
     /// AVSync request exceeds the supported audio storage limit.
     #[error("AVSync request exceeds the supported audio storage limit")]
     AvSyncStorageLimit,
-    /// Video frame has invalid width: {0}.
-    #[error("Video frame has invalid width: {0}")]
-    VideoWidth(DiagnosticInteger),
-    /// NDI video frames require even width, got {0}.
-    #[error("NDI video frames require even width, got {0}")]
-    VideoOddWidth(DiagnosticInteger),
-    /// Video frame has invalid height: {0}.
-    #[error("Video frame has invalid height: {0}")]
-    VideoHeight(DiagnosticInteger),
-    /// Uncompressed video frame has invalid line_stride_in_bytes: {0}.
-    #[error("Uncompressed video frame has invalid line_stride_in_bytes: {0}")]
-    VideoSdkStride(i32),
-    /// Video line_stride_in_bytes {stride} is smaller than minimum row size {minimum} for {format:?} width {width}.
-    #[error("{detail}")]
-    VideoShortStride {
-        /// Exact values, boxed only on 32-bit targets.
-        detail: CompactDiagnostic<VideoStrideDefect>,
-    },
-    /// Video line stride overflow for {format:?} width {width}.
-    #[error("Video line stride overflow for {format:?} width {width}")]
-    VideoStrideOverflow {
-        /// The format.
-        format: PixelFormat,
-        /// The width.
-        width: usize,
-    },
-    /// Video frame exceeds maximum size: {0} bytes > {MAX_VIDEO_BYTES} bytes.
-    #[error("Video frame exceeds maximum size: {0} bytes > {MAX_VIDEO_BYTES} bytes")]
-    VideoBytes(usize),
-    /// Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height {height} and stride {stride}.
-    #[error("Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height {height} and stride {stride}")]
-    VideoPlanar420 {
-        /// The height.
-        height: usize,
-        /// The stride.
-        stride: usize,
-    },
-    /// Semi-planar 4:2:0 (NV12) video frames require even height, got {0}.
-    #[error("Semi-planar 4:2:0 (NV12) video frames require even height, got {0}")]
-    VideoSemiPlanar420(usize),
-    /// UYVA video frames require even line stride, got {0}.
-    #[error("UYVA video frames require even line stride, got {0}")]
-    VideoUyvaStride(usize),
-    /// Video frame has invalid picture aspect ratio: {0}.
-    #[error("Video frame has invalid picture aspect ratio: {0}")]
-    PictureAspectRatio(f32),
-    /// Invalid sample rate: {0}.
-    #[error("Invalid sample rate: {0}")]
-    AudioRate(DiagnosticInteger),
-    /// Invalid number of {kind}: {value}.
-    #[error("Invalid number of {kind}: {value}")]
-    AudioCount {
-        /// The value.
-        value: DiagnosticInteger,
-        /// The kind.
-        kind: AudioCountKind,
-    },
-    /// Invalid channel_stride_in_bytes: {0}.
-    #[error("Invalid channel_stride_in_bytes: {0}")]
-    AudioStride(DiagnosticInteger),
-    /// channel_stride_in_bytes must be a multiple of 4, got {0}.
-    #[error("channel_stride_in_bytes must be a multiple of 4, got {0}")]
-    AudioStrideAlignment(usize),
-    /// channel_stride_in_bytes {stride} is smaller than one channel of audio samples {minimum}.
-    #[error(
-        "channel_stride_in_bytes {stride} is smaller than one channel of audio samples {minimum}"
-    )]
-    AudioShortStride {
-        /// The stride.
-        stride: usize,
-        /// The minimum.
-        minimum: usize,
-    },
-    /// Audio channel stride overflow: {0} samples × 4 bytes.
-    #[error("Audio channel stride overflow: {0} samples × 4 bytes")]
-    AudioStrideOverflow(usize),
-    /// Audio channel offset overflow: {channels} channels × {stride} stride samples.
-    #[error("Audio channel offset overflow: {channels} channels × {stride} stride samples")]
-    AudioChannelOffset {
-        /// The channels.
-        channels: usize,
-        /// The stride.
-        stride: usize,
-    },
-    /// Audio backing sample count overflow: channel offset {offset} + {samples} samples.
-    #[error("Audio backing sample count overflow: channel offset {offset} + {samples} samples")]
-    AudioSampleCount {
-        /// The offset.
-        offset: usize,
-        /// The samples.
-        samples: usize,
-    },
-    /// Audio byte size overflow: {0} samples × 4 bytes.
-    #[error("Audio byte size overflow: {0} samples × 4 bytes")]
-    AudioByteSize(usize),
-    /// Audio frame exceeds maximum size: {0} bytes > {MAX_AUDIO_BYTES} bytes.
-    #[error("Audio frame exceeds maximum size: {0} bytes > {MAX_AUDIO_BYTES} bytes")]
-    AudioBytes(usize),
-    /// Video line stride {stride} exceeds i32 range.
-    #[error("Video line stride {stride} exceeds i32 range")]
-    VideoStrideRange {
-        /// The stride.
-        stride: usize,
-    },
     /// timeout {requested:?} exceeds MAX_TIMEOUT (4294967294 ms, about 49.7 days).
     #[error("timeout {requested:?} exceeds MAX_TIMEOUT (4294967294 ms, about 49.7 days)")]
     TimeoutTooLong {
@@ -1221,30 +1117,6 @@ impl std::fmt::Display for VideoDimensionsDefect {
             f,
             "Compressed video dimensions {width}x{height} must each be in 1..=2147483647"
         )
-    }
-}
-
-/// Exact values reported by `VideoShortStride`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct VideoStrideDefect {
-    /// The stride.
-    pub stride: usize,
-    /// The minimum.
-    pub minimum: usize,
-    /// The format.
-    pub format: PixelFormat,
-    /// The width.
-    pub width: u32,
-}
-impl std::fmt::Display for VideoStrideDefect {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            stride,
-            minimum,
-            format,
-            width,
-        } = self;
-        write!(f, "Video line_stride_in_bytes {stride} is smaller than minimum row size {minimum} for {format:?} width {width}")
     }
 }
 

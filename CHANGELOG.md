@@ -22,7 +22,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   and empty AAC payloads use `EmptyCodecPayload`.
 
 - `InvalidFrame`, `InvalidInput` and `UnexpectedSdkResult` carry typed
-  `FrameDefect`, `InputDefect` and `SdkResultDefect` causes. Receiver capture
+  `FrameDefect`, `InputDefect` and `SdkResultDefect` causes. Shared layout
+  refusals use one nested `LayoutDefect` in both frame and input causes. Receiver capture
   failures use `ConnectionLost`; initialization retains `InitializationFailure`
   and invalid UTF-8 retains `Utf8Error`. Load-refusal symbol names borrow static
   `CStr` values. Update matches as described in the migration guide.

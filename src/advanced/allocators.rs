@@ -274,7 +274,7 @@ impl AllocationRequest {
                     Some(stride),
                 )
                 // This is an input stride refusal, retaining the layout evidence.
-                .map_err(|cause| invalid_input(cause.into()))?
+                .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?
                 .data_len_bytes()
             }
             AllocationFormat::AudioPlanarF32 => {
@@ -2703,10 +2703,15 @@ mod tests {
             input(planar.with_stride_bytes(15)),
             crate::InputDefect::AllocatorShortStride { .. }
         ));
-        assert!(matches!(
-            input(planar.with_stride_bytes(17)),
-            crate::InputDefect::VideoPlanar420 { .. }
-        ));
+        let crate::InputDefect::Layout(input_cause) = input(planar.with_stride_bytes(17)) else {
+            panic!("expected the shared layout cause")
+        };
+        let Err(Error::InvalidFrame(crate::FrameDefect::Layout(frame_cause))) =
+            PixelFormat::I420.send_buffer_len(16, 16, Some(17), crate::ScanType::Progressive)
+        else {
+            panic!("expected the same frame layout refusal")
+        };
+        assert_eq!(input_cause, frame_cause);
 
         let audio = request();
         assert!(matches!(

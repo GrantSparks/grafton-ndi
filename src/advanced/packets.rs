@@ -518,23 +518,13 @@ impl VideoPacketFormat {
     /// [`Error::InvalidInput`] unless both dimensions are in `1..=i32::MAX`,
     /// the range the SDK can carry.
     pub fn new(codec: VideoCodec, width: u32, height: u32) -> Result<Self> {
-        Self::checked(codec, width.into(), height.into()).map_err(|(width, height)| {
-            Error::InvalidInput(crate::InputDefect::CompressedVideoDimensions {
-                detail: crate::CompactDiagnostic::new(crate::VideoDimensionsDefect {
-                    width,
-                    height,
-                }),
-            })
-        })
+        Self::checked(codec, width.into(), height.into())
+            .map_err(|cause| Error::InvalidInput(crate::InputDefect::Layout(cause)))
     }
 
     /// The one dimension check, for values from the API and from the SDK.
     /// The error is the reason, for the caller to report as its own variant.
-    fn checked(
-        codec: VideoCodec,
-        width: i64,
-        height: i64,
-    ) -> std::result::Result<Self, (i64, i64)> {
+    fn checked(codec: VideoCodec, width: i64, height: i64) -> crate::frames::LayoutResult<Self> {
         match (sdk_quantity(width), sdk_quantity(height)) {
             (Some(width), Some(height)) => Ok(Self {
                 codec,
@@ -546,7 +536,12 @@ impl VideoPacketFormat {
                 picture_aspect_ratio: PictureAspectRatio::SQUARE_PIXELS,
                 scan_type: ScanType::Progressive,
             }),
-            _ => Err((width, height)),
+            _ => Err(crate::LayoutDefect::CompressedVideoDimensions {
+                detail: crate::CompactDiagnostic::new(crate::VideoDimensionsDefect {
+                    width,
+                    height,
+                }),
+            }),
         }
     }
 
@@ -555,15 +550,7 @@ impl VideoPacketFormat {
     pub(crate) fn from_sdk(raw: &NDIlib_video_frame_v2_t) -> Result<Self> {
         let (codec, tier, protected) = VideoCodec::from_outer(raw.FourCC)
             .ok_or_else(|| invalid_frame(crate::FrameDefect::UnknownCompressedVideo))?;
-        let format =
-            Self::checked(codec, raw.xres.into(), raw.yres.into()).map_err(|(width, height)| {
-                Error::InvalidFrame(crate::FrameDefect::CompressedVideoDimensions {
-                    detail: crate::CompactDiagnostic::new(crate::VideoDimensionsDefect {
-                        width,
-                        height,
-                    }),
-                })
-            })?;
+        let format = Self::checked(codec, raw.xres.into(), raw.yres.into()).map_err(Error::from)?;
         let header = VideoHeader::from_sdk(raw)?;
         Ok(Self {
             tier,
@@ -1854,8 +1841,8 @@ mod tests {
             let frame = reason(VideoHeader::from_sdk(&raw).map(drop));
             match (&packet, &frame) {
                 (
-                    crate::FrameDefect::PictureAspectRatio(a),
-                    crate::FrameDefect::PictureAspectRatio(b),
+                    crate::FrameDefect::Layout(crate::LayoutDefect::PictureAspectRatio(a)),
+                    crate::FrameDefect::Layout(crate::LayoutDefect::PictureAspectRatio(b)),
                 ) => assert_eq!(a.to_bits(), b.to_bits()),
                 _ => assert_eq!(packet, frame),
             }
@@ -1877,10 +1864,10 @@ mod tests {
                 panic!("frame setter must retain InvalidFrame")
             };
             assert!(
-                matches!(packet, crate::InputDefect::PictureAspectRatio(value) if value.to_bits()==ratio.to_bits())
+                matches!(packet, crate::InputDefect::Layout(crate::LayoutDefect::PictureAspectRatio(value)) if value.to_bits()==ratio.to_bits())
             );
             assert!(
-                matches!(frame, crate::FrameDefect::PictureAspectRatio(value) if value.to_bits()==ratio.to_bits())
+                matches!(frame, crate::FrameDefect::Layout(crate::LayoutDefect::PictureAspectRatio(value)) if value.to_bits()==ratio.to_bits())
             );
         }
     }
@@ -1962,7 +1949,7 @@ mod tests {
         for (width, height) in [(0, 1), (1, 0), (max + 1, 1), (1, u32::MAX)] {
             assert!(matches!(
                 VideoPacketFormat::new(VideoCodec::H264, width, height),
-                Err(Error::InvalidInput(reason)) if matches!(reason, crate::InputDefect::CompressedVideoDimensions {..})
+                Err(Error::InvalidInput(reason)) if matches!(reason, crate::InputDefect::Layout(crate::LayoutDefect::CompressedVideoDimensions {..}))
             ));
         }
         let delivered = h264_format().raw();

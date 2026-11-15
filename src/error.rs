@@ -201,6 +201,7 @@ pub enum Error {
     ConnectionLost,
 
     /// A frame, or a value describing media, is invalid; [`FrameDefect`] identifies the cause.
+    /// Shared layout checks use [`FrameDefect::Layout`] with a [`LayoutDefect`].
     ///
     /// * A frame the SDK delivered (video, audio, metadata or a compressed
     ///   packet) fails validation: its dimensions, format, strides, sizes or
@@ -222,6 +223,8 @@ pub enum Error {
     InvalidFrame(FrameDefect),
 
     /// A value passed to the crate cannot be used; [`InputDefect`] identifies the cause.
+    /// Standalone aspect ratios, frame rates, compressed video formats and
+    /// allocation strides use [`InputDefect::Layout`] with a [`LayoutDefect`].
     ///
     /// It is out of range, malformed, or conflicts with another setting: for
     /// example a timeout above [`MAX_TIMEOUT`](crate::MAX_TIMEOUT), a relative
@@ -388,6 +391,23 @@ const _: () = assert!(
     std::mem::size_of::<Error>()
         <= std::mem::size_of::<NulError>() + std::mem::align_of::<NulError>()
 );
+
+// Preserve the compact nested causes on every 32-bit and 64-bit target,
+// including SDK allocator paths that return a LayoutDefect without allocating.
+#[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
+const _: () = {
+    use std::mem::size_of;
+    assert!(size_of::<FrameDefect>() == 4 * size_of::<usize>());
+    assert!(size_of::<InputDefect>() == 4 * size_of::<usize>());
+    assert!(
+        size_of::<LayoutDefect>()
+            == if cfg!(target_pointer_width = "64") {
+                24
+            } else {
+                16
+            }
+    );
+};
 
 /// The resource budget exhausted by a discovery operation.
 ///
@@ -583,7 +603,7 @@ mod full_diagnostic_tests {
     #[test]
     fn error_groups_preserve_their_complete_diagnostic_prefixes() {
         for (error, expected) in [
-            (Error::InvalidFrame(FrameDefect::AudioRate(0.into())), "Invalid frame data: Invalid sample rate: 0"),
+            (Error::InvalidFrame(FrameDefect::Layout(crate::LayoutDefect::AudioRate(0.into()))), "Invalid frame data: Invalid sample rate: 0"),
             (Error::InvalidInput(InputDefect::RelativeLibraryPath), "Invalid input: an explicit NDI library path must be absolute"),
             (Error::UnexpectedSdkResult(SdkResultDefect::NegativeCount {operation:"NDIlib_send_get_no_connections",value:-1}), "Unexpected NDI SDK result: NDIlib_send_get_no_connections returned a negative count: -1"),
             (Error::UnexpectedSdkResult(SdkResultDefect::UnexpectedFrameType {operation:"sender metadata capture",kind:17}), "Failed to capture frame: sender metadata capture returned 17"),

@@ -55,19 +55,11 @@ fn check_cases<E: std::fmt::Display>(name: &str, cases: &[(&str, E, &str)]) {
 #[test]
 fn frame_defect_diagnostics_preserve_their_text() {
     let cases = [
+        ("Layout", FrameDefect::Layout(LayoutDefect::VideoZeroSize), "Video frame has zero calculated size"),
         ("ImageScratchAllocation", FrameDefect::ImageScratchAllocation(reserve_capacity_error()), "image scratch allocation failed: memory allocation failed because the computed capacity exceeded the collection's maximum"),
         ("ImageScratchOverflow", FrameDefect::ImageScratchOverflow, "image scratch size overflow"),
         ("ImageDimensionOverflow", FrameDefect::ImageDimensionOverflow, "image dimension overflow"),
         ("ImageDimension", FrameDefect::ImageDimension { codec: ImageCodec::Jpeg, dimension: ImageDimension::Width, length: 6, maximum: 16 }, "JPEG width 6 exceeds maximum supported value 16"),
-        ("FrameRate", FrameDefect::FrameRate { detail: CompactDiagnostic::new(FrameRateDefect { numerator: 30, denominator: 0 }) }, "Invalid frame rate 30/0: both parts must be in 1..=2147483647"),
-        ("CompressedVideoDimensions", FrameDefect::CompressedVideoDimensions { detail: CompactDiagnostic::new(VideoDimensionsDefect { width: 8, height: 4 }) }, "Compressed video dimensions 8x4 must each be in 1..=2147483647"),
-        ("VideoZeroStride", FrameDefect::VideoZeroStride, "Video line stride must be positive, got 0"),
-        ("VideoZeroHeight", FrameDefect::VideoZeroHeight, "Video frame height must be positive, got 0"),
-        ("VideoAllocationOverflow", FrameDefect::VideoAllocationOverflow, "Video send allocation size overflow"),
-        ("VideoZeroSize", FrameDefect::VideoZeroSize, "Video frame has zero calculated size"),
-        ("VideoBufferOverflow", FrameDefect::VideoBufferOverflow, "Video buffer size overflow"),
-        ("VideoPayloadOverflow", FrameDefect::VideoPayloadOverflow, "Video payload size overflow"),
-        ("AudioStrideRange", FrameDefect::AudioStrideRange, "Audio channel stride exceeds i32 range"),
         ("MetadataMissingTerminator", FrameDefect::MetadataMissingTerminator, "Metadata frame length does not include a trailing NUL terminator"),
         ("MetadataInteriorNul", FrameDefect::MetadataInteriorNul, "Metadata frame contains an interior NUL byte"),
         ("MetadataNullData", FrameDefect::MetadataNullData, "Metadata frame has non-zero length with null data pointer"),
@@ -116,28 +108,6 @@ fn frame_defect_diagnostics_preserve_their_text() {
         ("ScatterSize", FrameDefect::ScatterSize, "Scatter frame exceeds the packet size limit"),
         ("ScatterHeader", FrameDefect::ScatterHeader, "The first scatter block must hold the frame's complete header"),
         ("UnknownCompressedAudio", FrameDefect::UnknownCompressedAudio, "Unknown compressed audio FourCC"),
-        ("VideoWidth", FrameDefect::VideoWidth((-3).into()), "Video frame has invalid width: -3"),
-        ("VideoOddWidth", FrameDefect::VideoOddWidth((-3).into()), "NDI video frames require even width, got -3"),
-        ("VideoHeight", FrameDefect::VideoHeight((-3).into()), "Video frame has invalid height: -3"),
-        ("VideoSdkStride", FrameDefect::VideoSdkStride(-3), "Uncompressed video frame has invalid line_stride_in_bytes: -3"),
-        ("VideoShortStride", FrameDefect::VideoShortStride { detail: CompactDiagnostic::new(VideoStrideDefect { stride: 7, minimum: 12, format: PixelFormat::Bgra, width: 8 }) }, "Video line_stride_in_bytes 7 is smaller than minimum row size 12 for Bgra width 8"),
-        ("VideoStrideOverflow", FrameDefect::VideoStrideOverflow { format: PixelFormat::Bgra, width: 8 }, "Video line stride overflow for Bgra width 8"),
-        ("VideoBytes", FrameDefect::VideoBytes(7), "Video frame exceeds maximum size: 7 bytes > 268435456 bytes"),
-        ("VideoPlanar420", FrameDefect::VideoPlanar420 { height: 4, stride: 7 }, "Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height 4 and stride 7"),
-        ("VideoSemiPlanar420", FrameDefect::VideoSemiPlanar420(7), "Semi-planar 4:2:0 (NV12) video frames require even height, got 7"),
-        ("VideoUyvaStride", FrameDefect::VideoUyvaStride(7), "UYVA video frames require even line stride, got 7"),
-        ("PictureAspectRatio", FrameDefect::PictureAspectRatio(-1.5), "Video frame has invalid picture aspect ratio: -1.5"),
-        ("AudioRate", FrameDefect::AudioRate((-3).into()), "Invalid sample rate: -3"),
-        ("AudioCount", FrameDefect::AudioCount { value: (-3).into(), kind: AudioCountKind::Channels }, "Invalid number of channels: -3"),
-        ("AudioStride", FrameDefect::AudioStride((-3).into()), "Invalid channel_stride_in_bytes: -3"),
-        ("AudioStrideAlignment", FrameDefect::AudioStrideAlignment(7), "channel_stride_in_bytes must be a multiple of 4, got 7"),
-        ("AudioShortStride", FrameDefect::AudioShortStride { stride: 7, minimum: 12 }, "channel_stride_in_bytes 7 is smaller than one channel of audio samples 12"),
-        ("AudioStrideOverflow", FrameDefect::AudioStrideOverflow(7), "Audio channel stride overflow: 7 samples × 4 bytes"),
-        ("AudioChannelOffset", FrameDefect::AudioChannelOffset { channels: 2, stride: 7 }, "Audio channel offset overflow: 2 channels × 7 stride samples"),
-        ("AudioSampleCount", FrameDefect::AudioSampleCount { offset: 17, samples: 16 }, "Audio backing sample count overflow: channel offset 17 + 16 samples"),
-        ("AudioByteSize", FrameDefect::AudioByteSize(7), "Audio byte size overflow: 7 samples × 4 bytes"),
-        ("AudioBytes", FrameDefect::AudioBytes(7), "Audio frame exceeds maximum size: 7 bytes > 67108864 bytes"),
-        ("VideoStrideRange", FrameDefect::VideoStrideRange { stride: 7 }, "Video line stride 7 exceeds i32 range"),
         ("UnknownScanType", FrameDefect::UnknownScanType { code: 1094861636 }, "Unknown scan type: 0x41424344"),
         ("AudioBufferTooSmall", FrameDefect::AudioBufferTooSmall { actual: 5, minimum: 12 }, "Audio buffer has 5 samples, requires at least 12"),
         ("MetadataNegativeLength", FrameDefect::MetadataNegativeLength { length: 6 }, "Metadata frame has negative length: 6"),
@@ -170,12 +140,7 @@ fn frame_defect_diagnostics_preserve_their_text() {
 #[test]
 fn input_defect_diagnostics_preserve_their_text() {
     let cases = [
-        ("VideoZeroSize", InputDefect::VideoZeroSize, "Video frame has zero calculated size"),
-        ("VideoBufferOverflow", InputDefect::VideoBufferOverflow, "Video buffer size overflow"),
-        ("VideoPayloadOverflow", InputDefect::VideoPayloadOverflow, "Video payload size overflow"),
-        ("AudioStrideRange", InputDefect::AudioStrideRange, "Audio channel stride exceeds i32 range"),
-        ("FrameRate", InputDefect::FrameRate { detail: CompactDiagnostic::new(FrameRateDefect { numerator: 30, denominator: 0 }) }, "Invalid frame rate 30/0: both parts must be in 1..=2147483647"),
-        ("CompressedVideoDimensions", InputDefect::CompressedVideoDimensions { detail: CompactDiagnostic::new(VideoDimensionsDefect { width: 8, height: 4 }) }, "Compressed video dimensions 8x4 must each be in 1..=2147483647"),
+        ("Layout", InputDefect::Layout(LayoutDefect::VideoZeroSize), "Video frame has zero calculated size"),
         ("InvalidSourceName", InputDefect::InvalidSourceName, "Source name must be nonempty and contain no NUL"),
         ("InvalidHostQuery", InputDefect::InvalidHostQuery, "Host must be a bare hostname, IP address or NDI machine name"),
         ("PtzPreset", InputDefect::PtzPreset, "PTZ preset must be within 0..=99"),
@@ -212,28 +177,6 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("QueuedSenderRegistered", InputDefect::QueuedSenderRegistered, "queued conversion requires a sender without advertiser registrations"),
         ("CompletionStorage", InputDefect::CompletionStorage, "unable to allocate bounded completion storage"),
         ("AvSyncStorageLimit", InputDefect::AvSyncStorageLimit, "AVSync request exceeds the supported audio storage limit"),
-        ("VideoWidth", InputDefect::VideoWidth((-3).into()), "Video frame has invalid width: -3"),
-        ("VideoOddWidth", InputDefect::VideoOddWidth((-3).into()), "NDI video frames require even width, got -3"),
-        ("VideoHeight", InputDefect::VideoHeight((-3).into()), "Video frame has invalid height: -3"),
-        ("VideoSdkStride", InputDefect::VideoSdkStride(-3), "Uncompressed video frame has invalid line_stride_in_bytes: -3"),
-        ("VideoShortStride", InputDefect::VideoShortStride { detail: CompactDiagnostic::new(VideoStrideDefect { stride: 7, minimum: 12, format: PixelFormat::Bgra, width: 8 }) }, "Video line_stride_in_bytes 7 is smaller than minimum row size 12 for Bgra width 8"),
-        ("VideoStrideOverflow", InputDefect::VideoStrideOverflow { format: PixelFormat::Bgra, width: 8 }, "Video line stride overflow for Bgra width 8"),
-        ("VideoBytes", InputDefect::VideoBytes(7), "Video frame exceeds maximum size: 7 bytes > 268435456 bytes"),
-        ("VideoPlanar420", InputDefect::VideoPlanar420 { height: 4, stride: 7 }, "Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height 4 and stride 7"),
-        ("VideoSemiPlanar420", InputDefect::VideoSemiPlanar420(7), "Semi-planar 4:2:0 (NV12) video frames require even height, got 7"),
-        ("VideoUyvaStride", InputDefect::VideoUyvaStride(7), "UYVA video frames require even line stride, got 7"),
-        ("PictureAspectRatio", InputDefect::PictureAspectRatio(-1.5), "Video frame has invalid picture aspect ratio: -1.5"),
-        ("AudioRate", InputDefect::AudioRate((-3).into()), "Invalid sample rate: -3"),
-        ("AudioCount", InputDefect::AudioCount { value: (-3).into(), kind: AudioCountKind::Channels }, "Invalid number of channels: -3"),
-        ("AudioStride", InputDefect::AudioStride((-3).into()), "Invalid channel_stride_in_bytes: -3"),
-        ("AudioStrideAlignment", InputDefect::AudioStrideAlignment(7), "channel_stride_in_bytes must be a multiple of 4, got 7"),
-        ("AudioShortStride", InputDefect::AudioShortStride { stride: 7, minimum: 12 }, "channel_stride_in_bytes 7 is smaller than one channel of audio samples 12"),
-        ("AudioStrideOverflow", InputDefect::AudioStrideOverflow(7), "Audio channel stride overflow: 7 samples × 4 bytes"),
-        ("AudioChannelOffset", InputDefect::AudioChannelOffset { channels: 2, stride: 7 }, "Audio channel offset overflow: 2 channels × 7 stride samples"),
-        ("AudioSampleCount", InputDefect::AudioSampleCount { offset: 17, samples: 16 }, "Audio backing sample count overflow: channel offset 17 + 16 samples"),
-        ("AudioByteSize", InputDefect::AudioByteSize(7), "Audio byte size overflow: 7 samples × 4 bytes"),
-        ("AudioBytes", InputDefect::AudioBytes(7), "Audio frame exceeds maximum size: 7 bytes > 67108864 bytes"),
-        ("VideoStrideRange", InputDefect::VideoStrideRange { stride: 7 }, "Video line stride 7 exceeds i32 range"),
         ("TimeoutTooLong", InputDefect::TimeoutTooLong { requested: Duration::from_millis(4_294_967_295).into() }, "timeout 4294967.295s exceeds MAX_TIMEOUT (4294967294 ms, about 49.7 days)"),
         ("TimeoutInstantOverflow", InputDefect::TimeoutInstantOverflow { requested: Duration::from_millis(4_294_967_295).into() }, "timeout 4294967.295s ends at an instant this platform cannot represent"),
         ("ReceiveDelayTooLong", InputDefect::ReceiveDelayTooLong { requested: Duration::from_millis(4_294_967_295).into() }, "receive delay 4294967.295s exceeds 2000 ms"),
@@ -412,6 +355,72 @@ fn compact_scalar_evidence_roundtrips_without_changing_its_diagnostic() {
         for evidence in [DiagnosticDuration::new(value), value.into()] {
             assert_eq!(evidence.get(), value);
             assert_eq!(format!("{evidence:?}"), text);
+        }
+    }
+}
+
+#[test]
+fn layout_defect_diagnostics_preserve_their_text() {
+    let cases = [
+        ("FrameRate", LayoutDefect::FrameRate { detail: CompactDiagnostic::new(FrameRateDefect { numerator: 30, denominator: 0 }) }, "Invalid frame rate 30/0: both parts must be in 1..=2147483647"),
+        ("CompressedVideoDimensions", LayoutDefect::CompressedVideoDimensions { detail: CompactDiagnostic::new(VideoDimensionsDefect { width: 8, height: 4 }) }, "Compressed video dimensions 8x4 must each be in 1..=2147483647"),
+        ("VideoZeroStride", LayoutDefect::VideoZeroStride, "Video line stride must be positive, got 0"),
+        ("VideoAllocationOverflow", LayoutDefect::VideoAllocationOverflow, "Video send allocation size overflow"),
+        ("VideoZeroSize", LayoutDefect::VideoZeroSize, "Video frame has zero calculated size"),
+        ("VideoBufferOverflow", LayoutDefect::VideoBufferOverflow, "Video buffer size overflow"),
+        ("VideoPayloadOverflow", LayoutDefect::VideoPayloadOverflow, "Video payload size overflow"),
+        ("AudioStrideRange", LayoutDefect::AudioStrideRange, "Audio channel stride exceeds i32 range"),
+        ("VideoWidth", LayoutDefect::VideoWidth((-3).into()), "Video frame has invalid width: -3"),
+        ("VideoOddWidth", LayoutDefect::VideoOddWidth((-3).into()), "NDI video frames require even width, got -3"),
+        ("VideoHeight", LayoutDefect::VideoHeight((-3).into()), "Video frame has invalid height: -3"),
+        ("VideoSdkStride", LayoutDefect::VideoSdkStride(-3), "Uncompressed video frame has invalid line_stride_in_bytes: -3"),
+        ("VideoShortStride", LayoutDefect::VideoShortStride { stride: 7, minimum: 12, format: PixelFormat::Bgra, width: 8 }, "Video line_stride_in_bytes 7 is smaller than minimum row size 12 for Bgra width 8"),
+        ("VideoStrideOverflow", LayoutDefect::VideoStrideOverflow { format: PixelFormat::Bgra, width: 8 }, "Video line stride overflow for Bgra width 8"),
+        ("VideoBytes", LayoutDefect::VideoBytes(7), "Video frame exceeds maximum size: 7 bytes > 268435456 bytes"),
+        ("VideoPlanar420", LayoutDefect::VideoPlanar420 { height: 4, stride: 7 }, "Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height 4 and stride 7"),
+        ("VideoSemiPlanar420", LayoutDefect::VideoSemiPlanar420(7), "Semi-planar 4:2:0 (NV12) video frames require even height, got 7"),
+        ("VideoUyvaStride", LayoutDefect::VideoUyvaStride(7), "UYVA video frames require even line stride, got 7"),
+        ("PictureAspectRatio", LayoutDefect::PictureAspectRatio(-1.5), "Video frame has invalid picture aspect ratio: -1.5"),
+        ("AudioRate", LayoutDefect::AudioRate((-3).into()), "Invalid sample rate: -3"),
+        ("AudioCount", LayoutDefect::AudioCount { value: (-3).into(), kind: AudioCountKind::Channels }, "Invalid number of channels: -3"),
+        ("AudioStride", LayoutDefect::AudioStride((-3).into()), "Invalid channel_stride_in_bytes: -3"),
+        ("AudioStrideAlignment", LayoutDefect::AudioStrideAlignment(7), "channel_stride_in_bytes must be a multiple of 4, got 7"),
+        ("AudioShortStride", LayoutDefect::AudioShortStride { stride: 7, minimum: 12 }, "channel_stride_in_bytes 7 is smaller than one channel of audio samples 12"),
+        ("AudioStrideOverflow", LayoutDefect::AudioStrideOverflow(7), "Audio channel stride overflow: 7 samples × 4 bytes"),
+        ("AudioChannelOffset", LayoutDefect::AudioChannelOffset { channels: 2, stride: 7 }, "Audio channel offset overflow: 2 channels × 7 stride samples"),
+        ("AudioSampleCount", LayoutDefect::AudioSampleCount { offset: 17, samples: 16 }, "Audio backing sample count overflow: channel offset 17 + 16 samples"),
+        ("AudioByteSize", LayoutDefect::AudioByteSize(7), "Audio byte size overflow: 7 samples × 4 bytes"),
+        ("AudioBytes", LayoutDefect::AudioBytes(7), "Audio frame exceeds maximum size: 7 bytes > 67108864 bytes"),
+        ("VideoStrideRange", LayoutDefect::VideoStrideRange { stride: 7 }, "Video line stride 7 exceeds i32 range"),
+    ];
+    check_cases("LayoutDefect", &cases);
+}
+
+#[test]
+fn layout_refusals_have_one_public_leaf_variant() {
+    let declarations = syn::parse_file(include_str!("defects.rs")).unwrap();
+    let mut owners = std::collections::BTreeMap::new();
+    for item in declarations.items {
+        let syn::Item::Enum(item) = item else {
+            continue;
+        };
+        if !["FrameDefect", "InputDefect", "LayoutDefect"]
+            .iter()
+            .any(|name| item.ident == name)
+        {
+            continue;
+        }
+        for variant in item.variants {
+            // Both outer classifications deliberately share the one wrapper;
+            // no actual refusal is declared twice.
+            if variant.ident == "Layout" {
+                continue;
+            }
+            let name = variant.ident.to_string();
+            assert!(
+                owners.insert(name.clone(), item.ident.clone()).is_none(),
+                "duplicate refusal: {name}"
+            );
         }
     }
 }

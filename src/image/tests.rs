@@ -2201,14 +2201,14 @@ fn conversion_geometry_overflow_is_refused_before_output_or_row_access() {
     };
     assert!(matches!(
         invalid_frame(super::encode_to(source, &options, &mut output)),
-        crate::FrameDefect::AudioChannelOffset { .. }
-            | crate::FrameDefect::AudioSampleCount { .. }
-            | crate::FrameDefect::AudioByteSize(_)
-            | crate::FrameDefect::AudioBytes(_)
-            | crate::FrameDefect::VideoStrideOverflow { .. }
-            | crate::FrameDefect::VideoBufferOverflow
-            | crate::FrameDefect::VideoPayloadOverflow
-            | crate::FrameDefect::VideoBytes(_)
+        crate::FrameDefect::Layout(crate::LayoutDefect::AudioChannelOffset { .. })
+            | crate::FrameDefect::Layout(crate::LayoutDefect::AudioSampleCount { .. })
+            | crate::FrameDefect::Layout(crate::LayoutDefect::AudioByteSize(_))
+            | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
+            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoStrideOverflow { .. })
+            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
+            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoPayloadOverflow)
+            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
             | crate::FrameDefect::ImageScratchOverflow
             | crate::FrameDefect::ImageDimensionOverflow
     ));
