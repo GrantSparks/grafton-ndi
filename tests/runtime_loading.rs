@@ -6,7 +6,7 @@
 mod runtime_fixture;
 
 use grafton_ndi::{
-    capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
+    capabilities::{CapabilityUnavailable, RuntimeFeature, SdkEdition},
     runtime::{Runtime, RuntimeOptions},
     Error, LibraryKind, LoadFailure, LoadOrigin, LoadRefusal, Ndi, SelectionConflict,
 };
@@ -897,6 +897,7 @@ fn configured_objects_are_refused_for_their_own_capability(ndi: &Ndi) {
             SendListener,
         },
         routing::{Router, RouterOptions},
+        CapabilityStatus,
     };
     let config = AdvancedConfig::parse("{}").unwrap();
     let advertisers = AdvertiserOptions::default()
