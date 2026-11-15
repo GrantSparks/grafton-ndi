@@ -200,6 +200,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Shared `VideoSource`, `AudioSource` and `MetadataSource` inputs for synchronous
   operations, reusable `copy_into` buffers, application-borrowed audio, frame
   plane/channel views and allocation-preserving owned-buffer recovery.
+- Tokio and smol `AsyncFinder`, `AsyncSourceCache` and owned `AsyncSourceWatch`
+  adapters. Dropped discovery waits release their workers between bounded native
+  attempts; synchronous discovery retains whole-budget waits.
 - Tokio and smol scoped capture callbacks that process borrowed media on the
   blocking worker and return a `Send + 'static` result. Owned and combined
   async capture share the deadline and cancellation rules of that path.

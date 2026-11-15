@@ -55,6 +55,11 @@ policy for your service. IP hints belong on the finder; a lookup never changes
 its scope. See the compilable server-state example in
 [`SourceCache::new`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.SourceCache.html#method.new).
 
+For async service state, move that cache into
+`asynchronous::<runtime>::AsyncSourceCache::new(cache)`. Clones share its finder
+and cache; `cache()` lends it for invalidation and `finder()` for controls.
+Create one owned `watch()` cursor per async consumer and retain it across awaits.
+
 Queries accept IP addresses, DNS hostnames and NDI machine names, including
 spaces and underscores. Machine names compare only with the machine component
 of an SDK source label. The grammar is defined by
@@ -265,6 +270,19 @@ delay and native waits; processing can finish after that wait budget. Dropping a
 future skips queued work and stops a started wait before its next attempt.
 The attempt already in flight can still consume a frame/event and execute its
 callback; each native wait lasts at most 100 ms.
+
+Wrap a configured finder in `asynchronous::<runtime>::AsyncFinder::new(finder)`
+for `find_source`, `find_source_by_name` and `find_sources`. `AsyncSourceCache`
+also provides `sources_by_host`. These calls use the same first-poll budget and
+cancellation rule. Invalid names, host queries and timeouts are refused before
+worker submission. Predicates must be `Send + 'static`, and a running predicate
+or snapshot copy finishes. Async waits slice native calls into at most 100 ms;
+synchronous discovery keeps its whole-budget native waits.
+
+`watch()` returns an owned `AsyncSourceWatch` that can move into a spawned task.
+Take snapshots and wait through that same cursor. Failed or dropped operations
+leave its generation unchanged, so a report published while a wait was abandoned
+is visible to its next wait. Each consumer creates its own watch.
 
 Use typed `capture_with(timeout, callback)` or mixed
 `capture_any_with(timeout, callback)` for immediate inspection. A synchronous

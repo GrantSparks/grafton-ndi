@@ -1,0 +1,25 @@
+error[E0277]: `Rc<i32>` cannot be sent between threads safely
+ --> tests/ui/async/fail/async_discovery_nonsend_predicate.rs:6:51
+  |
+6 |     finder.find_source(std::time::Duration::ZERO, move |_| *local == 42).await.unwrap();
+  |            -----------                            --------^^^^^^^^^^^^^
+  |            |                                      |
+  |            |                                      `Rc<i32>` cannot be sent between threads safely
+  |            |                                      within this `{closure@$DIR/tests/ui/async/fail/async_discovery_nonsend_predicate.rs:6:51: 6:59}`
+  |            required by a bound introduced by this call
+  |
+  = help: within `{closure@$DIR/tests/ui/async/fail/async_discovery_nonsend_predicate.rs:6:51: 6:59}`, the trait `Send` is not implemented for `Rc<i32>`
+note: required because `local` is used within this closure
+ --> tests/ui/async/fail/async_discovery_nonsend_predicate.rs:6:61
+  |
+6 |     finder.find_source(std::time::Duration::ZERO, move |_| *local == 42).await.unwrap();
+  |                                                             ^^^^^
+note: required by a bound in `AsyncFinder::<R, D>::find_source`
+ --> src/asynchronous/discovery.rs
+  |
+  | impl<R: AsyncRuntime, D: Discovery> AsyncFinder<R, D> {
+...
+  |     pub async fn find_source(
+...
+  |         mut select: impl FnMut(&Source) -> bool + Send + 'static,
+  |                                                   ^^^^ required by this bound in `AsyncFinder::<R, D>::find_source`

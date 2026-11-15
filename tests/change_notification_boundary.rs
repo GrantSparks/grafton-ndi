@@ -75,6 +75,26 @@ fn shared_native_change_reports() {
             "cold-watch" => cold_watch(&ndi),
             "failed-snapshot" => failed_snapshot(&ndi, || unsafe { publish() }, true),
             "failed-snapshot-pending" => failed_snapshot(&ndi, || unsafe { publish() }, false),
+            #[cfg(feature = "tokio")]
+            "async-tokio" => ::tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap()
+                .block_on(async_discovery::<grafton_ndi::asynchronous::Tokio>(
+                    &ndi,
+                    || unsafe { publish() },
+                )),
+            #[cfg(feature = "tokio")]
+            "async-queued-tokio" => ::tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap()
+                .block_on(async_queued_discovery(&ndi)),
+            #[cfg(feature = "smol")]
+            "async-smol" => ::smol::block_on(async_discovery::<grafton_ndi::asynchronous::Smol>(
+                &ndi,
+                || unsafe { publish() },
+            )),
             #[cfg(feature = "advanced")]
             "keyframe" => keyframe(&ndi, false),
             #[cfg(feature = "advanced")]
@@ -106,6 +126,12 @@ fn shared_native_change_reports() {
         "failed-snapshot",
         "failed-snapshot-pending",
     ];
+    if cfg!(feature = "tokio") {
+        cases.extend(["async-tokio", "async-queued-tokio"]);
+    }
+    if cfg!(feature = "smol") {
+        cases.push("async-smol");
+    }
     if cfg!(feature = "advanced") {
         cases.extend(["keyframe", "keyframe-cleared"]);
     }
@@ -266,6 +292,209 @@ fn cursor(ndi: &Ndi, publish: impl Fn()) {
         assert!(watch.wait_for_change(Duration::ZERO).unwrap());
         assert!(!watch.wait_for_change(Duration::ZERO).unwrap());
     });
+    no_overlapping_waits("finder");
+}
+
+#[cfg(feature = "tokio")]
+async fn async_queued_discovery(ndi: &Ndi) {
+    use grafton_ndi::asynchronous::tokio::AsyncFinder;
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    let adapter = AsyncFinder::new(Finder::new(ndi, &FinderOptions::new()).unwrap());
+    for cancel in [true, false] {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = ::tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            released_wait(release_rx);
+        });
+        started_rx.recv_timeout(PATIENCE).unwrap();
+        let before = events()
+            .lines()
+            .filter(|line| *line == "finder-snapshot")
+            .count();
+        let mut pending = Box::pin(adapter.find_source(Duration::from_millis(20), |_| false));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(pending.as_mut().poll(&mut context), Poll::Pending));
+        if cancel {
+            drop(pending);
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            ::tokio::task::spawn_blocking(|| {}).await.unwrap();
+            assert_eq!(
+                events()
+                    .lines()
+                    .filter(|line| *line == "finder-snapshot")
+                    .count(),
+                before
+            );
+        } else {
+            thread::sleep(Duration::from_millis(25));
+            release_tx.send(()).unwrap();
+            assert!(pending.await.unwrap().is_none());
+            blocker.await.unwrap();
+            assert_eq!(
+                events()
+                    .lines()
+                    .filter(|line| *line == "finder-snapshot")
+                    .count(),
+                before + 1
+            );
+            assert!(!events().contains("finder-wait-begin"));
+        }
+    }
+    // Exercise a real discovery predicate, including resuming its panic payload.
+    let adapter = adapter.clone();
+    let task = ::tokio::spawn(async move {
+        adapter
+            .find_source(Duration::ZERO, |_| std::panic::panic_any(42_u32))
+            .await
+    });
+    let payload = task.await.unwrap_err().into_panic();
+    assert_eq!(*payload.downcast::<u32>().unwrap(), 42);
+}
+
+#[cfg(feature = "tokio")]
+fn released_wait(release: mpsc::Receiver<()>) {
+    release.recv_timeout(PATIENCE).unwrap();
+}
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+async fn async_discovery<R: grafton_ndi::asynchronous::AsyncRuntime>(
+    ndi: &Ndi,
+    publish: impl Fn() + Sync,
+) {
+    use grafton_ndi::{asynchronous::AsyncFinder, SourceCache};
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    fn count(label: &str) -> usize {
+        events().lines().filter(|line| *line == label).count()
+    }
+    fn wait_for_idle() {
+        let deadline = Instant::now() + Duration::from_millis(150);
+        while count("finder-wait-end") != count("finder-wait-begin") {
+            assert!(
+                Instant::now() < deadline,
+                "an abandoned native wait stayed active: {}",
+                events()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let adapter = AsyncFinder::<R>::new(Finder::new(ndi, &FinderOptions::new()).unwrap());
+    assert!(adapter
+        .find_source_by_name("OTHER (Unrelated)", Duration::ZERO)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(adapter.find_sources(Duration::ZERO).await.unwrap().len(), 1);
+    let mut watch = adapter.watch();
+    assert_eq!(watch.current_sources().await.unwrap().len(), 1);
+    // The worker may finish and publish a report, but a dropped future must
+    // leave the cursor uncommitted even when its result is already ready.
+    let before = count("finder-wait-begin");
+    let mut abandoned = Box::pin(watch.wait_for_change(Duration::from_secs(3)));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        abandoned.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    wait_for_entries("finder-wait-begin", before + 1);
+    publish();
+    wait_for_entries("finder-wait-end", before + 1);
+    drop(abandoned);
+    assert!(watch.wait_for_change(Duration::ZERO).await.unwrap());
+    assert_eq!(watch.current_sources().await.unwrap().len(), 2);
+    assert!(!watch.wait_for_change(Duration::ZERO).await.unwrap());
+    // Synchronous followers share the async leader's report without another
+    // native wait, and the follower does not require an async runtime.
+    let before = count("finder-wait-begin");
+    let mut pending = Box::pin(watch.wait_for_change(Duration::from_secs(3)));
+    assert!(matches!(pending.as_mut().poll(&mut context), Poll::Pending));
+    wait_for_entries("finder-wait-begin", before + 1);
+    let mut sync_watch = adapter.finder().watch();
+    thread::scope(|scope| {
+        let follower = scope.spawn(|| sync_watch.wait_for_change(PATIENCE).unwrap());
+        publish();
+        assert!(follower.join().unwrap());
+    });
+    assert!(pending.await.unwrap());
+    assert_eq!(count("finder-wait-begin"), before + 1);
+
+    let before = count("finder-wait-begin");
+    let mut abandoned = Box::pin(adapter.find_source(Duration::from_secs(3), |_| false));
+    assert!(matches!(
+        abandoned.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    wait_for_entries("finder-wait-begin", before + 1);
+    drop(abandoned);
+    wait_for_idle();
+
+    let cache = AsyncFinder::<R, SourceCache>::new(SourceCache::new(
+        Finder::new(ndi, &FinderOptions::new()).unwrap(),
+    ));
+    let before = count("finder-wait-begin");
+    let mut abandoned = Box::pin(cache.sources_by_host("STUDIO", Duration::from_secs(3)));
+    assert!(matches!(
+        abandoned.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    wait_for_entries("finder-wait-begin", before + 1);
+    drop(abandoned);
+    wait_for_idle();
+    // Let publication/cleanup finish after the native call returned.
+    for _ in 0..20 {
+        thread::yield_now();
+    }
+    assert!(
+        cache.cache().is_empty(),
+        "an incomplete window must not fill the cache"
+    );
+    assert_eq!(
+        cache
+            .sources_by_host("STUDIO", Duration::ZERO)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(cache.cache().len(), 1);
+    let calls = count("finder-wait-begin");
+    assert_eq!(
+        cache
+            .sources_by_host("STUDIO", Duration::ZERO)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(count("finder-wait-begin"), calls);
+    // A failed async snapshot also leaves reports published by another
+    // consumer outstanding, just like the synchronous SourceWatch.
+    publish();
+    assert!(adapter
+        .finder()
+        .watch()
+        .wait_for_change(Duration::ZERO)
+        .unwrap());
+    let directory =
+        PathBuf::from(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).with_extension("gate");
+    fs::create_dir(&directory).unwrap();
+    std::env::set_var("GRAFTON_FAKE_FINDER_GATE", &directory);
+    fs::write(directory.join("fail-snapshot"), b"").unwrap();
+    assert!(watch.current_sources().await.is_err());
+    assert!(watch.wait_for_change(Duration::ZERO).await.unwrap());
+    assert_eq!(watch.current_sources().await.unwrap().len(), 4);
+    assert!(!watch.wait_for_change(Duration::ZERO).await.unwrap());
+    assert!(events()
+        .lines()
+        .filter_map(|line| line.strip_prefix("finder-wait-timeout:"))
+        .all(|timeout| timeout.parse::<u32>().unwrap() <= 100));
     no_overlapping_waits("finder");
 }
 

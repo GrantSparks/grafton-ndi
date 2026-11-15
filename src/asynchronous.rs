@@ -1,4 +1,4 @@
-//! Async receivers for Tokio and smol.
+//! Async discovery and receivers for Tokio and smol.
 //!
 //! [`AsyncReceiver`] wraps the synchronous NDI receiver API for an async
 //! runtime, and its `video`, `audio` and `metadata` return an
@@ -11,6 +11,12 @@
 //! example `grafton_ndi::asynchronous::tokio::AsyncReceiver`. This module
 //! exists when either feature is enabled, and each runtime only with its own
 //! feature; the crate root does not re-export any of it.
+//!
+//! [`AsyncFinder`] owns a [`crate::Finder`] or [`crate::SourceCache`] for async
+//! selection and complete discovery windows. Its owned [`AsyncSourceWatch`]
+//! retains a consumer's generation across awaits without borrowing a finder.
+//! Runtime submodules also provide the `AsyncSourceCache` alias for cached
+//! discovery. Dropped lookups stop their workers using the same rule as receivers.
 //!
 //! The NDI SDK operations are synchronous and blocking. Tokio runs them through
 //! `tokio::task::spawn_blocking`; smol uses `smol::unblock`, keeping the work off
@@ -60,13 +66,15 @@
 //! ```no_run
 //! # #[cfg(feature = "tokio")]
 //! # {
-//! use grafton_ndi::{Ndi, ReceiverOptions, asynchronous::tokio::AsyncReceiver};
+//! use grafton_ndi::{Finder, FinderOptions, Ndi, ReceiverOptions,
+//!     asynchronous::tokio::{AsyncFinder, AsyncReceiver}};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), grafton_ndi::Error> {
 //!     let ndi = Ndi::new()?;
-//!     // ... obtain source from finder ...
-//!     # let source = grafton_ndi::Source::new("CAMERA (Program)");
+//!     let finder = AsyncFinder::new(Finder::new(&ndi, &FinderOptions::new())?);
+//!     let Some(source) = finder.find_source_by_name("CAMERA (Program)",
+//!         std::time::Duration::from_secs(5)).await? else { return Ok(()); };
 //!
 //!     let options = ReceiverOptions::snapshot_preset(source);
 //!     let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
@@ -101,6 +109,9 @@ use crate::{
     ConnectionStats, Error, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef, Result, Source,
     SourceNameChange, SpawnFailure,
 };
+
+mod discovery;
+pub use discovery::{AsyncFinder, AsyncSourceWatch, Discovery};
 
 mod private {
     use std::{future::Future, sync::atomic::AtomicBool};
@@ -198,7 +209,8 @@ fn tokio_join_error(error: ::tokio::task::JoinError) -> Error {
 }
 
 /// An async runtime whose blocking thread pool runs the NDI operations of an
-/// [`AsyncReceiver`] and its [`AsyncCapture`] views: [`Tokio`] or [`Smol`].
+/// [`AsyncReceiver`], [`AsyncCapture`], [`AsyncFinder`] and [`AsyncSourceWatch`]:
+/// [`Tokio`] or [`Smol`].
 ///
 /// The trait is sealed and has no items of its own; it only selects the
 /// runtime.
@@ -338,7 +350,16 @@ where
     F: FnOnce(Deadline, &AtomicBool) -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let deadline = Deadline::after(timeout)?;
+    with_deadline_budget::<R, _, _>(Deadline::after(timeout)?, operation).await
+}
+
+// Validated discovery inputs keep the deadline started before their conversion.
+async fn with_deadline_budget<R, F, T>(deadline: Deadline, operation: F) -> Result<T>
+where
+    R: AsyncRuntime,
+    F: FnOnce(Deadline, &AtomicBool) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
     R::spawn_stoppable(private::Token, move |stop| operation(deadline, stop)).await?
 }
 
@@ -883,6 +904,12 @@ pub mod tokio {
 
     /// An [`AsyncReceiver`](super::AsyncReceiver) on the Tokio runtime.
     pub type AsyncReceiver = super::AsyncReceiver<super::Tokio>;
+    /// Discovery on the Tokio runtime, owning a finder or source cache.
+    pub type AsyncFinder<D = crate::Finder> = super::AsyncFinder<super::Tokio, D>;
+    /// Cached discovery on the Tokio runtime.
+    pub type AsyncSourceCache = AsyncFinder<crate::SourceCache>;
+    /// An owned discovery cursor on the Tokio runtime.
+    pub type AsyncSourceWatch<D = crate::Finder> = super::AsyncSourceWatch<super::Tokio, D>;
     /// An [`AsyncCapture`](super::AsyncCapture) on the Tokio runtime.
     pub type AsyncCapture<'rx, K> = super::AsyncCapture<'rx, super::Tokio, K>;
 }
@@ -924,6 +951,12 @@ pub mod smol {
 
     /// An [`AsyncReceiver`](super::AsyncReceiver) on the smol runtime.
     pub type AsyncReceiver = super::AsyncReceiver<super::Smol>;
+    /// Discovery on the smol runtime, owning a finder or source cache.
+    pub type AsyncFinder<D = crate::Finder> = super::AsyncFinder<super::Smol, D>;
+    /// Cached discovery on the smol runtime.
+    pub type AsyncSourceCache = AsyncFinder<crate::SourceCache>;
+    /// An owned discovery cursor on the smol runtime.
+    pub type AsyncSourceWatch<D = crate::Finder> = super::AsyncSourceWatch<super::Smol, D>;
     /// An [`AsyncCapture`](super::AsyncCapture) on the smol runtime.
     pub type AsyncCapture<'rx, K> = super::AsyncCapture<'rx, super::Smol, K>;
 }

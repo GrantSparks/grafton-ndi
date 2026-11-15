@@ -23,7 +23,7 @@ use crate::{
     change_feed::ChangeFeed,
     frames::copy_sdk_string,
     sys::{self, bindings::*},
-    timeout::Deadline,
+    timeout::{Deadline, NeverStop, Stop, POLL_INTERVAL},
     to_ms_checked, Error, Ndi, ResourceKind, Result,
 };
 
@@ -339,12 +339,16 @@ impl SourceWatch<'_> {
     ///
     /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
     pub fn wait_for_change(&mut self, timeout: Duration) -> Result<bool> {
-        Ok(self.wait_until(Deadline::after(timeout)?))
+        Ok(self.wait_until(Deadline::after(timeout)?, NeverStop))
     }
 
-    fn current_sources_until(&mut self, deadline: Deadline) -> Result<Option<Vec<Source>>> {
+    fn current_sources_until(
+        &mut self,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Option<Vec<Source>>> {
         self.snapshot(
-            |finder| finder.current_sources_until(deadline),
+            |finder| finder.current_sources_until(deadline, stop),
             Option::is_some,
         )
     }
@@ -364,10 +368,10 @@ impl SourceWatch<'_> {
         Ok(value)
     }
 
-    fn wait_until(&mut self, deadline: Deadline) -> bool {
+    fn wait_until(&mut self, deadline: Deadline, stop: impl Stop) -> bool {
         if self
             .finder
-            .wait_for_sources_since(self.observed.get(), deadline)
+            .wait_for_sources_since(self.observed.get(), deadline, stop)
         {
             self.observed.set(self.finder.changes.generation());
             true
@@ -525,17 +529,50 @@ impl Finder {
     /// The guard carries the handle it protects, so fetching cannot pair a
     /// different finder's instance with this lock.
     pub(crate) fn snapshot<S: FinderSnapshot>(&self, snapshot: &S) -> Result<Vec<S::Item>> {
-        self.lock_snapshots(None)
+        self.lock_snapshots(None, NeverStop)
             .expect("an unbounded snapshot lock acquisition succeeds")
             .snapshot(snapshot)
     }
 
-    fn lock_snapshots(&self, deadline: Option<Deadline>) -> Option<SnapshotGuard<'_>> {
-        let instance = match deadline {
-            Some(deadline) => self.sources_lock.try_lock_until(deadline.end())?,
-            None => self.sources_lock.lock(),
+    fn lock_snapshots<S: Stop>(
+        &self,
+        deadline: Option<Deadline>,
+        stop: S,
+    ) -> Option<SnapshotGuard<'_>> {
+        let instance = if S::CAN_STOP {
+            loop {
+                if stop.is_stopped() {
+                    return None;
+                }
+                let remaining =
+                    deadline.map_or(POLL_INTERVAL, |end| end.remaining().min(POLL_INTERVAL));
+                if let Some(instance) = self.sources_lock.try_lock_for(remaining) {
+                    break instance;
+                }
+                if deadline.is_some_and(Deadline::is_expired) {
+                    return None;
+                }
+            }
+        } else {
+            match deadline {
+                Some(deadline) => self.sources_lock.try_lock_until(deadline.end())?,
+                None => self.sources_lock.lock(),
+            }
         };
         Some(SnapshotGuard { instance })
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn generation(&self) -> u64 {
+        self.changes.generation()
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn current_sources_stoppable(&self, stop: impl Stop) -> Result<Vec<Source>> {
+        let guard = self
+            .lock_snapshots(None, stop)
+            .ok_or(Error::SpawnFailed(crate::SpawnFailure::TaskCancelled))?;
+        guard.snapshot(&self._ndi.api().core)
     }
 
     /// The runtime this finder was created through.
@@ -558,10 +595,15 @@ impl Finder {
     }
 
     /// Share one native report with every observer of the earlier generation.
-    fn wait_for_sources_since(&self, generation: u64, deadline: Deadline) -> bool {
+    pub(crate) fn wait_for_sources_since(
+        &self,
+        generation: u64,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> bool {
         // SAFETY: the finder instance is live for this borrow.
         self.changes
-            .wait_since(generation, deadline, |timeout_ms| unsafe {
+            .wait_since(generation, deadline, stop, |timeout_ms| unsafe {
                 self._ndi
                     .api()
                     .core
@@ -609,8 +651,12 @@ impl Finder {
     }
 
     /// The lookup's next snapshot, or none when contention exhausts its budget.
-    fn current_sources_until(&self, deadline: Deadline) -> Result<Option<Vec<Source>>> {
-        let Some(guard) = self.lock_snapshots(Some(deadline)) else {
+    fn current_sources_until(
+        &self,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Option<Vec<Source>>> {
+        let Some(guard) = self.lock_snapshots(Some(deadline), stop) else {
             return Ok(None);
         };
         guard.snapshot(&self._ndi.api().core).map(Some)
@@ -631,15 +677,16 @@ impl Finder {
     /// value.
     fn poll_until_deadline<T>(
         &self,
-        timeout: Duration,
+        deadline: Deadline,
+        stop: impl Stop,
         mut accept: impl FnMut(Vec<Source>) -> Result<Option<T>>,
     ) -> Result<Option<T>> {
-        // Validate up front so an over-long timeout is rejected even when the
-        // first snapshot already satisfies `accept`.
-        let deadline = Deadline::after(timeout)?;
         let mut watch = self.watch();
         loop {
-            let Some(sources) = watch.current_sources_until(deadline)? else {
+            if stop.is_stopped() {
+                return Ok(None);
+            }
+            let Some(sources) = watch.current_sources_until(deadline, stop)? else {
                 return Ok(None);
             };
             if let Some(selected) = accept(sources)? {
@@ -651,7 +698,7 @@ impl Finder {
             // Block until the source list changes or the window ends; either
             // way the next iteration re-snapshots. The wait is rounded up, so
             // the last one lasts until the deadline rather than polling.
-            watch.wait_until(deadline);
+            watch.wait_until(deadline, stop);
         }
     }
 
@@ -682,9 +729,18 @@ impl Finder {
     pub fn find_source(
         &self,
         timeout: Duration,
+        select: impl FnMut(&Source) -> bool,
+    ) -> Result<Option<Source>> {
+        self.find_source_until(Deadline::after(timeout)?, NeverStop, select)
+    }
+
+    pub(crate) fn find_source_until(
+        &self,
+        deadline: Deadline,
+        stop: impl Stop,
         mut select: impl FnMut(&Source) -> bool,
     ) -> Result<Option<Source>> {
-        self.poll_until_deadline(timeout, |sources| {
+        self.poll_until_deadline(deadline, stop, |sources| {
             Ok(sources.into_iter().find(|source| select(source)))
         })
     }
@@ -699,9 +755,7 @@ impl Finder {
     /// [`Error::InvalidInput`] before inspecting a snapshot.
     pub fn find_source_by_name(&self, name: &str, timeout: Duration) -> Result<Option<Source>> {
         to_ms_checked(timeout)?;
-        if name.is_empty() || name.contains('\0') {
-            return Err(Error::InvalidInput(crate::InputDefect::InvalidSourceName));
-        }
+        validate_source_name(name)?;
         self.find_source(timeout, |source| source.name() == name)
     }
 
@@ -760,11 +814,19 @@ impl Finder {
     /// # }
     /// ```
     pub fn find_sources(&self, timeout: Duration) -> Result<Vec<Source>> {
+        self.find_sources_until(Deadline::after(timeout)?, NeverStop)
+    }
+
+    pub(crate) fn find_sources_until(
+        &self,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Vec<Source>> {
         // Preserve first-observed order and deduplicate by complete descriptor.
         let mut seen = HashSet::new();
         let mut discovered = Vec::new();
         let mut retained_bytes = 0;
-        self.poll_until_deadline(timeout, |sources| {
+        self.poll_until_deadline(deadline, stop, |sources| {
             accumulate_sources(&mut discovered, &mut seen, &mut retained_bytes, sources)?;
             Ok(None::<()>)
         })?;
@@ -783,6 +845,21 @@ const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Finder>();
 };
+
+pub(crate) fn validate_source_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('\0') {
+        Err(Error::InvalidInput(crate::InputDefect::InvalidSourceName))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+pub(crate) fn validate_host_query(host: &str) -> Result<()> {
+    HostQuery::parse(host)
+        .map(|_| ())
+        .ok_or(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))
+}
 
 fn accumulate_sources(
     discovered: &mut Vec<Source>,
@@ -1479,16 +1556,43 @@ impl SourceCache {
     /// be configured on the finder; this method does not change its scope.
     pub fn sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
         self.entries.sources_by_host_with(host, timeout, |query| {
-            let mut seen = HashSet::new();
-            let mut discovered = Vec::new();
-            let mut retained_bytes = 0;
-            self.finder().poll_until_deadline(timeout, |mut sources| {
+            self.discover_host_until(query, Deadline::after(timeout)?, NeverStop)
+        })
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn sources_by_host_until(
+        &self,
+        host: &str,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Vec<Source>> {
+        self.entries
+            .sources_by_host_with(host, deadline.remaining(), |query| {
+                self.discover_host_until(query, deadline, stop)
+            })
+    }
+
+    fn discover_host_until(
+        &self,
+        query: HostQuery<'_>,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Vec<Source>> {
+        let mut seen = HashSet::new();
+        let mut discovered = Vec::new();
+        let mut retained_bytes = 0;
+        self.finder()
+            .poll_until_deadline(deadline, stop, |mut sources| {
                 sources.retain(|source| source.matches_query(query));
                 accumulate_sources(&mut discovered, &mut seen, &mut retained_bytes, sources)?;
                 Ok(None::<()>)
             })?;
-            Ok(discovered)
-        })
+        if stop.is_stopped() {
+            // An abandoned miss has not observed the full cache window.
+            return Err(Error::SpawnFailed(crate::SpawnFailure::TaskCancelled));
+        }
+        Ok(discovered)
     }
 
     /// Remove a host's complete result set and suppress pending fills.
@@ -1752,6 +1856,33 @@ mod tests {
         // One vector, its name, the Arc header, host key and map storage.
         assert_eq!(allocations, 5);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    #[test]
+    fn cancelled_snapshot_lock_wait_finishes_without_entering_the_sdk() {
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::Instant,
+        };
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let finder = Finder::new(&ndi, &FinderOptions::new()).unwrap();
+        let held = finder.sources_lock.lock();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| finder.current_sources_stoppable(&stop));
+            std::thread::sleep(Duration::from_millis(20));
+            let cancelled = Instant::now();
+            stop.store(true, Ordering::Release);
+            assert!(matches!(
+                waiting.join().unwrap(),
+                Err(Error::SpawnFailed(crate::SpawnFailure::TaskCancelled))
+            ));
+            assert!(cancelled.elapsed() < Duration::from_millis(150));
+        });
+        drop(held);
     }
 
     #[test]

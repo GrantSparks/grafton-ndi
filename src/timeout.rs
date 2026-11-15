@@ -26,18 +26,23 @@ mod stop_sealed {
 
 /// Whether a wait may begin another attempt. Checked only between attempts,
 /// so a delivered frame is always guarded and processed before cancellation.
-pub(crate) trait Stop: stop_sealed::Sealed {
+pub(crate) trait Stop: stop_sealed::Sealed + Copy {
+    /// Whether the caller can request cancellation while a wait is running.
+    const CAN_STOP: bool;
     fn is_stopped(&self) -> bool;
 }
 
 /// Synchronous waits have no cancellation state or atomic loads.
+#[derive(Clone, Copy)]
 pub(crate) struct NeverStop;
 impl Stop for NeverStop {
+    const CAN_STOP: bool = false;
     fn is_stopped(&self) -> bool {
         false
     }
 }
 impl Stop for &AtomicBool {
+    const CAN_STOP: bool = true;
     fn is_stopped(&self) -> bool {
         self.load(Ordering::Acquire)
     }

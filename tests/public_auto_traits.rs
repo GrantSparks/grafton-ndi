@@ -192,22 +192,34 @@ fn image_encoding_types_keep_their_auto_traits() {
 #[cfg(feature = "tokio")]
 #[test]
 fn tokio_types_keep_their_auto_traits() {
-    use grafton_ndi::asynchronous::{AsyncReceiver, Tokio};
+    use grafton_ndi::asynchronous::{AsyncFinder, AsyncReceiver, AsyncSourceWatch, Tokio};
+    use grafton_ndi::SourceCache;
     has! {
         AsyncReceiver<Tokio>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AsyncFinder<Tokio>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AsyncFinder<Tokio, SourceCache>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AsyncSourceWatch<Tokio>: Send, UnwindSafe;
+        AsyncSourceWatch<Tokio, SourceCache>: Send, UnwindSafe;
         Tokio: Send, Sync, UnwindSafe, RefUnwindSafe;
     }
+    lacks! { AsyncSourceWatch<Tokio>: Sync; }
 }
 
 /// The public types of the `asynchronous` module with smol.
 #[cfg(feature = "smol")]
 #[test]
 fn smol_types_keep_their_auto_traits() {
-    use grafton_ndi::asynchronous::{AsyncReceiver, Smol};
+    use grafton_ndi::asynchronous::{AsyncFinder, AsyncReceiver, AsyncSourceWatch, Smol};
+    use grafton_ndi::SourceCache;
     has! {
         AsyncReceiver<Smol>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AsyncFinder<Smol>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AsyncFinder<Smol, SourceCache>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AsyncSourceWatch<Smol>: Send, UnwindSafe;
+        AsyncSourceWatch<Smol, SourceCache>: Send, UnwindSafe;
         Smol: Send, Sync, UnwindSafe, RefUnwindSafe;
     }
+    lacks! { AsyncSourceWatch<Smol>: Sync; }
 }
 
 /// The public types of the `discovery` module.

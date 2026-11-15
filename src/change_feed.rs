@@ -8,7 +8,7 @@
 
 use std::sync::{Condvar, Mutex, MutexGuard};
 
-use crate::timeout::Deadline;
+use crate::timeout::{Deadline, Stop, POLL_INTERVAL};
 
 /// One native wait at a time, with a generation for every observer to compare.
 /// No lock is held across the native call or application code.
@@ -40,14 +40,18 @@ impl ChangeFeed {
     /// Wait for a report newer than `observed`, spending one absolute budget
     /// on both native and condvar waits. An uncontended zero budget still
     /// makes one nonblocking native call; a contended one only reads the feed.
-    pub(crate) fn wait_since(
+    pub(crate) fn wait_since<S: Stop>(
         &self,
         observed: u64,
         deadline: Deadline,
-        native_wait: impl FnOnce(u32) -> bool,
+        stop: S,
+        mut native_wait: impl FnMut(u32) -> bool,
     ) -> bool {
         let mut state = self.lock();
         loop {
+            if stop.is_stopped() {
+                return false;
+            }
             if state.generation != observed {
                 return true;
             }
@@ -58,7 +62,22 @@ impl ChangeFeed {
                     armed: true,
                 };
                 drop(state);
-                let changed = native_wait(deadline.remaining_ms());
+                // Retain the leader role across bounded attempts. No feed lock
+                // or follower wake is needed between cancellable native waits.
+                let changed = loop {
+                    if stop.is_stopped() {
+                        break false;
+                    }
+                    let attempt = if S::CAN_STOP {
+                        deadline.within_at(std::time::Instant::now(), POLL_INTERVAL)
+                    } else {
+                        deadline
+                    };
+                    let changed = native_wait(attempt.remaining_ms());
+                    if changed || !S::CAN_STOP || deadline.is_expired() {
+                        break changed;
+                    }
+                };
                 state = self.lock();
                 if changed {
                     state.generation = state.generation.wrapping_add(1);
@@ -68,7 +87,11 @@ impl ChangeFeed {
                 self.changed.notify_all();
                 return state.generation != observed;
             }
-            let remaining = deadline.remaining();
+            let remaining = if S::CAN_STOP {
+                deadline.remaining().min(POLL_INTERVAL)
+            } else {
+                deadline.remaining()
+            };
             if remaining.is_zero() {
                 return false;
             }
@@ -101,6 +124,7 @@ impl Drop for NativeWaiter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timeout::NeverStop;
     use std::{
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -115,6 +139,72 @@ mod tests {
     }
 
     #[test]
+    fn synchronous_wait_spends_one_whole_native_budget() {
+        let feed = ChangeFeed::default();
+        let mut calls = 0;
+        assert!(!feed.wait_since(0, budget(), NeverStop, |timeout| {
+            calls += 1;
+            assert_eq!(timeout, 3000);
+            false
+        }));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn stoppable_leader_keeps_its_role_across_slices_and_hands_off() {
+        use std::sync::atomic::AtomicBool;
+        let feed = ChangeFeed::default();
+        let stop = AtomicBool::new(false);
+        let mut calls = 0;
+        assert!(!feed.wait_since(0, budget(), &stop, |timeout| {
+            assert!(timeout <= 100);
+            let state = feed
+                .state
+                .try_lock()
+                .expect("native waits hold no feed lock");
+            assert!(state.native_waiter, "slicing must retain the leader role");
+            drop(state);
+            calls += 1;
+            if calls == 3 {
+                stop.store(true, Ordering::Release);
+            }
+            false
+        }));
+        assert_eq!(calls, 3);
+        assert!(feed.wait_since(0, budget(), NeverStop, |_| true));
+    }
+
+    #[test]
+    fn stoppable_follower_can_leave_a_synchronous_native_wait() {
+        use std::sync::atomic::AtomicBool;
+        let feed = ChangeFeed::default();
+        let stop = AtomicBool::new(false);
+        let (entered, started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        thread::scope(|scope| {
+            let feed = &feed;
+            let leader = scope.spawn(move || {
+                feed.wait_since(0, budget(), NeverStop, |_| {
+                    entered.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(3)).unwrap();
+                    false
+                })
+            });
+            started.recv_timeout(Duration::from_secs(3)).unwrap();
+            let follower = scope.spawn(|| {
+                feed.wait_since(0, budget(), &stop, |_| panic!("overlapping native wait"))
+            });
+            thread::sleep(Duration::from_millis(20));
+            let cancelled = std::time::Instant::now();
+            stop.store(true, Ordering::Release);
+            assert!(!follower.join().unwrap());
+            assert!(cancelled.elapsed() < Duration::from_millis(150));
+            release.send(()).unwrap();
+            assert!(!leader.join().unwrap());
+        });
+    }
+
+    #[test]
     fn one_report_wakes_every_observer_without_another_native_call() {
         let feed = ChangeFeed::default();
         let observed = feed.generation();
@@ -124,7 +214,7 @@ mod tests {
         thread::scope(|scope| {
             let feed = &feed;
             let leader = scope.spawn(move || {
-                feed.wait_since(observed, budget(), |_| {
+                feed.wait_since(observed, budget(), NeverStop, |_| {
                     entered.send(()).unwrap();
                     released.recv_timeout(Duration::from_secs(3)).unwrap();
                     true
@@ -135,7 +225,7 @@ mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         ready.wait();
-                        feed.wait_since(observed, budget(), |_| {
+                        feed.wait_since(observed, budget(), NeverStop, |_| {
                             panic!("a follower consumed another report")
                         })
                     })
@@ -148,7 +238,9 @@ mod tests {
                 assert!(follower.join().unwrap());
             }
         });
-        assert!(feed.wait_since(observed, budget(), |_| panic!("report already published")));
+        assert!(feed.wait_since(observed, budget(), NeverStop, |_| panic!(
+            "report already published"
+        )));
     }
 
     #[test]
@@ -160,7 +252,7 @@ mod tests {
         thread::scope(|scope| {
             let feed = &feed;
             let leader = scope.spawn(move || {
-                feed.wait_since(observed, budget(), |_| {
+                feed.wait_since(observed, budget(), NeverStop, |_| {
                     entered.send(()).unwrap();
                     released.recv_timeout(Duration::from_secs(3)).unwrap();
                     false
@@ -168,7 +260,7 @@ mod tests {
             });
             started.recv_timeout(Duration::from_secs(3)).unwrap();
             let follower = scope.spawn(|| {
-                feed.wait_since(observed, budget(), |timeout| {
+                feed.wait_since(observed, budget(), NeverStop, |timeout| {
                     assert!(timeout > 0);
                     true
                 })
@@ -187,7 +279,7 @@ mod tests {
         thread::scope(|scope| {
             let feed = &feed;
             let leader = scope.spawn(move || {
-                feed.wait_since(0, budget(), |_| {
+                feed.wait_since(0, budget(), NeverStop, |_| {
                     entered.send(()).unwrap();
                     released.recv_timeout(Duration::from_secs(3)).unwrap();
                     false
@@ -195,21 +287,25 @@ mod tests {
             });
             started.recv_timeout(Duration::from_secs(3)).unwrap();
             for timeout in [Duration::ZERO, Duration::from_millis(10)] {
-                assert!(
-                    !feed.wait_since(0, Deadline::after(timeout).unwrap(), |_| panic!(
-                        "overlapping native wait"
-                    ))
-                );
+                assert!(!feed.wait_since(
+                    0,
+                    Deadline::after(timeout).unwrap(),
+                    NeverStop,
+                    |_| panic!("overlapping native wait")
+                ));
             }
             release.send(()).unwrap();
             assert!(!leader.join().unwrap());
         });
-        assert!(
-            !feed.wait_since(0, Deadline::after(Duration::ZERO).unwrap(), |timeout| {
+        assert!(!feed.wait_since(
+            0,
+            Deadline::after(Duration::ZERO).unwrap(),
+            NeverStop,
+            |timeout| {
                 assert_eq!(timeout, 0);
                 false
-            })
-        );
+            }
+        ));
     }
 
     #[test]
@@ -217,16 +313,16 @@ mod tests {
         let feed = ChangeFeed::default();
         let observed = feed.generation();
         let panic = std::panic::catch_unwind(|| {
-            feed.wait_since(observed, budget(), |_| panic!("native wait"))
+            feed.wait_since(observed, budget(), NeverStop, |_| panic!("native wait"))
         });
         assert!(panic.is_err());
         let calls = AtomicUsize::new(0);
-        assert!(feed.wait_since(observed, budget(), |_| {
+        assert!(feed.wait_since(observed, budget(), NeverStop, |_| {
             calls.fetch_add(1, Ordering::Relaxed);
             true
         }));
         // This models a report published while a snapshot/predicate ran.
-        assert!(feed.wait_since(observed, budget(), |_| panic!(
+        assert!(feed.wait_since(observed, budget(), NeverStop, |_| panic!(
             "lost snapshot-to-wait report"
         )));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
