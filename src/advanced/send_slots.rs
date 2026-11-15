@@ -167,7 +167,7 @@ impl DescriptorLease {
 /// A stable initialized scatter list. Queue entries retain its descriptor
 /// lease; compressed stream lists instead own that lease's move-only key.
 #[cfg(ndi_has_advanced_scatter_send)]
-pub(super) struct ScatterLease {
+pub(crate) struct ScatterLease {
     owner: Arc<DescriptorSlots>,
     index: usize,
     key: Option<SlotKey>,
@@ -216,9 +216,13 @@ use std::sync::Arc;
 #[path = {bindings:?}]
 pub(crate) mod bindings;
 mod sys {{ pub(crate) use crate::bindings; }}
-mod sender {{ pub mod in_flight {{
+mod sender {{
+    pub trait SenderMode {{}}
+    pub struct Sender<M: SenderMode>(std::marker::PhantomData<M>);
+    pub mod in_flight {{
     {synchronized}
     {destroyed}
+    {pair}
 }} }}
 mod queued {{
     {completion}
@@ -233,6 +237,13 @@ mod send_slots;
             slots = root.join("src/advanced/send_slots.rs"),
             synchronized = proof_declaration("Synchronized"),
             destroyed = proof_declaration("Destroyed"),
+            pair = {
+                let source = include_str!("../sender.rs");
+                let start = source.find("pub(crate) struct LoanPair<").unwrap();
+                let tail = &source[start..];
+                let end = tail.find("    #[cfg(feature = \"advanced\")]\n    impl<'a> LoanPair<'a, crate::CompressedAttached").unwrap();
+                tail[..end].replace("#[cfg(feature = \"advanced\")]", "")
+            },
             completion = {
                 let source = include_str!("queued.rs");
                 let start = source.find("pub(super) struct Completion {").unwrap();
@@ -256,6 +267,8 @@ mod send_slots;
             ),
             ("moved", moved.to_owned(), Some("E0382")),
             ("cloned", cloned.to_owned(), Some("E0599")),
+            ("pair_private", include_str!("../../tests/ui/internal/fail/send_loan_pair_requires_its_owner.rs").to_owned(), Some("E0451")),
+            ("foreign_dispatch", include_str!("../../tests/ui/internal/fail/send_loan_pair_cannot_extract_foreign_dispatch.rs").to_owned(), Some("E0599")),
             ("synchronized_private", include_str!("../../tests/ui/internal/fail/synchronization_requires_its_owner.rs").to_owned(), Some("E0451")),
             ("destroyed_private", include_str!("../../tests/ui/internal/fail/destruction_requires_its_owner.rs").to_owned(), Some("E0451")),
             ("completion_private", include_str!("../../tests/ui/internal/fail/completion_requires_its_queue.rs").to_owned(), Some("E0451")),

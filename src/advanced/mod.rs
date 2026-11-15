@@ -74,9 +74,11 @@ pub use finder::ExtendedSource;
 pub use kvm::*;
 pub use kvm_receiver::KvmReceiver;
 pub use packets::*;
+pub(crate) use queued::QueueLoans;
 pub use queued::*;
 pub use receive::*;
 pub use send::*;
+pub(crate) use send::{PendingStreams, PendingVideo};
 pub use sync::*;
 
 /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) with its typed `cause`: a frame

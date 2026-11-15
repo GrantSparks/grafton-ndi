@@ -11,10 +11,7 @@ use super::{
     MAX_PACKET_BYTES,
 };
 use crate::{
-    sender::{
-        in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans},
-        SendHandle,
-    },
+    sender::in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans, Synchronized},
     sys::{
         advanced::{native, ScatterSend},
         bindings::*,
@@ -468,7 +465,7 @@ pub struct ReclaimedVideo {
 ///
 /// The entry owns all of these, so nothing can read the frame's bytes while
 /// the SDK may still write to them.
-pub(super) enum PendingVideo {
+pub(crate) enum PendingVideo {
     /// A frame submitted with [`CompressedSender::send_video_async`].
     Contiguous(CompressedVideoFrame),
     /// A frame submitted with [`CompressedSender::send_scatter_video_async`].
@@ -521,7 +518,7 @@ impl PendingVideo {
     }
 
     /// The stream the frame is sent on.
-    fn tier(&self) -> StreamTier {
+    pub(crate) fn tier(&self) -> StreamTier {
         match self {
             Self::Contiguous(frame) => frame.format().tier(),
             #[cfg(ndi_has_advanced_scatter_send)]
@@ -591,7 +588,7 @@ struct ScatterKeys {
     spare: Option<super::send_slots::SlotKey>,
 }
 
-struct PendingStreams {
+pub(crate) struct PendingStreams {
     program: InFlight<PendingVideo>,
     preview: InFlight<PendingVideo>,
     #[cfg(ndi_has_advanced_scatter_send)]
@@ -621,12 +618,11 @@ impl PendingStreams {
     }
 
     #[cfg(ndi_has_advanced_scatter_send)]
-    fn submit_scatter(
+    pub(crate) fn prepare_scatter(
         &mut self,
-        sender: SendHandle<'_>,
         mut frame: ScatterVideoFrame,
         table: &'static ScatterSend,
-    ) -> Option<SubmittedVideo> {
+    ) -> PendingVideo {
         let tier = frame.format().tier();
         let keys = match tier {
             StreamTier::Program => &mut self.program_keys,
@@ -656,29 +652,38 @@ impl PendingStreams {
                 assert_ne!(old.as_ptr(), next.as_ptr());
             }
         }
-        let returned = self.submit(sender, pending);
+        pending
+    }
+
+    #[cfg(ndi_has_advanced_scatter_send)]
+    pub(crate) fn advance_scatter(&mut self, tier: StreamTier) {
         let keys = match tier {
             StreamTier::Program => &mut self.program_keys,
             StreamTier::Preview => &mut self.preview_keys,
         };
         std::mem::swap(&mut keys.next, &mut keys.spare);
-        returned
     }
 
-    /// Hand `next` to the SDK through `sender`, then take back the frame it
-    /// replaces on the same stream.
-    fn submit(&mut self, sender: SendHandle<'_>, next: PendingVideo) -> Option<SubmittedVideo> {
-        let tier = next.tier();
-        let slot = match tier {
+    /// Select the retained slot; only its owning protocol can synchronize it.
+    pub(crate) fn slot(&mut self, tier: StreamTier) -> &mut InFlight<PendingVideo> {
+        match tier {
             StreamTier::Program => &mut self.program,
             StreamTier::Preview => &mut self.preview,
-        };
-        let (displaced, synchronized) = slot.submit(sender, next, ());
+        }
+    }
+
+    /// Recover the previous frame with the proof minted by this owner's send.
+    pub(crate) fn reclaim_displaced(
+        &mut self,
+        _tier: StreamTier,
+        displaced: InFlight<PendingVideo>,
+        synchronized: Synchronized,
+    ) -> Option<SubmittedVideo> {
         displaced.release_with(synchronized, |frame, proof| {
             let (frame, _key) = frame.release(super::send_slots::Released::Synchronized(proof));
             #[cfg(ndi_has_advanced_scatter_send)]
             if let Some(key) = _key {
-                let keys = match tier {
+                let keys = match _tier {
                     StreamTier::Program => &mut self.program_keys,
                     StreamTier::Preview => &mut self.preview_keys,
                 };
@@ -708,6 +713,12 @@ impl PendingStreams {
 }
 
 impl Loans for PendingStreams {
+    type Recovered = ReclaimedVideo;
+
+    fn recover(self, destroyed: &Destroyed) -> ReclaimedVideo {
+        self.into_reclaimed(destroyed)
+    }
+
     fn release(self, destroyed: &Destroyed) {
         drop(self.into_reclaimed(destroyed));
     }
@@ -940,7 +951,7 @@ impl CompressedSender {
     /// Destroying the native sender waits for the SDK to finish with every
     /// pending frame, without a timeout.
     pub fn close(self) -> ReclaimedVideo {
-        self.lending.close(PendingStreams::into_reclaimed)
+        self.lending.close()
     }
 }
 
@@ -995,12 +1006,7 @@ impl CompressedVideo<'_> {
         &mut self,
         frame: CompressedVideoFrame,
     ) -> std::result::Result<Option<SubmittedVideo>, Rejected<CompressedVideoFrame>> {
-        if let Err(error) = frame.validate_for_send() {
-            return Err(Rejected::new(error, frame));
-        }
-        Ok(self
-            .pair
-            .with(|pending, sender| pending.submit(sender, PendingVideo::Contiguous(frame))))
+        self.pair.submit_pending(frame)
     }
 
     /// See [`CompressedSender::send_scatter_video`].
@@ -1031,13 +1037,7 @@ impl CompressedVideo<'_> {
         &mut self,
         frame: ScatterVideoFrame,
     ) -> std::result::Result<Option<SubmittedVideo>, Rejected<ScatterVideoFrame>> {
-        let table = match self.pair.sender().runtime().table::<ScatterSend>() {
-            Ok(table) => table,
-            Err(error) => return Err(Rejected::new(error, frame)),
-        };
-        native!(ScatterSend, table => {
-            Ok(self.pair.with(|pending, sender| pending.submit_scatter(sender, frame, table)))
-        })
+        self.pair.submit_scatter(frame)
     }
 }
 

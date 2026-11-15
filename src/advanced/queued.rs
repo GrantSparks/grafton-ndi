@@ -368,10 +368,10 @@ const _: () = {
     assert_send_sync::<Entry>();
 };
 
-struct Admitted {
-    id: SubmissionId,
-    lent: Lent,
-    pointer: *const NDIlib_video_frame_v2_t,
+pub(crate) struct Admitted {
+    pub(crate) id: SubmissionId,
+    pub(crate) lent: Lent,
+    pub(crate) pointer: *const NDIlib_video_frame_v2_t,
 }
 
 /// The frames a queue holds. Each is in exactly one place: in flight until
@@ -525,7 +525,7 @@ impl State {
     }
 }
 
-struct CallbackState {
+pub(crate) struct CallbackState {
     // Immutable, so permanent admission failures need neither the state lock
     // nor a native descriptor allocation.
     max_bytes: usize,
@@ -535,6 +535,30 @@ struct CallbackState {
 }
 
 impl CallbackState {
+    /// Validate and retain one entry for this callback's owning sender.
+    pub(crate) fn prepare(
+        &self,
+        sender: &Sender<QueueAttached>,
+        frame: QueuedVideoFrame,
+    ) -> std::result::Result<Admitted, Rejected<QueuedVideoFrame>> {
+        let failure = Rejected::new;
+        let bytes = frame.retained_bytes();
+        let frame = frame.authorize(sender)?;
+        if let Err(error) = self.validate_frame_size(bytes) {
+            return Err(failure(error, frame.into_frame()));
+        }
+        if self.protocol_error.load(Ordering::Acquire) {
+            return Err(failure(
+                Error::UnexpectedSdkResult(crate::SdkResultDefect::UnknownCompletion),
+                frame.into_frame(),
+            ));
+        }
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.admit(frame, bytes, &self.protocol_error)
+        }
+    }
+
     #[cfg(any(test, ndi_has_advanced_send_completion))]
     fn new(options: QueueOptions) -> Result<Box<Self>> {
         let options = options.validate()?;
@@ -624,6 +648,9 @@ impl CallbackState {
         self.changed.notify_all();
     }
 }
+/// The callback storage paired with an exclusive queue sender.
+pub(crate) type QueueLoans = AliasableBox<CallbackState>;
+
 /// The completion callback the SDK calls, on its own threads, when it has
 /// finished with an asynchronously sent frame.
 #[cfg(any(test, ndi_has_advanced_send_completion))]
@@ -705,6 +732,15 @@ pub struct QueuedSender {
 }
 
 impl Loans for AliasableBox<CallbackState> {
+    type Recovered = Vec<CompletedVideo>;
+
+    fn recover(self, destroyed: &Destroyed) -> Vec<CompletedVideo> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take_retained(destroyed)
+    }
+
     fn release(self, destroyed: &Destroyed) {
         self.state
             .lock()
@@ -924,13 +960,7 @@ impl QueuedSender {
     /// every pending frame. Run this on a blocking thread when using an async
     /// executor. Only the returned collection is allocated.
     pub fn close(self) -> Vec<CompletedVideo> {
-        self.lending.close(|callback, destroyed| {
-            callback
-                .state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take_retained(destroyed)
-        })
+        self.lending.close()
     }
 }
 
@@ -954,33 +984,7 @@ impl QueuedVideo<'_> {
         &mut self,
         frame: impl Into<QueuedVideoFrame>,
     ) -> std::result::Result<SubmissionId, Rejected<QueuedVideoFrame>> {
-        let owner = self.pair.sender();
-        self.pair.with(|callback, sender| {
-            let frame = frame.into();
-            let failure = Rejected::new;
-            let bytes = frame.retained_bytes();
-            let frame = frame.authorize(owner)?;
-            if let Err(error) = callback.validate_frame_size(bytes) {
-                return Err(failure(error, frame.into_frame()));
-            }
-            if callback.protocol_error.load(Ordering::Acquire) {
-                return Err(failure(
-                    Error::UnexpectedSdkResult(crate::SdkResultDefect::UnknownCompletion),
-                    frame.into_frame(),
-                ));
-            }
-            let admitted = {
-                let mut state = callback.state.lock().unwrap_or_else(|p| p.into_inner());
-                state.admit(frame, bytes, &callback.protocol_error)?
-            };
-            // The entry is recorded and the lock released before dispatch because
-            // the SDK may complete this submission before the native call returns.
-            // SAFETY: the live sender owns this queue; admission retained the stable
-            // descriptor and all pointees until native completion or destruction.
-            unsafe { admitted.lent.submit(sender, admitted.pointer) };
-            let id = admitted.id;
-            Ok(id)
-        })
+        self.pair.try_submit_queued(frame)
     }
 
     /// See [`QueuedSender::try_take_completed`].
