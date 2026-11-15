@@ -265,7 +265,6 @@ impl FileRuntime {
 
     fn load(runtime: &Runtime, explicit: Option<&Path>) -> Result<Self> {
         let core = &runtime.info;
-        let api = runtime.gates.api();
         // The 6.4.0.2 POSIX File library, including Standard SDK copies,
         // imports the core entry points from the Advanced runtime by name.
         // Opened beside a Standard core it would make
@@ -284,7 +283,7 @@ impl FileRuntime {
             names: &[Self::LIBRARY_NAME],
             anchor: Self::ANCHOR,
             #[cfg(all(unix, not(target_vendor = "apple")))]
-            selected_core: Some(api.core.NDIlib_version as *const std::ffi::c_void),
+            selected_core: Some(runtime.gates.api().core.NDIlib_version as *const std::ffi::c_void),
             description: "NDI File library",
         }
         .open(|module| Self::describe(module, runtime))
