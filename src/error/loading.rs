@@ -39,6 +39,187 @@ pub enum LibraryKind {
     File,
 }
 
+/// A selection conflict, with the library identities needed to act on it.
+///
+/// The payload is boxed so adding diagnostic context does not enlarge
+/// [`crate::Error`] on capture and send paths. Use the accessors for decisions
+/// and [`Display`](fmt::Display) for diagnostic text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionFailure(Box<SelectionData>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelectionData {
+    #[cfg_attr(ndi_link_static, allow(dead_code))]
+    DifferentLibrary {
+        library: LibraryKind,
+        selected: PathBuf,
+        requested: PathBuf,
+    },
+    EditionNotMet {
+        selected: Option<PathBuf>,
+        requested: Option<PathBuf>,
+    },
+    #[cfg_attr(not(any(ndi_link_static, test)), allow(dead_code))]
+    LinkedImplementation {
+        library: LibraryKind,
+        requested: PathBuf,
+    },
+    ReentrantSelection {
+        library: LibraryKind,
+    },
+    #[cfg_attr(any(not(feature = "file-io"), ndi_link_static), allow(dead_code))]
+    FileNeedsAdvancedRuntime {
+        selected: Option<PathBuf>,
+        requested: Option<PathBuf>,
+    },
+    #[cfg_attr(ndi_link_static, allow(dead_code))]
+    ForeignRuntimeInScope {
+        library: LibraryKind,
+        selected: Option<PathBuf>,
+        requested: Option<PathBuf>,
+        foreign_module: PathBuf,
+        candidate: PathBuf,
+        origin: LoadOrigin,
+    },
+}
+
+impl SelectionFailure {
+    /// The typed cause of this conflict.
+    pub fn kind(&self) -> SelectionConflict {
+        match &*self.0 {
+            SelectionData::DifferentLibrary { .. } => SelectionConflict::DifferentLibrary,
+            SelectionData::EditionNotMet { .. } => SelectionConflict::EditionNotMet,
+            SelectionData::LinkedImplementation { .. } => SelectionConflict::LinkedImplementation,
+            SelectionData::ReentrantSelection { .. } => SelectionConflict::ReentrantSelection,
+            SelectionData::FileNeedsAdvancedRuntime { .. } => {
+                SelectionConflict::FileNeedsAdvancedRuntime
+            }
+            SelectionData::ForeignRuntimeInScope { .. } => SelectionConflict::ForeignRuntimeInScope,
+        }
+    }
+
+    /// The native library the failed selection sought.
+    pub fn library(&self) -> LibraryKind {
+        match &*self.0 {
+            SelectionData::DifferentLibrary { library, .. }
+            | SelectionData::LinkedImplementation { library, .. }
+            | SelectionData::ReentrantSelection { library }
+            | SelectionData::ForeignRuntimeInScope { library, .. } => *library,
+            SelectionData::EditionNotMet { .. } => LibraryKind::Runtime,
+            SelectionData::FileNeedsAdvancedRuntime { .. } => LibraryKind::File,
+        }
+    }
+
+    /// The already selected library, when its path is known.
+    ///
+    /// For a File conflict caused by the selected core runtime, this is that
+    /// core runtime's path, rather than a File library not yet selected.
+    pub fn selected(&self) -> Option<&Path> {
+        match &*self.0 {
+            SelectionData::DifferentLibrary { selected, .. } => Some(selected),
+            SelectionData::EditionNotMet { selected, .. }
+            | SelectionData::FileNeedsAdvancedRuntime { selected, .. }
+            | SelectionData::ForeignRuntimeInScope { selected, .. } => selected.as_deref(),
+            SelectionData::LinkedImplementation { .. }
+            | SelectionData::ReentrantSelection { .. } => None,
+        }
+    }
+
+    /// The explicit library path that conflicted, when the caller supplied one.
+    pub fn requested(&self) -> Option<&Path> {
+        match &*self.0 {
+            SelectionData::DifferentLibrary { requested, .. }
+            | SelectionData::LinkedImplementation { requested, .. } => Some(requested),
+            SelectionData::FileNeedsAdvancedRuntime { requested, .. }
+            | SelectionData::ForeignRuntimeInScope { requested, .. }
+            | SelectionData::EditionNotMet { requested, .. } => requested.as_deref(),
+            SelectionData::ReentrantSelection { .. } => None,
+        }
+    }
+
+    /// The foreign runtime already in the process's global symbol scope.
+    pub fn foreign_module(&self) -> Option<&Path> {
+        match &*self.0 {
+            SelectionData::ForeignRuntimeInScope { foreign_module, .. } => Some(foreign_module),
+            _ => None,
+        }
+    }
+
+    #[cfg(any(not(ndi_link_static), test))]
+    pub(crate) fn different_library(
+        library: LibraryKind,
+        selected: &Path,
+        requested: &Path,
+    ) -> Self {
+        Self(Box::new(SelectionData::DifferentLibrary {
+            library,
+            selected: selected.into(),
+            requested: requested.into(),
+        }))
+    }
+
+    pub(crate) fn edition_not_met(selected: Option<&Path>, requested: Option<&Path>) -> Self {
+        Self(Box::new(SelectionData::EditionNotMet {
+            selected: selected.map(Path::to_owned),
+            requested: requested.map(Path::to_owned),
+        }))
+    }
+
+    #[cfg(any(ndi_link_static, test))]
+    pub(crate) fn linked(library: LibraryKind, requested: &Path) -> Self {
+        Self(Box::new(SelectionData::LinkedImplementation {
+            library,
+            requested: requested.into(),
+        }))
+    }
+
+    pub(crate) fn reentrant(library: LibraryKind) -> Self {
+        Self(Box::new(SelectionData::ReentrantSelection { library }))
+    }
+
+    #[cfg(all(feature = "file-io", any(not(ndi_link_static), test)))]
+    pub(crate) fn file_needs_advanced(selected: Option<&Path>, requested: Option<&Path>) -> Self {
+        Self(Box::new(SelectionData::FileNeedsAdvancedRuntime {
+            selected: selected.map(Path::to_owned),
+            requested: requested.map(Path::to_owned),
+        }))
+    }
+
+    #[cfg(any(not(ndi_link_static), test))]
+    pub(crate) fn foreign(
+        library: LibraryKind,
+        selected: Option<&Path>,
+        requested: Option<&Path>,
+        foreign_module: &Path,
+        candidate: &Path,
+        origin: LoadOrigin,
+    ) -> Self {
+        Self(Box::new(SelectionData::ForeignRuntimeInScope {
+            library,
+            selected: selected.map(Path::to_owned),
+            requested: requested.map(Path::to_owned),
+            foreign_module: foreign_module.into(),
+            candidate: candidate.into(),
+            origin,
+        }))
+    }
+}
+
+impl fmt::Display for SelectionFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &*self.0 {
+            SelectionData::DifferentLibrary { selected, requested, .. } => write!(f, "{} is already selected; it cannot be switched to {}", selected.display(), requested.display()),
+            SelectionData::EditionNotMet { .. } => f.write_str("the selected NDI implementation is not an Advanced SDK"),
+            SelectionData::LinkedImplementation { library: LibraryKind::Runtime, requested } => write!(f, "the NDI SDK is linked into this program, so {} cannot be loaded instead", requested.display()),
+            SelectionData::LinkedImplementation { library: LibraryKind::File, .. } => f.write_str("a statically linked NDI File implementation cannot be replaced by a library"),
+            SelectionData::ReentrantSelection { .. } => f.write_str("native module loading re-entered NDI runtime selection"),
+            SelectionData::FileNeedsAdvancedRuntime { .. } => f.write_str("the NDI File library needs the Advanced SDK runtime, and the selected runtime is the Standard one"),
+            SelectionData::ForeignRuntimeInScope { candidate, origin, foreign_module, .. } => write!(f,
+                "{} ({origin}): the process's global symbol scope already holds another NDI runtime ({}); select that runtime or stop linking or preloading it", candidate.display(), foreign_module.display()),
+        }
+    }
+}
+
 /// Why a native library location was considered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -398,23 +579,96 @@ mod tests {
     }
 
     #[test]
-    fn every_conflict_kind_retains_its_diagnostic() {
-        for kind in [
-            SelectionConflict::DifferentLibrary,
-            SelectionConflict::EditionNotMet,
-            SelectionConflict::LinkedImplementation,
-            SelectionConflict::ReentrantSelection,
-            SelectionConflict::FileNeedsAdvancedRuntime,
-            SelectionConflict::ForeignRuntimeInScope,
-        ] {
-            let error = Error::RuntimeConflict {
-                kind,
-                detail: "selection context".into(),
-            };
+    fn every_conflict_kind_preserves_its_typed_paths_and_diagnostic() {
+        let selected = Path::new("selected/ndi.so");
+        let requested = Path::new("requested/ndi.so");
+        let foreign = Path::new("foreign/ndi.so");
+        for library in [LibraryKind::Runtime, LibraryKind::File] {
+            let failure = SelectionFailure::different_library(library, selected, requested);
+            assert_eq!(failure.kind(), SelectionConflict::DifferentLibrary);
+            assert_eq!(failure.library(), library);
+            assert_eq!(failure.selected(), Some(selected));
+            assert_eq!(failure.requested(), Some(requested));
+            assert_eq!(failure.foreign_module(), None);
             assert_eq!(
-                error.to_string(),
-                "Conflicting NDI runtime selection: selection context"
+                failure.to_string(),
+                "selected/ndi.so is already selected; it cannot be switched to requested/ndi.so"
             );
+
+            let failure = SelectionFailure::linked(library, requested);
+            assert_eq!(failure.kind(), SelectionConflict::LinkedImplementation);
+            assert_eq!(failure.library(), library);
+            assert_eq!(failure.selected(), None);
+            assert_eq!(failure.requested(), Some(requested));
+            assert_eq!(failure.foreign_module(), None);
+            assert_eq!(failure.to_string(), match library {
+                LibraryKind::Runtime => "the NDI SDK is linked into this program, so requested/ndi.so cannot be loaded instead",
+                LibraryKind::File => "a statically linked NDI File implementation cannot be replaced by a library",
+            });
+
+            let failure = SelectionFailure::reentrant(library);
+            assert_eq!(failure.kind(), SelectionConflict::ReentrantSelection);
+            assert_eq!(failure.library(), library);
+            assert_eq!(failure.selected(), None);
+            assert_eq!(failure.requested(), None);
+            assert_eq!(failure.foreign_module(), None);
+            assert_eq!(
+                failure.to_string(),
+                "native module loading re-entered NDI runtime selection"
+            );
+
+            for (explicit, origin) in [
+                (Some(requested), LoadOrigin::Explicit),
+                (None, LoadOrigin::Companion),
+            ] {
+                let failure = SelectionFailure::foreign(
+                    library,
+                    Some(selected),
+                    explicit,
+                    foreign,
+                    requested,
+                    origin,
+                );
+                assert_eq!(failure.kind(), SelectionConflict::ForeignRuntimeInScope);
+                assert_eq!(failure.library(), library);
+                assert_eq!(failure.selected(), Some(selected));
+                assert_eq!(failure.requested(), explicit);
+                assert_eq!(failure.foreign_module(), Some(foreign));
+                assert_eq!(
+                    failure.to_string(),
+                    format!(
+                        "requested/ndi.so ({origin}): {}",
+                        LoadRefusal::ForeignRuntimeInScope {
+                            module: foreign.into()
+                        }
+                    )
+                );
+                assert_eq!(
+                    Error::RuntimeConflict(failure.clone()).to_string(),
+                    format!("Conflicting NDI runtime selection: {failure}")
+                );
+            }
+        }
+        let failure = SelectionFailure::edition_not_met(Some(selected), Some(requested));
+        assert_eq!(failure.kind(), SelectionConflict::EditionNotMet);
+        assert_eq!(failure.library(), LibraryKind::Runtime);
+        assert_eq!(failure.selected(), Some(selected));
+        assert_eq!(failure.requested(), Some(requested));
+        assert_eq!(failure.foreign_module(), None);
+        assert_eq!(
+            failure.to_string(),
+            "the selected NDI implementation is not an Advanced SDK"
+        );
+
+        #[cfg(feature = "file-io")]
+        {
+            let failure = SelectionFailure::file_needs_advanced(Some(selected), Some(requested));
+            assert_eq!(failure.kind(), SelectionConflict::FileNeedsAdvancedRuntime);
+            assert_eq!(failure.library(), LibraryKind::File);
+            assert_eq!(failure.selected(), Some(selected));
+            assert_eq!(failure.requested(), Some(requested));
+            assert_eq!(failure.foreign_module(), None);
+            assert_eq!(failure.to_string(), "the NDI File library needs the Advanced SDK runtime, and the selected runtime is the Standard one");
         }
     }
 

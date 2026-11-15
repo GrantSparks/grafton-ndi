@@ -24,11 +24,10 @@ pub fn file_api() -> Option<(Ndi, super::api::file::FileApi)> {
             );
             None
         }
-        Err(Error::RuntimeConflict {
-            kind: SelectionConflict::FileNeedsAdvancedRuntime,
-            detail,
-        }) => {
-            skip(Requirement::File, &detail);
+        Err(Error::RuntimeConflict(failure))
+            if failure.kind() == SelectionConflict::FileNeedsAdvancedRuntime =>
+        {
+            skip(Requirement::File, &failure.to_string());
             None
         }
         Err(error) => panic!("the NDI File library could not be selected: {error}"),

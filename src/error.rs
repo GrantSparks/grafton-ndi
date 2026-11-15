@@ -3,6 +3,7 @@
 mod loading;
 pub use loading::{
     LibraryKind, LoadAttempt, LoadFailure, LoadOrigin, LoadRefusal, SelectionConflict,
+    SelectionFailure,
 };
 
 use thiserror::Error;
@@ -93,8 +94,8 @@ pub enum Error {
     /// Runtime or File library selection conflicts with the process's native
     /// libraries or a selection already in progress.
     ///
-    /// `kind` identifies the [`SelectionConflict`] without parsing `detail`;
-    /// the latter preserves the diagnostic text.
+    /// [`SelectionFailure`] identifies the [`SelectionConflict`], library and
+    /// selected, requested or foreign module paths without parsing text.
     ///
     /// * The runtime options name a library file other than the selected one,
     ///   ask for the Advanced SDK when the selected runtime is not one, or
@@ -107,13 +108,8 @@ pub enum Error {
     ///   macOS and Android it needs the Advanced SDK runtime, and it is
     ///   refused while the process's global symbol scope holds an NDI runtime
     ///   other than the selected one, which it would bind to.
-    #[error("Conflicting NDI runtime selection: {detail}")]
-    RuntimeConflict {
-        /// The typed cause of the conflict.
-        kind: SelectionConflict,
-        /// Diagnostic context, retained for display and logging.
-        detail: String,
-    },
+    #[error("Conflicting NDI runtime selection: {0}")]
+    RuntimeConflict(SelectionFailure),
 
     /// The native SDK did not perform an operation.
     ///

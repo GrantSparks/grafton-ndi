@@ -5,7 +5,7 @@ use std::{
     thread::{self, ThreadId},
 };
 
-use crate::{Error, Result, SelectionConflict};
+use crate::{Error, LibraryKind, Result, SelectionFailure};
 
 /// A value selected once for the process: a failed load can be retried, a
 /// successful one is permanent.
@@ -14,14 +14,16 @@ use crate::{Error, Result, SelectionConflict};
 /// loading (a native library's constructors) cannot deadlock against it, and a
 /// load that panics leaves the selection retryable.
 pub(crate) struct Selection<T> {
+    library: LibraryKind,
     value: OnceLock<T>,
     loading: Mutex<Option<ThreadId>>,
     changed: Condvar,
 }
 
 impl<T> Selection<T> {
-    pub(crate) const fn new() -> Self {
+    pub(crate) const fn new(library: LibraryKind) -> Self {
         Self {
+            library,
             value: OnceLock::new(),
             loading: Mutex::new(None),
             changed: Condvar::new(),
@@ -47,10 +49,9 @@ impl<T> Selection<T> {
             match *loading {
                 None => break,
                 Some(owner) if owner == current => {
-                    return Err(Error::RuntimeConflict {
-                        kind: SelectionConflict::ReentrantSelection,
-                        detail: "native module loading re-entered NDI runtime selection".into(),
-                    });
+                    return Err(Error::RuntimeConflict(SelectionFailure::reentrant(
+                        self.library,
+                    )));
                 }
                 Some(_) => {
                     loading = self
@@ -96,7 +97,7 @@ mod tests {
 
     #[test]
     fn a_failed_load_is_retryable_and_a_successful_one_is_permanent() {
-        let selection = Selection::new();
+        let selection = Selection::new(LibraryKind::Runtime);
         assert!(matches!(
             selection.get_or_try_load(|| Err::<u32, _>(Error::InvalidInput("missing".into()))),
             Err(Error::InvalidInput(_))
@@ -107,7 +108,7 @@ mod tests {
 
     #[test]
     fn a_panicking_load_does_not_block_later_selection() {
-        let selection = Selection::new();
+        let selection = Selection::new(LibraryKind::Runtime);
         let unwound = catch_unwind(AssertUnwindSafe(|| {
             let _ = selection.get_or_try_load(|| -> Result<u32> { panic!("loader panicked") });
         }));
@@ -123,14 +124,11 @@ mod tests {
 
     #[test]
     fn re_entrant_loading_is_reported_instead_of_deadlocking() {
-        let selection = Selection::new();
+        let selection = Selection::new(LibraryKind::Runtime);
         let outer = selection.get_or_try_load(|| {
             assert!(matches!(
                 selection.get_or_try_load(|| Ok(1)),
-                Err(Error::RuntimeConflict {
-                    kind: SelectionConflict::ReentrantSelection,
-                    ..
-                })
+                Err(Error::RuntimeConflict(failure)) if failure.kind() == crate::SelectionConflict::ReentrantSelection && failure.library() == LibraryKind::Runtime
             ));
             Ok(2)
         });
@@ -140,7 +138,7 @@ mod tests {
     #[test]
     fn concurrent_callers_share_one_successful_load() {
         const CALLERS: usize = 16;
-        let selection = Selection::new();
+        let selection = Selection::new(LibraryKind::Runtime);
         let loads = AtomicUsize::new(0);
         let start = Barrier::new(CALLERS);
         thread::scope(|scope| {

@@ -455,10 +455,15 @@ fn child(name: &str, fixtures: &Fixtures) {
                 Runtime::select(&options).unwrap_err(),
             ] {
                 match error {
-                    Error::RuntimeConflict { kind, detail } => {
-                        assert_eq!(kind, SelectionConflict::ForeignRuntimeInScope);
-                        assert!(detail.contains(complete.to_str().unwrap()));
-                        assert!(detail.contains(fixtures.preloaded().to_str().unwrap()));
+                    Error::RuntimeConflict(failure) => {
+                        assert_eq!(failure.kind(), SelectionConflict::ForeignRuntimeInScope);
+                        assert_eq!(failure.library(), LibraryKind::Runtime);
+                        assert_eq!(failure.requested(), Some(complete.as_path()));
+                        assert_eq!(
+                            failure.foreign_module(),
+                            Some(fixtures.preloaded().as_path())
+                        );
+                        assert_eq!(failure.selected(), None);
                     }
                     other => panic!("expected a global-scope conflict, got {other}"),
                 }
@@ -581,20 +586,26 @@ fn child(name: &str, fixtures: &Fixtures) {
         }
         "conflict" => {
             let ndi = Ndi::with_options(&options).unwrap();
-            assert!(matches!(
-                Ndi::with_options(&explicit(fixtures.missing())),
-                Err(Error::RuntimeConflict {
-                    kind: SelectionConflict::DifferentLibrary,
-                    ..
-                })
-            ));
-            assert!(matches!(
-                Ndi::with_options(&RuntimeOptions::default().edition(SdkEdition::Advanced)),
-                Err(Error::RuntimeConflict {
-                    kind: SelectionConflict::EditionNotMet,
-                    ..
-                })
-            ));
+            let Error::RuntimeConflict(failure) =
+                Ndi::with_options(&explicit(fixtures.missing())).unwrap_err()
+            else {
+                panic!("expected path conflict")
+            };
+            assert_eq!(failure.kind(), SelectionConflict::DifferentLibrary);
+            assert_eq!(failure.library(), LibraryKind::Runtime);
+            assert_eq!(failure.selected(), Some(complete.as_path()));
+            assert_eq!(failure.requested(), Some(fixtures.missing().as_path()));
+            assert_eq!(failure.foreign_module(), None);
+            let Error::RuntimeConflict(failure) =
+                Ndi::with_options(&RuntimeOptions::default().edition(SdkEdition::Advanced))
+                    .unwrap_err()
+            else {
+                panic!("expected edition conflict")
+            };
+            assert_eq!(failure.kind(), SelectionConflict::EditionNotMet);
+            assert_eq!(failure.selected(), Some(complete.as_path()));
+            assert_eq!(failure.requested(), None);
+            assert_eq!(failure.foreign_module(), None);
             // The selected module satisfies a request that names no other one.
             drop(Ndi::with_options(&standard()).unwrap());
             drop(ndi);

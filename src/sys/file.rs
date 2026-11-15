@@ -28,7 +28,7 @@ use crate::LoadFailure;
 use crate::{
     capabilities::{CapabilityRefusal, CapabilityStatus, RuntimeInfo},
     file::FileFamily,
-    Error, LibraryKind, LoadRefusal, Result, SelectionConflict,
+    Error, LibraryKind, LoadRefusal, Result, SelectionFailure,
 };
 
 /// A family's table as one library resolved it, or the first of its entry
@@ -181,7 +181,7 @@ pub(crate) struct FileRuntime {
     path: std::path::PathBuf,
 }
 
-static SELECTED: Selection<FileRuntime> = Selection::new();
+static SELECTED: Selection<FileRuntime> = Selection::new(LibraryKind::File);
 
 /// Select the File library that accompanies the selected core runtime, or
 /// confirm that the one already pinned satisfies a request for `library_path`.
@@ -272,13 +272,9 @@ impl FileRuntime {
         // process, so it is refused before anything is opened. The Windows
         // File library carries its own implementation and imports none.
         if cfg!(unix) && core.edition() != crate::capabilities::SdkEdition::Advanced {
-            return Err(Error::RuntimeConflict {
-                kind: SelectionConflict::FileNeedsAdvancedRuntime,
-                detail:
-                    "the NDI File library needs the Advanced SDK runtime, and the selected runtime \
-                 is the Standard one"
-                        .into(),
-            });
+            return Err(Error::RuntimeConflict(
+                SelectionFailure::file_needs_advanced(core.library_path(), explicit),
+            ));
         }
         Search {
             kind: LibraryKind::File,
@@ -315,7 +311,7 @@ impl FileRuntime {
     }
 
     fn accepts(&self, requested: Option<&Path>) -> Result<()> {
-        confirm_selected(&self.path, requested)
+        confirm_selected(LibraryKind::File, &self.path, requested)
     }
 }
 
@@ -343,13 +339,11 @@ impl FileRuntime {
     }
 
     fn reject_path(requested: Option<&Path>) -> Result<()> {
-        if requested.is_some() {
-            return Err(Error::RuntimeConflict {
-                kind: SelectionConflict::LinkedImplementation,
-                detail:
-                    "a statically linked NDI File implementation cannot be replaced by a library"
-                        .into(),
-            });
+        if let Some(requested) = requested {
+            return Err(Error::RuntimeConflict(SelectionFailure::linked(
+                LibraryKind::File,
+                requested,
+            )));
         }
         Ok(())
     }

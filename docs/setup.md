@@ -97,7 +97,9 @@ it does not establish license entitlement.
 
 Cargo features expose Rust APIs; `ndi.capabilities()` reports optional native
 operations. Use `ndi.require_feature(RuntimeFeature::ReceiveDelay)?` to require
-one. `UnsupportedCapability` identifies its feature and a typed `CapabilityRefusal`, including the missing symbol or required version. Its `reason()` gives the refusal category; see
+one. `UnsupportedCapability` identifies its feature and a typed
+`CapabilityRefusal`, including the missing symbol or required version. Its
+`reason()` gives the refusal category; see
 [`CapabilityUnavailable`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/capabilities/enum.CapabilityUnavailable.html).
 Availability does not establish hardware support or license entitlement.
 
@@ -110,9 +112,10 @@ and `supports`; operations refuse a missing family with `FileFamilyUnavailable`.
 Selection failures are structured. `RuntimeLoadFailed(failure)` exposes each
 attempt's location, `LoadOrigin`, and `LoadRefusal`; `failure.loaded_any()`
 distinguishes libraries that could not be opened from ones loaded and refused.
-`RuntimeConflict { kind, detail }` carries a `SelectionConflict` for a selected
-library mismatch, edition mismatch, linked implementation or other conflict.
-Use these fields for decisions and `Display` for diagnostics.
+`RuntimeConflict(failure)` exposes `kind()` (`SelectionConflict`), `library()`,
+`selected()`, `requested()` and `foreign_module()` for a library mismatch,
+edition mismatch, linked implementation or other conflict. Use these typed
+fields for decisions and `Display` for diagnostics.
 
 ## Deploy an application
 

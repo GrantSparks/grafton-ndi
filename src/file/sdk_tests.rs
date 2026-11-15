@@ -926,10 +926,7 @@ fn the_file_library_stays_selected_after_its_handles_are_dropped() {
                 &ndi,
                 &FileRuntimeOptions::default().library_path(selected.with_file_name("other"))
             ),
-            Err(Error::RuntimeConflict {
-                kind: crate::SelectionConflict::DifferentLibrary,
-                ..
-            })
+            Err(Error::RuntimeConflict(failure)) if failure.kind() == crate::SelectionConflict::DifferentLibrary
         ));
         FileApi::open(&ndi, &FileRuntimeOptions::default().library_path(selected)).unwrap();
     }

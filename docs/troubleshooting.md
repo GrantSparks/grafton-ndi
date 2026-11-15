@@ -20,8 +20,9 @@ For `RuntimeLoadFailed`, inspect the attempted paths and errors, then check the
 `RuntimeOptions::library_path` selects one file without fallback. Verify its
 architecture and dependencies as well as its name.
 
-For `RuntimeConflict`, inspect the selected path and edition. A successful
-selection lasts for the process, so configure it before another component
+For `RuntimeConflict(failure)`, inspect `failure.kind()`, `selected()`,
+`requested()` and `foreign_module()` alongside the selected runtime edition.
+A successful selection lasts for the process, so configure it before another component
 initializes NDI. Restart after changing the selected library.
 
 `SelectionConflict::ForeignRuntimeInScope` or

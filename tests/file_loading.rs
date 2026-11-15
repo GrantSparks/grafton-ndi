@@ -249,7 +249,10 @@ fn unavailable(result: Result<FileApi, Error>) -> LoadFailure {
 /// Why the File library cannot accompany the selected runtime.
 fn conflicting(result: Result<FileApi, Error>) -> SelectionConflict {
     match result {
-        Err(Error::RuntimeConflict { kind, .. }) => kind,
+        Err(Error::RuntimeConflict(failure)) => {
+            assert_eq!(failure.library(), LibraryKind::File);
+            failure.kind()
+        }
         Err(other) => panic!("expected the selected runtime to be refused, got {other}"),
         Ok(api) => panic!("expected the selected runtime to be refused, but loaded {api:?}"),
     }
@@ -290,13 +293,19 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert_eq!(bound_runtime(&api), PAIRED.build);
 
             // A different library cannot replace the selected one.
-            assert!(matches!(
-                FileApi::open(&ndi, &explicit(fixtures.file(OTHER.directory))),
-                Err(Error::RuntimeConflict {
-                    kind: SelectionConflict::DifferentLibrary,
-                    ..
-                })
-            ));
+            let Err(Error::RuntimeConflict(failure)) =
+                FileApi::open(&ndi, &explicit(fixtures.file(OTHER.directory)))
+            else {
+                panic!("expected path conflict")
+            };
+            assert_eq!(failure.kind(), SelectionConflict::DifferentLibrary);
+            assert_eq!(failure.library(), LibraryKind::File);
+            assert_eq!(failure.selected(), Some(selected.as_path()));
+            assert_eq!(
+                failure.requested(),
+                Some(fixtures.file(OTHER.directory).as_path())
+            );
+            assert_eq!(failure.foreign_module(), None);
             assert!(matches!(
                 FileApi::open(&ndi, &explicit(PathBuf::from(FILE_LIBRARY))),
                 Err(Error::InvalidInput(_))
@@ -376,23 +385,36 @@ fn child(name: &str, fixtures: &Fixtures) {
                 .unwrap()
                 .into_raw();
             }
-            let reason = conflicting(FileApi::open(&ndi, &defaults));
-            assert_eq!(reason, SelectionConflict::ForeignRuntimeInScope);
-            assert!(!is_loaded(FILE_LIBRARY));
-            let reason = conflicting(FileApi::open(
-                &ndi,
-                &explicit(fixtures.file(PAIRED.directory)),
-            ));
-            assert_eq!(reason, SelectionConflict::ForeignRuntimeInScope);
-            assert!(!is_loaded(FILE_LIBRARY));
+            let requested = fixtures.file(PAIRED.directory);
+            for explicit_path in [None, Some(requested.as_path())] {
+                let options = explicit_path.map_or_else(FileRuntimeOptions::default, |path| {
+                    FileRuntimeOptions::default().library_path(path)
+                });
+                let Err(Error::RuntimeConflict(failure)) = FileApi::open(&ndi, &options) else {
+                    panic!("expected a foreign runtime conflict before opening the File library");
+                };
+                assert_eq!(failure.kind(), SelectionConflict::ForeignRuntimeInScope);
+                assert_eq!(failure.library(), LibraryKind::File);
+                assert_eq!(failure.selected(), ndi.info().library_path());
+                assert_eq!(failure.requested(), explicit_path);
+                assert_eq!(
+                    failure.foreign_module(),
+                    Some(fixtures.core(&UNNAMED).as_path())
+                );
+                assert!(!is_loaded(FILE_LIBRARY));
+            }
         }
         "a_preloaded_foreign_runtime_is_refused_during_core_selection" => {
             let selected = fixtures.core(&PAIRED);
             match Ndi::with_options(&RuntimeOptions::new().library_path(&selected)) {
-                Err(Error::RuntimeConflict { kind, detail }) => {
-                    assert_eq!(kind, SelectionConflict::ForeignRuntimeInScope);
-                    assert!(detail.contains(selected.to_str().unwrap()));
-                    assert!(detail.contains(fixtures.core(&UNNAMED).to_str().unwrap()));
+                Err(Error::RuntimeConflict(failure)) => {
+                    assert_eq!(failure.kind(), SelectionConflict::ForeignRuntimeInScope);
+                    assert_eq!(failure.library(), LibraryKind::Runtime);
+                    assert_eq!(failure.requested(), Some(selected.as_path()));
+                    assert_eq!(
+                        failure.foreign_module(),
+                        Some(fixtures.core(&UNNAMED).as_path())
+                    );
                 }
                 other => panic!("expected core selection to refuse the preload: {other:?}"),
             }
