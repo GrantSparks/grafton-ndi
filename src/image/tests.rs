@@ -2461,11 +2461,8 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                 let plan = Plan::new(&source, &options).unwrap();
                 let mut pixels = plan.pixels::<u8>();
                 let (width, height) = (pixels.width() as u16, pixels.height() as u16);
-                let rows = jpeg::Rows {
-                    pixels: std::cell::RefCell::new(&mut pixels),
-                    width,
-                    height,
-                };
+                let mut cache = vec![0; plan.shape.row_bytes];
+                let rows = jpeg::Rows::new(&mut pixels, width, height, &mut cache);
                 let mut buffers = std::array::from_fn(|_| Vec::with_capacity(reduced.0));
                 let (_, allocations) = allocation_count(|| {
                     for y in (0..height).chain([height - 1]) {

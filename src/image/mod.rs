@@ -62,7 +62,7 @@ impl<'a> Source<'a> {
 
 /// Reusable conversion storage for still-image encoding.
 ///
-/// Keeps one PNG row, WebP's complete converted image, and downscale sums
+/// Keeps one PNG row or JPEG final row, WebP's complete converted image, and downscale sums
 /// at each sample depth. Capacity grows to the largest encode and remains
 /// retained until [`release`](Self::release) or drop. Each concurrent worker
 /// needs its own workspace. Codec state and encoded output are not retained;
@@ -202,7 +202,15 @@ fn write_image(plan: Plan<'_>, out: &mut dyn Write, workspace: &mut ImageWorkspa
             width,
             height,
         } => plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
-            jpeg::encode(pixels, quality, width, height, &mut out)
+            jpeg::encode(
+                pixels,
+                quality,
+                width,
+                height,
+                plan.shape.row_bytes,
+                &mut workspace.row,
+                &mut out,
+            )
         }),
         Codec::WebpLossless { shape } => plan
             .with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {

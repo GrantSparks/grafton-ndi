@@ -160,10 +160,10 @@ impl ImageFormat {
 ///
 /// # Memory
 ///
-/// PNG and JPEG convert at most one output row at a time, so their
-/// conversion scratch does not grow with the frame's height: none for a PNG
-/// of an RGBA frame, whose rows the codec reads in place, or for a JPEG,
-/// whose pixels convert straight into the codec's rows; one row otherwise.
+/// PNG and JPEG convert one output row at a time, so conversion scratch
+/// does not grow with frame height. PNG borrows eligible RGBA rows or
+/// retains one row; JPEG converts into the codec's rows and retains its
+/// final component row to avoid converting padding requests again.
 /// WebP encodes from one buffer, so it holds the whole converted
 /// image, unless full-size contiguous RGBA can be borrowed with alpha kept.
 /// Lossless WebP uses three channels with alpha discarded; lossy WebP

@@ -8,7 +8,9 @@ and color/HDR handling.
 
 ## Whole-image buffering and concurrency
 
-PNG and JPEG convert rows incrementally. WebP borrows eligible contiguous RGBA
+PNG and JPEG convert rows incrementally. JPEG retains its final converted
+component row (three bytes per output pixel) for repeated padding requests.
+WebP borrows eligible contiguous RGBA
 input or constructs a complete converted image. Lossless WebP uses three bytes
 per output pixel with alpha discarded, otherwise four; lossy WebP always takes
 four, with opaque alpha when discarded. Both WebP formats also buffer the complete
@@ -16,7 +18,8 @@ encoded result before `encode_image_to` writes it. These are conversion/output
 costs; codec state, source frames, reduction scratch and consumer buffers add to
 memory use.
 
-`ImageWorkspace` reuses wrapper conversion capacity across frames, with
+`ImageWorkspace` reuses wrapper conversion capacity, including the PNG/JPEG row,
+across frames, with
 `retained_bytes()` for accounting and `release()` to discard it. Warm reuse
 removes scratch allocation churn; the full WebP image still occupies memory.
 Each concurrent worker needs its own workspace. Codec/output allocations
