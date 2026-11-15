@@ -962,7 +962,9 @@ impl<M: ReceiverMode + std::panic::UnwindSafe> std::panic::UnwindSafe for Receiv
 /// Replaced as one value under the capture guard, so neither half can be stale.
 struct ConnectionTarget {
     source: Source,
-    raw: RawSource,
+    // Keep both the descriptor and its strings at stable addresses until a
+    // replacement request returns, or the native receiver is destroyed.
+    raw: Box<RawSource>,
 }
 
 /// A receiver's opaque native identity; ownership stays with `ReceiverCore`.
@@ -1102,7 +1104,7 @@ impl Receiver {
                 _ndi: ndi.clone(),
                 capture_guard: RwLock::new(ConnectionTarget {
                     source: options.source.clone(),
-                    raw: raw._source,
+                    raw: Box::new(raw._source),
                 }),
                 pending_status: AtomicBool::new(false),
                 pending_source: AtomicBool::new(false),
@@ -1358,7 +1360,7 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn connect_to(&self, source: &Source) -> Result<()> {
         let next = ConnectionTarget {
             source: source.clone(),
-            raw: source.to_raw()?,
+            raw: Box::new(source.to_raw()?),
         };
         let mut target = self.core.capture_guard.write();
         self.core.connect_raw(Some(&next.raw), &target);
@@ -1736,9 +1738,10 @@ impl ReceiverCore {
     ) {
         let source = source.map_or(ptr::null(), |raw| ptr::from_ref(raw.as_raw()));
         // SAFETY: the receiver instance is live for this borrow. `source` is
-        // null or points into a `RawSource`, which owns the strings its
-        // descriptor points to and outlives this synchronous call, during
-        // which the SDK copies the descriptor.
+        // null or points into a boxed `RawSource`, which owns the strings its
+        // descriptor points to. The caller retains that same box in the
+        // receiver's target until a replacement request returns, or the native
+        // receiver is destroyed; no assumption about an SDK copy is needed.
         unsafe { self.sdk().NDIlib_recv_connect(self.instance.0, source) };
     }
 
