@@ -13,7 +13,7 @@ use std::{
 };
 
 use crate::{
-    finder::Source,
+    finder::{RawSource, Source},
     frames::{AudioPartsExt, MetadataPartsExt},
     frames::{
         AudioSource, FrameMetadataRef, MetadataFrame, MetadataSource, MetadataText, PixelFormat,
@@ -137,10 +137,17 @@ mod ownership {
         pub(super) instance: SendInstance,
         pub(super) _name: CString,
         pub(super) _groups: Option<CString>,
+        // A registration may keep this native sender alive after Sender drops.
+        pub(super) failover: parking_lot::Mutex<Option<Box<RawSource>>>,
         #[cfg(feature = "advanced")]
         pub(super) _config: Option<crate::advanced::AdvancedConfig>,
         pub(super) _ndi: Ndi,
     }
+
+    // No application code runs under the failover lock. A replacement keeps
+    // both descriptors alive through the native call, then commits one swap;
+    // unwinding cannot leave a dangling native source descriptor.
+    impl std::panic::RefUnwindSafe for SenderResource {}
 
     impl SenderResource {
         /// The native sender this token keeps alive.
@@ -174,6 +181,8 @@ mod ownership {
     pub trait NativeOwner: Send + Sync + fmt::Debug {
         /// Own a native sender that was just created.
         fn new(resource: SenderResource) -> Self;
+        /// The resource shared by this sender's common operations.
+        fn resource(&self) -> &SenderResource;
     }
 
     /// The native sender of a [`RawSend`] sender, which advertiser registrations
@@ -184,6 +193,10 @@ mod ownership {
     }
 
     impl NativeOwner for Shared {
+        fn resource(&self) -> &SenderResource {
+            &self.owner
+        }
+
         fn new(resource: SenderResource) -> Self {
             let owner = Arc::new(resource);
             Self {
@@ -212,6 +225,10 @@ mod ownership {
 
     #[cfg(feature = "advanced")]
     impl NativeOwner for Exclusive {
+        fn resource(&self) -> &SenderResource {
+            &self.0
+        }
+
         fn new(resource: SenderResource) -> Self {
             Self(resource)
         }
@@ -1568,6 +1585,7 @@ impl<M: SenderMode> Sender<M> {
                 instance,
                 _name: name,
                 _groups: groups,
+                failover: parking_lot::Mutex::new(None),
                 #[cfg(feature = "advanced")]
                 _config: config,
                 _ndi: ndi.clone(),
@@ -2157,26 +2175,32 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// Returns an error if source conversion fails.
     pub fn set_failover(&self, source: &Source) -> Result<()> {
-        let raw_source = source.to_raw()?;
-        // SAFETY: the sender instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
+        let raw_source = Box::new(source.to_raw()?);
+        let mut failover = self.native.resource().failover.lock();
+        // SAFETY: the native owner retains this boxed descriptor and its
+        // strings until a later replacement has returned, or native destruction.
+        // The lock keeps concurrent failover calls from releasing each other's
+        // descriptors while the SDK may still read them.
         unsafe {
             self.inner
                 .core
                 .NDIlib_send_set_failover(self.inner.instance.0, raw_source.as_raw())
         }
+        *failover = Some(raw_source);
         Ok(())
     }
 
     /// Clear the failover source previously configured with [`Self::set_failover`].
     pub fn clear_failover(&self) {
-        // SAFETY: the sender instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
+        let mut failover = self.native.resource().failover.lock();
+        // SAFETY: the sender is live, and the previous descriptor stays owned
+        // until this null replacement has returned from the SDK.
         unsafe {
             self.inner
                 .core
                 .NDIlib_send_set_failover(self.inner.instance.0, ptr::null())
         }
+        *failover = None;
     }
 
     /// Get the source information for this sender.
