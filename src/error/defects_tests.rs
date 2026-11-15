@@ -118,9 +118,9 @@ fn frame_defect_diagnostics_preserve_their_text() {
         ("ScatterSize", FrameDefect::ScatterSize, "Scatter frame exceeds the packet size limit"),
         ("ScatterHeader", FrameDefect::ScatterHeader, "The first scatter block must hold the frame's complete header"),
         ("UnknownCompressedAudio", FrameDefect::UnknownCompressedAudio, "Unknown compressed audio FourCC"),
-        ("VideoWidth", FrameDefect::VideoWidth(-3), "Video frame has invalid width: -3"),
-        ("VideoOddWidth", FrameDefect::VideoOddWidth(-3), "NDI video frames require even width, got -3"),
-        ("VideoHeight", FrameDefect::VideoHeight(-3), "Video frame has invalid height: -3"),
+        ("VideoWidth", FrameDefect::VideoWidth((-3).into()), "Video frame has invalid width: -3"),
+        ("VideoOddWidth", FrameDefect::VideoOddWidth((-3).into()), "NDI video frames require even width, got -3"),
+        ("VideoHeight", FrameDefect::VideoHeight((-3).into()), "Video frame has invalid height: -3"),
         ("VideoSdkStride", FrameDefect::VideoSdkStride(-3), "Uncompressed video frame has invalid line_stride_in_bytes: -3"),
         ("VideoShortStride", FrameDefect::VideoShortStride { detail: CompactDiagnostic::new(VideoStrideDefect { stride: 7, minimum: 12, format: PixelFormat::Bgra, width: 8 }) }, "Video line_stride_in_bytes 7 is smaller than minimum row size 12 for Bgra width 8"),
         ("VideoStrideOverflow", FrameDefect::VideoStrideOverflow { format: PixelFormat::Bgra, width: 8 }, "Video line stride overflow for Bgra width 8"),
@@ -129,9 +129,9 @@ fn frame_defect_diagnostics_preserve_their_text() {
         ("VideoSemiPlanar420", FrameDefect::VideoSemiPlanar420(7), "Semi-planar 4:2:0 (NV12) video frames require even height, got 7"),
         ("VideoUyvaStride", FrameDefect::VideoUyvaStride(7), "UYVA video frames require even line stride, got 7"),
         ("PictureAspectRatio", FrameDefect::PictureAspectRatio(-1.5), "Video frame has invalid picture aspect ratio: -1.5"),
-        ("AudioRate", FrameDefect::AudioRate(-3), "Invalid sample rate: -3"),
-        ("AudioCount", FrameDefect::AudioCount { value: -3, kind: AudioCountKind::Channels }, "Invalid number of channels: -3"),
-        ("AudioStride", FrameDefect::AudioStride(-3), "Invalid channel_stride_in_bytes: -3"),
+        ("AudioRate", FrameDefect::AudioRate((-3).into()), "Invalid sample rate: -3"),
+        ("AudioCount", FrameDefect::AudioCount { value: (-3).into(), kind: AudioCountKind::Channels }, "Invalid number of channels: -3"),
+        ("AudioStride", FrameDefect::AudioStride((-3).into()), "Invalid channel_stride_in_bytes: -3"),
         ("AudioStrideAlignment", FrameDefect::AudioStrideAlignment(7), "channel_stride_in_bytes must be a multiple of 4, got 7"),
         ("AudioShortStride", FrameDefect::AudioShortStride { stride: 7, minimum: 12 }, "channel_stride_in_bytes 7 is smaller than one channel of audio samples 12"),
         ("AudioStrideOverflow", FrameDefect::AudioStrideOverflow(7), "Audio channel stride overflow: 7 samples × 4 bytes"),
@@ -214,9 +214,9 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("QueuedSenderRegistered", InputDefect::QueuedSenderRegistered, "queued conversion requires a sender without advertiser registrations"),
         ("CompletionStorage", InputDefect::CompletionStorage, "unable to allocate bounded completion storage"),
         ("AvSyncStorageLimit", InputDefect::AvSyncStorageLimit, "AVSync request exceeds the supported audio storage limit"),
-        ("VideoWidth", InputDefect::VideoWidth(-3), "Video frame has invalid width: -3"),
-        ("VideoOddWidth", InputDefect::VideoOddWidth(-3), "NDI video frames require even width, got -3"),
-        ("VideoHeight", InputDefect::VideoHeight(-3), "Video frame has invalid height: -3"),
+        ("VideoWidth", InputDefect::VideoWidth((-3).into()), "Video frame has invalid width: -3"),
+        ("VideoOddWidth", InputDefect::VideoOddWidth((-3).into()), "NDI video frames require even width, got -3"),
+        ("VideoHeight", InputDefect::VideoHeight((-3).into()), "Video frame has invalid height: -3"),
         ("VideoSdkStride", InputDefect::VideoSdkStride(-3), "Uncompressed video frame has invalid line_stride_in_bytes: -3"),
         ("VideoShortStride", InputDefect::VideoShortStride { detail: CompactDiagnostic::new(VideoStrideDefect { stride: 7, minimum: 12, format: PixelFormat::Bgra, width: 8 }) }, "Video line_stride_in_bytes 7 is smaller than minimum row size 12 for Bgra width 8"),
         ("VideoStrideOverflow", InputDefect::VideoStrideOverflow { format: PixelFormat::Bgra, width: 8 }, "Video line stride overflow for Bgra width 8"),
@@ -225,9 +225,9 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("VideoSemiPlanar420", InputDefect::VideoSemiPlanar420(7), "Semi-planar 4:2:0 (NV12) video frames require even height, got 7"),
         ("VideoUyvaStride", InputDefect::VideoUyvaStride(7), "UYVA video frames require even line stride, got 7"),
         ("PictureAspectRatio", InputDefect::PictureAspectRatio(-1.5), "Video frame has invalid picture aspect ratio: -1.5"),
-        ("AudioRate", InputDefect::AudioRate(-3), "Invalid sample rate: -3"),
-        ("AudioCount", InputDefect::AudioCount { value: -3, kind: AudioCountKind::Channels }, "Invalid number of channels: -3"),
-        ("AudioStride", InputDefect::AudioStride(-3), "Invalid channel_stride_in_bytes: -3"),
+        ("AudioRate", InputDefect::AudioRate((-3).into()), "Invalid sample rate: -3"),
+        ("AudioCount", InputDefect::AudioCount { value: (-3).into(), kind: AudioCountKind::Channels }, "Invalid number of channels: -3"),
+        ("AudioStride", InputDefect::AudioStride((-3).into()), "Invalid channel_stride_in_bytes: -3"),
         ("AudioStrideAlignment", InputDefect::AudioStrideAlignment(7), "channel_stride_in_bytes must be a multiple of 4, got 7"),
         ("AudioShortStride", InputDefect::AudioShortStride { stride: 7, minimum: 12 }, "channel_stride_in_bytes 7 is smaller than one channel of audio samples 12"),
         ("AudioStrideOverflow", InputDefect::AudioStrideOverflow(7), "Audio channel stride overflow: 7 samples × 4 bytes"),
@@ -236,9 +236,9 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("AudioByteSize", InputDefect::AudioByteSize(7), "Audio byte size overflow: 7 samples × 4 bytes"),
         ("AudioBytes", InputDefect::AudioBytes(7), "Audio frame exceeds maximum size: 7 bytes > 67108864 bytes"),
         ("VideoStrideRange", InputDefect::VideoStrideRange { stride: 7 }, "Video line stride 7 exceeds i32 range"),
-        ("TimeoutTooLong", InputDefect::TimeoutTooLong { requested: Duration::from_millis(4_294_967_295) }, "timeout 4294967.295s exceeds MAX_TIMEOUT (4294967294 ms, about 49.7 days)"),
-        ("TimeoutInstantOverflow", InputDefect::TimeoutInstantOverflow { requested: Duration::from_millis(4_294_967_295) }, "timeout 4294967.295s ends at an instant this platform cannot represent"),
-        ("ReceiveDelayTooLong", InputDefect::ReceiveDelayTooLong { requested: Duration::from_millis(4_294_967_295) }, "receive delay 4294967.295s exceeds 2000 ms"),
+        ("TimeoutTooLong", InputDefect::TimeoutTooLong { requested: Duration::from_millis(4_294_967_295).into() }, "timeout 4294967.295s exceeds MAX_TIMEOUT (4294967294 ms, about 49.7 days)"),
+        ("TimeoutInstantOverflow", InputDefect::TimeoutInstantOverflow { requested: Duration::from_millis(4_294_967_295).into() }, "timeout 4294967.295s ends at an instant this platform cannot represent"),
+        ("ReceiveDelayTooLong", InputDefect::ReceiveDelayTooLong { requested: Duration::from_millis(4_294_967_295).into() }, "receive delay 4294967.295s exceeds 2000 ms"),
         ("PtzValue", InputDefect::PtzValue { detail: CompactDiagnostic::new(PtzDefect { name: "quantity", minimum: 0.0, maximum: 1.0 }) }, "quantity must be finite and within 0..=1"),
         ("AlreadyRegistered", InputDefect::AlreadyRegistered { member: "receiver" }, "receiver is already registered"),
         ("Empty", InputDefect::Empty { what: "file path" }, "file path must not be empty"),
@@ -383,4 +383,37 @@ fn audio_count_kind_diagnostics_preserve_their_text() {
             ("Samples", AudioCountKind::Samples, "samples"),
         ],
     );
+}
+
+#[test]
+fn compact_scalar_evidence_roundtrips_without_changing_its_diagnostic() {
+    for (value, text) in [
+        (i64::MIN, "-9223372036854775808"),
+        (-1, "-1"),
+        (0, "0"),
+        (u32::MAX as i64, "4294967295"),
+        (i64::MAX, "9223372036854775807"),
+    ] {
+        for evidence in [DiagnosticInteger::new(value), value.into()] {
+            assert_eq!(evidence.get(), value);
+            assert_eq!(evidence.to_string(), text);
+            assert_eq!(format!("{evidence:?}"), text);
+        }
+    }
+    assert_eq!(DiagnosticInteger::from(i32::MIN).get(), i64::from(i32::MIN));
+    assert_eq!(DiagnosticInteger::from(u32::MAX).get(), i64::from(u32::MAX));
+    for (value, text) in [
+        (Duration::ZERO, "0ns"),
+        (Duration::from_nanos(1), "1ns"),
+        (Duration::from_millis(1500), "1.5s"),
+        (
+            Duration::new(u64::MAX, 999_999_999),
+            "18446744073709551615.999999999s",
+        ),
+    ] {
+        for evidence in [DiagnosticDuration::new(value), value.into()] {
+            assert_eq!(evidence.get(), value);
+            assert_eq!(format!("{evidence:?}"), text);
+        }
+    }
 }

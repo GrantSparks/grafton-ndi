@@ -970,7 +970,9 @@ fn conflicting_options_are_refused_before_the_sdk_creates_anything() {
         ),
         (
             indexed().drop_wait(requested),
-            crate::InputDefect::TimeoutTooLong { requested },
+            crate::InputDefect::TimeoutTooLong {
+                requested: requested.into(),
+            },
         ),
         (
             indexed().naming(FileNaming::Pattern("{prefix}_{take}.mkv".into())),

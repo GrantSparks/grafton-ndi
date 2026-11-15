@@ -291,13 +291,13 @@ pub enum FrameDefect {
     UnknownCompressedAudio,
     /// Video frame has invalid width: {0}.
     #[error("Video frame has invalid width: {0}")]
-    VideoWidth(i64),
+    VideoWidth(DiagnosticInteger),
     /// NDI video frames require even width, got {0}.
     #[error("NDI video frames require even width, got {0}")]
-    VideoOddWidth(i64),
+    VideoOddWidth(DiagnosticInteger),
     /// Video frame has invalid height: {0}.
     #[error("Video frame has invalid height: {0}")]
-    VideoHeight(i64),
+    VideoHeight(DiagnosticInteger),
     /// Uncompressed video frame has invalid line_stride_in_bytes: {0}.
     #[error("Uncompressed video frame has invalid line_stride_in_bytes: {0}")]
     VideoSdkStride(i32),
@@ -337,18 +337,18 @@ pub enum FrameDefect {
     PictureAspectRatio(f32),
     /// Invalid sample rate: {0}.
     #[error("Invalid sample rate: {0}")]
-    AudioRate(i64),
+    AudioRate(DiagnosticInteger),
     /// Invalid number of {kind}: {value}.
     #[error("Invalid number of {kind}: {value}")]
     AudioCount {
         /// The value.
-        value: i64,
+        value: DiagnosticInteger,
         /// The kind.
         kind: AudioCountKind,
     },
     /// Invalid channel_stride_in_bytes: {0}.
     #[error("Invalid channel_stride_in_bytes: {0}")]
-    AudioStride(i64),
+    AudioStride(DiagnosticInteger),
     /// channel_stride_in_bytes must be a multiple of 4, got {0}.
     #[error("channel_stride_in_bytes must be a multiple of 4, got {0}")]
     AudioStrideAlignment(usize),
@@ -716,13 +716,13 @@ pub enum InputDefect {
     AvSyncStorageLimit,
     /// Video frame has invalid width: {0}.
     #[error("Video frame has invalid width: {0}")]
-    VideoWidth(i64),
+    VideoWidth(DiagnosticInteger),
     /// NDI video frames require even width, got {0}.
     #[error("NDI video frames require even width, got {0}")]
-    VideoOddWidth(i64),
+    VideoOddWidth(DiagnosticInteger),
     /// Video frame has invalid height: {0}.
     #[error("Video frame has invalid height: {0}")]
-    VideoHeight(i64),
+    VideoHeight(DiagnosticInteger),
     /// Uncompressed video frame has invalid line_stride_in_bytes: {0}.
     #[error("Uncompressed video frame has invalid line_stride_in_bytes: {0}")]
     VideoSdkStride(i32),
@@ -762,18 +762,18 @@ pub enum InputDefect {
     PictureAspectRatio(f32),
     /// Invalid sample rate: {0}.
     #[error("Invalid sample rate: {0}")]
-    AudioRate(i64),
+    AudioRate(DiagnosticInteger),
     /// Invalid number of {kind}: {value}.
     #[error("Invalid number of {kind}: {value}")]
     AudioCount {
         /// The value.
-        value: i64,
+        value: DiagnosticInteger,
         /// The kind.
         kind: AudioCountKind,
     },
     /// Invalid channel_stride_in_bytes: {0}.
     #[error("Invalid channel_stride_in_bytes: {0}")]
-    AudioStride(i64),
+    AudioStride(DiagnosticInteger),
     /// channel_stride_in_bytes must be a multiple of 4, got {0}.
     #[error("channel_stride_in_bytes must be a multiple of 4, got {0}")]
     AudioStrideAlignment(usize),
@@ -822,19 +822,19 @@ pub enum InputDefect {
     #[error("timeout {requested:?} exceeds MAX_TIMEOUT (4294967294 ms, about 49.7 days)")]
     TimeoutTooLong {
         /// The requested.
-        requested: Duration,
+        requested: DiagnosticDuration,
     },
     /// timeout {requested:?} ends at an instant this platform cannot represent.
     #[error("timeout {requested:?} ends at an instant this platform cannot represent")]
     TimeoutInstantOverflow {
         /// The requested.
-        requested: Duration,
+        requested: DiagnosticDuration,
     },
     /// receive delay {requested:?} exceeds 2000 ms.
     #[error("receive delay {requested:?} exceeds 2000 ms")]
     ReceiveDelayTooLong {
         /// The requested.
-        requested: Duration,
+        requested: DiagnosticDuration,
     },
     /// {name} must be finite and within {minimum}..={maximum}.
     #[error("{detail}")]
@@ -1317,5 +1317,99 @@ impl std::fmt::Display for PtzDefect {
             maximum,
         } = self;
         write!(f, "{name} must be finite and within {minimum}..={maximum}")
+    }
+}
+
+/// An exact signed 64-bit diagnostic value with 32-bit alignment.
+///
+/// Two words keep common layout refusals inline even on 32-bit MSVC, where an
+/// `i64` field would enlarge every `Error`. Read the original value with `get`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DiagnosticInteger([u32; 2]);
+impl DiagnosticInteger {
+    /// Retain all bits without allocating or depending on native i64 alignment.
+    #[must_use]
+    pub const fn new(value: i64) -> Self {
+        let bits = value as u64;
+        Self([bits as u32, (bits >> 32) as u32])
+    }
+    /// The original signed value.
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        ((self.0[0] as u64) | ((self.0[1] as u64) << 32)) as i64
+    }
+}
+impl From<i64> for DiagnosticInteger {
+    fn from(value: i64) -> Self {
+        Self::new(value)
+    }
+}
+impl From<i32> for DiagnosticInteger {
+    fn from(value: i32) -> Self {
+        Self::new(value.into())
+    }
+}
+impl From<u32> for DiagnosticInteger {
+    fn from(value: u32) -> Self {
+        Self::new(value.into())
+    }
+}
+impl std::fmt::Display for DiagnosticInteger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.get(), f)
+    }
+}
+impl std::fmt::Debug for DiagnosticInteger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.get(), f)
+    }
+}
+
+/// Exact timeout evidence, stored in three 32-bit words without allocation.
+///
+/// `get` returns the original `Duration`; `Debug` uses its usual diagnostic
+/// format. The stable alignment preserves the compact Error budget on MSVC.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DiagnosticDuration {
+    seconds: [u32; 2],
+    nanoseconds: u32,
+}
+impl DiagnosticDuration {
+    /// Retain a duration exactly without allocating.
+    #[must_use]
+    pub const fn new(value: Duration) -> Self {
+        let seconds = value.as_secs();
+        Self {
+            seconds: [seconds as u32, (seconds >> 32) as u32],
+            nanoseconds: value.subsec_nanos(),
+        }
+    }
+    /// The original duration, reconstructed in aligned stack storage.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        Duration::new(
+            (self.seconds[0] as u64) | ((self.seconds[1] as u64) << 32),
+            self.nanoseconds,
+        )
+    }
+}
+impl From<Duration> for DiagnosticDuration {
+    fn from(value: Duration) -> Self {
+        Self::new(value)
+    }
+}
+impl PartialEq<Duration> for DiagnosticDuration {
+    fn eq(&self, other: &Duration) -> bool {
+        self.get() == *other
+    }
+}
+impl PartialEq<DiagnosticDuration> for Duration {
+    fn eq(&self, other: &DiagnosticDuration) -> bool {
+        *self == other.get()
+    }
+}
+impl std::fmt::Debug for DiagnosticDuration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.get(), f)
     }
 }

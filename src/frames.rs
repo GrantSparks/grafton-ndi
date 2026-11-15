@@ -4166,9 +4166,9 @@ pub(crate) type LayoutResult<T> = std::result::Result<T, LayoutError>;
 impl From<LayoutError> for crate::FrameDefect {
     fn from(reason: LayoutError) -> Self {
         match reason {
-            LayoutError::VideoWidth(value) => Self::VideoWidth(value),
-            LayoutError::VideoOddWidth(value) => Self::VideoOddWidth(value),
-            LayoutError::VideoHeight(value) => Self::VideoHeight(value),
+            LayoutError::VideoWidth(value) => Self::VideoWidth(value.into()),
+            LayoutError::VideoOddWidth(value) => Self::VideoOddWidth(value.into()),
+            LayoutError::VideoHeight(value) => Self::VideoHeight(value.into()),
             LayoutError::VideoSdkStride(value) => Self::VideoSdkStride(value),
             LayoutError::VideoShortStride {
                 stride,
@@ -4193,9 +4193,12 @@ impl From<LayoutError> for crate::FrameDefect {
             LayoutError::VideoSemiPlanar420(value) => Self::VideoSemiPlanar420(value),
             LayoutError::VideoUyvaStride(value) => Self::VideoUyvaStride(value),
             LayoutError::PictureAspectRatio(value) => Self::PictureAspectRatio(value),
-            LayoutError::AudioRate(value) => Self::AudioRate(value),
-            LayoutError::AudioCount { value, kind } => Self::AudioCount { value, kind },
-            LayoutError::AudioStride(value) => Self::AudioStride(value),
+            LayoutError::AudioRate(value) => Self::AudioRate(value.into()),
+            LayoutError::AudioCount { value, kind } => Self::AudioCount {
+                value: value.into(),
+                kind,
+            },
+            LayoutError::AudioStride(value) => Self::AudioStride(value.into()),
             LayoutError::AudioStrideAlignment(value) => Self::AudioStrideAlignment(value),
             LayoutError::AudioShortStride { stride, minimum } => {
                 Self::AudioShortStride { stride, minimum }
@@ -4220,9 +4223,9 @@ impl From<LayoutError> for crate::FrameDefect {
 impl From<LayoutError> for crate::InputDefect {
     fn from(reason: LayoutError) -> Self {
         match reason {
-            LayoutError::VideoWidth(value) => Self::VideoWidth(value),
-            LayoutError::VideoOddWidth(value) => Self::VideoOddWidth(value),
-            LayoutError::VideoHeight(value) => Self::VideoHeight(value),
+            LayoutError::VideoWidth(value) => Self::VideoWidth(value.into()),
+            LayoutError::VideoOddWidth(value) => Self::VideoOddWidth(value.into()),
+            LayoutError::VideoHeight(value) => Self::VideoHeight(value.into()),
             LayoutError::VideoSdkStride(value) => Self::VideoSdkStride(value),
             LayoutError::VideoShortStride {
                 stride,
@@ -4247,9 +4250,12 @@ impl From<LayoutError> for crate::InputDefect {
             LayoutError::VideoSemiPlanar420(value) => Self::VideoSemiPlanar420(value),
             LayoutError::VideoUyvaStride(value) => Self::VideoUyvaStride(value),
             LayoutError::PictureAspectRatio(value) => Self::PictureAspectRatio(value),
-            LayoutError::AudioRate(value) => Self::AudioRate(value),
-            LayoutError::AudioCount { value, kind } => Self::AudioCount { value, kind },
-            LayoutError::AudioStride(value) => Self::AudioStride(value),
+            LayoutError::AudioRate(value) => Self::AudioRate(value.into()),
+            LayoutError::AudioCount { value, kind } => Self::AudioCount {
+                value: value.into(),
+                kind,
+            },
+            LayoutError::AudioStride(value) => Self::AudioStride(value.into()),
             LayoutError::AudioStrideAlignment(value) => Self::AudioStrideAlignment(value),
             LayoutError::AudioShortStride { stride, minimum } => {
                 Self::AudioShortStride { stride, minimum }
@@ -4862,7 +4868,7 @@ fn checked_audio_extent(
 pub(crate) fn validate_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<ValidatedAudioLayout> {
     if raw.no_samples == 0 {
         return Err(Error::InvalidFrame(crate::FrameDefect::AudioCount {
-            value: 0,
+            value: 0.into(),
             kind: crate::AudioCountKind::Samples,
         }));
     }
@@ -9771,7 +9777,7 @@ mod tests {
                     assert_eq!(
                         message,
                         crate::FrameDefect::AudioCount {
-                            value: 0,
+                            value: 0.into(),
                             kind: crate::AudioCountKind::Samples
                         }
                     );

@@ -1953,7 +1953,9 @@ mod tests {
         let requested = crate::MAX_TIMEOUT + Duration::from_millis(1);
         assert_eq!(
             invalid_cause(options.drop_wait(requested).resolve()),
-            crate::InputDefect::TimeoutTooLong { requested }
+            crate::InputDefect::TimeoutTooLong {
+                requested: requested.into()
+            }
         );
     }
 

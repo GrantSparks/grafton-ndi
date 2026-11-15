@@ -79,7 +79,9 @@ impl RecvStringGuard<'_> {
         let bytes = unsafe {
             crate::frames::bounded_sdk_text(self.pointer, crate::frames::MAX_METADATA_BYTES)
         }
-        .ok_or({ Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedReceiverText) })?;
+        .ok_or(Error::UnexpectedSdkResult(
+            crate::SdkResultDefect::UnterminatedReceiverText,
+        ))?;
         Ok(Some(bytes))
     }
 
@@ -143,7 +145,9 @@ fn receiver_delay_millis(delay: Duration) -> Result<i32> {
         .filter(|millis| *millis <= MAX_RECEIVE_DELAY_MILLIS)
         .and_then(|millis| i32::try_from(millis).ok())
         .ok_or({
-            Error::InvalidInput(crate::InputDefect::ReceiveDelayTooLong { requested: delay })
+            Error::InvalidInput(crate::InputDefect::ReceiveDelayTooLong {
+                requested: delay.into(),
+            })
         })
 }
 

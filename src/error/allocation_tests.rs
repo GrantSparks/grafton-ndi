@@ -18,7 +18,7 @@ fn common_refusals_keep_typed_evidence_without_allocating() {
         crate::test_alloc::allocation_count(|| frames::validate_video_frame(&raw));
     assert!(matches!(
         result,
-        Err(Error::InvalidFrame(FrameDefect::VideoOddWidth(3)))
+        Err(Error::InvalidFrame(FrameDefect::VideoOddWidth(value))) if value.get()==3
     ));
     assert_eq!(allocations, 0);
 

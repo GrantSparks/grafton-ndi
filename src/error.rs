@@ -271,7 +271,7 @@ pub enum Error {
     /// frames are reported as [`Error::InvalidFrame`], and text that is not
     /// UTF-8 as [`Error::InvalidUtf8`]. Ordinary resource-budget ceilings are
     /// [`Error::ResourceLimit`] instead.
-    #[error("Unexpected NDI SDK result: {0}")]
+    #[error("{prefix}{cause}", prefix = sdk_result_prefix(.0), cause = .0)]
     UnexpectedSdkResult(SdkResultDefect),
 
     /// Discovery data exceeded a per-copy or whole-discovery resource limit.
@@ -564,5 +564,33 @@ mod initialization_failure_tests {
             error.to_string(),
             format!("Invalid UTF-8 string in data: {cause}")
         );
+    }
+}
+
+// Preserve the sender capture diagnostic while exposing its typed SDK breach.
+fn sdk_result_prefix(cause: &SdkResultDefect) -> &'static str {
+    match cause {
+        SdkResultDefect::UnexpectedFrameType { .. } => "Failed to capture frame: ",
+        _ => "Unexpected NDI SDK result: ",
+    }
+}
+
+#[cfg(test)]
+mod full_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn error_groups_preserve_their_complete_diagnostic_prefixes() {
+        for (error, expected) in [
+            (Error::InvalidFrame(FrameDefect::AudioRate(0.into())), "Invalid frame data: Invalid sample rate: 0"),
+            (Error::InvalidInput(InputDefect::RelativeLibraryPath), "Invalid input: an explicit NDI library path must be absolute"),
+            (Error::UnexpectedSdkResult(SdkResultDefect::NegativeCount {operation:"NDIlib_send_get_no_connections",value:-1}), "Unexpected NDI SDK result: NDIlib_send_get_no_connections returned a negative count: -1"),
+            (Error::UnexpectedSdkResult(SdkResultDefect::UnexpectedFrameType {operation:"sender metadata capture",kind:17}), "Failed to capture frame: sender metadata capture returned 17"),
+            (Error::ConnectionLost, "Failed to capture frame: the SDK returned an error frame: the connection was lost"),
+            (Error::InitializationFailed(InitializationFailure::NotStarted), "Failed to initialize the NDI runtime: NDIlib_initialize returned false on a CPU the runtime reports as supported"),
+            (Error::InitializationFailed(InitializationFailure::HandleCountExhausted), "Failed to initialize the NDI runtime: NDI runtime reference count exhausted"),
+        ] {
+            assert_eq!(error.to_string(), expected);
+        }
     }
 }
