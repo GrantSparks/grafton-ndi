@@ -29,8 +29,8 @@ use grafton_ndi::{
     capabilities::{CapabilityStatus, RuntimeFeature, SdkEdition},
     AudioFrame, Error, Finder, FinderOptions, FrameRate, MediaTypes, MetadataFrame, Ndi, Receiver,
     ReceiverBandwidth, ReceiverColorFormat, ReceiverMode, ReceiverOptions, ScanType, Sender,
-    SenderMode, SenderOptions, SettingChange, Source, StreamTier, Tally, Timecode, VideoFrame,
-    VideoFrameRef,
+    SenderMode, SenderOptions, SettingChange, Source, SourceCache, StreamTier, Tally, Timecode,
+    VideoFrame, VideoFrameRef,
 };
 use std::{
     sync::{
@@ -2716,6 +2716,57 @@ fn a_finder_is_told_the_metadata_a_sender_advertises() {
         metadata,
         [Some("<grafton-test kind=\"described\"/>".to_owned()), None]
     );
+}
+
+/// Per-sender machine names are SDK label text, including spaces and underscores,
+/// and remain selectable through a cache by another ASCII letter case.
+#[test]
+fn configured_machine_names_are_discovered_and_cached_without_dns_restrictions() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let machine = format!("Grafton Studio_{}", std::process::id());
+    let group = common::unique_name("machine-query");
+    let config =
+        AdvancedConfig::parse(format!(r#"{{"ndi":{{"machinename":"{machine}"}}}}"#)).unwrap();
+    let sender = Sender::new(
+        &ndi,
+        &options("machine-query").groups(&group).config(config),
+    )
+    .unwrap();
+    let advertised = sender.source().unwrap();
+    assert!(
+        advertised
+            .name()
+            .split_once(" (")
+            .is_some_and(|(label, _)| label.eq_ignore_ascii_case(&machine)),
+        "the configured machine name was not advertised: {:?}",
+        advertised.name()
+    );
+    let finder = Finder::new(
+        &ndi,
+        &FinderOptions::new().groups(&group).extra_ips("127.0.0.1"),
+    )
+    .unwrap();
+    let discovered = finder
+        .find_source_by_name(advertised.name(), PATIENCE)
+        .unwrap()
+        .expect("the finder did not discover its configured-machine-name sender");
+    assert!(discovered.matches_host(&machine.to_ascii_uppercase()));
+    let cache = SourceCache::new(finder);
+    let matches = cache
+        .sources_by_host(&machine.to_ascii_lowercase(), SLICE)
+        .unwrap();
+    assert!(
+        matches
+            .iter()
+            .any(|source| source.name() == advertised.name()),
+        "the cache could not select its sender by machine name: {matches:?}"
+    );
+    assert_eq!(cache.len(), 1);
+    cache.invalidate(&format!("{}.", machine.to_ascii_uppercase()));
+    assert!(cache.is_empty());
 }
 
 /// A real encoded picture exercises the decoder and planar pixel layout. The

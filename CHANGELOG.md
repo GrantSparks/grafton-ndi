@@ -201,6 +201,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   shared views, copies and native descriptors cannot be overridden. Packed
   audio copies derive and check their own layout. Failed packed-copy checks
   leave reused video and audio destinations valid after unwinding.
+- Host lookups and `SourceCache` accept NDI machine names containing spaces,
+  underscores and other label text, while rejecting endpoint and URI syntax.
+  Matching and cache keys preserve ASCII case/final-dot equivalence without
+  allocating; machine-name queries match only SDK label machine components.
 - Every image encode into a writer flushes on success and preserves the first
   writer error, including final JPEG and WebP writes from an owned `BufWriter`.
 - Custom receive buffers use the same stride validation as their requests.
