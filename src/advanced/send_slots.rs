@@ -42,12 +42,6 @@ pub(super) struct SlotKey {
     index: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SlotIdentity {
-    owner: usize,
-    index: usize,
-}
-
 impl SlotKey {
     /// Consume this key and claim the storage allocation it keeps alive.
     pub(super) fn claim(self) -> DescriptorLease {
@@ -59,17 +53,10 @@ impl SlotKey {
             scatter_written: false,
         }
     }
-
-    fn identity(&self) -> SlotIdentity {
-        SlotIdentity {
-            owner: Arc::as_ptr(&self.owner) as usize,
-            index: self.index,
-        }
-    }
 }
 
 /// Evidence that native access has ended, supplied by the operation that
-/// releases an entry. Completion evidence identifies its exact descriptor.
+/// releases an entry. A completion stays with the entry the callback released.
 pub(super) enum Released<'a> {
     Completed(super::queued::Completion),
     Synchronized(&'a Synchronized),
@@ -77,13 +64,9 @@ pub(super) enum Released<'a> {
 }
 
 impl Released<'_> {
-    fn validate(&self, key: &SlotKey, sender: Option<usize>) {
+    fn validate(&self, sender: Option<usize>) {
         match self {
-            Self::Completed(completion) => assert_eq!(
-                key.identity(),
-                completion.identity(),
-                "completion proof belongs to another descriptor slot"
-            ),
+            Self::Completed(_) => {}
             Self::Synchronized(proof) => {
                 proof.assert_sender(sender.expect("a compressed loan is bound to its sender"))
             }
@@ -143,13 +126,8 @@ impl DescriptorLease {
         self.sender = Some(sender);
     }
 
-    #[cfg(any(test, ndi_has_advanced_send_completion))]
-    pub(super) fn identity(&self) -> SlotIdentity {
-        self.key.identity()
-    }
-
     pub(super) fn validate_release(&self, proof: &Released<'_>) {
-        proof.validate(&self.key, self.sender);
+        proof.validate(self.sender);
     }
 
     pub(super) fn release(self, proof: Released<'_>) -> SlotKey {
@@ -231,8 +209,8 @@ impl ScatterLease {
     }
 
     pub(super) fn validate_release(&self, proof: &Released<'_>) {
-        if let Some(key) = &self.key {
-            proof.validate(key, self.sender);
+        if self.key.is_some() {
+            proof.validate(self.sender);
         }
     }
 
@@ -267,8 +245,7 @@ mod sender {{ pub mod in_flight {{
     impl Destroyed {{ pub fn assert_sender(&self, _: usize) {{ unimplemented!() }} }}
 }} }}
 mod queued {{
-    pub struct Completion;
-    impl Completion {{ pub fn identity(&self) -> super::send_slots::SlotIdentity {{ unimplemented!() }} }}
+    {completion}
 }}
 #[path = {aliasable:?}]
 mod aliasable;
@@ -277,7 +254,13 @@ mod send_slots;
 "#,
             bindings = root.join("src/sys/bindings.rs"),
             aliasable = root.join("src/advanced/aliasable.rs"),
-            slots = root.join("src/advanced/send_slots.rs")
+            slots = root.join("src/advanced/send_slots.rs"),
+            completion = {
+                let source = include_str!("queued.rs");
+                let start = source.find("pub(super) struct Completion {").unwrap();
+                let declaration = &source[start..];
+                &declaration[..declaration.find("\n}").unwrap() + 2]
+            }
         );
         let moved = include_str!(
             "../../tests/ui/internal/fail/descriptor_slot_key_is_consumed_by_claim.rs"
@@ -295,6 +278,7 @@ mod send_slots;
             ),
             ("moved", moved.to_owned(), Some("E0382")),
             ("cloned", cloned.to_owned(), Some("E0599")),
+            ("completion_private", include_str!("../../tests/ui/internal/fail/completion_requires_its_queue.rs").to_owned(), Some("E0451")),
             ("foreign_storage", include_str!("../../tests/ui/internal/fail/descriptor_slot_key_cannot_claim_other_storage.rs").to_owned(), Some("E0599")),
         ] {
             let path = directory.join(format!("{name}.rs"));

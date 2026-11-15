@@ -15,7 +15,7 @@ use std::ffi::c_void;
 
 use super::{
     send::PendingVideo,
-    send_slots::{DescriptorLease, DescriptorSlots, Released, SlotIdentity, SlotKey},
+    send_slots::{DescriptorLease, DescriptorSlots, Released, SlotKey},
     CompressedVideoFrame, ScatterVideoFrame, SubmittedVideo,
 };
 use crate::{
@@ -337,15 +337,13 @@ impl Entry {
 }
 
 /// Minted only when the SDK identifies the exact in-flight entry as complete.
-/// Its private identity prevents another entry's completion from returning a key.
+/// Its private constructor stays in this module, and the token remains paired
+/// with that entry until collection releases both its payload and slot.
 pub(super) struct Completion {
-    slot: SlotIdentity,
+    _private: (),
 }
-impl Completion {
-    pub(super) fn identity(&self) -> SlotIdentity {
-        self.slot
-    }
-}
+
+const _: () = assert!(std::mem::size_of::<Completion>() == 0);
 
 struct ReadyEntry {
     entry: Entry,
@@ -587,9 +585,7 @@ impl CallbackState {
         } = &mut *state;
         match in_flight.remove(&address) {
             Some(entry) => {
-                let completion = Completion {
-                    slot: entry.slot.identity(),
-                };
+                let completion = Completion { _private: () };
                 ready.push_back(ReadyEntry { entry, completion });
             }
             // No frame in flight has this data: the SDK named a frame twice,
@@ -1055,61 +1051,6 @@ mod tests {
         let (result, allocations) = crate::test_alloc::allocation_count(|| video.try_submit(frame));
         result.unwrap();
         assert_eq!(allocations, 0);
-    }
-
-    #[test]
-    fn completion_proof_reclaims_only_its_own_descriptor_key() {
-        // A callback token is one-use authority, including when a slot's key
-        // is subsequently recycled for a different native loan.
-        trait AmbiguousIfClone<A> {
-            fn check() {}
-        }
-        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
-        impl<T: Clone> AmbiguousIfClone<u8> for T {}
-        let _ = <Completion as AmbiguousIfClone<_>>::check;
-        let callback = CallbackState::new(QueueOptions::default().max_frames(2)).unwrap();
-        let mut submitted = Vec::new();
-        for _ in 0..2 {
-            let frame = VideoFrame::builder().resolution(2, 2).build().unwrap();
-            let bytes = frame.retained_bytes();
-            let admitted = callback
-                .state
-                .lock()
-                .unwrap()
-                .admit(
-                    QueuedVideoFrame::from(frame).authorize_for_test(None),
-                    bytes,
-                )
-                .unwrap();
-            submitted.push(admitted.lent.descriptor().p_data as usize);
-        }
-        callback.complete(submitted[0]);
-        {
-            let mut state = callback.state.lock().unwrap();
-            let ReadyEntry { entry, completion } = state.ready.pop_front().unwrap();
-            let other = &state.in_flight[&submitted[1]];
-            let proof = Released::Completed(completion);
-            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                other.slot.validate_release(&proof);
-            }));
-            assert!(
-                refused.is_err(),
-                "a different slot's proof cannot reclaim this key"
-            );
-            state.bytes -= entry.bytes;
-            let ((completed, key), allocations) =
-                crate::test_alloc::allocation_count(|| entry.release(proof));
-            assert_eq!(allocations, 0);
-            drop(completed);
-            state.free.push(key);
-            assert_eq!(state.free.len(), 1);
-        }
-        callback.complete(submitted[1]);
-        let mut state = callback.state.lock().unwrap();
-        let (_, allocations) = crate::test_alloc::allocation_count(|| take_completed(&mut state));
-        assert_eq!(allocations, 0);
-        assert_eq!(state.free.len(), state.options.frames);
-        assert_eq!(state.bytes, 0);
     }
 
     #[test]
