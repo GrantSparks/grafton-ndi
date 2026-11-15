@@ -322,7 +322,9 @@ fn advanced_types_keep_their_auto_traits() {
         QueuedSender: Send, Sync, UnwindSafe, RefUnwindSafe;
         QueuedVideoFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceivedAudio: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ReceivedAudioPacket: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceivedVideo: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ReceivedVideoPacket: Send, Sync, UnwindSafe, RefUnwindSafe;
         ScatterAudioFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         ScatterVideoFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         SubmissionId: Send, Sync, UnwindSafe, RefUnwindSafe;
