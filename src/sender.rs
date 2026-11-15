@@ -1291,8 +1291,6 @@ unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
     }
 }
 
-impl VideoSource for BorrowedVideoFrame<'_> {}
-
 /// A descriptor borrowing either a proven direct input or initialized packed
 /// staging. Its lifetime keeps both input metadata and staging alive until the
 /// synchronous native call returns. It never forms slices over capture padding.
@@ -1333,8 +1331,130 @@ crate::frames::video_accessors! {
     }
     plane {
         /// Its rows exclude the padding of the frame's line stride, which
-        /// [`Self::data`] includes, so the active pixels of a padded buffer
+        /// [`Self::storage`] includes, so the active pixels of a padded buffer
         /// can be read in place.
+    }
+    timestamp {
+        /// Application input has no SDK submission timestamp.
+    }
+    data(self -> Option<&[u8]>) {
+        /// Contiguous active pixels, or `None` when row or plane padding separates
+        /// them. Use [`Self::plane`] and [`Self::planes`] for padded active rows, or
+        /// [`Self::storage`] for the validated storage including row padding.
+    } { crate::frames::VideoPartsExt::active_data(self) }
+    to_owned(self) {
+        /// Copy this borrowed frame into a validated owned frame.
+        ///
+        /// Active pixels are copied into tightly packed planes; row padding is
+        /// skipped and the owned stride can shrink. Metadata is copied separately;
+        /// no reference to the source is retained. [`Self::copy_into`] makes the
+        /// same copy into an existing frame, reusing its allocations.
+        ///
+        /// The copy cannot fail: building the frame validated everything it
+        /// relies on, and the packed layout of a valid frame is valid.
+    } {
+        crate::frames::VideoPartsExt::owned_copy(self)
+    }
+    copy_into {
+        /// Copy this borrowed frame into `destination`, reusing its allocations.
+        ///
+        /// `destination` ends up exactly as [`Self::to_owned`] would have
+        /// returned it, whatever it held before: tightly packed active rows,
+        /// format, dimensions, frame rate, aspect ratio, scan type, timecode and
+        /// metadata, and no timestamp. No reference to the source is retained.
+        ///
+        /// Its pixel buffer is reused when its capacity holds the packed frame
+        /// and the SDK tail room required by its format and scan type, including
+        /// extra strides for interlaced UYVY/UYVA when needed. Otherwise it is
+        /// replaced by one allocation of exactly that size. Its metadata string
+        /// is reused when its capacity holds the new text and its terminator;
+        /// otherwise it grows once. With sufficient pixel and metadata capacity,
+        /// subsequent copies allocate nothing. The copy makes no SDK call and can
+        /// run on any thread. Copies without metadata retain the destination's
+        /// text allocation for later frames.
+        ///
+        /// # Example
+        ///
+        /// A copy-and-send loop that stops allocating once two frames exist.
+        /// [`Sender::send_video_async`] keeps the frame it is given until the next
+        /// send, and returns the previous one, which the SDK has finished with:
+        /// that frame is the destination of the next copy.
+        /// [`Sender::send_video_async_copy`] keeps its own reusable frames for
+        /// this copy instead.
+        ///
+        /// ```no_run
+        /// # use grafton_ndi::{BorrowedVideoFrame, Ndi, PixelFormat, Sender, SenderOptions, VideoFrame};
+        /// # fn main() -> Result<(), grafton_ndi::Error> {
+        /// # let ndi = Ndi::new()?;
+        /// let mut sender = Sender::new(&ndi, &SenderOptions::new("Copied"))?;
+        /// // 64 pixels per row, padded to a 512-byte stride.
+        /// let mut buffer = vec![0u8; 512 * 32];
+        /// let mut spare: Option<VideoFrame> = None;
+        /// for shade in 0..=255u8 {
+        ///     buffer.fill(shade); // the application draws into its own buffer
+        ///     let frame = BorrowedVideoFrame::builder(&buffer, 64, 32, PixelFormat::Bgra)
+        ///         .line_stride_bytes(512)
+        ///         .build()?;
+        ///     let owned = match spare.take() {
+        ///         Some(mut reused) => {
+        ///             frame.copy_into(&mut reused); // no allocation
+        ///             reused
+        ///         }
+        ///         None => frame.to_owned(), // the first two frames only
+        ///     };
+        ///     spare = sender.send_video_async(owned)?;
+        /// }
+        /// sender.finish_video_async();
+        /// # Ok(())
+        /// # }
+        /// ```
+    }
+    sends_in_place {
+        /// Whether [`Sender::send_video`] sends this frame from its buffer,
+        /// without copying its pixels.
+        ///
+        /// UYVY and UYVA frames are copied by default wherever
+        /// [`PixelFormat::send_tail_room`] is nonzero. Opting in with
+        /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`] allows
+        /// direct sending if enough room follows the last pixel. The last row's
+        /// padding, the bytes of the
+        /// buffer after the frame, and bytes vouched for with
+        /// [`BorrowedVideoFrameBuilder::readable_after`] all count towards the
+        /// room after that opt-in. An interlaced or single-field frame of those
+        /// formats whose height is not a multiple of four needs two line strides more.
+        ///
+        /// Where the SDK reads frames exactly, which is 64-bit ARM Linux, the
+        /// room is zero and every frame sends in place.
+        ///
+        /// # Example
+        ///
+        /// ```
+        /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat, VideoFrame};
+        /// # fn main() -> Result<(), grafton_ndi::Error> {
+        /// let uyvy = PixelFormat::Uyvy;
+        /// let room = uyvy.send_tail_room();
+        /// let exact = vec![0u8; 720 * 480 * 2];
+        /// let frame = BorrowedVideoFrame::builder(&exact, 720, 480, uyvy).build()?;
+        /// // Copied wherever the SDK needs room after the frame.
+        /// assert_eq!(frame.sends_in_place(), room == 0);
+        ///
+        /// let longer = vec![0u8; 720 * 480 * 2 + room];
+        /// let default = BorrowedVideoFrame::builder(&longer, 720, 480, uyvy).build()?;
+        /// assert_eq!(default.sends_in_place(), room == 0);
+        /// let in_place = BorrowedVideoFrame::builder(&longer, 720, 480, uyvy)
+        ///     .allow_send_from_padding_and_tail(true)
+        ///     .build()?;
+        /// assert!(in_place.sends_in_place());
+        /// assert_eq!(in_place.data().unwrap().len(), 720 * 480 * 2);
+        ///
+        /// let owned = VideoFrame::builder()
+        ///     .resolution(720, 480)
+        ///     .pixel_format(uyvy)
+        ///     .build()?;
+        /// assert!(owned.sends_in_place());
+        /// # Ok(())
+        /// # }
+        /// ```
     }
     images("", "\
  # use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
@@ -1350,7 +1470,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// Configure a checked borrowed frame over `data`.
     ///
     /// `data` may be longer than the frame: the frame is its start, and
-    /// [`Self::data`] never includes the rest. For UYVY/UYVA where the SDK
+    /// [`Self::storage`] never includes the rest. For UYVY/UYVA where the SDK
     /// needs tail room, the default send copies active rows only, even when
     /// `data` includes extra room. Direct sending requires an explicit
     /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`] opt-in.
@@ -1395,131 +1515,12 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         }
     }
 
-    /// Copy this borrowed frame into a validated owned frame.
-    ///
-    /// Active pixels are copied into tightly packed planes; row padding is
-    /// skipped and the owned stride can shrink. Metadata is copied separately;
-    /// no reference to the source is retained. [`Self::copy_into`] makes the
-    /// same copy into an existing frame, reusing its allocations.
-    ///
-    /// The copy cannot fail: building the frame validated everything it
-    /// relies on, and the packed layout of a valid frame is valid.
-    pub fn to_owned(&self) -> VideoFrame {
-        crate::frames::VideoPartsExt::owned_copy(self)
-    }
-
-    /// Copy this borrowed frame into `destination`, reusing its allocations.
-    ///
-    /// `destination` ends up exactly as [`Self::to_owned`] would have
-    /// returned it, whatever it held before: tightly packed active rows,
-    /// format, dimensions, frame rate, aspect ratio, scan type, timecode and
-    /// metadata, and no timestamp. No reference to the source is retained.
-    ///
-    /// Its pixel buffer is reused when its capacity holds the packed frame
-    /// and the SDK tail room required by its format and scan type, including
-    /// extra strides for interlaced UYVY/UYVA when needed. Otherwise it is
-    /// replaced by one allocation of exactly that size. Its metadata string
-    /// is reused when its capacity holds the new text and its terminator;
-    /// otherwise it grows once. With sufficient pixel and metadata capacity,
-    /// subsequent copies allocate nothing. The copy makes no SDK call and can
-    /// run on any thread. Copies without metadata retain the destination's
-    /// text allocation for later frames.
-    ///
-    /// # Example
-    ///
-    /// A copy-and-send loop that stops allocating once two frames exist.
-    /// [`Sender::send_video_async`] keeps the frame it is given until the next
-    /// send, and returns the previous one, which the SDK has finished with:
-    /// that frame is the destination of the next copy.
-    /// [`Sender::send_video_async_copy`] keeps its own reusable frames for
-    /// this copy instead.
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{BorrowedVideoFrame, Ndi, PixelFormat, Sender, SenderOptions, VideoFrame};
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = Ndi::new()?;
-    /// let mut sender = Sender::new(&ndi, &SenderOptions::new("Copied"))?;
-    /// // 64 pixels per row, padded to a 512-byte stride.
-    /// let mut buffer = vec![0u8; 512 * 32];
-    /// let mut spare: Option<VideoFrame> = None;
-    /// for shade in 0..=255u8 {
-    ///     buffer.fill(shade); // the application draws into its own buffer
-    ///     let frame = BorrowedVideoFrame::builder(&buffer, 64, 32, PixelFormat::Bgra)
-    ///         .line_stride_bytes(512)
-    ///         .build()?;
-    ///     let owned = match spare.take() {
-    ///         Some(mut reused) => {
-    ///             frame.copy_into(&mut reused); // no allocation
-    ///             reused
-    ///         }
-    ///         None => frame.to_owned(), // the first two frames only
-    ///     };
-    ///     spare = sender.send_video_async(owned)?;
-    /// }
-    /// sender.finish_video_async();
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn copy_into(&self, destination: &mut VideoFrame) {
-        crate::frames::VideoPartsExt::copy_into_owned(self, destination);
-    }
-
     /// Get the pixel data: exactly the frame's validated storage, including
     /// any row padding. Bytes of the source buffer beyond the frame are not
     /// part of it. [`Self::plane`] and [`Self::planes`] borrow the active
     /// rows alone.
-    pub fn data(&self) -> &[u8] {
+    pub fn storage(&self) -> &[u8] {
         self.data
-    }
-
-    /// Whether [`Sender::send_video`] sends this frame from its buffer,
-    /// without copying its pixels.
-    ///
-    /// UYVY and UYVA frames are copied by default wherever
-    /// [`PixelFormat::send_tail_room`] is nonzero. Opting in with
-    /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`] allows
-    /// direct sending if enough room follows the last pixel. The last row's
-    /// padding, the bytes of the
-    /// buffer after the frame, and bytes vouched for with
-    /// [`BorrowedVideoFrameBuilder::readable_after`] all count towards the
-    /// room after that opt-in. An interlaced or single-field frame of those
-    /// formats whose height is not a multiple of four needs two line strides more.
-    ///
-    /// Where the SDK reads frames exactly, which is 64-bit ARM Linux, the
-    /// room is zero and every frame sends in place.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat, VideoFrame};
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let uyvy = PixelFormat::Uyvy;
-    /// let room = uyvy.send_tail_room();
-    /// let exact = vec![0u8; 720 * 480 * 2];
-    /// let frame = BorrowedVideoFrame::builder(&exact, 720, 480, uyvy).build()?;
-    /// // Copied wherever the SDK needs room after the frame.
-    /// assert_eq!(frame.sends_in_place(), room == 0);
-    ///
-    /// let longer = vec![0u8; 720 * 480 * 2 + room];
-    /// let default = BorrowedVideoFrame::builder(&longer, 720, 480, uyvy).build()?;
-    /// assert_eq!(default.sends_in_place(), room == 0);
-    /// let in_place = BorrowedVideoFrame::builder(&longer, 720, 480, uyvy)
-    ///     .allow_send_from_padding_and_tail(true)
-    ///     .build()?;
-    /// assert!(in_place.sends_in_place());
-    /// assert_eq!(in_place.data().len(), 720 * 480 * 2);
-    ///
-    /// let owned = VideoFrame::builder()
-    ///     .resolution(720, 480)
-    ///     .pixel_format(uyvy)
-    ///     .build()?;
-    /// assert!(grafton_ndi::VideoSource::sends_in_place(&owned));
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[must_use]
-    pub fn sends_in_place(&self) -> bool {
-        self.can_send_direct()
     }
 
     /// Return this frame with `timecode`.
@@ -2640,7 +2641,7 @@ mod tests {
                                     || (allow && layout.trailing_padding() + extra >= room);
                                 assert_eq!(borrowed.sends_in_place(), expected,
                                     "{format:?} {scan:?} height={height} padding={padding} extra={extra} allow={allow}");
-                                assert_eq!(VideoSource::sends_in_place(&borrowed), expected);
+                                assert_eq!(borrowed.sends_in_place(), expected);
                                 assert_eq!(
                                     <&BorrowedVideoFrame<'_> as VideoParts>::initialized(
                                         &&borrowed
@@ -2673,7 +2674,7 @@ mod tests {
             .unwrap()
             .without_send_room_for_test();
         assert_eq!(frame.tail_room(), 0);
-        assert!(!VideoSource::sends_in_place(&frame));
+        assert!(!frame.sends_in_place());
         let mut staging = Pixels::default();
         let raw = PreparedVideo::new(&frame, &mut staging).raw;
         assert_ne!(raw.p_data.cast_const(), frame.data().as_ptr());
@@ -3761,7 +3762,7 @@ mod tests {
                         .unwrap();
                     for _ in 0..3 {
                         assert_eq!(frame.metadata(), Some("<pixels>é</pixels>"));
-                        assert_eq!(frame.data(), &data[..layout.data_len_bytes()]);
+                        assert_eq!(frame.storage(), &data[..layout.data_len_bytes()]);
                         assert_eq!(frame.pixel_format(), format);
                     }
                     frame
@@ -3916,7 +3917,7 @@ mod tests {
         // Buffer larger than needed should succeed
         let buffer = vec![0u8; 1920 * 1080 * 4 + 1000];
         let frame = borrowed(&buffer, 1920, 1080, PixelFormat::Bgra).unwrap();
-        assert_eq!(frame.data().len(), 1920 * 1080 * 4);
+        assert_eq!(frame.data().unwrap().len(), 1920 * 1080 * 4);
     }
 
     #[test]
@@ -3996,12 +3997,15 @@ mod tests {
         assert_eq!(frame.picture_aspect_ratio(), 0.0);
         assert_eq!(frame.scan_type(), ScanType::Progressive);
         assert_eq!(frame.timecode(), Timecode::SYNTHESIZE);
-        assert_eq!(frame.data().len(), buffer.len());
+        assert_eq!(frame.data().unwrap().len(), buffer.len());
         assert_eq!(frame.line_stride_bytes(), 1920 * 4);
         assert!(frame.metadata().is_none());
         // Copies share the borrow, and Debug summarizes rather than dumps pixels.
         let copy = frame;
-        assert_eq!(copy.data().as_ptr(), frame.data().as_ptr());
+        assert_eq!(
+            copy.data().unwrap().as_ptr(),
+            frame.data().unwrap().as_ptr()
+        );
         assert!(format!("{frame:?}").contains("data (bytes): 8294400"));
         assert_eq!(
             borrowed(&buffer, 1920, 1080, PixelFormat::Bgra)

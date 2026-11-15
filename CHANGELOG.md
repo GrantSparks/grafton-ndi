@@ -26,6 +26,11 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- `BorrowedVideoFrame::data()` returns contiguous active bytes as `Option<&[u8]>`.
+  Use `storage()` for validated storage including row padding. Video and audio
+  inherent accessors and source traits share one implementation; owned frames
+  gain inherent `copy_into` and video `sends_in_place`, and borrowed video gains
+  `timestamp()` returning `None`.
 - Owned received compressed packets use `ReceivedVideoPacket` and
   `ReceivedAudioPacket`. Checked conversions make sendable compressed frames
   without copying their storage; contiguous compressed sends are infallible.

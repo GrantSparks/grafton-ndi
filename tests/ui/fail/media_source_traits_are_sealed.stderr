@@ -1,3 +1,28 @@
+error[E0046]: not all trait items implemented, missing: `width`, `height`, `pixel_format`, `frame_rate`, `picture_aspect_ratio`, `scan_type`, `timecode`, `timestamp`, `line_stride_bytes`, `metadata`, `metadata_status`, `color_info`, `plane`, `planes`, `data`, `to_owned`, `copy_into`, `sends_in_place`
+ --> tests/ui/fail/media_source_traits_are_sealed.rs:4:1
+  |
+4 | impl VideoSource for Unchecked {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `width`, `height`, `pixel_format`, `frame_rate`, `picture_aspect_ratio`, `scan_type`, `timecode`, `timestamp`, `line_stride_bytes`, `metadata`, `metadata_status`, `color_info`, `plane`, `planes`, `data`, `to_owned`, `copy_into`, `sends_in_place` in implementation
+  |
+  = help: implement the missing item: `fn width(&self) -> u32 { todo!() }`
+  = help: implement the missing item: `fn height(&self) -> u32 { todo!() }`
+  = help: implement the missing item: `fn pixel_format(&self) -> PixelFormat { todo!() }`
+  = help: implement the missing item: `fn frame_rate(&self) -> grafton_ndi::FrameRate { todo!() }`
+  = help: implement the missing item: `fn picture_aspect_ratio(&self) -> f32 { todo!() }`
+  = help: implement the missing item: `fn scan_type(&self) -> ScanType { todo!() }`
+  = help: implement the missing item: `fn timecode(&self) -> Timecode { todo!() }`
+  = help: implement the missing item: `fn timestamp(&self) -> Option<grafton_ndi::SdkTimestamp> { todo!() }`
+  = help: implement the missing item: `fn line_stride_bytes(&self) -> usize { todo!() }`
+  = help: implement the missing item: `fn metadata(&self) -> Option<&str> { todo!() }`
+  = help: implement the missing item: `fn metadata_status(&self) -> FrameMetadataStatus { todo!() }`
+  = help: implement the missing item: `fn color_info(&self) -> Result<Option<ColorInfo>, grafton_ndi::Error> { todo!() }`
+  = help: implement the missing item: `fn plane(&self, _: usize) -> Option<VideoPlane<'_>> { todo!() }`
+  = help: implement the missing item: `fn planes(&self) -> VideoPlanes<'_> { todo!() }`
+  = help: implement the missing item: `fn data(&self) -> Option<&[u8]> { todo!() }`
+  = help: implement the missing item: `fn to_owned(&self) -> VideoFrame { todo!() }`
+  = help: implement the missing item: `fn copy_into(&self, _: &mut VideoFrame) { todo!() }`
+  = help: implement the missing item: `fn sends_in_place(&self) -> bool { todo!() }`
+
 error[E0277]: the trait bound `Unchecked: frames::VideoParts` is not satisfied
  --> tests/ui/fail/media_source_traits_are_sealed.rs:4:22
   |
@@ -39,6 +64,27 @@ note: required by a bound in `VideoSource`
             grafton_ndi::frames::borrowed::VideoRef<'_, S>
             grafton_ndi::BorrowedVideoFrame<'_>
             grafton_ndi::video_conversion::P216Output<'_>
+
+error[E0046]: not all trait items implemented, missing: `sample_rate`, `num_channels`, `num_samples`, `format`, `channel_stride_bytes`, `timecode`, `timestamp`, `metadata`, `metadata_status`, `channel_data`, `channels`, `data`, `to_owned`, `copy_into`
+ --> tests/ui/fail/media_source_traits_are_sealed.rs:5:1
+  |
+5 | impl AudioSource for Unchecked {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `sample_rate`, `num_channels`, `num_samples`, `format`, `channel_stride_bytes`, `timecode`, `timestamp`, `metadata`, `metadata_status`, `channel_data`, `channels`, `data`, `to_owned`, `copy_into` in implementation
+  |
+  = help: implement the missing item: `fn sample_rate(&self) -> u32 { todo!() }`
+  = help: implement the missing item: `fn num_channels(&self) -> u32 { todo!() }`
+  = help: implement the missing item: `fn num_samples(&self) -> u32 { todo!() }`
+  = help: implement the missing item: `fn format(&self) -> AudioFormat { todo!() }`
+  = help: implement the missing item: `fn channel_stride_bytes(&self) -> usize { todo!() }`
+  = help: implement the missing item: `fn timecode(&self) -> Timecode { todo!() }`
+  = help: implement the missing item: `fn timestamp(&self) -> Option<grafton_ndi::SdkTimestamp> { todo!() }`
+  = help: implement the missing item: `fn metadata(&self) -> Option<&str> { todo!() }`
+  = help: implement the missing item: `fn metadata_status(&self) -> FrameMetadataStatus { todo!() }`
+  = help: implement the missing item: `fn channel_data(&self, _: usize) -> Option<&[f32]> { todo!() }`
+  = help: implement the missing item: `fn channels(&self) -> AudioChannels<'_> { todo!() }`
+  = help: implement the missing item: `fn data(&self) -> Option<&[f32]> { todo!() }`
+  = help: implement the missing item: `fn to_owned(&self) -> AudioFrame { todo!() }`
+  = help: implement the missing item: `fn copy_into(&self, _: &mut AudioFrame) { todo!() }`
 
 error[E0277]: the trait bound `Unchecked: frames::AudioParts` is not satisfied
  --> tests/ui/fail/media_source_traits_are_sealed.rs:5:22

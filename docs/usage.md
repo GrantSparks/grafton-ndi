@@ -140,7 +140,14 @@ conversion also accepts borrowed audio and writes into caller-provided output;
 see [`NDIlib_Recv_Audio_16bpp`](../examples/NDIlib_Recv_Audio_16bpp.rs).
 Borrowing a frame avoids an intermediate owned copy but does not guarantee an
 in-place video send: padded captures and formats needing SDK tail room use
-reusable staging. `VideoSource::sends_in_place()` reports the selected path.
+reusable staging. `frame.sends_in_place()` reports the selected path.
+
+Concrete frames expose the same accessors as their source traits, including
+`copy_into`, `timestamp` and video `sends_in_place`, without importing a trait.
+`data()` always means active bytes or samples: owned frames return their packed
+slice; borrowed frames return `None` when padding separates active rows or
+channels. `BorrowedVideoFrame::storage()` also exposes validated frame storage
+including row padding, excluding extra input bytes and SDK tail room.
 
 Recover pooled buffers with `into_data()` or `swap_data()`. A rejected owned
 build or replacement returns its supplied storage in `Rejected`; recover it
