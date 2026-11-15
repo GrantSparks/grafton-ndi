@@ -111,6 +111,8 @@ fn native_resource_ownership() {
         "retained_concurrent_failover",
         "retained_routes",
         "retained_connection_targets",
+        "retained_receiver_name",
+        "retained_registered_receiver_name",
         "sender_unregistered",
         "sender_copy_reuse",
         "sender_registration",
@@ -368,6 +370,35 @@ fn child(case: &str) {
                     ("target B", "http://target.example/ndi"),
                     ("target B", "http://target.example/ndi"),
                 ],
+            );
+        }
+        "retained_receiver_name" | "retained_registered_receiver_name" => {
+            let name = "retained receiver creation name";
+            let options = ReceiverOptions::new(Source::new("")).name(name);
+            let receiver = Receiver::new(&ndi, &options).unwrap();
+            drop(options);
+            receiver.connect_to(&Source::new("named target")).unwrap();
+            receiver.reconnect();
+            if case == "retained_registered_receiver_name" {
+                let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
+                let _registration = advertiser
+                    .register(&receiver, RecvAdvertisement::default())
+                    .unwrap();
+                drop(receiver);
+                assert!(!log().contains("receiver-destroy\n"));
+                drop(advertiser);
+            } else {
+                drop(receiver);
+            }
+            let expected = format!("retained-receiver-name:{}", hex(name.as_bytes()));
+            let events = log();
+            let reads: Vec<_> = events
+                .lines()
+                .filter(|line| line.starts_with("retained-receiver-name:"))
+                .collect();
+            assert_eq!(
+                reads,
+                [expected.as_str(), expected.as_str(), expected.as_str()]
             );
         }
         #[cfg(feature = "advanced")]

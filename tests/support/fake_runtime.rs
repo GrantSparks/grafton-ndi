@@ -375,12 +375,21 @@ mod objects {
 
     struct Receiver {
         source: RetainedSource,
+        name: *const c_char,
+    }
+
+    impl Receiver {
+        unsafe fn read_name(&self) {
+            if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_some() {
+                log(&format!("retained-receiver-name:{}", unsafe { bytes(self.name) }));
+            }
+        }
     }
 
     pub(super) unsafe fn connect_source(instance: NDIlib_recv_instance_t, source: *const NDIlib_source_t) {
         if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_some() {
             let receiver = unsafe { &mut *instance.cast::<Receiver>() };
-            unsafe { receiver.source.read("receiver") };
+            unsafe { receiver.source.read("receiver"); receiver.read_name(); };
             receiver.source = RetainedSource(source);
         }
     }
@@ -460,12 +469,15 @@ mod objects {
                 let settings = unsafe { &*_p_create_settings };
                 log(&format!("receiver-settings:{}:{}", settings.color_format, settings.bandwidth));
             }
-            Box::into_raw(Box::new(Receiver { source: RetainedSource::default() })).cast()
+            Box::into_raw(Box::new(Receiver {
+                source: RetainedSource::default(),
+                name: unsafe { (*_p_create_settings).p_ndi_recv_name },
+            })).cast()
         }
 
         fn NDIlib_recv_destroy(p_instance: NDIlib_recv_instance_t) {
             let receiver = unsafe { Box::from_raw(p_instance.cast::<Receiver>()) };
-            unsafe { receiver.source.read("receiver") };
+            unsafe { receiver.source.read("receiver"); receiver.read_name(); };
             log("receiver-destroy");
         }
 

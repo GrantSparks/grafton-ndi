@@ -993,6 +993,7 @@ pub(crate) struct ReceiverCore {
     pending_source: AtomicBool,
     pending_unknown: Mutex<Option<u32>>,
     source_query_guard: Mutex<()>,
+    _name: Option<CString>,
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
 }
@@ -1089,8 +1090,14 @@ impl Receiver {
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(&'static sys::Core, &NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t,
     ) -> Result<Self> {
-        let raw = options.to_raw(ndi)?;
-        let instance = create(&ndi.api().core, &raw.raw);
+        let RawRecvCreateV3 {
+            _source,
+            _name,
+            raw,
+        } = options.to_raw(ndi)?;
+        // SAFETY: the core keeps every string these settings point to until
+        // after native destruction, including the target and receiver name.
+        let instance = create(&ndi.api().core, &raw);
         if instance.is_null() {
             return Err(Error::NativeOperationFailed { operation });
         }
@@ -1101,12 +1108,13 @@ impl Receiver {
                 connection_guard: Mutex::new(()),
                 target: RwLock::new(ConnectionTarget {
                     source: options.source.clone(),
-                    raw: Box::new(raw._source),
+                    raw: Box::new(_source),
                 }),
                 pending_status: AtomicBool::new(false),
                 pending_source: AtomicBool::new(false),
                 pending_unknown: Mutex::new(None),
                 source_query_guard: Mutex::new(()),
+                _name,
                 #[cfg(feature = "advanced")]
                 _config: config,
             }),
