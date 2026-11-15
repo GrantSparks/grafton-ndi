@@ -5,9 +5,11 @@ use crate::capture::CaptureKind;
 use std::time::Duration;
 
 use super::{
-    AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedAudioRef, CompressedVideoFrame,
-    CompressedVideoRef, ReceiverControls, VideoCodec,
+    AdvancedConfig, AudioCodec, CompressedAudioRef, CompressedVideoRef, ReceivedAudioPacket,
+    ReceivedVideoPacket, ReceiverControls, VideoCodec,
 };
+#[cfg(test)]
+use super::{CompressedAudioFrame, CompressedVideoFrame};
 use crate::{
     capture::{AllSlots, AudioKind, CaptureStrategy, Guard, Media, MetadataKind, VideoKind},
     receiver::PacketAttached,
@@ -73,7 +75,7 @@ pub enum ReceivedVideo {
     /// A decoded frame.
     Decoded(VideoFrame),
     /// A codec packet, exactly as the source sent it.
-    Compressed(CompressedVideoFrame),
+    Compressed(ReceivedVideoPacket),
 }
 
 /// Audio from a [`PacketReceiver`]: a codec packet when the source's format is
@@ -84,7 +86,7 @@ pub enum ReceivedAudio {
     /// Decoded planar floating-point audio.
     Decoded(AudioFrame),
     /// A codec packet, exactly as the source sent it.
-    Compressed(CompressedAudioFrame),
+    Compressed(ReceivedAudioPacket),
 }
 
 /// What one [`PacketReceiver::capture`] call produced.

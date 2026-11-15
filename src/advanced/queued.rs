@@ -183,10 +183,7 @@ impl QueuedVideoFrame {
             Self::Pixels(frame) => pixels(frame)
                 .map(AuthorizedVideo::Pixels)
                 .map_err(|rejected| rejected.map(Self::Pixels)),
-            Self::Compressed(frame) => match frame.validate_for_send() {
-                Ok(()) => Ok(AuthorizedVideo::Compressed(frame)),
-                Err(error) => Err(Rejected::new(error, Self::Compressed(frame))),
-            },
+            Self::Compressed(frame) => Ok(AuthorizedVideo::Compressed(frame)),
             Self::Scatter(frame) => {
                 let table = match scatter() {
                     Ok(table) => table,
@@ -892,8 +889,7 @@ impl QueuedSender {
     /// [`completion_protocol_failed`](Self::completion_protocol_failed)),
     /// with [`Error::UnsupportedCapability`] when the runtime lacks scatter
     /// sending or cannot send an uncompressed frame's pixel format
-    /// (as [`Sender::send_video`] checks),
-    /// and with [`Error::InvalidFrame`] when the frame is not sendable.
+    /// (as [`Sender::send_video`] checks).
     pub fn try_submit(
         &mut self,
         frame: impl Into<QueuedVideoFrame>,

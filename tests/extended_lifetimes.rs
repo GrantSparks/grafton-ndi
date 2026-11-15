@@ -481,7 +481,7 @@ fn child(case: &str) {
                     .unwrap()
                     .with_tier(tier);
                 let frame = CompressedVideoFrame::new(format, vec![value; 16]).unwrap();
-                assert!(sender.send_video_async(frame).unwrap().is_none());
+                assert!(sender.send_video_async(frame).is_none());
             }
             if case == "compressed_close" {
                 let reclaimed = sender.close();

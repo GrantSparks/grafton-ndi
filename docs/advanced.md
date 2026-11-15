@@ -73,7 +73,8 @@ can arrive decoded. `capture_ref(timeout)` returns a borrowed
 `PacketItemRef::{Video, Audio, Metadata, Event}`; `capture(timeout)` makes the
 same capture and copies it into an owned `PacketItem`. Compressed references
 expose codec bytes without copying their payload or metadata. Their `to_owned`
-and `copy_into` methods make sendable owned packets; `copy_into` reuses buffers.
+and `copy_into` methods make lossless `ReceivedVideoPacket` and
+`ReceivedAudioPacket` values; `copy_into` reuses buffers.
 Notifications use the common `ReceiverEvent` model and are consumed once.
 `Ok(None)` means the wait budget expired, rather than proof that the source
 disconnected. Packet receivers cannot feed `FrameSync`.
@@ -96,8 +97,14 @@ envelope; `parse` reads one. Opus and SpeedHQ use no envelope.
 
 Constructors validate layout and wrapper send constraints, **not codec
 bitstreams**. Supply valid encoded media and required codec configuration.
-Received envelopes can preserve unknown header fields that sending refuses;
-call `validate_for_send` before forwarding an arbitrary received packet.
+Received envelopes can preserve unknown header fields that sending refuses.
+Use `CompressedVideoFrame::try_from(packet)` or its audio equivalent to move
+received storage into a sendable frame; a refusal returns the original packet.
+Borrowed packets also convert through `TryFrom<&CompressedVideoRef>` and its
+audio equivalent, checking admission before copying. Their `try_copy_into`
+methods reuse an existing sendable frame and leave it unchanged on refusal.
+`validate_for_send` is available on the lossless received packet types for
+inspection; constructed compressed frames carry the sendability guarantee.
 Protection flags describe packet conventions and do not encrypt content.
 The [packet types](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.CompressedVideoFrame.html)
 and [envelope reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.PacketEnvelope.html)
@@ -113,7 +120,10 @@ joining payloads; `into_contiguous_copy` explicitly joins them.
 
 `CompressedSender` owns its sender. Synchronous video/audio and scatter sends
 borrow frames **mutably**, since the SDK can write their bytes during the call.
-The frame is reusable afterwards. Asynchronous video sends hold a frame until
+Contiguous video and audio sends return `()`; asynchronous contiguous video
+returns the displaced `Option<SubmittedVideo>`. Scatter sends retain their
+fallible runtime capability checks. The frame is reusable afterwards.
+Asynchronous video sends hold a frame until
 the next asynchronous send on the same program/preview stream returns it.
 Audio sends are synchronous. `close()` waits for pending SDK use and returns
 remaining video as `ReclaimedVideo`; reclamation does not confirm delivery.

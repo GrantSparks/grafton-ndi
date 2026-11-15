@@ -918,20 +918,6 @@ impl CompressedVideoFrame {
         self.bytes.into_vec()
     }
 
-    /// Check that this frame can be sent.
-    ///
-    /// A frame built with [`new`](Self::new) always can, before and after it
-    /// has been sent. A received frame may carry an envelope from a later SDK
-    /// that this module keeps but will not send, or be one the SDK does not
-    /// deliver when it is sent (see [`VideoCodec`]).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidFrame`] with the reason.
-    pub fn validate_for_send(&self) -> Result<()> {
-        validate_video_packet(self.format, &self.bytes, Use::Send)
-    }
-
     /// Bytes this frame keeps allocated.
     pub(crate) fn retained_bytes(&self) -> usize {
         self.bytes.capacity() + self.extras.retained_bytes()
@@ -1239,7 +1225,7 @@ impl CompressedAudioFrame {
             parameters,
             extras: FrameExtras::default(),
         };
-        match frame.validate_for_send() {
+        match validate_audio_for_send(frame.codec, frame.parameters, &frame.bytes) {
             Ok(()) => Ok(frame),
             Err(error) => Err(Rejected::new(error, frame.into_data())),
         }
@@ -1291,25 +1277,6 @@ impl CompressedAudioFrame {
         self.bytes.into_vec()
     }
 
-    /// Check that this frame can be sent.
-    ///
-    /// A frame built with [`new`](Self::new) always can, before and after it
-    /// has been sent. A received frame may have parameters the SDK does not
-    /// deliver when they are sent (see [`AudioCodec`]), or an AAC envelope
-    /// from a later SDK that this module keeps but will not send.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidFrame`] with the reason.
-    pub fn validate_for_send(&self) -> Result<()> {
-        validate_audio_size(&self.bytes)?;
-        let bytes = &*self.bytes;
-        self.codec
-            .validate_for_send(self.parameters, bytes, bytes.len(), |offset| {
-                bytes.get(offset..)?.first_chunk().copied()
-            })
-    }
-
     /// A native descriptor that lends this frame's bytes and metadata to the
     /// SDK; see [`CompressedVideoFrame::raw`].
     pub(crate) fn raw(&mut self) -> NDIlib_audio_frame_v3_t {
@@ -1321,6 +1288,17 @@ impl CompressedAudioFrame {
         raw.__bindgen_anon_1.data_size_in_bytes = self.bytes.len() as i32;
         raw
     }
+}
+
+fn validate_audio_for_send(
+    codec: AudioCodec,
+    parameters: AudioParameters,
+    bytes: &[u8],
+) -> Result<()> {
+    validate_audio_size(bytes)?;
+    codec.validate_for_send(parameters, bytes, bytes.len(), |offset| {
+        bytes.get(offset..)?.first_chunk().copied()
+    })
 }
 
 fn validate_audio_size(bytes: &[u8]) -> Result<()> {
@@ -1337,6 +1315,10 @@ fn validate_received_audio(codec: AudioCodec, bytes: &[u8]) -> Result<()> {
     }
     Ok(())
 }
+
+#[path = "packets/received.rs"]
+mod received;
+pub use received::{ReceivedAudioPacket, ReceivedVideoPacket};
 
 #[path = "packets/borrowed.rs"]
 mod borrowed;
@@ -1367,7 +1349,7 @@ unsafe fn packet_bytes<'a>(data: *const u8, size: i32) -> Result<&'a [u8]> {
 #[cfg(test)]
 pub(crate) unsafe fn copy_video_packet(
     raw: &NDIlib_video_frame_v2_t,
-) -> Result<CompressedVideoFrame> {
+) -> Result<ReceivedVideoPacket> {
     // SAFETY: the test caller retains raw's storage, and the synthetic guard
     // borrows it until the copy completes; its release callback frees nothing.
     let guard =
@@ -1383,7 +1365,7 @@ pub(crate) unsafe fn copy_video_packet(
 #[cfg(test)]
 pub(crate) unsafe fn copy_audio_packet(
     raw: &NDIlib_audio_frame_v3_t,
-) -> Result<CompressedAudioFrame> {
+) -> Result<ReceivedAudioPacket> {
     // SAFETY: as for the video fixture above.
     let guard =
         unsafe { crate::capture::Guard::with_test_free(std::ptr::null_mut(), *raw, |_, _| {}) };
@@ -2211,12 +2193,16 @@ mod tests {
             stamp(&mut video, value);
             assert_eq!(PacketEnvelope::parse(&video).unwrap().reserved(), value);
             let frame = CompressedVideoFrame::new(format, video).unwrap();
-            frame.validate_for_send().unwrap();
+            ReceivedVideoPacket::from(frame.clone())
+                .validate_for_send()
+                .unwrap();
 
             let mut audio = aac_packet(48_000, 2, &[1]);
             stamp(&mut audio, value);
             let frame = CompressedAudioFrame::new(AudioCodec::Aac, 48_000, 2, 1024, audio).unwrap();
-            frame.validate_for_send().unwrap();
+            ReceivedAudioPacket::from(frame.clone())
+                .validate_for_send()
+                .unwrap();
         }
 
         // As sent: the SDK writes through the pointer the descriptor lends.
@@ -2235,7 +2221,9 @@ mod tests {
                 PacketEnvelope::parse(frame.data()).unwrap().reserved(),
                 value
             );
-            frame.validate_for_send().unwrap();
+            ReceivedVideoPacket::from(frame.clone())
+                .validate_for_send()
+                .unwrap();
         }
     }
 
@@ -2333,10 +2321,10 @@ mod tests {
         // and refused when sent: the SDK would drop it without a word.
         let mut packet = aac_packet(48_000, 2, &[1]);
         packet[FLAGS_OFFSET..FLAGS_OFFSET + 4].copy_from_slice(&0u32.to_ne_bytes());
-        let received = CompressedAudioFrame {
+        let received = ReceivedAudioPacket {
             codec: AudioCodec::Aac,
             protected: false,
-            bytes: AliasableVec::new(packet.clone()),
+            bytes: packet.clone(),
             parameters: AudioParameters::new(48_000, 2, 1024).unwrap(),
             extras: FrameExtras::default(),
         };
@@ -2475,7 +2463,13 @@ mod tests {
         assert_eq!(received.timecode(), Timecode::from_ticks(17));
         assert_eq!(received.timestamp(), Some(SdkTimestamp::from_ticks(4242)));
         // Relaying a received frame hands the SDK what it delivered.
-        assert_eq!(received.clone().raw().timestamp, 4242);
+        assert_eq!(
+            CompressedVideoFrame::try_from(received.clone())
+                .unwrap()
+                .raw()
+                .timestamp,
+            4242
+        );
         let received = unsafe { copy_video_packet(&raw) }.unwrap();
         assert_eq!(received.timestamp(), None);
 

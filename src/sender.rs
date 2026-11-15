@@ -622,20 +622,12 @@ pub(crate) mod in_flight {
 
     #[cfg(feature = "advanced")]
     impl<'a> LoanPair<'a, crate::CompressedAttached, &'a mut crate::advanced::PendingStreams> {
-        /// Validate and submit through the sender that owns these streams.
-        // Rejection returns the caller's complete owned frame without boxing.
-        #[allow(clippy::result_large_err)]
+        /// Submit a frame whose type already proves send admission.
         pub(crate) fn submit_pending(
             &mut self,
             frame: crate::advanced::CompressedVideoFrame,
-        ) -> std::result::Result<
-            Option<crate::advanced::SubmittedVideo>,
-            crate::Rejected<crate::advanced::CompressedVideoFrame>,
-        > {
-            if let Err(error) = frame.validate_for_send() {
-                return Err(crate::Rejected::new(error, frame));
-            }
-            Ok(self.submit_prepared(crate::advanced::PendingVideo::Contiguous(frame)))
+        ) -> Option<crate::advanced::SubmittedVideo> {
+            self.submit_prepared(crate::advanced::PendingVideo::Contiguous(frame))
         }
 
         // Rejection preserves every block of the caller's owned frame.

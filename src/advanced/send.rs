@@ -757,12 +757,7 @@ impl CompressedSender {
     /// Send a video frame and return when the SDK has finished with it.
     ///
     /// The frame is borrowed exclusively because the SDK writes to its bytes.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the frame is
-    /// not sendable; see [`CompressedVideoFrame::validate_for_send`].
-    pub fn send_video(&mut self, frame: &mut CompressedVideoFrame) -> Result<()> {
+    pub fn send_video(&mut self, frame: &mut CompressedVideoFrame) {
         self.split().0.send_video(frame)
     }
 
@@ -771,27 +766,14 @@ impl CompressedSender {
     /// The sender keeps the frame until the next asynchronous send on the same
     /// stream, and returns the frame that this one replaces. The call can
     /// still block while the SDK applies back-pressure.
-    ///
-    /// # Errors
-    ///
-    /// Returns the frame when it is not sendable; see
-    /// [`CompressedVideoFrame::validate_for_send`].
-    pub fn send_video_async(
-        &mut self,
-        frame: CompressedVideoFrame,
-    ) -> std::result::Result<Option<SubmittedVideo>, Rejected<CompressedVideoFrame>> {
+    pub fn send_video_async(&mut self, frame: CompressedVideoFrame) -> Option<SubmittedVideo> {
         self.split().0.send_video_async(frame)
     }
 
     /// Send an audio frame and return when the SDK has finished with it.
     ///
     /// The frame is borrowed exclusively because the SDK writes to its bytes.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the frame is
-    /// not sendable; see [`CompressedAudioFrame::validate_for_send`].
-    pub fn send_audio(&mut self, frame: &mut CompressedAudioFrame) -> Result<()> {
+    pub fn send_audio(&mut self, frame: &mut CompressedAudioFrame) {
         self.split().1.send_audio(frame)
     }
 
@@ -867,12 +849,7 @@ impl CompressedVideo<'_> {
     }
 
     /// See [`CompressedSender::send_video`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`CompressedSender::send_video`].
-    pub fn send_video(&mut self, frame: &mut CompressedVideoFrame) -> Result<()> {
-        frame.validate_for_send()?;
+    pub fn send_video(&mut self, frame: &mut CompressedVideoFrame) {
         let descriptor = frame.raw();
         // SAFETY: the sender is live, and the descriptor lends `frame`, which
         // is borrowed exclusively for longer than this synchronous call.
@@ -882,18 +859,10 @@ impl CompressedVideo<'_> {
                 .core()
                 .NDIlib_send_send_video_v2(self.instance(), &descriptor)
         };
-        Ok(())
     }
 
     /// See [`CompressedSender::send_video_async`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`CompressedSender::send_video_async`].
-    pub fn send_video_async(
-        &mut self,
-        frame: CompressedVideoFrame,
-    ) -> std::result::Result<Option<SubmittedVideo>, Rejected<CompressedVideoFrame>> {
+    pub fn send_video_async(&mut self, frame: CompressedVideoFrame) -> Option<SubmittedVideo> {
         self.pair.submit_pending(frame)
     }
 
@@ -940,12 +909,7 @@ impl CompressedAudio<'_> {
     }
 
     /// See [`CompressedSender::send_audio`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`CompressedSender::send_audio`].
-    pub fn send_audio(&mut self, frame: &mut CompressedAudioFrame) -> Result<()> {
-        frame.validate_for_send()?;
+    pub fn send_audio(&mut self, frame: &mut CompressedAudioFrame) {
         let descriptor = frame.raw();
         // SAFETY: the sender is live, and the descriptor lends `frame`, which
         // is borrowed exclusively for longer than this synchronous call.
@@ -954,7 +918,6 @@ impl CompressedAudio<'_> {
                 .core()
                 .NDIlib_send_send_audio_v3(self.instance(), &descriptor)
         };
-        Ok(())
     }
 
     /// See [`CompressedSender::send_scatter_audio`].
@@ -1002,9 +965,8 @@ mod tests {
         let ((_video, mut audio), allocations) =
             crate::test_alloc::allocation_count(|| sender.split());
         assert_eq!(allocations, 0);
-        let (result, allocations) =
+        let ((), allocations) =
             crate::test_alloc::allocation_count(|| audio.send_audio(&mut frame));
-        result.unwrap();
         assert_eq!(allocations, 0);
     }
 
@@ -1204,7 +1166,9 @@ mod tests {
         assert_eq!(stamped[..24], bytes[..24]);
 
         let joined = moved.into_contiguous_copy();
-        joined.validate_for_send().unwrap();
+        super::super::ReceivedVideoPacket::from(joined.clone())
+            .validate_for_send()
+            .unwrap();
         assert_eq!(joined.data()[24..32], 7u64.to_ne_bytes());
     }
 
@@ -1223,7 +1187,9 @@ mod tests {
                 .unwrap()
                 .into_contiguous_copy();
             assert_eq!(aac.data(), packet);
-            aac.validate_for_send().unwrap();
+            super::super::ReceivedAudioPacket::from(aac.clone())
+                .validate_for_send()
+                .unwrap();
         }
 
         let reason = |result: Result<ScatterAudioFrame>| match result {
@@ -1281,7 +1247,9 @@ mod tests {
         };
         let frame = opus(48_000, 960).unwrap().into_contiguous_copy();
         assert_eq!(frame.data(), &[1, 2]);
-        frame.validate_for_send().unwrap();
+        super::super::ReceivedAudioPacket::from(frame.clone())
+            .validate_for_send()
+            .unwrap();
         assert!(matches!(
             reason(opus(44_100, 882)),
             crate::FrameDefect::OpusSampleRate
@@ -1460,15 +1428,12 @@ mod tests {
         let mut sender = CompressedSender::new(&ndi, &options).unwrap();
         let program = make(StreamTier::Program);
         let program_data = program.data().as_ptr();
-        assert!(sender.send_video_async(program).unwrap().is_none());
+        assert!(sender.send_video_async(program).is_none());
         // A preview submission leaves the program frame in flight.
         let preview = sender.send_video_async(make(StreamTier::Preview));
-        assert!(preview.unwrap().is_none());
+        assert!(preview.is_none());
         assert!(sender.lending.loans().program.is_in_flight());
-        let returned = sender
-            .send_video_async(make(StreamTier::Program))
-            .unwrap()
-            .unwrap();
+        let returned = sender.send_video_async(make(StreamTier::Program)).unwrap();
         let SubmittedVideo::Contiguous(returned) = returned else {
             panic!("a contiguous frame was submitted");
         };
@@ -1477,7 +1442,9 @@ mod tests {
         // The SDK may have stamped the reserved field, and nothing else.
         assert_eq!(returned.data()[..24], bytes[..24]);
         assert_eq!(returned.data()[32..], bytes[32..]);
-        returned.validate_for_send().unwrap();
+        super::super::ReceivedVideoPacket::from(returned.clone())
+            .validate_for_send()
+            .unwrap();
         let reclaimed = sender.close();
         assert_eq!(
             reclaimed.program.unwrap().format().tier(),

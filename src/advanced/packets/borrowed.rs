@@ -102,12 +102,12 @@ impl<'rx> CompressedVideoRef<'rx> {
 
     /// Copy payload and readable metadata into independently owned storage.
     /// Withheld metadata keeps its status without retaining unreadable text.
-    pub fn to_owned(&self) -> CompressedVideoFrame {
+    pub fn to_owned(&self) -> ReceivedVideoPacket {
         let mut extras = FrameExtras::default();
         extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
-        CompressedVideoFrame {
+        ReceivedVideoPacket {
             format: self.format(),
-            bytes: AliasableVec::new(self.data().to_vec()),
+            bytes: self.data().to_vec(),
             extras,
         }
     }
@@ -115,12 +115,36 @@ impl<'rx> CompressedVideoRef<'rx> {
     /// Make the same owned copy while reusing destination payload and metadata
     /// allocations. Once capacities suffice, repeated copies allocate nothing,
     /// including when metadata alternates between present and absent.
-    pub fn copy_into(&self, destination: &mut CompressedVideoFrame) {
-        destination.bytes.copy_from_slice(self.data());
-        destination
-            .extras
-            .copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
-        destination.format = self.format();
+    pub fn copy_into(&self, destination: &mut ReceivedVideoPacket) {
+        let ReceivedVideoPacket {
+            format,
+            bytes,
+            extras,
+        } = destination;
+        bytes.clear();
+        bytes.extend_from_slice(self.data());
+        extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
+        *format = self.format();
+    }
+
+    /// Copy into sendable storage after checking this borrowed packet.
+    /// A refusal leaves every field and allocation of `destination` unchanged.
+    /// Sufficient capacities permit allocation-free copying.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`] when this packet cannot be sent.
+    pub fn try_copy_into(&self, destination: &mut CompressedVideoFrame) -> Result<()> {
+        validate_video_packet(self.format(), self.data(), Use::Send)?;
+        let CompressedVideoFrame {
+            format,
+            bytes,
+            extras,
+        } = destination;
+        bytes.copy_from_slice(self.data());
+        extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
+        *format = self.format();
+        Ok(())
     }
 }
 
@@ -177,28 +201,58 @@ impl<'rx> CompressedAudioRef<'rx> {
 
     /// Copy payload and readable metadata into independently owned storage.
     /// Withheld metadata keeps its status without retaining unreadable text.
-    pub fn to_owned(&self) -> CompressedAudioFrame {
+    pub fn to_owned(&self) -> ReceivedAudioPacket {
         let mut extras = FrameExtras::default();
         extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
-        CompressedAudioFrame {
+        ReceivedAudioPacket {
             codec: self.codec(),
             protected: self.is_protected(),
             parameters: self.frame.parts().parameters,
-            bytes: AliasableVec::new(self.data().to_vec()),
+            bytes: self.data().to_vec(),
             extras,
         }
     }
 
     /// Reuse destination payload and metadata storage for the same copy as
     /// [`Self::to_owned`]. Sufficient capacities permit allocation-free copies.
-    pub fn copy_into(&self, destination: &mut CompressedAudioFrame) {
-        destination.bytes.copy_from_slice(self.data());
-        destination
-            .extras
-            .copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
-        destination.codec = self.codec();
-        destination.protected = self.is_protected();
-        destination.parameters = self.frame.parts().parameters;
+    pub fn copy_into(&self, destination: &mut ReceivedAudioPacket) {
+        let ReceivedAudioPacket {
+            codec,
+            protected,
+            parameters,
+            bytes,
+            extras,
+        } = destination;
+        bytes.clear();
+        bytes.extend_from_slice(self.data());
+        extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
+        *codec = self.codec();
+        *protected = self.is_protected();
+        *parameters = self.frame.parts().parameters;
+    }
+
+    /// Copy into sendable storage after checking this borrowed packet.
+    /// A refusal leaves every destination field unchanged. Sufficient
+    /// capacities permit allocation-free copying.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`] when this packet cannot be sent.
+    pub fn try_copy_into(&self, destination: &mut CompressedAudioFrame) -> Result<()> {
+        validate_audio_for_send(self.codec(), self.frame.parts().parameters, self.data())?;
+        let CompressedAudioFrame {
+            codec,
+            protected,
+            parameters,
+            bytes,
+            extras,
+        } = destination;
+        bytes.copy_from_slice(self.data());
+        extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
+        *codec = self.codec();
+        *protected = self.is_protected();
+        *parameters = self.frame.parts().parameters;
+        Ok(())
     }
 }
 
@@ -225,5 +279,52 @@ impl std::fmt::Debug for CompressedAudioRef<'_> {
             .field("timestamp", &self.timestamp())
             .field("metadata_status", &self.metadata_status())
             .finish()
+    }
+}
+
+impl TryFrom<&CompressedVideoRef<'_>> for CompressedVideoFrame {
+    type Error = Error;
+
+    /// Admit the borrowed packet before allocating its owned copy.
+    fn try_from(packet: &CompressedVideoRef<'_>) -> Result<Self> {
+        validate_video_packet(packet.format(), packet.data(), Use::Send)?;
+        // The same borrowed packet was admitted above; no second check or copy.
+        let ReceivedVideoPacket {
+            format,
+            bytes,
+            extras,
+        } = packet.to_owned();
+        Ok(Self {
+            format,
+            bytes: AliasableVec::new(bytes),
+            extras,
+        })
+    }
+}
+
+impl TryFrom<&CompressedAudioRef<'_>> for CompressedAudioFrame {
+    type Error = Error;
+
+    /// Admit the borrowed packet before allocating its owned copy.
+    fn try_from(packet: &CompressedAudioRef<'_>) -> Result<Self> {
+        validate_audio_for_send(
+            packet.codec(),
+            packet.frame.parts().parameters,
+            packet.data(),
+        )?;
+        let ReceivedAudioPacket {
+            codec,
+            protected,
+            parameters,
+            bytes,
+            extras,
+        } = packet.to_owned();
+        Ok(Self {
+            codec,
+            protected,
+            parameters,
+            bytes: AliasableVec::new(bytes),
+            extras,
+        })
     }
 }

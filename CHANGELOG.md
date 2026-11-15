@@ -17,6 +17,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- Owned received compressed packets use `ReceivedVideoPacket` and
+  `ReceivedAudioPacket`. Checked conversions make sendable compressed frames
+  without copying their storage; contiguous compressed sends are infallible.
+
 - Compressed packet-envelope refusals use the same typed cause for contiguous,
   scatter and received packets; codec mismatches use `PacketCodecMismatch`,
   and empty AAC payloads use `EmptyCodecPayload`.
