@@ -1866,6 +1866,9 @@ mod tests {
     #[test]
     fn successful_cache_publication_keeps_its_allocation_count() {
         let cache = CachedSources::default();
+        // Apple pthread mutexes allocate their native storage on the first
+        // lock. Initialize it before measuring publication into the empty map.
+        assert!(cache.is_empty());
         let sources = vec![Source::new("camera (Program)")];
         let (result, allocations) = crate::test_alloc::allocation_count(|| {
             cache.sources_by_host_with("camera", Duration::ZERO, |_| Ok(sources))

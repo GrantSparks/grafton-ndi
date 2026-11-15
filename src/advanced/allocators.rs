@@ -1750,12 +1750,16 @@ mod tests {
                 .enumerate()
                 .map(|(tag, storage)| PoolBlock::new(storage.pointer(), bytes, tag))
                 .collect();
-            Arc::new(Self {
+            let pool = Arc::new(Self {
                 _storage: Mutex::new(storage),
                 blocks,
                 free: Mutex::new((0..count).collect()),
                 releases: AtomicUsize::new(0),
-            })
+            });
+            // Apple pthread mutexes allocate on first lock. Pool setup belongs
+            // outside callback allocation counts and cycle measurements.
+            drop(lock(&pool.free));
+            pool
         }
         fn claim(&self) -> PoolBlock {
             self.blocks[lock(&self.free)
