@@ -3044,6 +3044,9 @@ mod tests {
             let mut owner = RecorderOwner::new(recorder);
             let events = EventQueue::new(16);
             let control = Control::new();
+            // Exclude the mock SDK's lazy native-mutex initialization while
+            // retaining the wrapper's very first pump in the measurement.
+            device.prepare_capture();
             let before = device.captures.load(Ordering::Acquire);
             device.recording_queries.store(0, Ordering::Release);
             device.dropped_queries.store(0, Ordering::Release);

@@ -239,6 +239,12 @@ impl Recorder {
         NEXT_RECORDER.with(|next| *next.borrow_mut() = Some(std::sync::Arc::clone(self)));
     }
 
+    /// Initialize the fake SDK's capture mutex before measuring wrapper work.
+    /// The standard library's pthread mutex allocates on its first lock.
+    pub(super) fn prepare_capture(&self) {
+        drop(self.events.lock().unwrap());
+    }
+
     /// Queue an event of `kind` for `path`, as the SDK's own thread would.
     pub(super) fn push(&self, kind: NDIlib_file_recorder_event_type_e, path: &str) {
         self.push_event(recorder_event(kind, path));
