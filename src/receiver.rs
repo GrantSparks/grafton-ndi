@@ -937,6 +937,62 @@ struct ConnectionTarget {
     raw: Box<RawSource>,
 }
 
+/// Only a receiver's connection lock can issue this permit.
+struct ConnectionPermit;
+
+/// One local connection request, with this receiver's exclusive permit.
+/// It keeps the passed descriptor and its strings until a later request has
+/// returned or the native receiver is destroyed. Captures may overlap it.
+struct Connection<'a> {
+    core: &'a ReceiverCore,
+    _exclusive: MutexGuard<'a, ConnectionPermit>,
+}
+
+enum ConnectionRequest {
+    Connect(ConnectionTarget),
+    Reconnect,
+    Disconnect,
+}
+
+impl Connection<'_> {
+    fn connect(&self, next: ConnectionTarget) {
+        self.request(ConnectionRequest::Connect(next));
+    }
+
+    fn reconnect(&self) {
+        self.request(ConnectionRequest::Reconnect);
+    }
+
+    fn disconnect(&self) {
+        self.request(ConnectionRequest::Disconnect);
+    }
+
+    fn request(&self, request: ConnectionRequest) {
+        // Only reconnect needs the target during the call. Snapshots share this
+        // read lock, and every writer holds this Connection's exclusive permit.
+        let target =
+            matches!(request, ConnectionRequest::Reconnect).then(|| self.core.target.read());
+        let source = match &request {
+            ConnectionRequest::Connect(next) => ptr::from_ref(next.raw.as_raw()),
+            ConnectionRequest::Reconnect => ptr::from_ref(target.as_ref().unwrap().raw.as_raw()),
+            ConnectionRequest::Disconnect => ptr::null(),
+        };
+        // SAFETY: this permit fixes the live receiver and serializes requests.
+        // A connect passes the box moved into target below; reconnect passes
+        // the stored box under a read lock; disconnect passes null. The old
+        // target remains owned until this call returns, without assuming copies.
+        unsafe {
+            self.core
+                .sdk()
+                .NDIlib_recv_connect(self.core.instance.0, source)
+        };
+        drop(target);
+        if let ConnectionRequest::Connect(next) = request {
+            *self.core.target.write() = next;
+        }
+    }
+}
+
 /// A receiver's opaque native identity; ownership stays with `ReceiverCore`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RecvInstance(pub(crate) NDIlib_recv_instance_t);
@@ -955,8 +1011,8 @@ pub(crate) struct ReceiverCore {
     pub(crate) _ndi: Ndi,
     /// Serializes local connection changes. Captures never take this lock;
     /// their overlap with connection changes is measured beside CaptureLock.
-    connection_guard: Mutex<()>,
-    /// The latest requested target. The connection guard serializes its writers;
+    connection_guard: Mutex<ConnectionPermit>,
+    /// The latest requested target. Connection serializes its writers;
     /// snapshots never take it and therefore never wait for a capture or a queued
     /// connection change. Writers hold this lock only to replace the value.
     target: RwLock<ConnectionTarget>,
@@ -1076,7 +1132,7 @@ impl Receiver {
             core: Arc::new(ReceiverCore {
                 instance: RecvInstance(instance),
                 _ndi: ndi.clone(),
-                connection_guard: Mutex::new(()),
+                connection_guard: Mutex::new(ConnectionPermit),
                 target: RwLock::new(ConnectionTarget {
                     source: options.source.clone(),
                     raw: Box::new(_source),
@@ -1339,9 +1395,7 @@ impl<M: ReceiverMode> Receiver<M> {
             source: source.clone(),
             raw: Box::new(source.to_raw()?),
         };
-        let connection = self.core.connection_guard.lock();
-        self.core.connect_raw(Some(&next.raw), &connection);
-        *self.core.target.write() = next;
+        self.core.lock_connection().connect(next);
         Ok(())
     }
 
@@ -1350,8 +1404,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Serializes with other local connection changes, as [`Self::reconnect`]
     /// does, while captures may continue.
     pub fn disconnect(&self) {
-        let connection = self.core.connection_guard.lock();
-        self.core.connect_raw(None, &connection);
+        self.core.lock_connection().disconnect();
     }
 
     /// Publish this receiver's program and preview tally to its source.
@@ -1490,11 +1543,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// issued, not that the feed recovered. Confirm recovery through
     /// [`Self::connection_stats`].
     pub fn reconnect(&self) {
-        // Read and submit under the same exclusive lock, so a concurrent
-        // connect_to cannot be overwritten by a stale retained descriptor.
-        let connection = self.core.connection_guard.lock();
-        let target = self.core.target.read();
-        self.core.connect_raw(Some(&target.raw), &connection);
+        self.core.lock_connection().reconnect();
     }
 
     /// An owned snapshot of the latest locally requested connection target.
@@ -1697,17 +1746,20 @@ impl ReceiverCore {
         self._ndi.table()
     }
 
-    /// Point the native receiver at `source`, or at no source, under the
-    /// connection guard that serializes local requests and target updates.
-    /// Captures may overlap it, as measured beside [`CaptureLock`].
-    fn connect_raw(&self, source: Option<&RawSource>, _exclusive: &MutexGuard<'_, ()>) {
-        let source = source.map_or(ptr::null(), |raw| ptr::from_ref(raw.as_raw()));
-        // SAFETY: the receiver instance is live for this borrow. `source` is
-        // null or points into a boxed `RawSource`, which owns the strings its
-        // descriptor points to. The caller retains that same box in the
-        // receiver's target until a replacement request returns, or the native
-        // receiver is destroyed; no assumption about an SDK copy is needed.
-        unsafe { self.sdk().NDIlib_recv_connect(self.instance.0, source) };
+    /// Issue a permit tied to this receiver and its local connection lock.
+    fn lock_connection(&self) -> Connection<'_> {
+        Connection {
+            core: self,
+            _exclusive: self.connection_guard.lock(),
+        }
+    }
+
+    #[cfg(test)]
+    fn try_lock_connection(&self) -> Option<Connection<'_>> {
+        Some(Connection {
+            core: self,
+            _exclusive: self.connection_guard.try_lock()?,
+        })
     }
 
     /// Bind `attempt` to this receiver and its runtime, without taking the
@@ -1730,7 +1782,7 @@ impl ReceiverCore {
     /// snapshots proceed while another connection change is queued.
     #[cfg(all(test, any(feature = "advanced", feature = "tokio", feature = "smol")))]
     pub(crate) fn reconnect_lock(&self) -> impl Drop + '_ {
-        self.connection_guard.lock()
+        self.lock_connection()._exclusive
     }
 
     /// One SDK capture of kind `K` within `attempt`.
@@ -3306,7 +3358,7 @@ mod tests {
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         let expected = receiver.connection_target();
-        let connection = receiver.core.connection_guard.lock();
+        let connection = receiver.core.lock_connection();
         std::thread::scope(|scope| {
             let (started, waiting) = std::sync::mpsc::channel();
             let receiver = &receiver;
@@ -3368,7 +3420,7 @@ mod tests {
                 Deadline::after(Duration::ZERO).unwrap(),
                 NeverStop,
                 |event| {
-                    assert!(receiver.core.connection_guard.try_lock().is_some());
+                    assert!(receiver.core.try_lock_connection().is_some());
                     event
                 },
                 |_| unreachable!("a pending event avoids native capture"),
@@ -3384,7 +3436,7 @@ mod tests {
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         receiver.core.retain(Notification::SourceChanged);
-        let _exclusive = receiver.core.connection_guard.lock();
+        let _exclusive = receiver.core.lock_connection();
         native_capture_calls::take();
         assert!(matches!(
             receiver.capture_any_ref(Duration::ZERO).unwrap(),
@@ -3540,7 +3592,7 @@ mod tests {
         assert!(receiver.core.take_pending_status().is_some());
 
         // Publishing a pending notification needs no local connection lock.
-        let _exclusive = receiver.core.connection_guard.lock();
+        let _exclusive = receiver.core.lock_connection();
         receiver
             .core
             .capture_result::<VideoKind>(CaptureResult::Notification(Notification::StatusChanged))
@@ -3688,7 +3740,7 @@ mod tests {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        let exclusive = receiver.core.connection_guard.lock();
+        let exclusive = receiver.core.lock_connection();
         std::thread::scope(|scope| {
             let (done, completed) = std::sync::mpsc::channel();
             let receiver = &receiver;
