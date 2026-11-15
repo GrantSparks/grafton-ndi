@@ -2322,7 +2322,9 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    // This reproducer needs Linux's byte-oriented directory names. The macOS
+    // CI filesystem rejects the invalid UTF-8 name before a process can use it.
+    #[cfg(target_os = "linux")]
     fn non_utf8_output_paths_are_refused_without_panicking() {
         const CHILD: &str = "GRAFTON_NDI_TEST_NON_UTF8_RECORDING_CWD";
         if std::env::var_os(CHILD).is_some() {
