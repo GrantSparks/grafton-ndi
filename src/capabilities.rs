@@ -78,24 +78,21 @@ impl SdkVersion {
     /// date, so numbers elsewhere in the text are never mistaken for it.
     pub(crate) fn parse(text: &str) -> Option<Self> {
         let token = text.split_whitespace().last()?;
-        let components: Vec<_> = token.split('.').collect();
-        if !(3..=4).contains(&components.len())
-            || components
-                .iter()
-                .any(|s| s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()))
-        {
-            return None;
-        }
-        Some(Self {
-            major: components[0].parse().ok()?,
-            minor: components[1].parse().ok()?,
-            patch: components[2].parse().ok()?,
-            build: if components.len() == 4 {
-                components[3].parse().ok()?
+        let mut components = token.split('.');
+        let parse = |text: &str| {
+            if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                None
             } else {
-                0
-            },
-        })
+                text.parse().ok()
+            }
+        };
+        let version = Self {
+            major: parse(components.next()?)?,
+            minor: parse(components.next()?)?,
+            patch: parse(components.next()?)?,
+            build: components.next().map_or(Some(0), parse)?,
+        };
+        components.next().is_none().then_some(version)
     }
 }
 
@@ -787,6 +784,27 @@ mod tests {
             "6.4.0.-1",
         ] {
             assert!(SdkVersion::parse(text).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn version_parsing_preserves_components_without_allocating() {
+        let (version, allocations) = crate::test_alloc::allocation_count(|| {
+            SdkVersion::parse("NDI SDK TEST 4294967295.65536.4294967295.0")
+        });
+        assert_eq!(allocations, 0);
+        let version = version.unwrap();
+        assert_eq!(
+            (
+                version.major(),
+                version.minor(),
+                version.patch(),
+                version.build()
+            ),
+            (u32::MAX, 65536, u32::MAX, 0)
+        );
+        for text in ["1.2.3.4.5", "4294967296.2.3", "1.2.3."] {
+            assert!(SdkVersion::parse(text).is_none());
         }
     }
 

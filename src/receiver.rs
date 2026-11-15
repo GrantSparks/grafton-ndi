@@ -1249,7 +1249,7 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// [`Error::InvalidInput`] for a delay above two seconds, and
     /// [`Error::UnsupportedCapability`] without
-    /// [`RuntimeFeature::ReceiveDelay`].
+    /// [`RuntimeFeature::ReceiveDelay`](crate::RuntimeFeature::ReceiveDelay).
     pub fn set_video_delay(&self, delay: Duration) -> Result<SettingChange> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
@@ -1263,7 +1263,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Errors
     ///
     /// [`Error::UnsupportedCapability`] without
-    /// [`RuntimeFeature::ReceiveDelay`], and [`Error::UnexpectedSdkResult`]
+    /// [`RuntimeFeature::ReceiveDelay`](crate::RuntimeFeature::ReceiveDelay), and [`Error::UnexpectedSdkResult`]
     /// when the SDK reports a delay outside 0 to 2000 ms.
     pub fn video_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
