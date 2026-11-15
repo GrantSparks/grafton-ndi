@@ -3104,3 +3104,30 @@ fn warm_workspace_allocates_output_once_without_retaining_it() {
         assert_eq!(workspace.retained_bytes(), 0);
     }
 }
+
+#[test]
+fn reader_format_facts_match_the_frame_layout_for_every_format() {
+    for format in PixelFormat::ALL {
+        let frame = VideoFrame::builder()
+            .resolution(4, 2)
+            .pixel_format(format)
+            .build()
+            .unwrap();
+        let info = format.info();
+        let (expected_bits, expected_alpha) = if RGB_FORMATS.contains(&format) {
+            (8, matches!(format, PixelFormat::Bgra | PixelFormat::Rgba))
+        } else {
+            let sampling = sampling(format);
+            (sampling.bits, sampling.alpha)
+        };
+        assert_eq!(info.sample_width().bits(), expected_bits, "{format:?}");
+        assert_eq!(info.has_alpha(), expected_alpha, "{format:?}");
+        assert_eq!(info.plane_count(), frame.planes().len(), "{format:?}");
+        for keep in [false, true] {
+            let source = Source::new(&frame);
+            let reader =
+                super::Reader::<u8>::new(&source, YuvMatrix::Bt709, YuvRange::Limited, keep);
+            assert_eq!(reader.has_alpha(), keep && info.has_alpha(), "{format:?}");
+        }
+    }
+}

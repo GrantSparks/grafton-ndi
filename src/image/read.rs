@@ -13,7 +13,7 @@ use super::{
     options::YuvRange,
     Source,
 };
-use crate::{frames::VideoPlane, PixelFormat, YuvMatrix};
+use crate::{frames::VideoPlane, FormatCategory, PixelFormat, YuvMatrix};
 
 #[cfg(test)]
 thread_local! {
@@ -126,72 +126,92 @@ impl<'a, P: Sample> Reader<'a, P> {
         range: YuvRange,
         alpha: bool,
     ) -> Self {
+        let info = source.format.info();
         let mut planes = source.planes.clone();
+        assert_eq!(
+            planes.len(),
+            info.plane_count(),
+            "a validated format has its complete plane layout"
+        );
         let mut plane = || {
             planes
                 .next()
-                .expect("a validated layout has every plane of its format")
+                .expect("plane count was checked against the format category")
         };
-        let kernel = |bits| Kernel::new(matrix, range, bits);
-        // Every format has a reader: a format added to `PixelFormat` stops
-        // this match from compiling until it has one.
-        let layout = match source.format {
-            PixelFormat::Bgra | PixelFormat::Bgrx | PixelFormat::Rgba | PixelFormat::Rgbx => {
-                let rgb_order = matches!(source.format, PixelFormat::Rgba | PixelFormat::Rgbx);
-                Layout::Rgb {
-                    plane: plane(),
-                    red: if rgb_order { 0 } else { 2 },
-                    blue: if rgb_order { 2 } else { 0 },
-                    alpha: alpha && matches!(source.format, PixelFormat::Bgra | PixelFormat::Rgba),
+        let kernel = || Kernel::new(matrix, range, info.sample_width().bits());
+        // Only byte/plane order is image-local. This exhaustive match requires
+        // a newly added format to choose its order; alpha/depth come from info.
+        let (rgb_order, cr_first) = match source.format {
+            PixelFormat::Rgba | PixelFormat::Rgbx => (true, false),
+            PixelFormat::Bgra | PixelFormat::Bgrx => (false, false),
+            PixelFormat::Yv12 => (false, true),
+            PixelFormat::Uyvy
+            | PixelFormat::Uyva
+            | PixelFormat::P216
+            | PixelFormat::Pa16
+            | PixelFormat::Nv12
+            | PixelFormat::I420
+            | PixelFormat::Na48
+            | PixelFormat::Nb48
+            | PixelFormat::Na4g
+            | PixelFormat::Nb4g => (false, false),
+        };
+        // These category choices mirror video_plane_layouts. Consume the alpha
+        // plane even when discarded, so the complete checked layout is consumed.
+        let layout = match info.category() {
+            FormatCategory::Packed if info.bytes_per_pixel() == 4 => Layout::Rgb {
+                plane: plane(),
+                red: if rgb_order { 0 } else { 2 },
+                blue: if rgb_order { 2 } else { 0 },
+                alpha: alpha && info.has_alpha(),
+            },
+            FormatCategory::Packed | FormatCategory::PackedAlpha => Layout::Packed422 {
+                plane: plane(),
+                alpha: info.has_alpha().then(&mut plane).filter(|_| alpha),
+                kernel: kernel(),
+            },
+            FormatCategory::SemiPlanar422 | FormatCategory::SemiPlanar422Alpha => {
+                Layout::SemiPlanar422 {
+                    luma: plane(),
+                    chroma: plane(),
+                    alpha: info.has_alpha().then(&mut plane).filter(|_| alpha),
+                    kernel: kernel(),
                 }
             }
-            PixelFormat::Uyvy | PixelFormat::Uyva => Layout::Packed422 {
-                plane: plane(),
-                alpha: (source.format == PixelFormat::Uyva && alpha).then(&mut plane),
-                kernel: kernel(8),
-            },
-            PixelFormat::P216 | PixelFormat::Pa16 => Layout::SemiPlanar422 {
-                luma: plane(),
-                chroma: plane(),
-                alpha: (source.format == PixelFormat::Pa16 && alpha).then(&mut plane),
-                kernel: kernel(16),
-            },
-            PixelFormat::Nv12 => Layout::Planar420 {
+            FormatCategory::SemiPlanar420 => Layout::Planar420 {
                 luma: plane(),
                 chroma: Chroma420::Interleaved(plane()),
-                kernel: kernel(8),
+                kernel: kernel(),
             },
-            PixelFormat::I420 => Layout::Planar420 {
-                luma: plane(),
-                chroma: Chroma420::Separate {
-                    cb: plane(),
-                    cr: plane(),
-                },
-                kernel: kernel(8),
-            },
-            PixelFormat::Yv12 => {
+            FormatCategory::Planar420 => {
                 let luma = plane();
-                let cr = plane();
-                let cb = plane();
+                let first = plane();
+                let second = plane();
+                let (cb, cr) = if cr_first {
+                    (second, first)
+                } else {
+                    (first, second)
+                };
                 Layout::Planar420 {
                     luma,
                     chroma: Chroma420::Separate { cb, cr },
-                    kernel: kernel(8),
+                    kernel: kernel(),
                 }
             }
-            PixelFormat::Na48 | PixelFormat::Nb48 | PixelFormat::Na4g | PixelFormat::Nb4g => {
-                let wide = matches!(source.format, PixelFormat::Na4g | PixelFormat::Nb4g);
-                let has_alpha = matches!(source.format, PixelFormat::Nb48 | PixelFormat::Nb4g);
-                Layout::Planar444 {
-                    luma: plane(),
-                    cb: plane(),
-                    cr: plane(),
-                    alpha: (has_alpha && alpha).then(&mut plane),
-                    wide,
-                    kernel: kernel(if wide { 16 } else { 8 }),
-                }
-            }
+            FormatCategory::Planar444 | FormatCategory::Planar444Alpha => Layout::Planar444 {
+                luma: plane(),
+                cb: plane(),
+                cr: plane(),
+                alpha: info.has_alpha().then(&mut plane).filter(|_| alpha),
+                wide: info.sample_width() == crate::frames::PixelSampleWidth::Sixteen,
+                kernel: kernel(),
+            },
         };
+        debug_assert_eq!(
+            planes.len(),
+            0,
+            "reader consumed every plane of the checked layout"
+        );
         Self {
             width: source.width,
             height: source.height,

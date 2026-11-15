@@ -128,6 +128,22 @@ pub enum FormatCategory {
     Planar444Alpha,
 }
 
+/// Width of one component sample, independent of packed bytes per pixel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PixelSampleWidth {
+    Eight,
+    Sixteen,
+}
+impl PixelSampleWidth {
+    #[cfg(feature = "image-encoding")]
+    pub(crate) const fn bits(self) -> u32 {
+        match self {
+            Self::Eight => 8,
+            Self::Sixteen => 16,
+        }
+    }
+}
+
 /// Compile-time pixel format properties.
 ///
 /// This struct encapsulates all format-specific knowledge in one location,
@@ -154,6 +170,8 @@ pub struct PixelFormatInfo {
     bytes_per_pixel: u8,
     /// Format category for union field access and buffer calculation.
     category: FormatCategory,
+    has_alpha: bool,
+    sample_width: PixelSampleWidth,
 }
 
 impl PixelFormatInfo {
@@ -169,6 +187,31 @@ impl PixelFormatInfo {
     #[must_use]
     pub const fn category(&self) -> FormatCategory {
         self.category
+    }
+
+    /// Whether this format defines an alpha channel rather than padding.
+    #[cfg(feature = "image-encoding")]
+    pub(crate) const fn has_alpha(self) -> bool {
+        self.has_alpha
+    }
+
+    /// Precision of one component, independent of packed pixel width.
+    #[cfg(feature = "image-encoding")]
+    pub(crate) const fn sample_width(self) -> PixelSampleWidth {
+        self.sample_width
+    }
+
+    pub(crate) const fn plane_count(self) -> usize {
+        match self.category {
+            FormatCategory::Packed => 1,
+            FormatCategory::PackedAlpha
+            | FormatCategory::SemiPlanar420
+            | FormatCategory::SemiPlanar422 => 2,
+            FormatCategory::Planar420
+            | FormatCategory::SemiPlanar422Alpha
+            | FormatCategory::Planar444 => 3,
+            FormatCategory::Planar444Alpha => 4,
+        }
     }
 
     /// Returns true if this is a planar 4:2:0 format (YV12, I420, or NV12).
@@ -316,47 +359,75 @@ impl PixelFormat {
     #[must_use]
     pub const fn info(self) -> PixelFormatInfo {
         match self {
-            Self::Bgra | Self::Bgrx | Self::Rgba | Self::Rgbx => PixelFormatInfo {
+            Self::Bgra | Self::Rgba => PixelFormatInfo {
+                has_alpha: true,
+                sample_width: PixelSampleWidth::Eight,
+                bytes_per_pixel: 4,
+                category: FormatCategory::Packed,
+            },
+            Self::Bgrx | Self::Rgbx => PixelFormatInfo {
+                has_alpha: false,
+                sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 4,
                 category: FormatCategory::Packed,
             },
             Self::Uyvy => PixelFormatInfo {
+                has_alpha: false,
+                sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 2,
                 category: FormatCategory::Packed,
             },
             Self::Uyva => PixelFormatInfo {
+                has_alpha: true,
+                sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 2,
                 category: FormatCategory::PackedAlpha,
             },
             Self::P216 => PixelFormatInfo {
+                has_alpha: false,
+                sample_width: PixelSampleWidth::Sixteen,
                 bytes_per_pixel: 2,
                 category: FormatCategory::SemiPlanar422,
             },
             Self::Pa16 => PixelFormatInfo {
+                has_alpha: true,
+                sample_width: PixelSampleWidth::Sixteen,
                 bytes_per_pixel: 2,
                 category: FormatCategory::SemiPlanar422Alpha,
             },
             Self::Yv12 | Self::I420 => PixelFormatInfo {
+                has_alpha: false,
+                sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 1,
                 category: FormatCategory::Planar420,
             },
             Self::Nv12 => PixelFormatInfo {
+                has_alpha: false,
+                sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 1,
                 category: FormatCategory::SemiPlanar420,
             },
             Self::Na48 => PixelFormatInfo {
+                has_alpha: false,
+                sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 1,
                 category: FormatCategory::Planar444,
             },
             Self::Nb48 => PixelFormatInfo {
+                has_alpha: true,
+                sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 1,
                 category: FormatCategory::Planar444Alpha,
             },
             Self::Na4g => PixelFormatInfo {
+                has_alpha: false,
+                sample_width: PixelSampleWidth::Sixteen,
                 bytes_per_pixel: 2,
                 category: FormatCategory::Planar444,
             },
             Self::Nb4g => PixelFormatInfo {
+                has_alpha: true,
+                sample_width: PixelSampleWidth::Sixteen,
                 bytes_per_pixel: 2,
                 category: FormatCategory::Planar444Alpha,
             },
@@ -3791,34 +3862,32 @@ fn video_plane_layouts(
     height: usize,
 ) -> LayoutResult<([VideoPlaneLayout; MAX_VIDEO_PLANES], usize, usize, usize)> {
     let mut dimensions = [(stride, active, height); MAX_VIDEO_PLANES];
-    let count = match info.category() {
-        FormatCategory::Packed => 1,
+    match info.category() {
+        FormatCategory::Packed => {}
         FormatCategory::Planar420 => {
             if !height.is_multiple_of(2) || !stride.is_multiple_of(2) {
                 return Err(crate::LayoutDefect::VideoPlanar420 { height, stride });
             }
             dimensions[1] = (stride / 2, active / 2, height / 2);
             dimensions[2] = dimensions[1];
-            3
         }
         FormatCategory::SemiPlanar420 => {
             if !height.is_multiple_of(2) {
                 return Err(crate::LayoutDefect::VideoSemiPlanar420(height));
             }
             dimensions[1] = (stride, active, height / 2);
-            2
         }
         FormatCategory::PackedAlpha => {
             if !stride.is_multiple_of(2) {
                 return Err(crate::LayoutDefect::VideoUyvaStride(stride));
             }
             dimensions[1] = (stride / 2, active / 2, height);
-            2
         }
-        FormatCategory::SemiPlanar422 => 2,
-        FormatCategory::SemiPlanar422Alpha | FormatCategory::Planar444 => 3,
-        FormatCategory::Planar444Alpha => 4,
-    };
+        FormatCategory::SemiPlanar422 => {}
+        FormatCategory::SemiPlanar422Alpha | FormatCategory::Planar444 => {}
+        FormatCategory::Planar444Alpha => {}
+    }
+    let count = info.plane_count();
     let mut planes = [VideoPlaneLayout::default(); MAX_VIDEO_PLANES];
     let mut storage = 0usize;
     let mut payload = 0usize;
