@@ -3826,7 +3826,11 @@ fn borrowed_packet_capture_decodes_formats_outside_its_preset() {
         return;
     }
     let _turn = sockets();
-    let mut sender = CompressedSender::new(&ndi, &options("borrowed-decoded-fallback")).unwrap();
+    let sender = CompressedSender::new(
+        &ndi,
+        &options("borrowed-decoded-fallback").clock_video(true),
+    )
+    .unwrap();
     let receiver = PacketReceiver::new(
         &ndi,
         &ReceiverOptions::new(loopback(&ndi, &sender.sender().source().unwrap())),
@@ -3838,48 +3842,74 @@ fn borrowed_packet_capture_decodes_formats_outside_its_preset() {
     let format = VideoPacketFormat::new(VideoCodec::H264, 64, 64)
         .unwrap()
         .with_frame_rate(FrameRate::new(30, 1).unwrap());
-    let mut pts = 0;
-    let deadline = Instant::now() + PATIENCE;
-    let mut placeholders = 0;
-    loop {
-        let bytes =
-            PacketEnvelope::encode(EnvelopeCodec::H264, pts, pts, true, bitstream, config).unwrap();
-        let mut packet = CompressedVideoFrame::new(format, bytes).unwrap();
-        sender.send_video(&mut packet);
-        pts += 3000;
-        match receiver.capture_ref(SLICE).unwrap() {
-            Some(PacketItemRef::Video(ReceivedVideoRef::Decoded(frame))) => {
-                if common::is_hx_placeholder((64, 64), (frame.width(), frame.height())) {
-                    placeholders += 1;
-                } else {
-                    assert_eq!((frame.width(), frame.height()), (64, 64));
-                    assert!(frame
-                        .planes()
-                        .flat_map(|plane| plane.rows())
-                        .flatten()
-                        .any(|&byte| byte != 0));
-                    assert_eq!(frame.to_owned().width(), 64);
-                    return;
-                }
-            }
-            Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(_))) => {
-                panic!("preset must decode H.264")
-            }
-            _ => {}
-        }
-        if Instant::now() >= deadline {
-            assert!(
-                placeholders > 0,
-                "no fallback video arrived: {}",
-                link(receiver.receiver())
-            );
-            common::skip(
-                H264Decoder,
-                "packet receiver delivered only the SDK decoder placeholder",
-            );
-            return;
+    // Decoding runs asynchronously. Keep a correctly paced source feeding it
+    // while capture waits, rather than making a declared 30fps source depend
+    // on 100ms receive timeouts or bursts of status/metadata notifications.
+    let stop = AtomicBool::new(false);
+    let submitted = AtomicUsize::new(0);
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
         }
     }
+    std::thread::scope(|scope| {
+        // This guard signals even when capture or an assertion unwinds, so
+        // the scope never waits for a producer whose stop flag was forgotten.
+        let _stop_on_exit = StopOnDrop(&stop);
+        scope.spawn(|| {
+            let mut sender = sender;
+            let mut pts = 0;
+            while !stop.load(Ordering::Acquire) {
+                let bytes =
+                    PacketEnvelope::encode(EnvelopeCodec::H264, pts, pts, true, bitstream, config)
+                        .unwrap();
+                let mut packet = CompressedVideoFrame::new(format, bytes).unwrap();
+                sender.send_video(&mut packet);
+                submitted.fetch_add(1, Ordering::Release);
+                pts += 3000;
+            }
+        });
+        let deadline = Instant::now() + PATIENCE;
+        let mut placeholders = 0;
+        let mut other_items = 0;
+        loop {
+            match receiver.capture_ref(SLICE).unwrap() {
+                Some(PacketItemRef::Video(ReceivedVideoRef::Decoded(frame))) => {
+                    if common::is_hx_placeholder((64, 64), (frame.width(), frame.height())) {
+                        placeholders += 1;
+                    } else {
+                        assert_eq!((frame.width(), frame.height()), (64, 64));
+                        assert!(frame
+                            .planes()
+                            .flat_map(|plane| plane.rows())
+                            .flatten()
+                            .any(|&byte| byte != 0));
+                        assert_eq!(frame.to_owned().width(), 64);
+                        return;
+                    }
+                }
+                Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(_))) => {
+                    panic!("preset must decode H.264")
+                }
+                Some(_) => other_items += 1,
+                None => {}
+            }
+            if Instant::now() >= deadline {
+                assert!(
+                    placeholders > 0,
+                    "no fallback video arrived after {} submitted frames and {other_items} other items: {}",
+                    submitted.load(Ordering::Acquire),
+                    link(receiver.receiver())
+                );
+                common::skip(
+                    H264Decoder,
+                    "packet receiver delivered only the SDK decoder placeholder",
+                );
+                return;
+            }
+        }
+    });
 }
 
 /// AV-sync loans keep separate native buffers across consecutive requests.
