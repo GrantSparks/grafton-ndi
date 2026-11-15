@@ -17,7 +17,7 @@ use grafton_ndi::{
         AdvertiserOptions, ListenerOptions, RecvAdvertiser, RecvListener, SendAdvertiser,
         SendListener,
     },
-    Ndi, RuntimeOptions,
+    Error, Ndi, RuntimeOptions,
 };
 use std::{fs, path::PathBuf, process::Command};
 
@@ -28,6 +28,7 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
             Ndi::with_options(&RuntimeOptions::new().library_path(PathBuf::from(library))).unwrap();
         let log_path = PathBuf::from(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap());
         let configured = std::env::var_os("GRAFTON_LIFECYCLE_CONFIGURED").is_some();
+        let refused = std::env::var_os("GRAFTON_LIFECYCLE_REFUSED").is_some();
         if configured {
             if let Err(error) =
                 ndi.require_feature(RuntimeFeature::AdvancedSenderAdvertiserConfiguration)
@@ -39,12 +40,37 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
                 return;
             }
         }
-        let mut advertisers = AdvertiserOptions::new().servers("127.0.0.1");
-        let mut listeners = ListenerOptions::new().server("127.0.0.1");
+        const SERVER: &str = "127.0.0.1:5959";
+        let mut advertisers = AdvertiserOptions::new().servers(SERVER);
+        let mut listeners = ListenerOptions::new().server(SERVER);
         if configured {
             let config = AdvancedConfig::parse("{}").unwrap();
             advertisers = advertisers.config(config.clone());
             listeners = listeners.config(config);
+        }
+        if refused {
+            let errors = [
+                ("advertiser", SendAdvertiser::new(&ndi, &advertisers).err()),
+                ("advertiser", RecvAdvertiser::new(&ndi, &advertisers).err()),
+                ("listener", SendListener::new(&ndi, &listeners).err()),
+                ("listener", RecvListener::new(&ndi, &listeners).err()),
+            ];
+            for (object, error) in errors {
+                let Some(Error::InvalidInput(reason)) = error else {
+                    panic!("{object}: expected null-creation refusal, got {error:?}");
+                };
+                assert!(
+                    reason.contains(&format!("the SDK created no {object}:")),
+                    "{reason}"
+                );
+                assert!(reason.contains(&format!("{SERVER:?}")), "{reason}");
+            }
+            let log = fs::read_to_string(log_path).unwrap_or_default();
+            assert!(
+                !log.contains("-destroy"),
+                "null objects must never be destroyed: {log}"
+            );
+            return;
         }
         let owners = (
             SendAdvertiser::new(&ndi, &advertisers).unwrap(),
@@ -88,45 +114,58 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
         return;
     }
     let directory = fixture::FixtureDir::create("discovery-lifecycle");
-    let library = directory.path().join("libndi_advanced.so");
-    runtime_fixture::FakeRuntime {
-        cfgs: vec![
+    for refused in [false, true] {
+        let variant = directory
+            .path()
+            .join(if refused { "refused" } else { "accepted" });
+        fs::create_dir(&variant).unwrap();
+        let library = variant.join("libndi_advanced.so");
+        let mut cfgs = vec![
             "fake_objects",
             "fake_discovery",
             "fake_advanced",
             "fake_configured_creation",
             "fake_configured_success",
-        ],
-        version: Some("6.4.0.2"),
-        ..Default::default()
-    }
-    .build(&library);
-    for configured in [false, true] {
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .args([
-                "--exact",
-                "every_server_object_shares_plain_and_configured_creation_and_destruction",
-                "--nocapture",
-            ])
-            .env("GRAFTON_LIFECYCLE_LIBRARY", &library)
-            .env(
-                "GRAFTON_FAKE_NDI_LOG",
-                directory.path().join(if configured {
-                    "configured.log"
-                } else {
-                    "plain.log"
-                }),
-            );
-        if configured {
-            command.env("GRAFTON_LIFECYCLE_CONFIGURED", "1");
+        ];
+        if refused {
+            cfgs.push("fake_refuse_server_creation");
         }
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        runtime_fixture::FakeRuntime {
+            cfgs,
+            version: Some("6.4.0.2"),
+            ..Default::default()
+        }
+        .build(&library);
+        for configured in [false, true] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "every_server_object_shares_plain_and_configured_creation_and_destruction",
+                    "--nocapture",
+                ])
+                .env("GRAFTON_LIFECYCLE_LIBRARY", &library)
+                .env(
+                    "GRAFTON_FAKE_NDI_LOG",
+                    variant.join(if configured {
+                        "configured.log"
+                    } else {
+                        "plain.log"
+                    }),
+                );
+            if configured {
+                command.env("GRAFTON_LIFECYCLE_CONFIGURED", "1");
+            }
+            if refused {
+                command.env("GRAFTON_LIFECYCLE_REFUSED", "1");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

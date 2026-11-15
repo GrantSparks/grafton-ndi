@@ -134,7 +134,9 @@ unsafe fn bytes(text: *const c_char) -> String {
 #[cfg(any(fake_objects, fake_discovery))]
 macro_rules! names_a_server {
     ($settings:expr) => {
-        !$settings.is_null() && !unsafe { (*$settings).p_url_address }.is_null()
+        !cfg!(fake_refuse_server_creation)
+            && !$settings.is_null()
+            && !unsafe { (*$settings).p_url_address }.is_null()
     };
 }
 
