@@ -256,6 +256,37 @@ mod tests {
         assert_eq!(received.data().as_ptr(), pointer);
     }
 
+    #[test]
+    fn received_packet_metadata_refusals_preserve_both_allocations() {
+        fn returned(text: String, refusal: impl FnOnce(String) -> Rejected<String>) {
+            let pointer = text.as_ptr();
+            let capacity = text.capacity();
+            let length = text.len();
+            let text = refusal(text).into_inner();
+            assert_eq!(
+                (text.as_ptr(), text.capacity(), text.len()),
+                (pointer, capacity, length)
+            );
+        }
+        for text in [
+            "bad\0metadata".to_owned(),
+            "x".repeat(crate::frames::MAX_METADATA_BYTES),
+        ] {
+            let mut video = ReceivedVideoPacket::from(video());
+            video.set_metadata("<old/>").unwrap();
+            let pointer = video.metadata().unwrap().as_ptr();
+            returned(text.clone(), |text| video.set_metadata(text).unwrap_err());
+            assert_eq!(video.metadata(), Some("<old/>"));
+            assert_eq!(video.metadata().unwrap().as_ptr(), pointer);
+            let mut audio = ReceivedAudioPacket::from(audio());
+            audio.set_metadata("<old/>").unwrap();
+            let pointer = audio.metadata().unwrap().as_ptr();
+            returned(text, |text| audio.set_metadata(text).unwrap_err());
+            assert_eq!(audio.metadata(), Some("<old/>"));
+            assert_eq!(audio.metadata().unwrap().as_ptr(), pointer);
+        }
+    }
+
     fn later_header(mut bytes: Vec<u8>) -> Vec<u8> {
         bytes.splice(ENVELOPE_HEADER_BYTES..ENVELOPE_HEADER_BYTES, [7; 4]);
         bytes[..4].copy_from_slice(&48i32.to_ne_bytes());
