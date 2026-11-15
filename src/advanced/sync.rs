@@ -642,9 +642,7 @@ pub trait AvSyncFrame: video_sealed::Sealed {}
 
 impl video_sealed::Sealed for VideoFrame {
     fn descriptor(&self, ndi: &crate::Ndi) -> crate::Result<NDIlib_video_frame_v2_t> {
-        use crate::frames::VideoParts;
-        let authorized = crate::frames::SendableVideoLayout::new(*self.layout(), ndi)?;
-        self.to_raw(authorized)
+        Ok(crate::frames::Sendable::borrowed(self, ndi)?.video_descriptor())
     }
 
     fn receive_timestamp(&self) -> Option<SdkTimestamp> {

@@ -19,7 +19,7 @@ use super::{
     CompressedVideoFrame, ScatterVideoFrame, SubmittedVideo,
 };
 use crate::{
-    frames::{SendableVideoLayout, ValidatedVideoLayout, VideoParts},
+    frames::Sendable,
     sender::in_flight::{Destroyed, Lend, Lending, Lent, Loans},
     sys::{
         advanced::{native, ScatterSend, SendCompletion},
@@ -165,7 +165,7 @@ impl QueuedVideoFrame {
         sender: &Sender<QueueAttached>,
     ) -> std::result::Result<AuthorizedVideo, Rejected<Self>> {
         self.authorize_with(
-            |layout| sender.require_video_layout(layout),
+            |frame| sender.require_video_layout(frame),
             || sender.runtime().table::<ScatterSend>(),
         )
     }
@@ -174,14 +174,15 @@ impl QueuedVideoFrame {
     /// the caller, so SDK-free boundary tests exercise the production arms.
     fn authorize_with(
         self,
-        pixels: impl FnOnce(ValidatedVideoLayout) -> Result<SendableVideoLayout>,
+        pixels: impl FnOnce(
+            VideoFrame,
+        ) -> std::result::Result<Sendable<VideoFrame>, Rejected<VideoFrame>>,
         scatter: impl FnOnce() -> Result<&'static ScatterSend>,
     ) -> std::result::Result<AuthorizedVideo, Rejected<Self>> {
         match self {
-            Self::Pixels(frame) => match pixels(*frame.layout()) {
-                Ok(authorized) => Ok(AuthorizedVideo::Pixels { frame, authorized }),
-                Err(error) => Err(Rejected::new(error, Self::Pixels(frame))),
-            },
+            Self::Pixels(frame) => pixels(frame)
+                .map(AuthorizedVideo::Pixels)
+                .map_err(|rejected| rejected.map(Self::Pixels)),
             Self::Compressed(frame) => match frame.validate_for_send() {
                 Ok(()) => Ok(AuthorizedVideo::Compressed(frame)),
                 Err(error) => Err(Rejected::new(error, Self::Compressed(frame))),
@@ -201,7 +202,7 @@ impl QueuedVideoFrame {
     #[cfg(test)]
     fn authorize_for_test(self, scatter: Option<&'static ScatterSend>) -> AuthorizedVideo {
         self.authorize_with(
-            |layout| Ok(SendableVideoLayout::for_test(layout)),
+            |frame| Ok(Sendable::for_test(frame)),
             || scatter.ok_or_else(|| Error::InvalidInput("scatter table required by test".into())),
         )
         .unwrap()
@@ -210,10 +211,7 @@ impl QueuedVideoFrame {
 
 /// Authorized payloads do not acquire descriptor storage until admitted.
 enum AuthorizedVideo {
-    Pixels {
-        frame: VideoFrame,
-        authorized: SendableVideoLayout,
-    },
+    Pixels(Sendable<VideoFrame>),
     Compressed(CompressedVideoFrame),
     #[cfg(ndi_has_advanced_scatter_send)]
     Scatter {
@@ -225,7 +223,7 @@ enum AuthorizedVideo {
 impl AuthorizedVideo {
     fn into_frame(self) -> QueuedVideoFrame {
         match self {
-            Self::Pixels { frame, .. } => frame.into(),
+            Self::Pixels(frame) => frame.into_frame().into(),
             Self::Compressed(frame) => frame.into(),
             #[cfg(ndi_has_advanced_scatter_send)]
             Self::Scatter { frame, .. } => frame.into(),
@@ -234,7 +232,7 @@ impl AuthorizedVideo {
 
     fn retain(self, _slot: &mut DescriptorLease) -> QueuedStorage {
         match self {
-            Self::Pixels { frame, authorized } => QueuedStorage::Pixels { frame, authorized },
+            Self::Pixels(frame) => QueuedStorage::Pixels(frame),
             Self::Compressed(frame) => QueuedStorage::Packet(PendingVideo::Contiguous(frame)),
             #[cfg(ndi_has_advanced_scatter_send)]
             Self::Scatter { frame, table } => {
@@ -247,17 +245,14 @@ impl AuthorizedVideo {
 /// Every variant owns the exact capability its payload needs. Packet storage
 /// additionally owns the scatter table and stable list when one is needed.
 enum QueuedStorage {
-    Pixels {
-        frame: VideoFrame,
-        authorized: SendableVideoLayout,
-    },
+    Pixels(Sendable<VideoFrame>),
     Packet(PendingVideo),
 }
 
 impl QueuedStorage {
     fn into_frame(self) -> QueuedVideoFrame {
         let packet = match self {
-            Self::Pixels { frame, .. } => return QueuedVideoFrame::Pixels(frame),
+            Self::Pixels(frame) => return QueuedVideoFrame::Pixels(frame.into_frame()),
             Self::Packet(packet) => packet,
         };
         match packet.into_submitted() {
@@ -278,7 +273,7 @@ unsafe impl Lend for QueuedStorage {
 
     fn lend(&mut self, (): ()) -> Lent {
         match self {
-            Self::Pixels { frame, authorized } => frame.lend(*authorized),
+            Self::Pixels(frame) => frame.lend(()),
             Self::Packet(frame) => frame.lend_for_queue(),
         }
     }
@@ -1017,6 +1012,7 @@ fn take_completed(state: &mut State) -> Option<CompletedVideo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frames::VideoPartsExt;
 
     #[test]
     fn split_submission_reuses_reserved_descriptors() {
@@ -1317,31 +1313,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mismatched_pixel_authorization_cannot_mutate_admission_state() {
-        let pixels = VideoFrame::builder().resolution(2, 2).build().unwrap();
-        let wrong = VideoFrame::builder()
-            .resolution(2, 2)
-            .pixel_format(crate::PixelFormat::Uyvy)
-            .build()
-            .unwrap();
-        let proof = SendableVideoLayout::for_test(*wrong.layout());
-        let bytes = pixels.retained_bytes();
-        let frame = QueuedVideoFrame::from(pixels)
-            .authorize_with(
-                |_| Ok(proof),
-                || Err(Error::InvalidInput("unused scatter lookup".into())),
-            )
-            .unwrap();
-        let callback = CallbackState::new(QueueOptions::default()).unwrap();
-        let mut state = callback.state.lock().unwrap();
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.admit(frame, bytes)));
-        assert!(result.is_err());
-        assert_eq!((state.retained(), state.bytes, state.next), (0, 0, 1));
-    }
-
-    #[cfg(ndi_has_advanced_scatter_send)]
     #[test]
     fn every_authorized_storage_lends_its_original_completion_key() {
         let Some(ndi) = crate::test_support::advanced_ndi() else {

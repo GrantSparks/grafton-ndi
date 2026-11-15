@@ -89,7 +89,11 @@ impl Pixels {
         }
         self.bytes.clear();
         write(&mut self.bytes);
-        debug_assert_eq!(self.bytes.len(), len);
+        assert_eq!(
+            self.bytes.len(),
+            len,
+            "packed copy must initialize its complete layout"
+        );
         seal(&mut self.bytes, tail);
         self.tail = tail;
     }
@@ -218,6 +222,13 @@ mod tests {
         assert_eq!(pixels.as_slice(), [7; 100]);
         assert_eq!((pixels.capacity(), pixels.tail_room()), (164, 64));
         assert_eq!(pixels.room(), [0; 64]);
+    }
+
+    #[test]
+    #[should_panic(expected = "packed copy must initialize its complete layout")]
+    fn an_incomplete_packed_fill_is_refused_in_every_build() {
+        let mut pixels = Pixels::with_room(8, 64);
+        pixels.fill(8, 64, |bytes| bytes.extend_from_slice(&[7; 7]));
     }
 
     #[test]

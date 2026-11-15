@@ -32,6 +32,7 @@ use self::{
     downscale::{reduced, Downscaler},
     read::{Reader, Sink},
 };
+use crate::frames::VideoPartsExt;
 use crate::{
     color_info, frames::VideoParts, ColorInfo, ColorPrimaries, Error, PixelFormat, Result,
     TransferFunction, VideoPlane, VideoPlanes, YuvMatrix,

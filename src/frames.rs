@@ -676,9 +676,9 @@ impl VideoHeader {
 /// storage that [`layout`](Self::layout) describes, with every active row
 /// initialized and unchanged while `self` is borrowed. Row padding need not
 /// be initialized. Metadata text must remain a bounded NUL-terminated UTF-8
-/// string for the borrow. Any overridden descriptor builder must describe only
-/// live storage; an overridden `can_send_direct` must additionally guarantee
+/// string for the borrow. An overridden `can_send_direct` additionally guarantees
 /// initialization of the SDK's entire read, including padding and tail room.
+/// Copying, views and descriptors are non-overridable helpers.
 pub(crate) unsafe trait VideoParts {
     /// The validated layout of the frame's pixels.
     fn layout(&self) -> &ValidatedVideoLayout;
@@ -692,11 +692,6 @@ pub(crate) unsafe trait VideoParts {
     /// The frame's one validated metadata observation.
     fn frame_metadata(&self) -> FrameMetadataRef<'_>;
 
-    /// Keep the metadata's status beside its text for a lazy color read.
-    fn color_metadata(&self) -> crate::color_info::Metadata<'_> {
-        crate::color_info::Metadata::new(self.frame_metadata())
-    }
-
     /// The time the sender submitted the frame, when it is known.
     fn sdk_timestamp(&self) -> Option<SdkTimestamp>;
 
@@ -706,33 +701,36 @@ pub(crate) unsafe trait VideoParts {
         self.layout().payload_len_bytes == self.layout().data_len_bytes
             && crate::pixels::send_room(self.layout(), self.header().scan_type) == 0
     }
+}
 
-    /// Borrow this validated frame's SDK descriptor without copying pixels.
-    fn video_descriptor(&self, authorized: SendableVideoLayout) -> Result<NDIlib_video_frame_v2_t> {
-        let layout = self.layout();
-        if authorized.pixel_format != layout.pixel_format() {
-            return Err(Error::InvalidFrame(
-                "video send authorization does not match the storage's pixel format".into(),
-            ));
-        }
-        let header = self.header();
-        let (frame_rate_n, frame_rate_d) = header.frame_rate.to_sdk();
-        Ok(NDIlib_video_frame_v2_t {
-            xres: layout.sdk_width(),
-            yres: layout.sdk_height(),
-            FourCC: FourCc::from(layout.pixel_format()).raw(),
-            frame_rate_N: frame_rate_n,
-            frame_rate_D: frame_rate_d,
-            picture_aspect_ratio: header.picture_aspect_ratio.to_sdk(),
-            frame_format_type: header.scan_type.to_sdk(),
-            timecode: header.timecode.ticks(),
-            p_data: self.pixels().cast_mut(),
-            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                line_stride_in_bytes: layout.sdk_line_stride(),
-            },
-            p_metadata: self.frame_metadata().as_ptr(),
-            timestamp: SdkTimestamp::to_sdk(self.sdk_timestamp()),
-        })
+// SAFETY: a reference forwards every accessor and keeps its original owner
+// borrowed; it neither changes storage nor adds a new lifetime claim.
+unsafe impl<T: VideoParts + ?Sized> VideoParts for &T {
+    fn layout(&self) -> &ValidatedVideoLayout {
+        (**self).layout()
+    }
+    fn header(&self) -> &VideoHeader {
+        (**self).header()
+    }
+    fn pixels(&self) -> *const u8 {
+        (**self).pixels()
+    }
+    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+        (**self).frame_metadata()
+    }
+    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+        (**self).sdk_timestamp()
+    }
+    fn can_send_direct(&self) -> bool {
+        (**self).can_send_direct()
+    }
+}
+
+/// Shared operations whose blanket implementation prevents per-frame overrides.
+pub(crate) trait VideoPartsExt: VideoParts {
+    /// Keep the metadata's status beside its text for a lazy color read.
+    fn color_metadata(&self) -> crate::color_info::Metadata<'_> {
+        crate::color_info::Metadata::new(self.frame_metadata())
     }
 
     /// One plane, or `None` for an invalid index: the view behind every
@@ -769,7 +767,6 @@ pub(crate) unsafe trait VideoParts {
         let room = crate::pixels::send_room(&packed, self.header().scan_type);
         packed_video(
             self,
-            packed,
             Pixels::with_room(packed.data_len_bytes, room),
             metadata,
         )
@@ -798,12 +795,14 @@ pub(crate) unsafe trait VideoParts {
         let mut metadata = std::mem::take(&mut destination.metadata);
         metadata.copy_from(self.frame_metadata());
         let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
-        *destination = packed_video(self, packed, data, metadata);
+        *destination = packed_video(self, data, metadata);
     }
 
-    /// Fill reusable storage with packed active rows and a zeroed SDK tail.
-    fn copy_active_pixels(&self, data: &mut Pixels, packed: &ValidatedVideoLayout, room: usize) {
-        data.fill(packed.data_len_bytes, room, |bytes| {
+    /// Fill packed rows and SDK tail room derived only from this frame.
+    fn copy_active_pixels<'a>(&'a self, data: &'a mut Pixels) -> PackedVideo<'a> {
+        let layout = self.layout().packed();
+        let room = crate::pixels::send_room(&layout, self.header().scan_type);
+        data.fill(layout.data_len_bytes, room, |bytes| {
             for plane in self.plane_views() {
                 match plane.data() {
                     Some(active) => bytes.extend_from_slice(active),
@@ -811,6 +810,47 @@ pub(crate) unsafe trait VideoParts {
                 }
             }
         });
+        PackedVideo {
+            layout,
+            pixels: data,
+            header: self.header(),
+            metadata: self.frame_metadata(),
+            timestamp: self.sdk_timestamp(),
+        }
+    }
+}
+
+impl<T: VideoParts + ?Sized> VideoPartsExt for T {}
+
+/// The exact packed storage initialized by `copy_active_pixels`.
+pub(crate) struct PackedVideo<'a> {
+    layout: ValidatedVideoLayout,
+    pixels: &'a Pixels,
+    header: &'a VideoHeader,
+    metadata: FrameMetadataRef<'a>,
+    timestamp: Option<SdkTimestamp>,
+}
+
+// SAFETY: only the copy kernel constructs this view, after filling its own
+// computed layout and zeroed tail. All other fields borrow the source frame.
+unsafe impl VideoParts for PackedVideo<'_> {
+    fn layout(&self) -> &ValidatedVideoLayout {
+        &self.layout
+    }
+    fn header(&self) -> &VideoHeader {
+        self.header
+    }
+    fn pixels(&self) -> *const u8 {
+        self.pixels.as_ptr()
+    }
+    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+        self.metadata
+    }
+    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+        self.timestamp
+    }
+    fn can_send_direct(&self) -> bool {
+        true
     }
 }
 
@@ -940,19 +980,19 @@ pub trait VideoSource: VideoParts {
 /// here. Filling storage that holds the copy neither allocates nor panics.
 fn packed_video<P: VideoParts + ?Sized>(
     source: &P,
-    packed: ValidatedVideoLayout,
     mut data: Pixels,
     metadata: OwnedFrameMetadata,
 ) -> VideoFrame {
-    let room = crate::pixels::send_room(&packed, source.header().scan_type);
-    source.copy_active_pixels(&mut data, &packed, room);
-
+    let packed = source.copy_active_pixels(&mut data);
+    let layout = *packed.layout();
+    let header = *packed.header();
+    let timestamp = packed.sdk_timestamp();
     VideoFrame {
-        layout: packed,
-        header: *source.header(),
+        layout,
+        header,
         data,
         metadata,
-        timestamp: source.sdk_timestamp(),
+        timestamp,
     }
 }
 
@@ -1146,7 +1186,7 @@ macro_rules! video_accessors {
             /// # Ok::<(), Box<dyn std::error::Error>>(())
             /// ```
             pub fn color_info(&self) -> $crate::Result<Option<$crate::ColorInfo>> {
-                $crate::frames::VideoParts::color_metadata(self).read()
+                $crate::frames::VideoPartsExt::color_metadata(self).read()
             }
 
             /// Get one plane in SDK memory order, or `None` for an invalid index.
@@ -1158,13 +1198,13 @@ macro_rules! video_accessors {
             $(#[$plane])*
             #[inline]
             pub fn plane(&self, index: usize) -> Option<$crate::VideoPlane<'_>> {
-                $crate::frames::VideoParts::plane_view(self, index)
+                $crate::frames::VideoPartsExt::plane_view(self, index)
             }
 
             /// Iterate planes in SDK memory order without allocating or copying.
             #[inline]
             pub fn planes(&self) -> $crate::VideoPlanes<'_> {
-                $crate::frames::VideoParts::plane_views(self)
+                $crate::frames::VideoPartsExt::plane_views(self)
             }
 
             /// Encode the frame as an image, as `options` describe.
@@ -1498,18 +1538,9 @@ impl VideoFrame {
             .saturating_add(self.metadata.retained_bytes())
     }
 
-    /// The SDK descriptor of this frame, borrowing its pixels and metadata.
-    pub(crate) fn to_raw(
-        &self,
-        authorized: SendableVideoLayout,
-    ) -> Result<NDIlib_video_frame_v2_t> {
-        self.video_descriptor(authorized)
-    }
-
     #[cfg(test)]
     pub(crate) fn as_test_raw(&self) -> NDIlib_video_frame_v2_t {
-        self.to_raw(SendableVideoLayout::for_test(*self.layout()))
-            .unwrap()
+        Sendable::for_test(self).video_descriptor()
     }
 
     /// Set the timecode without reallocating the pixels.
@@ -3695,26 +3726,90 @@ pub(crate) struct ValidatedVideoLayout {
     line_stride_bytes: usize,
 }
 
-/// A pixel format authorized for the selected runtime. Geometry belongs only
-/// to the storage described by `VideoParts`, never to this capability proof.
-#[derive(Clone, Copy)]
-pub(crate) struct SendableVideoLayout {
-    pixel_format: PixelFormat,
+/// A frame together with the capability proof obtained for that frame.
+/// Geometry stays with its storage; no other frame can consume its proof.
+pub(crate) struct Sendable<F> {
+    frame: F,
     _planar444: Option<&'static sys::Planar444Video>,
 }
 
-impl SendableVideoLayout {
-    pub(crate) fn new(layout: ValidatedVideoLayout, ndi: &crate::Ndi) -> Result<Self> {
-        let planar444 = layout.pixel_format().require_sendable(ndi)?;
-        Ok(Self {
-            pixel_format: layout.pixel_format(),
-            _planar444: planar444,
-        })
+impl<F> std::ops::Deref for Sendable<F> {
+    type Target = F;
+    fn deref(&self) -> &F {
+        &self.frame
+    }
+}
+
+impl<F: VideoParts> Sendable<F> {
+    fn checked(frame: F, ndi: &crate::Ndi) -> std::result::Result<Self, (Error, F)> {
+        match frame.layout().pixel_format().require_sendable(ndi) {
+            Ok(planar444) => Ok(Self {
+                frame,
+                _planar444: planar444,
+            }),
+            Err(error) => Err((error, frame)),
+        }
+    }
+
+    pub(crate) fn new(frame: F, ndi: &crate::Ndi) -> std::result::Result<Self, Rejected<F>> {
+        Self::checked(frame, ndi).map_err(|(error, frame)| Rejected::new(error, frame))
+    }
+
+    pub(crate) fn frame(&self) -> &F {
+        &self.frame
+    }
+    pub(crate) fn into_frame(self) -> F {
+        self.frame
+    }
+
+    pub(crate) fn video_descriptor(&self) -> NDIlib_video_frame_v2_t {
+        let frame = &self.frame;
+        let layout = frame.layout();
+        let header = frame.header();
+        let (frame_rate_n, frame_rate_d) = header.frame_rate.to_sdk();
+        NDIlib_video_frame_v2_t {
+            xres: layout.sdk_width(),
+            yres: layout.sdk_height(),
+            FourCC: FourCc::from(layout.pixel_format()).raw(),
+            frame_rate_N: frame_rate_n,
+            frame_rate_D: frame_rate_d,
+            picture_aspect_ratio: header.picture_aspect_ratio.to_sdk(),
+            frame_format_type: header.scan_type.to_sdk(),
+            timecode: header.timecode.ticks(),
+            p_data: frame.pixels().cast_mut(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: layout.sdk_line_stride(),
+            },
+            p_metadata: frame.frame_metadata().as_ptr(),
+            timestamp: SdkTimestamp::to_sdk(frame.sdk_timestamp()),
+        }
+    }
+
+    /// Copies preserve the pixel format that the capability authorizes.
+    pub(crate) fn copied(self, reusable: Option<VideoFrame>) -> Sendable<VideoFrame> {
+        let frame = match reusable {
+            Some(mut frame) => {
+                self.frame.copy_into_owned(&mut frame);
+                frame
+            }
+            None => self.frame.owned_copy(),
+        };
+        Sendable {
+            frame,
+            _planar444: self._planar444,
+        }
+    }
+
+    pub(crate) fn packed<'a>(&'a self, pixels: &'a mut Pixels) -> Sendable<PackedVideo<'a>> {
+        Sendable {
+            frame: self.frame.copy_active_pixels(pixels),
+            _planar444: self._planar444,
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(layout: ValidatedVideoLayout) -> Self {
-        let pixel_format = layout.pixel_format();
+    pub(crate) fn for_test(frame: F) -> Self {
+        let pixel_format = frame.layout().pixel_format();
         let planar444 = if matches!(
             pixel_format.info().category(),
             FormatCategory::Planar444 | FormatCategory::Planar444Alpha
@@ -3726,9 +3821,16 @@ impl SendableVideoLayout {
             None
         };
         Self {
-            pixel_format,
+            frame,
             _planar444: planar444,
         }
+    }
+}
+
+impl<'a, F: VideoParts + ?Sized> Sendable<&'a F> {
+    /// Borrowed gates return their typed refusal without allocating recovery storage.
+    pub(crate) fn borrowed(frame: &'a F, ndi: &crate::Ndi) -> Result<Self> {
+        Self::checked(frame, ndi).map_err(|(error, _)| error)
     }
 }
 

@@ -166,7 +166,7 @@ impl V210Layout {
         let frame =
             crate::BorrowedVideoFrame::builder(data, self.width, self.height, PixelFormat::P216)
                 .build()?;
-        frame.video_descriptor(crate::frames::SendableVideoLayout::new(p216, ndi)?)
+        Ok(crate::frames::Sendable::borrowed(&frame, ndi)?.video_descriptor())
     }
 
     /// Borrow writable P216 storage without deriving the output pointer from
@@ -180,7 +180,7 @@ impl V210Layout {
             None,
         )?;
         let frame = P216Output::new(layout, data)?;
-        frame.video_descriptor(crate::frames::SendableVideoLayout::new(layout, ndi)?)
+        Ok(crate::frames::Sendable::borrowed(&frame, ndi)?.video_descriptor())
     }
 
     /// The SDK descriptor of this layout's V210 words at `data`: `p216`, the
@@ -344,10 +344,7 @@ impl VideoConverter {
         layout.check_p216(source)?;
         self.pack_descriptor(
             layout,
-            source.video_descriptor(crate::frames::SendableVideoLayout::new(
-                *source.layout(),
-                &self._ndi,
-            )?)?,
+            crate::frames::Sendable::borrowed(source, &self._ndi)?.video_descriptor(),
             destination,
         )
     }
@@ -624,7 +621,7 @@ mod tests {
     fn strided_borrowed_and_captured_p216_convert_without_pixel_copies() {
         use crate::{
             capture::{FrameSyncVideoFree, Guard, VideoKind},
-            frames::{VideoParts, VideoRef},
+            frames::VideoRef,
             BorrowedVideoFrame,
         };
         let Some(ndi) = crate::test_support::ndi() else {
@@ -652,11 +649,7 @@ mod tests {
                             .metadata(c"<p216/>")
                             .build()
                             .unwrap();
-                    let raw = borrowed
-                        .video_descriptor(crate::frames::SendableVideoLayout::for_test(
-                            *borrowed.layout(),
-                        ))
-                        .unwrap();
+                    let raw = crate::frames::Sendable::for_test(&borrowed).video_descriptor();
                     // SAFETY: Both synthetic guards borrow storage and static
                     // metadata for this test, and neither callback frees them.
                     let receiver = unsafe {
@@ -688,11 +681,8 @@ mod tests {
                         .unwrap();
                     for source in [&borrowed as &dyn VideoSource, &receiver, &framesync] {
                         assert_eq!(
-                            source
-                                .video_descriptor(crate::frames::SendableVideoLayout::for_test(
-                                    *source.layout()
-                                ))
-                                .unwrap()
+                            crate::frames::Sendable::for_test(source)
+                                .video_descriptor()
                                 .p_data,
                             raw.p_data
                         );

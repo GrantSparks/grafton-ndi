@@ -56,9 +56,8 @@ where
         }
         assert_eq!(VideoSource::data(&frame), Some(pixels.as_slice()));
         assert_eq!(
-            frame
-                .video_descriptor(SendableVideoLayout::for_test(*frame.layout()))
-                .unwrap()
+            Sendable::for_test(&frame)
+                .video_descriptor()
                 .p_metadata
                 .is_null(),
             status != FrameMetadataStatus::Text
@@ -418,9 +417,7 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
     let captured_video = unsafe {
         VideoFrameRef::new(Guard::with_test_free(
             ptr::null_mut(),
-            present_video
-                .video_descriptor(SendableVideoLayout::for_test(*present_video.layout()))
-                .unwrap(),
+            Sendable::for_test(&present_video).video_descriptor(),
             count_free,
         ))
         .unwrap()
@@ -428,9 +425,7 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
     let captured_bare_video = unsafe {
         VideoFrameRef::new(Guard::with_test_free(
             ptr::null_mut(),
-            absent_video
-                .video_descriptor(SendableVideoLayout::for_test(*absent_video.layout()))
-                .unwrap(),
+            Sendable::for_test(&absent_video).video_descriptor(),
             count_free,
         ))
         .unwrap()
