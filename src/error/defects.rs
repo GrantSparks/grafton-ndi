@@ -244,9 +244,6 @@ pub enum FrameDefect {
     /// Invalid compressed video size.
     #[error("Invalid compressed video size")]
     CompressedVideoSize,
-    /// Packet codec does not match video descriptor.
-    #[error("Packet codec does not match video descriptor")]
-    VideoCodecMismatch,
     /// Truncated SpeedHQ frame.
     #[error("Truncated SpeedHQ frame")]
     SpeedHqTruncated,
@@ -268,9 +265,6 @@ pub enum FrameDefect {
     /// Invalid compressed audio size.
     #[error("Invalid compressed audio size")]
     CompressedAudioSize,
-    /// Invalid AAC packet envelope.
-    #[error("Invalid AAC packet envelope")]
-    AacEnvelope,
     /// Invalid compressed frame buffer.
     #[error("Invalid compressed frame buffer")]
     CompressedBuffer,

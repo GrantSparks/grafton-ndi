@@ -17,6 +17,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- Compressed packet-envelope refusals use the same typed cause for contiguous,
+  scatter and received packets; codec mismatches use `PacketCodecMismatch`,
+  and empty AAC payloads use `EmptyCodecPayload`.
+
 - `InvalidFrame`, `InvalidInput` and `UnexpectedSdkResult` carry typed
   `FrameDefect`, `InputDefect` and `SdkResultDefect` causes. Receiver capture
   failures use `ConnectionLost`; initialization retains `InitializationFailure`
