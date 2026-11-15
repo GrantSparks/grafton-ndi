@@ -626,12 +626,14 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
         timeout: Duration,
     ) -> Result<Option<SourceNameChange>> {
         let deadline = Deadline::after(timeout)?;
-        let (source_name, strings) = self.inner.core.source_name_tables()?;
+        // The task owns copies of the immutable tables it validated, keeping
+        // its inputs independent of reference-lifetime inference on the MSRV.
+        let (source_name, strings) = *self.inner.core.source_name_tables()?;
         let receiver = Arc::clone(&self.inner);
         R::spawn_stoppable(private::Token, move |stop| {
             receiver
                 .core
-                .poll_source_name_change_with(source_name, strings, deadline, stop)
+                .poll_source_name_change_with(&source_name, &strings, deadline, stop)
         })
         .await?
     }
