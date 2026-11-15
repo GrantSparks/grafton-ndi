@@ -1872,8 +1872,7 @@ impl ReceiverCore {
         match result {
             CaptureResult::Frame(guard) => {
                 // Validation (e.g. FourCC) happens during ref construction.
-                // SAFETY: the guard owns a frame this capture reported as `K`'s kind.
-                let frame_ref = unsafe { K::make_ref(guard)? };
+                let frame_ref = K::make_ref(guard)?;
                 Ok(Some(frame_ref))
             }
             CaptureResult::Notification(notification) => {
@@ -1935,14 +1934,9 @@ impl ReceiverCore {
 
     fn combined_result(media: Media<'_>) -> Result<ReceiverItemRef<'_>> {
         Ok(match media {
-            // SAFETY: all-slot dispatch guards each delivered descriptor
-            // with its matching capture kind and free operation. Construction
-            // validates the active layout without reading native padding.
-            Media::Video(guard) => ReceiverItemRef::Video(unsafe { VideoKind::make_ref(guard)? }),
-            Media::Audio(guard) => ReceiverItemRef::Audio(unsafe { AudioKind::make_ref(guard)? }),
-            Media::Metadata(guard) => {
-                ReceiverItemRef::Metadata(unsafe { MetadataKind::make_ref(guard)? })
-            }
+            Media::Video(guard) => ReceiverItemRef::Video(VideoKind::make_ref(guard)?),
+            Media::Audio(guard) => ReceiverItemRef::Audio(AudioKind::make_ref(guard)?),
+            Media::Metadata(guard) => ReceiverItemRef::Metadata(MetadataKind::make_ref(guard)?),
         })
     }
 

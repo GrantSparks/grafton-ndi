@@ -74,22 +74,18 @@ macro_rules! borrowed_extras {
 
 impl<'rx> CompressedVideoRef<'rx> {
     pub(crate) fn new(frame: Guard<'rx, VideoKind>) -> Result<Self> {
-        // SAFETY: the capture guard retains this delivered descriptor, payload,
-        // and metadata unchanged until release. Validation keeps only the
-        // checked format and payload extent from that same descriptor.
-        let frame = unsafe {
-            ValidatedFrame::validate(frame, |raw| {
-                let format = VideoPacketFormat::from_sdk(raw)?;
-                // SAFETY: the delivered size union names the guard's readable
-                // initialized allocation; packet_bytes checks its extent.
-                let bytes = packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)?;
-                validate_video_packet(format, bytes, Use::Receive)?;
-                Ok(VideoPacketParts {
-                    format,
-                    len: bytes.len(),
-                })
-            })?
-        };
+        let frame = ValidatedFrame::validate(frame, |raw| {
+            let format = VideoPacketFormat::from_sdk(raw)?;
+            // SAFETY: the delivered size union names the guard's readable
+            // initialized allocation; packet_bytes checks its extent.
+            let bytes =
+                unsafe { packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
+            validate_video_packet(format, bytes, Use::Receive)?;
+            Ok(VideoPacketParts {
+                format,
+                len: bytes.len(),
+            })
+        })?;
         Ok(Self { frame })
     }
 
@@ -150,25 +146,22 @@ impl<'rx> CompressedVideoRef<'rx> {
 
 impl<'rx> CompressedAudioRef<'rx> {
     pub(crate) fn new(frame: Guard<'rx, AudioKind>) -> Result<Self> {
-        // SAFETY: as for compressed video: this capture guard retains every
-        // byte described by the validated packet parts and metadata scan.
-        let frame = unsafe {
-            ValidatedFrame::validate(frame, |raw| {
-                let (codec, protected) = AudioCodec::from_outer(raw.FourCC)
-                    .ok_or_else(|| invalid_frame(crate::FrameDefect::UnknownCompressedAudio))?;
-                let parameters = AudioParameters::from_sdk(raw)?;
-                // SAFETY: this delivered union names the guard's initialized
-                // readable payload; packet_bytes checks the positive extent.
-                let bytes = packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)?;
-                validate_received_audio(codec, bytes)?;
-                Ok(AudioPacketParts {
-                    codec,
-                    protected,
-                    parameters,
-                    len: bytes.len(),
-                })
-            })?
-        };
+        let frame = ValidatedFrame::validate(frame, |raw| {
+            let (codec, protected) = AudioCodec::from_outer(raw.FourCC)
+                .ok_or_else(|| invalid_frame(crate::FrameDefect::UnknownCompressedAudio))?;
+            let parameters = AudioParameters::from_sdk(raw)?;
+            // SAFETY: this delivered union names the guard's initialized
+            // readable payload; packet_bytes checks the positive extent.
+            let bytes =
+                unsafe { packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
+            validate_received_audio(codec, bytes)?;
+            Ok(AudioPacketParts {
+                codec,
+                protected,
+                parameters,
+                len: bytes.len(),
+            })
+        })?;
         Ok(Self { frame })
     }
 

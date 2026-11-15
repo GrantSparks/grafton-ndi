@@ -430,8 +430,7 @@ impl<'a> FrameSyncCapture<'a> {
         let Some(guard) = self.resource.capture_video(scan_type) else {
             return Ok(None);
         };
-        // SAFETY: the guard owns the frame just returned by this live resource.
-        Ok(Some(unsafe { FrameSyncVideoRef::new(guard)? }))
+        Ok(Some(FrameSyncVideoRef::new(guard)?))
     }
 
     /// Capture owned resampled audio; see [`FrameSync::capture_audio`].
@@ -454,8 +453,7 @@ impl<'a> FrameSyncCapture<'a> {
         request: FrameSyncAudioRequest,
     ) -> Result<FrameSyncAudioRef<'a>> {
         let guard = self.resource.capture_audio(AudioCall::Samples(request));
-        // SAFETY: the guard owns the samples this live resource just returned.
-        unsafe { FrameSyncAudioRef::new(guard) }
+        FrameSyncAudioRef::new(guard)
     }
 
     /// Query the cached input audio format; see [`FrameSync::audio_input_format`].
@@ -1408,7 +1406,7 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = unsafe { FrameSyncVideoRef::new(guard) }.expect("valid video frame");
+        let frame = FrameSyncVideoRef::new(guard).expect("valid video frame");
 
         assert_eq!(frame.metadata(), Some("framesync video"));
         assert_eq!(frame.data().unwrap().len(), expected_len);
@@ -1446,7 +1444,7 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = unsafe { FrameSyncVideoRef::new(guard) }.unwrap();
+        let frame = FrameSyncVideoRef::new(guard).unwrap();
         assert_eq!(frame.metadata(), None);
         assert_eq!(
             frame.metadata_status(),
@@ -1476,7 +1474,7 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let result = unsafe { FrameSyncVideoRef::new(guard) };
+        let result = FrameSyncVideoRef::new(guard);
         assert!(matches!(result, Err(Error::InvalidFrame(_))));
     }
 
@@ -1568,12 +1566,23 @@ mod tests {
             ..no_source
         };
         for raw in [no_source, format_only] {
+            let released = std::cell::Cell::new(0usize);
+            // SAFETY: both descriptors have null storage. The callback's
+            // synthetic instance retains this live release counter only.
             let guard = unsafe {
-                Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {})
+                Guard::<FrameSyncAudioFree>::with_test_free(
+                    ptr::from_ref(&released).cast_mut().cast(),
+                    raw,
+                    |instance, _| {
+                        let released = &*instance.cast::<std::cell::Cell<usize>>();
+                        released.set(released.get() + 1);
+                    },
+                )
             };
-            let result = unsafe { FrameSyncAudioRef::new(guard) };
+            let result = FrameSyncAudioRef::new(guard);
 
             assert!(matches!(result, Err(Error::InvalidFrame(_))));
+            assert_eq!(released.get(), 1, "empty input-format guard releases once");
         }
     }
 
@@ -1603,7 +1612,7 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = unsafe { FrameSyncAudioRef::new(guard) }.expect("strided audio frame");
+        let frame = FrameSyncAudioRef::new(guard).expect("strided audio frame");
 
         assert_eq!(frame.metadata(), Some("framesync audio"));
         assert!(frame.data().is_none());
@@ -1643,7 +1652,7 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = unsafe { FrameSyncAudioRef::new(guard) }.unwrap();
+        let frame = FrameSyncAudioRef::new(guard).unwrap();
         assert_eq!(frame.metadata(), None);
         assert_eq!(frame.metadata_status(), crate::FrameMetadataStatus::NotUtf8);
         assert_eq!(frame.to_owned().metadata(), None);

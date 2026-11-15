@@ -247,7 +247,7 @@ where
         // AV sync uses a borrowed descriptor rather than a receive Guard. It
         // shares the same metadata-state validation and forwarding policy.
         let (returned, allocations) = crate::test_alloc::allocation_count(|| unsafe {
-            ValidatedAudio::returned_audio(&raw).unwrap()
+            ValidatedAudio::returned_audio_descriptor(&raw).unwrap()
         });
         assert_eq!(allocations, 0);
         let ReturnedAudio::Samples(returned) = returned else {
@@ -414,38 +414,34 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
     let bare_audio = absent_audio.to_owned();
     // SAFETY: the input slices and metadata remain alive and immutable until
     // these guards are dropped; their callback releases no borrowed storage.
-    let captured_video = unsafe {
-        VideoFrameRef::new(Guard::with_test_free(
+    let captured_video = VideoFrameRef::new(unsafe {
+        Guard::with_test_free(
             ptr::null_mut(),
             Sendable::for_test(&present_video).video_descriptor(),
             count_free,
-        ))
-        .unwrap()
-    };
-    let captured_bare_video = unsafe {
-        VideoFrameRef::new(Guard::with_test_free(
+        )
+    })
+    .unwrap();
+    let captured_bare_video = VideoFrameRef::new(unsafe {
+        Guard::with_test_free(
             ptr::null_mut(),
             Sendable::for_test(&absent_video).video_descriptor(),
             count_free,
-        ))
-        .unwrap()
-    };
-    let captured_audio = unsafe {
-        AudioFrameRef::new(Guard::with_test_free(
+        )
+    })
+    .unwrap();
+    let captured_audio = AudioFrameRef::new(unsafe {
+        Guard::with_test_free(
             ptr::null_mut(),
             present_audio.audio_descriptor(),
             count_free,
-        ))
-        .unwrap()
-    };
-    let captured_bare_audio = unsafe {
-        AudioFrameRef::new(Guard::with_test_free(
-            ptr::null_mut(),
-            absent_audio.audio_descriptor(),
-            count_free,
-        ))
-        .unwrap()
-    };
+        )
+    })
+    .unwrap();
+    let captured_bare_audio = AudioFrameRef::new(unsafe {
+        Guard::with_test_free(ptr::null_mut(), absent_audio.audio_descriptor(), count_free)
+    })
+    .unwrap();
     let video_sources: [&dyn VideoSource; 8] = [
         &present_video,
         &absent_video,

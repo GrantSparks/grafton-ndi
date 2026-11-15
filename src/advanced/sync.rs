@@ -644,28 +644,23 @@ impl<'a> AvSyncCapture<'a> {
             // SAFETY: the synchronizer and runtime remain borrowed through
             // the result; its guard returns this descriptor exactly once.
             let guard = unsafe { Guard::new(&self.resource.receiver._ndi, instance, audio) };
-            unsafe { outcome_with_call(status, guard) }
+            outcome_with_call(status, guard)
         })
     }
 }
 
 /// Validate one synchronization while its guard owns every returned buffer.
-///
-/// # Safety
-///
-/// For the two successful statuses, `audio` is a frame descriptor whose data
-/// and metadata pointers are null or valid for the layout it describes.
+/// The guard retains every non-null sample or metadata extent, including
+/// empty request descriptors returned for statuses without audio.
 #[cfg(any(test, ndi_has_advanced_av_sync))]
-unsafe fn outcome_with_call<'a>(
+fn outcome_with_call<'a>(
     called: crate::sys::table::Called<Synchronized>,
     audio: Guard<'a, AvSyncAudioFree>,
 ) -> Result<AvSyncOutcomeRef<'a>> {
     Ok(match *called.value() {
         Synchronized::Matched | Synchronized::Adjusted => {
             let samples_adjusted = *called.value() == Synchronized::Adjusted;
-            // SAFETY: forwarded to the caller; the guard retains the native
-            // descriptor and every buffer throughout validation and borrowing.
-            match unsafe { ValidatedAudio::returned_audio(audio)? } {
+            match ValidatedAudio::returned_audio(audio)? {
                 // The format of an empty result is not reported.
                 ReturnedAudio::Empty(_) => AvSyncOutcomeRef::Empty { samples_adjusted },
                 ReturnedAudio::Samples(validated) => AvSyncOutcomeRef::Audio {
@@ -710,17 +705,14 @@ unsafe fn outcome_with_call<'a>(
 }
 
 #[cfg(test)]
-unsafe fn outcome<'a>(
+fn outcome<'a>(
     status: Synchronized,
     audio: Guard<'a, AvSyncAudioFree>,
 ) -> Result<AvSyncOutcomeRef<'a>> {
-    // SAFETY: forwarded to the caller's delivered-frame contract.
-    unsafe {
-        outcome_with_call(
-            crate::sys::table::for_test(status, c"NDIlib_avsync_synchronize"),
-            audio,
-        )
-    }
+    outcome_with_call(
+        crate::sys::table::for_test(status, c"NDIlib_avsync_synchronize"),
+        audio,
+    )
 }
 
 mod video_sealed {
@@ -1158,7 +1150,7 @@ mod tests {
                 |_, _| {},
             )
         };
-        unsafe { outcome(status, guard) }.map(|outcome| outcome.to_owned())
+        outcome(status, guard).map(|outcome| outcome.to_owned())
     }
 
     #[test]
@@ -1354,7 +1346,7 @@ mod tests {
         };
         // SAFETY: `pixels` holds every row the descriptor describes and stays
         // borrowed for as long as the frame; the synthetic free owns nothing.
-        unsafe { VideoKind::make_ref(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})) }
+        VideoKind::make_ref(unsafe { Guard::with_test_free(ptr::null_mut(), raw, |_, _| {}) })
             .unwrap()
     }
 
@@ -1427,9 +1419,9 @@ mod tests {
             raw.timestamp = 1234;
             // SAFETY: backing owns the descriptor's complete validated storage
             // throughout this synthetic capture and copy; no-op free owns nothing.
-            let captured = unsafe {
-                VideoKind::make_ref(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {}))
-            }
+            let captured = VideoKind::make_ref(unsafe {
+                Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})
+            })
             .unwrap();
             let owned = captured.to_owned();
             let video = AvSyncVideo::new(&owned).unwrap();
@@ -1520,7 +1512,7 @@ mod tests {
         ] {
             let before = released.get();
             let guard = test_guard(samples.audio_descriptor(), &released);
-            let result = unsafe { outcome(status, guard) };
+            let result = outcome(status, guard);
             if matches!(status, Synchronized::Matched | Synchronized::Adjusted) {
                 assert_eq!(released.get(), before);
             } else {
@@ -1531,9 +1523,7 @@ mod tests {
         }
         // A misaligned buffer is rejected before reading but still released.
         let before = released.get();
-        assert!(
-            unsafe { outcome(Synchronized::Matched, test_guard(descriptor(), &released)) }.is_err()
-        );
+        assert!(outcome(Synchronized::Matched, test_guard(descriptor(), &released)).is_err());
         assert_eq!(released.get(), before + 1);
         // Empty status may own metadata alone; that allocation is returned too.
         let raw = NDIlib_audio_frame_v3_t {
@@ -1542,7 +1532,7 @@ mod tests {
         };
         let before = released.get();
         assert!(matches!(
-            unsafe { outcome(Synchronized::Matched, test_guard(raw, &released)) }.unwrap(),
+            outcome(Synchronized::Matched, test_guard(raw, &released)).unwrap(),
             AvSyncOutcomeRef::Empty { .. }
         ));
         assert_eq!(released.get(), before + 1);
@@ -1578,12 +1568,10 @@ mod tests {
             .build()
             .unwrap();
         let released = Cell::new(0);
-        let result = unsafe {
-            outcome(
-                Synchronized::Matched,
-                test_guard(source.audio_descriptor(), &released),
-            )
-        }
+        let result = outcome(
+            Synchronized::Matched,
+            test_guard(source.audio_descriptor(), &released),
+        )
         .unwrap();
         let AvSyncOutcomeRef::Audio { frame, .. } = &result else {
             panic!("matched samples")
@@ -1609,8 +1597,7 @@ mod tests {
                 timestamp,
                 ..source.audio_descriptor()
             };
-            let result =
-                unsafe { outcome(Synchronized::Matched, test_guard(raw, &released)) }.unwrap();
+            let result = outcome(Synchronized::Matched, test_guard(raw, &released)).unwrap();
             let AvSyncOutcomeRef::Audio { frame, .. } = result else {
                 panic!("matched samples")
             };
@@ -1658,7 +1645,7 @@ mod tests {
         };
         assert_eq!(guard.audio_timestamp(raw.timestamp), None);
         assert!(matches!(
-            unsafe { outcome(Synchronized::NoAudioStream, guard) }.unwrap(),
+            outcome(Synchronized::NoAudioStream, guard).unwrap(),
             AvSyncOutcomeRef::NoAudioStream
         ));
     }

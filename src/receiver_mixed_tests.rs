@@ -48,7 +48,7 @@ fn borrowed_video_item_allocates_nothing_and_owned_copy_skips_uninitialized_padd
         // SAFETY: active rows are initialized and immutable for the item;
         // padding stays uninitialized and the callback frees only the guard.
         let frame =
-            unsafe { VideoKind::make_ref(Guard::with_test_free(instance, raw, free_video)) }
+            VideoKind::make_ref(unsafe { Guard::with_test_free(instance, raw, free_video) })
                 .unwrap();
         ReceiverItemRef::Video(frame)
     });
@@ -92,7 +92,7 @@ fn borrowed_audio_item_allocates_nothing_and_owned_copy_skips_uninitialized_chan
         // SAFETY: each active channel is aligned/initialized and remains
         // immutable through the guard. Channel padding is never initialized.
         let frame =
-            unsafe { AudioKind::make_ref(Guard::with_test_free(instance, raw, free_audio)) }
+            AudioKind::make_ref(unsafe { Guard::with_test_free(instance, raw, free_audio) })
                 .unwrap();
         ReceiverItemRef::Audio(frame)
     });
@@ -120,13 +120,13 @@ fn metadata_and_event_items_have_the_documented_allocation_costs() {
     let (item, allocations) = allocation_count(|| {
         // SAFETY: static NUL-terminated text outlives the synthetic guard,
         // whose callback records release without freeing static storage.
-        let frame = unsafe {
-            MetadataKind::make_ref(Guard::with_test_free(
+        let frame = MetadataKind::make_ref(unsafe {
+            Guard::with_test_free(
                 ptr::from_ref(&releases).cast_mut().cast(),
                 raw,
                 free_metadata,
-            ))
-        }
+            )
+        })
         .unwrap();
         ReceiverItemRef::Metadata(frame)
     });

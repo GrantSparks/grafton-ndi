@@ -731,7 +731,8 @@ impl FrameExtras {
         };
         // SAFETY: only metadata is inspected; the caller retains its bounded
         // readable text while this synthetic descriptor is borrowed.
-        let frame = unsafe { crate::frames::ValidatedFrame::validate(&descriptor, |_| Ok(()))? };
+        let frame =
+            unsafe { crate::frames::ValidatedFrame::validate_descriptor(&descriptor, |_| Ok(()))? };
         let mut extras = Self::default();
         extras.copy_received(
             Timecode::from_ticks(timecode),

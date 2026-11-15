@@ -1798,7 +1798,7 @@ impl VideoFrame {
     #[cfg(test)]
     pub(crate) unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Result<VideoFrame> {
         // SAFETY: forwarded to the caller; the borrow holds the descriptor.
-        let frame = unsafe { ValidatedVideo::video(c_frame)? };
+        let frame = unsafe { ValidatedVideo::video_descriptor(c_frame)? };
         Ok(frame.owned_copy())
     }
 }
@@ -2721,7 +2721,7 @@ impl AudioFrame {
     /// initialized active samples through this ownership copy.
     pub(crate) unsafe fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Result<AudioFrame> {
         // SAFETY: forwarded to the caller; the borrow holds the descriptor.
-        let frame = unsafe { ValidatedAudio::audio(&raw)? };
+        let frame = unsafe { ValidatedAudio::audio_descriptor(&raw)? };
         Ok(frame.owned_copy())
     }
 
@@ -4589,6 +4589,7 @@ where
     }
 }
 
+#[cfg(test)]
 impl<D: SdkDescriptor> HoldsDescriptor for &D {
     type Descriptor = D;
 
@@ -4638,7 +4639,7 @@ impl<F: HoldsDescriptor, V> ValidatedFrame<F, V> {
     /// validator must establish those parts from the descriptor it receives.
     /// A non-null metadata pointer must remain readable through its first NUL
     /// or [`MAX_METADATA_BYTES`], whichever comes first.
-    pub(crate) unsafe fn validate(
+    unsafe fn validate_held(
         frame: F,
         validate: impl FnOnce(&F::Descriptor) -> Result<V>,
     ) -> Result<Self> {
@@ -4711,9 +4712,10 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_video_frame_v2_t>> ValidatedVideo<F>
     /// metadata pointer must be null or readable up to its first NUL or
     /// [`MAX_METADATA_BYTES`], all live and unchanged. Row padding need not
     /// be initialized.
-    pub(crate) unsafe fn video(frame: F) -> Result<Self> {
+    #[cfg(test)]
+    unsafe fn video_held(frame: F) -> Result<Self> {
         // SAFETY: forwarded to the caller for this held video descriptor.
-        unsafe { Self::validate(frame, validate_video_frame) }
+        unsafe { Self::validate_held(frame, validate_video_frame) }
     }
 }
 
@@ -4728,9 +4730,10 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> ValidatedAudio<F>
     /// describes must be initialized, and its metadata pointer must be null
     /// or readable up to its first NUL or [`MAX_METADATA_BYTES`], all live
     /// and unchanged. Padding between channels need not be initialized.
-    pub(crate) unsafe fn audio(frame: F) -> Result<Self> {
+    #[cfg(test)]
+    unsafe fn audio_held(frame: F) -> Result<Self> {
         // SAFETY: forwarded to the caller for this held audio descriptor.
-        unsafe { Self::validate(frame, validate_audio_layout) }
+        unsafe { Self::validate_held(frame, validate_audio_layout) }
     }
 
     /// Validate audio the SDK returned where no samples is a valid answer:
@@ -4741,7 +4744,7 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> ValidatedAudio<F>
     ///
     /// As for [`Self::audio`], for a descriptor that holds samples.
     #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_av_sync)))]
-    pub(crate) unsafe fn returned_audio(frame: F) -> Result<ReturnedAudio<Self>> {
+    unsafe fn returned_audio_held(frame: F) -> Result<ReturnedAudio<Self>> {
         Ok(match validate_returned_audio(frame.descriptor())? {
             ReturnedAudio::Empty(format) => ReturnedAudio::Empty(format),
             // SAFETY: forwarded to the caller for a frame of samples.
@@ -4762,7 +4765,7 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_metadata_frame_t>> ValidatedMetadata
     /// it is dropped, its data pointer must be null or reference readable
     /// storage for the declared length, or a NUL-terminated string within
     /// the metadata cap when the length is zero, live and unchanged.
-    pub(crate) unsafe fn metadata_frame(frame: F) -> Result<Self> {
+    unsafe fn metadata_frame_held(frame: F) -> Result<Self> {
         // SAFETY: forwarded to the caller.
         let text = unsafe { validate_metadata_layout(frame.descriptor())? };
         Ok(Self {
@@ -4773,8 +4776,102 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_metadata_frame_t>> ValidatedMetadata
     }
 }
 
-// SAFETY: video validates this descriptor's layout and metadata; its unsafe
-// caller guarantees initialized active pixels and live unchanged storage for
+// Safe production entry points accept only the holder whose construction
+// establishes delivered storage validity. Raw descriptor borrows are test-only.
+impl<'a, S: FrameFree, V> ValidatedFrame<Guard<'a, S>, V>
+where
+    S::RawFrame: SdkDescriptor,
+{
+    /// Validate this delivered guard's descriptor and cache its metadata.
+    pub(crate) fn validate(
+        frame: Guard<'a, S>,
+        validate: impl FnOnce(&S::RawFrame) -> Result<V>,
+    ) -> Result<Self> {
+        // SAFETY: Guard retains its descriptor and the initialized storage
+        // every non-null pointer describes, unchanged until matching release.
+        unsafe { Self::validate_held(frame, validate) }
+    }
+}
+
+impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> ValidatedVideo<Guard<'a, S>> {
+    /// Validate the video descriptor and initialized active rows Guard retains.
+    pub(crate) fn video(frame: Guard<'a, S>) -> Result<Self> {
+        Self::validate(frame, validate_video_frame)
+    }
+}
+
+impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> ValidatedAudio<Guard<'a, S>> {
+    /// Validate the descriptor and initialized channel samples Guard retains.
+    pub(crate) fn audio(frame: Guard<'a, S>) -> Result<Self> {
+        Self::validate(frame, validate_audio_layout)
+    }
+
+    /// Validate a guarded synchronization result, including an empty answer.
+    #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_av_sync)))]
+    pub(crate) fn returned_audio(frame: Guard<'a, S>) -> Result<ReturnedAudio<Self>> {
+        // SAFETY: null pointers are permitted by Guard; each non-null pointer
+        // retains the initialized sample or metadata extent it describes.
+        unsafe { Self::returned_audio_held(frame) }
+    }
+}
+
+impl<'a, S: FrameFree<RawFrame = NDIlib_metadata_frame_t>> ValidatedMetadata<Guard<'a, S>> {
+    /// Validate the standalone metadata descriptor and text Guard retains.
+    pub(crate) fn metadata_frame(frame: Guard<'a, S>) -> Result<Self> {
+        // SAFETY: the guard retains readable initialized text for the declared
+        // length, or through its first NUL or metadata cap when length is zero.
+        unsafe { Self::metadata_frame_held(frame) }
+    }
+}
+
+#[cfg(all(test, feature = "advanced"))]
+impl<'a, D: SdkDescriptor, V> ValidatedFrame<&'a D, V> {
+    /// Validate a synthetic descriptor whose storage the test retains.
+    ///
+    /// # Safety
+    /// Every pointer and initialized extent described by `frame` must stay
+    /// valid and unchanged for `'a`, including bounded metadata text.
+    pub(crate) unsafe fn validate_descriptor(
+        frame: &'a D,
+        validate: impl FnOnce(&D) -> Result<V>,
+    ) -> Result<Self> {
+        // SAFETY: forwarded to the test caller retaining the descriptor.
+        unsafe { Self::validate_held(frame, validate) }
+    }
+}
+
+#[cfg(test)]
+impl<'a> ValidatedVideo<&'a NDIlib_video_frame_v2_t> {
+    /// # Safety
+    /// The test retains initialized active pixels and readable metadata for `'a`.
+    pub(crate) unsafe fn video_descriptor(frame: &'a NDIlib_video_frame_v2_t) -> Result<Self> {
+        // SAFETY: forwarded to the test caller.
+        unsafe { Self::video_held(frame) }
+    }
+}
+
+#[cfg(test)]
+impl<'a> ValidatedAudio<&'a NDIlib_audio_frame_v3_t> {
+    /// # Safety
+    /// The test retains initialized active samples and readable metadata for `'a`.
+    pub(crate) unsafe fn audio_descriptor(frame: &'a NDIlib_audio_frame_v3_t) -> Result<Self> {
+        // SAFETY: forwarded to the test caller.
+        unsafe { Self::audio_held(frame) }
+    }
+
+    /// # Safety
+    /// The test retains each non-null sample/metadata extent for `'a`.
+    #[cfg(feature = "advanced")]
+    pub(crate) unsafe fn returned_audio_descriptor(
+        frame: &'a NDIlib_audio_frame_v3_t,
+    ) -> Result<ReturnedAudio<Self>> {
+        // SAFETY: forwarded to the test caller.
+        unsafe { Self::returned_audio_held(frame) }
+    }
+}
+
+// SAFETY: video validates this descriptor's layout and metadata; its holder's
+// invariant guarantees initialized active pixels and live unchanged storage for
 // F's lifetime. Views borrow this holder. Default descriptors and direct-send
 // checks never extend the initialized active span into padding or tail room.
 unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_video_frame_v2_t>> VideoParts
@@ -4804,7 +4901,7 @@ unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_video_frame_v2_t>> VideoParts
 }
 
 // SAFETY: audio/returned_audio validate this descriptor's layout and text;
-// their unsafe caller guarantees aligned initialized active samples and live
+// the holder's invariant guarantees aligned initialized active samples and live
 // unchanged storage for F's lifetime. Views and default descriptors borrow
 // this holder and address only that validated sample extent and metadata.
 unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> AudioParts
@@ -5041,16 +5138,8 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     ///
     /// The validated layout, header and text are cached so that accessors
     /// return them without re-computation or unchecked arithmetic.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure the guard was created from a valid NDI instance
-    /// and contains a frame populated by the matching SDK capture call.
-    pub(crate) unsafe fn new(guard: Guard<'a, S>) -> Result<Self> {
-        // SAFETY: the guard holds the one descriptor the capture populated
-        // until it frees the frame on drop, and the SDK keeps the pixels and
-        // metadata it points to allocated and unchanged until then.
-        let frame = unsafe { ValidatedVideo::video(guard)? };
+    pub(crate) fn new(guard: Guard<'a, S>) -> Result<Self> {
+        let frame = ValidatedVideo::video(guard)?;
         Ok(Self { frame })
     }
 
@@ -5210,16 +5299,8 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
     /// and the frame metadata. Both are cached so that accessors return
     /// slices without re-computation or unchecked arithmetic. A descriptor
     /// without samples is rejected.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure the guard was created from a valid NDI instance
-    /// and contains a frame populated by the matching SDK capture call.
-    unsafe fn from_guard(guard: Guard<'a, S>) -> Result<Self> {
-        // SAFETY: the guard holds the one descriptor the capture populated
-        // until it frees the frame on drop, and the SDK keeps the samples and
-        // metadata it points to allocated and unchanged until then.
-        let frame = unsafe { ValidatedAudio::audio(guard)? };
+    fn from_guard(guard: Guard<'a, S>) -> Result<Self> {
+        let frame = ValidatedAudio::audio(guard)?;
         Ok(Self { frame })
     }
 
@@ -5349,29 +5430,16 @@ borrowed_audio_accessors!(AvSyncAudioRef, AvSyncAudioFree);
 impl<'rx> AudioRef<'rx, AudioKind> {
     /// Create a borrowed audio frame from a receiver RAII guard, validated
     /// as [`from_guard`](Self::from_guard) describes.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure the guard was created from a valid NDI receiver
-    /// and contains a frame populated by `NDIlib_recv_capture_v3`.
-    pub(crate) unsafe fn new(guard: RecvAudioGuard<'rx>) -> Result<Self> {
-        // SAFETY: forwarded to the caller.
-        unsafe { Self::from_guard(guard) }
+    pub(crate) fn new(guard: RecvAudioGuard<'rx>) -> Result<Self> {
+        Self::from_guard(guard)
     }
 }
 
 impl<'fs> AudioRef<'fs, FrameSyncAudioFree> {
     /// Create a borrowed audio frame from a FrameSync RAII guard, validated
     /// as [`from_guard`](Self::from_guard) describes.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure the guard was created from a valid FrameSync
-    /// instance and contains a frame populated by
-    /// `NDIlib_framesync_capture_audio_v2` with a capture request.
-    pub(crate) unsafe fn new(guard: Guard<'fs, FrameSyncAudioFree>) -> Result<Self> {
-        // SAFETY: forwarded to the caller.
-        unsafe { Self::from_guard(guard) }
+    pub(crate) fn new(guard: Guard<'fs, FrameSyncAudioFree>) -> Result<Self> {
+        Self::from_guard(guard)
     }
 }
 
@@ -5415,16 +5483,8 @@ pub struct MetadataFrameRef<'rx> {
 
 impl<'rx> MetadataFrameRef<'rx> {
     /// Create a borrowed metadata frame from an RAII guard.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure the guard was created from a valid NDI receiver
-    /// and contains a frame populated by `NDIlib_recv_capture_v3`.
-    pub(crate) unsafe fn new(guard: RecvMetadataGuard<'rx>) -> Result<Self> {
-        // SAFETY: the receive guard holds the one descriptor the capture
-        // populated until it frees the frame on drop, and the SDK keeps the
-        // text it points to allocated and unchanged until then.
-        let frame = unsafe { ValidatedMetadata::metadata_frame(guard)? };
+    pub(crate) fn new(guard: RecvMetadataGuard<'rx>) -> Result<Self> {
+        let frame = ValidatedMetadata::metadata_frame(guard)?;
         Ok(Self { frame })
     }
 
@@ -7211,7 +7271,7 @@ mod tests {
             unsafe { Guard::<VideoKind>::with_test_free(mock_instance, c_frame, |_, _| {}) };
 
         // VideoFrameRef::new should return an error for unknown FourCC
-        let result = unsafe { VideoFrameRef::new(guard) };
+        let result = VideoFrameRef::new(guard);
         assert!(result.is_err(), "Should reject unknown FourCC");
 
         if let Err(Error::InvalidFrame(ref msg)) = result {
@@ -7260,7 +7320,7 @@ mod tests {
         let guard =
             unsafe { Guard::<VideoKind>::with_test_free(mock_instance, c_frame, |_, _| {}) };
 
-        let frame_ref = unsafe { VideoFrameRef::new(guard) }.expect("Should accept BGRA FourCC");
+        let frame_ref = VideoFrameRef::new(guard).expect("Should accept BGRA FourCC");
         assert_eq!(
             frame_ref.pixel_format(),
             PixelFormat::Bgra,
@@ -7296,7 +7356,7 @@ mod tests {
         let mock_instance = ptr::null_mut();
         let guard = unsafe { RecvAudioGuard::with_test_free(mock_instance, c_frame, |_, _| {}) };
 
-        let result = unsafe { AudioFrameRef::new(guard) };
+        let result = AudioFrameRef::new(guard);
         assert!(result.is_err(), "Should reject unknown audio FourCC");
 
         if let Err(Error::InvalidFrame(ref msg)) = result {
@@ -7340,7 +7400,7 @@ mod tests {
         let mock_instance = ptr::null_mut();
         let guard = unsafe { RecvAudioGuard::with_test_free(mock_instance, c_frame, |_, _| {}) };
 
-        let frame_ref = unsafe { AudioFrameRef::new(guard) }.expect("Should accept FLTP FourCC");
+        let frame_ref = AudioFrameRef::new(guard).expect("Should accept FLTP FourCC");
         assert_eq!(
             frame_ref.format(),
             AudioFormat::Fltp,
@@ -7380,7 +7440,7 @@ mod tests {
         let mock_instance = ptr::null_mut();
         let guard =
             unsafe { Guard::<VideoKind>::with_test_free(mock_instance, c_frame, |_, _| {}) };
-        let frame_ref = unsafe { VideoFrameRef::new(guard) }.expect("Should create frame ref");
+        let frame_ref = VideoFrameRef::new(guard).expect("Should create frame ref");
 
         // Verify data() returns correct size based on validated format
         assert_eq!(
@@ -7440,12 +7500,11 @@ mod tests {
 
         let recv_guard =
             unsafe { Guard::<VideoKind>::with_test_free(ptr::null_mut(), recv_raw, |_, _| {}) };
-        let recv = unsafe { VideoFrameRef::new(recv_guard) }.expect("receiver video ref");
+        let recv = VideoFrameRef::new(recv_guard).expect("receiver video ref");
         let fs_guard = unsafe {
             Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), fs_raw, |_, _| {})
         };
-        let fs =
-            unsafe { VideoRef::<FrameSyncVideoFree>::new(fs_guard) }.expect("framesync video ref");
+        let fs = VideoRef::<FrameSyncVideoFree>::new(fs_guard).expect("framesync video ref");
 
         assert_eq!(recv.width(), fs.width());
         assert_eq!(recv.height(), fs.height());
@@ -7503,7 +7562,7 @@ mod tests {
             Guard::<VideoKind>::with_test_free(ptr::null_mut(), raw(&mut recv_data), |_, _| {})
         };
         assert!(matches!(
-            unsafe { VideoFrameRef::new(recv_guard) },
+            VideoFrameRef::new(recv_guard),
             Err(Error::InvalidFrame(_))
         ));
 
@@ -7515,7 +7574,7 @@ mod tests {
             )
         };
         assert!(matches!(
-            unsafe { VideoRef::<FrameSyncVideoFree>::new(fs_guard) },
+            VideoRef::<FrameSyncVideoFree>::new(fs_guard),
             Err(Error::InvalidFrame(_))
         ));
     }
@@ -8079,7 +8138,7 @@ mod tests {
         let length = bytes.len() as i32;
         let raw = metadata_raw_from_bytes(&mut bytes, length);
         let guard = unsafe { RecvMetadataGuard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let captured = unsafe { MetadataFrameRef::new(guard) }.unwrap();
+        let captured = MetadataFrameRef::new(guard).unwrap();
         let source: &dyn MetadataSource = &captured;
         let (descriptor, allocations) = crate::test_alloc::allocation_count(|| {
             assert_eq!(source.data(), "<relay>é</relay>");
@@ -8109,7 +8168,7 @@ mod tests {
 
         let raw = null_metadata_raw(0);
         let guard = unsafe { RecvMetadataGuard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let captured = unsafe { MetadataFrameRef::new(guard) }.unwrap();
+        let captured = MetadataFrameRef::new(guard).unwrap();
         let source: &dyn MetadataSource = &captured;
         let outgoing = source.metadata_raw();
         assert_eq!(outgoing.length, 1);
@@ -8135,7 +8194,7 @@ mod tests {
         let mut data = b"zero-copy\0\0\xFF".to_vec();
         let raw = metadata_raw_from_bytes(&mut data, 10);
         let guard = unsafe { RecvMetadataGuard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame_ref = unsafe { MetadataFrameRef::new(guard) }.expect("valid metadata ref");
+        let frame_ref = MetadataFrameRef::new(guard).expect("valid metadata ref");
 
         assert_eq!(frame_ref.data(), "zero-copy");
         assert_eq!(frame_ref.as_bytes(), b"zero-copy");
@@ -8159,7 +8218,7 @@ mod tests {
         // The empty null frame is absent text: nothing is read from `p_data`.
         let raw = null_metadata_raw(0);
         let guard = unsafe { RecvMetadataGuard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame_ref = unsafe { MetadataFrameRef::new(guard) }.expect("empty null frame");
+        let frame_ref = MetadataFrameRef::new(guard).expect("empty null frame");
         assert!(frame_ref.frame.metadata().is_none());
         assert_eq!(frame_ref.data(), "");
         assert_eq!(frame_ref.as_bytes(), b"");
@@ -8172,7 +8231,7 @@ mod tests {
         let mut data = b"\0ignored".to_vec();
         let raw = metadata_raw_from_bytes(&mut data, 0);
         let guard = unsafe { RecvMetadataGuard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame_ref = unsafe { MetadataFrameRef::new(guard) }.expect("empty C-string sentinel");
+        let frame_ref = MetadataFrameRef::new(guard).expect("empty C-string sentinel");
         assert_eq!(
             frame_ref.frame.metadata().map(MetadataText::len_with_nul),
             Some(1)
@@ -8297,7 +8356,7 @@ mod tests {
         };
 
         let guard = unsafe { Guard::<VideoKind>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame_ref = unsafe { VideoFrameRef::new(guard) }.expect("valid video ref");
+        let frame_ref = VideoFrameRef::new(guard).expect("valid video ref");
 
         assert_eq!(frame_ref.metadata(), Some("cached"));
         metadata[6] = b'!';
@@ -8336,7 +8395,7 @@ mod tests {
         };
 
         let guard = unsafe { RecvAudioGuard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame_ref = unsafe { AudioFrameRef::new(guard) }.expect("valid audio ref");
+        let frame_ref = AudioFrameRef::new(guard).expect("valid audio ref");
 
         assert_eq!(frame_ref.metadata(), Some("audio meta"));
         assert_eq!(frame_ref.timecode(), Timecode::from_ticks(123));
@@ -8745,7 +8804,7 @@ mod tests {
                 .unwrap();
             let raw = frame.as_test_raw();
             // SAFETY: `raw` borrows this live owned frame's initialized pixels.
-            let captured = unsafe { ValidatedVideo::video(&raw).unwrap() };
+            let captured = unsafe { ValidatedVideo::video_descriptor(&raw).unwrap() };
             let mut copy = captured.owned_copy();
             assert_eq!(copy.picture_aspect_ratio(), ratio);
             copy.set_picture_aspect_ratio(2.0).unwrap();
@@ -9205,7 +9264,7 @@ mod tests {
         };
         let guard =
             unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = unsafe { AudioRef::<FrameSyncAudioFree>::new(guard) }.unwrap();
+        let frame = AudioRef::<FrameSyncAudioFree>::new(guard).unwrap();
         assert!(frame.data().is_none());
         assert_eq!(frame.channel_data(0).unwrap(), &[1.0, 2.0, 3.0]);
         assert_eq!(frame.channel_data(1).unwrap(), &[4.0, 5.0, 6.0]);
@@ -9647,7 +9706,7 @@ mod tests {
         let guard = unsafe { Guard::<VideoKind>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
 
         // Create the VideoFrameRef
-        let frame_ref = unsafe { VideoFrameRef::new(guard) };
+        let frame_ref = VideoFrameRef::new(guard);
         assert!(frame_ref.is_ok(), "Should create valid VideoFrameRef");
 
         let frame_ref = frame_ref.unwrap();
@@ -9692,7 +9751,7 @@ mod tests {
         let guard = unsafe { RecvAudioGuard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
 
         // Create the AudioFrameRef
-        let frame_ref = unsafe { AudioFrameRef::new(guard) };
+        let frame_ref = AudioFrameRef::new(guard);
         assert!(frame_ref.is_ok(), "Should create valid AudioFrameRef");
 
         let frame_ref = frame_ref.unwrap();

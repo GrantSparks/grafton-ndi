@@ -392,9 +392,7 @@ fn video_ref_event(frame: Guard<'_, VideoKind>) -> Result<PacketItemRef<'_>> {
     let video = if VideoCodec::from_outer(frame.frame().FourCC).is_some() {
         ReceivedVideoRef::Compressed(CompressedVideoRef::new(frame)?)
     } else {
-        // SAFETY: this delivered guard owns the SDK's uncompressed frame;
-        // construction validates its descriptor while retaining its buffers.
-        ReceivedVideoRef::Decoded(unsafe { VideoKind::make_ref(frame)? })
+        ReceivedVideoRef::Decoded(VideoKind::make_ref(frame)?)
     };
     Ok(PacketItemRef::Video(video))
 }
@@ -403,18 +401,13 @@ fn audio_ref_event(frame: Guard<'_, AudioKind>) -> Result<PacketItemRef<'_>> {
     let audio = if AudioCodec::from_outer(frame.frame().FourCC).is_some() {
         ReceivedAudioRef::Compressed(CompressedAudioRef::new(frame)?)
     } else {
-        // SAFETY: as for decoded video, with this audio guard's sample storage.
-        ReceivedAudioRef::Decoded(unsafe { AudioKind::make_ref(frame)? })
+        ReceivedAudioRef::Decoded(AudioKind::make_ref(frame)?)
     };
     Ok(PacketItemRef::Audio(audio))
 }
 
 fn metadata_ref_event(frame: Guard<'_, MetadataKind>) -> Result<PacketItemRef<'_>> {
-    // SAFETY: the delivered guard retains this standalone metadata allocation
-    // while the validated reference borrows it.
-    Ok(PacketItemRef::Metadata(unsafe {
-        MetadataKind::make_ref(frame)?
-    }))
+    Ok(PacketItemRef::Metadata(MetadataKind::make_ref(frame)?))
 }
 
 #[cfg(test)]
