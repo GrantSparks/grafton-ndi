@@ -43,7 +43,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+#[cfg(not(ndi_test_connect_overlap))]
+use parking_lot::RwLockReadGuard;
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 
 use crate::{
     capture::{
@@ -1755,6 +1757,9 @@ impl ReceiverCore {
     /// This is the only way to make a [`CaptureLock`], and so to call
     /// `NDIlib_recv_capture_v3` on this instance.
     fn capture_lock(&self, attempt: Attempt) -> Option<CaptureLock<'_>> {
+        // Only the native overlap probe opts out, to measure whether SDK
+        // connection changes can safely overlap its capture calls.
+        #[cfg(not(ndi_test_connect_overlap))]
         let shared = self.capture_gate.try_read_until(attempt.0.end())?;
         #[cfg(test)]
         if let Some(event) = capture_lock_test_event::take() {
@@ -1763,6 +1768,7 @@ impl ReceiverCore {
         Some(CaptureLock {
             core: self,
             attempt,
+            #[cfg(not(ndi_test_connect_overlap))]
             _shared: shared,
         })
     }
@@ -2005,6 +2011,7 @@ impl ReceiverCore {
 pub(crate) struct CaptureLock<'rx> {
     core: &'rx ReceiverCore,
     attempt: Attempt,
+    #[cfg(not(ndi_test_connect_overlap))]
     _shared: RwLockReadGuard<'rx, ()>,
 }
 
