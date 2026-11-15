@@ -770,14 +770,19 @@ impl Registry {
             }
         };
         let actual = allocation.request;
-        if capacity > reservation.bytes
-            || actual.format != request.format
-            || actual.width != request.width
-            || actual.height != request.height
-            || actual.stride < request.stride
-            || actual.bytes < request.bytes
-            || capacity < actual.bytes
-        {
+        // The request's stride rule also defines the publication layout. A
+        // compressed size must match exactly; uncompressed padding must produce
+        // this same minimum extent. Capacity is a separate admission bound.
+        let consistent = request
+            .with_stride_bytes(actual.stride)
+            .is_ok_and(|expected| {
+                expected
+                    == AllocationRequest {
+                        capacity_limit: expected.capacity_limit,
+                        ..actual
+                    }
+            });
+        if capacity > reservation.bytes || !consistent || capacity < actual.bytes {
             self.decline(AllocationDecline::BufferRefused);
             return None;
         }
@@ -1963,17 +1968,18 @@ mod tests {
 
     #[test]
     fn invalid_buffer_layout_and_stride_overflow_are_counted_once() {
-        for overflow in [false, true] {
+        for malformed in 0..3 {
             let registry = Registry::new(limits());
             let token = registry
                 .register(move |request| {
                     let mut buffer = AllocationBuffer::zeroed(request)?;
                     // Simulate a malformed policy result inside the fixture;
                     // neither value can be published as a native descriptor.
-                    if overflow {
-                        buffer.request.stride = i32::MAX as usize + 1;
-                    } else {
-                        buffer.request.width += 1;
+                    match malformed {
+                        0 => buffer.request.width += 1,
+                        1 => buffer.request.stride = i32::MAX as usize + 1,
+                        2 => buffer.request.bytes -= 1,
+                        _ => unreachable!(),
                     }
                     Ok(buffer)
                 })
@@ -1986,6 +1992,134 @@ mod tests {
             assert_eq!(usage.retained_bytes(), 0);
             assert_eq!(usage.in_progress_allocations(), 0);
         }
+    }
+
+    fn compressed_requests(bytes: i32) -> [AllocationRequest; 2] {
+        let mut video = NDIlib_video_frame_v2_t {
+            FourCC: VideoCodec::H264.outer(StreamTier::Program, false),
+            xres: 16,
+            yres: 16,
+            ..Default::default()
+        };
+        video.__bindgen_anon_1.data_size_in_bytes = bytes;
+        let mut audio = NDIlib_audio_frame_v3_t {
+            FourCC: AudioCodec::Opus.outer(false),
+            sample_rate: 48_000,
+            no_channels: 2,
+            no_samples: 8,
+            ..Default::default()
+        };
+        audio.__bindgen_anon_1.data_size_in_bytes = bytes;
+        [
+            video_request(&video).unwrap(),
+            audio_request(&audio).unwrap(),
+        ]
+    }
+
+    fn cached_request_policy() -> impl ReceiveAllocator {
+        let cached = Mutex::new(None);
+        move |request| AllocationBuffer::zeroed(*lock(&cached).get_or_insert(request))
+    }
+
+    #[test]
+    fn stale_compressed_requests_are_declined_without_retaining_storage() {
+        for (first, smaller) in compressed_requests(64)
+            .into_iter()
+            .zip(compressed_requests(32))
+        {
+            let registry = Registry::new(limits());
+            let token = registry.register(cached_request_policy()).unwrap();
+            let (pointer, size) = registry.allocate(token, first).unwrap();
+            assert_eq!(size, 64);
+            assert!(registry.free(token, pointer.as_ptr()));
+
+            assert!(registry.allocate(token, smaller).is_none());
+            let usage = registry.usage();
+            assert_eq!(usage.declined(AllocationDecline::BufferRefused), 1);
+            assert_eq!(usage.declined_allocations(), 1);
+            assert_eq!(usage.retained_allocations(), 0);
+            assert_eq!(usage.retained_bytes(), 0);
+            assert_eq!(usage.in_progress_allocations(), 0);
+        }
+    }
+
+    #[test]
+    fn exact_compressed_sizes_and_valid_uncompressed_padding_are_published() {
+        let video = video_request(&NDIlib_video_frame_v2_t {
+            FourCC: FourCc::from(PixelFormat::Bgra).raw(),
+            xres: 4,
+            yres: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        for request in compressed_requests(32)
+            .into_iter()
+            .chain([video, request_of(32)])
+        {
+            let registry = Registry::new(limits());
+            let token = registry
+                .register(|request: AllocationRequest| {
+                    AllocationBuffer::zeroed(request.with_stride_bytes(32)?)
+                })
+                .unwrap();
+            let (pointer, stride) = registry.allocate(token, request).unwrap();
+            assert_eq!(stride, 32);
+            assert_eq!(registry.usage().declined_allocations(), 0);
+            assert!(registry.free(token, pointer.as_ptr()));
+        }
+    }
+
+    #[cfg(ndi_has_advanced_receive_allocators)]
+    #[test]
+    fn compressed_callback_declines_clear_the_data_and_size() {
+        // This is the only unit test using the process-wide registry. It drives
+        // the native callback boundary directly without creating SDK objects.
+        let registry = REGISTRY.get_or_init(|| Registry::new(limits()));
+        let token = registry.register(cached_request_policy()).unwrap();
+        let opaque = token as *mut c_void;
+        let mut video = NDIlib_video_frame_v2_t {
+            FourCC: VideoCodec::H264.outer(StreamTier::Program, false),
+            xres: 16,
+            yres: 16,
+            ..Default::default()
+        };
+        video.__bindgen_anon_1.data_size_in_bytes = 64;
+        // SAFETY: this live descriptor belongs to this call, and the token
+        // names a registered policy. The fixture performs no native access.
+        unsafe {
+            assert!(video_allocate(opaque, &mut video));
+            assert!(video_free(opaque, &video));
+            video.__bindgen_anon_1.data_size_in_bytes = 32;
+            assert!(!video_allocate(opaque, &mut video));
+            assert!(video.p_data.is_null());
+            assert_eq!(video.__bindgen_anon_1.data_size_in_bytes, 0);
+        }
+        registry.retire(token);
+
+        let token = registry.register(cached_request_policy()).unwrap();
+        let opaque = token as *mut c_void;
+        let mut audio = NDIlib_audio_frame_v3_t {
+            FourCC: AudioCodec::Opus.outer(false),
+            sample_rate: 48_000,
+            no_channels: 2,
+            no_samples: 8,
+            ..Default::default()
+        };
+        audio.__bindgen_anon_1.data_size_in_bytes = 64;
+        // SAFETY: as above, with the matching audio allocation and release.
+        unsafe {
+            assert!(audio_allocate(opaque, &mut audio));
+            assert!(audio_free(opaque, &audio));
+            audio.__bindgen_anon_1.data_size_in_bytes = 32;
+            assert!(!audio_allocate(opaque, &mut audio));
+            assert!(audio.p_data.is_null());
+            assert_eq!(audio.__bindgen_anon_1.data_size_in_bytes, 0);
+        }
+        registry.retire(token);
+        let usage = registry.usage();
+        assert_eq!(usage.declined(AllocationDecline::BufferRefused), 2);
+        assert_eq!(usage.retained_allocations(), 0);
+        assert_eq!(usage.in_progress_allocations(), 0);
     }
 
     /// A policy that can be told apart from another of its type.
