@@ -26,9 +26,15 @@ const ADVANCED_RECEIVER: &CStr = c"NDIlib_recv_create_v4";
 
 /// The implementation selected for this process.
 pub(crate) struct Runtime {
+    pub(crate) lifecycle: crate::runtime::RuntimeManager,
     pub(crate) gates: Gates,
     pub(crate) info: RuntimeInfo,
     provider: Provider,
+}
+
+/// Observe the selected runtime without selecting or loading one.
+pub(crate) fn selected() -> Option<&'static Runtime> {
+    SELECTED.get()
 }
 
 /// Which of the entry points that identify the Advanced SDK an
@@ -162,6 +168,10 @@ impl Runtime {
             version,
         };
         Ok(Self {
+            lifecycle: crate::runtime::RuntimeManager::new(
+                resolved.lifecycle(),
+                resolved.core().NDIlib_is_supported_CPU,
+            ),
             gates: resolved.seal(version, edition),
             info,
             provider,

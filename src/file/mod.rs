@@ -301,7 +301,10 @@ impl FileApi {
     ///   the cause; `detail` retains the diagnostic context.
     /// * [`Error::InvalidInput`] when `options` names a relative path.
     pub fn open(ndi: &Ndi, options: &FileRuntimeOptions) -> Result<Self> {
-        let runtime = sys::select_file(ndi.info(), ndi.api(), options.library_path.as_deref())?;
+        let runtime = sys::select_file(
+            ndi.runtime().selected_runtime(),
+            options.library_path.as_deref(),
+        )?;
         Ok(Self {
             runtime,
             #[cfg(not(test))]

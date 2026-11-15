@@ -114,6 +114,7 @@
 
 use std::{
     fmt,
+    num::NonZeroUsize,
     path::PathBuf,
     sync::{Condvar, Mutex, MutexGuard, OnceLock},
 };
@@ -387,6 +388,11 @@ impl Runtime {
         is_supported_cpu(&self.selected.gates.api().core)
     }
 
+    #[cfg(feature = "file-io")]
+    pub(crate) fn selected_runtime(&self) -> &'static sys::Runtime {
+        self.selected
+    }
+
     /// Start NDI and return a handle to it.
     ///
     /// NDI is started by the first handle and stays started while any handle
@@ -418,7 +424,7 @@ impl Runtime {
     /// # }
     /// ```
     pub fn initialize(&self) -> Result<Ndi> {
-        lifecycle(self.selected).acquire()?;
+        self.selected.lifecycle.acquire()?;
         Ok(Ndi { runtime: *self })
     }
 }
@@ -451,45 +457,18 @@ impl ProcessLifetimeRuntime {
 
 static PROCESS_LIFETIME: OnceLock<Ndi> = OnceLock::new();
 
-/// Runtime lifecycle phase.
-///
-/// Transitions:
-/// - `Uninitialized` → `Initializing` → `Running` (on success)
-/// - `Uninitialized` → `Initializing` → `Failed` (on failure)
-/// - `Running` → `Destroying` → `Uninitialized` (on last release)
-/// - `Failed` → `Initializing` (retry allowed)
+/// Lifecycle state; only an active runtime can own live handle counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// Runtime not initialized. Ready for initialization.
-    Uninitialized,
-    /// Initialization in progress. Other threads should wait.
-    Initializing,
-    /// Runtime is active with one or more live handles.
-    Running,
-    /// Destruction in progress. Other threads should wait.
-    Destroying,
-    /// Last initialization attempt failed. Retry is allowed.
-    Failed,
-}
-
-/// Internal state protected by the mutex.
-struct RuntimeState {
-    phase: Phase,
-    refcount: usize,
-}
-
-impl RuntimeState {
-    const fn new() -> Self {
-        Self {
-            phase: Phase::Uninitialized,
-            refcount: 0,
-        }
-    }
+    Stopped,
+    Starting,
+    Running(NonZeroUsize),
+    Stopping,
 }
 
 /// The native calls the lifecycle needs. Tests substitute their own, so the
 /// production state machine runs without an SDK.
-trait RuntimeBackend {
+pub(crate) trait RuntimeBackend {
     /// Start NDI; `false` when it does not start.
     fn initialize(&self) -> bool;
     /// Whether the implementation can run on this CPU.
@@ -505,22 +484,26 @@ fn is_supported_cpu(core: &sys::Core) -> bool {
 }
 
 /// Initialization through the selected implementation's own entry points.
-struct SdkBackend(&'static sys::Core);
+pub(crate) struct SdkBackend {
+    lifecycle: sys::Lifecycle,
+    supported_cpu: unsafe extern "C" fn() -> bool,
+}
 
 impl RuntimeBackend for SdkBackend {
     fn initialize(&self) -> bool {
         // SAFETY: the manager serializes initialization against destruction.
-        unsafe { self.0.NDIlib_initialize() }
+        unsafe { self.lifecycle.NDIlib_initialize() }
     }
 
     fn is_supported_cpu(&self) -> bool {
-        is_supported_cpu(self.0)
+        // SAFETY: this no-argument query needs no initialization.
+        unsafe { (self.supported_cpu)() }
     }
 
     fn destroy(&self) {
         // SAFETY: the manager calls this only after the last handle is released,
         // so no SDK object created through this initialization remains.
-        unsafe { self.0.NDIlib_destroy() };
+        unsafe { self.lifecycle.NDIlib_destroy() };
     }
 }
 
@@ -531,8 +514,8 @@ impl RuntimeBackend for SdkBackend {
 /// - Allows retry after initialization failure
 /// - Avoids spin loops by using `Condvar` waits
 /// - Maintains the invariant: `Ndi::new()` returns `Ok` only when runtime is initialized
-struct RuntimeManager<B = SdkBackend> {
-    state: Mutex<RuntimeState>,
+pub(crate) struct RuntimeManager<B = SdkBackend> {
+    state: Mutex<Phase>,
     cv: Condvar,
     backend: B,
 }
@@ -540,7 +523,7 @@ struct RuntimeManager<B = SdkBackend> {
 impl<B: RuntimeBackend> RuntimeManager<B> {
     const fn with_backend(backend: B) -> Self {
         Self {
-            state: Mutex::new(RuntimeState::new()),
+            state: Mutex::new(Phase::Stopped),
             cv: Condvar::new(),
             backend,
         }
@@ -548,50 +531,37 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
 
     /// Recover from mutex poisoning, preferring progress over panic.
     fn recover_guard<'a>(
-        result: std::sync::LockResult<MutexGuard<'a, RuntimeState>>,
-    ) -> MutexGuard<'a, RuntimeState> {
+        result: std::sync::LockResult<MutexGuard<'a, Phase>>,
+    ) -> MutexGuard<'a, Phase> {
         result.unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn acquire(&self) -> Result<()> {
         let mut guard = Self::recover_guard(self.state.lock());
-
         loop {
-            match guard.phase {
-                Phase::Uninitialized | Phase::Failed => {
-                    // We're responsible for initialization
-                    guard.phase = Phase::Initializing;
+            match *guard {
+                Phase::Stopped => {
+                    *guard = Phase::Starting;
                     drop(guard);
-
-                    // The native calls run outside the lock.
+                    // Native calls run outside the state lock.
                     let started = self.start();
-
-                    // Re-acquire lock to update state
                     guard = Self::recover_guard(self.state.lock());
-
-                    if started.is_ok() {
-                        guard.phase = Phase::Running;
-                        guard.refcount = 1;
+                    *guard = if started.is_ok() {
+                        Phase::Running(NonZeroUsize::MIN)
                     } else {
-                        guard.phase = Phase::Failed;
-                    }
+                        Phase::Stopped
+                    };
                     self.cv.notify_all();
                     return started;
                 }
-
-                Phase::Initializing | Phase::Destroying => {
-                    // Wait for state transition to complete
+                Phase::Starting | Phase::Stopping => {
                     guard = Self::recover_guard(self.cv.wait(guard));
-                    // Loop again to check the new state
                 }
-
-                Phase::Running => {
-                    // Runtime is already initialized, just increment refcount
-                    guard.refcount = guard.refcount.checked_add(1).ok_or({
-                        Error::InitializationFailed(
-                            crate::InitializationFailure::HandleCountExhausted,
-                        )
-                    })?;
+                Phase::Running(count) => {
+                    let next = count.checked_add(1).ok_or(Error::InitializationFailed(
+                        crate::InitializationFailure::HandleCountExhausted,
+                    ))?;
+                    *guard = Phase::Running(next);
                     return Ok(());
                 }
             }
@@ -616,45 +586,48 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
 
     fn release(&self) {
         let mut guard = Self::recover_guard(self.state.lock());
-
-        debug_assert!(
-            guard.refcount > 0,
-            "release() called when refcount was already 0 (double-free or unbalanced release)"
-        );
-        debug_assert!(
-            guard.phase == Phase::Running,
-            "release() called when phase was {:?}, expected Running",
-            guard.phase
-        );
-
-        guard.refcount -= 1;
-
-        if guard.refcount == 0 {
-            // Last reference - destroy the runtime
-            guard.phase = Phase::Destroying;
-            drop(guard);
-
-            // Call NDIlib_destroy outside the lock
-            self.backend.destroy();
-
-            // Re-acquire lock to reset state
-            let mut guard = Self::recover_guard(self.state.lock());
-            guard.phase = Phase::Uninitialized;
-            self.cv.notify_all();
+        match *guard {
+            Phase::Running(count) => {
+                // NonZeroUsize proves the subtraction cannot underflow.
+                if let Some(remaining) = NonZeroUsize::new(count.get() - 1) {
+                    *guard = Phase::Running(remaining);
+                    return;
+                }
+                *guard = Phase::Stopping;
+                drop(guard);
+                // The last handle stops NDI outside the state lock.
+                self.backend.destroy();
+                let mut guard = Self::recover_guard(self.state.lock());
+                *guard = Phase::Stopped;
+                self.cv.notify_all();
+            }
+            other => {
+                debug_assert!(false, "release() called while runtime was {other:?}");
+            }
         }
     }
 
     fn is_running(&self) -> bool {
-        let guard = Self::recover_guard(self.state.lock());
-        guard.phase == Phase::Running && guard.refcount > 0
+        matches!(*Self::recover_guard(self.state.lock()), Phase::Running(_))
     }
 }
 
-/// Initialization state of the one implementation a process can select.
-static LIFECYCLE: OnceLock<RuntimeManager> = OnceLock::new();
+impl RuntimeManager {
+    pub(crate) fn new(
+        lifecycle: sys::Lifecycle,
+        supported_cpu: unsafe extern "C" fn() -> bool,
+    ) -> Self {
+        Self::with_backend(SdkBackend {
+            lifecycle,
+            supported_cpu,
+        })
+    }
 
-fn lifecycle(runtime: &'static sys::Runtime) -> &'static RuntimeManager {
-    LIFECYCLE.get_or_init(|| RuntimeManager::with_backend(SdkBackend(&runtime.gates.api().core)))
+    /// The address imported by a companion File library must be this one.
+    #[cfg(all(feature = "file-io", not(ndi_link_static)))]
+    pub(crate) fn initialize_address(&self) -> *const std::ffi::c_void {
+        self.backend.lifecycle.NDIlib_initialize as *const std::ffi::c_void
+    }
 }
 
 /// A handle to the started NDI runtime.
@@ -851,7 +824,7 @@ impl Ndi {
     /// }
     /// ```
     pub fn is_running() -> bool {
-        LIFECYCLE.get().is_some_and(RuntimeManager::is_running)
+        sys::selected().is_some_and(|runtime| runtime.lifecycle.is_running())
     }
 }
 
@@ -863,7 +836,9 @@ impl Clone for Ndi {
     /// Panics if the runtime handle reference count is exhausted. The original
     /// handle and runtime remain valid.
     fn clone(&self) -> Self {
-        lifecycle(self.runtime.selected)
+        self.runtime
+            .selected
+            .lifecycle
             .acquire()
             .expect("Unable to acquire another reference to the existing NDI runtime");
         Self {
@@ -874,7 +849,7 @@ impl Clone for Ndi {
 
 impl Drop for Ndi {
     fn drop(&mut self) {
-        lifecycle(self.runtime.selected).release();
+        self.runtime.selected.lifecycle.release();
     }
 }
 
@@ -921,11 +896,14 @@ mod tests {
 
     impl RuntimeManager<MockBackend> {
         fn phase(&self) -> Phase {
-            Self::recover_guard(self.state.lock()).phase
+            *Self::recover_guard(self.state.lock())
         }
 
         fn refcount(&self) -> usize {
-            Self::recover_guard(self.state.lock()).refcount
+            match *Self::recover_guard(self.state.lock()) {
+                Phase::Running(count) => count.get(),
+                _ => 0,
+            }
         }
     }
 
@@ -933,14 +911,28 @@ mod tests {
     fn refcount_overflow_preserves_live_runtime() {
         let manager = RuntimeManager::with_backend(MockBackend::default());
         manager.acquire().unwrap();
-        manager.state.lock().unwrap().refcount = usize::MAX;
+        *manager.state.lock().unwrap() = Phase::Running(NonZeroUsize::MAX);
         assert!(manager.acquire().is_err());
         assert_eq!(manager.refcount(), usize::MAX);
         assert!(manager.is_running());
         assert_eq!(manager.backend.destroy_count.load(Ordering::Acquire), 0);
         // Restore the injected count so the acquired reference can be released.
-        manager.state.lock().unwrap().refcount = 1;
+        *manager.state.lock().unwrap() = Phase::Running(NonZeroUsize::MIN);
         manager.release();
+        assert_eq!(manager.backend.destroy_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn two_handles_release_the_runtime_exactly_once() {
+        let manager = RuntimeManager::with_backend(MockBackend::default());
+        manager.acquire().unwrap();
+        manager.acquire().unwrap();
+        assert_eq!(manager.refcount(), 2);
+        manager.release();
+        assert_eq!(manager.phase(), Phase::Running(NonZeroUsize::MIN));
+        assert_eq!(manager.backend.destroy_count.load(Ordering::Acquire), 0);
+        manager.release();
+        assert_eq!(manager.phase(), Phase::Stopped);
         assert_eq!(manager.backend.destroy_count.load(Ordering::Acquire), 1);
     }
 
@@ -957,14 +949,14 @@ mod tests {
             manager.acquire(),
             Err(Error::InitializationFailed(_))
         ));
-        assert_eq!(manager.phase(), Phase::Failed);
+        assert_eq!(manager.phase(), Phase::Stopped);
 
         manager
             .backend
             .cpu_unsupported
             .store(true, Ordering::Release);
         assert!(matches!(manager.acquire(), Err(Error::UnsupportedCpu)));
-        assert_eq!(manager.phase(), Phase::Failed);
+        assert_eq!(manager.phase(), Phase::Stopped);
         assert!(!manager.is_running());
         assert_eq!(manager.backend.init_count.load(Ordering::Acquire), 2);
         assert_eq!(manager.backend.cpu_query_count.load(Ordering::Acquire), 2);
@@ -1011,7 +1003,7 @@ mod tests {
         manager.release();
         assert_eq!(manager.backend.destroy_count.load(Ordering::Acquire), 1);
         assert!(!manager.is_running());
-        assert_eq!(manager.phase(), Phase::Uninitialized);
+        assert_eq!(manager.phase(), Phase::Stopped);
 
         // Second cycle - must re-initialize
         manager.acquire().expect("Second init should succeed");
@@ -1037,7 +1029,7 @@ mod tests {
         let result = manager.acquire();
         assert!(result.is_err());
         assert_eq!(manager.backend.init_count.load(Ordering::Acquire), 1);
-        assert_eq!(manager.phase(), Phase::Failed);
+        assert_eq!(manager.phase(), Phase::Stopped);
         assert!(!manager.is_running());
 
         // Configure next init to succeed
@@ -1060,7 +1052,7 @@ mod tests {
         let manager = Arc::new(RuntimeManager::with_backend(MockBackend::default()));
 
         // Verify initial state
-        assert_eq!(manager.phase(), Phase::Uninitialized);
+        assert_eq!(manager.phase(), Phase::Stopped);
         assert!(!manager.is_running());
         assert_eq!(manager.backend.init_count.load(Ordering::Acquire), 0);
 
@@ -1078,7 +1070,7 @@ mod tests {
         manager.release();
 
         // After teardown, next acquire MUST call init
-        assert_eq!(manager.phase(), Phase::Uninitialized);
+        assert_eq!(manager.phase(), Phase::Stopped);
         manager.acquire().expect("Re-init should succeed");
         assert_eq!(manager.backend.init_count.load(Ordering::Acquire), 2);
 
@@ -1230,7 +1222,7 @@ mod tests {
         // Final state should be clean
         assert!(!manager.is_running());
         assert_eq!(manager.refcount(), 0);
-        assert_eq!(manager.phase(), Phase::Uninitialized);
+        assert_eq!(manager.phase(), Phase::Stopped);
     }
 
     #[test]
@@ -1258,7 +1250,7 @@ mod tests {
         }
 
         // State should be Failed
-        assert_eq!(manager.phase(), Phase::Failed);
+        assert_eq!(manager.phase(), Phase::Stopped);
         assert!(!manager.is_running());
 
         // Now allow init to succeed
