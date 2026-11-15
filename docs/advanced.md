@@ -234,6 +234,10 @@ if let Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(packet))) =
 }
 ```
 
+See [`advanced_allocator`](../examples/advanced_allocator.rs) for allocator setup
+and [`advanced_passthrough`](../examples/advanced_passthrough.rs) for packet
+capture and forwarding.
+
 `AllocationBuffer::zeroed(request)` provides zeroed, 64-byte-aligned memory.
 Use `request.with_stride_bytes(stride)` for permitted line/channel padding.
 `AllocationBuffer::from_external` supports arbitrary application-owned handles
