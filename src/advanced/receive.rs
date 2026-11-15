@@ -343,7 +343,7 @@ impl PacketReceiver {
         receiver: &Receiver<PacketAttached>,
         timeout: Duration,
     ) -> Result<Option<PacketItemRef<'_>>> {
-        receiver.core.capture_any_until_with::<AllSlots, _>(
+        receiver.capture_any_until_with::<AllSlots, _>(
             Deadline::after(timeout)?,
             crate::receiver::NeverStop,
             PacketItemRef::Event,

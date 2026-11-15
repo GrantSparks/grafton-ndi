@@ -804,7 +804,8 @@ pub trait ReceiverMode: mode_sealed::Sealed + Send + Sync {}
 ///
 /// Metadata capture retains any notifications it encounters for a later raw
 /// receiver, but does not grant event polling; see [`EventMode`].
-pub trait MetadataMode: ReceiverMode + mode_sealed::MetadataSealed {}
+#[allow(private_bounds)]
+pub trait MetadataMode: ReceiverMode + mode_sealed::MetadataSealed + Permits<MetadataKind> {}
 
 /// Sealed receiver mode permitting event polling: [`RawCapture`].
 ///
@@ -812,7 +813,8 @@ pub trait MetadataMode: ReceiverMode + mode_sealed::MetadataSealed {}
 /// attached receiver observes them. Attached receivers therefore use capability
 /// getters, [`Receiver::poll_source_name_change`], [`Receiver::is_connected`]
 /// and [`Receiver::connection_stats`] rather than event polling.
-pub trait EventMode: ReceiverMode + mode_sealed::EventSealed {}
+#[allow(private_bounds)]
+pub trait EventMode: ReceiverMode + mode_sealed::EventSealed + Permits<NoSlots> {}
 
 /// Sealed receiver mode in which the receiver's own audio and metadata
 /// capture are available: [`RawCapture`].
@@ -821,7 +823,8 @@ pub trait EventMode: ReceiverMode + mode_sealed::EventSealed {}
 /// that holds the receiver: [`FrameSyncAttached`] to a
 /// [`FrameSync`](crate::FrameSync) and, with the `advanced` feature,
 /// `AvSyncAttached` to an Advanced `AvSync`.
-pub trait CaptureMode: MetadataMode + mode_sealed::CaptureSealed {}
+#[allow(private_bounds)]
+pub trait CaptureMode: MetadataMode + mode_sealed::CaptureSealed + Permits<AudioKind> {}
 
 /// Sealed receiver mode in which the receiver's own video capture is
 /// available: [`RawCapture`] and, with the `advanced` feature, the
@@ -829,7 +832,26 @@ pub trait CaptureMode: MetadataMode + mode_sealed::CaptureSealed {}
 ///
 /// A mode without it hands the receiver's video to the object that holds the
 /// receiver.
-pub trait VideoMode: ReceiverMode + mode_sealed::VideoSealed {}
+#[allow(private_bounds)]
+pub trait VideoMode: ReceiverMode + mode_sealed::VideoSealed + Permits<VideoKind> {}
+
+/// The one crate-internal permission table for both typed and slot-set capture.
+/// ReceiverMode seals the implementors. Public modes inherit their permissions,
+/// so a generic adapter's public mode bound carries this same internal gate.
+pub(crate) trait Permits<K>: ReceiverMode {}
+
+// Raw capture permits every sealed public kind, including generic CaptureKind
+// callers. Attached modes retain only the slots their synchronizer leaves free.
+impl<K: CaptureKind> Permits<K> for RawCapture {}
+impl Permits<AllSlots> for RawCapture {}
+impl Permits<NoSlots> for RawCapture {}
+impl Permits<MetadataKind> for FrameSyncAttached {}
+#[cfg(feature = "advanced")]
+impl Permits<AllSlots> for PacketAttached {}
+#[cfg(feature = "advanced")]
+impl Permits<VideoKind> for AvSyncAttached {}
+#[cfg(feature = "advanced")]
+impl Permits<MetadataKind> for AvSyncAttached {}
 
 /// Ordinary receiver mode, permitting raw video capture.
 #[derive(Debug)]
@@ -1005,8 +1027,7 @@ impl Receiver {
     /// the same frame-validation errors as typed borrowed capture. Rejected
     /// frames are freed through their matching native free operation.
     pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<ReceiverItemRef<'_>>> {
-        self.core
-            .capture_any_ref_until(Deadline::after(timeout)?, NeverStop)
+        self.capture_any_ref_until(Deadline::after(timeout)?, NeverStop)
     }
 
     /// Wait up to `timeout` for any media or receiver event and return an
@@ -1023,7 +1044,7 @@ impl Receiver {
     ///
     /// The errors of [`Self::capture_any_ref`].
     pub fn capture_any(&self, timeout: Duration) -> Result<Option<ReceiverItem>> {
-        self.core.capture_any_until(Deadline::after(timeout)?)
+        self.capture_any_until(Deadline::after(timeout)?)
     }
 
     /// Create a receiver and connect it to the configured source.
@@ -1135,11 +1156,81 @@ impl<M: VideoMode> Receiver<M> {
     /// ```
     #[must_use = "the Capture view does nothing until a capture verb is called"]
     pub fn video(&self) -> Capture<'_, VideoKind> {
-        Capture::new(&self.core)
+        Capture::new(self)
     }
 }
 
 impl<M: ReceiverMode> Receiver<M> {
+    /// Typed capture for an adapter whose receiver mode permits this kind.
+    #[cfg(any(feature = "tokio", feature = "smol", ndi_test_capture_permissions))]
+    pub(crate) fn capture_ref_until<K: CaptureKind>(
+        &self,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Option<K::Ref<'_>>>
+    where
+        M: Permits<K>,
+    {
+        self.core.capture_ref_until::<K>(deadline, stop)
+    }
+
+    /// Mixed capture selects its slot set through the same mode permission.
+    pub(crate) fn capture_any_until_with<'rx, S: SlotSet, T>(
+        &'rx self,
+        deadline: Deadline,
+        stop: impl Stop,
+        event: impl FnMut(ReceiverEvent) -> T,
+        convert: impl FnMut(S::Media<'rx>) -> Result<T>,
+    ) -> Result<Option<T>>
+    where
+        M: Permits<S>,
+    {
+        self.core
+            .capture_any_until_with::<S, T>(deadline, stop, event, convert)
+    }
+
+    pub(crate) fn capture_any_ref_until(
+        &self,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Option<ReceiverItemRef<'_>>>
+    where
+        M: Permits<AllSlots>,
+    {
+        self.capture_any_until_with::<AllSlots, _>(
+            deadline,
+            stop,
+            ReceiverItemRef::Event,
+            ReceiverCore::combined_result,
+        )
+    }
+
+    fn capture_any_until(&self, deadline: Deadline) -> Result<Option<ReceiverItem>>
+    where
+        M: Permits<AllSlots>,
+    {
+        Ok(self
+            .capture_any_ref_until(deadline, NeverStop)?
+            .as_ref()
+            .map(ReceiverItemRef::to_owned))
+    }
+
+    pub(crate) fn poll_event_until(
+        &self,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Option<ReceiverEvent>>
+    where
+        M: Permits<NoSlots>,
+    {
+        self.capture_any_until_with::<NoSlots, _>(
+            deadline,
+            stop,
+            |event| event,
+            |media| match media {},
+        )
+    }
+
     pub(crate) fn into_mode<T: ReceiverMode>(self) -> Receiver<T> {
         Receiver {
             core: self.core,
@@ -1554,8 +1645,7 @@ impl<M: EventMode> Receiver<M> {
     /// (~49.7 days), and [`Error::CaptureFailed`] when the SDK reports a lost
     /// connection.
     pub fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
-        self.core
-            .poll_event_until(Deadline::after(timeout)?, NeverStop)
+        self.poll_event_until(Deadline::after(timeout)?, NeverStop)
     }
 }
 
@@ -1587,7 +1677,7 @@ impl<M: MetadataMode> Receiver<M> {
     where
         M: CaptureMode,
     {
-        Capture::new(&self.core)
+        Capture::new(self)
     }
 
     /// Capture **metadata** frames from this receiver.
@@ -1611,7 +1701,7 @@ impl<M: MetadataMode> Receiver<M> {
     /// ```
     #[must_use = "the Capture view does nothing until a capture verb is called"]
     pub fn metadata(&self) -> Capture<'_, MetadataKind> {
-        Capture::new(&self.core)
+        Capture::new(self)
     }
 }
 
@@ -1658,7 +1748,7 @@ impl ReceiverCore {
     ///
     /// This is the only way to make a [`CaptureLock`], and so to call
     /// `NDIlib_recv_capture_v3` on this instance.
-    pub(crate) fn capture_lock(&self, attempt: Attempt) -> Option<CaptureLock<'_>> {
+    fn capture_lock(&self, attempt: Attempt) -> Option<CaptureLock<'_>> {
         let shared = self.capture_guard.try_read_until(attempt.0.end())?;
         Some(CaptureLock {
             core: self,
@@ -1717,39 +1807,12 @@ impl ReceiverCore {
     /// The one capture loop, behind [`Capture::capture_ref`] and every owned
     /// capture: SDK captures in [`capture_within`]'s attempts until one
     /// delivers a frame of kind `K` or `deadline` is spent.
-    pub(crate) fn capture_ref_until<K: CaptureKind>(
+    fn capture_ref_until<K: CaptureKind>(
         &self,
         deadline: Deadline,
         stop: impl Stop,
     ) -> Result<Option<K::Ref<'_>>> {
         capture_within(deadline, stop, |attempt| self.poll_ref_until::<K>(attempt))
-    }
-
-    /// [`Self::capture_ref_until`], copied into an owned frame: behind
-    /// [`Capture::capture`]. Async captures copy inside their scoped callback.
-    pub(crate) fn capture_until<K: CaptureKind>(
-        &self,
-        deadline: Deadline,
-    ) -> Result<Option<K::Owned>> {
-        Ok(self
-            .capture_ref_until::<K>(deadline, NeverStop)?
-            .as_ref()
-            .map(K::ref_to_owned))
-    }
-
-    /// All-slot capture through the same attempt/deadline kernel as typed
-    /// capture, with pending invalidations consumed by the combined reader.
-    pub(crate) fn capture_any_ref_until(
-        &self,
-        deadline: Deadline,
-        stop: impl Stop,
-    ) -> Result<Option<ReceiverItemRef<'_>>> {
-        self.capture_any_until_with::<AllSlots, _>(
-            deadline,
-            stop,
-            ReceiverItemRef::Event,
-            Self::combined_result,
-        )
     }
 
     /// The mixed-capture kernel, shared by raw and packet receivers and
@@ -1759,7 +1822,7 @@ impl ReceiverCore {
     /// spares the native wait. A failed lock attempt also checks for events
     /// retained during that attempt. Only media reaches `convert`, retaining
     /// its guards through the caller's validation and copy.
-    pub(crate) fn capture_any_until_with<'rx, S: SlotSet, T>(
+    fn capture_any_until_with<'rx, S: SlotSet, T>(
         &'rx self,
         deadline: Deadline,
         stop: impl Stop,
@@ -1810,14 +1873,6 @@ impl ReceiverCore {
         })
     }
 
-    /// Combined capture copied while its native guards are still local.
-    pub(crate) fn capture_any_until(&self, deadline: Deadline) -> Result<Option<ReceiverItem>> {
-        Ok(self
-            .capture_any_ref_until(deadline, NeverStop)?
-            .as_ref()
-            .map(ReceiverItemRef::to_owned))
-    }
-
     /// Coalesce the native notification with any invalidation a concurrent
     /// typed capture retained during this wait, then consume one. A pending
     /// event returned before the native wait never comes through this path
@@ -1847,7 +1902,7 @@ impl ReceiverCore {
         }
     }
 
-    /// Keep a notification a capture reported for [`Self::poll_event_until`].
+    /// Keep a notification a capture reported for [`Receiver::poll_event`].
     fn retain(&self, notification: Notification) {
         match notification {
             Notification::None => {}
@@ -1868,24 +1923,6 @@ impl ReceiverCore {
             .lock()
             .take()
             .map(ReceiverEvent::Unknown)
-    }
-
-    /// The one implementation of event polling, behind [`Receiver::poll_event`]
-    /// and the async receivers' `poll_event`: event attempts in the one
-    /// capture loop until `deadline` is spent, which may have started before
-    /// this call. An expired `deadline`, like a zero timeout, makes one
-    /// attempt without waiting.
-    pub(crate) fn poll_event_until(
-        &self,
-        deadline: Deadline,
-        stop: impl Stop,
-    ) -> Result<Option<ReceiverEvent>> {
-        self.capture_any_until_with::<NoSlots, _>(
-            deadline,
-            stop,
-            |event| event,
-            |media| match media {},
-        )
     }
 
     /// The one implementation of [`Receiver::poll_source_name_change`], also
@@ -2074,14 +2111,15 @@ pub(crate) mod native_capture_calls {
 /// restores the ordinary mode, and an Advanced `AvSync` owns audio capture
 /// until its `into_receiver` does.
 pub struct Capture<'rx, K: CaptureKind> {
+    // Only new can erase the mode, after checking its Permits<K> bound.
     rx: &'rx ReceiverCore,
     _kind: PhantomData<K>,
 }
 
 impl<'rx, K: CaptureKind> Capture<'rx, K> {
-    fn new(rx: &'rx ReceiverCore) -> Self {
+    fn new<M: Permits<K>>(rx: &'rx Receiver<M>) -> Self {
         Self {
-            rx,
+            rx: &rx.core,
             _kind: PhantomData,
         }
     }
@@ -2102,7 +2140,7 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
     /// (~49.7 days), [`Error::CaptureFailed`] when the SDK reports a lost
     /// connection, and the errors of validating and copying the frame.
     pub fn capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
-        self.rx.capture_until::<K>(Deadline::after(timeout)?)
+        Ok(self.capture_ref(timeout)?.as_ref().map(K::ref_to_owned))
     }
 
     /// Wait up to `timeout` for a frame and borrow the SDK's buffer in
@@ -4289,3 +4327,9 @@ mod tests {
         assert!(sleeps.is_empty());
     }
 }
+
+// This fixture is compiled in the crate, so it exercises internal gates rather
+// than failing because an external doctest cannot access private methods.
+#[cfg(ndi_test_capture_permissions)]
+#[path = "../tests/ui/internal/capture_permissions.rs"]
+mod capture_permission_fixture;
