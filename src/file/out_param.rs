@@ -119,6 +119,31 @@ mod tests {
     use crate::sys::{self, bindings::*};
 
     #[test]
+    fn required_fill_preserves_the_failure_but_checks_corruption_first() {
+        for corrupt in [false, true] {
+            let result = required_fill(|out: *mut u64| {
+                if corrupt {
+                    // SAFETY: the helper's guard contains this first byte past u64.
+                    unsafe { out.cast::<u8>().add(size_of::<u64>()).write(0) };
+                }
+                sys::table::for_test(false, c"NDIlib_file_player_probe_file")
+            });
+            if corrupt {
+                assert!(matches!(
+                    result,
+                    Err(Error::UnexpectedSdkResult(
+                        crate::SdkResultDefect::FileStructureTooLarge { .. }
+                    ))
+                ));
+            } else {
+                assert!(
+                    matches!(result, Err(Error::NativeOperationFailed { operation }) if operation == c"NDIlib_file_player_probe_file")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_write_within_the_layout_is_returned() {
         let mut out = OutParam::<u64>::new();
         // SAFETY: the pointer is valid for one u64.

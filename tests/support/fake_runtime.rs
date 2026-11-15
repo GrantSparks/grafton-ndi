@@ -619,7 +619,7 @@ mod objects {
 
         fn NDIlib_send_advertiser_add_sender(_p_instance: NDIlib_send_advertiser_instance_t, _p_sender: NDIlib_send_instance_t, allow_monitoring: bool) -> bool {
             log(&format!("send-advertiser-add monitoring={allow_monitoring}"));
-            true
+            !std::env::var_os("GRAFTON_FAKE_ADVERTISER_ADD").is_some_and(|mode| mode == "refuse")
         }
 
         fn NDIlib_send_advertiser_del_sender(_p_instance: NDIlib_send_advertiser_instance_t, _p_sender: NDIlib_send_instance_t) -> bool {
@@ -645,6 +645,7 @@ mod objects {
 
         fn NDIlib_recv_advertiser_add_receiver(p_instance: NDIlib_recv_advertiser_instance_t, p_receiver: NDIlib_recv_instance_t, allow_controlling: bool, allow_monitoring: bool, p_input_group_name: *const c_char) -> bool {
             log(&format!("recv-advertiser-add controlling={allow_controlling} monitoring={allow_monitoring}"));
+            if std::env::var_os("GRAFTON_FAKE_ADVERTISER_ADD").is_some_and(|mode| mode == "refuse") { return false; }
             let advertiser = unsafe { &mut *p_instance.cast::<RecvAdvertiser>() };
             advertiser.groups.push((p_receiver, p_input_group_name));
             true
@@ -707,6 +708,7 @@ mod objects {
         }
 
         fn NDIlib_routing_clear(p_instance: NDIlib_routing_instance_t) -> bool {
+            if std::env::var_os("GRAFTON_FAKE_ROUTING_CLEAR").is_some_and(|mode| mode == "refuse") { return false; }
             let router = unsafe { &mut *p_instance.cast::<Router>() };
             unsafe { router.route.read("route") };
             unsafe { router.refused.read("refused-route") };
@@ -1060,7 +1062,7 @@ mod discovery {
 
         fn NDIlib_recv_listener_send_connect(_p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char, p_source_name: *const c_char) -> bool {
             log(&format!("recv-listener-connect {} {}", unsafe { bytes(p_receiver_uuid) }, unsafe { bytes(p_source_name) }));
-            true
+            !std::env::var_os("GRAFTON_FAKE_LISTENER_CONNECT").is_some_and(|mode| mode == "refuse")
         }
     }
 }

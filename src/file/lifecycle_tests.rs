@@ -683,6 +683,30 @@ fn a_malformed_stale_event_is_consumed_before_the_native_start() {
 }
 
 #[test]
+fn refused_starts_name_the_actual_timecode_entry_point() {
+    for (timecode, expected) in [
+        (RecordingTimecode::Preserve, c"NDIlib_file_recorder_start"),
+        (
+            RecordingTimecode::GenerateFrom(
+                SessionTimecode::new(crate::Timecode::from_ticks(123)).unwrap(),
+            ),
+            c"NDIlib_file_recorder_start_with_timecode",
+        ),
+    ] {
+        let device = mock::Recorder::new(Closing::AtStop);
+        device.install();
+        let mut recorder = mock::recorder_api()
+            .create_recorder(&RecorderOptions::new(
+                SourceSpec::new("mock source").unwrap(),
+            ))
+            .unwrap();
+        device.fail_next_start.store(true, Ordering::Release);
+        assert!(matches!(recorder.start(&target("unopenable"), timecode),
+            Err(Error::NativeOperationFailed { operation }) if operation == expected));
+    }
+}
+
+#[test]
 fn a_refused_start_is_not_counted_in_any_session() {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();

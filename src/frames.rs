@@ -3259,8 +3259,7 @@ pub(crate) const MAX_SDK_STRING_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// # Errors
 ///
-/// [`Error::UnexpectedSdkResult`] naming `operation`, the SDK function that
-/// returned the string, when there is no terminator within the limit.
+/// [`Error::UnexpectedSdkResult`] naming the SDK function retained by `text`, when there is no terminator within the limit.
 ///
 /// # Safety
 ///

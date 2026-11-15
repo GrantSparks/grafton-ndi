@@ -6,6 +6,8 @@ use super::{
     out_param, types, FileApi, FileDuration, FilePosition, PlayerEvent, PlayerOptions, PlayerStats,
     SourceFormat,
 };
+#[cfg(doc)]
+use crate::Error;
 use crate::{
     sys::{self, bindings::*},
     Result, Source, Timecode,

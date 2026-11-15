@@ -345,6 +345,41 @@ mod tests {
     }
 
     #[test]
+    fn refused_results_retain_the_entry_point_without_allocating() {
+        unsafe extern "C" fn refuse() -> bool {
+            false
+        }
+        unsafe extern "C" fn destroy(_: NDIlib_recv_instance_t) {}
+        let table = Pair {
+            NDIlib_initialize: refuse,
+            NDIlib_recv_destroy: destroy,
+        };
+        let (result, allocations) = crate::test_alloc::allocation_count(|| {
+            // SAFETY: the table contains the no-argument stub above.
+            unsafe { table.named().NDIlib_initialize() }.performed()
+        });
+        assert!(
+            matches!(result, Err(crate::Error::NativeOperationFailed { operation })
+            if operation == c"NDIlib_initialize")
+        );
+        assert_eq!(allocations, 0);
+        let called = for_test(std::ptr::null_mut::<u8>(), c"NDIlib_send_create");
+        assert!(
+            matches!(called.created(), Err(crate::Error::NativeOperationFailed { operation })
+            if operation == c"NDIlib_send_create")
+        );
+        let mut live = 7u8;
+        let pointer = std::ptr::from_mut(&mut live);
+        assert_eq!(
+            for_test(pointer, c"NDIlib_send_create")
+                .created()
+                .unwrap()
+                .as_ptr(),
+            pointer
+        );
+    }
+
+    #[test]
     fn a_provenance_failure_is_an_error_not_a_missing_symbol() {
         struct Foreign;
         impl Resolver for Foreign {

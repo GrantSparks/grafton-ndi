@@ -179,7 +179,7 @@ pub use types::*;
 
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
+#[cfg(any(test, doc))]
 use crate::Error;
 use crate::{capabilities::CapabilityStatus, sys, Ndi, Result};
 #[cfg(test)]

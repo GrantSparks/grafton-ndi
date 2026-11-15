@@ -1258,7 +1258,7 @@ impl Source {
             .map(|authority| authority.host)
     }
 
-    /// Copy a source descriptor that the SDK function `operation` returned
+    /// Copy a source descriptor that the SDK call `source` returned
     /// into owned strings after null checks, replacing bytes that are not
     /// UTF-8.
     ///
@@ -1267,14 +1267,14 @@ impl Source {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NativeOperationFailed`] naming `operation` when the
+    /// Returns [`Error::NativeOperationFailed`] naming the call's function when the
     /// descriptor is null, or names neither a source nor an address, and
     /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
     /// the 4 MiB one SDK string may be.
     ///
     /// # Safety
     ///
-    /// A non-null `source_ptr` must point to a live `NDIlib_source_t`. Its
+    /// The non-null pointer in `source` must point to a live `NDIlib_source_t`. Its
     /// non-null string pointers must remain readable through their NUL
     /// terminators, or for 4 MiB, until copying finishes.
     pub(crate) unsafe fn try_from_raw(

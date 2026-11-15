@@ -37,6 +37,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Owned metadata constructors and setters return refused text in
   `Rejected<String>`; owned frame builders expose metadata recovery accessors.
 
+- Native operation failures and SDK-result causes identify their entry point
+  with `NativeFunction`. Compare it with a C string or inspect `name()`; File
+  failures now name the actual SDK function, including timecoded starts.
+
 - `InvalidFrame`, `InvalidInput` and `UnexpectedSdkResult` carry typed
   `FrameDefect`, `InputDefect` and `SdkResultDefect` causes. Shared layout
   refusals use one nested `LayoutDefect` in both frame and input causes. Receiver capture
