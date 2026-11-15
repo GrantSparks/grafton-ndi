@@ -262,7 +262,9 @@ pub(super) struct ResolvedPlayerOptions {
 /// Every absolute output path must fit exactly in the recorder's event field:
 /// at most 4094 UTF-8 bytes with the current SDK. Preflight reserves at least
 /// 20 digits for each index token, including future rollovers, and refuses
-/// longer paths with [`Error::InvalidInput`].
+/// longer paths with [`Error::InvalidInput`]. It also refuses a resolved path
+/// that is not lossless UTF-8, including a relative pattern resolved against
+/// a non-UTF-8 current directory.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum FileNaming {

@@ -1004,9 +1004,10 @@ impl FileRecorder {
     ///   finish or poll it first, or [`reset`](Self::reset) it. With
     ///   [`StateError::EarlierSessionEvents`] when the SDK keeps reporting
     ///   events of an earlier session.
-    /// * [`Error::InvalidInput`] when the longest output path exceeds the
-    ///   recorder event's exact path limit (4094 UTF-8 bytes with the current
-    ///   SDK), reserving at least 20 digits per index token. The SDK is not called.
+    /// * [`Error::InvalidInput`] when the resolved output path is not lossless
+    ///   UTF-8, or its longest form exceeds the recorder event's exact path
+    ///   limit (4094 UTF-8 bytes with the current SDK), reserving at least
+    ///   20 digits per index token. The SDK is not called.
     /// * [`Error::Io`] when the directory of the file the pattern names
     ///   does not exist or cannot be written to, or, with an exact file name,
     ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
@@ -1521,10 +1522,10 @@ impl FileRecorder {
     ///
     /// * [`Error::InvalidState`] with [`StateError::NotRecording`] unless
     ///   a session is recording.
-    /// * [`Error::InvalidInput`] when the longest output path exceeds the
-    ///   recorder event's exact path limit (4094 UTF-8 bytes with the current
-    ///   SDK), reserving at least 20 digits per index token. The SDK is not
-    ///   called and the session goes on.
+    /// * [`Error::InvalidInput`] when the resolved output path is not lossless
+    ///   UTF-8, or its longest form exceeds the recorder event's exact path
+    ///   limit (4094 UTF-8 bytes with the current SDK), reserving at least
+    ///   20 digits per index token. The SDK is not called and the session goes on.
     /// * [`Error::Io`] when the directory of the file the pattern names
     ///   does not exist or cannot be written to, or, with an exact file name,
     ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
