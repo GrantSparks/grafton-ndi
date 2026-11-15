@@ -6,7 +6,10 @@
 //! `tests/change_notifications.rs`: reports survive idle intervals and snapshots,
 //! and a native wait consumes the report it returns.
 
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::{
+    sync::{Condvar, Mutex, MutexGuard},
+    time::Duration,
+};
 
 use crate::timeout::{Deadline, Stop, POLL_INTERVAL};
 
@@ -45,8 +48,45 @@ impl ChangeFeed {
         observed: u64,
         deadline: Deadline,
         stop: S,
-        mut native_wait: impl FnMut(u32) -> bool,
+        native_wait: impl FnMut(u32) -> bool,
     ) -> bool {
+        self.wait_since_with(
+            observed,
+            deadline,
+            stop,
+            native_wait,
+            |changed, state, remaining| {
+                changed
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0
+            },
+        )
+    }
+
+    // The suspension adapter also lets tests coordinate a follower at its
+    // actual condvar wait, rather than guessing its progress with a sleep.
+    fn wait_since_with<'a, S: Stop>(
+        &'a self,
+        observed: u64,
+        deadline: Deadline,
+        stop: S,
+        mut native_wait: impl FnMut(u32) -> bool,
+        mut follower_wait: impl FnMut(
+            &Condvar,
+            MutexGuard<'a, State>,
+            Duration,
+        ) -> MutexGuard<'a, State>,
+    ) -> bool {
+        // Both the native leader and condvar followers use this one stop
+        // bound. Scripted native waits pin it independently of OS scheduling.
+        let next_wait = || {
+            if S::CAN_STOP {
+                deadline.within_at(std::time::Instant::now(), POLL_INTERVAL)
+            } else {
+                deadline
+            }
+        };
         let mut state = self.lock();
         loop {
             if stop.is_stopped() {
@@ -68,12 +108,7 @@ impl ChangeFeed {
                     if stop.is_stopped() {
                         break false;
                     }
-                    let attempt = if S::CAN_STOP {
-                        deadline.within_at(std::time::Instant::now(), POLL_INTERVAL)
-                    } else {
-                        deadline
-                    };
-                    let changed = native_wait(attempt.remaining_ms());
+                    let changed = native_wait(next_wait().remaining_ms());
                     if changed || !S::CAN_STOP || deadline.is_expired() {
                         break changed;
                     }
@@ -87,21 +122,13 @@ impl ChangeFeed {
                 self.changed.notify_all();
                 return state.generation != observed;
             }
-            let remaining = if S::CAN_STOP {
-                deadline.remaining().min(POLL_INTERVAL)
-            } else {
-                deadline.remaining()
-            };
+            let remaining = next_wait().remaining();
             if remaining.is_zero() {
                 return false;
             }
             // Recheck both the generation and native-waiter flag after every
             // wake, including timeouts, handoff and spurious notifications.
-            state = self
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
+            state = follower_wait(&self.changed, state, remaining);
         }
     }
 }
@@ -177,30 +204,72 @@ mod tests {
     #[test]
     fn stoppable_follower_can_leave_a_synchronous_native_wait() {
         use std::sync::atomic::AtomicBool;
+        const WATCHDOG: Duration = Duration::from_secs(5);
+        const LOOKUP: Duration = Duration::from_secs(30);
+        struct ReleaseLeader(mpsc::Sender<()>);
+        impl Drop for ReleaseLeader {
+            fn drop(&mut self) {
+                // Also release on assertion failure before scope joins workers.
+                let _ = self.0.send(());
+            }
+        }
         let feed = ChangeFeed::default();
         let stop = AtomicBool::new(false);
         let (entered, started) = mpsc::channel();
         let (release, released) = mpsc::channel();
+        let (ready, follower_ready) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
         thread::scope(|scope| {
+            let release = ReleaseLeader(release);
             let feed = &feed;
             let leader = scope.spawn(move || {
-                feed.wait_since(0, budget(), NeverStop, |_| {
+                feed.wait_since(0, Deadline::after(LOOKUP).unwrap(), NeverStop, |_| {
                     entered.send(()).unwrap();
-                    released.recv_timeout(Duration::from_secs(3)).unwrap();
+                    // Only the test releases this native wait. In particular,
+                    // the follower cannot pass by waiting for its timeout.
+                    let _ = released.recv();
                     false
                 })
             });
-            started.recv_timeout(Duration::from_secs(3)).unwrap();
-            let follower = scope.spawn(|| {
-                feed.wait_since(0, budget(), &stop, |_| panic!("overlapping native wait"))
+            started.recv_timeout(WATCHDOG).unwrap();
+            let stop = &stop;
+            let follower = scope.spawn(move || {
+                let mut ready = Some(ready);
+                let result = feed.wait_since_with(
+                    0,
+                    Deadline::after(LOOKUP).unwrap(),
+                    stop,
+                    |_| panic!("overlapping native wait"),
+                    |changed, state, remaining| {
+                        // Pin the actual follower timeout argument, independent
+                        // of how soon the OS schedules either thread afterward.
+                        assert!(remaining > Duration::ZERO && remaining <= POLL_INTERVAL);
+                        if let Some(ready) = ready.take() {
+                            ready.send(()).unwrap();
+                        }
+                        changed
+                            .wait_timeout(state, remaining)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0
+                    },
+                );
+                let _ = finished.send(result);
+                result
             });
-            thread::sleep(Duration::from_millis(20));
-            let cancelled = std::time::Instant::now();
+            follower_ready.recv_timeout(WATCHDOG).unwrap();
             stop.store(true, Ordering::Release);
-            assert!(!follower.join().unwrap());
-            assert!(cancelled.elapsed() < Duration::from_millis(150));
-            release.send(()).unwrap();
-            assert!(!leader.join().unwrap());
+            // Test liveness separately from the scripted 100 ms slice bound:
+            // shared CI scheduling and join latency have no such guarantee.
+            let completed = completion.recv_timeout(WATCHDOG);
+            drop(release);
+            let leader = leader.join().unwrap();
+            let follower = follower.join();
+            assert!(
+                !completed.expect("cancelled follower waited for the blocked native leader"),
+                "cancellation must report no change"
+            );
+            assert!(!leader);
+            assert!(!follower.unwrap());
         });
     }
 

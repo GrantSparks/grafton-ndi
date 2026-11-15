@@ -357,7 +357,14 @@ mod tests {
         };
         let adapter = AsyncFinder::<R>::new(finder(&ndi));
         let cache = AsyncFinder::<R, SourceCache>::new(SourceCache::new(finder(&ndi)));
+        // Wall time also includes executor/OS scheduling. Keep the native
+        // lookup budget much longer than the liveness watchdog so ordinary
+        // timeout cannot make an uncancelled worker pass this check. Scripted
+        // ChangeFeed and fake-runtime tests pin the actual 100 ms wait slices.
+        const LOOKUP: Duration = Duration::from_secs(30);
+        const WATCHDOG: Duration = Duration::from_secs(5);
         fn abandon<T>(
+            label: &str,
             operation: impl Future<Output = T>,
             references: impl Fn() -> usize,
             owners: usize,
@@ -370,22 +377,28 @@ mod tests {
             ));
             thread::sleep(Duration::from_millis(50));
             drop(operation);
-            let deadline = Instant::now() + Duration::from_millis(150);
-            while references() != owners {
+            let deadline = Instant::now() + WATCHDOG;
+            loop {
+                let observed = references();
+                if observed == owners {
+                    break;
+                }
                 assert!(
                     Instant::now() < deadline,
-                    "abandoned discovery kept its blocking worker"
+                    "abandoned {label} kept its blocking worker ({observed} owners, expected {owners})"
                 );
                 thread::sleep(Duration::from_millis(1));
             }
         }
         abandon(
-            adapter.find_source(Duration::from_secs(3), |_| false),
+            "find_source",
+            adapter.find_source(LOOKUP, |_| false),
             || Arc::strong_count(&adapter.inner),
             1,
         );
         abandon(
-            cache.sources_by_host("missing.invalid", Duration::from_secs(3)),
+            "sources_by_host",
+            cache.sources_by_host("missing.invalid", LOOKUP),
             || Arc::strong_count(&cache.inner),
             1,
         );
@@ -400,7 +413,8 @@ mod tests {
         {}
         watch.current_sources().await.unwrap();
         abandon(
-            watch.wait_for_change(Duration::from_secs(3)),
+            "wait_for_change",
+            watch.wait_for_change(LOOKUP),
             || Arc::strong_count(&adapter.inner),
             2,
         );

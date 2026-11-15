@@ -1920,28 +1920,50 @@ mod tests {
     #[cfg(any(feature = "tokio", feature = "smol"))]
     #[test]
     fn cancelled_snapshot_lock_wait_finishes_without_entering_the_sdk() {
-        use std::{
-            sync::atomic::{AtomicBool, Ordering},
-            time::Instant,
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
         };
+        const WATCHDOG: Duration = Duration::from_secs(5);
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         let finder = Finder::new(&ndi, &FinderOptions::new()).unwrap();
         let held = finder.sources_lock.lock();
         let stop = AtomicBool::new(false);
+        let (ready, waiting) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
         std::thread::scope(|scope| {
-            let waiting = scope.spawn(|| finder.current_sources_stoppable(&stop));
-            std::thread::sleep(Duration::from_millis(20));
-            let cancelled = Instant::now();
+            // Keep cleanup inside the scope, so even a failed assertion drops
+            // the held lock before scope waits for a blocked worker to finish.
+            let held = held;
+            let finder = &finder;
+            let stop = &stop;
+            let worker = scope.spawn(move || {
+                let mut ready = Some(ready);
+                let stopped = finder
+                    .lock_snapshots_with(None, stop, |remaining| {
+                        assert!(remaining > Duration::ZERO && remaining <= POLL_INTERVAL);
+                        if let Some(ready) = ready.take() {
+                            ready.send(()).unwrap();
+                        }
+                        finder.sources_lock.try_lock_for(remaining)
+                    })
+                    .is_none();
+                let _ = finished.send(stopped);
+            });
+            waiting.recv_timeout(WATCHDOG).unwrap();
             stop.store(true, Ordering::Release);
-            assert!(matches!(
-                waiting.join().unwrap(),
-                Err(Error::SpawnFailed(crate::SpawnFailure::TaskCancelled))
-            ));
-            assert!(cancelled.elapsed() < Duration::from_millis(150));
+            // Completion must precede unlocking; the watchdog permits shared
+            // CI scheduling delays, not an unbounded snapshot-lock wait.
+            let result = completion.recv_timeout(WATCHDOG);
+            drop(held);
+            worker.join().unwrap();
+            assert!(
+                result.expect("cancelled snapshot wait did not finish while the lock was held"),
+                "cancellation must withhold the native snapshot permission"
+            );
         });
-        drop(held);
     }
 
     #[test]
