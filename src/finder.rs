@@ -2,6 +2,10 @@
 
 mod budget;
 
+#[cfg(ndi_test_finder_snapshot_guard)]
+#[path = "../tests/ui/internal/finder_snapshot_guard.rs"]
+mod snapshot_guard_contract;
+
 pub(crate) use budget::SnapshotBudget;
 
 use std::{
