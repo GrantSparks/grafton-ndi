@@ -16,6 +16,20 @@ raw capture exposes incoming frames and their timing. The native SDK performs th
 network and codec work. Applications still need to choose their buffering,
 threading and backpressure policies.
 
+## Safety and ownership
+
+Compared with calling the C API directly, grafton-ndi reduces manual lifetime
+and buffer management by encoding NDI ownership rules in Rust's types:
+
+- Captured frames borrow their receiver or synchronizer and release native
+  buffers on drop.
+- Async video sends take ownership of frames, preventing reuse while the SDK
+  may still read them.
+- Native resources keep the runtime initialized for their lifetime.
+- Frame builders validate dimensions, strides and buffer sizes.
+- Attaching FrameSync removes raw audio and video capture from the receiver's
+  API, keeping those paths reserved for the synchronizer.
+
 ## Supported SDKs and platforms
 
 - **NDI SDKs:** 6.1.1 Standard; 6.3.2 and 6.4.0.2 Standard and Advanced.
