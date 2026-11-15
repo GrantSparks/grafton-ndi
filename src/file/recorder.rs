@@ -2012,3 +2012,7 @@ mod tests {
         assert!(!ledger.report().stopped_by_sdk());
     }
 }
+
+#[cfg(test)]
+#[path = "drain_budget_tests.rs"]
+mod drain_budget_tests;
