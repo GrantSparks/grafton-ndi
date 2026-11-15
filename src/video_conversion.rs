@@ -169,14 +169,14 @@ impl V210Layout {
     /// Borrow writable P216 storage without deriving the output pointer from
     /// a shared slice: the native converter writes through the original
     /// exclusive borrow's pointer.
-    fn p216_output_descriptor(self, ndi: &Ndi, data: &mut [u8]) -> Result<NDIlib_video_frame_v2_t> {
-        let layout = ValidatedVideoLayout::new_uncompressed(
-            PixelFormat::P216,
-            self.width,
-            self.height,
-            None,
-        )?;
-        let frame = P216Output::new(layout, data)?;
+    fn p216_output_descriptor(
+        self,
+        ndi: &Ndi,
+        destination: &mut VideoFrame,
+    ) -> Result<NDIlib_video_frame_v2_t> {
+        let frame = P216Output::new(destination);
+        // The caller checked P216, which the planar-4:4:4 capability gate
+        // never refuses. Descriptor creation stays at the shared Sendable gate.
         Ok(crate::frames::Sendable::borrowed(&frame, ndi)?.video_descriptor())
     }
 
@@ -208,16 +208,12 @@ struct P216Output<'a> {
 }
 
 impl<'a> P216Output<'a> {
-    fn new(layout: ValidatedVideoLayout, data: &'a mut [u8]) -> Result<Self> {
-        if data.len() != layout.data_len_bytes() {
-            return Err(Error::InvalidFrame(
-                crate::FrameDefect::P216BufferTooSmall {
-                    actual: data.len(),
-                    minimum: layout.data_len_bytes(),
-                },
-            ));
-        }
-        Ok(Self {
+    fn new(destination: &'a mut VideoFrame) -> Self {
+        let layout = *VideoParts::layout(destination);
+        // Derive the pointer from the exclusive borrow, preserving writable
+        // provenance; the frame's storage fills its own validated layout.
+        let pointer = destination.data_mut().as_mut_ptr();
+        Self {
             layout,
             header: VideoHeader::new(
                 crate::media::DEFAULT_VIDEO_FRAME_RATE,
@@ -225,14 +221,14 @@ impl<'a> P216Output<'a> {
                 ScanType::Progressive,
                 Timecode::SYNTHESIZE,
             ),
-            pointer: data.as_mut_ptr(),
+            pointer,
             _borrow: std::marker::PhantomData,
-        })
+        }
     }
 }
 
-// SAFETY: construction checks the exclusive slice has exactly the layout's
-// initialized storage. The borrow keeps it allocated and inaccessible until
+// SAFETY: construction copies the owned frame's validated layout and borrows
+// its exactly sized initialized storage exclusively. The borrow keeps it allocated and inaccessible until
 // the view is consumed; metadata is absent and the header is valid.
 unsafe impl VideoParts for P216Output<'_> {
     fn layout(&self) -> &ValidatedVideoLayout {
@@ -298,12 +294,11 @@ impl VideoConverter {
         destination: &mut VideoFrame,
     ) -> Result<()> {
         layout.check_p216(destination)?;
-        self.unpack(layout, source, destination.data_mut())
+        self.unpack(layout, source, destination)
     }
 
-    /// Unpack `source` into `p216`, the samples of the packed P216 frame of
-    /// `layout`'s dimensions, which may start at any address.
-    fn unpack(&self, layout: V210Layout, source: &[u32], p216: &mut [u8]) -> Result<()> {
+    /// Unpack `source` into the checked destination frame's own P216 layout.
+    fn unpack(&self, layout: V210Layout, source: &[u32], p216: &mut VideoFrame) -> Result<()> {
         layout.check_storage(source.len())?;
         let mut output = layout.p216_output_descriptor(&self._ndi, p216)?;
         let input = layout.v210_descriptor(output, source.as_ptr());
@@ -413,8 +408,15 @@ mod tests {
             return;
         };
         let layout = V210Layout::new(12, 32).unwrap();
-        let mut storage = vec![0u8; 12 * 2 * 32 * 2];
-        let raw = layout.p216_output_descriptor(&ndi, &mut storage).unwrap();
+        let mut destination = VideoFrame::builder()
+            .resolution(12, 32)
+            .pixel_format(PixelFormat::P216)
+            .build()
+            .unwrap();
+        let raw = layout
+            .p216_output_descriptor(&ndi, &mut destination)
+            .unwrap();
+        let storage = destination.data();
         crate::frames::descriptor_tests::assert_extent(&raw, storage.as_ptr(), storage.len());
         let raw = layout.p216_descriptor(&ndi, &storage).unwrap();
         crate::frames::descriptor_tests::assert_extent(&raw, storage.as_ptr(), storage.len());
@@ -504,7 +506,11 @@ mod tests {
                         .build()
                         .unwrap();
                     let address = frame.data().as_ptr();
-                    converter.v210_to_p216(layout, source, &mut frame).unwrap();
+                    let (result, allocations) = crate::test_alloc::allocation_count(|| {
+                        converter.v210_to_p216(layout, source, &mut frame)
+                    });
+                    result.unwrap();
+                    assert_eq!(allocations, 0);
                     assert_eq!(frame.data().as_ptr(), address);
                     assert_eq!(frame.timecode(), Timecode::from_ticks(123));
                     assert_eq!(frame.timestamp(), None);
@@ -587,7 +593,21 @@ mod tests {
             let odd = usize::from(storage.as_ptr().addr().is_multiple_of(2));
             let p216 = &mut storage[odd..odd + len];
             assert!(!p216.as_ptr().addr().is_multiple_of(2));
-            converter.unpack(layout, &source, p216).unwrap();
+            // Test the native utility's odd-address output independently of
+            // the public API, whose destination is an owned frame. Substitute
+            // this equally sized exclusive slice into the validated descriptor.
+            let mut output = layout.p216_output_descriptor(&ndi, &mut frame).unwrap();
+            output.p_data = p216.as_mut_ptr();
+            crate::frames::descriptor_tests::assert_extent(&output, p216.as_ptr(), p216.len());
+            let input = layout.v210_descriptor(output, source.as_ptr());
+            // SAFETY: both descriptors retain their validated geometry; source
+            // covers the V210 words and p216 covers the output extent, with an
+            // exclusive writable pointer, for this synchronous call.
+            unsafe {
+                converter
+                    .conversion
+                    .NDIlib_util_V210_to_P216(&input, &mut output)
+            };
             assert_eq!(&*p216, frame.data());
 
             let mut packed = vec![0; layout.required_words()];
@@ -598,7 +618,6 @@ mod tests {
                 .unwrap();
             assert_eq!(packed, expected);
 
-            assert!(converter.unpack(layout, &source, &mut p216[1..]).is_err());
             assert!(converter.pack(layout, &p216[1..], &mut packed).is_err());
         }
     }
