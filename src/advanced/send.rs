@@ -713,7 +713,7 @@ impl Loans for PendingStreams {
 /// let packet =
 ///     PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, &payload, &parameter_sets)?;
 /// let mut frame = CompressedVideoFrame::new(format, packet)?;
-/// sender.send_video(&mut frame)?;
+/// sender.send_video(&mut frame);
 /// # Ok(())
 /// # }
 /// ```
