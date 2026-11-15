@@ -300,7 +300,7 @@ macro_rules! optional_tables {
             /// resolves outside the selected implementation.
             pub(in crate::sys) fn load(resolver: &dyn Resolver) -> std::result::Result<ResolvedApi, LoadRefusal> {
                 let core = Core::load(resolver)?.map_err(|symbol| {
-                    LoadRefusal::MissingEntryPoint { symbol: symbol.to_string_lossy().into_owned(), required: true, detail: None }
+                    LoadRefusal::MissingEntryPoint { symbol, required: true, detail: None }
                 })?;
                 Ok(ResolvedApi {
                     core,
@@ -516,6 +516,24 @@ pub(crate) fn with_test_evidence<T>(version: &str, run: impl FnOnce(Evidence<'_>
 mod tests {
     use super::*;
     use crate::sys::table::ExportsWhere;
+
+    #[test]
+    fn a_missing_required_export_borrows_its_name_without_allocating() {
+        let (refusal, allocations) = crate::test_alloc::allocation_count(|| {
+            Api::load(&ExportsWhere(|name| name != "NDIlib_initialize"))
+                .err()
+                .expect("the required export is missing")
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(
+            refusal,
+            LoadRefusal::MissingEntryPoint {
+                symbol: c"NDIlib_initialize",
+                required: true,
+                detail: None,
+            }
+        );
+    }
 
     #[test]
     fn a_capability_is_exported_only_with_every_table_it_needs() {

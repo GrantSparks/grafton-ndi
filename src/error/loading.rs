@@ -1,6 +1,7 @@
 //! Structured causes for native library selection failures.
 
 use std::{
+    ffi::CStr,
     fmt,
     path::{Path, PathBuf},
 };
@@ -277,8 +278,8 @@ pub enum LoadRefusal {
     },
     /// A required entry point, including an identification anchor, is absent.
     MissingEntryPoint {
-        /// The native symbol's name.
-        symbol: String,
+        /// The statically declared native symbol's name.
+        symbol: &'static CStr,
         /// Whether it is an API-required entry rather than the identification anchor.
         required: bool,
         /// The platform's symbol lookup diagnostic, when one is available.
@@ -286,8 +287,8 @@ pub enum LoadRefusal {
     },
     /// A lookup found the entry point in a dependency instead of the selected module.
     EntryPointOutsideModule {
-        /// The native symbol's name.
-        symbol: String,
+        /// The statically declared native symbol's name.
+        symbol: &'static CStr,
         /// The selected module that did not define it.
         module: PathBuf,
     },
@@ -307,8 +308,8 @@ pub enum LoadRefusal {
     },
     /// The File library has no complete family of entry points.
     NoCompleteFileFamily {
-        /// The first missing entry point in declaration order.
-        first_missing: String,
+        /// The first missing, statically declared entry point in declaration order.
+        first_missing: &'static CStr,
     },
     /// The File library's imports bind to a runtime other than the selected one.
     BoundToAnotherRuntime,
@@ -334,6 +335,7 @@ impl fmt::Display for LoadRefusal {
                 | Self::UnreadableVersion { detail } => f.write_str(detail),
             Self::ResolvedToAnotherFile { resolved } => write!(f, "the loader resolved it to {}", resolved.display()),
             Self::MissingEntryPoint { symbol, required, detail } => {
+                let symbol = symbol.to_string_lossy();
                 if *required {
                     write!(f, "it does not export the required entry point {symbol}")?;
                 } else {
@@ -342,11 +344,11 @@ impl fmt::Display for LoadRefusal {
                 if let Some(detail) = detail { write!(f, ": {detail}")?; }
                 Ok(())
             }
-            Self::EntryPointOutsideModule { symbol, module } => write!(f, "{symbol} resolves outside {}", module.display()),
+            Self::EntryPointOutsideModule { symbol, module } => write!(f, "{} resolves outside {}", symbol.to_string_lossy(), module.display()),
             Self::EditionNotMet => f.write_str("it does not export the Advanced SDK entry points"),
             Self::AlreadyRefused { path, refusal } => write!(f,
                 "the platform loader returned {}, which is already loaded and was rejected ({refusal}); no other library of that name can be found by name in this process, so remove or fix that file or pass an explicit library path", path.display()),
-            Self::NoCompleteFileFamily { first_missing } => write!(f, "it provides no family of NDI File entry points (it does not export {first_missing})"),
+            Self::NoCompleteFileFamily { first_missing } => write!(f, "it provides no family of NDI File entry points (it does not export {})", first_missing.to_string_lossy()),
             Self::BoundToAnotherRuntime => f.write_str("it is bound to an NDI runtime other than the selected one"),
             Self::ForeignRuntimeInScope { module } => write!(f,
                 "the process's global symbol scope already holds another NDI runtime ({}); select that runtime or stop linking or preloading it", module.display()),
@@ -517,13 +519,13 @@ mod tests {
             (LoadRefusal::PlatformLoader { detail: "dlopen failed: absent".into() }, "dlopen failed: absent"),
             (LoadRefusal::NotIdentifiable { detail: "the module cannot be identified".into() }, "the module cannot be identified"),
             (LoadRefusal::ResolvedToAnotherFile { resolved: "another.so".into() }, "the loader resolved it to another.so"),
-            (LoadRefusal::MissingEntryPoint { symbol: "NDIlib_version".into(), required: false, detail: Some("undefined symbol".into()) }, "it does not export NDIlib_version: undefined symbol"),
-            (LoadRefusal::MissingEntryPoint { symbol: "NDIlib_initialize".into(), required: true, detail: None }, "it does not export the required entry point NDIlib_initialize"),
-            (LoadRefusal::EntryPointOutsideModule { symbol: "NDIlib_initialize".into(), module: "selected.so".into() }, "NDIlib_initialize resolves outside selected.so"),
+            (LoadRefusal::MissingEntryPoint { symbol: c"NDIlib_version", required: false, detail: Some("undefined symbol".into()) }, "it does not export NDIlib_version: undefined symbol"),
+            (LoadRefusal::MissingEntryPoint { symbol: c"NDIlib_initialize", required: true, detail: None }, "it does not export the required entry point NDIlib_initialize"),
+            (LoadRefusal::EntryPointOutsideModule { symbol: c"NDIlib_initialize", module: "selected.so".into() }, "NDIlib_initialize resolves outside selected.so"),
             (LoadRefusal::EditionNotMet, "it does not export the Advanced SDK entry points"),
             (LoadRefusal::UnreadableVersion { detail: "NDIlib_version returned no version text".into() }, "NDIlib_version returned no version text"),
             (LoadRefusal::AlreadyRefused { path: "rejected.so".into(), refusal: Box::new(LoadRefusal::EditionNotMet) }, "the platform loader returned rejected.so, which is already loaded and was rejected (it does not export the Advanced SDK entry points); no other library of that name can be found by name in this process, so remove or fix that file or pass an explicit library path"),
-            (LoadRefusal::NoCompleteFileFamily { first_missing: "NDIlib_file_player_create".into() }, "it provides no family of NDI File entry points (it does not export NDIlib_file_player_create)"),
+            (LoadRefusal::NoCompleteFileFamily { first_missing: c"NDIlib_file_player_create" }, "it provides no family of NDI File entry points (it does not export NDIlib_file_player_create)"),
             (LoadRefusal::BoundToAnotherRuntime, "it is bound to an NDI runtime other than the selected one"),
             (LoadRefusal::ForeignRuntimeInScope { module: "preloaded.so".into() }, "the process's global symbol scope already holds another NDI runtime (preloaded.so); select that runtime or stop linking or preloading it"),
             (LoadRefusal::RelativeRuntimeDirectory, "the runtime directory must be absolute"),

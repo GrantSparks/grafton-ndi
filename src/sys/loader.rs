@@ -273,7 +273,10 @@ mod shared {
         /// The error carries the reason, including the operating system's own
         /// text, and the identity of the module when the location was loaded
         /// before it was refused: it stays loaded.
-        pub(super) fn open(location: &OsStr, anchor: &CStr) -> std::result::Result<Self, Refusal> {
+        pub(super) fn open(
+            location: &OsStr,
+            anchor: &'static CStr,
+        ) -> std::result::Result<Self, Refusal> {
             let (library, handle) = open_library(location).map_err(|error| {
                 Refusal::unloaded(LoadRefusal::PlatformLoader {
                     detail: error_chain(&error),
@@ -289,7 +292,7 @@ mod shared {
                 .map(|symbol| *symbol)
                 .map_err(|error| {
                     let reason = LoadRefusal::MissingEntryPoint {
-                        symbol: anchor.to_string_lossy().into_owned(),
+                        symbol: anchor,
                         required: false,
                         detail: Some(error_chain(&error)),
                     };
@@ -370,7 +373,7 @@ mod shared {
     impl Resolver for Module {
         fn resolve(
             &self,
-            name: &CStr,
+            name: &'static CStr,
         ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
             let Some((address, base)) = self.lookup(name)? else {
                 return Ok(None);
@@ -378,7 +381,7 @@ mod shared {
             // Accept a symbol only when this module itself defines it.
             if base != self.base {
                 return Err(LoadRefusal::EntryPointOutsideModule {
-                    symbol: name.to_string_lossy().into_owned(),
+                    symbol: name,
                     module: self.path.clone(),
                 });
             }
@@ -452,7 +455,7 @@ mod shared {
         /// each location.
         pub(in crate::sys) names: &'a [&'a str],
         /// A symbol the library must define; it identifies the opened module.
-        pub(in crate::sys) anchor: &'a CStr,
+        pub(in crate::sys) anchor: &'static CStr,
         /// The selected core's anchor when this search loads its File library.
         #[cfg(all(unix, not(target_vendor = "apple")))]
         pub(in crate::sys) selected_core: Option<*const c_void>,
@@ -1166,7 +1169,7 @@ mod linked {
     impl Resolver for Linked {
         fn resolve(
             &self,
-            name: &CStr,
+            name: &'static CStr,
         ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
             Ok(
                 linked_address(name.to_bytes())
