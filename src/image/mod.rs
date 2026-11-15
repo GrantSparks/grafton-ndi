@@ -277,9 +277,7 @@ pub(crate) fn encode(source: Source<'_>, options: &ImageOptions) -> Result<Vec<u
 fn resize_scratch<T: Default + Clone>(scratch: &mut Vec<T>, len: usize) -> Result<()> {
     scratch
         .try_reserve_exact(len.saturating_sub(scratch.len()))
-        .map_err(|error| {
-            Error::InvalidFrame(format!("image scratch allocation failed: {error}"))
-        })?;
+        .map_err(|error| Error::InvalidFrame(crate::FrameDefect::ImageScratchAllocation(error)))?;
     scratch.resize(len, T::default());
     Ok(())
 }
@@ -288,7 +286,7 @@ fn packed_len(width: usize, height: usize, channels: usize) -> Result<usize> {
     width
         .checked_mul(height)
         .and_then(|n| n.checked_mul(channels))
-        .ok_or_else(|| Error::InvalidFrame("image scratch size overflow".into()))
+        .ok_or_else(|| Error::InvalidFrame(crate::FrameDefect::ImageScratchOverflow))
 }
 
 /// Encode `source` as a base64 data URL, allocated at its exact final
@@ -357,7 +355,8 @@ impl ImageShape {
     fn new(width: usize, height: usize, channels: Channels, sample_bytes: usize) -> Result<Self> {
         let row_bytes = packed_len(width, 1, channels.count() * sample_bytes)?;
         let dimension = |value| {
-            u32::try_from(value).map_err(|_| Error::InvalidFrame("image dimension overflow".into()))
+            u32::try_from(value)
+                .map_err(|_| Error::InvalidFrame(crate::FrameDefect::ImageDimensionOverflow))
         };
         Ok(Self {
             width: dimension(width)?,
@@ -371,7 +370,7 @@ impl ImageShape {
         let image_bytes = self
             .row_bytes
             .checked_mul(self.height as usize)
-            .ok_or_else(|| Error::InvalidFrame("image scratch size overflow".into()))?;
+            .ok_or_else(|| Error::InvalidFrame(crate::FrameDefect::ImageScratchOverflow))?;
         Ok(BufferedImageShape {
             rows: self,
             image_bytes,
@@ -422,25 +421,25 @@ impl<'a> Plan<'a> {
         let format = options.format;
         if let Some((quality, bounds)) = format.quality().zip(format.quality_bounds()) {
             if !bounds.contains(&quality) {
-                return Err(Error::InvalidInput(format!(
-                    "{} quality must be in {}..={}, got {quality}",
-                    format.name(),
-                    bounds.start(),
-                    bounds.end()
-                )));
+                return Err(Error::InvalidInput(crate::InputDefect::ImageQuality {
+                    format: format.name(),
+                    quality,
+                    minimum: *bounds.start(),
+                    maximum: *bounds.end(),
+                }));
             }
         }
         if matches!(format, ImageFormat::WebpLossy(_)) && options.webp_effort > 6 {
-            return Err(Error::InvalidInput(format!(
-                "WebP effort must be in 0..=6, got {}",
-                options.webp_effort
-            )));
+            return Err(Error::InvalidInput(crate::InputDefect::WebpEffort {
+                effort: options.webp_effort,
+            }));
         }
         if options.depth == SampleDepth::Sixteen && format != ImageFormat::Png {
-            return Err(Error::InvalidInput(format!(
-                "{} images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png",
-                format.name()
-            )));
+            return Err(Error::InvalidInput(
+                crate::InputDefect::SixteenBitNeedsPng {
+                    format: format.name(),
+                },
+            ));
         }
 
         // The caller who overrides the conversion takes responsibility for
@@ -452,17 +451,15 @@ impl<'a> Plan<'a> {
         if let Some(transfer) = color.and_then(|color| hdr_transfer(&color)) {
             match options.hdr {
                 HdrPolicy::Refuse => {
-                    return Err(Error::InvalidFrame(format!(
-                        "The frame's ndi_color_info gives the {transfer} transfer function; \
-                         HdrPolicy::CodeValues encodes its code values to a tagged PNG"
-                    )))
+                    return Err(Error::InvalidFrame(crate::FrameDefect::HdrRefused {
+                        transfer,
+                    }))
                 }
                 HdrPolicy::CodeValues if format != ImageFormat::Png => {
-                    return Err(Error::InvalidInput(format!(
-                        "{} cannot say that its values are {transfer} code values; \
-                         HdrPolicy::CodeValues needs ImageFormat::Png",
-                        format.name()
-                    )))
+                    return Err(Error::InvalidInput(crate::InputDefect::HdrNeedsPng {
+                        format: format.name(),
+                        transfer,
+                    }))
                 }
                 HdrPolicy::CodeValues => {}
             }
@@ -493,13 +490,21 @@ impl<'a> Plan<'a> {
         // Preserve codec dimension diagnostics before checking conversion storage.
         match format {
             ImageFormat::Png => {}
-            ImageFormat::Jpeg(_) => check_size("JPEG", width, height, jpeg::MAX_DIMENSION)?,
-            ImageFormat::WebpLossless => {
-                check_size("WebP", width, height, webp::MAX_LOSSLESS_DIMENSION)?
+            ImageFormat::Jpeg(_) => {
+                check_size(crate::ImageCodec::Jpeg, width, height, jpeg::MAX_DIMENSION)?
             }
-            ImageFormat::WebpLossy(_) => {
-                check_size("WebP", width, height, webp::MAX_LOSSY_DIMENSION)?
-            }
+            ImageFormat::WebpLossless => check_size(
+                crate::ImageCodec::Webp,
+                width,
+                height,
+                webp::MAX_LOSSLESS_DIMENSION,
+            )?,
+            ImageFormat::WebpLossy(_) => check_size(
+                crate::ImageCodec::Webp,
+                width,
+                height,
+                webp::MAX_LOSSY_DIMENSION,
+            )?,
         }
         let shape = ImageShape::new(width, height, channels, sample_bytes)?;
         let codec = match format {
@@ -580,11 +585,8 @@ impl<'a> Plan<'a> {
 }
 
 /// The PQ or HLG transfer of a color description, named for messages.
-fn hdr_transfer(color: &ColorInfo) -> Option<&'static str> {
-    color
-        .transfer()
-        .filter(|transfer| transfer.is_hdr())
-        .map(TransferFunction::name)
+fn hdr_transfer(color: &ColorInfo) -> Option<crate::TransferFunction> {
+    color.transfer().filter(|transfer| transfer.is_hdr())
 }
 
 /// The `cICP` chunk of a PNG whose colors an untagged viewer would show
@@ -603,12 +605,18 @@ fn cicp(color: &ColorInfo) -> Option<[u8; 4]> {
 }
 
 /// Refuse an image larger than its codec can write.
-fn check_size(codec: &str, width: usize, height: usize, max: usize) -> Result<()> {
-    for (dimension, length) in [("width", width), ("height", height)] {
+fn check_size(codec: crate::ImageCodec, width: usize, height: usize, max: usize) -> Result<()> {
+    for (dimension, length) in [
+        (crate::ImageDimension::Width, width),
+        (crate::ImageDimension::Height, height),
+    ] {
         if length > max {
-            return Err(Error::InvalidFrame(format!(
-                "{codec} {dimension} {length} exceeds maximum supported value {max}"
-            )));
+            return Err(Error::InvalidFrame(crate::FrameDefect::ImageDimension {
+                codec,
+                dimension,
+                length,
+                maximum: max,
+            }));
         }
     }
     Ok(())

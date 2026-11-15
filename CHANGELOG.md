@@ -17,6 +17,12 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- `InvalidFrame`, `InvalidInput` and `UnexpectedSdkResult` carry typed
+  `FrameDefect`, `InputDefect` and `SdkResultDefect` causes. Receiver capture
+  failures use `ConnectionLost`; initialization retains `InitializationFailure`
+  and invalid UTF-8 retains `Utf8Error`. Load-refusal symbol names borrow static
+  `CStr` values. Update matches as described in the migration guide.
+
 - `Finder::watch` replaces `Finder::wait_for_sources`. Keep one `SourceWatch`
   per consumer and take snapshots and wait through that cursor, so concurrent
   lookups cannot hide reports between a snapshot and its next wait.
@@ -185,6 +191,12 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   recording and playback. See the [examples index](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/README.md).
 
 ### Performance and correctness
+
+- Validation, timeout, HDR, withheld-metadata and completion refusals retain
+  typed evidence without formatting allocations. Wide cold-path evidence uses
+  boxes only on 32-bit targets; arbitrary color, encoder, filename-token and
+  rejected-address diagnostics remain boxed on every target. Diagnostic text
+  and the existing error-size bound are preserved.
 
 - Every image encode into a writer flushes on success and preserves the first
   writer error, including final JPEG and WebP writes from an owned `BufWriter`.

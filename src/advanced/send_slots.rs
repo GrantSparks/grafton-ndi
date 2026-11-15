@@ -12,7 +12,7 @@ use crate::{Error, Result};
 
 #[cfg(any(test, ndi_has_advanced_send_completion, ndi_has_advanced_scatter_send))]
 pub(super) fn unavailable(_: std::collections::TryReserveError) -> Error {
-    Error::InvalidInput("unable to allocate bounded completion storage".into())
+    Error::InvalidInput(crate::InputDefect::CompletionStorage)
 }
 
 struct Slot {

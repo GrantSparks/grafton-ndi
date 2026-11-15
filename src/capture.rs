@@ -472,7 +472,7 @@ impl Notification {
     ///
     /// # Errors
     ///
-    /// [`Error::CaptureFailed`] for an error frame, which
+    /// [`Error::ConnectionLost`] for an error frame, which
     /// `Processing.NDI.Recv.h` documents as a lost connection.
     pub(crate) fn classify(frame_type: NDIlib_frame_type_e) -> Result<Self> {
         match frame_type {
@@ -487,9 +487,7 @@ impl Notification {
                 Ok(Self::SourceChanged)
             }
             sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_error => {
-                Err(Error::CaptureFailed(
-                    "the SDK returned an error frame: the connection was lost".into(),
-                ))
+                Err(Error::ConnectionLost)
             }
             value => Ok(Self::Unknown(value)),
         }
@@ -793,10 +791,7 @@ mod tests {
             assert_eq!(Notification::classify(frame_type).unwrap(), expected);
         }
         let error = Notification::classify(NDIlib_frame_type_e_NDIlib_frame_type_error);
-        assert!(
-            matches!(&error, Err(Error::CaptureFailed(reason)) if reason.contains("error frame")),
-            "{error:?}"
-        );
+        assert!(matches!(&error, Err(Error::ConnectionLost)), "{error:?}");
     }
 
     /// A single-kind capture is given no other slot: the SDK could fill one,

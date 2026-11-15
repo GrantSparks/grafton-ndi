@@ -290,9 +290,10 @@ impl Router {
                 .NDIlib_routing_get_no_connections(self.instance.0, timeout)
         };
         u32::try_from(count).map_err(|_| {
-            Error::UnexpectedSdkResult(format!(
-                "NDIlib_routing_get_no_connections returned a negative count: {count}"
-            ))
+            Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
+                operation: "NDIlib_routing_get_no_connections",
+                value: count,
+            })
         })
     }
     /// The source descriptor this router is advertised under, which receivers

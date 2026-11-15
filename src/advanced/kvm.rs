@@ -116,12 +116,7 @@ macro_rules! kvm_send {
 }
 
 fn key_symbol(keysym: u32) -> Result<i32> {
-    i32::try_from(keysym).map_err(|_| {
-        invalid_input(format!(
-            "KVM key symbol {keysym:#x} exceeds the SDK's range, 0..={:#x}",
-            i32::MAX
-        ))
-    })
+    i32::try_from(keysym).map_err(|_| invalid_input(crate::InputDefect::KvmKeySymbol { keysym }))
 }
 
 /// Positions are fractions of the source's screen: `0.0..=1.0` on each axis.
@@ -131,9 +126,7 @@ fn validate_position(x: f32, y: f32) -> Result<()> {
     if in_range(x) && in_range(y) {
         Ok(())
     } else {
-        Err(invalid_input(format!(
-            "KVM position ({x}, {y}) is not within 0..=1 on each axis"
-        )))
+        Err(invalid_input(crate::InputDefect::KvmPosition { x, y }))
     }
 }
 
@@ -244,9 +237,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     pub fn wheel(&mut self, _axis: WheelAxis, _units: f32) -> Result<()> {
         native!(Kvm, self.kvm => {
             if !_units.is_finite() {
-                return Err(invalid_input(format!(
-                    "KVM wheel units {_units} are not finite"
-                )));
+                return Err(invalid_input(crate::InputDefect::KvmWheel { units: _units }));
             }
             match _axis {
                 WheelAxis::Vertical => {
@@ -311,10 +302,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
         }
         native!(Kvm, self.kvm => {
             let count = i32::try_from(_points.len()).map_err(|_| {
-                invalid_input(format!(
-                    "{} KVM touch points are more than the SDK can count",
-                    _points.len()
-                ))
+                invalid_input(crate::InputDefect::KvmTouchCount { count: _points.len() })
             })?;
             for [x, y] in _points {
                 validate_position(*x, *y)?;

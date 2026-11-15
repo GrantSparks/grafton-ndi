@@ -1,5 +1,12 @@
 //! The crate's one error type.
 
+#[cfg(test)]
+mod allocation_tests;
+mod defects;
+#[cfg(test)]
+mod defects_tests;
+pub use defects::*;
+
 mod loading;
 pub use loading::{
     LibraryKind, LoadAttempt, LoadFailure, LoadOrigin, LoadRefusal, SelectionConflict,
@@ -144,7 +151,7 @@ pub enum Error {
         operation: &'static str,
     },
 
-    /// NDI runtime initialization failed.
+    /// NDI runtime initialization failed, with its [`InitializationFailure`].
     ///
     /// Returned only for the runtime itself: the SDK refused to start, or the
     /// runtime handle reference count was exhausted. A finder, receiver,
@@ -173,7 +180,7 @@ pub enum Error {
     #[error("Not connected: the NDI SDK sent nothing")]
     NotConnected,
 
-    /// Text the SDK delivered is not UTF-8.
+    /// Text the SDK delivered is not UTF-8; the original [`std::str::Utf8Error`] retains its offsets.
     ///
     /// Reported for standalone received metadata frames and strings a receiver
     /// returns, such as its source's web-control URL. Unreadable per-frame
@@ -188,15 +195,11 @@ pub enum Error {
     #[error("Invalid CString: {0}")]
     InvalidCString(#[from] NulError),
 
-    /// A capture reported a failure instead of a frame or an event.
-    ///
-    /// A receiver's capture returned the SDK's error frame type, which
-    /// `Processing.NDI.Recv.h` documents as a lost connection; or a sender's
-    /// metadata capture returned a frame type other than metadata or none.
-    #[error("Failed to capture frame: {0}")]
-    CaptureFailed(String),
+    /// A receiver reported the SDK error frame: its connection was lost.
+    #[error("Failed to capture frame: the SDK returned an error frame: the connection was lost")]
+    ConnectionLost,
 
-    /// A frame, or a value describing media, is invalid.
+    /// A frame, or a value describing media, is invalid; [`FrameDefect`] identifies the cause.
     ///
     /// * A frame the SDK delivered (video, audio, metadata or a compressed
     ///   packet) fails validation: its dimensions, format, strides, sizes or
@@ -215,9 +218,9 @@ pub enum Error {
     /// or an allocation, AV sync, clock or remote-control value of the
     /// `advanced` module, is [`Error::InvalidInput`] when it is out of range.
     #[error("Invalid frame data: {0}")]
-    InvalidFrame(String),
+    InvalidFrame(FrameDefect),
 
-    /// A value passed to the crate cannot be used.
+    /// A value passed to the crate cannot be used; [`InputDefect`] identifies the cause.
     ///
     /// It is out of range, malformed, or conflicts with another setting: for
     /// example a timeout above [`MAX_TIMEOUT`](crate::MAX_TIMEOUT), a relative
@@ -233,7 +236,7 @@ pub enum Error {
     /// or listener for any address it can parse, so when it creates none, the
     /// address it was given, or the lack of one, is reported here.
     #[error("Invalid input: {0}")]
-    InvalidInput(String),
+    InvalidInput(InputDefect),
 
     /// A bounded queue is full. The same call can succeed once queued work
     /// has completed, with nothing else changed; the [`QueueLimit`] says
@@ -255,6 +258,7 @@ pub enum Error {
 
     /// A value the SDK returned, other than a frame, breaks the SDK's
     /// documented contract, or owned storage could not be reserved for it.
+    /// [`SdkResultDefect`] identifies that contract breach.
     ///
     /// For example a negative connection count, a receive delay outside the
     /// range the SDK accepts, a string without a terminator within its limit,
@@ -268,7 +272,7 @@ pub enum Error {
     /// UTF-8 as [`Error::InvalidUtf8`]. Ordinary resource-budget ceilings are
     /// [`Error::ResourceLimit`] instead.
     #[error("Unexpected NDI SDK result: {0}")]
-    UnexpectedSdkResult(String),
+    UnexpectedSdkResult(SdkResultDefect),
 
     /// Discovery data exceeded a per-copy or whole-discovery resource limit.
     /// No partial result is returned. `resource` identifies the exhausted
@@ -551,7 +555,7 @@ mod initialization_failure_tests {
     #[test]
     fn utf8_errors_keep_the_offset_and_incomplete_sequence() {
         let bytes = [b'a', 0xe2, 0x82];
-        let cause = std::str::from_utf8(&bytes).unwrap_err();
+        let cause = std::str::from_utf8(std::hint::black_box(&bytes)).unwrap_err();
         let error = Error::InvalidUtf8(cause);
         assert!(
             matches!(error, Error::InvalidUtf8(found) if found.valid_up_to() == 1 && found.error_len().is_none())

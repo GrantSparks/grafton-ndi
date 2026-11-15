@@ -292,10 +292,9 @@ impl<A: AdvertiserApi> Advertiser<A> {
             .values()
             .any(|existing| A::same_member(existing, &member))
         {
-            return Err(Error::InvalidInput(format!(
-                "{} is already registered",
-                A::MEMBER
-            )));
+            return Err(Error::InvalidInput(crate::InputDefect::AlreadyRegistered {
+                member: A::MEMBER,
+            }));
         }
         // SAFETY: the member owns its native object and advertisement strings;
         // successful registration retains that value until the SDK releases it.
@@ -336,7 +335,7 @@ impl<A: AdvertiserApi> Advertiser<A> {
     ) -> std::result::Result<(), Rejected<R>> {
         let Some(member) = self.members.get(&id) else {
             return Err(Rejected::new(
-                Error::InvalidInput("the registration was issued by another advertiser".into()),
+                Error::InvalidInput(crate::InputDefect::ForeignRegistration),
                 registration,
             ));
         };

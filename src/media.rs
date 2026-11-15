@@ -62,7 +62,14 @@ impl FrameRate {
     /// [`Error::InvalidInput`] unless both parts are in `1..=i32::MAX`, the
     /// range the SDK can carry.
     pub fn new(numerator: u32, denominator: u32) -> Result<Self> {
-        Self::checked(numerator.into(), denominator.into()).map_err(Error::InvalidInput)
+        Self::checked(numerator.into(), denominator.into()).map_err(|(numerator, denominator)| {
+            Error::InvalidInput(crate::InputDefect::FrameRate {
+                detail: crate::CompactDiagnostic::new(crate::FrameRateDefect {
+                    numerator,
+                    denominator,
+                }),
+            })
+        })
     }
 
     /// `frames` frames per second, for the builders' defaults. Call it in a
@@ -78,12 +85,19 @@ impl FrameRate {
     /// The frame rate of a frame the SDK delivered; an invalid one makes the
     /// frame invalid.
     pub(crate) fn from_sdk(numerator: i32, denominator: i32) -> Result<Self> {
-        Self::checked(numerator.into(), denominator.into()).map_err(Error::InvalidFrame)
+        Self::checked(numerator.into(), denominator.into()).map_err(|(numerator, denominator)| {
+            Error::InvalidFrame(crate::FrameDefect::FrameRate {
+                detail: crate::CompactDiagnostic::new(crate::FrameRateDefect {
+                    numerator,
+                    denominator,
+                }),
+            })
+        })
     }
 
     /// The one frame-rate check, for values from the API and from the SDK.
     /// The error is the reason, for the caller to report as its own variant.
-    fn checked(numerator: i64, denominator: i64) -> std::result::Result<Self, String> {
+    fn checked(numerator: i64, denominator: i64) -> std::result::Result<Self, (i64, i64)> {
         let part = |value: i64| {
             u32::try_from(value)
                 .ok()
@@ -94,10 +108,7 @@ impl FrameRate {
                 numerator,
                 denominator,
             }),
-            _ => Err(format!(
-                "Invalid frame rate {numerator}/{denominator}: both parts must be in 1..={}",
-                i32::MAX
-            )),
+            _ => Err((numerator, denominator)),
         }
     }
 
@@ -137,7 +148,7 @@ impl PictureAspectRatio {
     ///
     /// [`Error::InvalidInput`] when `ratio` is negative or not finite.
     pub fn new(ratio: f32) -> Result<Self> {
-        Self::checked(ratio).map_err(|reason| Error::InvalidInput(reason.to_string()))
+        Self::checked(ratio).map_err(|reason| Error::InvalidInput(crate::InputDefect::from(reason)))
     }
 
     /// The ratio, with zero representing square pixels.
@@ -223,7 +234,7 @@ impl TryFrom<FourCc> for PixelFormat {
     /// this crate supports.
     fn try_from(fourcc: FourCc) -> Result<Self> {
         Self::from_fourcc(fourcc).ok_or_else(|| {
-            Error::InvalidFrame(format!("Unknown pixel format FourCC: 0x{:08X}", fourcc.0))
+            Error::InvalidFrame(crate::FrameDefect::UnknownPixelFormat { fourcc: fourcc.0 })
         })
     }
 }
@@ -349,7 +360,7 @@ mod tests {
         for (numerator, denominator) in [(-1, 1), (1, -1), (0, 0), (i32::MIN, i32::MIN)] {
             assert!(matches!(
                 FrameRate::from_sdk(numerator, denominator),
-                Err(Error::InvalidFrame(message)) if message.contains(&format!("{numerator}/{denominator}"))
+                Err(Error::InvalidFrame(message)) if matches!(&message, crate::FrameDefect::FrameRate {detail} if detail.numerator==i64::from(numerator) && detail.denominator==i64::from(denominator))
             ));
         }
     }
@@ -396,7 +407,7 @@ mod tests {
         let v210 = FourCc::from_raw(u32::from_le_bytes(*b"V210"));
         assert!(matches!(
             PixelFormat::try_from(v210),
-            Err(Error::InvalidFrame(message)) if message.contains(&format!("{:08X}", v210.raw()))
+            Err(Error::InvalidFrame(message)) if matches!(message, crate::FrameDefect::UnknownPixelFormat {fourcc} if fourcc==v210.raw())
         ));
     }
 

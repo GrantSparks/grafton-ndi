@@ -319,10 +319,12 @@ fn child(scenario: &str) {
                     panic!("{name}: expected a creation failure, got {error:?}");
                 };
                 assert!(
-                    reason.contains("no Discovery Server was named"),
+                    matches!(
+                        reason,
+                        grafton_ndi::InputDefect::DiscoveryAddressMissing { .. }
+                    ),
                     "{name}: {reason}"
                 );
-                assert!(!reason.contains("reachable"), "{name}: {reason}");
             }
             // A listener uses one server, so a list is refused before the SDK
             // is asked for anything.
@@ -334,7 +336,10 @@ fn child(scenario: &str) {
                 let Some(Error::InvalidInput(reason)) = error else {
                     panic!("expected a refused server list, got {error:?}");
                 };
-                assert!(reason.contains("one Discovery Server"), "{reason}");
+                assert!(
+                    matches!(reason, grafton_ndi::InputDefect::MultipleDiscoveryServers),
+                    "{reason}"
+                );
             }
             assert!(!log().contains("-create\n"), "{}", log());
         }

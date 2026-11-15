@@ -66,9 +66,7 @@ pub(crate) fn select(options: &RuntimeOptions) -> Result<&'static Runtime> {
 /// can select anything. Empty paths are relative and are refused as well.
 pub(in crate::sys) fn validate_library_path(path: Option<&Path>) -> Result<()> {
     if path.is_some_and(|path| !path.is_absolute()) {
-        return Err(Error::InvalidInput(
-            "an explicit NDI library path must be absolute".into(),
-        ));
+        return Err(Error::InvalidInput(crate::InputDefect::RelativeLibraryPath));
     }
     Ok(())
 }

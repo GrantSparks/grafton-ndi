@@ -1502,12 +1502,13 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
             self.line_stride,
         )?;
         let Some(data) = self.data.get(..layout.data_len_bytes()) else {
-            return Err(Error::InvalidFrame(format!(
-                "Buffer too small for {:?}: got {} bytes, expected at least {}",
-                self.pixel_format,
-                self.data.len(),
-                layout.data_len_bytes(),
-            )));
+            return Err(Error::InvalidFrame(
+                crate::FrameDefect::VideoBufferTooSmall {
+                    format: self.pixel_format,
+                    actual: self.data.len(),
+                    minimum: layout.data_len_bytes(),
+                },
+            ));
         };
         let metadata = self.metadata.map(MetadataText::from_cstr).transpose()?;
         Ok(BorrowedVideoFrame {
@@ -1910,7 +1911,7 @@ impl<M: SenderMode> Sender<M> {
     /// timeout exceeds [`crate::MAX_TIMEOUT`], [`Error::InvalidFrame`] for an
     /// invalid metadata count, a positive count with null data, or a missing
     /// bounded terminator,
-    /// [`Error::InvalidUtf8`] for non-UTF-8 text, and [`Error::CaptureFailed`]
+    /// [`Error::InvalidUtf8`] for non-UTF-8 text, and [`Error::UnexpectedSdkResult`]
     /// when the SDK returns a frame type other than metadata or no frame.
     pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
         let metadata = self._ndi.table::<sys::SenderMetadata>()?;
@@ -1976,9 +1977,12 @@ impl<M: SenderMode> Sender<M> {
         } else if kind == NDIlib_frame_type_e_NDIlib_frame_type_none {
             Ok(None)
         } else {
-            Err(Error::CaptureFailed(format!(
-                "sender metadata capture returned {kind}"
-            )))
+            Err(Error::UnexpectedSdkResult(
+                crate::SdkResultDefect::UnexpectedFrameType {
+                    operation: "sender metadata capture",
+                    kind: kind as u32,
+                },
+            ))
         }
     }
 
@@ -2145,9 +2149,10 @@ impl<M: SenderMode> Sender<M> {
         };
 
         u32::try_from(count).map_err(|_| {
-            Error::UnexpectedSdkResult(format!(
-                "NDIlib_send_get_no_connections returned a negative count: {count}"
-            ))
+            Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
+                operation: "NDIlib_send_get_no_connections",
+                value: count,
+            })
         })
     }
 
@@ -3603,8 +3608,17 @@ mod tests {
         let result = borrowed(&buffer, 1920, 1080, PixelFormat::Bgra);
         assert!(result.is_err());
         if let Err(Error::InvalidFrame(msg)) = result {
-            assert!(msg.contains("Buffer too small"));
-            assert!(msg.contains("Bgra"));
+            assert!(matches!(
+                msg,
+                crate::FrameDefect::VideoBufferTooSmall { .. }
+            ));
+            assert!(matches!(
+                msg,
+                crate::FrameDefect::VideoBufferTooSmall {
+                    format: PixelFormat::Bgra,
+                    ..
+                }
+            ));
         }
     }
 

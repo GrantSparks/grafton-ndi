@@ -307,12 +307,12 @@ impl PacketReceiver {
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when `timeout` exceeds
-    /// [`crate::MAX_TIMEOUT`], [`Error::CaptureFailed`] when the SDK reports a
+    /// [`crate::MAX_TIMEOUT`], [`Error::ConnectionLost`] when the SDK reports a
     /// lost connection, and [`Error::InvalidFrame`] when a delivered frame
     /// fails validation.
     ///
     /// [`Error::InvalidInput`]: crate::Error::InvalidInput
-    /// [`Error::CaptureFailed`]: crate::Error::CaptureFailed
+    /// [`Error::ConnectionLost`]: crate::Error::ConnectionLost
     /// [`Error::InvalidFrame`]: crate::Error::InvalidFrame
     pub fn capture(&self, timeout: Duration) -> Result<Option<PacketItem>> {
         Self::capture_from(&self.receiver, timeout)

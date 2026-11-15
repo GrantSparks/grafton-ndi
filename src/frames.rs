@@ -229,14 +229,10 @@ impl PixelFormatInfo {
     /// ```
     pub fn buffer_len(&self, line_stride: usize, height: u32) -> Result<usize> {
         if line_stride == 0 {
-            return Err(Error::InvalidFrame(
-                "Video line stride must be positive, got 0".into(),
-            ));
+            return Err(Error::InvalidFrame(crate::FrameDefect::VideoZeroStride));
         }
         if height == 0 {
-            return Err(Error::InvalidFrame(
-                "Video frame height must be positive, got 0".into(),
-            ));
+            return Err(Error::InvalidFrame(crate::FrameDefect::VideoZeroHeight));
         }
 
         let len = calculate_buffer_len_for_info_checked(*self, line_stride, height as usize)?;
@@ -292,7 +288,7 @@ impl PixelFormat {
         layout
             .data_len_bytes
             .checked_add(crate::pixels::send_room(&layout, scan_type))
-            .ok_or_else(|| Error::InvalidFrame("Video send allocation size overflow".into()))
+            .ok_or_else(|| Error::InvalidFrame(crate::FrameDefect::VideoAllocationOverflow))
     }
 
     /// Get compile-time format properties.
@@ -484,9 +480,9 @@ impl PixelFormat {
         validate_video_width(width.into())?;
         let stride = min_video_line_stride_checked(self, width as usize)?;
         if i32::try_from(stride).is_err() {
-            return Err(Error::InvalidFrame(format!(
-                "Video line stride {stride} exceeds i32 range"
-            )));
+            return Err(Error::InvalidFrame(crate::FrameDefect::VideoStrideRange {
+                stride,
+            }));
         }
         Ok(stride)
     }
@@ -644,10 +640,9 @@ impl VideoHeader {
         let frame_rate = FrameRate::from_sdk(raw.frame_rate_N, raw.frame_rate_D)?;
         let picture_aspect_ratio = PictureAspectRatio::from_sdk(raw.picture_aspect_ratio)?;
         let scan_type = ScanType::from_sdk(raw.frame_format_type).ok_or_else(|| {
-            Error::InvalidFrame(format!(
-                "Unknown scan type: 0x{:08X}",
-                raw.frame_format_type
-            ))
+            Error::InvalidFrame(crate::FrameDefect::UnknownScanType {
+                code: raw.frame_format_type,
+            })
         })?;
         Ok(Self::new(
             frame_rate,
@@ -2272,11 +2267,10 @@ impl<'buf> BorrowedAudioFrameBuilder<'buf> {
         // The slice supplies alignment; the layout's extent establishes that
         // every active channel is initialized and borrowed for 'buf.
         let data = self.data.get(..layout.sample_count).ok_or_else(|| {
-            Error::InvalidFrame(format!(
-                "Audio buffer has {} samples, requires at least {}",
-                self.data.len(),
-                layout.sample_count,
-            ))
+            Error::InvalidFrame(crate::FrameDefect::AudioBufferTooSmall {
+                actual: self.data.len(),
+                minimum: layout.sample_count,
+            })
         })?;
         let metadata = self.metadata.map(MetadataText::from_cstr).transpose()?;
         Ok(BorrowedAudioFrame {
@@ -3211,13 +3205,11 @@ pub(crate) unsafe fn validate_metadata_layout(
     let bytes = unsafe { slice::from_raw_parts(raw.p_data.cast::<u8>(), len_with_nul) };
     let Some((&0, payload)) = bytes.split_last() else {
         return Err(Error::InvalidFrame(
-            "Metadata frame length does not include a trailing NUL terminator".into(),
+            crate::FrameDefect::MetadataMissingTerminator,
         ));
     };
     if payload.contains(&0) {
-        return Err(Error::InvalidFrame(
-            "Metadata frame contains an interior NUL byte".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::MetadataInteriorNul));
     }
 
     // The bytes end in their only NUL and are within the cap.
@@ -3255,10 +3247,9 @@ pub(crate) unsafe fn validate_sender_metadata(
 /// validation reads a pointer. Zero retains the SDK's lengthless sentinel.
 fn validate_metadata_prefix(raw: &NDIlib_metadata_frame_t) -> Result<usize> {
     if raw.length < 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Metadata frame has negative length: {}",
-            raw.length
-        )));
+        return Err(Error::InvalidFrame(
+            crate::FrameDefect::MetadataNegativeLength { length: raw.length },
+        ));
     }
 
     if raw.length == 0 {
@@ -3266,13 +3257,11 @@ fn validate_metadata_prefix(raw: &NDIlib_metadata_frame_t) -> Result<usize> {
     }
 
     if raw.p_data.is_null() {
-        return Err(Error::InvalidFrame(
-            "Metadata frame has non-zero length with null data pointer".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::MetadataNullData));
     }
 
     let len_with_nul = usize::try_from(raw.length).map_err(|_| {
-        Error::InvalidFrame(format!("Invalid metadata length value: {}", raw.length))
+        Error::InvalidFrame(crate::FrameDefect::MetadataInvalidLength { length: raw.length })
     })?;
     validate_metadata_len_with_nul(len_with_nul)?;
     Ok(len_with_nul)
@@ -3280,16 +3269,13 @@ fn validate_metadata_prefix(raw: &NDIlib_metadata_frame_t) -> Result<usize> {
 
 fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
     if len_with_nul == 0 {
-        return Err(Error::InvalidFrame(
-            "Metadata length must include a trailing NUL terminator".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::MetadataEmpty));
     }
 
     if len_with_nul > MAX_METADATA_BYTES {
-        return Err(Error::InvalidFrame(format!(
-            "Metadata exceeds maximum size: {} bytes > {} bytes",
-            len_with_nul, MAX_METADATA_BYTES
-        )));
+        return Err(Error::InvalidFrame(crate::FrameDefect::MetadataTooLarge {
+            length: len_with_nul,
+        }));
     }
 
     metadata_len_to_i32(len_with_nul)
@@ -3297,9 +3283,9 @@ fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
 
 fn metadata_len_to_i32(len_with_nul: usize) -> Result<i32> {
     i32::try_from(len_with_nul).map_err(|_| {
-        Error::InvalidFrame(format!(
-            "Metadata length {len_with_nul} exceeds SDK i32 range"
-        ))
+        Error::InvalidFrame(crate::FrameDefect::MetadataSdkLength {
+            length: len_with_nul,
+        })
     })
 }
 
@@ -3457,9 +3443,10 @@ impl TerminatedText {
     }
 
     fn validate_and_terminate(text: &mut String) -> Result<()> {
-        let len_with_nul = text.len().checked_add(1).ok_or_else(|| {
-            Error::InvalidFrame("Frame metadata length overflow while adding terminator".into())
-        })?;
+        let len_with_nul = text
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidFrame(crate::FrameDefect::MetadataLengthOverflow))?;
         validate_metadata_len_with_nul(len_with_nul)?;
         if text.as_bytes().contains(&0) {
             return Err(Error::InvalidCString(
@@ -3638,9 +3625,9 @@ pub(crate) unsafe fn validate_frame_metadata<'a>(
 
     // SAFETY: forwarded to the caller's obligation for a non-null pointer.
     let Some(payload) = (unsafe { bounded_sdk_text(p_metadata, MAX_METADATA_BYTES) }) else {
-        return Err(Error::InvalidFrame(format!(
-            "Frame metadata is missing a NUL terminator within {MAX_METADATA_BYTES} bytes"
-        )));
+        return Err(Error::InvalidFrame(
+            crate::FrameDefect::MetadataUnterminated,
+        ));
     };
     // SAFETY: the scan just read these bytes and the NUL after them, all
     // within the cap, from the non-null `p_metadata`, which the caller keeps
@@ -3688,12 +3675,13 @@ pub(crate) const MAX_SDK_STRING_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// `text` must be non-null and readable byte-by-byte until either its first
 /// NUL or [`MAX_SDK_STRING_BYTES`] bytes have been read.
-pub(crate) unsafe fn copy_sdk_string(text: *const c_char, operation: &str) -> Result<String> {
+pub(crate) unsafe fn copy_sdk_string(
+    text: *const c_char,
+    operation: &'static str,
+) -> Result<String> {
     // SAFETY: forwarded to the caller's obligation.
     let bytes = unsafe { bounded_sdk_text(text, MAX_SDK_STRING_BYTES) }.ok_or_else(|| {
-        Error::UnexpectedSdkResult(format!(
-            "{operation} returned a string longer than the 4 MiB one string may be"
-        ))
+        Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedText { operation })
     })?;
     Ok(String::from_utf8_lossy(bytes).into_owned())
 }
@@ -3880,7 +3868,7 @@ impl ValidatedVideoLayout {
         Self::new_uncompressed_checked(pixel_format, width, height, line_stride).map_err(Into::into)
     }
 
-    fn new_uncompressed_checked(
+    pub(crate) fn new_uncompressed_checked(
         pixel_format: PixelFormat,
         width: u32,
         height: u32,
@@ -4064,9 +4052,7 @@ pub(crate) fn validate_video_frame(
     raw: &NDIlib_video_frame_v2_t,
 ) -> Result<(ValidatedVideoLayout, VideoHeader)> {
     if raw.p_data.is_null() {
-        return Err(Error::InvalidFrame(
-            "Video frame has null data pointer".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::NullVideoData));
     }
 
     let header = VideoHeader::from_sdk(raw)?;
@@ -4085,7 +4071,10 @@ pub(crate) fn validate_video_frame(
 /// these reasons; API and capture paths format them only when returning Error.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum LayoutError {
-    Message(&'static str),
+    VideoZeroSize,
+    VideoBufferOverflow,
+    VideoPayloadOverflow,
+    AudioStrideRange,
     VideoWidth(i64),
     VideoOddWidth(i64),
     VideoHeight(i64),
@@ -4111,7 +4100,7 @@ pub(crate) enum LayoutError {
     AudioRate(i64),
     AudioCount {
         value: i64,
-        kind: &'static str,
+        kind: crate::AudioCountKind,
     },
     AudioStride(i64),
     AudioStrideAlignment(usize),
@@ -4134,85 +4123,123 @@ pub(crate) enum LayoutError {
 
 pub(crate) type LayoutResult<T> = std::result::Result<T, LayoutError>;
 
+impl From<LayoutError> for crate::FrameDefect {
+    fn from(reason: LayoutError) -> Self {
+        match reason {
+            LayoutError::VideoWidth(value) => Self::VideoWidth(value),
+            LayoutError::VideoOddWidth(value) => Self::VideoOddWidth(value),
+            LayoutError::VideoHeight(value) => Self::VideoHeight(value),
+            LayoutError::VideoSdkStride(value) => Self::VideoSdkStride(value),
+            LayoutError::VideoShortStride {
+                stride,
+                minimum,
+                format,
+                width,
+            } => Self::VideoShortStride {
+                detail: crate::CompactDiagnostic::new(crate::VideoStrideDefect {
+                    stride,
+                    minimum,
+                    format,
+                    width,
+                }),
+            },
+            LayoutError::VideoStrideOverflow { format, width } => {
+                Self::VideoStrideOverflow { format, width }
+            }
+            LayoutError::VideoBytes(value) => Self::VideoBytes(value),
+            LayoutError::VideoPlanar420 { height, stride } => {
+                Self::VideoPlanar420 { height, stride }
+            }
+            LayoutError::VideoSemiPlanar420(value) => Self::VideoSemiPlanar420(value),
+            LayoutError::VideoUyvaStride(value) => Self::VideoUyvaStride(value),
+            LayoutError::PictureAspectRatio(value) => Self::PictureAspectRatio(value),
+            LayoutError::AudioRate(value) => Self::AudioRate(value),
+            LayoutError::AudioCount { value, kind } => Self::AudioCount { value, kind },
+            LayoutError::AudioStride(value) => Self::AudioStride(value),
+            LayoutError::AudioStrideAlignment(value) => Self::AudioStrideAlignment(value),
+            LayoutError::AudioShortStride { stride, minimum } => {
+                Self::AudioShortStride { stride, minimum }
+            }
+            LayoutError::AudioStrideOverflow(value) => Self::AudioStrideOverflow(value),
+            LayoutError::AudioChannelOffset { channels, stride } => {
+                Self::AudioChannelOffset { channels, stride }
+            }
+            LayoutError::AudioSampleCount { offset, samples } => {
+                Self::AudioSampleCount { offset, samples }
+            }
+            LayoutError::AudioByteSize(value) => Self::AudioByteSize(value),
+            LayoutError::AudioBytes(value) => Self::AudioBytes(value),
+            LayoutError::VideoZeroSize => Self::VideoZeroSize,
+            LayoutError::VideoBufferOverflow => Self::VideoBufferOverflow,
+            LayoutError::VideoPayloadOverflow => Self::VideoPayloadOverflow,
+            LayoutError::AudioStrideRange => Self::AudioStrideRange,
+        }
+    }
+}
+
+impl From<LayoutError> for crate::InputDefect {
+    fn from(reason: LayoutError) -> Self {
+        match reason {
+            LayoutError::VideoWidth(value) => Self::VideoWidth(value),
+            LayoutError::VideoOddWidth(value) => Self::VideoOddWidth(value),
+            LayoutError::VideoHeight(value) => Self::VideoHeight(value),
+            LayoutError::VideoSdkStride(value) => Self::VideoSdkStride(value),
+            LayoutError::VideoShortStride {
+                stride,
+                minimum,
+                format,
+                width,
+            } => Self::VideoShortStride {
+                detail: crate::CompactDiagnostic::new(crate::VideoStrideDefect {
+                    stride,
+                    minimum,
+                    format,
+                    width,
+                }),
+            },
+            LayoutError::VideoStrideOverflow { format, width } => {
+                Self::VideoStrideOverflow { format, width }
+            }
+            LayoutError::VideoBytes(value) => Self::VideoBytes(value),
+            LayoutError::VideoPlanar420 { height, stride } => {
+                Self::VideoPlanar420 { height, stride }
+            }
+            LayoutError::VideoSemiPlanar420(value) => Self::VideoSemiPlanar420(value),
+            LayoutError::VideoUyvaStride(value) => Self::VideoUyvaStride(value),
+            LayoutError::PictureAspectRatio(value) => Self::PictureAspectRatio(value),
+            LayoutError::AudioRate(value) => Self::AudioRate(value),
+            LayoutError::AudioCount { value, kind } => Self::AudioCount { value, kind },
+            LayoutError::AudioStride(value) => Self::AudioStride(value),
+            LayoutError::AudioStrideAlignment(value) => Self::AudioStrideAlignment(value),
+            LayoutError::AudioShortStride { stride, minimum } => {
+                Self::AudioShortStride { stride, minimum }
+            }
+            LayoutError::AudioStrideOverflow(value) => Self::AudioStrideOverflow(value),
+            LayoutError::AudioChannelOffset { channels, stride } => {
+                Self::AudioChannelOffset { channels, stride }
+            }
+            LayoutError::AudioSampleCount { offset, samples } => {
+                Self::AudioSampleCount { offset, samples }
+            }
+            LayoutError::AudioByteSize(value) => Self::AudioByteSize(value),
+            LayoutError::AudioBytes(value) => Self::AudioBytes(value),
+            LayoutError::VideoZeroSize => Self::VideoZeroSize,
+            LayoutError::VideoBufferOverflow => Self::VideoBufferOverflow,
+            LayoutError::VideoPayloadOverflow => Self::VideoPayloadOverflow,
+            LayoutError::AudioStrideRange => Self::AudioStrideRange,
+        }
+    }
+}
+
 impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::Message(message) => f.write_str(message),
-            Self::VideoWidth(width) => write!(f, "Video frame has invalid width: {width}"),
-            Self::VideoOddWidth(width) => {
-                write!(f, "NDI video frames require even width, got {width}")
-            }
-            Self::VideoHeight(height) => write!(f, "Video frame has invalid height: {height}"),
-            Self::VideoSdkStride(stride) => write!(
-                f,
-                "Uncompressed video frame has invalid line_stride_in_bytes: {stride}"
-            ),
-            Self::VideoShortStride { stride, minimum, format, width } => write!(
-                f,
-                "Video line_stride_in_bytes {stride} is smaller than minimum row size {minimum} for {format:?} width {width}"
-            ),
-            Self::VideoStrideOverflow { format, width } => {
-                write!(f, "Video line stride overflow for {format:?} width {width}")
-            }
-            Self::VideoBytes(bytes) => write!(
-                f,
-                "Video frame exceeds maximum size: {bytes} bytes > {MAX_VIDEO_BYTES} bytes"
-            ),
-            Self::VideoPlanar420 { height, stride } => write!(
-                f,
-                "Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height {height} and stride {stride}"
-            ),
-            Self::VideoSemiPlanar420(height) => write!(
-                f,
-                "Semi-planar 4:2:0 (NV12) video frames require even height, got {height}"
-            ),
-            Self::VideoUyvaStride(stride) => {
-                write!(f, "UYVA video frames require even line stride, got {stride}")
-            }
-            Self::PictureAspectRatio(ratio) => {
-                write!(f, "Video frame has invalid picture aspect ratio: {ratio}")
-            }
-            Self::AudioRate(rate) => write!(f, "Invalid sample rate: {rate}"),
-            Self::AudioCount { value, kind } => write!(f, "Invalid number of {kind}: {value}"),
-            Self::AudioStride(stride) => write!(f, "Invalid channel_stride_in_bytes: {stride}"),
-            Self::AudioStrideAlignment(stride) => write!(
-                f,
-                "channel_stride_in_bytes must be a multiple of {}, got {stride}",
-                size_of::<f32>()
-            ),
-            Self::AudioShortStride { stride, minimum } => write!(
-                f,
-                "channel_stride_in_bytes {stride} is smaller than one channel of audio samples {minimum}"
-            ),
-            Self::AudioStrideOverflow(samples) => write!(
-                f,
-                "Audio channel stride overflow: {samples} samples × {} bytes",
-                size_of::<f32>()
-            ),
-            Self::AudioChannelOffset { channels, stride } => write!(
-                f,
-                "Audio channel offset overflow: {channels} channels × {stride} stride samples"
-            ),
-            Self::AudioSampleCount { offset, samples } => write!(
-                f,
-                "Audio backing sample count overflow: channel offset {offset} + {samples} samples"
-            ),
-            Self::AudioByteSize(samples) => write!(
-                f,
-                "Audio byte size overflow: {samples} samples × {} bytes",
-                size_of::<f32>()
-            ),
-            Self::AudioBytes(bytes) => write!(
-                f,
-                "Audio frame exceeds maximum size: {bytes} bytes > {MAX_AUDIO_BYTES} bytes"
-            ),
-        }
+        fmt::Display::fmt(&crate::FrameDefect::from(*self), f)
     }
 }
 
 impl From<LayoutError> for Error {
     fn from(reason: LayoutError) -> Self {
-        Self::InvalidFrame(reason.to_string())
+        Self::InvalidFrame(reason.into())
     }
 }
 
@@ -4243,17 +4270,17 @@ fn validate_video_width(width: i64) -> LayoutResult<()> {
 /// Require supplied pixels to fill `layout` exactly.
 fn check_video_data_len(layout: &ValidatedVideoLayout, len: usize) -> Result<()> {
     if len != layout.data_len_bytes {
-        return Err(Error::InvalidFrame(format!(
-            "Video data length {len}, expected {} bytes for validated layout",
-            layout.data_len_bytes
-        )));
+        return Err(Error::InvalidFrame(crate::FrameDefect::VideoDataLength {
+            actual: len,
+            expected: layout.data_len_bytes,
+        }));
     }
     Ok(())
 }
 
 fn validate_video_data_len(data_len_bytes: usize) -> LayoutResult<()> {
     if data_len_bytes == 0 {
-        return Err(LayoutError::Message("Video frame has zero calculated size"));
+        return Err(LayoutError::VideoZeroSize);
     }
 
     if data_len_bytes > MAX_VIDEO_BYTES {
@@ -4381,11 +4408,11 @@ fn video_plane_layouts(
         storage = row_stride
             .checked_mul(row_count)
             .and_then(|n| storage.checked_add(n))
-            .ok_or(LayoutError::Message("Video buffer size overflow"))?;
+            .ok_or(LayoutError::VideoBufferOverflow)?;
         payload = active_row_bytes
             .checked_mul(row_count)
             .and_then(|n| payload.checked_add(n))
-            .ok_or(LayoutError::Message("Video payload size overflow"))?;
+            .ok_or(LayoutError::VideoPayloadOverflow)?;
     }
     Ok((planes, count, storage, payload))
 }
@@ -4567,9 +4594,7 @@ impl ValidatedAudioLayout {
             .ok_or(LayoutError::AudioStrideOverflow(no_samples))?;
         let stride = channel_stride.unwrap_or(minimum);
         if i32::try_from(stride).is_err() {
-            return Err(LayoutError::Message(
-                "Audio channel stride exceeds i32 range",
-            ));
+            return Err(LayoutError::AudioStrideRange);
         }
         if stride == 0 {
             return Err(LayoutError::AudioStride(0));
@@ -4704,10 +4729,14 @@ fn validate_outbound_audio_layout(
 /// Require supplied samples to fill the packed `layout` exactly.
 fn check_audio_data_len(layout: &ValidatedAudioLayout, len: usize) -> Result<()> {
     if len != layout.sample_count {
-        return Err(Error::InvalidFrame(format!(
-            "Audio data length {len}, expected {} samples ({} channels x {} samples) for validated layout",
-            layout.sample_count, layout.no_channels, layout.no_samples
-        )));
+        return Err(Error::InvalidFrame(crate::FrameDefect::AudioDataLength {
+            detail: crate::CompactDiagnostic::new(crate::AudioLengthDefect {
+                actual: len,
+                expected: layout.sample_count,
+                channels: layout.no_channels as u32,
+                samples: layout.no_samples as u32,
+            }),
+        }));
     }
     Ok(())
 }
@@ -4726,15 +4755,15 @@ fn validate_positive_audio_counts(
     no_channels: i64,
     no_samples: i64,
 ) -> LayoutResult<(usize, usize)> {
-    let count = |value: i64, kind: &'static str| {
+    let count = |value: i64, kind: crate::AudioCountKind| {
         usize::try_from(value)
             .ok()
             .filter(|&count| count > 0)
             .ok_or(LayoutError::AudioCount { value, kind })
     };
     Ok((
-        count(no_channels, "channels")?,
-        count(no_samples, "samples")?,
+        count(no_channels, crate::AudioCountKind::Channels)?,
+        count(no_samples, crate::AudioCountKind::Samples)?,
     ))
 }
 
@@ -4792,19 +4821,18 @@ fn checked_audio_extent(
 /// [`validate_returned_audio`] accepts one.
 pub(crate) fn validate_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<ValidatedAudioLayout> {
     if raw.no_samples == 0 {
-        return Err(Error::InvalidFrame("Invalid number of samples: 0".into()));
+        return Err(Error::InvalidFrame(crate::FrameDefect::AudioCount {
+            value: 0,
+            kind: crate::AudioCountKind::Samples,
+        }));
     }
 
     if raw.p_data.is_null() {
-        return Err(Error::InvalidFrame(
-            "Audio frame has null data pointer".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::NullAudioData));
     }
 
     if !raw.p_data.cast::<f32>().is_aligned() {
-        return Err(Error::InvalidFrame(
-            "Audio data pointer is not aligned for f32".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::AudioMisaligned));
     }
 
     let format = validate_audio_format(raw.FourCC)?;
@@ -4853,23 +4881,20 @@ pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<R
     }
 
     if !raw.p_data.is_null() {
-        return Err(Error::InvalidFrame(
-            "Zero-length audio frame has non-null data pointer".into(),
-        ));
+        return Err(Error::InvalidFrame(crate::FrameDefect::EmptyAudioHasData));
     }
 
     if raw.sample_rate < 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Invalid sample rate: {}",
-            raw.sample_rate
+        return Err(Error::InvalidFrame(crate::FrameDefect::AudioRate(
+            raw.sample_rate.into(),
         )));
     }
 
     if raw.no_channels < 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Invalid number of channels: {}",
-            raw.no_channels
-        )));
+        return Err(Error::InvalidFrame(crate::FrameDefect::AudioCount {
+            value: raw.no_channels.into(),
+            kind: crate::AudioCountKind::Channels,
+        }));
     }
 
     // SAFETY: both members of the descriptor's union are `int`s at the same
@@ -4879,10 +4904,9 @@ pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<R
     // buffer size, so the value must be zero whatever its meaning.
     let channel_stride_in_bytes = unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes };
     if channel_stride_in_bytes != 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Zero-length audio frame has non-zero channel_stride_in_bytes: {}",
-            channel_stride_in_bytes
-        )));
+        return Err(Error::InvalidFrame(crate::FrameDefect::EmptyAudioStride {
+            stride: channel_stride_in_bytes,
+        }));
     }
 
     // Both were just checked nonnegative, so zero is the only value that
@@ -4902,10 +4926,10 @@ pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<R
             Some(AudioInputFormat::new(sample_rate, num_channels))
         }
         _ => {
-            return Err(Error::InvalidFrame(format!(
-                "Invalid zero-length audio state: sample_rate={}, no_channels={}",
-                raw.sample_rate, raw.no_channels
-            )))
+            return Err(Error::InvalidFrame(crate::FrameDefect::EmptyAudioFormat {
+                sample_rate: raw.sample_rate,
+                channels: raw.no_channels,
+            }))
         }
     };
 
@@ -4917,10 +4941,9 @@ fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioForm
         sys::bindings::NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => {
             Ok(AudioFormat::Fltp)
         }
-        _ => Err(Error::InvalidFrame(format!(
-            "Unknown audio format FourCC: 0x{:08X}",
-            fourcc
-        ))),
+        _ => Err(Error::InvalidFrame(
+            crate::FrameDefect::UnknownAudioFormat { fourcc },
+        )),
     }
 }
 
@@ -6224,7 +6247,7 @@ mod tests {
             other => panic!("expected InvalidFrame, got {other:?}"),
         };
         for rate in [0u32, 1 << 31, u32::MAX] {
-            let expected = format!("Invalid sample rate: {rate}");
+            let expected = crate::FrameDefect::AudioRate(rate.into());
             assert_eq!(
                 message(
                     validate_audio_sample_rate(rate.into())
@@ -6267,7 +6290,7 @@ mod tests {
             };
             assert_eq!(
                 message(validate_audio_layout(&raw).map(|_| ())),
-                format!("Invalid sample rate: {rate}")
+                crate::FrameDefect::AudioRate(rate.into())
             );
         }
         assert_eq!(validate_audio_sample_rate(1).unwrap(), 1);
@@ -7171,9 +7194,8 @@ mod tests {
             }
             if !accepted && height % 2 == 0 {
                 let msg = format.info().buffer_len(stride, height).unwrap_err();
-                let msg = msg.to_string();
                 assert!(
-                    msg.contains(&stride.to_string()) && msg.contains("4:2:0"),
+                    matches!(msg, Error::InvalidFrame(crate::FrameDefect::VideoPlanar420 {stride:found,..}) if found==stride),
                     "{label}: {msg}"
                 );
             }
@@ -7563,7 +7585,10 @@ mod tests {
 
         if let Err(Error::InvalidFrame(ref msg)) = result {
             assert!(
-                msg.contains("0xDEADBEEF"),
+                matches!(
+                    msg,
+                    crate::FrameDefect::UnknownPixelFormat { fourcc: 0xDEADBEEF }
+                ),
                 "Error message should include FourCC: {}",
                 msg
             );
@@ -7645,7 +7670,10 @@ mod tests {
 
         if let Err(Error::InvalidFrame(ref msg)) = result {
             assert!(
-                msg.contains("0x0BADC0DE"),
+                matches!(
+                    msg,
+                    crate::FrameDefect::UnknownAudioFormat { fourcc: 0x0BADC0DE }
+                ),
                 "Error message should include FourCC: {}",
                 msg
             );
@@ -8848,7 +8876,22 @@ mod tests {
         if let Err(Error::InvalidFrame(msg)) = result {
             // Accept either overflow or size limit error - both are correct guards
             assert!(
-                msg.contains("overflow") || msg.contains("exceeds maximum size"),
+                matches!(
+                    msg,
+                    crate::FrameDefect::AudioChannelOffset { .. }
+                        | crate::FrameDefect::AudioSampleCount { .. }
+                        | crate::FrameDefect::AudioByteSize(_)
+                        | crate::FrameDefect::AudioBytes(_)
+                        | crate::FrameDefect::VideoStrideOverflow { .. }
+                        | crate::FrameDefect::VideoBufferOverflow
+                        | crate::FrameDefect::VideoPayloadOverflow
+                        | crate::FrameDefect::VideoBytes(_)
+                        | crate::FrameDefect::ImageScratchOverflow
+                        | crate::FrameDefect::ImageDimensionOverflow
+                ) || matches!(
+                    msg,
+                    crate::FrameDefect::VideoBytes(_) | crate::FrameDefect::AudioBytes(_)
+                ),
                 "Error message should mention overflow or size limit, got: {msg}"
             );
         } else {
@@ -9257,7 +9300,7 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("null data pointer"),
+                matches!(msg, crate::FrameDefect::NullVideoData),
                 "Error should mention null pointer, got: {msg}"
             );
         } else {
@@ -9292,7 +9335,7 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("invalid line_stride_in_bytes"),
+                matches!(msg, crate::FrameDefect::VideoSdkStride(_)),
                 "Error should mention invalid stride, got: {msg}"
             );
         } else {
@@ -9406,7 +9449,7 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("invalid height"),
+                matches!(msg, crate::FrameDefect::VideoHeight(_)),
                 "Error should mention invalid height, got: {msg}"
             );
         } else {
@@ -9445,7 +9488,10 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("exceeds maximum size"),
+                matches!(
+                    msg,
+                    crate::FrameDefect::VideoBytes(_) | crate::FrameDefect::AudioBytes(_)
+                ),
                 "Error should mention size limit, got: {msg}"
             );
         } else {
@@ -9667,7 +9713,13 @@ mod tests {
         for raw in [NDIlib_audio_frame_v3_t::default(), format_only] {
             match validate_audio_layout(&raw) {
                 Err(Error::InvalidFrame(message)) => {
-                    assert_eq!(message, "Invalid number of samples: 0");
+                    assert_eq!(
+                        message,
+                        crate::FrameDefect::AudioCount {
+                            value: 0,
+                            kind: crate::AudioCountKind::Samples
+                        }
+                    );
                 }
                 other => panic!("expected InvalidFrame, got {other:?}"),
             }
@@ -9783,7 +9835,7 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("null data pointer"),
+                matches!(msg, crate::FrameDefect::NullAudioData),
                 "Error should mention null pointer, got: {msg}"
             );
         } else {
@@ -9815,7 +9867,13 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("Invalid number of samples"),
+                matches!(
+                    msg,
+                    crate::FrameDefect::AudioCount {
+                        kind: crate::AudioCountKind::Samples,
+                        ..
+                    }
+                ),
                 "Error should mention invalid samples, got: {msg}"
             );
         } else {
@@ -9850,7 +9908,22 @@ mod tests {
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
-                msg.contains("overflow") || msg.contains("exceeds maximum size"),
+                matches!(
+                    msg,
+                    crate::FrameDefect::AudioChannelOffset { .. }
+                        | crate::FrameDefect::AudioSampleCount { .. }
+                        | crate::FrameDefect::AudioByteSize(_)
+                        | crate::FrameDefect::AudioBytes(_)
+                        | crate::FrameDefect::VideoStrideOverflow { .. }
+                        | crate::FrameDefect::VideoBufferOverflow
+                        | crate::FrameDefect::VideoPayloadOverflow
+                        | crate::FrameDefect::VideoBytes(_)
+                        | crate::FrameDefect::ImageScratchOverflow
+                        | crate::FrameDefect::ImageDimensionOverflow
+                ) || matches!(
+                    msg,
+                    crate::FrameDefect::VideoBytes(_) | crate::FrameDefect::AudioBytes(_)
+                ),
                 "Error should mention overflow or size limit, got: {msg}"
             );
         } else {

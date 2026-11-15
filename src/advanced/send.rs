@@ -81,17 +81,17 @@ impl ScatterStorage {
     /// Check a block list and return its total size in bytes.
     fn total(blocks: &[Vec<u8>]) -> Result<usize> {
         if blocks.is_empty() || blocks.len() > MAX_SCATTER_BLOCKS {
-            return Err(invalid_frame("Invalid scatter block count"));
+            return Err(invalid_frame(crate::FrameDefect::ScatterBlockCount));
         }
         let mut total = 0usize;
         for block in blocks {
             if block.is_empty() {
-                return Err(invalid_frame("Scatter blocks must not be empty"));
+                return Err(invalid_frame(crate::FrameDefect::EmptyScatterBlock));
             }
             total = total
                 .checked_add(block.len())
                 .filter(|total| *total <= MAX_PACKET_BYTES)
-                .ok_or_else(|| invalid_frame("Scatter frame exceeds the packet size limit"))?;
+                .ok_or_else(|| invalid_frame(crate::FrameDefect::ScatterSize))?;
         }
         Ok(total)
     }
@@ -162,9 +162,7 @@ impl ScatterStorage {
 fn first_block(blocks: &[Vec<u8>], header_bytes: usize) -> Result<&[u8]> {
     let first = &blocks[0];
     if first.len() < header_bytes {
-        return Err(invalid_frame(
-            "The first scatter block must hold the frame's complete header",
-        ));
+        return Err(invalid_frame(crate::FrameDefect::ScatterHeader));
     }
     Ok(first)
 }
@@ -1199,9 +1197,12 @@ mod tests {
         let speedhq = VideoPacketFormat::new(VideoCodec::SpeedHq422, 1920, 1080).unwrap();
         ScatterVideoFrame::new(speedhq, vec![vec![99, 0, 0, 0], vec![1; 8]]).unwrap();
         let refused = ScatterVideoFrame::new(speedhq, vec![vec![100, 0, 0, 0], vec![1; 8]]);
-        assert!(reason(refused).contains("quality"));
+        assert!(matches!(
+            reason(refused),
+            crate::FrameDefect::SpeedHqQuality
+        ));
         let refused = ScatterVideoFrame::new(speedhq, vec![vec![0, 0, 0], vec![1; 8]]);
-        assert!(reason(refused).contains("complete header"));
+        assert!(matches!(reason(refused), crate::FrameDefect::ScatterHeader));
 
         let (format, bytes) = h264();
         let preview = |width, height| {
@@ -1211,15 +1212,27 @@ mod tests {
             ScatterVideoFrame::new(format, split(&bytes, &[44]))
         };
         preview(640, 640).unwrap();
-        assert!(reason(preview(641, 360)).contains("640 pixels"));
-        assert!(reason(preview(640, 641)).contains("640 pixels"));
-        assert!(reason(ScatterVideoFrame::new(format, split(&bytes, &[43]))).contains("header"));
+        assert!(matches!(
+            reason(preview(641, 360)),
+            crate::FrameDefect::PreviewVideoDimensions
+        ));
+        assert!(matches!(
+            reason(preview(640, 641)),
+            crate::FrameDefect::PreviewVideoDimensions
+        ));
+        assert!(matches!(
+            reason(ScatterVideoFrame::new(format, split(&bytes, &[43]))),
+            crate::FrameDefect::ScatterHeader
+        ));
 
         // A keyframe needs its parameter sets here too.
         let bare =
             PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, &[1, 2, 3], &[]).unwrap();
         let refused = ScatterVideoFrame::new(format, split(&bare, &[44]));
-        assert!(reason(refused).contains("codec configuration"));
+        assert!(matches!(
+            reason(refused),
+            crate::FrameDefect::KeyframeConfigurationMissing
+        ));
     }
 
     #[test]
@@ -1320,20 +1333,35 @@ mod tests {
                 split(packet, &[44, config_at + 1]),
             ))
         };
-        assert!(aac(48_000, 2, 960, &packet).contains("1024 samples"));
-        assert!(aac(44_100, 2, 1024, &packet).contains("sample rate"));
-        assert!(aac(48_000, 1, 1024, &packet).contains("channel layout"));
+        assert!(matches!(
+            aac(48_000, 2, 960, &packet),
+            crate::FrameDefect::AacSampleCount
+        ));
+        assert!(matches!(
+            aac(44_100, 2, 1024, &packet),
+            crate::FrameDefect::AacRateMismatch
+        ));
+        assert!(matches!(
+            aac(48_000, 1, 1024, &packet),
+            crate::FrameDefect::AacChannelsMismatch
+        ));
 
         let mut unflagged = packet.clone();
         unflagged[32..36].copy_from_slice(&0u32.to_ne_bytes());
-        assert!(aac(48_000, 2, 1024, &unflagged).contains("keyframe flag"));
+        assert!(matches!(
+            aac(48_000, 2, 1024, &unflagged),
+            crate::FrameDefect::AacKeyframeMissing
+        ));
 
         let config = aac_config(48_000, 2);
         for config in [&[][..], &config[..1]] {
             let bare =
                 PacketEnvelope::encode(EnvelopeCodec::Aac, 0, 0, true, &[1, 2], config).unwrap();
             let result = scatter_audio(AudioCodec::Aac, 48_000, 2, 1024, split(&bare, &[44]));
-            assert!(reason(result).contains("AudioSpecificConfig"));
+            assert!(matches!(
+                reason(result),
+                crate::FrameDefect::AacConfigurationMissing
+            ));
         }
 
         let opus = |sample_rate, samples| {
@@ -1348,9 +1376,18 @@ mod tests {
         let frame = opus(48_000, 960).unwrap().into_contiguous_copy();
         assert_eq!(frame.data(), &[1, 2]);
         frame.validate_for_send().unwrap();
-        assert!(reason(opus(44_100, 882)).contains("48000 Hz"));
-        assert!(reason(opus(48_000, 1440)).contains("ms of audio"));
-        assert!(reason(opus(0, 960)).contains("1..="));
+        assert!(matches!(
+            reason(opus(44_100, 882)),
+            crate::FrameDefect::OpusSampleRate
+        ));
+        assert!(matches!(
+            reason(opus(48_000, 1440)),
+            crate::FrameDefect::OpusDuration
+        ));
+        assert!(matches!(
+            reason(opus(0, 960)),
+            crate::FrameDefect::CompressedAudioQuantities { .. }
+        ));
     }
 
     #[test]

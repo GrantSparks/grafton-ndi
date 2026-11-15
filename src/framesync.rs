@@ -1057,11 +1057,12 @@ pub(crate) fn is_framesync_video_empty(frame: &NDIlib_video_frame_v2_t) -> bool 
 fn input_format(returned: &NDIlib_audio_frame_v3_t) -> Result<Option<AudioInputFormat>> {
     match validate_returned_audio(returned)? {
         ReturnedAudio::Empty(format) => Ok(format),
-        ReturnedAudio::Samples(layout) => Err(Error::InvalidFrame(format!(
-            "FrameSync audio input-format query returned {} channels of {} samples",
-            layout.no_channels(),
-            layout.no_samples()
-        ))),
+        ReturnedAudio::Samples(layout) => Err(Error::InvalidFrame(
+            crate::FrameDefect::FrameSyncAudioInput {
+                channels: layout.no_channels(),
+                samples: layout.no_samples(),
+            },
+        )),
     }
 }
 
@@ -1515,7 +1516,13 @@ mod tests {
         match input_format(&with_samples) {
             Err(Error::InvalidFrame(message)) => {
                 assert!(
-                    message.contains("query returned 2 channels of 4 samples"),
+                    matches!(
+                        message,
+                        crate::FrameDefect::FrameSyncAudioInput {
+                            channels: 2,
+                            samples: 4
+                        }
+                    ),
                     "{message}"
                 )
             }

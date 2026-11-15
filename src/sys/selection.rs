@@ -99,7 +99,9 @@ mod tests {
     fn a_failed_load_is_retryable_and_a_successful_one_is_permanent() {
         let selection = Selection::new(LibraryKind::Runtime);
         assert!(matches!(
-            selection.get_or_try_load(|| Err::<u32, _>(Error::InvalidInput("missing".into()))),
+            selection.get_or_try_load(|| Err::<u32, _>(Error::InvalidInput(
+                crate::InputDefect::RelativeLibraryPath
+            ))),
             Err(Error::InvalidInput(_))
         ));
         assert_eq!(*selection.get_or_try_load(|| Ok(1)).unwrap(), 1);

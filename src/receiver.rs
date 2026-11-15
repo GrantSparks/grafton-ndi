@@ -79,10 +79,7 @@ impl RecvStringGuard<'_> {
             crate::frames::bounded_sdk_text(self.pointer, crate::frames::MAX_METADATA_BYTES)
         }
         .ok_or_else(|| {
-            Error::UnexpectedSdkResult(format!(
-                "SDK string is missing a NUL terminator within {} bytes",
-                crate::frames::MAX_METADATA_BYTES
-            ))
+            Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedReceiverText)
         })?;
         Ok(Some(bytes))
     }
@@ -135,7 +132,7 @@ fn receiver_delay(millis: i32) -> Result<Duration> {
         .filter(|millis| *millis <= MAX_RECEIVE_DELAY_MILLIS)
         .map(|millis| Duration::from_millis(millis.into()))
         .ok_or_else(|| {
-            Error::UnexpectedSdkResult(format!("SDK returned invalid receive delay: {millis} ms"))
+            Error::UnexpectedSdkResult(crate::SdkResultDefect::InvalidReceiveDelay { millis })
         })
 }
 
@@ -147,9 +144,7 @@ fn receiver_delay_millis(delay: Duration) -> Result<i32> {
         .filter(|millis| *millis <= MAX_RECEIVE_DELAY_MILLIS)
         .and_then(|millis| i32::try_from(millis).ok())
         .ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "receive delay {delay:?} exceeds {MAX_RECEIVE_DELAY_MILLIS} ms"
-            ))
+            Error::InvalidInput(crate::InputDefect::ReceiveDelayTooLong { requested: delay })
         })
 }
 
@@ -291,13 +286,17 @@ fn capture_within_clock_with_stop<T, R: Into<Retry<T>>>(
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Attempt(Deadline);
 
-fn validate_ptz_value(name: &str, value: f32, min: f32, max: f32) -> Result<()> {
+fn validate_ptz_value(name: &'static str, value: f32, min: f32, max: f32) -> Result<()> {
     if value.is_finite() && (min..=max).contains(&value) {
         Ok(())
     } else {
-        Err(Error::InvalidInput(format!(
-            "{name} must be finite and within {min}..={max}"
-        )))
+        Err(Error::InvalidInput(crate::InputDefect::PtzValue {
+            detail: crate::CompactDiagnostic::new(crate::PtzDefect {
+                name,
+                minimum: min,
+                maximum: max,
+            }),
+        }))
     }
 }
 
@@ -305,9 +304,7 @@ fn validate_ptz_preset(preset: u8) -> Result<i32> {
     if preset <= 99 {
         Ok(i32::from(preset))
     } else {
-        Err(Error::InvalidInput(
-            "PTZ preset must be within 0..=99".into(),
-        ))
+        Err(Error::InvalidInput(crate::InputDefect::PtzPreset))
     }
 }
 
@@ -1023,7 +1020,7 @@ impl Receiver {
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
-    /// [`Error::CaptureFailed`] when the SDK reports a lost connection, and
+    /// [`Error::ConnectionLost`] when the SDK reports a lost connection, and
     /// the same frame-validation errors as typed borrowed capture. Rejected
     /// frames are freed through their matching native free operation.
     pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<ReceiverItemRef<'_>>> {
@@ -1642,7 +1639,7 @@ impl<M: EventMode> Receiver<M> {
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
-    /// (~49.7 days), and [`Error::CaptureFailed`] when the SDK reports a lost
+    /// (~49.7 days), and [`Error::ConnectionLost`] when the SDK reports a lost
     /// connection.
     pub fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
         self.poll_event_until(Deadline::after(timeout)?, NeverStop)
@@ -2137,7 +2134,7 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
-    /// (~49.7 days), [`Error::CaptureFailed`] when the SDK reports a lost
+    /// (~49.7 days), [`Error::ConnectionLost`] when the SDK reports a lost
     /// connection, and the errors of validating and copying the frame.
     pub fn capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
         Ok(self.capture_ref(timeout)?.as_ref().map(K::ref_to_owned))
@@ -2156,7 +2153,7 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
-    /// (~49.7 days), [`Error::CaptureFailed`] when the SDK reports a lost
+    /// (~49.7 days), [`Error::ConnectionLost`] when the SDK reports a lost
     /// connection, and the errors of validating the frame.
     pub fn capture_ref(&self, timeout: Duration) -> Result<Option<K::Ref<'rx>>> {
         // Bind through `'rx` so the returned borrow is tied to the receiver, not
@@ -4313,15 +4310,15 @@ mod tests {
             clock.deadline(Duration::from_secs(1)),
             |_| {
                 attempts.set(attempts.get() + 1);
-                Err::<Option<i32>, _>(Error::CaptureFailed("test error".into()))
+                Err::<Option<i32>, _>(Error::ConnectionLost)
             },
             || clock.now(),
             |sleep| sleeps.push(sleep),
         );
 
         assert!(
-            matches!(result, Err(Error::CaptureFailed(_))),
-            "Should propagate CaptureFailed error"
+            matches!(result, Err(Error::ConnectionLost)),
+            "Should propagate ConnectionLost error"
         );
         assert_eq!(attempts.get(), 1);
         assert!(sleeps.is_empty());

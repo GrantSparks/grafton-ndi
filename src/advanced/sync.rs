@@ -74,9 +74,7 @@ impl AvSyncRequest {
                 .checked_mul(size_of::<f32>())
                 .is_none_or(|bytes| bytes > MAX_AUDIO_BYTES)
         }) {
-            return Err(invalid_input(
-                "AVSync request exceeds the supported audio storage limit",
-            ));
+            return Err(invalid_input(crate::InputDefect::AvSyncStorageLimit));
         }
         Ok(request)
     }
@@ -598,10 +596,12 @@ unsafe fn outcome(status: Synchronized, audio: &NDIlib_audio_frame_v3_t) -> Resu
                     num_channels,
                 },
                 _ => {
-                    return Err(Error::UnexpectedSdkResult(format!(
-                    "NDIlib_avsync_synchronize reported a format change to {} Hz and {} channels",
-                    audio.sample_rate, audio.no_channels
-                )))
+                    return Err(Error::UnexpectedSdkResult(
+                        crate::SdkResultDefect::AvSyncFormatChange {
+                            sample_rate: audio.sample_rate,
+                            channels: audio.no_channels,
+                        },
+                    ))
                 }
             }
         }
@@ -611,9 +611,12 @@ unsafe fn outcome(status: Synchronized, audio: &NDIlib_audio_frame_v3_t) -> Resu
             });
         }
         Synchronized::Unknown(code) => {
-            return Err(Error::UnexpectedSdkResult(format!(
-                "NDIlib_avsync_synchronize returned unknown status {code}"
-            )));
+            return Err(Error::UnexpectedSdkResult(
+                crate::SdkResultDefect::UnknownStatus {
+                    operation: "NDIlib_avsync_synchronize",
+                    code,
+                },
+            ));
         }
     })
 }
@@ -1003,9 +1006,9 @@ impl AudioClock<'_> {
 /// # Errors
 ///
 /// [`Error::InvalidInput`] otherwise.
-fn quantity(name: &str, value: u32) -> Result<u32> {
+fn quantity(name: &'static str, value: u32) -> Result<u32> {
     sdk_quantity(value)
-        .ok_or_else(|| invalid_input(format!("{name} {value} is not in 1..={}", i32::MAX)))
+        .ok_or_else(|| invalid_input(crate::InputDefect::SdkQuantity { name, value }))
 }
 
 /// The descriptor a video clock reads its timing from.
@@ -1108,7 +1111,7 @@ mod tests {
             // SAFETY: an unknown status never reads a buffer.
             assert!(matches!(
                 unsafe { outcome(Synchronized::Unknown(code), &audio) },
-                Err(Error::UnexpectedSdkResult(message)) if message.contains(&code.to_string())
+                Err(Error::UnexpectedSdkResult(message)) if matches!(message,crate::SdkResultDefect::UnknownStatus {code:found,..} if found==code)
             ));
         }
 

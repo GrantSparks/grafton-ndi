@@ -133,10 +133,10 @@ impl AsyncFileOptions {
             ("event", self.event_capacity),
         ] {
             if !(1..=MAX_CAPACITY).contains(&capacity) {
-                return Err(Error::InvalidInput(format!(
-                    "async {queue} queue capacity must be between 1 and {MAX_CAPACITY}, not \
-                     {capacity}"
-                )));
+                return Err(Error::InvalidInput(crate::InputDefect::FileQueueCapacity {
+                    queue,
+                    capacity,
+                }));
             }
         }
         Ok(self)
@@ -2143,7 +2143,9 @@ mod tests {
         fn poll_native(&mut self) -> Result<Option<usize>> {
             self.polls += 1;
             if self.fail {
-                return Err(Error::InvalidFrame("malformed fake event".into()));
+                return Err(Error::InvalidFrame(
+                    crate::FrameDefect::MetadataMissingTerminator,
+                ));
             }
             if self.remaining == 0 {
                 return Ok(None);
@@ -4339,7 +4341,7 @@ mod tests {
             assert!(lock(&finishing.response).completed);
             let result = block_on(finishing);
             assert!(
-                matches!(&result, Err(Error::InvalidInput(reason)) if reason.contains("MAX_TIMEOUT")),
+                matches!(&result, Err(Error::InvalidInput(crate::InputDefect::TimeoutTooLong { requested })) if *requested == too_long),
                 "{result:?}"
             );
         }
@@ -4360,7 +4362,7 @@ mod tests {
             .as_mut()
             .poll(&mut Context::from_waker(&idle_waker()));
         assert!(
-            matches!(&polled, Poll::Ready(Err(Error::InvalidInput(reason))) if reason.contains("MAX_TIMEOUT")),
+            matches!(&polled, Poll::Ready(Err(Error::InvalidInput(crate::InputDefect::TimeoutTooLong { requested }))) if *requested == crate::MAX_TIMEOUT + Duration::from_nanos(1)),
             "{polled:?}"
         );
         assert!(waiting.timer.is_none());
@@ -4393,7 +4395,15 @@ mod tests {
         assert_eq!(started.kind(), RecorderEventKind::Started);
         let malformed = block_on(recorder.next_event(Duration::ZERO));
         assert!(
-            matches!(malformed, Err(Error::UnexpectedSdkResult(_))),
+            matches!(
+                malformed,
+                Err(Error::UnexpectedSdkResult(
+                    crate::SdkResultDefect::FileTrackCount {
+                        count: 3,
+                        capacity: 2
+                    }
+                ))
+            ),
             "{malformed:?}"
         );
         block_on(recorder.close()).unwrap();
@@ -4558,17 +4568,27 @@ mod tests {
             .format_change_rollover(true);
         assert!(matches!(
             block_on(AsyncFileRecorder::create(&mock::recorder_api(), &options)),
-            Err(Error::InvalidInput(_))
+            Err(Error::InvalidInput(
+                crate::InputDefect::ExactNameFormatRollover
+            ))
         ));
     }
 
     #[test]
     fn queue_sizes_out_of_range_are_refused_before_a_thread_starts() {
-        for options in [
-            AsyncFileOptions::new().command_capacity(0),
-            AsyncFileOptions::new().event_capacity(0),
-            AsyncFileOptions::new().command_capacity(MAX_CAPACITY + 1),
-            AsyncFileOptions::new().event_capacity(MAX_CAPACITY + 1),
+        for (options, queue, capacity) in [
+            (AsyncFileOptions::new().command_capacity(0), "command", 0),
+            (AsyncFileOptions::new().event_capacity(0), "event", 0),
+            (
+                AsyncFileOptions::new().command_capacity(MAX_CAPACITY + 1),
+                "command",
+                MAX_CAPACITY + 1,
+            ),
+            (
+                AsyncFileOptions::new().event_capacity(MAX_CAPACITY + 1),
+                "event",
+                MAX_CAPACITY + 1,
+            ),
         ] {
             let created = spawn_owner(
                 "file-test-refused",
@@ -4576,10 +4596,13 @@ mod tests {
                 options,
                 |worker| worker,
             );
-            assert!(matches!(
-                block_on(created),
-                Err(Error::InvalidInput(reason)) if reason.contains("capacity")
-            ));
+            let Err(Error::InvalidInput(cause)) = block_on(created) else {
+                panic!("an out-of-range queue capacity was not refused");
+            };
+            assert_eq!(
+                cause,
+                crate::InputDefect::FileQueueCapacity { queue, capacity }
+            );
         }
         let api = mock::recorder_api();
         let player_options = PlayerOptions::new("mock player");
@@ -4589,7 +4612,10 @@ mod tests {
                 &player_options,
                 AsyncFileOptions::new().event_capacity(0),
             )),
-            Err(Error::InvalidInput(_))
+            Err(Error::InvalidInput(crate::InputDefect::FileQueueCapacity {
+                queue: "event",
+                capacity: 0
+            }))
         ));
         let recorder_options = RecorderOptions::new(SourceSpec::new("mock source").unwrap());
         assert!(matches!(
@@ -4598,7 +4624,10 @@ mod tests {
                 &recorder_options,
                 AsyncFileOptions::new().command_capacity(0),
             )),
-            Err(Error::InvalidInput(_))
+            Err(Error::InvalidInput(crate::InputDefect::FileQueueCapacity {
+                queue: "command",
+                capacity: 0
+            }))
         ));
         // The largest sizes are accepted.
         let (worker, dropped) = local_worker_with_options(

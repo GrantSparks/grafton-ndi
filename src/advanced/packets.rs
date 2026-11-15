@@ -191,12 +191,12 @@ impl EnvelopeHeader {
     /// Read the header at the start of `bytes`.
     pub(crate) fn read(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < ENVELOPE_HEADER_BYTES {
-            return Err(invalid_frame("Truncated compressed packet header"));
+            return Err(invalid_frame(crate::FrameDefect::PacketHeaderTruncated));
         }
         let size = usize::try_from(i32::from_ne_bytes(field(bytes, VERSION_OFFSET)))
             .ok()
             .filter(|size| *size >= ENVELOPE_HEADER_BYTES)
-            .ok_or_else(|| invalid_frame("Unsupported compressed packet header size"))?;
+            .ok_or_else(|| invalid_frame(crate::FrameDefect::PacketHeaderSize))?;
         Ok(Self {
             size,
             codec: FourCc::from_raw(u32::from_ne_bytes(field(bytes, CODEC_OFFSET))),
@@ -235,22 +235,16 @@ impl EnvelopeHeader {
     /// or received carries whatever the SDK left there.
     pub(crate) fn validate_for_send(&self, codec: EnvelopeCodec, total: usize) -> Result<()> {
         if self.size != ENVELOPE_HEADER_BYTES || self.flags & !KEYFRAME != 0 {
-            return Err(invalid_frame(
-                "Cannot send a packet with an unsupported header version or unknown flags",
-            ));
+            return Err(invalid_frame(crate::FrameDefect::PacketHeaderUnsupported));
         }
         if self.codec != codec.fourcc() {
-            return Err(invalid_frame(
-                "Packet codec does not match the frame's codec",
-            ));
+            return Err(invalid_frame(crate::FrameDefect::PacketCodecMismatch));
         }
         if self.data_len == 0 {
-            return Err(invalid_frame("Empty codec payload"));
+            return Err(invalid_frame(crate::FrameDefect::EmptyCodecPayload));
         }
         if self.total_len() != Some(total) {
-            return Err(invalid_frame(
-                "Packet header lengths do not match the size of the frame",
-            ));
+            return Err(invalid_frame(crate::FrameDefect::PacketLengthsMismatch));
         }
         Ok(())
     }
@@ -259,7 +253,9 @@ impl EnvelopeHeader {
     /// sent: a decoder cannot start on a keyframe without its parameter sets.
     pub(crate) fn validate_video_configuration(&self) -> Result<()> {
         if self.is_keyframe() && self.extra_len == 0 {
-            return Err(invalid_frame("Keyframes require codec configuration data"));
+            return Err(invalid_frame(
+                crate::FrameDefect::KeyframeConfigurationMissing,
+            ));
         }
         Ok(())
     }
@@ -277,12 +273,10 @@ impl EnvelopeHeader {
         parameters: AudioParameters,
     ) -> Result<()> {
         if !self.is_keyframe() {
-            return Err(invalid_frame("AAC packets must carry the keyframe flag"));
+            return Err(invalid_frame(crate::FrameDefect::AacKeyframeMissing));
         }
         let Some(config) = config else {
-            return Err(invalid_frame(
-                "AAC packets require their AudioSpecificConfig as codec configuration data",
-            ));
+            return Err(invalid_frame(crate::FrameDefect::AacConfigurationMissing));
         };
         // Five bits of object type, four of sampling-frequency index, four of
         // channel configuration.
@@ -290,18 +284,14 @@ impl EnvelopeHeader {
         let frequency_index = usize::from((bits >> 7) & 0xf);
         let channel_configuration = usize::from((bits >> 3) & 0xf);
         if AAC_SAMPLE_RATES.get(frequency_index) != Some(&parameters.sample_rate) {
-            return Err(invalid_frame(
-                "The AAC configuration names a different sample rate than the frame",
-            ));
+            return Err(invalid_frame(crate::FrameDefect::AacRateMismatch));
         }
         if channel_configuration
             .checked_sub(1)
             .and_then(|index| AAC_CHANNELS.get(index))
             != Some(&parameters.num_channels)
         {
-            return Err(invalid_frame(
-                "The AAC configuration names a different channel layout than the frame",
-            ));
+            return Err(invalid_frame(crate::FrameDefect::AacChannelsMismatch));
         }
         Ok(())
     }
@@ -329,14 +319,14 @@ impl<'a> PacketEnvelope<'a> {
     /// declares.
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
         if bytes.len() > MAX_PACKET_BYTES {
-            return Err(invalid_frame("Invalid compressed packet length"));
+            return Err(invalid_frame(crate::FrameDefect::PacketLength));
         }
         let header = EnvelopeHeader::read(bytes)?;
         let end = header
             .total_len()
-            .ok_or_else(|| invalid_frame("Compressed packet length overflow"))?;
+            .ok_or_else(|| invalid_frame(crate::FrameDefect::PacketLengthOverflow))?;
         if end > bytes.len() {
-            return Err(invalid_frame("Truncated compressed packet"));
+            return Err(invalid_frame(crate::FrameDefect::PacketTruncated));
         }
         Ok(Self { bytes, header })
     }
@@ -378,9 +368,9 @@ impl<'a> PacketEnvelope<'a> {
         let size = ENVELOPE_HEADER_BYTES
             .checked_add(data.len())
             .and_then(|n| n.checked_add(extra_data.len()))
-            .ok_or_else(|| invalid_frame("Packet size overflow"))?;
+            .ok_or_else(|| invalid_frame(crate::FrameDefect::PacketSizeOverflow))?;
         if data.is_empty() || size > MAX_PACKET_BYTES {
-            return Err(invalid_frame("Invalid compressed packet payload size"));
+            return Err(invalid_frame(crate::FrameDefect::PacketPayloadSize));
         }
         let mut bytes = vec![0; size];
         let mut put = |offset: usize, value: &[u8]| {
@@ -519,12 +509,23 @@ impl VideoPacketFormat {
     /// [`Error::InvalidInput`] unless both dimensions are in `1..=i32::MAX`,
     /// the range the SDK can carry.
     pub fn new(codec: VideoCodec, width: u32, height: u32) -> Result<Self> {
-        Self::checked(codec, width.into(), height.into()).map_err(Error::InvalidInput)
+        Self::checked(codec, width.into(), height.into()).map_err(|(width, height)| {
+            Error::InvalidInput(crate::InputDefect::CompressedVideoDimensions {
+                detail: crate::CompactDiagnostic::new(crate::VideoDimensionsDefect {
+                    width,
+                    height,
+                }),
+            })
+        })
     }
 
     /// The one dimension check, for values from the API and from the SDK.
     /// The error is the reason, for the caller to report as its own variant.
-    fn checked(codec: VideoCodec, width: i64, height: i64) -> std::result::Result<Self, String> {
+    fn checked(
+        codec: VideoCodec,
+        width: i64,
+        height: i64,
+    ) -> std::result::Result<Self, (i64, i64)> {
         match (sdk_quantity(width), sdk_quantity(height)) {
             (Some(width), Some(height)) => Ok(Self {
                 codec,
@@ -536,10 +537,7 @@ impl VideoPacketFormat {
                 picture_aspect_ratio: PictureAspectRatio::SQUARE_PIXELS,
                 scan_type: ScanType::Progressive,
             }),
-            _ => Err(format!(
-                "Compressed video dimensions {width}x{height} must each be in 1..={}",
-                i32::MAX
-            )),
+            _ => Err((width, height)),
         }
     }
 
@@ -547,9 +545,16 @@ impl VideoPacketFormat {
     /// range makes the frame invalid.
     pub(crate) fn from_sdk(raw: &NDIlib_video_frame_v2_t) -> Result<Self> {
         let (codec, tier, protected) = VideoCodec::from_outer(raw.FourCC)
-            .ok_or_else(|| invalid_frame("Unknown compressed video FourCC"))?;
+            .ok_or_else(|| invalid_frame(crate::FrameDefect::UnknownCompressedVideo))?;
         let format =
-            Self::checked(codec, raw.xres.into(), raw.yres.into()).map_err(Error::InvalidFrame)?;
+            Self::checked(codec, raw.xres.into(), raw.yres.into()).map_err(|(width, height)| {
+                Error::InvalidFrame(crate::FrameDefect::CompressedVideoDimensions {
+                    detail: crate::CompactDiagnostic::new(crate::VideoDimensionsDefect {
+                        width,
+                        height,
+                    }),
+                })
+            })?;
         let header = VideoHeader::from_sdk(raw)?;
         Ok(Self {
             tier,
@@ -659,9 +664,7 @@ impl VideoPacketFormat {
                 .first()
                 .is_none_or(|quality| *quality >= SPEEDHQ_QUALITY_LIMIT)
             {
-                return Err(invalid_frame(
-                    "A SpeedHQ frame begins with its quality, a byte below 100",
-                ));
+                return Err(invalid_frame(crate::FrameDefect::SpeedHqQuality));
             }
             return Ok(());
         };
@@ -671,9 +674,7 @@ impl VideoPacketFormat {
         if self.tier == StreamTier::Preview
             && (self.width > MAX_PREVIEW_DIMENSION || self.height > MAX_PREVIEW_DIMENSION)
         {
-            return Err(invalid_frame(
-                "An H.264 or HEVC picture on the preview stream is at most 640 pixels wide and 640 high",
-            ));
+            return Err(invalid_frame(crate::FrameDefect::PreviewVideoDimensions));
         }
         Ok(())
     }
@@ -967,22 +968,20 @@ pub(crate) fn validate_video_packet(
     purpose: Use,
 ) -> Result<()> {
     if bytes.is_empty() || bytes.len() > MAX_PACKET_BYTES {
-        return Err(invalid_frame("Invalid compressed video size"));
+        return Err(invalid_frame(crate::FrameDefect::CompressedVideoSize));
     }
     match format.codec.envelope_codec() {
         Some(codec) => {
             let packet = PacketEnvelope::parse(bytes)?;
             if packet.codec() != Some(codec) {
-                return Err(invalid_frame(
-                    "Packet codec does not match video descriptor",
-                ));
+                return Err(invalid_frame(crate::FrameDefect::VideoCodecMismatch));
             }
             if packet.data().is_empty() {
-                return Err(invalid_frame("Empty codec payload"));
+                return Err(invalid_frame(crate::FrameDefect::EmptyCodecPayload));
             }
         }
         None if bytes.len() < SPEEDHQ_HEADER_BYTES => {
-            return Err(invalid_frame("Truncated SpeedHQ frame"));
+            return Err(invalid_frame(crate::FrameDefect::SpeedHqTruncated));
         }
         None => {}
     }
@@ -1078,11 +1077,15 @@ impl AudioParameters {
                 num_channels,
                 num_samples,
             }),
-            _ => Err(invalid_frame(format!(
-                "Compressed audio of {sample_rate} Hz, {num_channels} channels and \
-                 {num_samples} samples per channel: each must be in 1..={}",
-                i32::MAX
-            ))),
+            _ => Err(invalid_frame(
+                crate::FrameDefect::CompressedAudioQuantities {
+                    detail: crate::CompactDiagnostic::new(crate::CompressedAudioDefect {
+                        sample_rate,
+                        channels: num_channels,
+                        samples: num_samples,
+                    }),
+                },
+            )),
         }
     }
 
@@ -1158,9 +1161,7 @@ impl AudioCodec {
         match self {
             Self::Opus => {
                 if !OPUS_SAMPLE_RATES.contains(&sample_rate) {
-                    return Err(invalid_frame(
-                        "Opus is sent at 8000, 12000, 16000, 24000 or 48000 Hz",
-                    ));
+                    return Err(invalid_frame(crate::FrameDefect::OpusSampleRate));
                 }
                 // One unit is 2.5 ms, which is a four-hundredth of a second.
                 let units = u64::from(num_samples) * 400;
@@ -1168,24 +1169,18 @@ impl AudioCodec {
                     .iter()
                     .any(|duration| units == duration * u64::from(sample_rate))
                 {
-                    return Err(invalid_frame(
-                        "An Opus frame holds 2.5, 5, 10, 20, 40 or 60 ms of audio",
-                    ));
+                    return Err(invalid_frame(crate::FrameDefect::OpusDuration));
                 }
             }
             Self::Aac => {
                 if num_samples != AAC_FRAME_SAMPLES {
-                    return Err(invalid_frame("An AAC frame holds 1024 samples per channel"));
+                    return Err(invalid_frame(crate::FrameDefect::AacSampleCount));
                 }
                 if !AAC_SAMPLE_RATES.contains(&sample_rate) {
-                    return Err(invalid_frame(
-                        "AAC is sent at a sample rate its configuration can name, from 7350 to 96000 Hz",
-                    ));
+                    return Err(invalid_frame(crate::FrameDefect::AacSampleRate));
                 }
                 if !AAC_CHANNELS.contains(&num_channels) {
-                    return Err(invalid_frame(
-                        "AAC is sent with one to six or eight channels",
-                    ));
+                    return Err(invalid_frame(crate::FrameDefect::AacChannels));
                 }
             }
         }
@@ -1348,12 +1343,12 @@ impl CompressedAudioFrame {
 
 fn validate_received_audio(codec: AudioCodec, bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() || bytes.len() > MAX_PACKET_BYTES {
-        return Err(invalid_frame("Invalid compressed audio size"));
+        return Err(invalid_frame(crate::FrameDefect::CompressedAudioSize));
     }
     if codec == AudioCodec::Aac {
         let packet = PacketEnvelope::parse(bytes)?;
         if packet.codec() != Some(EnvelopeCodec::Aac) || packet.data().is_empty() {
-            return Err(invalid_frame("Invalid AAC packet envelope"));
+            return Err(invalid_frame(crate::FrameDefect::AacEnvelope));
         }
     }
     Ok(())
@@ -1372,7 +1367,7 @@ unsafe fn packet_bytes<'a>(data: *const u8, size: i32) -> Result<&'a [u8]> {
     let size = usize::try_from(size)
         .ok()
         .filter(|size| !data.is_null() && (1..=MAX_PACKET_BYTES).contains(size))
-        .ok_or_else(|| invalid_frame("Invalid compressed frame buffer"))?;
+        .ok_or_else(|| invalid_frame(crate::FrameDefect::CompressedBuffer))?;
     // SAFETY: non-null and a positive in-range size were checked; the caller
     // guarantees readability for that size.
     Ok(unsafe { std::slice::from_raw_parts(data, size) })
@@ -1651,7 +1646,7 @@ mod tests {
     }
 
     /// The text of an invalid-frame error.
-    fn reason(result: Result<()>) -> String {
+    fn reason(result: Result<()>) -> crate::FrameDefect {
         match result {
             Err(Error::InvalidFrame(reason)) => reason,
             other => panic!("expected an invalid frame, got {other:?}"),
@@ -1704,12 +1699,20 @@ mod tests {
             },
         ];
         for raw in invalid {
-            assert_eq!(
-                reason(VideoPacketFormat::from_sdk(&raw).map(drop)),
-                reason(VideoHeader::from_sdk(&raw).map(drop)),
-            );
+            let packet = reason(VideoPacketFormat::from_sdk(&raw).map(drop));
+            let frame = reason(VideoHeader::from_sdk(&raw).map(drop));
+            match (&packet, &frame) {
+                (
+                    crate::FrameDefect::PictureAspectRatio(a),
+                    crate::FrameDefect::PictureAspectRatio(b),
+                ) => assert_eq!(a.to_bits(), b.to_bits()),
+                _ => assert_eq!(packet, frame),
+            }
         }
-        assert!(reason(VideoHeader::from_sdk(&invalid[7]).map(drop)).contains("0xFFFFFFFF"));
+        assert!(matches!(
+            reason(VideoHeader::from_sdk(&invalid[7]).map(drop)),
+            crate::FrameDefect::UnknownScanType { code: 0xFFFFFFFF }
+        ));
         for ratio in [-1.0, f32::NAN, f32::INFINITY] {
             let Err(Error::InvalidInput(packet)) = h264_format().with_picture_aspect_ratio(ratio)
             else {
@@ -1722,7 +1725,12 @@ mod tests {
             let Err(Error::InvalidFrame(frame)) = frame.set_picture_aspect_ratio(ratio) else {
                 panic!("frame setter must retain InvalidFrame")
             };
-            assert_eq!(packet, frame);
+            assert!(
+                matches!(packet, crate::InputDefect::PictureAspectRatio(value) if value.to_bits()==ratio.to_bits())
+            );
+            assert!(
+                matches!(frame, crate::FrameDefect::PictureAspectRatio(value) if value.to_bits()==ratio.to_bits())
+            );
         }
     }
 
@@ -1803,7 +1811,7 @@ mod tests {
         for (width, height) in [(0, 1), (1, 0), (max + 1, 1), (1, u32::MAX)] {
             assert!(matches!(
                 VideoPacketFormat::new(VideoCodec::H264, width, height),
-                Err(Error::InvalidInput(reason)) if reason.contains("1..=")
+                Err(Error::InvalidInput(reason)) if matches!(reason, crate::InputDefect::CompressedVideoDimensions {..})
             ));
         }
         let delivered = h264_format().raw();
@@ -1894,7 +1902,7 @@ mod tests {
                 CompressedAudioFrame::new(AudioCodec::Opus, sample_rate, channels, 960, vec![1, 2])
                     .unwrap_err();
             assert!(
-                matches!(rejected.error(), Error::InvalidFrame(reason) if reason.contains("1..="))
+                matches!(rejected.error(), Error::InvalidFrame(reason) if matches!(reason, crate::FrameDefect::CompressedAudioQuantities {..}))
             );
             assert_eq!(rejected.into_inner(), [1, 2]);
         }
@@ -2114,13 +2122,19 @@ mod tests {
                     video(format, vec![quality, 0, 0, 0]).unwrap();
                 }
                 for quality in [100, 101, 255] {
-                    assert!(reason(video(format, vec![quality, 0, 0, 0])).contains("quality"));
+                    assert!(matches!(
+                        reason(video(format, vec![quality, 0, 0, 0])),
+                        crate::FrameDefect::SpeedHqQuality
+                    ));
                     // A received frame is kept whatever it holds.
                     assert!(
                         validate_video_packet(format, &[quality, 0, 0, 0], Use::Receive).is_ok()
                     );
                 }
-                assert!(reason(video(format, vec![0; 3])).contains("Truncated"));
+                assert!(matches!(
+                    reason(video(format, vec![0; 3])),
+                    crate::FrameDefect::SpeedHqTruncated
+                ));
             }
         }
 
@@ -2144,7 +2158,10 @@ mod tests {
                 preview(width, height).unwrap();
             }
             for (width, height) in [(641, 360), (640, 641), (1280, 720), (2, 2000)] {
-                assert!(reason(preview(width, height)).contains("640 pixels"));
+                assert!(matches!(
+                    reason(preview(width, height)),
+                    crate::FrameDefect::PreviewVideoDimensions
+                ));
                 let format = VideoPacketFormat::new(codec, width, height).unwrap();
                 // The program stream has no such limit, and neither has a
                 // frame that was received.
@@ -2186,8 +2203,14 @@ mod tests {
             extras: FrameExtras::default(),
         };
         assert!(received.validate().is_ok());
-        assert!(reason(received.validate_for_send()).contains("keyframe flag"));
-        assert!(reason(aac(48_000, 2, 1024, packet)).contains("keyframe flag"));
+        assert!(matches!(
+            reason(received.validate_for_send()),
+            crate::FrameDefect::AacKeyframeMissing
+        ));
+        assert!(matches!(
+            reason(aac(48_000, 2, 1024, packet)),
+            crate::FrameDefect::AacKeyframeMissing
+        ));
     }
 
     #[test]
@@ -2199,17 +2222,29 @@ mod tests {
             }
             // 7.5, 15, 30, 80 and 120 ms.
             for units in [3, 6, 12, 32, 48] {
-                assert!(reason(opus(rate, 2, rate / 400 * units)).contains("ms of audio"));
+                assert!(matches!(
+                    reason(opus(rate, 2, rate / 400 * units)),
+                    crate::FrameDefect::OpusDuration
+                ));
             }
-            assert!(reason(opus(rate, 2, rate / 400 + 1)).contains("ms of audio"));
+            assert!(matches!(
+                reason(opus(rate, 2, rate / 400 + 1)),
+                crate::FrameDefect::OpusDuration
+            ));
         }
         for rate in [11_025, 22_050, 32_000, 44_100, 96_000] {
-            assert!(reason(opus(rate, 2, rate / 50)).contains("48000 Hz"));
+            assert!(matches!(
+                reason(opus(rate, 2, rate / 50)),
+                crate::FrameDefect::OpusSampleRate
+            ));
         }
         for channels in [1, 2, 6, 255] {
             opus(48_000, channels, 960).unwrap();
         }
-        assert!(reason(opus(48_000, 0, 960)).contains("1..="));
+        assert!(matches!(
+            reason(opus(48_000, 0, 960)),
+            crate::FrameDefect::CompressedAudioQuantities { .. }
+        ));
     }
 
     #[test]
@@ -2223,22 +2258,37 @@ mod tests {
 
         for samples in [1, 512, 960, 2048] {
             let result = aac(48_000, 2, samples, aac_packet(48_000, 2, &[1]));
-            assert!(reason(result).contains("1024 samples"));
+            assert!(matches!(reason(result), crate::FrameDefect::AacSampleCount));
         }
-        assert!(reason(aac(50_000, 2, 1024, aac_packet(48_000, 2, &[1]))).contains("7350"));
-        assert!(reason(aac(48_000, 7, 1024, aac_packet(48_000, 8, &[1]))).contains("channels"));
+        assert!(matches!(
+            reason(aac(50_000, 2, 1024, aac_packet(48_000, 2, &[1]))),
+            crate::FrameDefect::AacSampleRate
+        ));
+        assert!(matches!(
+            reason(aac(48_000, 7, 1024, aac_packet(48_000, 8, &[1]))),
+            crate::FrameDefect::AacChannels
+        ));
 
         // A configuration for another rate or layout than the frame's.
         let result = aac(44_100, 2, 1024, aac_packet(48_000, 2, &[1]));
-        assert!(reason(result).contains("sample rate"));
+        assert!(matches!(
+            reason(result),
+            crate::FrameDefect::AacRateMismatch
+        ));
         let result = aac(48_000, 1, 1024, aac_packet(48_000, 2, &[1]));
-        assert!(reason(result).contains("channel layout"));
+        assert!(matches!(
+            reason(result),
+            crate::FrameDefect::AacChannelsMismatch
+        ));
 
         // No configuration, and one too short to name a rate and a layout.
         for config in [&[][..], &[0x11][..]] {
             let packet =
                 PacketEnvelope::encode(EnvelopeCodec::Aac, 0, 0, true, &[1], config).unwrap();
-            assert!(reason(aac(48_000, 2, 1024, packet)).contains("AudioSpecificConfig"));
+            assert!(matches!(
+                reason(aac(48_000, 2, 1024, packet)),
+                crate::FrameDefect::AacConfigurationMissing
+            ));
         }
         // A longer configuration is read by its first two bytes.
         let mut config = aac_config(48_000, 2).to_vec();
@@ -2254,9 +2304,18 @@ mod tests {
                 PacketEnvelope::encode(EnvelopeCodec::Aac, 0, 0, true, &[1], &config).unwrap();
             reason(aac(48_000, 2, 1024, packet))
         };
-        assert!(unindexed(15, 2).contains("sample rate"));
-        assert!(unindexed(3, 0).contains("channel layout"));
-        assert!(unindexed(3, 8).contains("channel layout"));
+        assert!(matches!(
+            unindexed(15, 2),
+            crate::FrameDefect::AacRateMismatch
+        ));
+        assert!(matches!(
+            unindexed(3, 0),
+            crate::FrameDefect::AacChannelsMismatch
+        ));
+        assert!(matches!(
+            unindexed(3, 8),
+            crate::FrameDefect::AacChannelsMismatch
+        ));
     }
 
     /// A frame built for sending carries no timestamp, and its descriptor

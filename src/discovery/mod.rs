@@ -170,16 +170,15 @@ pub use listener::{
 /// The SDK creates these objects for any address it can parse, reachable or
 /// not, so a refusal is about the configuration: `server` is the address that
 /// was given.
-fn not_created(object: &str, server: Option<&str>) -> crate::Error {
+fn not_created(object: &'static str, server: Option<&str>) -> crate::Error {
     crate::Error::InvalidInput(match server {
-        Some(server) => format!(
-            "the SDK created no {object}: it does not accept {server:?} as a Discovery Server \
-             address"
-        ),
-        None => format!(
-            "the SDK created no {object}: no Discovery Server was named and the NDI \
-             configuration supplies none"
-        ),
+        Some(server) => {
+            crate::InputDefect::DiscoveryAddressRejected(Box::new(crate::DiscoveryAddressFailure {
+                object,
+                address: server.into(),
+            }))
+        }
+        None => crate::InputDefect::DiscoveryAddressMissing { object },
     })
 }
 
@@ -400,7 +399,7 @@ impl<A: ServerApi> ServerObject<A> {
         let server = options.server();
         if A::SINGLE_ENDPOINT && server.is_some_and(|s| s.contains(',')) {
             return Err(crate::Error::InvalidInput(
-                "a listener accepts one Discovery Server endpoint".into(),
+                crate::InputDefect::MultipleDiscoveryServers,
             ));
         }
         let url = server.map(std::ffi::CString::new).transpose()?;

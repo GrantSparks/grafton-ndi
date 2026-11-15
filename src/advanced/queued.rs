@@ -97,9 +97,7 @@ impl QueueOptions {
             || self.bytes == 0
             || self.bytes > isize::MAX as usize
         {
-            return Err(Error::InvalidInput(
-                "queue requires 1..=65536 frames and a positive addressable byte limit".into(),
-            ));
+            return Err(Error::InvalidInput(crate::InputDefect::QueueLimits));
         }
         Ok(self)
     }
@@ -203,7 +201,7 @@ impl QueuedVideoFrame {
     fn authorize_for_test(self, scatter: Option<&'static ScatterSend>) -> AuthorizedVideo {
         self.authorize_with(
             |frame| Ok(Sendable::for_test(frame)),
-            || scatter.ok_or_else(|| Error::InvalidInput("scatter table required by test".into())),
+            || scatter.ok_or_else(|| Error::InvalidInput(crate::InputDefect::ScatterTableRequired)),
         )
         .unwrap()
     }
@@ -411,7 +409,7 @@ impl State {
         }
         let Some(next) = self.next.checked_add(1) else {
             return Err(Rejected::new(
-                Error::InvalidInput("queue submission identifiers exhausted".into()),
+                Error::InvalidInput(crate::InputDefect::QueueIdentifiersExhausted),
                 frame.into_frame(),
             ));
         };
@@ -564,10 +562,12 @@ impl CallbackState {
 
     fn validate_frame_size(&self, bytes: usize) -> Result<()> {
         if bytes > self.max_bytes {
-            return Err(Error::InvalidInput(format!(
-                "frame retains {bytes} bytes of allocation capacity, exceeding the queue's {} byte limit",
-                self.max_bytes
-            )));
+            return Err(Error::InvalidInput(
+                crate::InputDefect::QueueFrameTooLarge {
+                    bytes,
+                    limit: self.max_bytes,
+                },
+            ));
         }
         Ok(())
     }
@@ -759,9 +759,7 @@ impl QueuedSender {
             match sender.into_attached() {
                 Ok((sender, earlier)) => Ok((Self::install(sender, callback, table), earlier)),
                 Err(sender) => Err(Rejected::new(
-                    Error::InvalidInput(
-                        "queued conversion requires a sender without advertiser registrations".into(),
-                    ),
+                    Error::InvalidInput(crate::InputDefect::QueuedSenderRegistered),
                     sender,
                 )),
             }
@@ -947,9 +945,7 @@ impl QueuedVideo<'_> {
         }
         if self.callback.protocol_error.load(Ordering::Acquire) {
             return Err(failure(
-                Error::UnexpectedSdkResult(
-                    "native completion protocol failed; use QueuedSender::close to recover retained frames".into(),
-                ),
+                Error::UnexpectedSdkResult(crate::SdkResultDefect::UnknownCompletion),
                 frame.into_frame(),
             ));
         }
@@ -998,7 +994,7 @@ impl QueuedVideo<'_> {
             }
             if self.callback.protocol_error.load(Ordering::Acquire) {
                 return Err(Error::UnexpectedSdkResult(
-                    "native completion protocol failed; use QueuedSender::close to recover retained frames".into(),
+                    crate::SdkResultDefect::UnknownCompletion,
                 ));
             }
             let remaining = deadline.remaining();
@@ -1342,17 +1338,21 @@ mod tests {
     #[test]
     fn permanent_admission_check_needs_no_lock_or_descriptor() {
         let state = CallbackState::new(QueueOptions::default().max_bytes(4)).unwrap();
-        // An occupied lock cannot delay this check. The error's diagnostic
-        // String is its only allocation; there is no descriptor allocation.
+        // An occupied lock cannot delay this allocation-free refusal.
         let _locked = state.state.lock().unwrap();
         let (result, allocations) =
             crate::test_alloc::allocation_count(|| state.validate_frame_size(1024));
         let Error::InvalidInput(message) = result.unwrap_err() else {
             panic!("an oversized frame is not retryable");
         };
-        assert!(message.contains("1024"));
-        assert!(message.contains("4 byte limit"));
-        assert_eq!(allocations, 1);
+        assert_eq!(
+            message,
+            crate::InputDefect::QueueFrameTooLarge {
+                bytes: 1024,
+                limit: 4
+            }
+        );
+        assert_eq!(allocations, 0);
         let (result, allocations) =
             crate::test_alloc::allocation_count(|| state.validate_frame_size(4));
         result.unwrap();

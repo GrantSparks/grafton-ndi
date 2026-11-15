@@ -326,8 +326,8 @@ fn withheld_video_color_is_refused_on_receiver_framesync_and_owned_frames() {
                     let Error::InvalidFrame(message) = source.color_info().unwrap_err() else {
                         panic!("expected an invalid color description")
                     };
-                    assert!(message.contains(&format!("{status:?}")), "{message}");
-                    assert!(message.contains("ColorPolicy::Override"), "{message}");
+                    assert!(matches!(message, crate::FrameDefect::ColorMetadataWithheld {status:found} if found==status), "{message}");
+
                 }
                 assert!(matches!(frame.color_info(), Err(Error::InvalidFrame(_))));
                 assert!(matches!(owned.color_info(), Err(Error::InvalidFrame(_))));

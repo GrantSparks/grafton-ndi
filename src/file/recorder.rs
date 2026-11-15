@@ -1030,7 +1030,7 @@ impl FileRecorder {
             .ledger
             .session_number()
             .checked_add(1)
-            .ok_or_else(|| Error::InvalidInput("the session counter is exhausted".into()))?;
+            .ok_or_else(|| Error::InvalidInput(crate::InputDefect::SessionCounterExhausted))?;
         let dropped = self.dropped_event_count();
         let prefix = target.prefix.as_ptr();
         // SAFETY: the recorder is live, and `prefix` points into `target`,
@@ -1398,7 +1398,7 @@ impl FileRecorder {
         let generation = self
             .generation
             .checked_add(1)
-            .ok_or_else(|| Error::InvalidInput("the recorder generation is exhausted".into()))?;
+            .ok_or_else(|| Error::InvalidInput(crate::InputDefect::RecorderGenerationExhausted))?;
         let mut replacement = Self::create(self._api.clone(), options)?;
         replacement.generation = generation;
         replacement.ledger = Ledger::inheriting(self.report());
