@@ -388,6 +388,12 @@ impl VideoPipeline {
         call(&mut state, self.owner.handle())
     }
 
+    /// Exclusive callers already serialize the state through their borrow.
+    fn exclusive(&mut self) -> (&mut VideoState, SendHandle<'_>) {
+        let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+        (state, self.owner.handle())
+    }
+
     /// Send the checked frame synchronously, completing the previous loan.
     fn send(&self, frame: Sendable<&(impl VideoSource + ?Sized)>) -> Result<()> {
         self.synchronize(|state, sender| {
@@ -398,21 +404,19 @@ impl VideoPipeline {
         Ok(())
     }
 
-    fn submit(&self, frame: Sendable<VideoFrame>) -> Option<VideoFrame> {
-        self.synchronize(|state, sender| {
-            let (mut displaced, synchronized) = state.in_flight.submit(sender, frame, ());
-            displaced.completed(synchronized);
-            displaced.take_retained().map(Sendable::into_frame)
-        })
+    fn submit(&mut self, frame: Sendable<VideoFrame>) -> Option<VideoFrame> {
+        let (state, sender) = self.exclusive();
+        let (mut displaced, synchronized) = state.in_flight.submit(sender, frame, ());
+        displaced.completed(synchronized);
+        displaced.take_retained().map(Sendable::into_frame)
     }
 
-    fn copy(&self, frame: Sendable<&(impl VideoSource + ?Sized)>) {
-        self.synchronize(|state, sender| {
-            let owned = frame.copied(state.spare.take());
-            let (mut displaced, synchronized) = state.in_flight.submit(sender, owned, ());
-            displaced.completed(synchronized);
-            state.spare = displaced.take_retained().map(Sendable::into_frame);
-        });
+    fn copy(&mut self, frame: Sendable<&(impl VideoSource + ?Sized)>) {
+        let (state, sender) = self.exclusive();
+        let owned = frame.copied(state.spare.take());
+        let (mut displaced, synchronized) = state.in_flight.submit(sender, owned, ());
+        displaced.completed(synchronized);
+        state.spare = displaced.take_retained().map(Sendable::into_frame);
     }
 
     /// Wait for the SDK to release the frame in flight, which stays retained.
@@ -421,12 +425,11 @@ impl VideoPipeline {
     }
 
     /// Drain the SDK and take the retained frame.
-    fn finish(&self) -> Option<VideoFrame> {
-        self.synchronize(|state, sender| {
-            drain(&mut state.in_flight, sender);
-            state.spare = None;
-            state.in_flight.take_retained().map(Sendable::into_frame)
-        })
+    fn finish(&mut self) -> Option<VideoFrame> {
+        let (state, sender) = self.exclusive();
+        drain(&mut state.in_flight, sender);
+        state.spare = None;
+        state.in_flight.take_retained().map(Sendable::into_frame)
     }
 
     /// End the pipeline: drain the SDK and take the retained frame.
