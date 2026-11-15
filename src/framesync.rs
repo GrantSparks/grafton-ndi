@@ -576,7 +576,7 @@ impl FrameSync {
         receiver: Receiver,
         create: impl FnOnce(NDIlib_recv_instance_t) -> NDIlib_framesync_instance_t,
     ) -> std::result::Result<Self, Rejected<Receiver>> {
-        let instance = create(receiver.core.instance);
+        let instance = create(receiver.core.instance.0);
         if instance.is_null() {
             // The untouched raw receiver goes back to the caller.
             return Err(Rejected::new(
@@ -1094,7 +1094,7 @@ mod tests {
         let receiver =
             Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
         let mut sync = FrameSync::new(receiver).unwrap();
-        let original = (sync.resource.instance, sync.receiver.core.instance);
+        let original = (sync.resource.instance, sync.receiver.core.instance.0);
         let (results, allocations) = crate::test_alloc::allocation_count(|| {
             let tier = sync.controls().set_stream_tier(crate::StreamTier::Preview);
             let streams = sync.controls().set_streams(crate::MediaTypes::ALL);
@@ -1105,7 +1105,7 @@ mod tests {
         assert_eq!(allocations, 0);
         assert!(results.0.is_ok() && results.1.is_ok() && results.2.is_ok());
         assert_eq!(
-            (sync.resource.instance, sync.receiver.core.instance),
+            (sync.resource.instance, sync.receiver.core.instance.0),
             original
         );
     }
@@ -1127,13 +1127,13 @@ mod tests {
                 let mut receiver =
                     Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new("")))
                         .unwrap();
-                let original = receiver.core.instance;
+                let original = receiver.core.instance.0;
                 drop(ndi);
                 for _ in 0..3 {
                     let fs = FrameSync::new(receiver).unwrap();
-                    assert_eq!(fs.receiver().core.instance, original);
+                    assert_eq!(fs.receiver().core.instance.0, original);
                     receiver = fs.into_receiver();
-                    assert_eq!(receiver.core.instance, original);
+                    assert_eq!(receiver.core.instance.0, original);
                     assert!(receiver.video().capture(std::time::Duration::ZERO).is_ok());
                 }
                 let fs = FrameSync::new(receiver).unwrap();

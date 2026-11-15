@@ -316,7 +316,7 @@ impl AdvertiserApi for sys::ReceiverAdvertising {
     unsafe fn remove(&self, instance: Self::Instance, member: &Self::Member) -> bool {
         // SAFETY: the caller supplies a live advertiser, and `member` owns a
         // live receiver.
-        unsafe { self.NDIlib_recv_advertiser_del_receiver(instance, member.resource.instance) }
+        unsafe { self.NDIlib_recv_advertiser_del_receiver(instance, member.resource.instance.0) }
     }
 }
 
@@ -767,7 +767,7 @@ impl RecvAdvertiser {
         if !unsafe {
             self.inner.api.NDIlib_recv_advertiser_add_receiver(
                 self.inner.instance,
-                resource.instance,
+                resource.instance.0,
                 options.controlling,
                 options.monitoring,
                 input_group.as_ref().map_or(ptr::null(), |v| v.as_ptr()),

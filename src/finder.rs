@@ -151,6 +151,17 @@ impl FinderOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FindInstance(NDIlib_find_instance_t);
+
+// SAFETY: the SDK gives finders no thread affinity and allows source-change
+// waits beside snapshot queries. Finder's snapshot lock covers every fetch and
+// copy before another query can invalidate its buffers; its change feed permits
+// only one native waiter. The surrounding Rust fields determine Finder's traits.
+unsafe impl Send for FindInstance {}
+// SAFETY: the same snapshot and waiter serialization applies to shared uses.
+unsafe impl Sync for FindInstance {}
+
 /// Discovers NDI sources on the network.
 ///
 /// `Finder` provides methods to discover and monitor NDI sources. It maintains
@@ -178,7 +189,7 @@ impl FinderOptions {
 /// # }
 /// ```
 pub struct Finder {
-    instance: NDIlib_find_instance_t,
+    instance: FindInstance,
     // SDK snapshots and their strings expire on the next snapshot call.
     sources_lock: Mutex<()>,
     changes: ChangeFeed,
@@ -318,7 +329,7 @@ impl Finder {
             return Err(Error::NativeOperationFailed { operation });
         }
         Ok(Self {
-            instance,
+            instance: FindInstance(instance),
             sources_lock: Mutex::new(()),
             changes: ChangeFeed::default(),
             _groups: groups,
@@ -371,7 +382,7 @@ impl Finder {
         copy: impl FnMut(&D, &mut SnapshotBudget) -> Result<Option<T>>,
     ) -> Result<Vec<T>> {
         let mut count = 0;
-        let descriptors = fetch(self.instance, &mut count);
+        let descriptors = fetch(self.instance.0, &mut count);
         // SAFETY: fetch's contract supplies the array; the lock keeps it
         // and its strings live until the complete bounded copy returns.
         unsafe { budget::copy_snapshot(descriptors, count, copy) }
@@ -432,7 +443,7 @@ impl Finder {
                 self._ndi
                     .api()
                     .core
-                    .NDIlib_find_wait_for_sources(self.instance, timeout_ms)
+                    .NDIlib_find_wait_for_sources(self.instance.0, timeout_ms)
             })
     }
 
@@ -685,27 +696,15 @@ impl Finder {
 
 impl Drop for Finder {
     fn drop(&mut self) {
-        // SAFETY: the instance was created through this runtime and is
-        // destroyed exactly once, before the runtime handle is released.
-        unsafe { self._ndi.api().core.NDIlib_find_destroy(self.instance) };
+        // SAFETY: the instance belongs to this runtime and is destroyed once.
+        unsafe { self._ndi.api().core.NDIlib_find_destroy(self.instance.0) };
     }
 }
 
-/// # Safety
-///
-/// The SDK finder handle may be moved between threads. Its runtime and creation
-/// strings remain alive with it, and destruction requires exclusive ownership.
-unsafe impl std::marker::Send for Finder {}
-
-/// # Safety
-///
-/// The SDK forbids concurrent `NDIlib_find_get_current_sources` calls on one
-/// instance and invalidates its returned buffers on the next call. `sources_lock`
-/// serializes those calls through the complete deep copy into owned `Source`s.
-/// Waiting for source changes does not invalidate those buffers; destruction
-/// requires exclusive access through `Drop`. `changes` serializes native
-/// waits and broadcasts each report to concurrent Rust observers.
-unsafe impl std::marker::Sync for Finder {}
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Finder>();
+};
 
 fn accumulate_sources(
     discovered: &mut Vec<Source>,

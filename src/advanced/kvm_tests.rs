@@ -198,7 +198,7 @@ fn rejected_releases_are_retained_and_drop_retries_only_the_inputs_still_pressed
         assert!(calls
             .instances
             .iter()
-            .all(|&id| id == receiver.core.instance as usize));
+            .all(|&id| id == receiver.core.instance.0 as usize));
         assert_eq!(calls.keys, [0xff0d]);
         assert_eq!(calls.releases, 2);
         assert_eq!(calls.mouse_releases, 1);
@@ -278,7 +278,7 @@ fn every_held_input_combination_retries_only_failed_releases() {
                 assert!(calls
                     .instances
                     .iter()
-                    .all(|&id| id == receiver.core.instance as usize));
+                    .all(|&id| id == receiver.core.instance.0 as usize));
             });
         }
     }

@@ -280,7 +280,7 @@ impl AvSync {
         native!(AvSync, table => {
             // SAFETY: the receiver instance is live, and this value keeps it
             // alive for longer than the synchronizer.
-            let handle = unsafe { table.NDIlib_avsync_create(receiver.core.instance) };
+            let handle = unsafe { table.NDIlib_avsync_create(receiver.core.instance.0) };
             if handle.is_null() {
                 return Err(Rejected::new(
                     Error::NativeOperationFailed {

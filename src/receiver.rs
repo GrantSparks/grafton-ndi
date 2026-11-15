@@ -112,7 +112,7 @@ impl Drop for RecvStringGuard<'_> {
             // released exactly once.
             unsafe {
                 self.strings
-                    .NDIlib_recv_free_string(self.core.instance, self.pointer)
+                    .NDIlib_recv_free_string(self.core.instance.0, self.pointer)
             };
         }
     }
@@ -315,7 +315,7 @@ macro_rules! ptz_command {
     ($ptz:expr, $func:ident $(, $arg:expr)*) => {{
         // SAFETY: the receiver instance is live for the handle's borrow, and
         // every argument is a plain value.
-        if unsafe { $ptz.core.sdk().$func($ptz.core.instance $(, $arg)*) } {
+        if unsafe { $ptz.core.sdk().$func($ptz.core.instance.0 $(, $arg)*) } {
             Ok(())
         } else {
             Err(Error::NativeOperationFailed {
@@ -952,8 +952,20 @@ struct ConnectionTarget {
     raw: RawSource,
 }
 
+/// A receiver's opaque native identity; ownership stays with `ReceiverCore`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecvInstance(pub(crate) NDIlib_recv_instance_t);
+
+// SAFETY: the SDK gives receivers no thread affinity and permits concurrent
+// captures (Processing.NDI.Recv.h). ReceiverCore's capture guard serializes
+// reconnects against captures, and its query lock protects temporary SDK strings.
+// Every native use retains the core; its other fields determine its auto traits.
+unsafe impl Send for RecvInstance {}
+// SAFETY: as above; receiver modes reserve the media paths used by synchronizers.
+unsafe impl Sync for RecvInstance {}
+
 pub(crate) struct ReceiverCore {
-    pub(crate) instance: NDIlib_recv_instance_t,
+    pub(crate) instance: RecvInstance,
     pub(crate) _ndi: Ndi,
     /// The latest requested target; serializes connection changes against captures.
     ///
@@ -1074,7 +1086,7 @@ impl Receiver {
         }
         Ok(Self {
             core: Arc::new(ReceiverCore {
-                instance,
+                instance: RecvInstance(instance),
                 _ndi: ndi.clone(),
                 capture_guard: RwLock::new(ConnectionTarget {
                     source: options.source.clone(),
@@ -1160,7 +1172,7 @@ impl<M: ReceiverMode> Receiver<M> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
         // SAFETY: the receiver instance is live for this borrow.
-        let changed = unsafe { table.NDIlib_recv_set_video_delay(self.core.instance, millis) };
+        let changed = unsafe { table.NDIlib_recv_set_video_delay(self.core.instance.0, millis) };
         Ok(SettingChange::from_sdk(changed))
     }
 
@@ -1174,7 +1186,7 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn video_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
         // SAFETY: the receiver instance is live for this borrow.
-        receiver_delay(unsafe { table.NDIlib_recv_get_video_delay(self.core.instance) })
+        receiver_delay(unsafe { table.NDIlib_recv_get_video_delay(self.core.instance.0) })
     }
 
     /// Set native audio buffering with the same rounding/range as [`Self::set_video_delay`].
@@ -1189,7 +1201,7 @@ impl<M: ReceiverMode> Receiver<M> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
         // SAFETY: the receiver instance is live for this borrow.
-        let changed = unsafe { table.NDIlib_recv_set_audio_delay(self.core.instance, millis) };
+        let changed = unsafe { table.NDIlib_recv_set_audio_delay(self.core.instance.0, millis) };
         Ok(SettingChange::from_sdk(changed))
     }
 
@@ -1201,7 +1213,7 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn audio_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
         // SAFETY: the receiver instance is live for this borrow.
-        receiver_delay(unsafe { table.NDIlib_recv_get_audio_delay(self.core.instance) })
+        receiver_delay(unsafe { table.NDIlib_recv_get_audio_delay(self.core.instance.0) })
     }
 
     /// Add validated metadata sent immediately and again on each connection.
@@ -1212,7 +1224,7 @@ impl<M: ReceiverMode> Receiver<M> {
         let table = self.core.connection_metadata()?;
         let raw = metadata.metadata_raw();
         // SAFETY: The metadata C string remains live for the synchronous SDK call.
-        unsafe { table.NDIlib_recv_add_connection_metadata(self.core.instance, &raw) };
+        unsafe { table.NDIlib_recv_add_connection_metadata(self.core.instance.0, &raw) };
         Ok(())
     }
 
@@ -1220,7 +1232,7 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.core.connection_metadata()?;
         // SAFETY: the receiver instance is live for this borrow.
-        unsafe { table.NDIlib_recv_clear_connection_metadata(self.core.instance) };
+        unsafe { table.NDIlib_recv_clear_connection_metadata(self.core.instance.0) };
         Ok(())
     }
 
@@ -1234,7 +1246,7 @@ impl<M: ReceiverMode> Receiver<M> {
         let guard = RecvStringGuard {
             core: &self.core,
             // SAFETY: the receiver instance is live for this borrow.
-            pointer: unsafe { web_control.NDIlib_recv_get_web_control(self.core.instance) },
+            pointer: unsafe { web_control.NDIlib_recv_get_web_control(self.core.instance.0) },
             strings,
         };
         guard.copy()
@@ -1294,7 +1306,7 @@ impl<M: ReceiverMode> Receiver<M> {
         unsafe {
             self.core
                 .sdk()
-                .NDIlib_recv_set_tally(self.core.instance, &tally.to_sdk())
+                .NDIlib_recv_set_tally(self.core.instance.0, &tally.to_sdk())
         };
     }
 
@@ -1314,7 +1326,7 @@ impl<M: ReceiverMode> Receiver<M> {
         let sent = unsafe {
             self.core
                 .sdk()
-                .NDIlib_recv_send_metadata(self.core.instance, &raw)
+                .NDIlib_recv_send_metadata(self.core.instance.0, &raw)
         };
         // `Processing.NDI.Recv.h`: false means nothing is connected.
         if sent {
@@ -1376,7 +1388,7 @@ impl<M: ReceiverMode> Receiver<M> {
         unsafe {
             self.core
                 .sdk()
-                .NDIlib_recv_get_no_connections(self.core.instance)
+                .NDIlib_recv_get_no_connections(self.core.instance.0)
                 > 0
         }
     }
@@ -1486,7 +1498,7 @@ impl<M: ReceiverMode> Receiver<M> {
         let connections = unsafe {
             self.core
                 .sdk()
-                .NDIlib_recv_get_no_connections(self.core.instance)
+                .NDIlib_recv_get_no_connections(self.core.instance.0)
         };
 
         let mut total = NDIlib_recv_performance_t::default();
@@ -1495,7 +1507,7 @@ impl<M: ReceiverMode> Receiver<M> {
         // passed outlives the synchronous call.
         unsafe {
             self.core.sdk().NDIlib_recv_get_performance(
-                self.core.instance,
+                self.core.instance.0,
                 &mut total,
                 &mut dropped,
             );
@@ -1507,7 +1519,7 @@ impl<M: ReceiverMode> Receiver<M> {
         unsafe {
             self.core
                 .sdk()
-                .NDIlib_recv_get_queue(self.core.instance, &mut queue);
+                .NDIlib_recv_get_queue(self.core.instance.0, &mut queue);
         }
 
         ConnectionStats {
@@ -1646,7 +1658,7 @@ impl ReceiverCore {
         // null or points into a `RawSource`, which owns the strings its
         // descriptor points to and outlives this synchronous call, during
         // which the SDK copies the descriptor.
-        unsafe { self.sdk().NDIlib_recv_connect(self.instance, source) };
+        unsafe { self.sdk().NDIlib_recv_connect(self.instance.0, source) };
     }
 
     /// Take the shared capture guard for `attempt`, waiting for it no longer
@@ -1838,7 +1850,7 @@ impl ReceiverCore {
             // passed outlives the synchronous call.
             connections: unsafe {
                 self.sdk()
-                    .NDIlib_recv_get_no_connections(self.instance)
+                    .NDIlib_recv_get_no_connections(self.instance.0)
                     .max(0) as u32
             },
         }
@@ -1921,7 +1933,7 @@ impl ReceiverCore {
             // SAFETY: the receiver instance is live for this borrow and `pointer` is
             // writable storage for the returned string.
             let changed = unsafe {
-                source_name.NDIlib_recv_get_source_name(self.instance, &mut pointer, remaining)
+                source_name.NDIlib_recv_get_source_name(self.instance.0, &mut pointer, remaining)
             };
             let guard = RecvStringGuard {
                 core: self,
@@ -1966,7 +1978,7 @@ impl<'rx> CaptureLock<'rx> {
 
     /// The receiver instance a capture under this lock is made on.
     pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
-        self.core.instance
+        self.core.instance.0
     }
 
     /// The receiver's one `NDIlib_recv_capture_v3` call: wait for what is
@@ -1993,7 +2005,7 @@ impl<'rx> CaptureLock<'rx> {
         // exclusively, cannot run on this instance during the call.
         unsafe {
             self.core.sdk().NDIlib_recv_capture_v3(
-                self.core.instance,
+                self.core.instance.0,
                 video.map_or(ptr::null_mut(), ptr::from_mut),
                 audio.map_or(ptr::null_mut(), ptr::from_mut),
                 metadata.map_or(ptr::null_mut(), ptr::from_mut),
@@ -2144,7 +2156,7 @@ impl Ptz<'_> {
         unsafe {
             self.core
                 .sdk()
-                .NDIlib_recv_ptz_is_supported(self.core.instance)
+                .NDIlib_recv_ptz_is_supported(self.core.instance.0)
         }
     }
 
@@ -2337,25 +2349,17 @@ impl Drop for ReceiverCore {
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
         unsafe {
-            self.sdk().NDIlib_recv_destroy(self.instance);
+            self.sdk().NDIlib_recv_destroy(self.instance.0);
         }
         #[cfg(test)]
         lifecycle_test_events::record("receiver");
     }
 }
 
-// SAFETY: Moving the core transfers its opaque native handle without moving
-// SDK buffers or changing their lifetime. Its Ndi keeps the runtime alive.
-// Processing.NDI.Recv.h permits capture calls on separate threads, and the
-// crate's borrowed frame guards preserve their own lifetime/thread contracts.
-unsafe impl Send for ReceiverCore {}
-
-// SAFETY: Processing.NDI.Recv.h documents concurrent capture calls. The
-// crate's capture guard conservatively serializes connection changes against
-// them, and query locks protect SDK strings invalidated by a later query.
-// Receiver modes reserve the media paths used by FrameSync and AvSync.
-// Borrowed frame guards retain the receiver until their native buffers are freed.
-unsafe impl Sync for ReceiverCore {}
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ReceiverCore>();
+};
 
 // A panic cannot leave a receiver's shared state half-changed: of its locks,
 // the target and pending unknown event are replaced whole; the string-query

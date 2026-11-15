@@ -331,13 +331,10 @@ impl Entry {
     }
 }
 
-// SAFETY: the descriptor points only into allocations this entry owns, and
-// moving the entry moves none of them. While the frame is queued only the
-// SDK reads or writes them: the completion callback moves the entry from
-// `State::in_flight` to `State::ready` without touching the frame, and the
-// queue hands the frame out only from `ready`, after the SDK has reported
-// it complete, or after native destruction has ended access to every entry.
-unsafe impl Send for Entry {}
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Entry>();
+};
 
 struct Admitted {
     id: SubmissionId,

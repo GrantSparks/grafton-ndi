@@ -349,7 +349,7 @@ impl<M: ReceiverMode> Receiver<M> {
         let table = self.core._ndi.table::<KeyframeRequest>()?;
         native!(KeyframeRequest, table => {
             // SAFETY: the receiver instance is live for this borrow.
-            unsafe { table.NDIlib_recv_request_keyframe(self.core.instance) };
+            unsafe { table.NDIlib_recv_request_keyframe(self.core.instance.0) };
             Ok(())
         })
     }
@@ -373,7 +373,7 @@ impl<M: ReceiverMode> Receiver<M> {
                 StreamTier::Preview => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
             };
             // SAFETY: the receiver instance is live for this borrow.
-            let switched = unsafe { table.NDIlib_recv_set_bandwidth(self.core.instance, bandwidth) };
+            let switched = unsafe { table.NDIlib_recv_set_bandwidth(self.core.instance.0, bandwidth) };
             Ok(SettingChange::from_sdk(switched))
         })
     }
@@ -396,7 +396,7 @@ impl<M: ReceiverMode> Receiver<M> {
             // SAFETY: the receiver instance is live for this borrow.
             let changed = unsafe {
                 table.NDIlib_recv_set_enabled_streams(
-                    self.core.instance,
+                    self.core.instance.0,
                     _streams.contains(MediaTypes::VIDEO),
                     _streams.contains(MediaTypes::AUDIO),
                     _streams.contains(MediaTypes::METADATA),

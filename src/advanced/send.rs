@@ -471,18 +471,10 @@ pub(super) enum PendingVideo {
     },
 }
 
-// SAFETY: the scatter list points only into allocations this entry owns, and
-// moving the entry moves none of them. Until the sender that owns the entry
-// takes the frame back, once the SDK has finished with it, only the SDK reads
-// or writes those allocations.
-unsafe impl Send for PendingVideo {}
-// SAFETY: a shared reference to an entry reads only its frame's format, which
-// the SDK never writes; it never dereferences the scatter list's pointers.
-// Everything that lends the entry to the SDK or takes it back goes through
-// `&mut` or by value. The generated `NDIlib_frame_scatter_t` holds raw
-// pointers, which would otherwise make this entry, and with it
-// `CompressedSender`, `Sync` only in builds without the Advanced headers.
-unsafe impl Sync for PendingVideo {}
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PendingVideo>();
+};
 
 impl PendingVideo {
     /// The frame owns a strong lease of its caller's already reserved list

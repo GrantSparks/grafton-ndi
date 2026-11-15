@@ -151,7 +151,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
 
     #[cfg(ndi_has_advanced_kvm)]
     fn instance(&self) -> NDIlib_recv_instance_t {
-        self.receiver.core.instance
+        self.receiver.core.instance.0
     }
 
     /// Whether the connected source accepts remote control. This can change

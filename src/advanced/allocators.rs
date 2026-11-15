@@ -1312,7 +1312,7 @@ impl<M: ReceiverMode> Allocation<M> {
             registry.closing(earlier);
         }
         let opaque = token.map_or(std::ptr::null_mut(), |token| token as *mut c_void);
-        let instance = self.receiver().core.instance;
+        let instance = self.receiver().core.instance.0;
         let table = self.table;
         // SAFETY: the receiver is live. The callbacks are functions of this
         // program, which stays loaded, and the opaque value is a token they
