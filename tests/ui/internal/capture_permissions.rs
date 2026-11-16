@@ -18,3 +18,8 @@ fn attached_events(receiver: &Receiver<FrameSyncAttached>, deadline: Deadline) {
 fn attached_audio_view(receiver: &Receiver<FrameSyncAttached>) {
     let _ = receiver.capture_audio(std::time::Duration::ZERO);
 }
+
+// Recovery takes the attached owner, never a separately supplied receiver.
+fn attached_recovery(receiver: Receiver<FrameSyncAttached>) -> Receiver {
+    receiver.detach()
+}

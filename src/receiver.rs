@@ -64,6 +64,8 @@ use crate::{
     VideoFrame, VideoFrameRef,
 };
 
+pub(crate) mod attached;
+
 /// A string the receiver API returned, released when dropped.
 struct RecvStringGuard<'a> {
     core: &'a ReceiverCore,
@@ -940,41 +942,6 @@ impl SynchronizerMode for FrameSyncAttached {}
 #[cfg(feature = "advanced")]
 impl SynchronizerMode for AvSyncAttached {}
 
-/// Proof that this receiver's native synchronizer has been destroyed.
-/// Construction consumes a native resource; retained core identity prevents
-/// another synchronizer's release from restoring raw capture on a live one.
-pub(crate) struct Released<M: SynchronizerMode> {
-    core: Arc<ReceiverCore>,
-    _mode: PhantomData<fn() -> M>,
-}
-
-impl Released<FrameSyncAttached> {
-    pub(crate) fn release(resource: crate::framesync::FrameSyncResource) -> Self {
-        // Keep this exact core allocated through identity validation. Cloning
-        // avoids manual field extraction from a resource with a native Drop.
-        let core = Arc::clone(resource.receiver_core());
-        drop(resource);
-        Self {
-            core,
-            _mode: PhantomData,
-        }
-    }
-}
-
-#[cfg(feature = "advanced")]
-impl Released<AvSyncAttached> {
-    pub(crate) fn release(resource: crate::advanced::AvResource) -> Self {
-        // Keep this exact core allocated through identity validation. Cloning
-        // avoids manual field extraction from a resource with a native Drop.
-        let core = Arc::clone(resource.receiver_core());
-        drop(resource);
-        Self {
-            core,
-            _mode: PhantomData,
-        }
-    }
-}
-
 /// Ordinary receiver mode, permitting raw video capture.
 #[derive(Debug)]
 pub enum RawCapture {}
@@ -1292,30 +1259,9 @@ impl<M: CreatableMode> Receiver<M> {
 }
 
 impl Receiver<RawCapture> {
-    pub(crate) fn attach<M: SynchronizerMode>(self) -> Receiver<M> {
-        Receiver {
-            core: self.core,
-            _mode: PhantomData,
-        }
-    }
-
     /// Synthetic packet-mode receiver for tests without a passthrough SDK.
     #[cfg(all(test, feature = "advanced"))]
     pub(crate) fn into_packet_for_test(self) -> Receiver<PacketAttached> {
-        Receiver {
-            core: self.core,
-            _mode: PhantomData,
-        }
-    }
-}
-
-#[allow(private_bounds)]
-impl<M: SynchronizerMode> Receiver<M> {
-    pub(crate) fn detach(self, released: Released<M>) -> Receiver<RawCapture> {
-        assert!(
-            Arc::ptr_eq(&self.core, &released.core),
-            "synchronizer release belongs to another receiver"
-        );
         Receiver {
             core: self.core,
             _mode: PhantomData,

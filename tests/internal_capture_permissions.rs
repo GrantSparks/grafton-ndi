@@ -41,4 +41,8 @@ fn attached_modes_fail_the_internal_capture_entry_points() {
         stderr.contains("capture_ref_until") && stderr.contains("capture_audio"),
         "internal and public typed capture must both fail their permission gates:\n{stderr}"
     );
+    assert!(
+        stderr.contains("no method named `detach`"),
+        "raw recovery must require the attached synchronizer owner:\n{stderr}"
+    );
 }

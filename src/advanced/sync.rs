@@ -2,14 +2,17 @@
 
 #[cfg(any(test, ndi_has_advanced_av_sync, ndi_has_advanced_genlock))]
 use std::ptr;
-use std::{cell::Cell, marker::PhantomData, sync::Arc};
+use std::{cell::Cell, marker::PhantomData};
 
 use super::{invalid_input, sdk_quantity, AdvancedConfig, AvSyncAttached, ReceiverControls};
 use crate::{
     capture::{AvSyncAudioFree, Guard},
     frames::ValidatedAudio,
     frames::MAX_AUDIO_BYTES,
-    receiver::{ReceiverCore, Released},
+    receiver::{
+        attached::{sealed, Attached, Resource, Synchronizer},
+        ReceiverCore,
+    },
     source_retention::RetainedSources,
     sys::{
         advanced::{native, AvSync as AvSyncTable, Genlock as GenlockTable},
@@ -230,12 +233,15 @@ enum Synchronized {
 }
 
 /// A native synchronizer, destroyed when dropped.
-pub(crate) struct AvResource {
-    receiver: Arc<ReceiverCore>,
+pub(crate) struct AvSyncKind {
     #[cfg(ndi_has_advanced_av_sync)]
     handle: AvSyncInstance,
     table: &'static AvSyncTable,
+    // Keep the public Send + !Sync contract even without native declarations.
+    _not_sync: NotSync,
 }
+
+type AvResource = Resource<AvSyncKind>;
 
 #[cfg(ndi_has_advanced_av_sync)]
 #[derive(Clone, Copy)]
@@ -257,26 +263,29 @@ const _: () = {
     send::<AvResource>();
 };
 
-impl AvResource {
-    pub(crate) fn receiver_core(&self) -> &Arc<ReceiverCore> {
-        &self.receiver
-    }
+impl sealed::Sealed for AvSyncKind {}
 
-    fn release(self) -> Released<AvSyncAttached> {
-        Released::<AvSyncAttached>::release(self)
-    }
-}
+// SAFETY: adoption retains the receiver from which this handle was created.
+// The view borrows the same resource and exposes no ownership transition.
+unsafe impl Synchronizer for AvSyncKind {
+    type Mode = AvSyncAttached;
+    type Capture<'a> = AvSyncCapture<'a>;
 
-impl Drop for AvResource {
-    fn drop(&mut self) {
-        // SAFETY: the handle was created by this table and is destroyed once,
-        // while this resource still owns the receiver it reads.
+    unsafe fn destroy(&mut self, _receiver: &ReceiverCore) {
         native!(AvSync, self.table => {
-            // SAFETY: this resource retains the receiver through destruction.
+            // SAFETY: Resource retains the creating receiver and runtime, and
+            // invokes this destruction once for the uniquely owned handle.
             unsafe { self.table.NDIlib_avsync_destroy(self.handle.0) };
             #[cfg(test)]
             crate::receiver::lifecycle_test_events::record("avsync");
         });
+    }
+
+    fn capture(resource: &AvResource) -> AvSyncCapture<'_> {
+        AvSyncCapture {
+            resource,
+            _thread: PhantomData,
+        }
     }
 }
 
@@ -338,15 +347,7 @@ impl Drop for AvResource {
 /// # }
 /// ```
 pub struct AvSync {
-    resource: AvResource,
-    receiver: Receiver<AvSyncAttached>,
-    // `synchronize` takes `&self`, so withholding Sync keeps two
-    // synchronizations of one synchronizer from running at once, which
-    // neither Processing.NDI.AVSync.h nor the Advanced SDK manual (25.6)
-    // documents as safe. AvSyncInstance withholds Sync when its native
-    // handle is present; this also states it without Advanced declarations.
-    // Send comes from the fields.
-    _not_sync: NotSync,
+    inner: Attached<AvSyncKind>,
 }
 
 /// A field that withholds [`Sync`] from the type that holds it, and nothing
@@ -380,17 +381,19 @@ impl AvSync {
             Err(error) => return Err(Rejected::new(error, receiver)),
         };
         native!(AvSync, table => {
-            // SAFETY: the receiver instance is live, and this value keeps it
-            // alive for longer than the synchronizer.
-            let handle = match unsafe { table.named().NDIlib_avsync_create(receiver.core.instance.0) }.created() {
-                Ok(handle) => handle.as_ptr(),
-                Err(error) => return Err(Rejected::new(error, receiver)),
-            };
-            Ok(Self {
-                resource: AvResource { handle: AvSyncInstance(handle), table, receiver: Arc::clone(&receiver.core) },
-                receiver: receiver.attach(),
-                _not_sync: NotSync(PhantomData),
-            })
+            // SAFETY: this creates a uniquely owned synchronizer from the
+            // supplied receiver, using that receiver's runtime table.
+            unsafe {
+                Attached::adopt(receiver, |core| {
+                    let handle = table.named().NDIlib_avsync_create(core.instance.0)
+                        .created()?.as_ptr();
+                    Ok(AvSyncKind {
+                        handle: AvSyncInstance(handle),
+                        table,
+                        _not_sync: NotSync(PhantomData),
+                    })
+                })
+            }.map(|inner| Self { inner })
         })
     }
 
@@ -422,14 +425,14 @@ impl AvSync {
     /// controls and KVM; [`split`](Self::split) keeps synchronization usable
     /// while a KVM session holds the receiver borrow.
     pub fn receiver(&self) -> &Receiver<AvSyncAttached> {
-        &self.receiver
+        self.inner.receiver()
     }
 
     /// Borrow exclusive receiver controls without permitting receiver replacement.
     /// This allocates nothing and makes no SDK call. Use [`Self::split`] to
     /// synchronize while a KVM session retains the receiver borrow.
     pub fn controls(&mut self) -> ReceiverControls<'_, AvSyncAttached> {
-        ReceiverControls::new(&mut self.receiver)
+        self.inner.controls()
     }
 
     /// Lend synchronization and exclusive receiver controls independently.
@@ -440,22 +443,13 @@ impl AvSync {
     /// Release held inputs before changing source, and drop both views before
     /// recovering the receiver.
     pub fn split(&mut self) -> (AvSyncCapture<'_>, ReceiverControls<'_, AvSyncAttached>) {
-        (
-            AvSyncCapture {
-                resource: &self.resource,
-                _thread: PhantomData,
-            },
-            ReceiverControls::new(&mut self.receiver),
-        )
+        self.inner.split()
     }
 
     /// Stop synchronizing and return the receiver, with its own audio
     /// capture again.
     pub fn into_receiver(self) -> Receiver {
-        let Self {
-            resource, receiver, ..
-        } = self;
-        receiver.detach(resource.release())
+        self.inner.into_receiver()
     }
 
     /// Fetch the audio that belongs to `video`.
@@ -534,10 +528,7 @@ impl AvSync {
     /// The synchronization view of this owner, which `&self` keeps on its
     /// thread for as long as it is borrowed.
     fn capture(&self) -> AvSyncCapture<'_> {
-        AvSyncCapture {
-            resource: &self.resource,
-            _thread: PhantomData,
-        }
+        self.inner.capture()
     }
 }
 
@@ -618,7 +609,7 @@ impl<'a> AvSyncCapture<'a> {
             // buffers, which the borrow keeps allocated for the call, and
             // carrying the timestamp `AvSyncVideo::new` checked.
             let video = _video.map(|video| video.descriptor(&self.resource.receiver._ndi)).transpose()?;
-            let AvResource { handle, table, .. } = *self.resource;
+            let (handle, table) = (self.resource.handle, self.resource.table);
             let mut audio = _request.raw();
             let status = {
                 // SAFETY: the synchronizer is live, and so is the receiver it
@@ -1773,7 +1764,8 @@ mod tests {
         let receiver =
             Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new("").unwrap())).unwrap();
         let sync = AvSync::new(receiver).unwrap();
-        let AvResource { handle, table, .. } = &sync.resource;
+        let resource = sync.inner.resource();
+        let (handle, table) = (resource.handle, resource.table);
         let mut raw = AvSyncRequest::automatic().raw();
         raw.timestamp = 12345;
         let status = unsafe {

@@ -73,7 +73,7 @@
 //! }
 //! ```
 
-use std::{fmt, num::NonZeroU32, sync::Arc};
+use std::{fmt, num::NonZeroU32};
 
 use crate::{
     capture::{FrameSyncAudioFree, FrameSyncVideoFree, Guard},
@@ -81,7 +81,10 @@ use crate::{
         validate_returned_audio, AudioFrame, ReturnedAudio, ScanType, ValidatedAudio,
         ValidatedAudioLayout, ValidatedVideo, VideoFrame,
     },
-    receiver::{FrameSyncAttached, Receiver, ReceiverCore, Released},
+    receiver::{
+        attached::{sealed, Attached, Resource, Synchronizer},
+        FrameSyncAttached, Receiver, ReceiverCore,
+    },
     sys::bindings::*,
     Error, Rejected, Result,
 };
@@ -334,8 +337,7 @@ impl FrameSyncAudioRequest {
 /// # }
 /// ```
 pub struct FrameSync {
-    resource: FrameSyncResource,
-    receiver: Receiver<FrameSyncAttached>,
+    inner: Attached<FrameSyncKind>,
 }
 
 const _: () = {
@@ -387,10 +389,40 @@ unsafe impl Send for FrameSyncInstance {}
 /// including when the receiver is accessed through [`FrameSync::receiver`].
 unsafe impl Sync for FrameSyncInstance {}
 
-pub(crate) struct FrameSyncResource {
+pub(crate) struct FrameSyncKind {
     instance: FrameSyncInstance,
-    // Native destruction reads this receiver; ownership keeps it and its runtime live.
-    receiver: Arc<ReceiverCore>,
+}
+
+type FrameSyncResource = Resource<FrameSyncKind>;
+
+impl sealed::Sealed for FrameSyncKind {}
+
+// SAFETY: adoption pairs this native handle with its creating receiver. The
+// capture view borrows that resource and cannot replace either owned field.
+unsafe impl Synchronizer for FrameSyncKind {
+    type Mode = FrameSyncAttached;
+    type Capture<'a> = FrameSyncCapture<'a>;
+
+    unsafe fn destroy(&mut self, receiver: &ReceiverCore) {
+        // SAFETY: the uniquely owned handle is live, and Resource retains its
+        // creating receiver and runtime until this destruction returns.
+        unsafe {
+            receiver
+                ._ndi
+                .api()
+                .core
+                .NDIlib_framesync_destroy(self.instance.0)
+        };
+        #[cfg(test)]
+        crate::receiver::lifecycle_test_events::record("framesync");
+    }
+
+    fn capture(resource: &FrameSyncResource) -> FrameSyncCapture<'_> {
+        FrameSyncCapture {
+            resource,
+            _thread: std::marker::PhantomData,
+        }
+    }
 }
 
 /// Clocked capture access lent by `FrameSync::split` with the `advanced` feature.
@@ -519,15 +551,6 @@ enum AudioCall {
 }
 
 impl FrameSyncResource {
-    pub(crate) fn receiver_core(&self) -> &Arc<ReceiverCore> {
-        &self.receiver
-    }
-
-    /// Destroy the synchronizer before issuing permission to restore raw capture.
-    fn release(self) -> Released<FrameSyncAttached> {
-        Released::<FrameSyncAttached>::release(self)
-    }
-
     /// Capture video for `scan_type`: the guard of the frame the SDK
     /// returned, or `None` for the documented all-zero "no video yet" state,
     /// which holds nothing to free. The one place a FrameSync video guard is
@@ -606,22 +629,6 @@ impl FrameSyncResource {
     }
 }
 
-impl Drop for FrameSyncResource {
-    fn drop(&mut self) {
-        // SAFETY: Creation checked for null; exclusive ownership and borrowed
-        // guards prevent destruction while capture buffers remain live.
-        unsafe {
-            self.receiver
-                ._ndi
-                .api()
-                .core
-                .NDIlib_framesync_destroy(self.instance.0)
-        };
-        #[cfg(test)]
-        crate::receiver::lifecycle_test_events::record("framesync");
-    }
-}
-
 impl FrameSync {
     /// Create a frame synchronizer from a receiver.
     ///
@@ -650,33 +657,24 @@ impl FrameSync {
     /// ```
     #[doc(alias = "NDIlib_framesync_create")]
     pub fn new(receiver: Receiver) -> std::result::Result<Self, Rejected<Receiver>> {
-        // SAFETY: The owned receiver retains a live SDK resource through creation;
-        // successful creation transfers both resources into the ordered owners.
-        let core = &receiver.core._ndi.api().core;
-        Self::new_with(receiver, |instance| unsafe {
-            core.named().NDIlib_framesync_create(instance)
-        })
-    }
-
-    fn new_with(
-        receiver: Receiver,
-        create: impl FnOnce(
-            NDIlib_recv_instance_t,
-        ) -> crate::sys::table::Called<NDIlib_framesync_instance_t>,
-    ) -> std::result::Result<Self, Rejected<Receiver>> {
-        let instance = match create(receiver.core.instance.0).created() {
-            Ok(instance) => instance.as_ptr(),
-            // The untouched raw receiver goes back to the caller.
-            Err(error) => return Err(Rejected::new(error, receiver)),
-        };
-        let resource = FrameSyncResource {
-            instance: FrameSyncInstance(instance),
-            receiver: Arc::clone(&receiver.core),
-        };
-        Ok(Self {
-            resource,
-            receiver: receiver.attach(),
-        })
+        // SAFETY: this call creates a uniquely owned synchronizer from the
+        // supplied live receiver, through that receiver's runtime.
+        unsafe {
+            Attached::adopt(receiver, |core| {
+                let instance = core
+                    ._ndi
+                    .api()
+                    .core
+                    .named()
+                    .NDIlib_framesync_create(core.instance.0)
+                    .created()?
+                    .as_ptr();
+                Ok(FrameSyncKind {
+                    instance: FrameSyncInstance(instance),
+                })
+            })
+        }
+        .map(|inner| Self { inner })
     }
 
     /// Access the underlying receiver.
@@ -705,7 +703,7 @@ impl FrameSync {
     /// }
     /// ```
     pub fn receiver(&self) -> &Receiver<FrameSyncAttached> {
-        &self.receiver
+        self.inner.receiver()
     }
 
     /// Borrow the receiver's exclusive Advanced controls without lending the
@@ -713,7 +711,7 @@ impl FrameSync {
     /// Use [`Self::split`] to capture while a KVM session holds this borrow.
     #[cfg(feature = "advanced")]
     pub fn controls(&mut self) -> crate::advanced::ReceiverControls<'_, FrameSyncAttached> {
-        crate::advanced::ReceiverControls::new(&mut self.receiver)
+        self.inner.controls()
     }
 
     /// Lend clocked capture and exclusive receiver controls independently.
@@ -746,13 +744,7 @@ impl FrameSync {
         FrameSyncCapture<'_>,
         crate::advanced::ReceiverControls<'_, FrameSyncAttached>,
     ) {
-        (
-            FrameSyncCapture {
-                resource: &self.resource,
-                _thread: std::marker::PhantomData,
-            },
-            crate::advanced::ReceiverControls::new(&mut self.receiver),
-        )
+        self.inner.split()
     }
 
     /// Consume the FrameSync and recover the underlying Receiver.
@@ -760,8 +752,7 @@ impl FrameSync {
     /// This destroys the frame synchronizer and returns the receiver for
     /// continued use with raw capture or for creating a new FrameSync.
     pub fn into_receiver(self) -> Receiver {
-        let Self { resource, receiver } = self;
-        receiver.detach(resource.release())
+        self.inner.into_receiver()
     }
 
     /// Capture video with time-base correction, as an owned frame that can
@@ -844,11 +835,7 @@ impl FrameSync {
     /// [`VideoSource::metadata_status`](crate::VideoSource::metadata_status).
     #[doc(alias = "NDIlib_framesync_capture_video")]
     pub fn capture_video_ref(&self, scan_type: ScanType) -> Result<Option<FrameSyncVideoRef<'_>>> {
-        FrameSyncCapture {
-            resource: &self.resource,
-            _thread: std::marker::PhantomData,
-        }
-        .capture_video_ref(scan_type)
+        self.inner.capture().capture_video_ref(scan_type)
     }
 
     /// Capture audio with dynamic resampling, as an owned frame that can be
@@ -967,11 +954,7 @@ impl FrameSync {
         &self,
         request: FrameSyncAudioRequest,
     ) -> Result<FrameSyncAudioRef<'_>> {
-        FrameSyncCapture {
-            resource: &self.resource,
-            _thread: std::marker::PhantomData,
-        }
-        .capture_audio_ref(request)
+        self.inner.capture().capture_audio_ref(request)
     }
 
     /// Query the format of the audio this FrameSync is receiving, without
@@ -1018,11 +1001,7 @@ impl FrameSync {
     /// ```
     #[doc(alias = "NDIlib_framesync_capture_audio_v2")]
     pub fn audio_input_format(&self) -> Result<Option<AudioInputFormat>> {
-        FrameSyncCapture {
-            resource: &self.resource,
-            _thread: std::marker::PhantomData,
-        }
-        .audio_input_format()
+        self.inner.capture().audio_input_format()
     }
 
     /// Query the current audio queue depth.
@@ -1061,11 +1040,7 @@ impl FrameSync {
     /// [`Error::UnexpectedSdkResult`] when the native queue depth is negative.
     #[doc(alias = "NDIlib_framesync_audio_queue_depth")]
     pub fn audio_queue_depth(&self) -> Result<u32> {
-        FrameSyncCapture {
-            resource: &self.resource,
-            _thread: std::marker::PhantomData,
-        }
-        .audio_queue_depth()
+        self.inner.capture().audio_queue_depth()
     }
 }
 
@@ -1164,10 +1139,7 @@ mod tests {
             format!("{sync:?}"),
             "FrameSync { mode: \"FrameSyncAttached\", .. }"
         );
-        let capture = FrameSyncCapture {
-            resource: &sync.resource,
-            _thread: std::marker::PhantomData,
-        };
+        let capture = sync.inner.capture();
         assert_eq!(
             format!("{capture:?}"),
             "FrameSyncCapture { mode: \"FrameSyncAttached\", .. }"
@@ -1187,7 +1159,10 @@ mod tests {
         )
         .unwrap();
         let mut sync = FrameSync::new(receiver).unwrap();
-        let original = (sync.resource.instance, sync.receiver.core.instance.0);
+        let original = (
+            sync.inner.resource().instance,
+            sync.receiver().core.instance.0,
+        );
         let (results, allocations) = crate::test_alloc::allocation_count(|| {
             let tier = sync.controls().set_stream_tier(crate::StreamTier::Preview);
             let streams = sync.controls().set_streams(crate::MediaTypes::ALL);
@@ -1198,7 +1173,10 @@ mod tests {
         assert_eq!(allocations, 0);
         assert!(results.0.is_ok() && results.1.is_ok() && results.2.is_ok());
         assert_eq!(
-            (sync.resource.instance, sync.receiver.core.instance.0),
+            (
+                sync.inner.resource().instance,
+                sync.receiver().core.instance.0
+            ),
             original
         );
     }
@@ -1230,48 +1208,6 @@ mod tests {
             drop(receiver);
         });
         assert_eq!(events, ["framesync", "receiver"]);
-    }
-
-    #[test]
-    fn release_of_another_framesync_cannot_restore_raw_capture() {
-        use crate::receiver::lifecycle_test_events::{snapshot, track};
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let events = track(|| {
-            let make = || {
-                FrameSync::new(
-                    Receiver::new(
-                        &ndi,
-                        &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
-                    )
-                    .unwrap(),
-                )
-                .unwrap()
-            };
-            let FrameSync {
-                resource: first_resource,
-                receiver: first_receiver,
-            } = make();
-            let FrameSync {
-                resource: second_resource,
-                receiver: second_receiver,
-            } = make();
-            let released = first_resource.release();
-            assert_eq!(snapshot(), ["framesync"]);
-            let mismatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                second_receiver.detach(released)
-            }));
-            assert!(mismatch.is_err(), "a foreign token restored raw capture");
-            assert_eq!(
-                snapshot(),
-                ["framesync"],
-                "the second synchronizer is still alive"
-            );
-            drop(second_resource);
-            drop(first_receiver);
-        });
-        assert_eq!(events, ["framesync", "framesync", "receiver", "receiver"]);
     }
 
     #[test]
@@ -1323,9 +1259,19 @@ mod tests {
             )
             .unwrap();
             drop(ndi);
-            let rejected = match FrameSync::new_with(receiver, |_| {
-                crate::sys::table::for_test(ptr::null_mut(), c"NDIlib_framesync_create")
-            }) {
+            // SAFETY: this synthetic failure creates no synchronizer.
+            let rejected = match unsafe {
+                Attached::<FrameSyncKind>::adopt(receiver, |_| {
+                    crate::sys::table::for_test(
+                        ptr::null_mut::<NDIlib_framesync_instance_type>(),
+                        c"NDIlib_framesync_create",
+                    )
+                    .created()
+                    .map(|instance| FrameSyncKind {
+                        instance: FrameSyncInstance(instance.as_ptr()),
+                    })
+                })
+            } {
                 Err(rejected) => rejected,
                 Ok(_) => panic!("a null instance must be rejected"),
             };
