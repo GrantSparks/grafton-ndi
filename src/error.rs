@@ -35,7 +35,8 @@ pub enum SpawnFailure {
     /// The Tokio operation was polled outside a Tokio runtime.
     #[error("no Tokio runtime is entered")]
     NoRuntime,
-    /// The runtime cancelled the blocking task, or its abandoned closure never started.
+    /// The runtime cancelled the blocking task, its abandoned closure never started,
+    /// or a started worker observed that its future was dropped.
     #[error("the blocking task was cancelled")]
     TaskCancelled,
 }

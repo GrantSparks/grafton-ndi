@@ -1,5 +1,5 @@
 //! Owned discovery adapters sharing the receivers' blocking-pool stop rule.
-use super::{private, with_deadline_budget, with_timeout_budget, AsyncRuntime};
+use super::{discovery_result, private, with_deadline_budget, with_timeout_budget, AsyncRuntime};
 use crate::{
     finder::{validate_source_name, HostQuery, SourceCursor},
     timeout::Deadline,
@@ -131,7 +131,11 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncFinder<R, D> {
     ) -> Result<Option<Source>> {
         let inner = Arc::clone(&self.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-            sealed::SourceDiscovery::finder(&*inner).find_source_until(deadline, stop, &mut select)
+            discovery_result(sealed::SourceDiscovery::finder(&*inner).find_source_until(
+                deadline,
+                stop,
+                &mut select,
+            ))
         })
         .await
     }
@@ -154,8 +158,11 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncFinder<R, D> {
         let name = name.to_owned();
         let inner = Arc::clone(&self.inner);
         with_deadline_budget::<R, _, _>(deadline, move |deadline, stop| {
-            sealed::SourceDiscovery::finder(&*inner)
-                .find_source_until(deadline, stop, |source| source.name() == name)
+            discovery_result(sealed::SourceDiscovery::finder(&*inner).find_source_until(
+                deadline,
+                stop,
+                |source| source.name() == name,
+            ))
         })
         .await
     }
@@ -171,7 +178,9 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncFinder<R, D> {
     pub async fn find_sources(&self, timeout: Duration) -> Result<Vec<Source>> {
         let inner = Arc::clone(&self.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-            sealed::SourceDiscovery::finder(&*inner).find_sources_until(deadline, stop)
+            discovery_result(
+                sealed::SourceDiscovery::finder(&*inner).find_sources_until(deadline, stop),
+            )
         })
         .await
     }
@@ -207,7 +216,7 @@ impl<R: AsyncRuntime> AsyncFinder<R, SourceCache> {
         let query = query.into_owned();
         let inner = Arc::clone(&self.inner);
         with_deadline_budget::<R, _, _>(deadline, move |deadline, stop| {
-            inner.find_sources_by_host_until(query.as_query(), deadline, stop)
+            discovery_result(inner.find_sources_by_host_until(query.as_query(), deadline, stop))
         })
         .await
     }
@@ -253,7 +262,7 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncSourceWatch<R, D> {
         let (sources, observation) = R::spawn_stoppable(private::Token, move |stop| {
             SourceCursor::snapshot(
                 sealed::SourceDiscovery::finder(&*inner),
-                |finder| finder.current_sources_stoppable(stop),
+                |finder| discovery_result(finder.current_sources_stoppable(stop)),
                 |_| true,
             )
         })
