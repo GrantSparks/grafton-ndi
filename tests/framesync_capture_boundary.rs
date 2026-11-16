@@ -93,10 +93,26 @@ fn framesync_pulls_leave_sequenced_metadata_for_the_attached_receiver() -> Resul
         // Startup and final-drain pulls cannot satisfy steady-state coverage.
         let mut video_pulls = 0;
         let mut audio_pulls = 0;
-        let observe = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < observe {
+        let metadata_before_observation = received.len();
+        let began = Instant::now();
+        let minimum_observation = began + Duration::from_secs(3);
+        let observation_deadline = began + Duration::from_secs(15);
+        // Establish sample coverage rather than requiring a particular pull
+        // rate from the host or native synchronizer in a fixed three seconds.
+        while Instant::now() < minimum_observation
+            || video_pulls <= 30
+            || audio_pulls <= 30
+            || received.len() - metadata_before_observation < 30
+        {
             video_pulls += usize::from(pull(&mut received)?);
             audio_pulls += 1;
+            assert!(
+                Instant::now() < observation_deadline,
+                "continuity coverage did not arrive: {video_pulls} live video pulls, \
+                 {audio_pulls} audio pulls, {} new metadata frames in {:?}",
+                received.len() - metadata_before_observation,
+                began.elapsed()
+            );
             std::thread::sleep(Duration::from_millis(16));
         }
         stop.store(true, Ordering::Relaxed);
@@ -110,12 +126,6 @@ fn framesync_pulls_leave_sequenced_metadata_for_the_attached_receiver() -> Resul
             assert!(Instant::now() < drain, "the final metadata frame was lost");
             std::thread::sleep(Duration::from_millis(16));
         }
-        assert!(video_pulls > 30, "the test did not pull live video");
-        assert!(audio_pulls > 30, "the test did not pull audio throughout");
-        assert!(
-            received.len() >= 30,
-            "too few metadata frames to establish continuity"
-        );
         let first = *received.first().unwrap();
         for sequence in first..sent {
             assert!(
