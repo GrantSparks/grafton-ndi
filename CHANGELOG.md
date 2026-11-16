@@ -24,6 +24,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Interleaved floating-point input uses `AudioFrame::from_interleaved` with
   validated `InterleavedAudioF32`; `AudioLayout` and the audio builder's `layout`
   setter are removed. Audio builders accept packed planar samples.
+- Packet KVM sessions capture through `session.receiver()`, allowing capture on
+  a worker thread alongside input. Their direct capture methods are removed.
+
 - Audio allocator padding uses the same validated layout and error causes as
   captured audio, including the 64 MiB active extent limit. Allocator-only audio
   stride and extent error leaves are removed.

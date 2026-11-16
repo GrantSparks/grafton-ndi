@@ -11,7 +11,7 @@ fn sharing(receiver: &PacketReceiver) {
 }
 fn kvm(receiver: &mut PacketReceiver) {
     let mut session = receiver.controls().kvm().unwrap();
-    let packet = session.capture_any_ref(Duration::ZERO).unwrap();
+    let packet = session.receiver().capture_any_ref(Duration::ZERO).unwrap();
     session.key_down(0xffe1).unwrap();
     session.release_all().unwrap();
     drop(session);

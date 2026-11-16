@@ -1,6 +1,6 @@
 // A KVM session lends its receiver for the session's whole lifetime, so a
 // captured frame can be held while keys, buttons and touches stay pressed, and
-// a packet session captures through itself.
+// a packet session captures through the same view.
 use std::time::Duration;
 
 use grafton_ndi::{
@@ -32,7 +32,7 @@ fn drag_across_frames(receiver: &mut Receiver) {
 fn packet_session(packets: &mut PacketReceiver) {
     let mut session = packets.controls().kvm().unwrap();
     session.mouse_down(MouseButton::Left).unwrap();
-    let _event = session.capture_any(Duration::ZERO).unwrap();
+    let _event = session.receiver().capture_any(Duration::ZERO).unwrap();
     session.mouse_up(MouseButton::Left).unwrap();
     let _: KvmReceiver<'_, PacketAttached> = session.receiver();
 }
@@ -40,7 +40,7 @@ fn packet_session(packets: &mut PacketReceiver) {
 fn allocated_packet_session(packets: &mut AllocatedReceiver<PacketAttached>) {
     let mut session = packets.controls().kvm().unwrap();
     session.key_down(0xffe1).unwrap();
-    let _ = session.capture_any(Duration::ZERO).unwrap();
+    let _ = session.receiver().capture_any(Duration::ZERO).unwrap();
     session.release_all().unwrap();
 }
 
@@ -90,6 +90,18 @@ fn scoped_controls_and_input(receiver: &mut Receiver) {
     });
 }
 
+fn scoped_packet_capture_and_input(packets: &mut PacketReceiver) {
+    let mut session = packets.controls().kvm().unwrap();
+    let view = session.receiver();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _ = view.capture_any_ref(Duration::from_millis(100)).unwrap();
+        });
+        session.key_down(0xff0d).unwrap();
+        session.release_all().unwrap();
+    });
+}
+
 fn switch(receiver: &mut Receiver, next: &Source) {
     let mut session = receiver.kvm().unwrap();
     session.key_down(0xffe1).unwrap();
@@ -109,6 +121,7 @@ fn main() {
         packet_session,
         allocated_packet_session,
         scoped_controls_and_input,
+        scoped_packet_capture_and_input,
         switch,
     );
     let _ = (

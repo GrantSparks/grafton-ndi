@@ -44,7 +44,9 @@ error[E0599]: no method named `capture_any` found for struct `KvmReceiver<'_, Fr
 13 |     let _ = view.capture_any(Duration::ZERO);
    |                  ^^^^^^^^^^^ method not found in `KvmReceiver<'_, FrameSyncAttached>`
    |
-   = note: the method was found for `KvmReceiver<'a>`
+   = note: the method was found for
+           - `KvmReceiver<'a, PacketAttached>`
+           - `KvmReceiver<'a>`
 
 error[E0599]: the method `capture_audio` exists for struct `KvmReceiver<'_, AvSyncAttached>`, but its trait bounds were not satisfied
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:19:18
@@ -78,13 +80,15 @@ error[E0599]: no method named `capture_any` found for struct `KvmReceiver<'_, Av
 21 |     let _ = view.capture_any(Duration::ZERO);
    |                  ^^^^^^^^^^^ method not found in `KvmReceiver<'_, AvSyncAttached>`
    |
-   = note: the method was found for `KvmReceiver<'a>`
+   = note: the method was found for
+           - `KvmReceiver<'a, PacketAttached>`
+           - `KvmReceiver<'a>`
 
 error[E0599]: the method `capture_video` exists for struct `KvmReceiver<'_, PacketAttached>`, but its trait bounds were not satisfied
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:27:18
    |
 27 |     let _ = view.capture_video(Duration::ZERO);
-   |                  ^^^^^^^^^^^^^ method cannot be called on `KvmReceiver<'_, PacketAttached>` due to unsatisfied trait bounds
+   |                  ^^^^^^^^^^^^^
    |
   ::: src/advanced/mod.rs
    |
@@ -98,7 +102,7 @@ error[E0599]: the method `capture_audio` exists for struct `KvmReceiver<'_, Pack
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:28:18
    |
 28 |     let _ = view.capture_audio(Duration::ZERO);
-   |                  ^^^^^^^^^^^^^ method cannot be called on `KvmReceiver<'_, PacketAttached>` due to unsatisfied trait bounds
+   |                  ^^^^^^^^^^^^^
    |
   ::: src/advanced/mod.rs
    |
@@ -112,7 +116,7 @@ error[E0599]: the method `capture_metadata` exists for struct `KvmReceiver<'_, P
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:29:18
    |
 29 |     let _ = view.capture_metadata(Duration::ZERO);
-   |                  ^^^^^^^^^^^^^^^^ method cannot be called on `KvmReceiver<'_, PacketAttached>` due to unsatisfied trait bounds
+   |                  ^^^^^^^^^^^^^^^^
    |
   ::: src/advanced/mod.rs
    |
@@ -136,18 +140,24 @@ error[E0599]: the method `next_event` exists for struct `KvmReceiver<'_, PacketA
    = note: the following trait bounds were not satisfied:
            `PacketAttached: EventMode`
 
-error[E0599]: no method named `capture_any_ref` found for struct `KvmReceiver<'_, PacketAttached>` in the current scope
-  --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:31:18
+error[E0308]: mismatched types
+  --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:31:42
    |
-31 |     let _ = view.capture_any_ref(Duration::ZERO);
-   |                  ^^^^^^^^^^^^^^^ method not found in `KvmReceiver<'_, PacketAttached>`
+31 |     let _: Option<ReceiverItemRef<'_>> = view.capture_any_ref(Duration::ZERO).unwrap();
+   |            ---------------------------   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Option<ReceiverItemRef<'_>>`, found `Option<PacketItemRef<'_>>`
+   |            |
+   |            expected due to this
    |
-   = note: the method was found for `KvmReceiver<'a>`
+   = note: expected enum `Option<ReceiverItemRef<'_>>`
+              found enum `Option<PacketItemRef<'_>>`
 
-error[E0599]: no method named `capture_any` found for struct `KvmReceiver<'_, PacketAttached>` in the current scope
-  --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:32:18
+error[E0308]: mismatched types
+  --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:32:35
    |
-32 |     let _ = view.capture_any(Duration::ZERO);
-   |                  ^^^^^^^^^^^ method not found in `KvmReceiver<'_, PacketAttached>`
+32 |     let _: Option<ReceiverItem> = view.capture_any(Duration::ZERO).unwrap();
+   |            --------------------   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Option<ReceiverItem>`, found `Option<PacketItem>`
+   |            |
+   |            expected due to this
    |
-   = note: the method was found for `KvmReceiver<'a>`
+   = note: expected enum `Option<ReceiverItem>`
+              found enum `Option<PacketItem>`

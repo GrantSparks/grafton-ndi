@@ -1000,9 +1000,9 @@ impl MetadataMode for AvSyncAttached {}
 impl VideoMode for AvSyncAttached {}
 
 /// An owned NDI receiver. The default mode permits all raw capture kinds.
-/// [`FrameSync`](crate::FrameSync), and the Advanced `PacketReceiver` and
-/// `AvSync`, change the mode of the receiver they hold while retaining the
-/// same resource core; see [`ReceiverMode`].
+/// [`FrameSync`](crate::FrameSync) and the Advanced `AvSync` change the mode of
+/// the receiver they hold while retaining the same resource core. The Advanced
+/// `PacketReceiver` creates its receiver in `PacketAttached` mode; see [`ReceiverMode`].
 ///
 /// Dropping the receiver disconnects it from its source, unless a
 /// [`RecvAdvertiser`](crate::discovery_server::RecvAdvertiser) registration still
