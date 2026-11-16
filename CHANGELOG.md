@@ -15,6 +15,12 @@ mixed-media capture, Advanced SDK operations, recording, playback and image
 encoding. Upgrading from 2.x requires API and deployment changes; follow the
 [2.x to 3.0 migration guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/migration/2.0-to-3.0.md).
 
+### Added
+
+- `AsyncFileRecorder::abandon` destroys the recorder without spending its
+  finalization wait and returns the last session report after destruction.
+  It bypasses command queue limits, as `close` does.
+
 ### Fixed
 
 - Async File handles wait for native cleanup on last drop after a submitted

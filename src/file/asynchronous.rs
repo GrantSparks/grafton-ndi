@@ -9,7 +9,9 @@
 //! drop requests shutdown without joining another File thread, so notifications
 //! cannot stall behind cleanup or deadlock one another.
 
-use super::recorder::{CheckedRecorderOptions, FinishReply, FinishWaiters, Settlement};
+use super::recorder::{
+    CheckedRecorderOptions, CleanupRequest, FinishReply, FinishWaiters, Settlement,
+};
 use super::types::path_string;
 use super::{
     EventText, FileApi, FileDuration, FileInfo, FilePlayer, FilePlayerOptions, FilePosition,
@@ -259,9 +261,9 @@ enum Stage<T> {
 /// ordinary command before it begins cancels it; once it has begun, dropping
 /// only discards the result. Dropping a creation operation before receiving
 /// its handle never waits for owner shutdown, including after creation has
-/// completed. Submitted requests to stop, finish or close run
+/// completed. Submitted requests to stop, finish, close or abandon run
 /// even if their future is dropped, as those methods say. A last-handle drop
-/// waits for cleanup unless a submitted close still has a live future to report
+/// waits for cleanup unless a submitted close or abandon still has a live future to report
 /// completion. Dropping that close future restores the blocking drop guarantee.
 ///
 /// An unsubmitted command does not keep an existing player or recorder alive.
@@ -953,8 +955,33 @@ enum EventEnd {
 
 /// Native cleanup completion is independent of knowing that the owner failed.
 /// A close submitted during failed cleanup still waits for destruction.
+enum CloseReply {
+    Close(Reply<()>),
+    Abandon(Reply<RecordingReport>),
+}
+
+impl CloseReply {
+    fn cancelled(&self) -> bool {
+        match self {
+            Self::Close(reply) => reply.shared.cancelled.load(Ordering::Acquire),
+            Self::Abandon(reply) => reply.shared.cancelled.load(Ordering::Acquire),
+        }
+    }
+
+    fn complete(self, outcome: OwnerExit, report: Option<&RecordingReport>) {
+        match self {
+            Self::Close(reply) => reply.complete(outcome.result()),
+            Self::Abandon(reply) => reply.complete(
+                outcome
+                    .result()
+                    .and_then(|()| report.cloned().ok_or_else(|| stopped(true))),
+            ),
+        }
+    }
+}
+
 enum Closing {
-    Waiting(Vec<Reply<()>>),
+    Waiting(Vec<CloseReply>),
     Complete(OwnerExit),
 }
 
@@ -964,6 +991,10 @@ struct Control {
     claimed: AtomicBool,
     /// The first close or last-handle drop starts the one finalization budget.
     shutdown_at: OnceLock<Instant>,
+    /// Published with shutdown under `closing`; only recorder shutdown reads it.
+    skip_cleanup: AtomicBool,
+    /// Captured after cleanup and handed out only after native destruction.
+    final_report: OnceLock<RecordingReport>,
     /// The sole owner outcome. A failure is visible before cleanup starts.
     outcome: OnceLock<OwnerExit>,
     closing: Mutex<Closing>,
@@ -980,6 +1011,8 @@ impl Control {
         Self {
             claimed: AtomicBool::new(false),
             shutdown_at: OnceLock::new(),
+            skip_cleanup: AtomicBool::new(false),
+            final_report: OnceLock::new(),
             outcome: OnceLock::new(),
             closing: Mutex::new(Closing::Waiting(Vec::new())),
         }
@@ -1023,25 +1056,52 @@ impl Control {
 
     fn request_close_at(&self, requested: Instant, wake: impl FnOnce()) -> Live<()> {
         let (reply, future) = operation();
-        {
-            let mut closing = lock(&self.closing);
-            match &mut *closing {
-                Closing::Waiting(replies) => {
-                    replies.retain(|reply| !reply.shared.cancelled.load(Ordering::Acquire));
-                    replies.push(reply);
+        self.register_close(requested, CloseReply::Close(reply), false, wake);
+        future
+    }
+
+    fn request_abandon(
+        self: &Arc<Self>,
+        wake: impl FnOnce() + Send + 'static,
+    ) -> FileOperation<RecordingReport> {
+        let control = Arc::clone(self);
+        FileOperation::deferred(move || {
+            let requested = Instant::now();
+            let (reply, future) = operation();
+            control.register_close(requested, CloseReply::Abandon(reply), true, wake);
+            future
+        })
+    }
+
+    fn register_close(
+        &self,
+        requested: Instant,
+        reply: CloseReply,
+        skip_cleanup: bool,
+        wake: impl FnOnce(),
+    ) {
+        let mut closing = lock(&self.closing);
+        match &mut *closing {
+            Closing::Waiting(replies) => {
+                replies.retain(|reply| !reply.cancelled());
+                replies.push(reply);
+                if skip_cleanup {
+                    self.skip_cleanup.store(true, Ordering::Release);
                 }
-                Closing::Complete(outcome) => {
-                    let outcome = *outcome;
-                    drop(closing);
-                    reply.complete(outcome.result());
-                    return future;
+                // Publish admission, the skip request and the first budget
+                // together. No owner can start shutdown between those facts.
+                let first = self.shutdown_at.set(requested).is_ok();
+                drop(closing);
+                if first {
+                    wake();
                 }
             }
+            Closing::Complete(outcome) => {
+                let outcome = *outcome;
+                drop(closing);
+                reply.complete(outcome, self.final_report.get());
+            }
         }
-        if !self.request_shutdown_at(requested) {
-            wake();
-        }
-        future
     }
 
     /// Whether a last-handle drop must observe native destruction itself.
@@ -1050,9 +1110,7 @@ impl Control {
     /// command captures.
     fn needs_cleanup_join(&self) -> bool {
         match &*lock(&self.closing) {
-            Closing::Waiting(replies) => replies
-                .iter()
-                .all(|reply| reply.shared.cancelled.load(Ordering::Acquire)),
+            Closing::Waiting(replies) => replies.iter().all(CloseReply::cancelled),
             Closing::Complete(_) => false,
         }
     }
@@ -1109,7 +1167,7 @@ impl Control {
             }
         };
         for reply in replies {
-            reply.complete(outcome.result());
+            reply.complete(outcome, self.final_report.get());
         }
     }
 }
@@ -1343,8 +1401,15 @@ impl Owner for RecorderOwner {
                     events.push(event);
                 }
             },
-            || control.shutdown_requested(),
+            || {
+                if control.skip_cleanup.load(Ordering::Acquire) {
+                    CleanupRequest::Abandon
+                } else {
+                    CleanupRequest::Close
+                }
+            },
         );
+        let _ = control.final_report.set(self.recorder.report());
     }
 }
 
@@ -2258,7 +2323,7 @@ impl AsyncFilePlayer {
 /// be reported. A caller that must not block, such as a task on an async
 /// executor, awaits [`close`](Self::close) instead, which does the same
 /// without blocking; dropping the clones afterwards does not block.
-/// While a submitted close still has a live future, last-clone drop does not
+/// While a submitted close or abandon still has a live future, last-clone drop does not
 /// wait because that future reports completion. Dropping the future makes the
 /// last-clone drop wait for cleanup again.
 /// A last-clone drop performed by an executor callback on a File owner, timer
@@ -2508,6 +2573,28 @@ impl AsyncFileRecorder {
     pub fn source_format(&self) -> FileOperation<Option<SourceFormat>> {
         self.worker.source_format()
     }
+    /// Stop and destroy the recorder without waiting for the SDK to finalize
+    /// an open file, returning the last known session report after destruction.
+    /// The file of an unfinished session may be left truncated.
+    ///
+    /// Like [`close`](Self::close), this affects every clone, bypasses the
+    /// command queue and runs after submission even if its future is dropped.
+    /// A close pending when abandon is submitted completes with the same
+    /// shutdown; later operations fail with [`StateConflict::Closed`].
+    /// An already running native call cannot be interrupted.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidState`] with [`StateConflict::OwnerFailed`] when the
+    /// object's thread failed.
+    #[doc(alias = "NDIlib_file_recorder_destroy")]
+    pub fn abandon(&self) -> FileOperation<RecordingReport> {
+        let sender = self.worker.sender.clone();
+        self.worker.control.request_abandon(move || {
+            let _ = sender.send(Job::Wake);
+        })
+    }
+
     /// Stop an open session, destroy the recorder and end its thread, for
     /// every clone of this handle.
     ///
@@ -5325,6 +5412,113 @@ mod tests {
         .unwrap();
         assert_eq!(session, 2);
         assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
+    fn abandon_destroys_without_spending_drop_wait() {
+        let (device, recorder) = mock_recorder_with_drop_wait(
+            Closing::Never,
+            AsyncFileOptions::new(),
+            Duration::from_secs(2),
+        );
+        let began = Instant::now();
+        let report = block_on(recorder.abandon()).unwrap();
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert_eq!(report.session(), 1);
+        assert!(!report.closure_confirmed());
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        assert_eq!(block_on(recorder.abandon()).unwrap(), report);
+        block_on(recorder.close()).unwrap();
+        closed(block_on(recorder.report()));
+    }
+
+    #[test]
+    fn a_close_racing_abandon_completes_with_it() {
+        let (device, recorder) = mock_recorder_with_drop_wait(
+            Closing::Never,
+            AsyncFileOptions::new(),
+            Duration::from_secs(2),
+        );
+        let (blocked, release) = block_owner(&recorder.worker);
+        let closing = recorder.close().submit();
+        let abandoned = recorder.abandon().submit();
+        assert!(!closing.is_completed());
+        assert!(!abandoned.is_completed());
+        let began = Instant::now();
+        release.send(()).unwrap();
+        block_on(blocked).unwrap();
+        let report = block_on(abandoned).unwrap();
+        block_on(closing).unwrap();
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert_eq!(report.session(), 1);
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn abandon_ends_a_close_that_is_already_draining() {
+        let (device, recorder) = mock_recorder_with_drop_wait(
+            Closing::Never,
+            AsyncFileOptions::new(),
+            Duration::from_secs(2),
+        );
+        let closing = recorder.close().submit();
+        await_stop(&device);
+        let began = Instant::now();
+        let report = block_on(recorder.abandon()).unwrap();
+        block_on(closing).unwrap();
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert_eq!(report.session(), 1);
+        assert!(!report.closure_confirmed());
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_queued_finish_settles_when_abandoned() {
+        let (device, recorder) = mock_recorder(Closing::AtStop);
+        let (blocked, release) = block_owner(&recorder.worker);
+        let finishing = recorder.finish(Duration::from_secs(30)).submit();
+        let abandoned = recorder.abandon().submit();
+        release.send(()).unwrap();
+        block_on(blocked).unwrap();
+        let report = block_on(abandoned).unwrap();
+        assert_eq!(report.session(), 1);
+        closed(block_on(finishing));
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        assert_eq!(recorder.worker.admission.state.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn abandon_bypasses_a_full_command_queue() {
+        let (device, recorder) =
+            mock_recorder_with(Closing::Never, AsyncFileOptions::new().command_capacity(1));
+        let (blocked, release) = block_owner(&recorder.worker);
+        let queued = recorder.is_recording().submit();
+        let stopping = recorder.request_stop().submit();
+        assert_eq!(recorder.worker.admission.state.load(Ordering::Acquire), 3);
+        let abandoned = recorder.abandon().submit();
+        assert_eq!(recorder.worker.admission.state.load(Ordering::Acquire), 3);
+        assert!(!abandoned.is_completed());
+        release.send(()).unwrap();
+        block_on(blocked).unwrap();
+        assert_eq!(block_on(abandoned).unwrap().session(), 1);
+        closed(block_on(queued));
+        closed(block_on(stopping));
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn an_unsubmitted_abandon_does_not_shut_down_the_recorder() {
+        let (device, recorder) = mock_recorder(Closing::AtStop);
+        drop(recorder.abandon());
+        assert!(block_on(recorder.is_recording()).unwrap());
+        assert_eq!(device.stops.load(Ordering::Acquire), 0);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 0);
         block_on(recorder.close()).unwrap();
     }
 
