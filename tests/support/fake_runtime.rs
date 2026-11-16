@@ -31,6 +31,8 @@
 //! * `fake_changes` — consumable Finder and Advanced keyframe changes, with
 //!   explicit source announcements and one native wake per change;
 //! * `fake_tally` — poll/wait share a consumable tally change on each sender;
+//! * `fake_blocking_connect` — hold the `Blocked` receiver connection request
+//!   between `entered` and `release` files in `GRAFTON_FAKE_CONNECT_GATE`;
 
 //! * `fake_capability_descriptors` — log synchronous sends, receiver settings
 //!   and Advanced AV sync descriptors after their capability checks;
@@ -247,6 +249,14 @@ export! {
             }
         };
         log(&format!("receiver-connect:{name}"));
+        #[cfg(fake_blocking_connect)]
+        if name == "Blocked" {
+            let gate = std::path::PathBuf::from(std::env::var_os("GRAFTON_FAKE_CONNECT_GATE").unwrap());
+            std::fs::write(gate.join("entered"), b"").unwrap();
+            while !gate.join("release").exists() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         #[cfg(fake_objects)]
         unsafe { objects::connect_source(_p_instance, p_src) };
         #[cfg(fake_receiver_controls)]

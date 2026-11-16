@@ -111,7 +111,7 @@ use std::{
 
 use crate::{
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
-    receiver::ConnectionTarget,
+    source_retention::RetainedSource,
     timeout::Deadline,
     Error, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef, Result, Source,
     SourceNameChange, SpawnFailure,
@@ -713,7 +713,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// and may take effect after this future is dropped.
     #[doc(alias = "NDIlib_recv_connect")]
     pub async fn connect_to(&self, source: &Source) -> Result<()> {
-        let target = ConnectionTarget::new(source);
+        let target = RetainedSource::new(source);
         let receiver = Arc::clone(&self.inner);
         R::spawn_blocking(private::Token, move || receiver.connect_target(target)).await
     }

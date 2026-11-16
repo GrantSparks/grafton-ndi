@@ -7,10 +7,10 @@ use std::{cell::Cell, marker::PhantomData, sync::Arc};
 use super::{invalid_input, sdk_quantity, AdvancedConfig, AvSyncAttached, ReceiverControls};
 use crate::{
     capture::{AvSyncAudioFree, Guard},
-    finder::RawSource,
     frames::ValidatedAudio,
     frames::MAX_AUDIO_BYTES,
     receiver::{ReceiverCore, Released},
+    source_retention::RetainedSources,
     sys::{
         advanced::{native, AvSync as AvSyncTable, Genlock as GenlockTable},
         bindings::*,
@@ -897,8 +897,7 @@ struct GenResource {
     handle: GenlockInstance,
     table: &'static GenlockTable,
     _ndi: Ndi,
-    source: Option<Source>,
-    _raw_source: Option<Box<RawSource>>,
+    source: RetainedSources,
     _config: Option<AdvancedConfig>,
 }
 
@@ -1047,7 +1046,7 @@ pub struct Genlock {
 impl std::fmt::Debug for Genlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Genlock")
-            .field("source", &self.resource.source)
+            .field("source", &self.resource.source.current())
             .finish_non_exhaustive()
     }
 }
@@ -1066,22 +1065,23 @@ impl Genlock {
     pub fn new(ndi: &Ndi, options: &GenlockOptions) -> Result<Self> {
         let table = ndi.table::<GenlockTable>()?;
         native!(Genlock, table, uses(options) => {
-            let source = options.source.as_ref().map(Source::to_raw).map(Box::new);
-            // SAFETY: the source descriptor and configuration point to strings
-            // this resource retains until after native destruction.
-            let handle = unsafe {
-                table.named().NDIlib_genlock_create(
-                    source.as_ref().map_or(ptr::null(), |source| source.as_raw()),
-                    options.config.as_ref().map_or(ptr::null(), AdvancedConfig::as_ptr),
-                )
-            }.created()?.as_ptr();
+            let mut source = RetainedSources::default();
+            let handle = source.replace(options.source.as_ref(), |source| {
+                // SAFETY: the retention helper keeps the descriptor and text
+                // at stable addresses until after native destruction.
+                unsafe {
+                    table.named().NDIlib_genlock_create(
+                        source,
+                        options.config.as_ref().map_or(ptr::null(), AdvancedConfig::as_ptr),
+                    )
+                }
+            }).created()?.as_ptr();
             Ok(Self {
                 resource: GenResource {
                     handle: GenlockInstance(handle),
                     table,
                     _ndi: ndi.clone(),
-                    source: options.source.clone(),
-                    _raw_source: source,
+                    source,
                     _config: options.config.clone(),
                 },
                 _not_sync: NotSync(PhantomData),
@@ -1105,20 +1105,13 @@ impl Genlock {
     }
 
     fn connect_source(&mut self, source: Option<&Source>) {
-        let raw_source = source.map(Source::to_raw).map(Box::new);
-        native!(Genlock, self.resource.table, uses(source, raw_source) => {
-            let GenResource { handle, table, .. } = self.resource;
-            // SAFETY: the genlock is live with no wait in progress. Both the old
-            // and replacement descriptors remain alive through this call; the
-            // replacement is retained before the earlier one is released.
-            unsafe {
-                table.NDIlib_genlock_connect(
-                    handle.0,
-                    raw_source.as_ref().map_or(ptr::null(), |source| source.as_raw()),
-                )
-            };
-            self.resource._raw_source = raw_source;
-            self.resource.source = source.cloned();
+        native!(Genlock, self.resource.table, uses(source) => {
+            let GenResource { handle, table, source: retained, .. } = &mut self.resource;
+            retained.replace(source, |source| {
+                // SAFETY: the genlock is live with no wait in progress, and
+                // the retention helper owns both descriptors through this call.
+                unsafe { table.NDIlib_genlock_connect(handle.0, source) };
+            });
         })
     }
 

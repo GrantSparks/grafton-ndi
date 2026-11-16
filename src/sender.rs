@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::{
-    finder::{RawSource, Source},
+    finder::Source,
     frames::{AudioPartsExt, MetadataPartsExt},
     frames::{
         AudioSource, FrameMetadataRef, MetadataFrame, MetadataFrameRef, MetadataSource,
@@ -26,6 +26,7 @@ use crate::{
     },
     pixels::Pixels,
     receiver::Tally,
+    source_retention::RetainedSources,
     sys::{self, bindings::*},
     timeout::Deadline,
     to_ms_checked, Error, FrameRate, Ndi, PictureAspectRatio, Rejected, Result, Timecode,
@@ -185,7 +186,7 @@ mod ownership {
         pub(super) _name: CString,
         pub(super) _groups: Option<CString>,
         // A registration may keep this native sender alive after Sender drops.
-        pub(super) failover: parking_lot::Mutex<Option<Box<RawSource>>>,
+        pub(super) failover: parking_lot::Mutex<RetainedSources>,
         #[cfg(feature = "advanced")]
         pub(super) _config: Option<crate::advanced::AdvancedConfig>,
         pub(super) _ndi: Ndi,
@@ -1654,7 +1655,7 @@ impl<M: SenderMode> Sender<M> {
                 instance,
                 _name: name,
                 _groups: groups,
-                failover: parking_lot::Mutex::new(None),
+                failover: parking_lot::Mutex::new(RetainedSources::default()),
                 #[cfg(feature = "advanced")]
                 _config: config,
                 _ndi: ndi.clone(),
@@ -2237,32 +2238,37 @@ impl<M: SenderMode> Sender<M> {
     /// Set the validated failover source.
     #[doc(alias = "NDIlib_send_set_failover")]
     pub fn set_failover(&self, source: &Source) {
-        let raw_source = Box::new(source.to_raw());
-        let mut failover = self.native.resource().failover.lock();
-        // SAFETY: the native owner retains this boxed descriptor and its
-        // strings until a later replacement has returned, or native destruction.
-        // The lock keeps concurrent failover calls from releasing each other's
-        // descriptors while the SDK may still read them.
-        unsafe {
-            self.inner
-                .core
-                .NDIlib_send_set_failover(self.inner.instance.0, raw_source.as_raw())
-        }
-        *failover = Some(raw_source);
+        self.native
+            .resource()
+            .failover
+            .lock()
+            .replace(Some(source), |source| {
+                // SAFETY: the native owner and its locked retention slot keep the
+                // previous and replacement descriptors live through this request.
+                unsafe {
+                    self.inner
+                        .core
+                        .NDIlib_send_set_failover(self.inner.instance.0, source)
+                }
+            });
     }
 
     /// Clear the failover source previously configured with [`Self::set_failover`].
     #[doc(alias = "NDIlib_send_set_failover")]
     pub fn clear_failover(&self) {
-        let mut failover = self.native.resource().failover.lock();
-        // SAFETY: the sender is live, and the previous descriptor stays owned
-        // until this null replacement has returned from the SDK.
-        unsafe {
-            self.inner
-                .core
-                .NDIlib_send_set_failover(self.inner.instance.0, ptr::null())
-        }
-        *failover = None;
+        self.native
+            .resource()
+            .failover
+            .lock()
+            .replace(None, |source| {
+                // SAFETY: the sender is live and the retention helper keeps the
+                // previous descriptor until this null replacement returns.
+                unsafe {
+                    self.inner
+                        .core
+                        .NDIlib_send_set_failover(self.inner.instance.0, source)
+                }
+            });
     }
 
     /// Get the source information for this sender.
