@@ -417,13 +417,19 @@ fn alpha_sources_keep_their_tagged_matrix_with_best_and_fastest() {
             ReceiverColorFormat::Fastest,
         ],
     );
-    assert_eq!(received[0][0].pixel_format(), PixelFormat::Bgra);
-    assert_eq!(received[1][0].pixel_format(), PixelFormat::Rgba);
-    assert!(matches!(
-        received[2][0].pixel_format(),
-        PixelFormat::Uyva | PixelFormat::Pa16
-    ));
-    assert_eq!(received[3][0].pixel_format(), PixelFormat::Uyva);
+    let formats: [PixelFormat; 4] = std::array::from_fn(|i| received[i][0].pixel_format());
+    assert_eq!(formats[0], PixelFormat::Bgra, "{formats:?}");
+    // Windows Standard runtimes can deliver BGRA for UyvyRgba. Either RGB
+    // layout already contains the SDK's conversion for an alpha source.
+    assert!(
+        matches!(formats[1], PixelFormat::Bgra | PixelFormat::Rgba),
+        "{formats:?}"
+    );
+    assert!(
+        matches!(formats[2], PixelFormat::Uyva | PixelFormat::Pa16),
+        "{formats:?}"
+    );
+    assert_eq!(formats[3], PixelFormat::Uyva, "{formats:?}");
     for frames in &received {
         assert_eq!(frames[0].color_info().unwrap(), sent.color_info().unwrap());
     }
@@ -432,6 +438,14 @@ fn alpha_sources_keep_their_tagged_matrix_with_best_and_fastest() {
         matrix: YuvMatrix::Bt709,
         range: YuvRange::Limited,
     });
+    for frames in &received[..2] {
+        let frame = &frames[0];
+        assert_eq!(
+            png_rgb(&frame.encode_image(&tagged).unwrap()),
+            png_rgb(&frame.encode_image(&bt709).unwrap()),
+            "the encoder keeps RGB-received pixels regardless of the tag's matrix"
+        );
+    }
     for frames in &received[2..] {
         let frame = &frames[0];
         let (largest, _) = difference(
