@@ -4,6 +4,7 @@
 comply, and on a list of plausible wrong edits, each of which it must report.
 actionlint, in the same job, checks that the files are valid workflows at all.
 """
+import copy
 from pathlib import Path
 import re
 import shlex
@@ -53,6 +54,7 @@ ACTIONS = {
         'lint': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache', 'actions/upload-pages-artifact'],
         'test': ['actions/checkout', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
         'cross': ['actions/checkout', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
+        'miri': ['actions/checkout'],
         'sdk': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain'],
         'required-ci': ['actions/checkout'],
         'deploy-docs': ['actions/deploy-pages'],
@@ -106,7 +108,7 @@ def violations(texts):
             if 'runs-on' in body and not re.fullmatch(r'\d+', body.get('timeout-minutes', '')):
                 found.append(f'{name}: {job} has no timeout')
     return (found + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
-            + docs_violations(parsed['rust.yml']))
+            + docs_violations(parsed['rust.yml']) + memory_checker_violations(parsed['rust.yml']))
 
 
 def docs_violations(docs):
@@ -140,6 +142,54 @@ def rustdoc_feature_violations(steps):
     names = [step.get('name') for step in steps]
     if 'Rustdoc feature combinations' not in names or names.index('Rustdoc feature combinations') >= names.index('Rustdoc'):
         found.append('rust.yml: all-features rustdoc must be built last for checking and publication')
+    return found
+
+
+def memory_checker_violations(rust):
+    """Both interpreters and live padding checks must fail required jobs."""
+    jobs = rust['jobs']
+    miri = jobs.get('miri', {})
+    steps = {step.get('name'): step for step in miri.get('steps', [])}
+    setup = steps.get('Pinned Miri toolchain', {}).get('run', '')
+    run = steps.get('Initialized rows, metadata and synthetic native guards', {}).get('run', '')
+    found = differs('rust.yml: Miri aliasing models',
+                    miri.get('strategy', {}).get('matrix', {}).get('model'), ['stacked', 'tree'])
+    found += differs('rust.yml: Miri model selection', miri.get('env', {}).get('MIRIFLAGS'),
+                     "${{ matrix.model == 'tree' && '-Zmiri-tree-borrows' || '' }}")
+    for command in ('rustup toolchain install nightly-2026-11-10 --profile minimal --component miri,rust-src',
+                    'cargo +nightly-2026-11-10 miri setup'):
+        if command not in setup:
+            found.append('rust.yml: Miri setup does not pin the checked nightly and components')
+    if 'cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio "$filter"' not in run:
+        found.append('rust.yml: Miri does not execute the selected synthetic fixtures')
+    for fixture in ('frames::tests::video_padding_all_formats', 'frames::tests::video_padding_encoders',
+                    'receiver::mixed_tests', 'asynchronous::scoped_tests', 'advanced::send_slots::tests::'):
+        if fixture not in run:
+            found.append(f'rust.yml: Miri omits {fixture}')
+
+    test = next((step for step in jobs['test']['steps']
+                 if step.get('name') == 'Memcheck over scripted capture and encoder padding'), {})
+    sdk = next((step for step in jobs['sdk']['steps']
+                if step.get('name') == 'Memcheck over SDK padding'), {})
+    found += differs('rust.yml: scripted Memcheck condition', test.get('if'), "runner.os == 'Linux'")
+    found += differs('rust.yml: SDK Memcheck condition', sdk.get('if'),
+                     when("matrix.name == 'linux-x64 standard-6.3.2'"))
+    for owner, step in (('test', test), ('sdk', sdk)):
+        command = step.get('run', '')
+        for required in ('valgrind', '--tool=memcheck', '--error-exitcode=99'):
+            if required not in command:
+                found.append(f'rust.yml: {owner} Memcheck does not fail on detector errors')
+        if owner not in jobs['required-ci'].get('needs', []):
+            found.append(f'rust.yml: {owner} Memcheck is not required')
+    for required in ('--trace-children=yes', '--trace-children-skip=', '--test mixed_capture_boundary',
+                     '--test frame_metadata_boundary', '--lib frames::tests::video_padding_encoders'):
+        if required not in test.get('run', ''):
+            found.append('rust.yml: scripted Memcheck omits active SDK-free fixtures or their child processes')
+    for required in ('ci/offline/linux.sh', '--test video_padding_sdk', '--features image-encoding'):
+        if required not in sdk.get('run', ''):
+            found.append('rust.yml: live Memcheck omits SDK padding or loopback isolation')
+    if 'miri' not in jobs['required-ci'].get('needs', []):
+        found.append('rust.yml: Miri is not required')
     return found
 
 
@@ -224,7 +274,7 @@ WRONG_EDITS = (
     ('a job the gate does not wait for', 'rust.yml', '  required-ci:\n',
      '  docs:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n    steps:\n      - run: exit 1\n\n  required-ci:\n',
      'required-ci waits for'),
-    ('the gate no longer waits for sdk', 'rust.yml', '    needs: [lint, test, cross, sdk]\n',
+    ('the gate no longer waits for sdk', 'rust.yml', '    needs: [lint, test, cross, sdk, miri]\n',
      '    needs: [lint, test, cross]\n', 'required-ci waits for'),
     ('the gate skipped when a job fails', 'rust.yml', '    name: required-ci\n    if: always()\n',
      '    name: required-ci\n', 'job conditions'),
@@ -431,6 +481,7 @@ class SdkJob(unittest.TestCase):
                 self.assertTrue(step.get('if', '').startswith('${{ ' + ROW_READY),
                                 f"{step['name']} runs on {step.get('if')!r}")
         self.assertEqual({step['name']: step['if'] for step in after if 'matrix.' in step['if']}, {
+            'Memcheck over SDK padding': when("matrix.name == 'linux-x64 standard-6.3.2'"),
             'Lint and document the Advanced implementation': when("contains(matrix.package, 'advanced')"),
             'Vendored bindings are current': when('matrix.bindings'),
             'Build for the statically linked Apple mobile targets': when('matrix.apple-mobile'),
@@ -502,6 +553,46 @@ class SdkJob(unittest.TestCase):
                                  {edition: checkable(target, current, all_features=True, headers=pin, driver=driver,
                                                      decoders=False)
                                   for edition, pin in baselines.items()})
+
+class MemoryCheckers(unittest.TestCase):
+    def test_suppressions_match_only_the_observed_glibc_loader_stack(self):
+        text = (ROOT / 'ci/valgrind.supp').read_text(encoding='utf-8')
+        blocks = re.findall(r'\{(.*?)\}', text, re.DOTALL)
+        self.assertEqual(len(blocks), 2)
+        for block, operation in zip(blocks, ('_dl_dst_count', '_dl_dst_substitute')):
+            frames = re.findall(r'^\s+fun:(.+)$', block, re.MULTILINE)
+            expected = ['strncmp', 'is_dst', operation]
+            if operation == '_dl_dst_count':
+                expected.append('expand_dynamic_string_token')
+            expected += ['fillin_rpath*', 'decompose_rpath', '_dl_map_object']
+            self.assertEqual(frames, expected)
+            self.assertNotIn('...', block)
+            self.assertNotIn('obj:', block)
+            self.assertIn('Memcheck:Addr8', block)
+
+    def test_missing_detector_configuration_is_reported(self):
+        rust = workflows.load(read_workflows()['rust.yml'])
+        self.assertEqual(memory_checker_violations(rust), [])
+        variants = []
+        missing_model = copy.deepcopy(rust)
+        missing_model['jobs']['miri']['strategy']['matrix']['model'].remove('tree')
+        variants.append((missing_model, 'aliasing models'))
+        unpinned = copy.deepcopy(rust)
+        unpinned['jobs']['miri']['steps'][1]['run'] = 'cargo +nightly miri setup'
+        variants.append((unpinned, 'pin the checked nightly'))
+        for job in ('test', 'sdk'):
+            ineffective = copy.deepcopy(rust)
+            step = next(step for step in ineffective['jobs'][job]['steps']
+                        if step.get('name', '').startswith('Memcheck over '))
+            step['run'] = step['run'].replace('--error-exitcode=99', '')
+            variants.append((ineffective, 'fail on detector errors'))
+        ungated = copy.deepcopy(rust)
+        ungated['jobs']['required-ci']['needs'].remove('miri')
+        variants.append((ungated, 'Miri is not required'))
+        for broken, expected in variants:
+            with self.subTest(expected=expected):
+                self.assertTrue(any(expected in error for error in memory_checker_violations(broken)))
+
 
 class Repository(unittest.TestCase):
     def test_vendored_bindings_cover_exactly_the_supported_platform_targets(self):

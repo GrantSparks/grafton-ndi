@@ -1,7 +1,16 @@
-//! Scripted all-slot capture boundary. Padding is deliberately uninitialized;
-//! the wrapper may inspect/copy only the active regions initialized below.
+//! Scripted all-slot capture boundary. The required Memcheck CI step observes
+//! deliberately uninitialized padding: only active regions may be read/copied.
 use super::*;
 use std::{mem::MaybeUninit, sync::Mutex};
+
+/// Allocate without an intermediate array, whose undefined bytes native
+/// code generation may choose to materialize as initialized zeros.
+fn uninitialized<T, const N: usize>() -> Box<[MaybeUninit<T>; N]> {
+    // SAFETY: every bit pattern, including uninitialized storage, is valid
+    // for each MaybeUninit<T>. Only the explicit active-region writes below
+    // initialize values; Memcheck keeps every padding byte undefined.
+    unsafe { Box::<[MaybeUninit<T>; N]>::new_uninit().assume_init() }
+}
 
 fn next() -> String {
     static SCRIPT: Mutex<(String, usize)> = Mutex::new((String::new(), 0));
@@ -74,7 +83,7 @@ export! {
                 NDIlib_frame_type_e_NDIlib_frame_type_video
             }
             "packet-video" | "bad-packet-video" if !p_video_data.is_null() => {
-                let mut bytes = Box::new([MaybeUninit::<u8>::uninit(); 64]);
+                let mut bytes = uninitialized::<u8, 64>();
                 let mut packet = [0u8; 48];
                 packet[0..4].copy_from_slice(&44i32.to_ne_bytes());
                 packet[4..8].copy_from_slice(b"H264");
@@ -96,7 +105,7 @@ export! {
                 NDIlib_frame_type_e_NDIlib_frame_type_video
             }
             "packet-audio" if !p_audio_data.is_null() => {
-                let mut bytes = Box::new([MaybeUninit::<f32>::uninit(); 16]);
+                let mut bytes = uninitialized::<f32, 16>();
                 bytes[0].write(f32::from_ne_bytes([1,2,3,4]));
                 let data = Box::into_raw(bytes).cast::<u8>();
                 log(&format!("audio-data:{}", data as usize));
@@ -109,7 +118,7 @@ export! {
                 NDIlib_frame_type_e_NDIlib_frame_type_audio
             }
             "video" | "planar" | "alpha" | "bad-video" | "video-invalid-metadata" | "video-unterminated-metadata" if !p_video_data.is_null() => {
-                let mut pixels = Box::new([MaybeUninit::<u8>::uninit(); 64]);
+                let mut pixels = uninitialized::<u8, 64>();
                 let (format, height, stride, planes): (_, _, _, &[(usize, usize, usize, usize)]) = match kind.as_str() {
                     "planar" => (NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420, 4, 8, &[(0, 8, 4, 4), (32, 4, 2, 2), (40, 4, 2, 2)]),
                     "alpha" => (NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA, 2, 16, &[(0, 16, 8, 2), (32, 8, 4, 2)]),
@@ -136,7 +145,7 @@ export! {
                 NDIlib_frame_type_e_NDIlib_frame_type_video
             }
             "audio" | "bad-audio" | "audio-invalid-metadata" | "audio-unterminated-metadata" if !p_audio_data.is_null() => {
-                let mut samples = Box::new([MaybeUninit::<f32>::uninit(); 16]);
+                let mut samples = uninitialized::<f32, 16>();
                 for (index, value) in [(0, 0.25), (1, 0.5), (4, -0.25), (5, -0.5)] { samples[index].write(value); }
                 let data = Box::into_raw(samples).cast::<u8>();
                 log(&format!("audio-data:{}", data as usize));

@@ -11,7 +11,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import gate  # noqa: E402
 
-GREEN = {'lint': 'success', 'test': 'success', 'cross': 'success', 'sdk': 'success'}
+GREEN = {'lint': 'success', 'test': 'success', 'cross': 'success', 'sdk': 'success', 'miri': 'success'}
 FORK = {**GREEN, 'sdk': 'skipped'}
 WORKFLOW = Path(__file__).resolve().parents[2] / '.github' / 'workflows' / 'rust.yml'
 

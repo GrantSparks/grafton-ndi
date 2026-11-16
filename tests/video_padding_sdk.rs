@@ -1,4 +1,4 @@
-//! Live padding regression. Run alone against the standard SDK, optionally under
+//! Live padding regression. The Standard 6.3.2 Linux CI row runs this under
 //! Valgrind: `--tool=memcheck --track-origins=yes --error-exitcode=99`.
 #![cfg(target_os = "linux")]
 

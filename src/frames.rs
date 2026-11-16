@@ -6162,7 +6162,6 @@ mod tests {
     #[test]
     fn video_padding_all_formats_expose_and_copy_only_initialized_rows() {
         use crate::capture::{FrameSyncVideoFree, Guard};
-        use std::mem::MaybeUninit;
         // Independently specified active plane dimensions for 4x4 images.
         let cases: &[(PixelFormat, &[(usize, usize)])] = &[
             (PixelFormat::Bgra, &[(16, 4)]),
@@ -6177,10 +6176,13 @@ mod tests {
             (PixelFormat::I420, &[(4, 4), (2, 2), (2, 2)]),
             (PixelFormat::Nv12, &[(4, 4), (4, 2)]),
         ];
+        // One padded layout per format keeps interpretation bounded. The
+        // native and Memcheck runs retain the complete layout matrix.
+        let paddings: &[usize] = if cfg!(miri) { &[4] } else { &[0, 4, 8] };
         for &(format, dimensions) in cases {
-            for padding in [0, 4, 8] {
+            for &padding in paddings {
                 let stride = dimensions[0].0 + padding;
-                let mut storage = vec![MaybeUninit::<u8>::uninit(); 512];
+                let mut storage = Box::<[u8]>::new_uninit_slice(512);
                 let mut expected = Vec::new();
                 let mut offsets = Vec::new();
                 let mut offset = 0;
@@ -6545,15 +6547,21 @@ mod tests {
     }
 
     /// Encoders read active bytes only: every format's padding is left
-    /// uninitialized, which Miri and Memcheck would report if read.
+    /// uninitialized. The required Miri and Memcheck CI jobs detect reads of it.
     #[cfg(feature = "image-encoding")]
     #[test]
     fn video_padding_encoders_never_read_uninitialized_gaps() {
+        #[cfg(not(miri))]
+        use crate::image_encoding::{AlphaMode, Downscale, SampleDepth};
         use crate::{
             capture::{FrameSyncVideoFree, Guard},
-            image_encoding::{AlphaMode, Downscale, ImageFormat, ImageOptions, SampleDepth},
+            image_encoding::{ImageFormat, ImageOptions},
         };
-        use std::mem::MaybeUninit;
+        // Miri checks the initialized-region reader for every input format.
+        // Memcheck and native tests exercise every encoder and option below.
+        #[cfg(miri)]
+        let outputs = [ImageOptions::new(ImageFormat::Png)];
+        #[cfg(not(miri))]
         let outputs = [
             ImageOptions::new(ImageFormat::Png),
             ImageOptions::new(ImageFormat::Png).depth(SampleDepth::Sixteen),
@@ -6571,7 +6579,7 @@ mod tests {
             let padded =
                 ValidatedVideoLayout::new_uncompressed(format, width, height, Some(stride))
                     .unwrap();
-            let mut storage = vec![MaybeUninit::<u8>::uninit(); padded.data_len_bytes];
+            let mut storage = Box::<[u8]>::new_uninit_slice(padded.data_len_bytes);
             let mut active = Vec::new();
             let mut value = 7u8;
             for plane in padded.planes() {

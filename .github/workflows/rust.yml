@@ -134,6 +134,50 @@ jobs:
         run: cargo test --locked
       - name: Tests, File API without Advanced wrappers
         run: cargo test --locked --no-default-features --features file-io
+      - name: Memcheck over scripted capture and encoder padding
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends valgrind
+          runner='target.x86_64-unknown-linux-gnu.runner=["valgrind","--tool=memcheck","--error-exitcode=99","--trace-children=yes","--trace-children-skip=*/rustc,*/rustc-*"]'
+          cargo test --locked --all-features --config "$runner" --test mixed_capture_boundary --test frame_metadata_boundary -- --test-threads=1
+          cargo test --locked --all-features --config "$runner" --lib frames::tests::video_padding_encoders -- --test-threads=1
+
+  miri:
+    name: miri (${{ matrix.model }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [stacked, tree]
+    env:
+      MIRIFLAGS: ${{ matrix.model == 'tree' && '-Zmiri-tree-borrows' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Pinned Miri toolchain
+        run: |
+          rustup toolchain install nightly-2026-11-10 --profile minimal --component miri,rust-src
+          cargo +nightly-2026-11-10 miri setup
+      - name: Initialized rows, metadata and synthetic native guards
+        run: |
+          for filter in \
+            frames::tests::video_padding_all_formats \
+            frames::tests::video_padding_single_rows \
+            frames::tests::video_padding_encoders \
+            frames::metadata_tests::metadata_constructors \
+            frames::metadata_tests::owned_metadata_states \
+            frames::metadata_tests::audio_timestamp \
+            receiver::mixed_tests \
+            asynchronous::scoped_tests \
+            framesync::tests::test_framesync_video_ref_uses \
+            framesync::tests::test_framesync_audio_ref_supports \
+            advanced::sync::tests::returned_audio_is_released \
+            advanced::sync::tests::borrowed_avsync_audio \
+            advanced::send_slots::tests::; do
+            cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio "$filter" -- --skip slot_keys_cannot_be_reused_or_cloned
+          done
 
   cross:
     name: cross
@@ -403,6 +447,14 @@ jobs:
         env:
           GRAFTON_NDI_REQUIRE_RUNTIME: ${{ matrix.require-no-default || '1' }}
         run: cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --no-default-features
+      - name: Memcheck over SDK padding
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.name == 'linux-x64 standard-6.3.2' }}
+        timeout-minutes: 10
+        env:
+          GRAFTON_NDI_REQUIRE_RUNTIME: '1'
+        run: |
+          sudo apt-get install --yes --no-install-recommends valgrind
+          cargo test --locked --config ci/offline.toml --config 'target.x86_64-unknown-linux-gnu.runner=["ci/offline/linux.sh","valgrind","--tool=memcheck","--track-origins=yes","--error-exitcode=99","--suppressions=ci/valgrind.supp"]' --target "$TARGET" --no-fail-fast --features image-encoding --test video_padding_sdk -- --test-threads=1
       # Without the Advanced headers the advanced feature compiles to stubs, so
       # only a build that has them lints and documents the real implementation.
       - name: Lint and document the Advanced implementation
@@ -460,7 +512,7 @@ jobs:
   required-ci:
     name: required-ci
     if: always()
-    needs: [lint, test, cross, sdk]
+    needs: [lint, test, cross, sdk, miri]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

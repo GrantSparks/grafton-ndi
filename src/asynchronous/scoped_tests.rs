@@ -60,7 +60,10 @@ fn video_with_format<'a>(
 #[test]
 fn seeded_padded_rows_match_owned_oracle_without_allocations() {
     let mut seed = 137_u32;
-    for _ in 0..100 {
+    // The native run keeps broad seeded coverage; Miri repeats a small
+    // sample of the same uninitialized row layouts in both aliasing models.
+    let cases = if cfg!(miri) { 6 } else { 100 };
+    for _ in 0..cases {
         seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
         let width = 2 * (1 + (seed % 16) as i32);
         let height = 2 * (1 + ((seed >> 5) % 8) as i32);
