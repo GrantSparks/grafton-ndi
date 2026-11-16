@@ -703,8 +703,14 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 ///
 /// An ordinary asynchronous send must wait for the previous frame before it
 /// can accept the next. This sender instead keeps every submitted frame until
-/// the SDK reports it complete, so submission never waits on a slow
-/// connection, up to the limits in [`QueueLimits`]. No application code runs
+/// the SDK reports it complete, so accepting another frame does not require
+/// waiting for an earlier completion, up to the limits in [`QueueLimits`].
+/// With [`SenderOptions::clock_video`] enabled, the default, the SDK still
+/// paces video inside each submission call: the first can return immediately,
+/// while later calls wait for the next frame time. Set `clock_video(false)`
+/// and pace submissions in the application, or use [`super::Genlock`], to
+/// avoid that frame-rate wait. Native back-pressure can also block a call.
+/// No application code runs
 /// on an SDK thread: completed frames are collected with
 /// [`try_next_completed`](Self::try_next_completed) or
 /// [`next_completed`](Self::next_completed) and can be reused.
@@ -737,7 +743,8 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 /// let ndi = Ndi::new()?;
 /// let mut sender = QueuedSender::new(
 ///     &ndi,
-///     &SenderOptions::new("Queued"),
+///     // Completion-based sends are paced by the application.
+///     &SenderOptions::new("Queued").clock_video(false),
 ///     &QueueLimits::default().max_frames(4),
 /// )?;
 /// let id = sender.try_submit(VideoFrame::builder().resolution(1920, 1080).build()?)?;
@@ -910,6 +917,12 @@ impl QueuedSender {
     }
 
     /// Queue a frame without waiting for an earlier submission to complete.
+    ///
+    /// With [`SenderOptions::clock_video`] enabled, the default, the SDK paces
+    /// video to its frame rate inside this call. The first submission can
+    /// return immediately; subsequent calls wait for the next frame time.
+    /// Disable video clocking and pace the application, or use
+    /// [`super::Genlock`], to avoid this wait. SDK back-pressure can still block.
     ///
     /// The queue owns the frame until it is collected: the SDK writes to a
     /// compressed frame's bytes while it sends them. A collected frame can be

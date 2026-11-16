@@ -257,8 +257,8 @@ impl AllocationRequest {
     ///
     /// [`Error::InvalidInput`](crate::Error::InvalidInput) when the stride is
     /// smaller than requested, is not one the frame's layout allows (an audio
-    /// stride is a multiple of four bytes; a 4:2:0 or UYVA video stride is even), the frame is
-    /// compressed (it has no stride to change), or the buffer would exceed
+    /// stride is a multiple of four bytes; a 4:2:0 or UYVA video stride is even),
+    /// a compressed frame is given a stride other than its size, or the buffer would exceed
     /// the [`capacity_limit`](Self::capacity_limit).
     pub fn with_stride_bytes(self, stride: usize) -> Result<Self> {
         if stride < self.stride {
@@ -380,10 +380,12 @@ unsafe impl Sync for PoolBlock {}
 /// For each valid loan, the pool must keep its initialized, CPU-addressable,
 /// 64-byte-aligned memory stable and valid for the block's capacity until release,
 /// with no other access, remapping or reclamation. Release must not panic. It and
-/// the pool's last destructor may run on any SDK free thread, without registry locks.
+/// the pool's last destructor may run on any SDK free thread, or on the SDK's
+/// allocating thread when publication refuses a block, without registry locks.
 /// See [`ExternalAllocation`] for the equivalent arbitrary-handle contract.
 pub unsafe trait ExternalPool: Send + Sync + 'static {
-    /// Return a block after the SDK's exclusive access has ended.
+    /// Return a block after the SDK's exclusive access has ended, or after
+    /// publication refused it before any SDK access.
     ///
     /// # Safety
     ///

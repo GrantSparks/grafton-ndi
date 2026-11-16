@@ -459,7 +459,7 @@ impl SubmittedVideo {
     }
 }
 
-/// Frames reclaimed from a [`CompressedSender`] when it finishes or closes.
+/// Frames returned by [`CompressedSender::reclaim_video`] or [`CompressedSender::close`].
 ///
 /// The SDK has finished accessing these frames, so their storage can be reused.
 /// Reclaiming them does not report whether they were delivered to a receiver.
@@ -566,8 +566,8 @@ unsafe impl Lend for PendingVideo {
 ///
 /// `Processing.NDI.Send.h` makes subsequent video sends synchronizing calls
 /// for the sender, across streams. The crate conservatively retains one frame
-/// per stream until the replacement on that same stream returns, finishing
-/// reclaims it, or the native sender is destroyed. A synchronizing send on
+/// per stream until the replacement on that same stream returns, an explicit
+/// reclaim releases it, or the native sender is destroyed. A synchronizing send on
 /// another stream can end the native loan earlier without releasing this
 /// retained storage to the caller.
 pub(crate) struct PendingStreams {
@@ -636,8 +636,9 @@ impl Loans for PendingStreams {
 /// A sender of compressed video and audio.
 ///
 /// Each stream keeps the frame of its last asynchronous send until the next
-/// asynchronous send on that stream returns it, or finishing or closing
-/// reclaims it. The SDK has one asynchronous send outstanding per sender, so
+/// asynchronous send on that stream returns it, or
+/// [`reclaim_video`](Self::reclaim_video) or [`close`](Self::close) reclaims it.
+/// The SDK has one asynchronous send outstanding per sender, so
 /// a send on either stream may wait for the SDK to finish with the other
 /// stream's frame. The crate still returns each frame through its own stream.
 /// Which streams a codec needs, and how they must relate, is defined by the
@@ -654,8 +655,10 @@ impl Loans for PendingStreams {
 /// # Threading
 ///
 /// [`split`](Self::split) lends independent video and audio views to scoped
-/// threads without an external lock. Each view is `Send` but not `Sync`, so
-/// video submissions remain serialized and audio need not wait for them.
+/// threads without an external lock. The exclusive video view is `Send` but
+/// neither `Sync` nor `Clone`, so video submissions remain serialized. The
+/// shared `Send + Sync` sender supports compressed audio, metadata and controls
+/// while video is being submitted.
 ///
 /// # Sending lends the frame
 ///
@@ -682,7 +685,9 @@ impl Loans for PendingStreams {
 ///
 /// The SDK reports nothing about a frame it does not deliver. The frames it
 /// would discard for what they are (see [`VideoCodec`](super::VideoCodec) and
-/// [`AudioCodec`]) are refused when they are built and when they are sent.
+/// [`AudioCodec`]) are refused when they are built or converted. Contiguous
+/// sends are infallible; scatter sends can fail only when scatter sending is
+/// unavailable.
 /// Every other frame is delivered, subject to two rules about the stream it
 /// belongs to:
 ///
@@ -792,7 +797,11 @@ impl CompressedSender {
     ///
     /// The sender keeps the frame until the next asynchronous send on the same
     /// stream, and returns the frame that this one replaces. The call can
-    /// still block while the SDK applies back-pressure.
+    /// still block: with [`SenderOptions::clock_video`] enabled, the default,
+    /// the SDK paces video inside the call. The first can return immediately;
+    /// subsequent calls wait for the next frame time. Set `clock_video(false)`
+    /// and pace sends in the application, or use [`super::Genlock`], to avoid
+    /// this frame-rate wait. SDK back-pressure can also block a call.
     #[doc(alias = "NDIlib_send_send_video_async_v2")]
     pub fn submit_video(&mut self, frame: CompressedVideoFrame) -> Option<SubmittedVideo> {
         self.split().0.submit_video(frame)
@@ -803,7 +812,7 @@ impl CompressedSender {
     /// One null asynchronous flush waits for the SDK to finish with all
     /// pending video, without a timeout. The source stays available and can
     /// send again; the next asynchronous send on either drained stream
-    /// returns `None`. Finishing an empty sender makes no native call.
+    /// returns `None`. Reclaiming from an empty sender makes no native call.
     /// Reclamation does not report whether receivers received the frames.
     #[doc(alias = "NDIlib_send_send_video_async_v2")]
     pub fn reclaim_video(&mut self) -> ReclaimedVideo {

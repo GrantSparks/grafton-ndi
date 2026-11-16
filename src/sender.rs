@@ -1976,7 +1976,7 @@ impl Sender {
     /// recover the final frame.
     ///
     /// Synchronous sends and explicit flushes complete the operation but retain
-    /// the owned frame for recovery by the next async send or finish call.
+    /// the owned frame for recovery by the next async send or [`Self::reclaim_video`].
     /// No SDK completion callback is registered, including with Advanced SDK.
     ///
     /// # Errors

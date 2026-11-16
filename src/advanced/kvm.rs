@@ -154,7 +154,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     }
 
     /// Whether the connected source accepts remote control. This can change
-    /// when the receiver connects to a different source.
+    /// during the session when that source enables or disables remote control.
     #[doc(alias = "NDIlib_recv_kvm_is_supported")]
     pub fn is_supported(&self) -> bool {
         // SAFETY: the receiver instance is live for this borrow.

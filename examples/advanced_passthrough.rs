@@ -50,7 +50,8 @@ fn main() -> Result<(), Error> {
     let receiver = PacketReceiver::new(
         &ndi,
         &ReceiverOptions::new(source).name("Passthrough Example"),
-        // Every compressed format, video and audio, is passed through.
+        // Compressed video (including alpha) and audio pass through;
+        // protected streams need a Protected preset.
         PassthroughPreset::AlphaWithAudio,
     )?;
     // The packet receiver's own Receiver keeps the common controls. The relay

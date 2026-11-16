@@ -11,7 +11,7 @@ use crate::{Error, Result};
 /// included), immutable, and cheap to clone. Most objects take it through an
 /// options value's `config` setter, such as
 /// [`SenderOptions::config`](crate::SenderOptions::config).
-/// [`Genlock::new`](super::Genlock::new) takes it directly as an argument.
+/// Genlock uses [`GenlockOptions::config`](super::GenlockOptions::config).
 ///
 /// A configuration can carry vendor credentials or network details, so its
 /// `Debug` output shows no content and no error message quotes it.

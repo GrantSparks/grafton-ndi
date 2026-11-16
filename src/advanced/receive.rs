@@ -175,8 +175,8 @@ impl PacketItemRef<'_> {
 /// A receiver that delivers compressed packets where it can.
 ///
 /// One capture call returns whichever frame or event arrives first, as a
-/// [`PacketItem`] from [`capture`](Self::capture_any), or a borrowed
-/// [`PacketItemRef`] from [`capture_ref`](Self::capture_any_ref). It cannot feed a
+/// [`PacketItem`] from [`capture_any`](Self::capture_any), or a borrowed
+/// [`PacketItemRef`] from [`capture_any_ref`](Self::capture_any_ref). It cannot feed a
 /// [`FrameSync`](crate::framesync::FrameSync), which needs decoded frames.
 ///
 /// [`receiver`](Self::receiver) and [`controls`](Self::controls) reach
@@ -282,7 +282,7 @@ impl PacketReceiver {
     /// and source-name changes.
     ///
     /// Its own frame and event capture is unavailable in the
-    /// [`PacketAttached`] mode; [`capture`](Self::capture_any) delivers both.
+    /// [`PacketAttached`] mode; [`capture_any`](Self::capture_any) delivers both.
     pub fn receiver(&self) -> &Receiver<PacketAttached> {
         &self.receiver
     }
@@ -316,14 +316,17 @@ impl PacketReceiver {
     ///
     /// [`Error::InvalidInput`] when `timeout` exceeds
     /// [`crate::MAX_TIMEOUT`], [`Error::ConnectionLost`] when the SDK reports a
-    /// lost connection, and [`Error::InvalidFrame`] when a delivered frame
-    /// fails validation. [`crate::Error::UnexpectedSdkResult`] reports a
-    /// negative status connection count once per publication. Its event stays
-    /// pending for recovery while other events and media remain available.
+    /// lost connection, [`Error::InvalidFrame`] when a delivered frame fails
+    /// validation, and [`Error::InvalidUtf8`] for standalone metadata that
+    /// is not valid UTF-8.
+    /// [`crate::Error::UnexpectedSdkResult`] reports a negative status
+    /// connection count once per publication. Its event stays pending for
+    /// recovery while other events and media remain available.
     ///
     /// [`Error::InvalidInput`]: crate::Error::InvalidInput
     /// [`Error::ConnectionLost`]: crate::Error::ConnectionLost
     /// [`Error::InvalidFrame`]: crate::Error::InvalidFrame
+    /// [`Error::InvalidUtf8`]: crate::Error::InvalidUtf8
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any(&self, timeout: Duration) -> Result<Option<PacketItem>> {
         Self::capture_from(&self.receiver, timeout)
