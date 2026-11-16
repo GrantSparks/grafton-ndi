@@ -14,7 +14,7 @@ Pages write permissions are confined to the deployment job, which runs no
 repository scripts. The release caller forwards those permissions for reusable
 workflow validation; its tag ref keeps the Pages job disabled.
 
-Use the selected stable Rust toolchain with Clippy and rustfmt:
+Use the pinned Rust toolchain with Clippy and rustfmt:
 
 ```sh
 cargo build --locked --examples --all-features
@@ -32,6 +32,22 @@ initialization errors still fail. A successful SDK-free run therefore does
 not establish native transport coverage. The configured platform/runtime
 matrix is in [the CI workflow](../.github/workflows/rust.yml); execution results
 are available in [GitHub Actions](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml).
+
+### Updating the Rust toolchain
+
+`rust-toolchain.toml` pins the release used by contributors and every stable CI
+job. Change the toolchain file and every workflow toolchain step together in one
+PR. Install that release, then re-bless the compile-contract snapshots:
+
+```sh
+TRYBUILD=overwrite cargo test --locked --all-features --test compile_contracts
+# With Advanced SDK headers installed:
+TRYBUILD=overwrite cargo test --locked --all-features --test advanced_contracts
+```
+
+Review every `.stderr` change and fix new Clippy findings under `-D warnings`
+before merging the bump. The minimum supported version and the Miri and Apple
+mobile nightlies have their own pins.
 
 ### Memory checkers
 

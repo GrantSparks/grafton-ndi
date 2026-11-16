@@ -2,7 +2,7 @@
 
 See [setup](docs/setup.md#build-requirements) for build prerequisites and
 [examples](examples/README.md) for runnable uses of the library. The minimum
-Rust version is 1.88; `rust-toolchain.toml` selects stable contributor tooling.
+Rust version is 1.88; `rust-toolchain.toml` selects the pinned contributor toolchain.
 
 ```sh
 cargo build --locked

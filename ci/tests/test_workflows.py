@@ -105,6 +105,12 @@ def violations(texts):
             pinned = [used] if isinstance(used, str) else [re.sub(r'@[0-9a-f]{40}$', '', action) for action in used]
             found += differs(f'{name}: actions of {job}, each pinned to a commit',
                              pinned[0] if isinstance(used, str) else pinned, ACTIONS[name].get(job))
+            for step in body.get('steps', []):
+                if step.get('uses', '').startswith('dtolnay/rust-toolchain@'):
+                    pinned_release = tomllib.loads((ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel']
+                    if not re.fullmatch(r'\d+\.\d+\.\d+', pinned_release):
+                        found.append('rust-toolchain.toml: contributor toolchain is not an exact release')
+                    found += differs(f'{name}: toolchain of {job}', step.get('with', {}).get('toolchain'), pinned_release)
             if 'runs-on' in body and not re.fullmatch(r'\d+', body.get('timeout-minutes', '')):
                 found.append(f'{name}: {job} has no timeout')
     return (found + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
@@ -242,6 +248,8 @@ def publish_violations(publish):
 
 # Plausible wrong edits: (name, workflow, text to replace, replacement, words the report must contain).
 WRONG_EDITS = (
+    ('toolchain differs from contributor pin', 'publish.yml', '          toolchain: 1.100.0\n',
+     '          toolchain: 1.99.1\n', 'toolchain of verify'),
     ('Pages deploy without CI', 'rust.yml', '    needs: required-ci\n', '', 'job order'),
     ('Pages deploy runs a repository script', 'rust.yml', '      - name: Deploy to GitHub Pages\n',
      '      - run: python ci/docs.py\n      - name: Deploy to GitHub Pages\n', 'deployment scripts'),
