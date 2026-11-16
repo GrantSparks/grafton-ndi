@@ -770,7 +770,8 @@ impl FrameSync {
     /// This does not wait for a new network frame. It returns the best frame for
     /// the current output timing, handling clock drift and jitter automatically.
     /// The same frame may be returned multiple times when capture rate exceeds
-    /// source frame rate. Wrapper synchronization and SDK processing still take time.
+    /// source frame rate. SDK processing takes time; concurrent captures on
+    /// one FrameSync serialize briefly inside the SDK.
     /// [`Self::capture_video_ref`] borrows the frame instead of copying it.
     ///
     /// # Arguments
@@ -855,8 +856,9 @@ impl FrameSync {
     ///
     /// This does not wait for new network audio. Capture requests ask the NDI
     /// SDK to resample incoming audio to match the requested sample rate,
-    /// channel count, and sample count. Wrapper synchronization and resampling
-    /// still take time. [`Self::capture_audio_ref`] borrows the samples
+    /// channel count, and sample count. SDK processing and resampling take
+    /// time; concurrent captures on one FrameSync serialize briefly inside
+    /// the SDK. [`Self::capture_audio_ref`] borrows the samples
     /// instead of copying them.
     ///
     /// Call this at the rate you need audio - the SDK will adapt the incoming

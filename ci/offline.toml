@@ -7,7 +7,7 @@
 # tests never announce on, or connect to, the network the machine is attached
 # to. Windows has no such wrapper: there the SDK's receivers need multicast DNS,
 # so the tests run as they would on any Windows machine (ci/README.md,
-# "Windows").
+# "Loopback-only test runs").
 #
 # Relative runner paths resolve against the repository root.
 

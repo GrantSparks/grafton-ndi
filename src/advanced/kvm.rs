@@ -154,7 +154,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     }
 
     /// Whether the connected source accepts remote control. This can change
-    /// when the receiver connects to a different source.
+    /// during the session when that source enables or disables remote control.
     #[doc(alias = "NDIlib_recv_kvm_is_supported")]
     pub fn is_supported(&self) -> bool {
         // SAFETY: the receiver instance is live for this borrow.
@@ -393,7 +393,8 @@ impl<'a> KvmSession<'a, PacketAttached> {
     ///
     /// # Errors
     ///
-    /// As for [`PacketReceiver::capture_any`].
+    /// As for [`PacketReceiver::capture_any`], including [`crate::Error::UnexpectedSdkResult`]
+    /// once per failed status publication, whose event remains pending.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any(&self, timeout: Duration) -> Result<Option<PacketItem>> {
         PacketReceiver::capture_from(self.receiver, timeout)
@@ -404,7 +405,8 @@ impl<'a> KvmSession<'a, PacketAttached> {
     ///
     /// # Errors
     ///
-    /// As for [`PacketReceiver::capture_any_ref`].
+    /// As for [`PacketReceiver::capture_any_ref`], including [`crate::Error::UnexpectedSdkResult`]
+    /// once per failed status publication, whose event remains pending.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<PacketItemRef<'a>>> {
         PacketReceiver::capture_ref_from(self.receiver, timeout)

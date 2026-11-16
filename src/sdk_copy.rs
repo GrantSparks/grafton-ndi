@@ -17,8 +17,15 @@ pub(crate) const COPY_LIMIT: usize = 16 * 1024 * 1024;
 /// instead stop the complete copy, including when found in a nested array.
 #[derive(Debug)]
 pub(crate) enum CopyError {
-    Malformed(crate::DiscoveryDefect),
+    Malformed(CopyOmission),
     Failed(Error),
+}
+
+/// A malformed entry can be omitted without publishing a public error cause.
+#[derive(Debug)]
+pub(crate) enum CopyOmission {
+    Array(crate::DiscoveryDefect),
+    UnterminatedText,
 }
 
 pub(crate) type CopyResult<T> = std::result::Result<T, CopyError>;
@@ -26,8 +33,13 @@ pub(crate) type CopyResult<T> = std::result::Result<T, CopyError>;
 impl CopyError {
     pub(crate) fn into_error(self) -> Error {
         match self {
-            Self::Malformed(reason) => {
+            Self::Malformed(CopyOmission::Array(reason)) => {
                 Error::UnexpectedSdkResult(crate::SdkResultDefect::MalformedDiscoveryData(reason))
+            }
+            // String callers consume malformed entries in collect_entries or
+            // SnapshotBudget::text; only array boundaries publish a refusal.
+            Self::Malformed(CopyOmission::UnterminatedText) => {
+                unreachable!("unterminated discovery text is omitted before the public boundary")
             }
             Self::Failed(error) => error,
         }
@@ -41,7 +53,7 @@ impl From<Error> for CopyError {
 }
 
 pub(crate) fn allocation_failed() -> Error {
-    Error::UnexpectedSdkResult(crate::SdkResultDefect::DiscoveryAllocation)
+    crate::error::allocation_failed(crate::AllocationKind::DiscoveryResults, None)
 }
 
 /// One budget for native bytes scanned and owned storage reserved. Individual
@@ -76,14 +88,19 @@ impl CopyBudget {
         Ok(())
     }
 
+    #[cfg(all(test, feature = "advanced"))]
+    pub(crate) fn remaining(&self) -> usize {
+        self.remaining
+    }
+
     /// Check spans before pointer arithmetic or reservation, on every target.
     pub(crate) fn span_bytes(count: usize, element_size: usize) -> CopyResult<usize> {
         count
             .checked_mul(element_size)
             .filter(|&bytes| bytes <= isize::MAX as usize)
-            .ok_or(CopyError::Malformed(
+            .ok_or(CopyError::Malformed(CopyOmission::Array(
                 crate::DiscoveryDefect::ArraySpanOverflow,
-            ))
+            )))
     }
 
     /// Charge complete owned element storage before reserving it, including
@@ -147,7 +164,7 @@ impl CopyBudget {
             return Err(if limit < MAX_SDK_STRING_BYTES {
                 self.exceeded().into()
             } else {
-                CopyError::Malformed(crate::DiscoveryDefect::UnterminatedString)
+                CopyError::Malformed(CopyOmission::UnterminatedText)
             });
         };
         self.take(bytes.len() + 1)?;
@@ -205,10 +222,12 @@ impl CopyBudget {
             return Ok(&[]);
         }
         if value.is_null() {
-            return Err(CopyError::Malformed(crate::DiscoveryDefect::NullArray));
+            return Err(CopyError::Malformed(CopyOmission::Array(
+                crate::DiscoveryDefect::NullArray,
+            )));
         }
-        let count = usize::try_from(count)
-            .map_err(|_| CopyError::Malformed(crate::DiscoveryDefect::ArrayCountOverflow))?;
+        // Lossless: SDK counts are u32 and supported targets have >=32-bit usize.
+        let count = count as usize;
         self.take(Self::span_bytes(count, size_of::<T>())?)?;
         // SAFETY: the caller provides initialized storage, and its total span
         // has passed preflight before a slice is formed.

@@ -7,8 +7,9 @@ attempts with their paths, origins and refusals. When `failure.loaded_any()` is
 true, native code loaded but was refused; inspect `attempt.refusal()` for a
 missing entry point, incompatible edition, invalid version or other cause.
 When it is false, no candidate could be opened; platform-loader diagnostics
-can also describe problems other than an absent file. `RuntimeConflict`
-carries a `SelectionConflict` in `kind` and diagnostic text in `detail`.
+can also describe problems other than an absent file. `RuntimeConflict(failure)`
+exposes its `SelectionConflict` through `failure.kind()` and retains the library
+and paths involved. Its `Display` gives the diagnostic text.
 
 Use absolute paths for `library_path` and `NDI_RUNTIME_DIR_V6`. A relative
 explicit path returns `Error::InvalidInput` before selection on every target.

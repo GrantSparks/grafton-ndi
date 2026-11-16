@@ -36,6 +36,8 @@ use grafton_ndi::{
     SourceCache, StreamTier, Tally, Timecode, VideoFrame, VideoFrameRef,
 };
 use std::{
+    alloc::{alloc_zeroed, dealloc, Layout},
+    ptr::NonNull,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, MutexGuard,
@@ -899,15 +901,18 @@ fn split(bytes: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
 
 /// Check that `received` is the packet `sent`. The SDK owns the envelope's
 /// reserved field, so an envelope is compared by everything else in it.
-fn assert_same_packet(received: &[u8], sent: &[u8], envelope: Option<EnvelopeCodec>) {
+fn assert_same_packet(
+    (bytes, received): (&[u8], Option<PacketEnvelope<'_>>),
+    sent: &[u8],
+    envelope: Option<EnvelopeCodec>,
+) {
     let Some(codec) = envelope else {
-        assert_eq!(received, sent);
+        assert_eq!(bytes, sent);
+        assert!(received.is_none());
         return;
     };
-    let (received, sent) = (
-        PacketEnvelope::parse(received).unwrap(),
-        PacketEnvelope::parse(sent).unwrap(),
-    );
+    let received = received.expect("the validated packet exposes its envelope");
+    let sent = PacketEnvelope::parse(sent).unwrap();
     assert_eq!(received.codec(), Some(codec));
     assert_eq!(
         (
@@ -1079,7 +1084,11 @@ fn compressed_video_arrives_as_sent_by_every_kind_of_send() {
                     Submission::Contiguous => {
                         let mut frame = contiguous();
                         sender.send_video(&mut frame);
-                        assert_same_packet(frame.data(), &bytes, codec.envelope_codec());
+                        assert_same_packet(
+                            (frame.data(), frame.envelope()),
+                            &bytes,
+                            codec.envelope_codec(),
+                        );
                     }
                     Submission::ContiguousAsync => {
                         returned += usize::from(sender.submit_video(contiguous()).is_some());
@@ -1101,7 +1110,11 @@ fn compressed_video_arrives_as_sent_by_every_kind_of_send() {
                     "{codec:?} {submission:?} keyframe={keyframe}"
                 );
                 assert_eq!(received.metadata(), Some(metadata.as_str()));
-                assert_same_packet(received.data(), &bytes, codec.envelope_codec());
+                assert_same_packet(
+                    (received.data(), received.envelope()),
+                    &bytes,
+                    codec.envelope_codec(),
+                );
             }
         }
     }
@@ -1262,7 +1275,7 @@ fn queued_compressed_sources_deliver_aac_and_opus() {
                 (codec, 48_000, 2, samples)
             );
             assert_same_packet(
-                received.data(),
+                (received.data(), received.envelope()),
                 &bytes,
                 (codec == AudioCodec::Aac).then_some(EnvelopeCodec::Aac),
             );
@@ -1413,7 +1426,7 @@ fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
             );
             assert_eq!(received.metadata(), Some(metadata.as_str()));
             let envelope = (codec == AudioCodec::Aac).then_some(EnvelopeCodec::Aac);
-            assert_same_packet(received.data(), &bytes, envelope);
+            assert_same_packet((received.data(), received.envelope()), &bytes, envelope);
         }
     }
     // Opus at five sample rates and six durations; AAC at each sample rate
@@ -1513,7 +1526,11 @@ fn every_video_frame_the_wrapper_admits_is_delivered() {
                 sender.send_video(&mut frame);
                 let received = await_video(receiver, timecode);
                 assert_eq!(received.format(), delivered);
-                assert_same_packet(received.data(), &sent, codec.envelope_codec());
+                assert_same_packet(
+                    (received.data(), received.envelope()),
+                    &sent,
+                    codec.envelope_codec(),
+                );
 
                 timecode += 1;
                 let sent = bytes(timecode);
@@ -1522,7 +1539,11 @@ fn every_video_frame_the_wrapper_admits_is_delivered() {
                 sender.send_scatter_video(&mut frame).unwrap();
                 let received = await_video(receiver, timecode);
                 assert_eq!(received.format(), delivered);
-                assert_same_packet(received.data(), &sent, codec.envelope_codec());
+                assert_same_packet(
+                    (received.data(), received.envelope()),
+                    &sent,
+                    codec.envelope_codec(),
+                );
             }
         }
     }
@@ -1595,7 +1616,11 @@ fn a_relay_delivers_every_packet_it_receives() {
         let relayed = await_video(&mut downstream, timecode);
         assert_eq!(relayed.format(), format);
         assert_eq!(relayed.metadata(), Some("<relayed/>"));
-        assert_same_packet(relayed.data(), &bytes, codec.envelope_codec());
+        assert_same_packet(
+            (relayed.data(), relayed.envelope()),
+            &bytes,
+            codec.envelope_codec(),
+        );
     }
 
     let audio = [
@@ -1628,7 +1653,7 @@ fn a_relay_delivers_every_packet_it_receives() {
                 (codec, sample_rate, channels, samples)
             );
             let envelope = (codec == AudioCodec::Aac).then_some(EnvelopeCodec::Aac);
-            assert_same_packet(relayed.data(), &bytes, envelope);
+            assert_same_packet((relayed.data(), relayed.envelope()), &bytes, envelope);
         }
     }
 }
@@ -1667,9 +1692,9 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
     for _ in 0..3 {
         sender.send_video(&mut frame);
         let received = await_video(&mut receiver, timecode);
-        assert_same_packet(received.data(), &bytes, h264);
+        assert_same_packet((received.data(), received.envelope()), &bytes, h264);
         assert_eq!(received.metadata(), Some("<again/>"));
-        assert_same_packet(frame.data(), &bytes, h264);
+        assert_same_packet((frame.data(), frame.envelope()), &bytes, h264);
         assert_eq!(frame.metadata(), Some("<again/>"));
         ReceivedVideoPacket::from(frame.clone())
             .validate_for_send()
@@ -1683,10 +1708,11 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
     scatter.set_timecode(Timecode::from_ticks(timecode));
     for _ in 0..3 {
         sender.send_scatter_video(&mut scatter).unwrap();
-        assert_same_packet(await_video(&mut receiver, timecode).data(), &bytes, h264);
+        let received = await_video(&mut receiver, timecode);
+        assert_same_packet((received.data(), received.envelope()), &bytes, h264);
     }
     let joined = scatter.into_contiguous_copy();
-    assert_same_packet(joined.data(), &bytes, h264);
+    assert_same_packet((joined.data(), joined.envelope()), &bytes, h264);
 
     // Two frames that take turns being held by an asynchronous send.
     let mut frames = Vec::new();
@@ -1701,11 +1727,12 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
         let (timecode, bytes, frame) = &mut frames[round % 2];
         let frame = frame.take().expect("the frame came back from the sender");
         let replaced = sender.submit_video(frame);
-        assert_same_packet(await_video(&mut receiver, *timecode).data(), bytes, h264);
+        let received = await_video(&mut receiver, *timecode);
+        assert_same_packet((received.data(), received.envelope()), bytes, h264);
         match replaced {
             Some(SubmittedVideo::Contiguous(earlier)) => {
                 let (_, bytes, slot) = &mut frames[(round + 1) % 2];
-                assert_same_packet(earlier.data(), bytes, h264);
+                assert_same_packet((earlier.data(), earlier.envelope()), bytes, h264);
                 *slot = Some(earlier);
             }
             None => assert_eq!(round, 0),
@@ -1723,12 +1750,9 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
         frame.set_timecode(Timecode::from_ticks(timecode));
         for _ in 0..3 {
             sender.sender().send_compressed_audio(&mut frame);
-            assert_same_packet(
-                await_audio(&mut receiver, timecode).data(),
-                &bytes,
-                envelope,
-            );
-            assert_same_packet(frame.data(), &bytes, envelope);
+            let received = await_audio(&mut receiver, timecode);
+            assert_same_packet((received.data(), received.envelope()), &bytes, envelope);
+            assert_same_packet((frame.data(), frame.envelope()), &bytes, envelope);
         }
     }
 }
@@ -1799,7 +1823,11 @@ fn queued_scatter_frames_return_their_original_blocks() {
         frame.set_timecode(Timecode::from_ticks(timecode));
         let id = queue.try_submit(frame).unwrap();
         let received = await_video(&mut receiver, timecode);
-        assert_same_packet(received.data(), &bytes, Some(EnvelopeCodec::H264));
+        assert_same_packet(
+            (received.data(), received.envelope()),
+            &bytes,
+            Some(EnvelopeCodec::H264),
+        );
         let done = queue.next_completed(PATIENCE).unwrap().unwrap();
         assert_eq!(done.id(), id);
         let QueuedVideoFrame::Scatter(frame) = done.into_frame() else {
@@ -1850,7 +1878,11 @@ fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {
     for _ in 0..4 {
         let id = queue.try_submit(frame).unwrap();
         let received = await_video(&mut receiver, timecode);
-        assert_same_packet(received.data(), &bytes, Some(EnvelopeCodec::H264));
+        assert_same_packet(
+            (received.data(), received.envelope()),
+            &bytes,
+            Some(EnvelopeCodec::H264),
+        );
         let completed = queue
             .next_completed(PATIENCE)
             .unwrap()
@@ -1860,7 +1892,11 @@ fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {
         let QueuedVideoFrame::Compressed(sent) = &frame else {
             panic!("a compressed frame was queued");
         };
-        assert_same_packet(sent.data(), &bytes, Some(EnvelopeCodec::H264));
+        assert_same_packet(
+            (sent.data(), sent.envelope()),
+            &bytes,
+            Some(EnvelopeCodec::H264),
+        );
     }
     assert_eq!(queue.retained_frames(), 0);
     assert!(!queue.completion_protocol_failed());
@@ -2025,7 +2061,7 @@ fn a_queued_sender_moves_between_threads() {
     for timecode in sent {
         let frame = await_video(&mut receiver, timecode);
         assert_same_packet(
-            frame.data(),
+            (frame.data(), frame.envelope()),
             &video_bytes(VideoCodec::H264, timecode, true),
             Some(EnvelopeCodec::H264),
         );
@@ -2131,7 +2167,7 @@ fn a_packet_receiver_moves_between_threads() {
                     let timecode = frame.timecode().ticks();
                     assert!(timecode >= FIRST_TIMECODE);
                     assert_same_packet(
-                        frame.data(),
+                        (frame.data(), frame.envelope()),
                         &video_bytes(VideoCodec::H264, timecode, true),
                         Some(EnvelopeCodec::H264),
                     );
@@ -3053,6 +3089,10 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
         return;
     };
     if ndi.require_feature(RuntimeFeature::ReceiveBest444).is_err() {
+        common::skip(
+            Hevc444Decoder,
+            "HEVC 4:4:4 decoding needs the NDI 6.4 Best444 receiver",
+        );
         return;
     }
     // A decoder known to be missing skips here, and one that is missing
@@ -3596,7 +3636,8 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
 
 /// Whether this runtime's genlock acquires no reference: the Windows 6.4
 /// runtimes, x64 and x86, whose genlock connects to its reference and stays
-/// inactive. The README lists it as a known issue.
+/// inactive. The measured limitation is recorded at:
+/// https://github.com/GrantSparks/grafton-ndi/blob/226fa3ef36196bd20c3f0060c3fa0e233b700ace/README.md#receiving-and-sending
 fn genlock_acquires_nothing(ndi: &Ndi) -> bool {
     let unsupported = cfg!(windows)
         && ndi
@@ -3716,44 +3757,42 @@ fn a_genlock_moves_between_threads() {
     });
 }
 
+/// Aligned external storage shared by the native packet allocator tests.
+struct PacketStorage {
+    pointer: NonNull<u8>,
+    layout: Layout,
+    freed: Arc<AtomicBool>,
+}
+// SAFETY: PacketStorage exclusively owns its aligned initialized allocation;
+// transfer between SDK threads changes no pointer or storage extent.
+unsafe impl Send for PacketStorage {}
+// SAFETY: alloc_zeroed provides 64-byte aligned initialized memory, the
+// pointer/extent never change, and only the SDK accesses it before Drop.
+unsafe impl ExternalAllocation for PacketStorage {
+    fn pointer(&self) -> NonNull<u8> {
+        self.pointer
+    }
+    fn capacity(&self) -> usize {
+        self.layout.size()
+    }
+}
+impl Drop for PacketStorage {
+    fn drop(&mut self) {
+        // SAFETY: this value owns the allocation made with this Layout,
+        // and the SDK has released its last lease before dropping it.
+        unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
+        self.freed.store(true, Ordering::Release);
+    }
+}
+
 /// A borrowed compressed packet stays in the exact application allocation
 /// granted to the native receiver, until its receive guard is released.
 #[test]
 fn borrowed_packet_payload_stays_in_external_allocator_memory() {
-    use std::{
-        alloc::{alloc_zeroed, dealloc, Layout},
-        ptr::NonNull,
-    };
     let Some(ndi) = common::advanced_ndi() else {
         return;
     };
     let _turn = sockets();
-    struct Storage {
-        pointer: NonNull<u8>,
-        layout: Layout,
-        freed: Arc<AtomicBool>,
-    }
-    // SAFETY: Storage exclusively owns its aligned initialized allocation;
-    // transfer between SDK threads changes no pointer or storage extent.
-    unsafe impl Send for Storage {}
-    // SAFETY: alloc_zeroed provides 64-byte aligned initialized memory, the
-    // pointer/extent never change, and only the SDK accesses it before Drop.
-    unsafe impl ExternalAllocation for Storage {
-        fn pointer(&self) -> NonNull<u8> {
-            self.pointer
-        }
-        fn capacity(&self) -> usize {
-            self.layout.size()
-        }
-    }
-    impl Drop for Storage {
-        fn drop(&mut self) {
-            // SAFETY: this value owns the allocation made with this Layout,
-            // and the SDK has released its last lease before dropping it.
-            unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
-            self.freed.store(true, Ordering::Release);
-        }
-    }
     let buffers = Arc::new(Mutex::new(Vec::new()));
     let mut sender = CompressedSender::new(&ndi, &options("borrowed-external-packet")).unwrap();
     let receiver = PacketReceiver::new(
@@ -3778,7 +3817,7 @@ fn borrowed_packet_payload_stays_in_external_allocator_memory() {
                 .push((pointer.as_ptr() as usize, layout.size(), freed.clone()));
             AllocationBuffer::from_external(
                 request,
-                Storage {
+                PacketStorage {
                     pointer,
                     layout,
                     freed,
@@ -3829,7 +3868,7 @@ fn borrowed_packet_payload_stays_in_external_allocator_memory() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    // The exact buffer is now released, but Storage::drop sets its flag
+    // The exact buffer is now released, but PacketStorage::drop sets its flag
     // before the registry finishes bookkeeping, and the SDK may still own
     // other queued buffers. Destroying the receiver drains those callbacks
     // and prevents new grants before inspecting the process-wide counters.
@@ -3845,6 +3884,134 @@ fn borrowed_packet_payload_stays_in_external_allocator_memory() {
         ),
         (0, 0, 0, 0),
         "an allocation or generation outlived its receiver: {usage:?}"
+    );
+}
+
+#[test]
+fn compressed_audio_packets_use_exact_custom_allocator_grants() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("external-compressed-audio")).unwrap();
+    let receiver = PacketReceiver::new(
+        &ndi,
+        &ReceiverOptions::new(loopback(&ndi, &sender.sender().source().unwrap())),
+        PassthroughPreset::ProtectedWithAudio,
+    )
+    .unwrap();
+    let service =
+        AllocatorService::new(ndi.process_lifetime(), &AllocatorLimits::default()).unwrap();
+    let mut receiver = service.attach_packets(receiver).unwrap();
+    receiver
+        .set_video_allocator(AllocationBuffer::zeroed)
+        .unwrap();
+    let grants = Arc::new(Mutex::new(Vec::new()));
+    let audio_grants = grants.clone();
+    receiver
+        .set_audio_allocator(move |request: AllocationRequest| {
+            let layout = Layout::from_size_align(request.minimum_bytes(), 64).unwrap();
+            // SAFETY: the callback's request bounds this positive initialized
+            // allocation, and its native lease owns the resulting buffer.
+            let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).expect("test allocation");
+            let freed = Arc::new(AtomicBool::new(false));
+            audio_grants
+                .lock()
+                .unwrap()
+                .push((pointer.as_ptr() as usize, request, freed.clone()));
+            AllocationBuffer::from_external(
+                request,
+                PacketStorage {
+                    pointer,
+                    layout,
+                    freed,
+                },
+            )
+            .map_err(|error| error.into_error())
+        })
+        .unwrap();
+    let declines = service.usage().declined_allocations();
+    for (index, (codec, samples)) in [(AudioCodec::Aac, 1024), (AudioCodec::Opus, 960)]
+        .into_iter()
+        .enumerate()
+    {
+        let timecode = FIRST_TIMECODE + index as i64;
+        let bytes = audio_bytes(codec, 48_000, 2, timecode);
+        let mut audio = CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes).unwrap();
+        audio.set_timecode(Timecode::from_ticks(timecode));
+        let mut video = keyframe(VideoCodec::H264, StreamTier::Program, timecode);
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no custom-allocated {codec:?} audio arrived: {}",
+                link(receiver.receiver()),
+            );
+            sender.send_video(&mut video);
+            sender.sender().send_compressed_audio(&mut audio);
+            if let Some(PacketItemRef::Audio(ReceivedAudioRef::Compressed(packet))) =
+                receiver.capture_any_ref(SLICE).unwrap()
+            {
+                if packet.timecode().ticks() != timecode {
+                    continue;
+                }
+                assert_eq!(packet.codec(), codec);
+                assert_eq!(
+                    (
+                        packet.sample_rate(),
+                        packet.num_channels(),
+                        packet.num_samples()
+                    ),
+                    (48_000, 2, samples),
+                );
+                let pointer = packet.data().as_ptr() as usize;
+                let length = packet.data().len();
+                let grants = grants.lock().unwrap();
+                let (_, request, _) = grants
+                    .iter()
+                    .find(|(start, request, freed)| {
+                        !freed.load(Ordering::Acquire)
+                            && *start <= pointer
+                            && pointer + length <= start + request.minimum_bytes()
+                    })
+                    .expect("compressed audio must remain inside a live application grant");
+                let fourcc = match codec {
+                    AudioCodec::Aac => 0xff,
+                    AudioCodec::Opus => u32::from_le_bytes(*b"Opus"),
+                    _ => unreachable!("the test sends AAC and Opus only"),
+                };
+                assert_eq!(
+                    request.format(),
+                    AllocationFormat::CompressedAudio(grafton_ndi::FourCc::from_raw(fourcc)),
+                );
+                assert_eq!(request.minimum_bytes(), length, "{codec:?} request size");
+                assert_eq!(request.stride_bytes(), length, "{codec:?} size union");
+                assert_eq!((request.width(), request.height()), (samples, 2));
+                assert_eq!(service.usage().declined_allocations(), declines);
+                break;
+            }
+        }
+    }
+    drop(receiver);
+    drop(sender);
+    assert!(grants
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(_, _, freed)| freed.load(Ordering::Acquire)));
+    let usage = service.usage();
+    assert_eq!(usage.declined_allocations(), declines, "{usage:?}");
+    assert_eq!(
+        (
+            usage.retained_allocations(),
+            usage.retained_bytes(),
+            usage.generations(),
+            usage.active_generations(),
+            usage.in_progress_allocations(),
+            usage.in_progress_reclamations(),
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "compressed audio storage outlived its receiver: {usage:?}",
     );
 }
 
@@ -4206,9 +4373,10 @@ fn pool_backed_receive_releases_every_1080p_block() {
                 .lock()
                 .unwrap()
                 .pop()
-                .ok_or(Error::InvalidInput(
-                    grafton_ndi::InputDefect::AllocatorLeaseStorage,
-                ))?;
+                .ok_or(Error::AllocationFailed(grafton_ndi::AllocationFailure {
+                    kind: grafton_ndi::AllocationKind::AllocatorLeases,
+                    bytes: None,
+                }))?;
             let block = policy_pool.blocks[tag];
             // SAFETY: this slot was removed exclusively from the free list. The
             // pool owns its initialized aligned memory until this loan is released.

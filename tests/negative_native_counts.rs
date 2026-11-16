@@ -7,7 +7,7 @@ mod fixture;
 mod runtime_fixture;
 
 use grafton_ndi::{
-    Error, FrameSync, Ndi, Receiver, ReceiverEvent, ReceiverOptions, RuntimeOptions,
+    Error, FrameSync, Ndi, Receiver, ReceiverEvent, ReceiverItem, ReceiverOptions, RuntimeOptions,
     SdkResultDefect, Source,
 };
 use std::{process::Command, time::Duration};
@@ -71,6 +71,63 @@ fn negative_counts_are_errors_and_status_survives() {
         );
         assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
         assert_eq!(receiver.connection_stats().unwrap().connections(), 0);
+
+        std::env::set_var("GRAFTON_FAKE_NEGATIVE_COUNT", "connections");
+        std::env::set_var("GRAFTON_FAKE_CAPTURE_SCRIPT", "mixed-failure:status,video");
+        refused(
+            receiver.capture_any(Duration::ZERO),
+            "NDIlib_recv_get_no_connections",
+            -1,
+        );
+        let captures = || {
+            std::fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap())
+                .unwrap()
+                .lines()
+                .filter(|line| line.starts_with("capture:"))
+                .count()
+        };
+        let before = captures();
+        assert!(matches!(
+            receiver.capture_any(Duration::ZERO).unwrap(),
+            Some(ReceiverItem::Video(_))
+        ));
+        assert_eq!(
+            captures(),
+            before + 1,
+            "a failed status must permit native media capture"
+        );
+        refused(
+            receiver.connection_stats(),
+            "NDIlib_recv_get_no_connections",
+            -1,
+        );
+        std::env::set_var(
+            "GRAFTON_FAKE_CAPTURE_SCRIPT",
+            "other-events:source,unknown,status",
+        );
+        for _ in 0..3 {
+            assert!(receiver.capture_video(Duration::ZERO).unwrap().is_none());
+        }
+        assert!(matches!(
+            receiver.next_event(Duration::ZERO).unwrap(),
+            Some(ReceiverEvent::SourceChanged)
+        ));
+        assert!(matches!(
+            receiver.next_event(Duration::ZERO).unwrap(),
+            Some(ReceiverEvent::Unknown(987))
+        ));
+        refused(
+            receiver.next_event(Duration::ZERO),
+            "NDIlib_recv_get_no_connections",
+            -1,
+        );
+        assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
+        std::env::remove_var("GRAFTON_FAKE_NEGATIVE_COUNT");
+        assert!(matches!(
+            receiver.next_event(Duration::ZERO).unwrap(),
+            Some(ReceiverEvent::StatusChanged(_))
+        ));
+        assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
         let framesync = FrameSync::new(receiver).unwrap();
         std::env::set_var("GRAFTON_FAKE_NEGATIVE_COUNT", "queue-depth");
         refused(
@@ -95,6 +152,7 @@ fn negative_counts_are_errors_and_status_survives() {
             "--nocapture",
         ])
         .env("GRAFTON_NEGATIVE_COUNTS_CHILD", library)
+        .env("GRAFTON_FAKE_NDI_LOG", directory.path().join("counts.log"))
         .output()
         .unwrap();
     assert!(

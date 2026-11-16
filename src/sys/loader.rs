@@ -4,7 +4,7 @@
 //! first usable module for the life of the process. Statically linked targets
 //! resolve the same tables from the archive selected at build time.
 
-use std::{ffi::CStr, path::Path};
+use std::path::Path;
 
 use super::{
     api::{Gates, Resolved},
@@ -20,10 +20,6 @@ use crate::{
 
 static SELECTED: Selection<Runtime> = Selection::new(crate::LibraryKind::Runtime);
 
-/// Entry points only the Advanced SDK exports; together they identify its edition.
-const ADVANCED_SENDER: &CStr = c"NDIlib_send_create_v2";
-const ADVANCED_RECEIVER: &CStr = c"NDIlib_recv_create_v4";
-
 /// The implementation selected for this process.
 pub(crate) struct Runtime {
     pub(crate) lifecycle: crate::runtime::RuntimeManager,
@@ -35,23 +31,6 @@ pub(crate) struct Runtime {
 /// Observe the selected runtime without selecting or loading one.
 pub(crate) fn selected() -> Option<&'static Runtime> {
     SELECTED.get()
-}
-
-/// Which of the entry points that identify the Advanced SDK an
-/// implementation exports.
-#[derive(Clone, Copy, Debug)]
-struct AdvancedEntryPoints {
-    sender_configuration: bool,
-    receiver_configuration: bool,
-}
-
-impl AdvancedEntryPoints {
-    fn detect(resolver: &dyn Resolver) -> std::result::Result<Self, LoadRefusal> {
-        Ok(Self {
-            sender_configuration: resolver.resolve(ADVANCED_SENDER)?.is_some(),
-            receiver_configuration: resolver.resolve(ADVANCED_RECEIVER)?.is_some(),
-        })
-    }
 }
 
 /// Select the implementation `options` describe, or confirm that the one
@@ -126,8 +105,7 @@ impl Runtime {
         requested: SdkEdition,
     ) -> std::result::Result<Self, LoadRefusal> {
         let resolved = Resolved::load(&provider)?;
-        let advanced = AdvancedEntryPoints::detect(&provider)?;
-        let edition = provider.edition(advanced);
+        let edition = provider.edition()?;
         if !meets(requested, edition) {
             return Err(LoadRefusal::EditionNotMet);
         }
@@ -222,7 +200,7 @@ mod shared {
         sync::{Mutex, PoisonError},
     };
 
-    use super::{AdvancedEntryPoints, Resolver, Runtime};
+    use super::{Resolver, Runtime};
     use crate::{
         capabilities::{SdkEdition, SdkLinkage},
         runtime::RuntimeOptions,
@@ -369,12 +347,16 @@ mod shared {
 
         /// A module is an Advanced runtime when it exports both Advanced entry
         /// points; its file name and the caller's request are not evidence.
-        pub(super) fn edition(&self, advanced: AdvancedEntryPoints) -> SdkEdition {
-            if advanced.sender_configuration && advanced.receiver_configuration {
+        pub(super) fn edition(&self) -> std::result::Result<SdkEdition, LoadRefusal> {
+            // Only shared libraries need symbol-based edition detection. A
+            // linked provider already knows the archive the build selected.
+            let sender_configuration = self.resolve(c"NDIlib_send_create_v2")?.is_some();
+            let receiver_configuration = self.resolve(c"NDIlib_recv_create_v4")?.is_some();
+            Ok(if sender_configuration && receiver_configuration {
                 SdkEdition::Advanced
             } else {
                 SdkEdition::Standard
-            }
+            })
         }
     }
 
@@ -490,11 +472,19 @@ mod shared {
             let runtime_directory = std::env::var_os(RUNTIME_DIRECTORY)
                 .filter(|directory| !directory.is_empty())
                 .map(PathBuf::from);
+            let loader_directories = if cfg!(windows) {
+                std::env::var_os("PATH")
+            } else if cfg!(target_vendor = "apple") {
+                std::env::var_os("DYLD_LIBRARY_PATH")
+            } else {
+                None
+            };
             let plan = search_plan(
                 self.explicit,
                 self.beside.and_then(Path::parent),
                 executable.as_deref().and_then(Path::parent),
                 runtime_directory.as_deref(),
+                loader_directories.as_deref(),
                 self.names,
             );
             let mut failures = Vec::with_capacity(plan.len());
@@ -584,16 +574,32 @@ mod shared {
 
     impl Candidate {
         fn open(&self, search: &Search<'_>) -> std::result::Result<Module, Refusal> {
-            // A relative environment directory is a refused location, never
-            // a request to load code relative to the working directory.
-            if self.origin == Origin::RuntimeDirectory && !self.location.is_absolute() {
-                return Err(Refusal::unloaded(LoadRefusal::RelativeRuntimeDirectory));
+            // Environment directories name exact absolute files. Refuse
+            // relative/empty entries before opening anything: they never ask
+            // for code relative to the working directory. Only Unix's native
+            // search and Apple's @rpath, or Windows' System32-only search,
+            // may resolve a non-absolute candidate through the platform loader.
+            if !self.location.is_absolute() {
+                let refusal = match self.origin {
+                    Origin::RuntimeDirectory => Some(LoadRefusal::RelativeRuntimeDirectory),
+                    Origin::PathDirectory | Origin::DyldLibraryDirectory => {
+                        Some(LoadRefusal::RelativeSearchDirectory)
+                    }
+                    _ => None,
+                };
+                if let Some(refusal) = refusal {
+                    return Err(Refusal::unloaded(refusal));
+                }
             }
             // A directory candidate names one exact file. Skipping an absent
             // one keeps the loader from searching elsewhere for that path.
             if matches!(
                 self.origin,
-                Origin::Companion | Origin::Executable | Origin::RuntimeDirectory
+                Origin::Companion
+                    | Origin::Executable
+                    | Origin::RuntimeDirectory
+                    | Origin::PathDirectory
+                    | Origin::DyldLibraryDirectory
             ) && !self.location.is_file()
             {
                 return Err(Refusal::unloaded(LoadRefusal::Absent));
@@ -654,11 +660,15 @@ mod shared {
     /// loader finds on its own. Each location is tried for every name, in
     /// order, before the next location: where a library is installed matters
     /// more than which of the names it has.
+    /// Apple default searches refuse all locations before opening any when
+    /// `DYLD_LIBRARY_PATH` contains a relative or empty entry: dyld would apply
+    /// that override even to an otherwise exact path.
     pub(super) fn search_plan(
         explicit: Option<&Path>,
         companion_directory: Option<&Path>,
         executable_directory: Option<&Path>,
         runtime_directory: Option<&Path>,
+        loader_directories: Option<&OsStr>,
         names: &[&str],
     ) -> Vec<Candidate> {
         if let Some(path) = explicit {
@@ -666,6 +676,24 @@ mod shared {
                 location: path.to_owned(),
                 origin: Origin::Explicit,
             }];
+        }
+        // dyld applies DYLD_LIBRARY_PATH leaf overrides even to absolute
+        // paths and @rpath before resolving the requested location. Recording
+        // a bad entry later in the plan cannot prevent its initializer from
+        // running through an earlier companion/executable/@rpath candidate.
+        // Refuse the whole default search before any native open instead.
+        #[cfg(target_vendor = "apple")]
+        if let Some(directories) = loader_directories {
+            let refused: Vec<_> = std::env::split_paths(directories)
+                .filter(|directory| !directory.is_absolute())
+                .map(|location| Candidate {
+                    location,
+                    origin: Origin::DyldLibraryDirectory,
+                })
+                .collect();
+            if !refused.is_empty() {
+                return refused;
+            }
         }
         let mut plan: Vec<Candidate> = Vec::new();
         let mut add = |location: PathBuf, origin| {
@@ -696,8 +724,33 @@ mod shared {
                 add(Path::new("@rpath").join(name), Origin::LoaderSearch);
             }
         }
-        for name in names {
-            add(PathBuf::from(name), Origin::LoaderSearch);
+        // Expand only absolute environment directories on Windows and Apple
+        // targets; their bare-name searches would also trust the working
+        // directory. Preserve refused inputs in the plan for diagnostics.
+        if cfg!(any(windows, target_vendor = "apple")) {
+            let origin = if cfg!(windows) {
+                Origin::PathDirectory
+            } else {
+                Origin::DyldLibraryDirectory
+            };
+            if let Some(directories) = loader_directories {
+                for directory in std::env::split_paths(directories) {
+                    if !directory.is_absolute() {
+                        add(directory, origin);
+                        continue;
+                    }
+                    for name in names {
+                        add(directory.join(name), origin);
+                    }
+                }
+            }
+        }
+        if !cfg!(target_vendor = "apple") {
+            // Windows limits this final leaf to System32; non-Apple Unix
+            // retains its native rpath/environment/cache search.
+            for name in names {
+                add(PathBuf::from(name), Origin::LoaderSearch);
+            }
         }
         plan
     }
@@ -832,13 +885,16 @@ mod shared {
     fn open_library(
         location: &OsStr,
     ) -> std::result::Result<(libloading::Library, usize), libloading::Error> {
-        use libloading::os::windows::{Library, LOAD_WITH_ALTERED_SEARCH_PATH};
-        // A full path resolves the library's own dependencies beside it; a bare
-        // name uses the standard search order.
+        use libloading::os::windows::{
+            Library, LOAD_LIBRARY_SEARCH_SYSTEM32, LOAD_WITH_ALTERED_SEARCH_PATH,
+        };
+        // Exact paths resolve dependencies beside the library. A final leaf
+        // may match a loaded module or System32, never the working directory
+        // or PATH (whose absolute entries were already expanded).
         let flags = if Path::new(location).is_absolute() {
             LOAD_WITH_ALTERED_SEARCH_PATH
         } else {
-            0
+            LOAD_LIBRARY_SEARCH_SYSTEM32
         };
         // SAFETY: loading runs the library's initialization routine. Callers
         // select a trusted NDI runtime.
@@ -942,6 +998,7 @@ mod shared {
                 Some(Path::new("/core")),
                 Some(Path::new("/app")),
                 Some(runtime_directory()),
+                None,
                 &["libndi.so.6"],
             );
             assert_eq!(
@@ -957,6 +1014,7 @@ mod shared {
                 None,
                 Some(Path::new("/app")),
                 Some(runtime_directory()),
+                None,
                 &["libndi.so.6"],
             );
             let mut expected = vec![
@@ -969,13 +1027,15 @@ mod shared {
             if cfg!(target_vendor = "apple") {
                 expected.push((PathBuf::from("@rpath/libndi.so.6"), Origin::LoaderSearch));
             }
-            expected.push((PathBuf::from("libndi.so.6"), Origin::LoaderSearch));
+            if !cfg!(target_vendor = "apple") {
+                expected.push((PathBuf::from("libndi.so.6"), Origin::LoaderSearch));
+            }
             assert_eq!(locations(&plan), expected);
         }
 
         #[test]
         fn the_loader_search_remains_when_no_directory_is_known() {
-            let plan = search_plan(None, None, None, None, &["libndi.so.6"]);
+            let plan = search_plan(None, None, None, None, None, &["libndi.so.6"]);
             assert_eq!(
                 plan.last().map(|candidate| candidate.origin),
                 Some(Origin::LoaderSearch)
@@ -985,6 +1045,100 @@ mod shared {
                 .all(|candidate| candidate.origin == Origin::LoaderSearch));
         }
 
+        #[cfg(target_vendor = "apple")]
+        #[test]
+        fn apple_search_contains_only_absolute_files_and_rpaths() {
+            let directories = OsStr::new("/opt/ndi:/Library/NDI");
+            let plan = search_plan(
+                None,
+                None,
+                None,
+                None,
+                Some(directories),
+                &["libndi.dylib", "libndi_advanced.dylib"],
+            );
+            assert!(plan.iter().all(|candidate| {
+                candidate.location.is_absolute() || candidate.location.starts_with("@rpath")
+            }));
+            assert_eq!(plan[2].location, Path::new("/opt/ndi/libndi.dylib"));
+            assert_eq!(plan[2].origin, Origin::DyldLibraryDirectory);
+        }
+
+        #[cfg(any(windows, target_vendor = "apple"))]
+        #[test]
+        fn loader_environment_directories_are_expanded_or_refused_before_opening() {
+            let absolute = runtime_directory();
+            let directories =
+                std::env::join_paths([absolute, Path::new("relative"), Path::new("")]).unwrap();
+            let plan = search_plan(
+                None,
+                None,
+                None,
+                None,
+                Some(&directories),
+                &["first", "second"],
+            );
+            let origin = if cfg!(windows) {
+                Origin::PathDirectory
+            } else {
+                Origin::DyldLibraryDirectory
+            };
+            let entries: Vec<_> = plan
+                .iter()
+                .filter(|candidate| candidate.origin == origin)
+                .collect();
+            let refused = if cfg!(windows) {
+                assert_eq!(entries.len(), 4);
+                assert_eq!(entries[0].location, absolute.join("first"));
+                assert_eq!(entries[1].location, absolute.join("second"));
+                &entries[2..]
+            } else {
+                // No absolute or @rpath attempt may precede the refusal:
+                // dyld could apply the relative override to that attempt.
+                assert_eq!(plan.len(), 2);
+                &entries[..]
+            };
+            assert_eq!(refused[0].location, Path::new("relative"));
+            assert!(refused[1].location.as_os_str().is_empty());
+            let search = Search {
+                kind: LibraryKind::Runtime,
+                explicit: None,
+                beside: None,
+                names: &["first", "second"],
+                anchor: CORE_ANCHOR,
+                description: "NDI runtime",
+            };
+            for candidate in refused {
+                let refusal = match candidate.open(&search) {
+                    Ok(_) => panic!("relative search directory was opened"),
+                    Err(refusal) => refusal,
+                };
+                assert!(refusal.loaded.is_none());
+                assert_eq!(refusal.reason, LoadRefusal::RelativeSearchDirectory);
+                let diagnostic = candidate.describe(refusal).to_string();
+                assert!(diagnostic.contains(&origin.to_string()), "{diagnostic}");
+                assert!(diagnostic.contains("absolute and nonempty"), "{diagnostic}");
+            }
+        }
+
+        #[cfg(target_vendor = "apple")]
+        #[test]
+        fn unsafe_dyld_entries_block_every_default_location_before_opening() {
+            for directories in ["relative", "", "/trusted:relative", "/trusted:"] {
+                let plan = search_plan(
+                    None,
+                    Some(Path::new("/core")),
+                    Some(Path::new("/app")),
+                    Some(runtime_directory()),
+                    Some(OsStr::new(directories)),
+                    &["libndi.dylib", "libndi_advanced.dylib"],
+                );
+                assert_eq!(plan.len(), 1, "{directories:?}: {plan:?}");
+                assert_eq!(plan[0].origin, Origin::DyldLibraryDirectory);
+                assert!(!plan[0].location.is_absolute());
+            }
+        }
+
         #[test]
         fn a_relative_runtime_directory_is_recorded_but_never_opened() {
             let plan = search_plan(
@@ -992,6 +1146,7 @@ mod shared {
                 None,
                 None,
                 Some(Path::new("relative")),
+                None,
                 &["libndi.so.6", "libndi_advanced.so.6"],
             );
             let refused = &plan[0];
@@ -1029,6 +1184,7 @@ mod shared {
                 None,
                 Some(directory.as_path()),
                 Some(directory.as_path()),
+                None,
                 &["libndi.so.6"],
             );
             let bundled = plan
@@ -1045,6 +1201,7 @@ mod shared {
                 Some(Path::new("/core")),
                 Some(Path::new("/app")),
                 Some(runtime_directory()),
+                None,
                 &["libndifile.so.6"],
             );
             assert_eq!(
@@ -1071,6 +1228,7 @@ mod shared {
                 None,
                 Some(Path::new("/app")),
                 Some(runtime_directory()),
+                None,
                 &["libndi.so.6", "libndi_advanced.so.6"],
             );
             let mut expected = vec![
@@ -1095,8 +1253,10 @@ mod shared {
                     Origin::LoaderSearch,
                 ));
             }
-            expected.push((PathBuf::from("libndi.so.6"), Origin::LoaderSearch));
-            expected.push((PathBuf::from("libndi_advanced.so.6"), Origin::LoaderSearch));
+            if !cfg!(target_vendor = "apple") {
+                expected.push((PathBuf::from("libndi.so.6"), Origin::LoaderSearch));
+                expected.push((PathBuf::from("libndi_advanced.so.6"), Origin::LoaderSearch));
+            }
             assert_eq!(locations(&plan), expected);
         }
 
@@ -1135,7 +1295,7 @@ mod linked {
         ptr::NonNull,
     };
 
-    use super::{AdvancedEntryPoints, Resolver, Runtime};
+    use super::{Resolver, Runtime};
     use crate::{
         capabilities::{SdkEdition, SdkLinkage},
         runtime::RuntimeOptions,
@@ -1169,8 +1329,8 @@ mod linked {
         }
 
         /// The build selected exactly one edition-specific archive.
-        pub(super) fn edition(&self, _advanced: AdvancedEntryPoints) -> SdkEdition {
-            super::linked_edition()
+        pub(super) fn edition(&self) -> std::result::Result<SdkEdition, LoadRefusal> {
+            Ok(super::linked_edition())
         }
     }
 

@@ -36,7 +36,7 @@ impl JpegDimensions {
         let narrow = |length, dimension| {
             u16::try_from(length).map_err(|_| {
                 Error::InvalidFrame(crate::FrameDefect::ImageDimension {
-                    codec: crate::ImageCodec::Jpeg,
+                    codec: crate::ImageCodecKind::Jpeg,
                     dimension,
                     length,
                     maximum: MAX_DIMENSION,
@@ -44,8 +44,8 @@ impl JpegDimensions {
             })
         };
         Ok(Self {
-            width: narrow(width, crate::ImageDimension::Width)?,
-            height: narrow(height, crate::ImageDimension::Height)?,
+            width: narrow(width, crate::ImageAxisKind::Width)?,
+            height: narrow(height, crate::ImageAxisKind::Height)?,
         })
     }
     pub(super) fn shape(self) -> ImageShape {
@@ -126,7 +126,7 @@ fn encoding_error(error: jpeg_encoder::EncodingError) -> Error {
     match error {
         jpeg_encoder::EncodingError::IoError(error) => Error::Io(error),
         error => Error::InvalidFrame(crate::FrameDefect::EncodingFailed {
-            codec: crate::ImageCodec::Jpeg,
+            codec: crate::ImageCodecKind::Jpeg,
             diagnostic: error.to_string().into_boxed_str(),
         }),
     }
@@ -359,11 +359,11 @@ mod tests {
 fn checked_settings_enforce_jpeg_representation_boundaries() {
     assert_eq!(JpegDimensions::new(65_535, 65_535).unwrap().width, u16::MAX);
     for (width, height, dimension) in [
-        (65_536, 1, crate::ImageDimension::Width),
-        (1, 65_536, crate::ImageDimension::Height),
+        (65_536, 1, crate::ImageAxisKind::Width),
+        (1, 65_536, crate::ImageAxisKind::Height),
     ] {
         assert!(
-            matches!(JpegDimensions::new(width, height), Err(Error::InvalidFrame(crate::FrameDefect::ImageDimension { codec: crate::ImageCodec::Jpeg, dimension: actual, length: 65_536, maximum: 65_535 })) if actual == dimension)
+            matches!(JpegDimensions::new(width, height), Err(Error::InvalidFrame(crate::FrameDefect::ImageDimension { codec: crate::ImageCodecKind::Jpeg, dimension: actual, length: 65_536, maximum: 65_535 })) if actual == dimension)
         );
     }
     for value in [1, 85, 100] {

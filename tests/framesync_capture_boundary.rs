@@ -4,13 +4,123 @@ mod helpers;
 common_helpers!(runtime, name, loopback);
 
 use grafton_ndi::{
-    AudioFrame, Error, FrameRate, FrameSync, FrameSyncAudioRequest, Receiver, ReceiverOptions,
-    ScanType, Sender, SenderOptions, Source, Tally, VideoFrame,
+    AudioFrame, Error, FrameRate, FrameSync, FrameSyncAudioRequest, MetadataFrame, Receiver,
+    ReceiverOptions, ScanType, Sender, SenderOptions, Source, Tally, VideoFrame,
 };
 use std::{
+    collections::BTreeSet,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
+
+/// The metadata permission on FrameSyncAttached relies on its native
+/// synchronizer leaving every metadata frame for the receiver's own capture.
+#[test]
+fn framesync_pulls_leave_sequenced_metadata_for_the_attached_receiver() -> Result<(), Error> {
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
+    let sender = Sender::new(
+        &ndi,
+        &SenderOptions::new(common::unique_name("FrameSync metadata continuity"))
+            .clock_video(true)
+            .clock_audio(false),
+    )?;
+    let source = common::loopback_source(&ndi, &sender)?;
+    let framesync = FrameSync::new(Receiver::new(&ndi, &ReceiverOptions::new(source))?)?;
+    let video = VideoFrame::builder()
+        .resolution(64, 36)
+        .frame_rate(FrameRate::new(30, 1)?)
+        .data([96, 96, 96, 255].repeat(64 * 36))
+        .build()?;
+    let audio = AudioFrame::builder()
+        .num_samples(1600)
+        .data(vec![0.25; 3200])
+        .build()?;
+    let request = FrameSyncAudioRequest::capture_at(48_000, 2, 768)?;
+    let stop = AtomicBool::new(false);
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    std::thread::scope(|scope| -> Result<(), Error> {
+        let send = scope.spawn(|| -> Result<u64, Error> {
+            let mut sequence = 0;
+            while !stop.load(Ordering::Relaxed) {
+                sender.send_video(&video)?;
+                sender.send_audio(&audio);
+                sender.send_metadata(&MetadataFrame::new(format!(
+                    "<framesync-sequence>{sequence}</framesync-sequence>"
+                ))?);
+                sequence += 1;
+            }
+            Ok(sequence)
+        });
+        let _stop = Stop(&stop);
+        let mut received = BTreeSet::new();
+        let mut video_pulls = 0;
+        let mut audio_pulls = 0;
+        let mut pull = |received: &mut BTreeSet<u64>| -> Result<(), Error> {
+            if framesync
+                .capture_video_ref(ScanType::Progressive)?
+                .is_some()
+            {
+                video_pulls += 1;
+            }
+            let _audio = framesync.capture_audio_ref(request)?;
+            audio_pulls += 1;
+            while let Some(metadata) = framesync.receiver().capture_metadata_ref(Duration::ZERO)? {
+                if let Some(sequence) = metadata
+                    .data()
+                    .strip_prefix("<framesync-sequence>")
+                    .and_then(|text| text.strip_suffix("</framesync-sequence>"))
+                {
+                    received.insert(sequence.parse().expect("a sequence sent by this test"));
+                }
+            }
+            Ok(())
+        };
+        let startup = Instant::now() + Duration::from_secs(15);
+        while received.is_empty() {
+            pull(&mut received)?;
+            assert!(Instant::now() < startup, "no sequenced metadata arrived");
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        let observe = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < observe {
+            pull(&mut received)?;
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let sent = send.join().expect("metadata sender panicked")?;
+        // Continue pulling while draining the final native delivery. Knowing
+        // the last sent sequence also detects a missing tail, beyond gaps
+        // inside the observed span.
+        let drain = Instant::now() + Duration::from_secs(3);
+        while received.last().copied() != Some(sent - 1) {
+            pull(&mut received)?;
+            assert!(Instant::now() < drain, "the final metadata frame was lost");
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        assert!(video_pulls > 30, "the test did not pull live video");
+        assert!(audio_pulls > 30, "the test did not pull audio throughout");
+        assert!(
+            received.len() >= 30,
+            "too few metadata frames to establish continuity"
+        );
+        let first = *received.first().unwrap();
+        for sequence in first..sent {
+            assert!(
+                received.contains(&sequence),
+                "FrameSync consumed metadata sequence {sequence}"
+            );
+        }
+        Ok(())
+    })
+}
 
 // Raw audio capture on the attached receiver does not compile: the
 // synchronizer takes the receiver's audio

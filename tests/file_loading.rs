@@ -182,6 +182,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     scenario("failure_names_every_location"),
     scenario("incomplete_family_is_unavailable_alone"),
+    scenario("async_probes_keep_runtime_initialized_through_cancellation"),
 ];
 
 #[test]
@@ -452,6 +453,58 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert_eq!(attempts[2].origin(), LoadOrigin::LoaderSearch);
             // A failed search leaves selection open: it fails the same way again.
             unavailable(FileApi::new(&ndi, &defaults));
+        }
+        "async_probes_keep_runtime_initialized_through_cancellation" => {
+            use grafton_ndi::file::AsyncFilePlayer;
+            use std::time::{Duration, Instant};
+            fn wait_for(condition: impl Fn() -> bool) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !condition() {
+                    assert!(Instant::now() < deadline, "probe lifecycle did not advance");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            let gates = fixtures.root.join("probe-lease");
+            fs::create_dir(&gates).unwrap();
+            let log = gates.join("runtime.log");
+            std::env::set_var("GRAFTON_FAKE_FILE_PROBE_GATE", &gates);
+            std::env::set_var("GRAFTON_FAKE_NDI_LOG", &log);
+            let ndi = select(fixtures, &PAIRED);
+            let api = FileApi::new(&ndi, &defaults).unwrap();
+            let running = AsyncFilePlayer::probe(&api, "running.mkv").submit();
+            wait_for(|| gates.join("running.mkv.entered").exists());
+            let queued = AsyncFilePlayer::probe(&api, "queued.mkv").submit();
+            assert!(!gates.join("queued.mkv.entered").exists());
+            drop(api);
+            drop(ndi);
+            assert!(
+                Ndi::is_running(),
+                "running and queued probes lost their initialization lease"
+            );
+            fs::write(gates.join("running.mkv.release"), b"").unwrap();
+            let executor = ::tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            assert_eq!(
+                executor.block_on(running).unwrap().track_count(),
+                PAIRED.build
+            );
+            wait_for(|| gates.join("queued.mkv.entered").exists());
+            drop(queued);
+            assert!(
+                Ndi::is_running(),
+                "cancelling an in-flight probe released its lease"
+            );
+            fs::write(gates.join("queued.mkv.release"), b"").unwrap();
+            wait_for(|| !Ndi::is_running());
+            // Stopping is already not running, before the native destroy
+            // callback has necessarily appended its evidence.
+            wait_for(|| {
+                fs::read_to_string(&log).is_ok_and(|log| log.lines().any(|line| line == "destroy"))
+            });
+            let log = fs::read_to_string(log).unwrap();
+            assert_eq!(log.lines().filter(|line| *line == "initialize").count(), 1);
+            assert_eq!(log.lines().filter(|line| *line == "destroy").count(), 1);
         }
         "incomplete_family_is_unavailable_alone" => {
             let ndi = select(fixtures, &PAIRED);

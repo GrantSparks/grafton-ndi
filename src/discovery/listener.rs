@@ -10,6 +10,7 @@ use crate::{
 };
 use std::{
     borrow::Cow,
+    collections::BTreeSet,
     ffi::{c_char, CStr, CString},
     fmt, ptr,
     time::Duration,
@@ -185,7 +186,7 @@ impl ListenerOptions {
 ///
 /// Each kind of identifier is its own type, so one cannot be passed where
 /// another is meant.
-trait Identifier: Sized {
+trait Identifier: Sized + Clone + Ord {
     /// The identifier with exactly the bytes the server supplied.
     fn from_exact(bytes: CString) -> Self;
     /// Those bytes, as the SDK takes them back.
@@ -551,7 +552,7 @@ unsafe fn endpoint(url: *const c_char) -> Option<String> {
 }
 
 /// A listener adds membership operations to the shared lifecycle owner.
-struct Listener<A: ListenerApi>(ServerObject<A>);
+struct Listener<A: ListenerApi>(ServerObject<A>, BTreeSet<A::Id>);
 
 const _: () = {
     const fn assert_send<T: Send>() {}
@@ -564,7 +565,7 @@ where
     A: ServerApi<Options = ListenerOptions>,
 {
     fn new(ndi: &Ndi, options: &ListenerOptions) -> Result<Self> {
-        ServerObject::new(ndi, options).map(Self)
+        ServerObject::new(ndi, options).map(|server| Self(server, BTreeSet::new()))
     }
 }
 
@@ -599,15 +600,29 @@ impl<A: ListenerApi> Listener<A> {
             .map_err(CopyError::into_error)
     }
     fn subscription(&mut self, id: &A::Id, subscribe: bool) {
-        let id = id.as_c_str().as_ptr();
-        // SAFETY: the listener instance is live and `id` outlives the call.
-        unsafe {
-            if subscribe {
-                self.0.api.subscribe(self.0.instance(), id);
-            } else {
-                self.0.api.unsubscribe(self.0.instance(), id);
+        if subscribe {
+            if !self.1.contains(id) {
+                self.1.insert(id.clone());
             }
-        };
+            let retained = self.1.get(id).expect("subscribed identifier was retained");
+            // SAFETY: the listener and its stable identifier allocation stay
+            // live until unsubscribe returns or after native destruction.
+            unsafe {
+                self.0
+                    .api
+                    .subscribe(self.0.instance(), retained.as_c_str().as_ptr())
+            };
+        } else {
+            let retained = self.1.get(id).unwrap_or(id);
+            // SAFETY: a retained identifier stays live through unsubscribe;
+            // an identifier never subscribed is borrowed only for this call.
+            unsafe {
+                self.0
+                    .api
+                    .unsubscribe(self.0.instance(), retained.as_c_str().as_ptr())
+            };
+            self.1.remove(id);
+        }
     }
     fn next_events(&mut self, timeout: Duration) -> Result<Vec<ListenerEvent<A::Id>>> {
         struct Batch<'a, A: ListenerApi> {
@@ -654,6 +669,16 @@ impl<A: ListenerApi> Listener<A> {
                 })
             }
         })
+    }
+}
+
+impl<A: ListenerApi> Drop for Listener<A> {
+    fn drop(&mut self) {
+        // The native listener may read every subscribed identifier while it
+        // is destroyed. Release their allocations only after that returns,
+        // independently of the order of this owner's fields.
+        self.0.destroy();
+        self.1.clear();
     }
 }
 
@@ -762,6 +787,9 @@ macro_rules! listener_methods {
         }
         /// Ask to receive the events of the peer `id` names. The next snapshot
         /// reports whether the subscription is active.
+        ///
+        /// The listener keeps its own copy of the identifier until
+        /// [`unsubscribe`](Self::unsubscribe) returns or the listener is dropped.
         #[doc(alias = "NDIlib_send_listener_subscribe_events")]
         #[doc(alias = "NDIlib_recv_listener_subscribe_events")]
         pub fn subscribe(&mut self, id: &$Id) {
@@ -793,7 +821,8 @@ macro_rules! listener_methods {
         /// [`crate::MAX_TIMEOUT`], [`Error::ResourceLimit`] when copying the
         /// batch would exceed its 16 MiB budget, and
         /// [`Error::UnexpectedSdkResult`] when the top-level batch array is
-        /// malformed or storage cannot be reserved. The SDK has already
+        /// malformed, or [`Error::AllocationFailed`] when storage cannot be
+        /// reserved. The SDK has already
         /// handed a rejected batch over, so it is freed and its events are lost.
         #[doc(alias = "NDIlib_send_listener_get_events")]
         #[doc(alias = "NDIlib_recv_listener_get_events")]
@@ -839,7 +868,8 @@ impl SendListener {
     ///
     /// Returns [`Error::ResourceLimit`] when copying would exceed the 16 MiB
     /// budget, and [`Error::UnexpectedSdkResult`] when the top-level snapshot
-    /// array is malformed or storage cannot be reserved.
+    /// array is malformed. [`Error::AllocationFailed`] when storage cannot be
+    /// reserved.
     #[doc(alias = "NDIlib_send_listener_get_senders")]
     pub fn current_senders(&mut self) -> Result<Vec<AdvertisedSender>> {
         let mut budget = copy_budget();
@@ -900,7 +930,8 @@ impl RecvListener {
     ///
     /// Returns [`Error::ResourceLimit`] when copying would exceed the 16 MiB
     /// budget, and [`Error::UnexpectedSdkResult`] when the top-level snapshot
-    /// array is malformed or storage cannot be reserved.
+    /// array is malformed. [`Error::AllocationFailed`] when storage cannot be
+    /// reserved.
     #[doc(alias = "NDIlib_recv_listener_get_receivers")]
     pub fn current_receivers(&mut self) -> Result<Vec<AdvertisedReceiver>> {
         let mut budget = copy_budget();

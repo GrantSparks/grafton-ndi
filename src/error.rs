@@ -5,6 +5,8 @@ mod allocation_tests;
 mod defects;
 #[cfg(test)]
 mod defects_tests;
+#[cfg(test)]
+mod production_tests;
 pub use crate::sys::table::NativeFunction;
 pub use defects::*;
 
@@ -28,6 +30,7 @@ use crate::capabilities::{Capability, CapabilityRefusal};
 /// failures. This discriminator does not depend on diagnostic text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub enum SpawnFailure {
     /// The Tokio operation was polled outside a Tokio runtime.
     #[error("no Tokio runtime is entered")]
@@ -47,6 +50,55 @@ pub enum InitializationFailure {
     /// Another runtime handle would overflow the reference count.
     #[error("NDI runtime reference count exhausted")]
     HandleCountExhausted,
+}
+
+/// The storage an operation could not allocate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[non_exhaustive]
+pub enum AllocationKind {
+    /// Finder or Discovery Server snapshot and discovery-result storage.
+    #[error("discovery results")]
+    DiscoveryResults,
+    /// Reusable image encoder scratch storage.
+    #[error("image scratch storage")]
+    ImageScratch,
+    /// Custom allocator lease bookkeeping.
+    #[error("allocator lease storage")]
+    AllocatorLeases,
+    /// Queued sender descriptors and completion bookkeeping.
+    #[error("completion storage")]
+    QueuedCompletions,
+    /// A crate-owned custom receive buffer.
+    #[error("receive buffer")]
+    ReceiveBuffer,
+}
+
+/// An allocation failed after the operation passed its validation and budgets.
+///
+/// This describes storage exhaustion, rather than invalid input or malformed
+/// SDK data. It also covers a collection refusing an unrepresentable capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[error("could not allocate {kind}{requested}", requested = RequestedBytes(*.bytes))]
+pub struct AllocationFailure {
+    /// Which storage could not be supplied.
+    pub kind: AllocationKind,
+    /// The requested allocation size in bytes, when known.
+    pub bytes: Option<usize>,
+}
+
+struct RequestedBytes(Option<usize>);
+
+impl std::fmt::Display for RequestedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(bytes) = self.0 {
+            write!(f, " ({bytes} bytes)")?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn allocation_failed(kind: AllocationKind, bytes: Option<usize>) -> Error {
+    Error::AllocationFailed(AllocationFailure { kind, bytes })
 }
 
 /// Every error this crate reports, from the core API, the `advanced` module
@@ -113,6 +165,9 @@ pub enum Error {
     /// * The runtime options name a library file other than the selected one,
     ///   ask for the Advanced SDK when the selected runtime is not one, or
     ///   name any file when the SDK is linked into the program.
+    /// * On dynamically loaded, non-Apple ELF targets, an explicit runtime
+    ///   path is refused while another NDI runtime occupies the process's
+    ///   global symbol scope, with [`SelectionConflict::ForeignRuntimeInScope`].
     /// * Loading a native library re-entered runtime selection on the same
     ///   thread.
     /// * The File API options name a File library other than the selected one,
@@ -155,6 +210,16 @@ pub enum Error {
     /// because of the CPU as [`Error::UnsupportedCpu`].
     #[error("Failed to initialize the NDI runtime: {0}")]
     InitializationFailed(InitializationFailure),
+
+    /// Storage could not be allocated for an otherwise valid operation.
+    ///
+    /// [`AllocationFailure`] identifies the storage and its requested size
+    /// when known. Discovery copies, image encoding scratch, queued sender
+    /// bookkeeping, allocator leases and crate-owned receive buffers all
+    /// report this condition here. A configured budget refusal is instead
+    /// [`Error::ResourceLimit`].
+    #[error("Allocation failed: {0}")]
+    AllocationFailed(AllocationFailure),
 
     /// The selected NDI runtime cannot run on this CPU.
     ///
@@ -250,10 +315,11 @@ pub enum Error {
     /// * `file::AsyncFilePlayer::probe`, when the probes waiting for the
     ///   process's probe thread fill its queue ([`QueueLimit::FileProbes`]).
     #[error("Queue full: {0}")]
+    #[cfg(any(feature = "advanced", feature = "file-io"))]
     QueueFull(QueueLimit),
 
     /// A value the SDK returned, other than a frame, breaks the SDK's
-    /// documented contract, or owned storage could not be reserved for it.
+    /// documented contract.
     /// [`SdkResultDefect`] identifies that contract breach.
     ///
     /// For example a negative connection count, a receive delay outside the
@@ -321,6 +387,7 @@ pub enum Error {
     /// }
     /// ```
     #[error("Could not run blocking task: {0}")]
+    #[cfg(any(feature = "tokio", feature = "smol"))]
     SpawnFailed(SpawnFailure),
 
     /// A File API operation is not permitted in the current state of its
@@ -411,6 +478,7 @@ pub enum ResourceKind {
 /// the text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
+#[cfg(any(feature = "advanced", feature = "file-io"))]
 pub enum QueueLimit {
     /// An Advanced `QueuedSender` already holds as many frames as its
     /// `QueueLimits::max_frames` allows.
@@ -455,6 +523,11 @@ mod tests {
         error::<LoadFailure>();
         error::<LoadRefusal>();
         error::<DiscoveryAddressFailure>();
+        error::<NativeFunction>();
+        error::<DiscoveryDefect>();
+        error::<ImageCodecKind>();
+        error::<ImageAxisKind>();
+        error::<AudioCountKind>();
         error::<InputDefect>();
         error::<FrameDefect>();
         error::<LayoutDefect>();
@@ -462,34 +535,47 @@ mod tests {
         error::<Capability>();
         error::<CapabilityRefusal>();
         error::<crate::CapabilityUnavailable>();
+        #[cfg(any(feature = "advanced", feature = "file-io"))]
         error::<QueueLimit>();
         error::<ResourceKind>();
         error::<SelectionConflict>();
         error::<LibraryKind>();
-        error::<ColorMetadataIssue>();
+        error::<ColorMetadataDefect>();
         error::<FrameRateDefect>();
         error::<VideoDimensionsDefect>();
         error::<AudioLengthDefect>();
         error::<CompressedAudioDefect>();
         error::<PtzDefect>();
+        #[cfg(any(feature = "tokio", feature = "smol"))]
         error::<SpawnFailure>();
         error::<InitializationFailure>();
+        error::<AllocationFailure>();
+        error::<AllocationKind>();
 
         value::<SdkResultDefect>();
+        value::<NativeFunction>();
+        value::<DiscoveryDefect>();
+        value::<ImageCodecKind>();
+        value::<ImageAxisKind>();
+        value::<AudioCountKind>();
         value::<Capability>();
         value::<CapabilityRefusal>();
         value::<crate::CapabilityUnavailable>();
+        #[cfg(any(feature = "advanced", feature = "file-io"))]
         value::<QueueLimit>();
         value::<ResourceKind>();
         value::<SelectionConflict>();
         value::<LibraryKind>();
-        value::<ColorMetadataIssue>();
+        value::<ColorMetadataDefect>();
         value::<FrameRateDefect>();
         value::<VideoDimensionsDefect>();
         value::<AudioLengthDefect>();
         value::<CompressedAudioDefect>();
+        #[cfg(any(feature = "tokio", feature = "smol"))]
         value::<SpawnFailure>();
         value::<InitializationFailure>();
+        value::<AllocationFailure>();
+        value::<AllocationKind>();
     }
 
     #[test]
@@ -543,6 +629,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "advanced", feature = "file-io"))]
     fn a_full_queue_names_its_limit() {
         for (limit, text) in [
             (QueueLimit::Frames, "queued video frame limit reached"),

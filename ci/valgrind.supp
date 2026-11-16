@@ -1,0 +1,25 @@
+# glibc's dynamic loader compares an rpath token with an optimized strncmp.
+# Valgrind 3.19 reports its word read-ahead as Addr8 on glibc 2.36. These
+# suppressions require the loader's complete token-parsing prefix; they cannot
+# match an NDI or crate frame reader.
+{
+   glibc-dst-count-word-read
+   Memcheck:Addr8
+   fun:strncmp
+   fun:is_dst
+   fun:_dl_dst_count
+   fun:expand_dynamic_string_token
+   fun:fillin_rpath*
+   fun:decompose_rpath
+   fun:_dl_map_object
+}
+{
+   glibc-dst-substitute-word-read
+   Memcheck:Addr8
+   fun:strncmp
+   fun:is_dst
+   fun:_dl_dst_substitute
+   fun:fillin_rpath*
+   fun:decompose_rpath
+   fun:_dl_map_object
+}

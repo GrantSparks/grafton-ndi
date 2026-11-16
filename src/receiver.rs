@@ -35,6 +35,7 @@ use crate::RuntimeFeature;
 use crate::advanced::{AvSyncAttached, PacketAttached};
 
 use std::{
+    collections::VecDeque,
     ffi::CString,
     marker::PhantomData,
     os::raw::c_char,
@@ -149,19 +150,22 @@ pub(crate) fn native_count<T: Into<i64>>(count: sys::table::Called<T>) -> Result
     })
 }
 
-/// A coalesced status invalidation and its publication generation.
-/// Validation completes before a compare/exchange consumes that generation;
-/// failed validation or a newer publication therefore leaves status pending.
+/// A coalesced status invalidation, its failure-report bit and publication
+/// generation. Validation completes before a compare/exchange consumes that
+/// generation; a failed snapshot stays pending and reports at most once.
 #[derive(Default)]
 struct PendingStatus(AtomicUsize);
 
 impl PendingStatus {
+    const PENDING: usize = 1;
+    const REPORTED: usize = 2;
+
     fn publish(&self) {
         let mut observed = self.0.load(Ordering::Acquire);
         loop {
             match self.0.compare_exchange_weak(
                 observed,
-                observed.wrapping_add(2) | 1,
+                (observed.wrapping_add(4) & !(Self::PENDING | Self::REPORTED)) | Self::PENDING,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -173,20 +177,55 @@ impl PendingStatus {
 
     #[cfg(test)]
     fn is_pending(&self) -> bool {
-        self.0.load(Ordering::Acquire) & 1 != 0
+        self.0.load(Ordering::Acquire) & Self::PENDING != 0
     }
 
+    #[cfg(test)]
     fn take_with<T>(&self, snapshot: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+        self.take_or_else_with(snapshot, || None)
+    }
+
+    fn take_or_else_with<T>(
+        &self,
+        snapshot: impl FnOnce() -> Result<T>,
+        other: impl FnOnce() -> Option<T>,
+    ) -> Result<Option<T>> {
         let observed = self.0.load(Ordering::Acquire);
-        if observed & 1 == 0 {
+        if observed & Self::PENDING == 0 {
             return Ok(None);
         }
-        let status = snapshot()?;
+        let status = match snapshot() {
+            Ok(status) => status,
+            Err(error) => {
+                // A bad status must not hide an independent notification. Do
+                // not mark its breach reported until a caller receives it.
+                if let Some(other) = other() {
+                    return Ok(Some(other));
+                }
+                if observed & Self::REPORTED != 0 {
+                    return Ok(None);
+                }
+                return match self.0.compare_exchange(
+                    observed,
+                    observed | Self::REPORTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => Err(error),
+                    Err(_) => Ok(None),
+                };
+            }
+        };
         // A failed CAS means another consumer took it or a new generation was
         // published while validating. Neither case may consume that newer event.
         Ok(self
             .0
-            .compare_exchange(observed, observed & !1, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                observed,
+                observed & !(Self::PENDING | Self::REPORTED),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .ok()
             .map(|_| status))
     }
@@ -578,10 +617,17 @@ impl ReceiverOptions {
     ///
     /// Suited to image export, thumbnails and analysis pipelines, and to
     /// networks with little bandwidth to spare:
-    /// - color format [`ReceiverColorFormat::RgbxRgba`], which image
-    ///   encoding reads without converting color;
+    /// - color format [`ReceiverColorFormat::RgbxRgba`], convenient for
+    ///   encoding untagged sources directly;
     /// - bandwidth [`ReceiverBandwidth::Lowest`], the source's preview stream;
     /// - video fields not allowed, so interlaced video arrives as whole frames.
+    ///
+    /// The SDK converts YUV to RGB with BT.709 limited range even when
+    /// `ndi_color_info` names another matrix. This preset's RGB frames already
+    /// carry that conversion. Receive YUV with [`ReceiverColorFormat::UyvyBgra`]
+    /// or [`ReceiverColorFormat::UyvyRgba`] to let image encoding apply the
+    /// tag's matrix; [`ReceiverColorFormat::Best`] also retains high bit depth
+    /// and HDR code values. Tags still control HDR refusal and PNG tagging.
     ///
     /// # Example
     ///
@@ -621,6 +667,13 @@ impl ReceiverOptions {
     /// - color format [`ReceiverColorFormat::RgbxRgba`];
     /// - bandwidth [`ReceiverBandwidth::Highest`], the source's program stream;
     /// - video fields allowed, so interlaced video keeps its fields.
+    ///
+    /// RGB is convenient for untagged sources. For tagged YUV, the SDK has
+    /// already converted to BT.709 limited range, ignoring `ndi_color_info`;
+    /// image encoding cannot apply the tagged matrix to these RGB frames.
+    /// Use [`ReceiverColorFormat::UyvyBgra`] or [`ReceiverColorFormat::UyvyRgba`]
+    /// for that matrix, or [`ReceiverColorFormat::Best`] to retain high bit
+    /// depth and HDR code values. Tags still control HDR refusal and PNG tagging.
     ///
     /// # Example
     ///
@@ -944,7 +997,9 @@ pub enum RawCapture {}
 /// frames, none of which then reach the FrameSync, which returns silence in
 /// their place. Metadata is not taken that way: every metadata frame still
 /// reaches the receiver's own capture while the FrameSync pulls video and
-/// audio.
+/// audio. `framesync_pulls_leave_sequenced_metadata_for_the_attached_receiver`
+/// in `tests/framesync_capture_boundary.rs` repeats that metadata check on
+/// every runtime exercised by CI.
 #[derive(Debug)]
 pub enum FrameSyncAttached {}
 impl mode_sealed::Sealed for RawCapture {}
@@ -1114,7 +1169,9 @@ pub(crate) struct ReceiverCore {
     pending_status: PendingStatus,
     pending_source: AtomicBool,
     pending_unknown: Mutex<Option<u32>>,
-    source_query_guard: Mutex<()>,
+    // Serialize native one-shot queries and retain any results abandoned by an
+    // async caller. The queue allocates only when a completed result is replayed.
+    source_query_guard: Mutex<VecDeque<SourceNameChange>>,
     connection_metadata: Mutex<ConnectionMetadata>,
     _name: Option<CString>,
     #[cfg(feature = "advanced")]
@@ -1147,6 +1204,9 @@ impl Receiver {
     /// [`Error::ConnectionLost`] when the SDK reports a lost connection, and
     /// the same frame-validation errors as typed borrowed capture. Rejected
     /// frames are freed through their matching native free operation.
+    /// [`Error::UnexpectedSdkResult`] reports a negative status connection
+    /// count once per publication. That status stays pending for recovery;
+    /// other events and subsequent media capture remain available.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<ReceiverItemRef<'_>>> {
         self.capture_any_ref_until(Deadline::after(timeout)?, NeverStop)
@@ -1239,7 +1299,7 @@ impl<M: CreatableMode> Receiver<M> {
                 pending_status: PendingStatus::default(),
                 pending_source: AtomicBool::new(false),
                 pending_unknown: Mutex::new(None),
-                source_query_guard: Mutex::new(()),
+                source_query_guard: Mutex::new(VecDeque::new()),
                 connection_metadata: Mutex::new(ConnectionMetadata::default()),
                 _name,
                 #[cfg(feature = "advanced")]
@@ -1290,7 +1350,8 @@ macro_rules! receiver_capture_methods {
                 #[doc = concat!("Wait up to `timeout` for ", $label, " and copy it into an owned frame.")]
                 ///
                 /// A zero timeout makes one nonblocking SDK attempt. Early SDK
-                /// status and source reports are retained for `next_event`, and
+                /// status and source reports are retained for `next_event`, or, on an
+                /// attached receiver, for the raw receiver that detaching returns;
                 /// capture continues until a frame arrives or the budget expires.
                 /// Each native attempt waits at most 100 ms; validation and copying
                 /// can finish after the budget. `None` alone does not establish
@@ -1308,7 +1369,8 @@ macro_rules! receiver_capture_methods {
                 ///
                 /// The returned frame borrows the receiver and releases its SDK
                 /// buffer when dropped. Capture retains status and source reports
-                /// for `next_event`. A zero timeout makes one nonblocking attempt;
+                /// for `next_event`, or, on an attached receiver, for the raw
+                /// receiver that detaching returns. A zero timeout makes one nonblocking attempt;
                 /// each other attempt waits at most 100 ms within the shared budget.
                 ///
                 /// # Errors
@@ -1463,6 +1525,11 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Accepts owned or captured metadata. The receiver keeps its own copy,
     /// so the input need not outlive the registration.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedCapability`] without
+    /// [`RuntimeFeature::ReceiverConnectionMetadata`](crate::RuntimeFeature::ReceiverConnectionMetadata).
     #[doc(alias = "NDIlib_recv_add_connection_metadata")]
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let table = self.core.connection_metadata()?;
@@ -1475,6 +1542,11 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 
     /// Clear metadata registered for subsequent receiver connections.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedCapability`] without
+    /// [`RuntimeFeature::ReceiverConnectionMetadata`](crate::RuntimeFeature::ReceiverConnectionMetadata).
     #[doc(alias = "NDIlib_recv_clear_connection_metadata")]
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.core.connection_metadata()?;
@@ -1487,6 +1559,14 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 
     /// Copy the optional device web-control URL. This does not open the URL.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedCapability`] without
+    /// [`RuntimeFeature::ReceiverWebControl`](crate::RuntimeFeature::ReceiverWebControl),
+    /// [`Error::InvalidUtf8`] for an invalid URL encoding, and
+    /// [`Error::UnexpectedSdkResult`] when the SDK does not terminate the URL
+    /// within the bounded string scan.
     #[doc(alias = "NDIlib_recv_get_web_control")]
     pub fn web_control_url(&self) -> Result<Option<String>> {
         // The query comes with the function that releases what it returns.
@@ -1516,6 +1596,14 @@ impl<M: ReceiverMode> Receiver<M> {
     /// The SDK reports each change once, so a name that is not valid UTF-8 is
     /// not an error: invalid sequences are replaced with U+FFFD, as
     /// [`Finder`](crate::Finder) does for discovered source names.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
+    /// [`Error::UnsupportedCapability`] without
+    /// [`RuntimeFeature::ConnectedSourceName`](crate::RuntimeFeature::ConnectedSourceName),
+    /// and [`Error::UnexpectedSdkResult`] when the SDK does not terminate the
+    /// name within the bounded string scan.
     #[doc(alias = "NDIlib_recv_get_source_name")]
     pub fn wait_for_source_name_change(
         &self,
@@ -1831,7 +1919,9 @@ impl<M: EventMode> Receiver<M> {
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
     /// (~49.7 days), and [`Error::ConnectionLost`] when the SDK reports a lost
     /// connection, or [`Error::UnexpectedSdkResult`] when a status snapshot
-    /// contains a negative native connection count. Its invalidation stays pending.
+    /// contains a negative native connection count, once per publication.
+    /// Its invalidation stays pending for recovery, without hiding other events
+    /// or preventing subsequent native captures.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn next_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
         self.next_event_until(Deadline::after(timeout)?, NeverStop)
@@ -1981,6 +2071,7 @@ impl ReceiverCore {
         self.take_pending_event()
     }
 
+    #[cfg(test)]
     fn take_pending_status(&self) -> Result<Option<ReceiverStatus>> {
         self.pending_status.take_with(|| self.current_status())
     }
@@ -2007,18 +2098,41 @@ impl ReceiverCore {
         }
     }
 
+    /// Return an undelivered async event to the shared coalescing mechanism.
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn retain_event(&self, event: ReceiverEvent) {
+        self.retain(match event {
+            ReceiverEvent::StatusChanged(_) => Notification::StatusChanged,
+            ReceiverEvent::SourceChanged => Notification::SourceChanged,
+            ReceiverEvent::Unknown(value) => Notification::Unknown(value),
+        });
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn retain_source_name_change(&self, change: SourceNameChange) {
+        // Several workers can finish before their futures are polled. Keep all
+        // abandoned changes rather than overwriting another worker's result.
+        self.source_query_guard.lock().push_back(change);
+    }
+
     fn take_pending_event(&self) -> Result<Option<ReceiverEvent>> {
-        if let Some(status) = self.take_pending_status()? {
-            return Ok(Some(ReceiverEvent::StatusChanged(status)));
+        if let Some(event) = self.pending_status.take_or_else_with(
+            || self.current_status().map(ReceiverEvent::StatusChanged),
+            || self.take_pending_non_status_event(),
+        )? {
+            return Ok(Some(event));
         }
+        Ok(self.take_pending_non_status_event())
+    }
+
+    fn take_pending_non_status_event(&self) -> Option<ReceiverEvent> {
         if self.pending_source.swap(false, Ordering::AcqRel) {
-            return Ok(Some(ReceiverEvent::SourceChanged));
+            return Some(ReceiverEvent::SourceChanged);
         }
-        Ok(self
-            .pending_unknown
+        self.pending_unknown
             .lock()
             .take()
-            .map(ReceiverEvent::Unknown))
+            .map(ReceiverEvent::Unknown)
     }
 
     /// The one implementation of [`Receiver::wait_for_source_name_change`], also
@@ -2053,9 +2167,12 @@ impl ReceiverCore {
         stop: impl Stop,
     ) -> Result<Option<SourceNameChange>> {
         capture_within(deadline, stop, |attempt| {
-            let Some(_query) = self.source_query_guard.try_lock_until(attempt.0.end()) else {
+            let Some(mut query) = self.source_query_guard.try_lock_until(attempt.0.end()) else {
                 return Ok(None);
             };
+            if let Some(change) = query.pop_front() {
+                return Ok(Some(change));
+            }
             let mut pointer = ptr::null();
             let remaining = attempt.0.remaining_ms();
             // SAFETY: the receiver instance is live for this borrow and `pointer` is
@@ -2454,7 +2571,7 @@ const _: () = {
 
 // A panic cannot leave a receiver's shared state half-changed: of its locks,
 // the target and pending unknown event are replaced whole; the string-query
-// lock guards `()`. The rest of its mutable state is atomic, and no
+// lock protects complete retained changes. The rest of its mutable state is atomic, and no
 // application code runs while a
 // lock is held. The `parking_lot` locks do not poison and so do not declare
 // this themselves, which would otherwise leave `Receiver` short of
@@ -3222,6 +3339,56 @@ mod tests {
         CALLS.with(|calls| assert_eq!(calls.borrow().len(), 1));
     }
 
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    #[test]
+    fn retained_source_names_precede_native_queries_without_overwriting_each_other() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn get_source_name(
+            _instance: NDIlib_recv_instance_t,
+            name: *mut *const c_char,
+            _timeout_ms: u32,
+        ) -> bool {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            unsafe { name.write(ptr::null()) };
+            false
+        }
+        unsafe extern "C" fn free(_instance: NDIlib_recv_instance_t, _name: *const c_char) {}
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        let source_name = sys::ReceiverSourceName {
+            NDIlib_recv_get_source_name: get_source_name,
+        };
+        let strings = sys::ReceiverStrings {
+            NDIlib_recv_free_string: free,
+        };
+        let changes = [
+            SourceNameChange::Connected("first".into()),
+            SourceNameChange::Disconnected,
+        ];
+        for change in &changes {
+            receiver.core.retain_source_name_change(change.clone());
+        }
+        let poll = || {
+            receiver
+                .core
+                .wait_for_source_name_change_with(
+                    &source_name,
+                    &strings,
+                    Deadline::after(Duration::ZERO).unwrap(),
+                    NeverStop,
+                )
+                .unwrap()
+        };
+        for change in changes {
+            assert_eq!(poll(), Some(change));
+            assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+        }
+        assert!(poll().is_none());
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+    }
+
     /// A source no receiver can connect to: no name and no address.
     fn test_source() -> Source {
         Source::new("").unwrap()
@@ -3371,9 +3538,75 @@ mod tests {
                 pending.publish();
                 Err(Error::ConnectionLost)
             })
-            .is_err());
+            .unwrap()
+            .is_none());
         assert!(pending.is_pending());
         assert_eq!(pending.take_with(|| Ok(3)).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn pending_status_reports_each_publication_once_and_retries_validation() {
+        let pending = PendingStatus::default();
+        for _ in 0..2 {
+            pending.publish();
+            assert!(matches!(
+                pending.take_with::<()>(|| Err(Error::ConnectionLost)),
+                Err(Error::ConnectionLost)
+            ));
+            assert!(pending
+                .take_with::<()>(|| Err(Error::ConnectionLost))
+                .unwrap()
+                .is_none());
+            assert!(pending.is_pending());
+        }
+        assert_eq!(pending.take_with(|| Ok(7)).unwrap(), Some(7));
+        assert!(!pending.is_pending());
+    }
+
+    #[test]
+    fn pending_status_defers_failure_reporting_when_another_event_is_ready() {
+        let pending = PendingStatus::default();
+        pending.publish();
+        assert_eq!(
+            pending
+                .take_or_else_with(|| Err(Error::ConnectionLost), || Some(7))
+                .unwrap(),
+            Some(7)
+        );
+        assert!(matches!(
+            pending.take_with::<()>(|| Err(Error::ConnectionLost)),
+            Err(Error::ConnectionLost)
+        ));
+    }
+
+    #[test]
+    fn pending_status_failure_has_one_competing_reporter() {
+        let pending = PendingStatus::default();
+        pending.publish();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        pending
+                            .take_with::<()>(|| {
+                                barrier.wait();
+                                Err(Error::ConnectionLost)
+                            })
+                            .is_err()
+                    })
+                })
+                .collect();
+            assert_eq!(
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .filter(|reported| *reported)
+                    .count(),
+                1
+            );
+        });
+        assert!(pending.is_pending());
     }
 
     #[test]

@@ -1,7 +1,13 @@
 //! Frame types for video, audio, and metadata.
 
 use std::{
-    ffi::CStr, fmt, marker::PhantomData, mem::size_of, num::NonZeroU32, os::raw::c_char, slice,
+    ffi::CStr,
+    fmt,
+    marker::PhantomData,
+    mem::{size_of, ManuallyDrop},
+    num::NonZeroU32,
+    os::raw::c_char,
+    slice,
 };
 
 #[cfg(test)]
@@ -224,30 +230,16 @@ impl PixelFormatInfo {
     }
 }
 
-impl PixelFormat {
-    /// Every format, in declaration order.
-    pub(crate) const ALL: [Self; 15] = [
-        Self::Uyvy,
-        Self::Uyva,
-        Self::P216,
-        Self::Pa16,
-        Self::Yv12,
-        Self::I420,
-        Self::Nv12,
-        Self::Bgra,
-        Self::Bgrx,
-        Self::Rgba,
-        Self::Rgbx,
-        Self::Na48,
-        Self::Nb48,
-        Self::Na4g,
-        Self::Nb4g,
-    ];
+crate::media::decoded_variants!(PixelFormat:
+    Uyvy, Uyva, P216, Pa16, Yv12, I420, Nv12, Bgra, Bgrx, Rgba, Rgbx, Na48,
+    Nb48, Na4g, Nb4g,
+);
 
+impl PixelFormat {
     /// The complete readable allocation size for sending this layout.
     ///
-    /// `line_stride_bytes` is `None` for tightly packed rows, or the byte
-    /// distance between rows. The returned size includes every plane and
+    /// `line_stride_bytes` is `None` for tightly packed rows, or a positive
+    /// byte distance between rows that holds the active width. The returned size includes every plane and
     /// the extra readable bytes required by the format and scan type. It is
     /// suitable for allocating external buffers used with
     /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`](crate::BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail).
@@ -268,12 +260,9 @@ impl PixelFormat {
     ) -> Result<usize> {
         let layout =
             ValidatedVideoLayout::new_uncompressed(self, width, height, line_stride_bytes)?;
-        layout
-            .data_len_bytes
-            .checked_add(crate::pixels::send_room(&layout, scan_type))
-            .ok_or(Error::InvalidFrame(crate::FrameDefect::Layout(
-                crate::LayoutDefect::VideoAllocationOverflow,
-            )))
+        // The validated data and the maximum send room fit usize on every
+        // supported target; the bound is asserted beside ValidatedVideoLayout.
+        Ok(layout.data_len_bytes + crate::pixels::send_room(&layout, scan_type))
     }
 
     /// Get compile-time format properties.
@@ -388,8 +377,10 @@ impl PixelFormat {
     /// a multiple of 16. The SDK documents no such requirement, and it
     /// compresses what it reads there into the picture's last blocks. The
     /// 64-bit ARM Linux build reads every frame exactly. The figures are
-    /// measured with the Linux runtimes 6.1.1, 6.3.2 and 6.4.0.2, and checked
-    /// against the native SDK by `tests/send_tail_room_sdk.rs`. Every build
+    /// measured with the Linux runtimes 6.1.1, 6.3.2 and 6.4.0.2.
+    /// `tests/send_tail_room_sdk.rs` checks these room figures against the
+    /// native SDK for its listed packed, padded and planar video layouts,
+    /// and the exact extents of its strided audio layouts. Every build
     /// but the 64-bit ARM Linux one takes the
     /// x86 figure, the 32-bit x86 Linux build included.
     ///
@@ -531,11 +522,6 @@ impl PixelFormat {
         height: u32,
         line_stride_bytes: Option<usize>,
     ) -> Result<usize> {
-        if line_stride_bytes == Some(0) {
-            return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
-                crate::LayoutDefect::VideoZeroStride,
-            )));
-        }
         let layout =
             ValidatedVideoLayout::new_uncompressed(self, width, height, line_stride_bytes)?;
         Ok(layout.data_len_bytes)
@@ -594,15 +580,9 @@ pub enum ScanType {
     Field1,
 }
 
-impl ScanType {
-    /// Every scan type, in declaration order.
-    pub(crate) const ALL: [Self; 4] = [
-        Self::Progressive,
-        Self::Interlaced,
-        Self::Field0,
-        Self::Field1,
-    ];
+crate::media::decoded_variants!(ScanType: Progressive, Interlaced, Field0, Field1);
 
+impl ScanType {
     /// The SDK's frame format type for this scan type.
     pub(crate) const fn to_sdk(self) -> NDIlib_frame_format_type_e {
         match self {
@@ -1304,11 +1284,13 @@ macro_rules! video_accessors {
                 /// Encode the frame as an image, as `options` describe.
                 ///
                 /// Every uncompressed pixel format encodes, as PNG, JPEG or
-                /// lossless or lossy WebP. YUV is converted to RGB as the NDI SDK converts
-                /// it, with BT.709, limited range and repeated chroma, unless the
-                /// frame's `ndi_color_info` metadata names another matrix; a frame
-                /// tagged PQ or HLG is refused unless the options ask for its code
-                /// values. See
+                /// lossless or lossy WebP. By default, YUV uses limited range,
+                /// repeated chroma and the matrix in readable `ndi_color_info`,
+                /// or BT.709 when untagged. RGB-received frames already hold the
+                /// SDK's BT.709 limited-range conversion, which ignores the tag;
+                /// encoding cannot apply its matrix afterward. Tags still decide
+                /// HDR refusal and the PNG `cICP` chunk. Receive YUV when the
+                /// tagged matrix or original HDR code values matter. See
                 /// [`ImageOptions`](crate::image_encoding::ImageOptions) for formats, color, HDR,
                 /// bit depth, alpha, reduction, cost and memory.
                 ///
@@ -1320,17 +1302,11 @@ macro_rules! video_accessors {
                 ///
                 /// # Errors
                 ///
-                /// [`Error::InvalidInput`](crate::Error::InvalidInput) for options
-                /// that conflict: a JPEG quality outside 1 to 100, a WebP quality
-                /// outside 0 to 100, 16 bits or HDR
-                /// code values for JPEG or WebP.
-                /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) for a frame
-                /// the options cannot encode: a PQ or HLG frame under
-                /// [`HdrPolicy::Refuse`](crate::image_encoding::HdrPolicy::Refuse), unreadable
-                /// `ndi_color_info` or withheld received metadata under
-                /// [`ColorPolicy::Sdk`](crate::image_encoding::ColorPolicy::Sdk),
-                /// or an image larger than its codec allows; and when the codec
-                /// fails.
+                /// Returns [`Error::InvalidInput`](crate::Error::InvalidInput)
+                /// for unsuitable options, [`Error::InvalidFrame`](crate::Error::InvalidFrame)
+                /// for frame or codec refusals, or [`Error::AllocationFailed`](crate::Error::AllocationFailed) for
+                /// conversion scratch storage. The complete conditions are in the
+                /// [ImageOptions error table](crate::image_encoding::ImageOptions#errors).
                 ///
                 /// # Example
                 ///
@@ -2614,6 +2590,19 @@ audio_accessors! {
 }
 
 impl AudioFrame {
+    /// Allocate silent packed samples for a shape that is already validated.
+    /// Metadata and receive timestamp keep the ordinary outbound defaults.
+    pub(crate) fn from_validated_silence(layout: ValidatedAudioLayout, timecode: Timecode) -> Self {
+        let layout = layout.packed();
+        Self {
+            layout,
+            timecode,
+            data: vec![0.0; layout.sample_count()],
+            metadata: OwnedFrameMetadata::default(),
+            timestamp: None,
+        }
+    }
+
     /// Create a builder for a frame to send.
     ///
     /// Its defaults are 48 kHz stereo FLTP with 1024 samples per channel,
@@ -3464,7 +3453,14 @@ impl Sendable<VideoFrame> {
 
 // The width, height and line stride of a valid layout are each at most its
 // storage extent, so every one of them fits the SDK's signed 32-bit fields.
-const _: () = assert!(MAX_VIDEO_BYTES <= i32::MAX as usize);
+const _: () = {
+    assert!(usize::BITS >= 32);
+    assert!(MAX_VIDEO_BYTES <= i32::MAX as usize);
+    // Send room is at most 64 bytes plus two strides. A validated stride is
+    // at most the complete data size, even for a one-row frame.
+    assert!(3 * MAX_VIDEO_BYTES + 64 < usize::MAX);
+    assert!(MAX_METADATA_BYTES < i32::MAX as usize);
+};
 
 impl ValidatedVideoLayout {
     /// Initialized active payload, excluding padding.
@@ -3497,8 +3493,8 @@ impl ValidatedVideoLayout {
         self.line_stride_bytes
     }
 
-    /// Validate an uncompressed layout. A `line_stride` of `None` or zero
-    /// selects the packed stride.
+    /// Validate an uncompressed layout. Only `None` selects the packed stride;
+    /// an explicit stride must be positive and hold the active row.
     pub(crate) fn new_uncompressed(
         pixel_format: PixelFormat,
         width: u32,
@@ -3518,7 +3514,8 @@ impl ValidatedVideoLayout {
 
         let min_stride = min_video_line_stride_checked(pixel_format, width as usize)?;
         let line_stride = match line_stride {
-            None | Some(0) => min_stride,
+            None => min_stride,
+            Some(0) => return Err(crate::LayoutDefect::VideoZeroStride),
             Some(stride) if stride < min_stride => {
                 return Err(crate::LayoutDefect::VideoShortStride {
                     stride,
@@ -3578,7 +3575,7 @@ impl ValidatedVideoLayout {
             pixel_format,
             width.unsigned_abs(),
             height.unsigned_abs(),
-            Some(line_stride),
+            (line_stride != 0).then_some(line_stride),
         )
     }
 
@@ -3755,9 +3752,10 @@ fn check_video_data_len(layout: &ValidatedVideoLayout, len: usize) -> Result<()>
 }
 
 fn validate_video_data_len(data_len_bytes: usize) -> LayoutResult<()> {
-    if data_len_bytes == 0 {
-        return Err(crate::LayoutDefect::VideoZeroSize);
-    }
+    debug_assert!(
+        data_len_bytes > 0,
+        "validated dimensions and stride are positive"
+    );
 
     if data_len_bytes > MAX_VIDEO_BYTES {
         return Err(crate::LayoutDefect::VideoBytes(data_len_bytes));
@@ -3884,10 +3882,11 @@ fn video_plane_layouts(
             .checked_mul(row_count)
             .and_then(|n| storage.checked_add(n))
             .ok_or(crate::LayoutDefect::VideoBufferOverflow)?;
-        payload = active_row_bytes
-            .checked_mul(row_count)
-            .and_then(|n| payload.checked_add(n))
-            .ok_or(crate::LayoutDefect::VideoPayloadOverflow)?;
+        // Every active row fits its stride, and the complete storage sum
+        // just passed the overflow check. The active payload cannot exceed it.
+        debug_assert!(active_row_bytes <= row_stride);
+        payload += active_row_bytes * row_count;
+        debug_assert!(payload <= storage);
     }
     Ok((planes, count, storage, payload))
 }
@@ -4230,7 +4229,7 @@ fn validate_audio_sample_rate(sample_rate: i64) -> LayoutResult<u32> {
 }
 
 /// Require a positive channel and sample count and widen both to `usize`.
-fn validate_positive_audio_counts(
+pub(crate) fn validate_positive_audio_counts(
     no_channels: i64,
     no_samples: i64,
 ) -> LayoutResult<(usize, usize)> {
@@ -5433,10 +5432,21 @@ pub struct MetadataFrameRef<'rx> {
 }
 
 struct SenderMetadataGuard<'a> {
-    guard: Guard<'a, SenderMetadataFree>,
-    // Fields drop in declaration order on every exit, including validation
-    // errors and unwinding: native free always precedes capture-gate release.
-    _lease: crate::sender::SenderMetadataLease<'a>,
+    guard: ManuallyDrop<Guard<'a, SenderMetadataFree>>,
+    lease: ManuallyDrop<crate::sender::SenderMetadataLease<'a>>,
+}
+
+impl Drop for SenderMetadataGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: both fields are initialized once and taken only here. The
+        // native guard is freed while the capture lease still excludes other
+        // captures; only then may releasing the lease wake another capture.
+        // This order also holds on validation failure and during unwinding.
+        unsafe {
+            drop(ManuallyDrop::take(&mut self.guard));
+            drop(ManuallyDrop::take(&mut self.lease));
+        }
+    }
 }
 
 impl HoldsDescriptor for SenderMetadataGuard<'_> {
@@ -5481,8 +5491,8 @@ impl<'rx> MetadataFrameRef<'rx> {
         lease: crate::sender::SenderMetadataLease<'rx>,
     ) -> Result<Self> {
         let guard = SenderMetadataGuard {
-            guard,
-            _lease: lease,
+            guard: ManuallyDrop::new(guard),
+            lease: ManuallyDrop::new(lease),
         };
         // SAFETY: the sender guard retains its delivered descriptor and the
         // SDK's NUL-terminated UTF-8 storage through matching native release.
@@ -6152,7 +6162,6 @@ mod tests {
     #[test]
     fn video_padding_all_formats_expose_and_copy_only_initialized_rows() {
         use crate::capture::{FrameSyncVideoFree, Guard};
-        use std::mem::MaybeUninit;
         // Independently specified active plane dimensions for 4x4 images.
         let cases: &[(PixelFormat, &[(usize, usize)])] = &[
             (PixelFormat::Bgra, &[(16, 4)]),
@@ -6167,10 +6176,13 @@ mod tests {
             (PixelFormat::I420, &[(4, 4), (2, 2), (2, 2)]),
             (PixelFormat::Nv12, &[(4, 4), (4, 2)]),
         ];
+        // One padded layout per format keeps interpretation bounded. The
+        // native and Memcheck runs retain the complete layout matrix.
+        let paddings: &[usize] = if cfg!(miri) { &[4] } else { &[0, 4, 8] };
         for &(format, dimensions) in cases {
-            for padding in [0, 4, 8] {
+            for &padding in paddings {
                 let stride = dimensions[0].0 + padding;
-                let mut storage = vec![MaybeUninit::<u8>::uninit(); 512];
+                let mut storage = Box::<[u8]>::new_uninit_slice(512);
                 let mut expected = Vec::new();
                 let mut offsets = Vec::new();
                 let mut offset = 0;
@@ -6483,7 +6495,7 @@ mod tests {
             PixelFormat::P216,
             PixelFormat::Pa16,
         ] {
-            let tight = ValidatedVideoLayout::new_uncompressed(format, 2, 1, Some(0)).unwrap();
+            let tight = ValidatedVideoLayout::new_uncompressed(format, 2, 1, None).unwrap();
             assert!(VideoPlaneLayout::contiguous(tight.planes()).is_some());
             let active = format.line_stride_bytes(2).unwrap();
             let padded =
@@ -6527,7 +6539,7 @@ mod tests {
             assert_eq!(frame.to_owned().data(), vec![42; tight.payload_len_bytes]);
         }
         for format in [PixelFormat::Yv12, PixelFormat::I420, PixelFormat::Nv12] {
-            let tight = ValidatedVideoLayout::new_uncompressed(format, 4, 2, Some(0)).unwrap();
+            let tight = ValidatedVideoLayout::new_uncompressed(format, 4, 2, None).unwrap();
             assert!(VideoPlaneLayout::contiguous(tight.planes()).is_some());
             let padded = ValidatedVideoLayout::new_uncompressed(format, 4, 2, Some(8)).unwrap();
             assert!(VideoPlaneLayout::contiguous(padded.planes()).is_none()); // Chroma is one row, but plane gaps remain.
@@ -6535,15 +6547,21 @@ mod tests {
     }
 
     /// Encoders read active bytes only: every format's padding is left
-    /// uninitialized, which Miri and Memcheck would report if read.
+    /// uninitialized. The required Miri and Memcheck CI jobs detect reads of it.
     #[cfg(feature = "image-encoding")]
     #[test]
     fn video_padding_encoders_never_read_uninitialized_gaps() {
+        #[cfg(not(miri))]
+        use crate::image_encoding::{AlphaMode, Downscale, SampleDepth};
         use crate::{
             capture::{FrameSyncVideoFree, Guard},
-            image_encoding::{AlphaMode, Downscale, ImageFormat, ImageOptions, SampleDepth},
+            image_encoding::{ImageFormat, ImageOptions},
         };
-        use std::mem::MaybeUninit;
+        // Miri checks the initialized-region reader for every input format.
+        // Memcheck and native tests exercise every encoder and option below.
+        #[cfg(miri)]
+        let outputs = [ImageOptions::new(ImageFormat::Png)];
+        #[cfg(not(miri))]
         let outputs = [
             ImageOptions::new(ImageFormat::Png),
             ImageOptions::new(ImageFormat::Png).depth(SampleDepth::Sixteen),
@@ -6561,7 +6579,7 @@ mod tests {
             let padded =
                 ValidatedVideoLayout::new_uncompressed(format, width, height, Some(stride))
                     .unwrap();
-            let mut storage = vec![MaybeUninit::<u8>::uninit(); padded.data_len_bytes];
+            let mut storage = Box::<[u8]>::new_uninit_slice(padded.data_len_bytes);
             let mut active = Vec::new();
             let mut value = 7u8;
             for plane in padded.planes() {
@@ -6966,6 +6984,50 @@ mod tests {
                 .buffer_len(1920, 1080, Some(7680))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn explicit_zero_video_stride_is_refused_at_every_application_entry() {
+        let expected = crate::FrameDefect::Layout(crate::LayoutDefect::VideoZeroStride);
+        for format in PixelFormat::ALL {
+            assert!(
+                matches!(format.buffer_len(16, 16, Some(0)), Err(Error::InvalidFrame(defect)) if defect == expected),
+                "{format:?} buffer_len"
+            );
+            let packed = format.buffer_len(16, 16, None).unwrap();
+            let data = vec![0; packed];
+            for scan in ScanType::ALL {
+                assert!(
+                    matches!(format.send_buffer_len(16, 16, Some(0), scan), Err(Error::InvalidFrame(defect)) if defect == expected),
+                    "{format:?} {scan:?} send_buffer_len"
+                );
+                let frame = crate::BorrowedVideoFrame::builder(&data, 16, 16, format)
+                    .scan_type(scan)
+                    .line_stride_bytes(0)
+                    .build();
+                assert!(
+                    matches!(frame, Err(Error::InvalidFrame(defect)) if defect == expected),
+                    "{format:?} {scan:?} builder"
+                );
+                let reset = crate::BorrowedVideoFrame::builder(&data, 16, 16, format)
+                    .scan_type(scan)
+                    .line_stride_bytes(0)
+                    .clear_line_stride_bytes()
+                    .build()
+                    .unwrap();
+                assert_eq!(
+                    reset.line_stride_bytes(),
+                    format.line_stride_bytes(16).unwrap()
+                );
+            }
+            // SDK input alone keeps the documented zero-means-packed sentinel.
+            let sdk = ValidatedVideoLayout::from_sdk(format, 16, 16, 0).unwrap();
+            assert_eq!(sdk.data_len_bytes(), packed);
+            assert_eq!(
+                sdk.line_stride_bytes(),
+                format.line_stride_bytes(16).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -8272,12 +8334,17 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_raw_length_conversion_is_checked() {
-        assert!(metadata_len_to_i32(i32::MAX as usize).is_ok());
-        assert!(matches!(
-            metadata_len_to_i32(i32::MAX as usize + 1),
-            Err(Error::InvalidFrame(_))
-        ));
+    fn metadata_sdk_length_uses_the_validated_metadata_bound() {
+        assert_eq!(metadata_len_to_i32(1), 1);
+        assert_eq!(
+            metadata_len_to_i32(MAX_METADATA_BYTES),
+            MAX_METADATA_BYTES as i32
+        );
+        let text = "x".repeat(MAX_METADATA_BYTES);
+        let error = MetadataFrame::new(text).unwrap_err().into_error();
+        assert!(
+            matches!(error, Error::InvalidFrame(crate::FrameDefect::MetadataTooLarge { length }) if length == MAX_METADATA_BYTES + 1)
+        );
     }
 
     #[test]
@@ -8677,7 +8744,6 @@ mod tests {
                             crate::LayoutDefect::VideoStrideOverflow { .. }
                         )
                         | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoPayloadOverflow)
                         | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
                         | crate::FrameDefect::ImageScratchOverflow
                         | crate::FrameDefect::ImageDimensionOverflow
@@ -9704,7 +9770,6 @@ mod tests {
                             crate::LayoutDefect::VideoStrideOverflow { .. }
                         )
                         | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoPayloadOverflow)
                         | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
                         | crate::FrameDefect::ImageScratchOverflow
                         | crate::FrameDefect::ImageDimensionOverflow

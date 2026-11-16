@@ -119,8 +119,8 @@ struct SenderMetadataGate {
 }
 
 // Only the private acquisition/release paths change the occupancy bit, with
-// no application code under its lock. A live lease clears the bit on unwind,
-// after its metadata guard has freed the native frame, so a panic cannot leave
+// no application code under its lock. SenderMetadataGuard::drop sequences the
+// native free and lease release, including on unwind, so a panic cannot leave
 // capture state half-mutated. This preserves the captured frame's unwind traits.
 impl std::panic::RefUnwindSafe for SenderMetadataGate {}
 
@@ -1607,7 +1607,8 @@ pub struct BorrowedVideoFrameBuilder<'buf> {
 }
 
 impl<'buf> BorrowedVideoFrameBuilder<'buf> {
-    /// Set the first-plane stride in bytes. Zero selects the packed stride.
+    /// Set the first-plane stride in bytes. It must be positive and hold the
+    /// active row. Use [`Self::clear_line_stride_bytes`] for the packed stride.
     #[must_use]
     pub fn line_stride_bytes(mut self, stride: usize) -> Self {
         self.line_stride = Some(stride);
@@ -1975,7 +1976,7 @@ impl Sender {
     /// recover the final frame.
     ///
     /// Synchronous sends and explicit flushes complete the operation but retain
-    /// the owned frame for recovery by the next async send or finish call.
+    /// the owned frame for recovery by the next async send or [`Self::reclaim_video`].
     /// No SDK completion callback is registered, including with Advanced SDK.
     ///
     /// # Errors
@@ -2658,6 +2659,97 @@ mod tests {
         });
         assert!(panic.is_err());
         assert!(gate.acquire_until(Instant::now()).is_some());
+    }
+
+    fn check_metadata_free_before_capture_release(path: &str) {
+        use crate::capture::{Guard, SenderMetadataFree, SenderMetadataInstance};
+        use std::sync::{atomic::AtomicUsize, OnceLock};
+
+        struct Observation {
+            gate: SenderMetadataGate,
+            frees: AtomicUsize,
+            released_early: AtomicBool,
+        }
+
+        unsafe fn observe_free(instance: SenderMetadataInstance, _: &mut NDIlib_metadata_frame_t) {
+            // SAFETY: the synthetic instance borrows this observation until
+            // the metadata guard has invoked its sole release callback.
+            let observation = unsafe { &*instance.instance.cast::<Observation>() };
+            observation.frees.fetch_add(1, Ordering::Relaxed);
+            observation.released_early.store(
+                observation.gate.acquire_until(Instant::now()).is_some(),
+                Ordering::Relaxed,
+            );
+        }
+
+        static TABLE: OnceLock<sys::SenderMetadata> = OnceLock::new();
+        let table = TABLE.get_or_init(|| {
+            // Synthetic release uses observe_free, never these placeholder
+            // entry points. The table only completes the instance's type.
+            sys::SenderMetadata::load(&sys::table::ExportsWhere(|_| true))
+                .unwrap()
+                .unwrap()
+        });
+        let observation = Observation {
+            gate: SenderMetadataGate::default(),
+            frees: AtomicUsize::new(0),
+            released_early: AtomicBool::new(false),
+        };
+        let text = if path == "validation" {
+            c"\xff"
+        } else {
+            c"<held/>"
+        };
+        let raw = NDIlib_metadata_frame_t {
+            length: text.to_bytes().len() as i32,
+            p_data: text.as_ptr().cast_mut(),
+            timecode: 0,
+        };
+        let lease = observation.gate.acquire_until(Instant::now()).unwrap();
+        // SAFETY: the observation and terminated text outlive the guard; the
+        // synthetic callback observes release and does not free either one.
+        let guard = unsafe {
+            Guard::<SenderMetadataFree>::with_test_free(
+                SenderMetadataInstance {
+                    instance: (&observation as *const Observation).cast_mut().cast(),
+                    metadata: table,
+                },
+                raw,
+                observe_free,
+            )
+        };
+        let frame = MetadataFrameRef::from_sender(guard, lease);
+        match path {
+            "validation" => assert!(matches!(frame, Err(Error::InvalidUtf8(_)))),
+            "unwind" => {
+                let frame = frame.unwrap();
+                let panic = std::panic::catch_unwind(|| {
+                    let _frame = frame;
+                    panic!("unwind while upstream metadata is borrowed");
+                });
+                assert!(panic.is_err());
+            }
+            "normal" => drop(frame.unwrap()),
+            _ => unreachable!(),
+        }
+        assert_eq!(observation.frees.load(Ordering::Relaxed), 1);
+        assert!(!observation.released_early.load(Ordering::Relaxed));
+        assert!(observation.gate.acquire_until(Instant::now()).is_some());
+    }
+
+    #[test]
+    fn sender_metadata_guard_frees_before_releasing_capture() {
+        check_metadata_free_before_capture_release("normal");
+    }
+
+    #[test]
+    fn sender_metadata_validation_failure_frees_before_releasing_capture() {
+        check_metadata_free_before_capture_release("validation");
+    }
+
+    #[test]
+    fn sender_metadata_unwind_frees_before_releasing_capture() {
+        check_metadata_free_before_capture_release("unwind");
     }
 
     #[test]
@@ -3797,19 +3889,22 @@ mod tests {
             PixelFormat::Nv12,
         ] {
             for stride in [
-                0,
-                format.line_stride_bytes(4).unwrap(),
-                format.line_stride_bytes(4).unwrap() + 8,
+                None,
+                Some(format.line_stride_bytes(4).unwrap()),
+                Some(format.line_stride_bytes(4).unwrap() + 8),
             ] {
-                let layout =
-                    ValidatedVideoLayout::new_uncompressed(format, 4, 4, Some(stride)).unwrap();
+                let layout = ValidatedVideoLayout::new_uncompressed(format, 4, 4, stride).unwrap();
                 // A longer buffer is accepted; the frame is its layout's extent.
                 let data = vec![19; layout.data_len_bytes() + 3];
                 let metadata = c"<pixels>é</pixels>";
                 let rate = FrameRate::new(30000, 1001).unwrap();
                 let (borrowed, allocations) = crate::test_alloc::allocation_count(|| {
-                    let frame = BorrowedVideoFrame::builder(&data, 4, 4, format)
-                        .line_stride_bytes(stride)
+                    let builder = BorrowedVideoFrame::builder(&data, 4, 4, format);
+                    let builder = match stride {
+                        Some(stride) => builder.line_stride_bytes(stride),
+                        None => builder,
+                    };
+                    let frame = builder
                         .frame_rate(rate)
                         .picture_aspect_ratio(PictureAspectRatio::new(1.25).unwrap())
                         .scan_type(ScanType::Interlaced)
@@ -3843,17 +3938,15 @@ mod tests {
                 assert_eq!(allocations, 0);
                 assert_eq!(raw.p_metadata, owned.as_test_raw().p_metadata);
                 assert_eq!(raw.p_data, owned.as_test_raw().p_data);
-                assert!(BorrowedVideoFrame::builder(
-                    &data[..layout.data_len_bytes() - 1],
-                    4,
-                    4,
-                    format
-                )
-                .line_stride_bytes(stride)
-                .build()
-                .is_err());
+                let short =
+                    BorrowedVideoFrame::builder(&data[..layout.data_len_bytes() - 1], 4, 4, format);
+                let short = match stride {
+                    Some(stride) => short.line_stride_bytes(stride),
+                    None => short,
+                };
+                assert!(short.build().is_err());
             }
-            for stride in [1, i32::MAX.unsigned_abs() as usize, usize::MAX] {
+            for stride in [0, 1, i32::MAX.unsigned_abs() as usize, usize::MAX] {
                 let expected = ValidatedVideoLayout::new_uncompressed(format, 4, 4, Some(stride));
                 let result = BorrowedVideoFrame::builder(&[], 4, 4, format)
                     .line_stride_bytes(stride)

@@ -1,5 +1,5 @@
 //! Allocation and initialized-active-region checks need no SDK and can run
-//! under Miri: every pointer below belongs to a live test allocation.
+//! under the required Miri CI job: every pointer belongs to a live test allocation.
 use super::*;
 use crate::{capture::Guard, test_alloc::allocation_count, Timecode};
 use std::{mem::MaybeUninit, sync::atomic::AtomicUsize};

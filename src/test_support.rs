@@ -39,7 +39,9 @@ pub fn unverifiable_promises() -> Vec<String> {
     Requirement::promised()
         .into_iter()
         .filter_map(|requirement| {
-            let needed = missing_requirement(requirement)?;
+            let needed = std::iter::once(requirement)
+                .chain(requirement.implied().iter().copied())
+                .find_map(missing_requirement)?;
             Some(format!("`{}` needs {needed}", requirement.token()))
         })
         .collect()
@@ -60,10 +62,95 @@ fn missing_requirement(requirement: Requirement) -> Option<&'static str> {
             cfg!(all(target_os = "linux", not(ndi_link_static))),
             "a Linux target that loads the runtime dynamically",
         ),
-        // The tests that decode NDI|HX send it from an Advanced compressed
-        // sender.
-        Requirement::H264Decoder | Requirement::Hevc444Decoder => {
-            missing(cfg!(feature = "advanced"), "the `advanced` feature")
+        // Their Advanced prerequisite is checked through the implication
+        // table, just as an explicit `advanced` token is.
+        Requirement::H264Decoder | Requirement::Hevc444Decoder => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REQUIREMENTS: [Requirement; 6] = [
+        Requirement::Runtime,
+        Requirement::Advanced,
+        Requirement::File,
+        Requirement::DiscoveryServer,
+        Requirement::H264Decoder,
+        Requirement::Hevc444Decoder,
+    ];
+
+    #[test]
+    fn requirement_implications_include_decoder_prerequisites_without_cycles() {
+        fn visit(requirement: Requirement, path: &mut Vec<Requirement>) {
+            assert!(!path.contains(&requirement), "implication cycle: {path:?}");
+            path.push(requirement);
+            for &implied in requirement.implied() {
+                visit(implied, path);
+            }
+            path.pop();
+        }
+        for requirement in REQUIREMENTS {
+            visit(requirement, &mut Vec::new());
+            if requirement != Requirement::Runtime {
+                assert!(requirement.implied().contains(&Requirement::Runtime));
+            }
+        }
+        for decoder in [Requirement::H264Decoder, Requirement::Hevc444Decoder] {
+            assert!(decoder.implied().contains(&Requirement::Advanced));
+        }
+    }
+
+    #[test]
+    fn decoder_promises_enforce_their_implied_requirements() {
+        const CHILD: &str = "GRAFTON_DECODER_PROMISE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(Requirement::Runtime.is_promised());
+            assert!(Requirement::Advanced.is_promised());
+            assert!(
+                Requirement::H264Decoder.is_promised() || Requirement::Hevc444Decoder.is_promised()
+            );
+            let failures = unverifiable_promises();
+            assert_eq!(
+                failures.is_empty(),
+                cfg!(feature = "advanced"),
+                "{failures:?}"
+            );
+            // This is the same gate used when advanced_ndi cannot use the
+            // selected runtime or this build lacks Advanced declarations.
+            assert!(std::panic::catch_unwind(|| {
+                policy::skip(Requirement::Advanced, "the runtime is Standard")
+            })
+            .is_err());
+            return;
+        }
+        for tokens in [
+            "h264-decoder",
+            "hevc-444-decoder",
+            "file,h264-decoder,hevc-444-decoder",
+        ] {
+            let tokens = if cfg!(feature = "file-io") || !tokens.starts_with("file,") {
+                tokens
+            } else {
+                "h264-decoder,hevc-444-decoder"
+            };
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "test_support::tests::decoder_promises_enforce_their_implied_requirements",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("GRAFTON_NDI_REQUIRE_RUNTIME", tokens)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{tokens}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 }

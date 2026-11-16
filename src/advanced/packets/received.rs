@@ -6,15 +6,19 @@ use super::*;
 /// Later envelope versions, flags and trailing bytes remain intact. Convert
 /// with [`CompressedVideoFrame::try_from`] before sending; a refusal returns
 /// this packet and its storage in [`Rejected`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ReceivedVideoPacket {
     pub(crate) format: VideoPacketFormat,
     pub(crate) bytes: Vec<u8>,
     pub(crate) extras: FrameExtras,
 }
 
+packet_debug!(ReceivedVideoPacket, "ReceivedVideoPacket", frame, video, frame.timestamp();
+    "bytes" = frame.data().len());
+
 impl ReceivedVideoPacket {
     frame_extras_accessors!();
+    video_envelope_accessor!();
 
     /// The complete codec bytes, including retained envelope extensions.
     pub fn data(&self) -> &[u8] {
@@ -87,7 +91,7 @@ impl From<CompressedVideoFrame> for ReceivedVideoPacket {
 /// Convert with [`CompressedAudioFrame::try_from`] before sending. Unknown
 /// envelope details remain available for inspection and storage even when
 /// send admission refuses the packet.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ReceivedAudioPacket {
     pub(crate) codec: AudioCodec,
     pub(crate) protected: bool,
@@ -96,8 +100,12 @@ pub struct ReceivedAudioPacket {
     pub(crate) extras: FrameExtras,
 }
 
+packet_debug!(ReceivedAudioPacket, "ReceivedAudioPacket", frame, audio, frame.timestamp();
+    "bytes" = frame.data().len());
+
 impl ReceivedAudioPacket {
     frame_extras_accessors!();
+    audio_envelope_accessor!();
 
     /// The complete codec bytes, including retained envelope extensions.
     pub fn data(&self) -> &[u8] {
@@ -308,6 +316,11 @@ mod tests {
         let borrowed = CompressedVideoRef::new(guard).unwrap();
         let received = borrowed.to_owned();
         assert_eq!(received.data(), bytes);
+        assert_eq!(
+            borrowed.envelope(),
+            Some(PacketEnvelope::parse(&bytes).unwrap())
+        );
+        assert_eq!(received.envelope(), borrowed.envelope());
         let pointer = received.data().as_ptr();
         let refused = CompressedVideoFrame::try_from(received)
             .unwrap_err()
@@ -342,6 +355,11 @@ mod tests {
         let borrowed = CompressedAudioRef::new(guard).unwrap();
         let received = borrowed.to_owned();
         assert_eq!(received.data(), bytes);
+        assert_eq!(
+            borrowed.envelope(),
+            Some(PacketEnvelope::parse(&bytes).unwrap())
+        );
+        assert_eq!(received.envelope(), borrowed.envelope());
         let pointer = received.data().as_ptr();
         let refused = CompressedAudioFrame::try_from(received)
             .unwrap_err()

@@ -276,7 +276,7 @@ fn element(text: &[u8]) -> Result<(ColorInfo, usize)> {
         }
         if rest.is_empty() {
             return Err(malformed(
-                crate::ColorMetadataIssue::UnclosedElement,
+                crate::ColorMetadataDefect::UnclosedElement,
                 "is not closed",
             ));
         }
@@ -286,7 +286,7 @@ fn element(text: &[u8]) -> Result<(ColorInfo, usize)> {
             .unwrap_or(rest.len());
         if name_len == 0 {
             return Err(malformed(
-                crate::ColorMetadataIssue::AttributeStart,
+                crate::ColorMetadataDefect::AttributeStart,
                 format!("has {} where an attribute should begin", quoted(&rest[..1])),
             ));
         }
@@ -295,7 +295,7 @@ fn element(text: &[u8]) -> Result<(ColorInfo, usize)> {
         at += whitespace(&text[at..]);
         if text.get(at) != Some(&b'=') {
             return Err(malformed(
-                crate::ColorMetadataIssue::MissingValue,
+                crate::ColorMetadataDefect::MissingValue,
                 format!("gives attribute {} without a value", quoted(name)),
             ));
         }
@@ -305,7 +305,7 @@ fn element(text: &[u8]) -> Result<(ColorInfo, usize)> {
             Some(&quote @ (b'"' | b'\'')) => quote,
             _ => {
                 return Err(malformed(
-                    crate::ColorMetadataIssue::UnquotedValue,
+                    crate::ColorMetadataDefect::UnquotedValue,
                     format!("gives attribute {} an unquoted value", quoted(name)),
                 ))
             }
@@ -313,7 +313,7 @@ fn element(text: &[u8]) -> Result<(ColorInfo, usize)> {
         at += 1;
         let Some(value_len) = text[at..].iter().position(|&byte| byte == quote) else {
             return Err(malformed(
-                crate::ColorMetadataIssue::UnclosedValue,
+                crate::ColorMetadataDefect::UnclosedValue,
                 format!("does not close the value of attribute {}", quoted(name)),
             ));
         };
@@ -356,17 +356,17 @@ fn set<T>(
 ) -> Result<()> {
     if slot.is_some() {
         return Err(malformed(
-            crate::ColorMetadataIssue::DuplicateAttribute,
+            crate::ColorMetadataDefect::DuplicateAttribute,
             format!("gives attribute {} twice", quoted(name)),
         ));
     }
     *slot = Some(read(value).ok_or_else(|| {
-        Error::InvalidFrame(crate::FrameDefect::ColorMetadata { issue: crate::ColorMetadataIssue::UndefinedValue, diagnostic: format!("The frame's ndi_color_info gives attribute {} the value {}, which is not one the NDI SDK defines", quoted(name), quoted(value)).into_boxed_str() })
+        Error::InvalidFrame(crate::FrameDefect::ColorMetadata { issue: crate::ColorMetadataDefect::UndefinedValue, diagnostic: format!("The frame's ndi_color_info gives attribute {} the value {}, which is not one the NDI SDK defines", quoted(name), quoted(value)).into_boxed_str() })
     })?);
     Ok(())
 }
 
-fn malformed(issue: crate::ColorMetadataIssue, problem: impl std::fmt::Display) -> Error {
+fn malformed(issue: crate::ColorMetadataDefect, problem: impl std::fmt::Display) -> Error {
     Error::InvalidFrame(crate::FrameDefect::ColorMetadata {
         issue,
         diagnostic: format!(
@@ -601,13 +601,13 @@ mod tests {
         ] {
             let cause = unreadable(text);
             let expected_issue = match *needles.last().unwrap() {
-                "twice" => crate::ColorMetadataIssue::DuplicateAttribute,
-                "unquoted" => crate::ColorMetadataIssue::UnquotedValue,
-                "without a value" => crate::ColorMetadataIssue::MissingValue,
-                "does not close" => crate::ColorMetadataIssue::UnclosedValue,
-                "not closed" => crate::ColorMetadataIssue::UnclosedElement,
-                "attribute should begin" => crate::ColorMetadataIssue::AttributeStart,
-                _ => crate::ColorMetadataIssue::UndefinedValue,
+                "twice" => crate::ColorMetadataDefect::DuplicateAttribute,
+                "unquoted" => crate::ColorMetadataDefect::UnquotedValue,
+                "without a value" => crate::ColorMetadataDefect::MissingValue,
+                "does not close" => crate::ColorMetadataDefect::UnclosedValue,
+                "not closed" => crate::ColorMetadataDefect::UnclosedElement,
+                "attribute should begin" => crate::ColorMetadataDefect::AttributeStart,
+                _ => crate::ColorMetadataDefect::UndefinedValue,
             };
             let crate::FrameDefect::ColorMetadata { issue, diagnostic } = cause else {
                 panic!("{cause}")
@@ -623,7 +623,7 @@ mod tests {
         let crate::FrameDefect::ColorMetadata { issue, diagnostic } = cause else {
             panic!("{cause}")
         };
-        assert_eq!(issue, crate::ColorMetadataIssue::UndefinedValue);
+        assert_eq!(issue, crate::ColorMetadataDefect::UndefinedValue);
         assert!(
             diagnostic.contains("(1000 bytes)") && diagnostic.len() < 200,
             "{diagnostic}"

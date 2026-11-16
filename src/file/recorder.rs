@@ -120,7 +120,8 @@ impl SessionPhase {
 }
 
 impl RecordingReport {
-    /// The session's number, counting from one for each recorder.
+    /// The session's number, counting from one for each recorder; zero when
+    /// the recorder has not started a session.
     pub fn session(&self) -> u64 {
         self.session
     }
@@ -886,7 +887,9 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 /// [`FinishStatus::Closed`]. Dropping a recorder waits up to
 /// [`FileRecorderOptions::drop_wait`] while the session is open or a file it
 /// reported open has not been reported closed, including after an
-/// indeterminate outcome. Drop cannot report whether cleanup succeeded;
+/// indeterminate outcome. This budget starts at drop and includes the native
+/// stop; synchronous `finish` starts its event wait after the stop returns.
+/// Drop cannot report whether cleanup succeeded;
 /// [`abandon`](Self::abandon) skips the wait.
 ///
 /// # What a closed file means
@@ -1115,6 +1118,7 @@ impl FileRecorder {
     ///   does not exist or cannot be written to, or, with an exact file name,
     ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
     ///   that file exists. The SDK is not called.
+    ///   On Windows, also reports security queries that could not be completed.
     /// * [`Error::NativeOperationFailed`] when the SDK cannot start the source
     ///   or open the first file. `Processing.NDI.Lib.File.Recorder.h` specifies
     ///   an open-failed event for an output-file open failure; source-start
@@ -1429,12 +1433,16 @@ impl FileRecorder {
         &mut self,
         requested: Instant,
         waiters: &mut FinishWaiters<R>,
+        queued: impl IntoIterator<Item = (Deadline, R)>,
         tick: Duration,
         sink: &mut impl FnMut(Result<RecorderEvent>),
         closing: impl Fn() -> bool,
     ) {
         let mut budget = self.begin_cleanup(requested);
         self.request_stop();
+        for (deadline, reply) in queued {
+            waiters.register(self, deadline, reply);
+        }
         waiters.retain();
         while self.cleanup_pending() || !waiters.is_empty() {
             let polled = self.pump(&mut budget, waiters.wait_timeout(tick), sink);
@@ -1638,6 +1646,7 @@ impl FileRecorder {
     ///   does not exist or cannot be written to, or, with an exact file name,
     ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
     ///   that file exists. The SDK is not called and the session goes on.
+    ///   On Windows, also reports security queries that could not be completed.
     /// * [`Error::NativeOperationFailed`] when the SDK refuses the target.
     #[doc(alias = "NDIlib_file_recorder_rollover")]
     pub fn rollover(&mut self, target: &RecordingTarget) -> Result<()> {
@@ -1738,6 +1747,7 @@ impl Drop for FileRecorder {
             self.drain_cleanup(
                 Instant::now(),
                 &mut FinishWaiters::<LocalFinish<'_>>::new(),
+                std::iter::empty(),
                 FINISH_POLL,
                 &mut |_| {},
                 || false,

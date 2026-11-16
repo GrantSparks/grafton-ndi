@@ -39,7 +39,8 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
     std::fs::create_dir(&temporary).unwrap();
     // Only macOS needs a discovery address to suppress sender mDNS, matching its
     // offline runner. Leave it unset elsewhere: an unreachable Discovery Server
-    // can block Windows receivers (see docs/troubleshooting.md).
+    // can block Windows receivers, as measured at:
+    // https://github.com/GrantSparks/grafton-ndi/blob/226fa3ef36196bd20c3f0060c3fa0e233b700ace/README.md#receiving-and-sending
     let config = if cfg!(target_os = "macos") {
         r#"{"ndi":{"networks":{"discovery":"127.0.0.1","ips":"127.0.0.1"},"groups":{"send":"Public","recv":"Public"}}}"#
     } else {

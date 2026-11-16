@@ -1,6 +1,6 @@
 # Changes to these paths need the owner's review once "Require review from Code
-# Owners" is on for main (see ci/README.md). They decide what CI runs and what a
-# release publishes, without being part of the crate's source.
+# Owners" is on for main (ci/README.md, "Release controls"). They decide what CI
+# runs and what a release publishes, without being part of the crate's source.
 
 # Workflows, the release path and the scripts they run.
 /.github/ @GrantSparks

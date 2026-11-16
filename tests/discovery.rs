@@ -13,7 +13,7 @@ use grafton_ndi::{
     discovery_server::{
         AdvertiserOptions, ListenerOptions, ReceiverCommand, ReceiverId, ReceiverStream,
         RecvAdvertisement, RecvAdvertiser, RecvListener, SendAdvertisement, SendAdvertiser,
-        SendListener,
+        SendListener, SenderId,
     },
     routing::{Router, RouterOptions},
     runtime::RuntimeOptions,
@@ -78,6 +78,7 @@ const VARIANTS: &[Variant] = &[
             "advertisement_options_reach_the_sdk",
             "malformed_text_is_decoded_lossily",
             "identifiers_round_trip_exactly",
+            "subscription_identifiers_are_retained",
             "event_batches",
             "large_event_batches",
             "null_event_batch_with_a_count_is_refused",
@@ -461,6 +462,56 @@ fn child(scenario: &str) {
             assert_eq!(fixed.name(), Some("Fixed"));
             assert!(fixed.input_id().is_none() && fixed.input_name().is_none());
             assert!(fixed.streams().is_empty() && fixed.commands().is_empty());
+        }
+        "subscription_identifiers_are_retained" => {
+            std::env::set_var("GRAFTON_FAKE_RETAIN_SOURCES", "1");
+            macro_rules! check_retention {
+                ($Listener:ident, $Id:ident, $bytes:ident, $snapshot:ident, $prefix:literal) => {{
+                    let mut listener = $Listener::new(&ndi, &listeners).unwrap();
+                    let id = $Id::new($bytes).unwrap();
+                    let caller_pointer = id.as_bytes().as_ptr() as usize;
+                    listener.subscribe(&id);
+                    listener.subscribe(&id);
+                    assert!(
+                        !log()
+                            .contains(&format!("{}-retained-pointer {caller_pointer}\n", $prefix)),
+                        "the listener must pass its own allocation"
+                    );
+                    drop(id);
+                    listener.$snapshot().unwrap();
+                    listener.next_events(Duration::from_millis(1)).unwrap();
+                    listener.unsubscribe(&$Id::new($bytes).unwrap());
+                    listener.$snapshot().unwrap();
+                    assert!(log().contains(concat!($prefix, "-retained-snapshot 0\n")));
+                    // Unknown unsubscriptions keep their borrowed-call contract.
+                    listener.unsubscribe(&$Id::new("never-subscribed").unwrap());
+                    let id = $Id::new($bytes).unwrap();
+                    listener.subscribe(&id);
+                    drop(id);
+                    drop(listener);
+                    let log = log();
+                    for operation in ["snapshot", "events", "unsubscribe", "destroy"] {
+                        assert!(
+                            log.contains(&format!("{}-retained-{operation} 1\n", $prefix)),
+                            "{log}"
+                        );
+                    }
+                }};
+            }
+            check_retention!(
+                SendListener,
+                SenderId,
+                SENDER_ID,
+                current_senders,
+                "send-listener"
+            );
+            check_retention!(
+                RecvListener,
+                ReceiverId,
+                RECEIVER_ID,
+                current_receivers,
+                "recv-listener"
+            );
         }
         "identifiers_round_trip_exactly" => {
             let mut senders = SendListener::new(&ndi, &listeners).unwrap();

@@ -7,12 +7,55 @@ use super::*;
 use crate::{ColorInfo, FrameMetadataStatus, PixelFormat, TransferFunction};
 use std::time::Duration;
 
-fn color(metadata: &str) -> ColorInfo {
-    crate::color_info::parse(Some(metadata)).unwrap().unwrap()
+#[test]
+fn allocation_kinds_describe_storage_without_misclassifying_the_input() {
+    let cases = [
+        (
+            "DiscoveryResults",
+            AllocationKind::DiscoveryResults,
+            "discovery results",
+        ),
+        (
+            "ImageScratch",
+            AllocationKind::ImageScratch,
+            "image scratch storage",
+        ),
+        (
+            "AllocatorLeases",
+            AllocationKind::AllocatorLeases,
+            "allocator lease storage",
+        ),
+        (
+            "QueuedCompletions",
+            AllocationKind::QueuedCompletions,
+            "completion storage",
+        ),
+        (
+            "ReceiveBuffer",
+            AllocationKind::ReceiveBuffer,
+            "receive buffer",
+        ),
+    ];
+    check_cases("AllocationKind", &cases);
+    for (_, kind, description) in cases {
+        for bytes in [None, Some(4096)] {
+            let (error, count) =
+                crate::test_alloc::allocation_count(|| allocation_failed(kind, bytes));
+            assert_eq!(count, 0);
+            assert!(
+                matches!(error, Error::AllocationFailed(cause) if cause == AllocationFailure { kind, bytes })
+            );
+            let expected = format!(
+                "Allocation failed: could not allocate {description}{}",
+                if bytes.is_some() { " (4096 bytes)" } else { "" }
+            );
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 }
 
-fn reserve_capacity_error() -> std::collections::TryReserveError {
-    Vec::<u8>::new().try_reserve(usize::MAX).unwrap_err()
+fn color(metadata: &str) -> ColorInfo {
+    crate::color_info::parse(Some(metadata)).unwrap().unwrap()
 }
 
 fn check_cases<E: std::fmt::Display>(name: &str, cases: &[(&str, E, &str)]) {
@@ -20,7 +63,7 @@ fn check_cases<E: std::fmt::Display>(name: &str, cases: &[(&str, E, &str)]) {
         assert_eq!(cause.to_string(), *expected, "{name}::{variant}");
     }
     // Keep the hand-written goldens exhaustive as the public taxonomy grows.
-    let source = if name == "InitializationFailure" {
+    let source = if matches!(name, "InitializationFailure" | "AllocationKind") {
         include_str!("../error.rs")
     } else {
         include_str!("defects.rs")
@@ -56,16 +99,13 @@ fn check_cases<E: std::fmt::Display>(name: &str, cases: &[(&str, E, &str)]) {
 fn frame_defect_diagnostics_preserve_their_text() {
     let cases = [
         ("UnknownEnvelopeCodec", FrameDefect::UnknownEnvelopeCodec { fourcc: 1094861636 }, "Unknown packet envelope codec FourCC: 0x41424344"),
-        ("Layout", FrameDefect::Layout(LayoutDefect::VideoZeroSize), "Video frame has zero calculated size"),
-        ("ImageScratchAllocation", FrameDefect::ImageScratchAllocation(reserve_capacity_error()), "image scratch allocation failed: memory allocation failed because the computed capacity exceeded the collection's maximum"),
+        ("Layout", FrameDefect::Layout(LayoutDefect::VideoZeroStride), "Video line stride must be positive, got 0"),
         ("ImageScratchOverflow", FrameDefect::ImageScratchOverflow, "image scratch size overflow"),
         ("ImageDimensionOverflow", FrameDefect::ImageDimensionOverflow, "image dimension overflow"),
-        ("ImageDimension", FrameDefect::ImageDimension { codec: ImageCodec::Jpeg, dimension: ImageDimension::Width, length: 6, maximum: 16 }, "JPEG width 6 exceeds maximum supported value 16"),
+        ("ImageDimension", FrameDefect::ImageDimension { codec: ImageCodecKind::Jpeg, dimension: ImageAxisKind::Width, length: 6, maximum: 16 }, "JPEG width 6 exceeds maximum supported value 16"),
         ("MetadataMissingTerminator", FrameDefect::MetadataMissingTerminator, "Metadata frame length does not include a trailing NUL terminator"),
         ("MetadataInteriorNul", FrameDefect::MetadataInteriorNul, "Metadata frame contains an interior NUL byte"),
         ("MetadataNullData", FrameDefect::MetadataNullData, "Metadata frame has non-zero length with null data pointer"),
-        ("MetadataEmpty", FrameDefect::MetadataEmpty, "Metadata length must include a trailing NUL terminator"),
-        ("MetadataLengthOverflow", FrameDefect::MetadataLengthOverflow, "Frame metadata length overflow while adding terminator"),
         ("NullVideoData", FrameDefect::NullVideoData, "Video frame has null data pointer"),
         ("NullAudioData", FrameDefect::NullAudioData, "Audio frame has null data pointer"),
         ("AudioMisaligned", FrameDefect::AudioMisaligned, "Audio data pointer is not aligned for f32"),
@@ -112,9 +152,7 @@ fn frame_defect_diagnostics_preserve_their_text() {
         ("UnknownScanType", FrameDefect::UnknownScanType { code: 1094861636 }, "Unknown scan type: 0x41424344"),
         ("AudioBufferTooSmall", FrameDefect::AudioBufferTooSmall { actual: 5, minimum: 12 }, "Audio buffer has 5 samples, requires at least 12"),
         ("MetadataNegativeLength", FrameDefect::MetadataNegativeLength { length: 6 }, "Metadata frame has negative length: 6"),
-        ("MetadataInvalidLength", FrameDefect::MetadataInvalidLength { length: 6 }, "Invalid metadata length value: 6"),
         ("MetadataTooLarge", FrameDefect::MetadataTooLarge { length: 6 }, "Metadata exceeds maximum size: 6 bytes > 4194304 bytes"),
-        ("MetadataSdkLength", FrameDefect::MetadataSdkLength { length: 6 }, "Metadata length 6 exceeds SDK i32 range"),
         ("MetadataUnterminated", FrameDefect::MetadataUnterminated, "Frame metadata is missing a NUL terminator within 4194304 bytes"),
         ("VideoDataLength", FrameDefect::VideoDataLength { actual: 5, expected: 12 }, "Video data length 5, expected 12 bytes for validated layout"),
         ("AudioDataLength", FrameDefect::AudioDataLength { detail: CompactDiagnostic::new(AudioLengthDefect { actual: 5, expected: 12, channels: 2, samples: 16 }) }, "Audio data length 5, expected 12 samples (2 channels x 16 samples) for validated layout"),
@@ -125,15 +163,14 @@ fn frame_defect_diagnostics_preserve_their_text() {
         ("FrameSyncAudioInput", FrameDefect::FrameSyncAudioInput { channels: 2, samples: 16 }, "FrameSync audio input-format query returned 2 channels of 16 samples"),
         ("VideoBufferTooSmall", FrameDefect::VideoBufferTooSmall { format: PixelFormat::Bgra, actual: 5, minimum: 12 }, "Buffer too small for Bgra: got 5 bytes, expected at least 12"),
         ("V210BufferTooSmall", FrameDefect::V210BufferTooSmall { actual: 5, minimum: 12 }, "V210 buffer has 5 words, requires 12"),
-        ("P216BufferTooSmall", FrameDefect::P216BufferTooSmall { actual: 5, minimum: 12 }, "P216 buffer has 5 bytes, requires 12"),
-        ("InterleavedAudioLength", FrameDefect::InterleavedAudioLength { actual: 5, channels: 2 }, "interleaved audio has 5 samples, which is not a non-zero multiple of 2 channels"),
+        ("InterleavedAudioLength", FrameDefect::InterleavedAudioLength { actual: 5, channels: 2 }, "interleaved audio has 5 samples, which is not a multiple of 2 channels"),
         ("AudioDestinationLength", FrameDefect::AudioDestinationLength { actual: 5, minimum: 12 }, "audio destination has 5 samples, requires 12"),
         ("CompressedAudioQuantities", FrameDefect::CompressedAudioQuantities { detail: CompactDiagnostic::new(CompressedAudioDefect { sample_rate: 48000, channels: 2, samples: 16 }) }, "Compressed audio of 48000 Hz, 2 channels and 16 samples per channel: each must be in 1..=2147483647"),
         ("ColorMetadataWithheld", FrameDefect::ColorMetadataWithheld { status: FrameMetadataStatus::NotUtf8 }, "The frame's color description cannot be read because its metadata was withheld (NotUtf8); ColorPolicy::Override explicitly supplies its color conversion"),
         ("ConflictingColorMetadata", FrameDefect::ConflictingColorMetadata { first: color("<ndi_color_info transfer='bt_709'/>"), second: color("<ndi_color_info transfer='bt_2100_hlg'/>") }, "The frame's metadata holds ndi_color_info elements that differ: ColorInfo { primaries: None, transfer: Some(Bt709), matrix: None } and ColorInfo { primaries: None, transfer: Some(Hlg), matrix: None }"),
         ("HdrRefused", FrameDefect::HdrRefused { transfer: TransferFunction::Pq }, "The frame's ndi_color_info gives the PQ transfer function; HdrPolicy::CodeValues encodes its code values to a tagged PNG"),
-        ("ColorMetadata", FrameDefect::ColorMetadata { issue: ColorMetadataIssue::UndefinedValue, diagnostic: "peer diagnostic".into() }, "peer diagnostic"),
-        ("EncodingFailed", FrameDefect::EncodingFailed { codec: ImageCodec::Jpeg, diagnostic: "peer diagnostic".into() }, "JPEG encoding failed: peer diagnostic"),
+        ("ColorMetadata", FrameDefect::ColorMetadata { issue: ColorMetadataDefect::UndefinedValue, diagnostic: "peer diagnostic".into() }, "peer diagnostic"),
+        ("EncodingFailed", FrameDefect::EncodingFailed { codec: ImageCodecKind::Jpeg, diagnostic: "peer diagnostic".into() }, "JPEG encoding failed: peer diagnostic"),
     ];
     check_cases("FrameDefect", &cases);
 }
@@ -141,7 +178,7 @@ fn frame_defect_diagnostics_preserve_their_text() {
 #[test]
 fn input_defect_diagnostics_preserve_their_text() {
     let cases = [
-        ("Layout", InputDefect::Layout(LayoutDefect::VideoZeroSize), "Video frame has zero calculated size"),
+        ("Layout", InputDefect::Layout(LayoutDefect::VideoZeroStride), "Video line stride must be positive, got 0"),
         ("InvalidSourceName", InputDefect::InvalidSourceName, "Source name must be nonempty and contain no NUL"),
         ("ListElement", InputDefect::ListElement { setting: "groups", index: 2 }, "groups element 2 must be nonempty and contain neither a comma nor a NUL"),
         ("InvalidHostQuery", InputDefect::InvalidHostQuery, "Host must be a bare hostname, IP address or NDI machine name"),
@@ -167,18 +204,15 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("ExternalAllocationTooSmall", InputDefect::ExternalAllocationTooSmall, "External allocation is smaller than the request's minimum"),
         ("ExternalAllocationTooLarge", InputDefect::ExternalAllocationTooLarge, "External allocation is larger than the request's capacity limit"),
         ("ExternalAllocationAlignment", InputDefect::ExternalAllocationAlignment, "External allocation is not aligned to 64 bytes"),
-        ("AllocatorLeaseStorage", InputDefect::AllocatorLeaseStorage, "Unable to reserve bounded allocator lease storage"),
         ("AllocatorGenerationBudget", InputDefect::AllocatorGenerationBudget, "Process allocator generation budget exhausted"),
         ("AllocatorTokensExhausted", InputDefect::AllocatorTokensExhausted, "Allocator token space exhausted"),
         ("AllocatorLimitsDiffer", InputDefect::AllocatorLimitsDiffer, "Allocator limits differ from the existing process allocator service"),
         ("ConfigurationTooLarge", InputDefect::ConfigurationTooLarge, "Advanced configuration exceeds its byte limit"),
         ("ConfigurationJson", InputDefect::ConfigurationJson, "Invalid Advanced configuration JSON"),
         ("ConfigurationNotObject", InputDefect::ConfigurationNotObject, "Advanced configuration must be a JSON object"),
-        ("ConfigurationNul", InputDefect::ConfigurationNul, "Advanced configuration contains NUL"),
         ("QueueLimits", InputDefect::QueueLimits, "queue requires 1..=65536 frames and a positive addressable byte limit"),
         ("QueueIdentifiersExhausted", InputDefect::QueueIdentifiersExhausted, "queue submission identifiers exhausted"),
         ("QueuedSenderRegistered", InputDefect::QueuedSenderRegistered, "queued conversion requires a sender without advertiser registrations"),
-        ("CompletionStorage", InputDefect::CompletionStorage, "unable to allocate bounded completion storage"),
         ("AvSyncStorageLimit", InputDefect::AvSyncStorageLimit, "AVSync request exceeds the supported audio storage limit"),
         ("TimeoutTooLong", InputDefect::TimeoutTooLong { requested: Duration::from_millis(4_294_967_295).into() }, "timeout 4294967.295s exceeds MAX_TIMEOUT (4294967294 ms, about 49.7 days)"),
         ("TimeoutInstantOverflow", InputDefect::TimeoutInstantOverflow { requested: Duration::from_millis(4_294_967_295).into() }, "timeout 4294967.295s ends at an instant this platform cannot represent"),
@@ -193,7 +227,6 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("AllocatorAudioStride", InputDefect::AllocatorAudioStride { stride: 7 }, "Audio allocator stride 7 is not a whole number of samples"),
         ("AllocationTooLarge", InputDefect::AllocationTooLarge { bytes: 268435457, limit: 268435456 }, "An allocation of 268435457 bytes exceeds the capacity limit of 268435456 bytes"),
         ("AllocationLayout", InputDefect::AllocationLayout { bytes: 268435457 }, "No allocation can hold 268435457 bytes"),
-        ("AllocationFailed", InputDefect::AllocationFailed { bytes: 268435457 }, "The global allocator did not supply 268435457 bytes"),
         ("KvmKeySymbol", InputDefect::KvmKeySymbol { keysym: 2147483648 }, "KVM key symbol 0x80000000 exceeds the SDK's range, 0..=0x7fffffff"),
         ("KvmPosition", InputDefect::KvmPosition { x: 1.25, y: -0.5 }, "KVM position (1.25, -0.5) is not within 0..=1 on each axis"),
         ("KvmWheel", InputDefect::KvmWheel { units: 2.5 }, "KVM wheel units 2.5 are not finite"),
@@ -216,9 +249,7 @@ fn input_defect_diagnostics_preserve_their_text() {
 #[test]
 fn sdk_result_defect_diagnostics_preserve_their_text() {
     let cases = [
-        ("DiscoveryAllocation", SdkResultDefect::DiscoveryAllocation, "could not reserve memory for discovery results"),
         ("UnknownCompletion", SdkResultDefect::UnknownCompletion, "native completion protocol failed; use QueuedSender::close to recover retained frames"),
-        ("FileTrackCountOverflow", SdkResultDefect::FileTrackCountOverflow, "video track count does not fit usize"),
         ("NegativeCount", SdkResultDefect::NegativeCount { operation: crate::sys::table::for_test((), c"native operation").function(), value: (-3).into() }, "native operation returned a negative count: -3"),
         ("UnterminatedText", SdkResultDefect::UnterminatedText { operation: crate::sys::table::for_test((), c"native operation").function() }, "native operation returned a string longer than the 4 MiB one string may be"),
         ("InvalidReceiveDelay", SdkResultDefect::InvalidReceiveDelay { millis: -3 }, "SDK returned invalid receive delay: -3 ms"),
@@ -244,19 +275,9 @@ fn discovery_defect_diagnostics_preserve_their_text() {
             "SDK discovery array span overflow",
         ),
         (
-            "UnterminatedString",
-            DiscoveryDefect::UnterminatedString,
-            "SDK discovery string exceeds its 4 MiB bound",
-        ),
-        (
             "NullArray",
             DiscoveryDefect::NullArray,
             "SDK discovery array is null with a nonzero count",
-        ),
-        (
-            "ArrayCountOverflow",
-            DiscoveryDefect::ArrayCountOverflow,
-            "SDK discovery array count overflow",
         ),
     ];
     check_cases("DiscoveryDefect", &cases);
@@ -265,20 +286,20 @@ fn discovery_defect_diagnostics_preserve_their_text() {
 #[test]
 fn image_codec_diagnostics_preserve_their_text() {
     let cases = [
-        ("Png", ImageCodec::Png, "PNG"),
-        ("Jpeg", ImageCodec::Jpeg, "JPEG"),
-        ("Webp", ImageCodec::Webp, "WebP"),
+        ("Png", ImageCodecKind::Png, "PNG"),
+        ("Jpeg", ImageCodecKind::Jpeg, "JPEG"),
+        ("Webp", ImageCodecKind::Webp, "WebP"),
     ];
-    check_cases("ImageCodec", &cases);
+    check_cases("ImageCodecKind", &cases);
 }
 
 #[test]
 fn image_dimension_diagnostics_preserve_their_text() {
     let cases = [
-        ("Width", ImageDimension::Width, "width"),
-        ("Height", ImageDimension::Height, "height"),
+        ("Width", ImageAxisKind::Width, "width"),
+        ("Height", ImageAxisKind::Height, "height"),
     ];
-    check_cases("ImageDimension", &cases);
+    check_cases("ImageAxisKind", &cases);
 }
 
 #[test]
@@ -301,13 +322,13 @@ fn initialization_diagnostics_preserve_their_text() {
 #[test]
 fn color_metadata_issue_diagnostics_preserve_supplied_peer_text() {
     for issue in [
-        ColorMetadataIssue::UnclosedElement,
-        ColorMetadataIssue::AttributeStart,
-        ColorMetadataIssue::MissingValue,
-        ColorMetadataIssue::UnquotedValue,
-        ColorMetadataIssue::UnclosedValue,
-        ColorMetadataIssue::DuplicateAttribute,
-        ColorMetadataIssue::UndefinedValue,
+        ColorMetadataDefect::UnclosedElement,
+        ColorMetadataDefect::AttributeStart,
+        ColorMetadataDefect::MissingValue,
+        ColorMetadataDefect::UnquotedValue,
+        ColorMetadataDefect::UnclosedValue,
+        ColorMetadataDefect::DuplicateAttribute,
+        ColorMetadataDefect::UndefinedValue,
     ] {
         let cause = FrameDefect::ColorMetadata {
             issue,
@@ -367,10 +388,7 @@ fn layout_defect_diagnostics_preserve_their_text() {
         ("FrameRate", LayoutDefect::FrameRate { detail: CompactDiagnostic::new(FrameRateDefect { numerator: 30, denominator: 0 }) }, "Invalid frame rate 30/0: both parts must be in 1..=2147483647"),
         ("CompressedVideoDimensions", LayoutDefect::CompressedVideoDimensions { detail: CompactDiagnostic::new(VideoDimensionsDefect { width: 8, height: 4 }) }, "Compressed video dimensions 8x4 must each be in 1..=2147483647"),
         ("VideoZeroStride", LayoutDefect::VideoZeroStride, "Video line stride must be positive, got 0"),
-        ("VideoAllocationOverflow", LayoutDefect::VideoAllocationOverflow, "Video send allocation size overflow"),
-        ("VideoZeroSize", LayoutDefect::VideoZeroSize, "Video frame has zero calculated size"),
         ("VideoBufferOverflow", LayoutDefect::VideoBufferOverflow, "Video buffer size overflow"),
-        ("VideoPayloadOverflow", LayoutDefect::VideoPayloadOverflow, "Video payload size overflow"),
         ("AudioStrideRange", LayoutDefect::AudioStrideRange, "Audio channel stride exceeds i32 range"),
         ("VideoWidth", LayoutDefect::VideoWidth((-3).into()), "Video frame has invalid width: -3"),
         ("VideoOddWidth", LayoutDefect::VideoOddWidth((-3).into()), "NDI video frames require even width, got -3"),

@@ -146,17 +146,32 @@ impl ImageFormat {
 ///
 /// # Color
 ///
-/// By default, YUV frames use BT.709, limited range and repeated chroma,
-/// unless `ndi_color_info` metadata ([`ColorInfo`](crate::ColorInfo)) names
-/// another matrix. [`ColorPolicy::Override`] replaces the matrix and range.
-/// See [`ColorPolicy`] for malformed metadata handling.
+/// By default, YUV frames use limited range and repeated chroma, with the
+/// matrix in readable `ndi_color_info` metadata ([`ColorInfo`](crate::ColorInfo)),
+/// or BT.709 when untagged. [`ColorPolicy::Override`] replaces the matrix and
+/// range. See [`ColorPolicy`] for malformed metadata handling.
+///
+/// The SDK's own YUV-to-RGB conversion always uses BT.709 limited range,
+/// whatever the tag says. RGB-received frames already carry that conversion:
+/// encoding keeps their RGB pixels, so the tag's matrix can no longer be
+/// applied. Readable tags still decide HDR refusal and the PNG `cICP` chunk.
+/// For tagged sources, receive YUV with
+/// [`ReceiverColorFormat::UyvyBgra`](crate::ReceiverColorFormat::UyvyBgra) or
+/// [`UyvyRgba`](crate::ReceiverColorFormat::UyvyRgba); use
+/// [`ReceiverColorFormat::Best`](crate::ReceiverColorFormat::Best) to retain
+/// high bit depth and HDR code values.
 ///
 /// # HDR
 ///
 /// A frame tagged with the PQ or HLG transfer function is refused unless
 /// [`HdrPolicy::CodeValues`] asks for its code values, which only PNG can
 /// carry, tagged so that an HDR-aware viewer shows them correctly. Nothing is
-/// tone-mapped. See [`HdrPolicy`].
+/// tone-mapped. Receive YUV with
+/// [`ReceiverColorFormat::Best`](crate::ReceiverColorFormat::Best) to retain
+/// high bit depth and HDR code values: an RGB-received frame already holds
+/// the SDK's BT.709 limited-range conversion, which encoding at 16 bits cannot
+/// undo. The passed-through tag still controls HDR refusal and the PNG `cICP`
+/// chunk. See [`HdrPolicy`].
 ///
 /// # Performance
 ///
@@ -208,6 +223,8 @@ impl ImageFormat {
 /// | Unreadable `ndi_color_info` with [`ColorPolicy::Sdk`] | [`Error::InvalidFrame`] |
 /// | An image wider or taller than JPEG's 65,535, lossless WebP's 16,384 or lossy WebP's 16,383 pixels | [`Error::InvalidFrame`] |
 /// | Writing or flushing the writer given to `encode_image_to` fails | [`Error::Io`] |
+/// | The required conversion scratch size overflows | [`Error::InvalidFrame`] |
+/// | Conversion scratch cannot be allocated | [`Error::AllocationFailed`] |
 /// | The codec fails for another reason | [`Error::InvalidFrame`] |
 ///
 /// `ImageOptions` holds settings only, no buffers, so one value serves any
@@ -215,6 +232,7 @@ impl ImageFormat {
 ///
 /// [`VideoFrame::encode_image`]: crate::VideoFrame::encode_image
 /// [`Error::InvalidInput`]: crate::Error::InvalidInput
+/// [`Error::AllocationFailed`]: crate::Error::AllocationFailed
 /// [`Error::InvalidFrame`]: crate::Error::InvalidFrame
 /// [`Error::Io`]: crate::Error::Io
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -390,7 +408,8 @@ impl ImageOptions {
 /// How YUV frames are converted to RGB.
 ///
 /// RGB frames are encoded as they are; the policy still decides whether
-/// their `ndi_color_info` must be readable.
+/// their `ndi_color_info` must be readable. RGB-received frames already carry
+/// the SDK's BT.709 limited-range YUV conversion, whatever that tag says.
 ///
 /// This enum is marked `#[non_exhaustive]` so that policies can be added
 /// without a breaking change.
@@ -401,6 +420,14 @@ pub enum ColorPolicy {
     /// `ndi_color_info` metadata names another matrix, which is then used.
     /// An untagged source with different color encoding needs
     /// [`ColorPolicy::Override`].
+    ///
+    /// RGB-received frames already hold the SDK's BT.709 limited-range
+    /// conversion, which ignores the tag; this policy cannot apply its matrix
+    /// afterward. Tags still decide HDR refusal and the PNG `cICP` chunk.
+    /// Receive YUV with
+    /// [`ReceiverColorFormat::UyvyBgra`](crate::ReceiverColorFormat::UyvyBgra),
+    /// [`UyvyRgba`](crate::ReceiverColorFormat::UyvyRgba), or
+    /// [`Best`](crate::ReceiverColorFormat::Best) when the tag's matrix matters.
     ///
     /// A frame whose `ndi_color_info` cannot be read, including received
     /// metadata withheld as non-UTF-8 or unterminated text, is refused with
@@ -527,6 +554,12 @@ pub enum HdrPolicy {
     /// a `cICP` chunk that tells an HDR-aware viewer their primaries and
     /// transfer function. Use [`SampleDepth::Sixteen`] to keep a
     /// high-bit-depth frame's precision.
+    ///
+    /// RGB-received frames already contain the SDK's BT.709 limited-range
+    /// conversion, whatever `ndi_color_info` says; 16-bit output cannot recover
+    /// their original HDR code values. Receive YUV with
+    /// [`ReceiverColorFormat::Best`](crate::ReceiverColorFormat::Best) to keep
+    /// them. The tag still decides HDR refusal and the PNG `cICP` chunk.
     ///
     /// JPEG and WebP refuse such a frame with
     /// [`Error::InvalidInput`](crate::Error::InvalidInput): this encoder only

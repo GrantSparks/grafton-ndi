@@ -551,7 +551,8 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
             continue;
         }
         // The macOS File library can leave the file that a source switch
-        // closes unfinalized (the README's known issues).
+        // closes unfinalized, as measured at:
+        // https://github.com/GrantSparks/grafton-ndi/blob/226fa3ef36196bd20c3f0060c3fa0e233b700ace/README.md#file-library-ndi-64
         if cfg!(target_os = "macos") && *file == switched {
             test_support::unsupported(
                 "finalizing a file that a source switch closes, which the macOS File library can \

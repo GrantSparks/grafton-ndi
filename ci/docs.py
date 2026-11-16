@@ -7,7 +7,8 @@ available. External pages are outside this check. With --compile, standalone
 Rust fences are compiled (never run) against the current crate and locked
 versions of its dependencies. Use a linked runnable example for code fragments.
 With --rustdoc, GitHub Pages API URLs and current-version docs.rs URLs are
-checked against generated HTML.
+checked against generated HTML. Prose API names in current guides are checked
+against the same item and member names.
 Documented dependency features and the README feature table are checked against
 Cargo.toml so removed or renamed features cannot remain in install instructions.
 Native table entry points need public SDK search aliases or an explicit internal
@@ -696,9 +697,12 @@ class HtmlAnchors(HTMLParser):
     def __init__(self):
         super().__init__()
         self.found = set()
+        self.links = set()
 
     def handle_starttag(self, tag, attrs):
         for name, value in attrs:
+            if value and tag == 'a' and name == 'href':
+                self.links.add(value)
             if value and (name == 'id' or (tag == 'a' and name == 'name')):
                 self.found.add(value)
 
@@ -738,6 +742,90 @@ def rustdoc_violations(root, directory):
                     cache[path] = parser.found
                 if unquote(parsed.fragment) not in cache[path]:
                     found.append(f'{label}: missing generated rustdoc anchor: {url}')
+    return found
+
+
+# Native XML vocabulary is not a Rust API item. Keep exceptions explicit so
+# a rename cannot silently inherit a broad SDK-name exemption.
+NON_API_CODE_NAMES = {'ndi_color_info'}
+RUSTDOC_ITEM = re.compile(r'(?:struct|enum|trait|type|fn|constant|static|macro|union)\.([A-Za-z_]\w*)\.html$')
+RUSTDOC_MEMBER = re.compile(r'(?:method|tymethod|associatedconstant|associatedtype|variant|structfield)\.([A-Za-z_]\w*)(?:-\d+)?$')
+
+
+def documented_api_names(directory):
+    """Names reachable from the current crate index, excluding stale HTML."""
+    crate = (directory / 'grafton_ndi').resolve()
+    names, qualified = {'grafton_ndi'}, set()
+    pending, visited = [crate / 'index.html'], set()
+    while pending:
+        page = pending.pop()
+        if page in visited:
+            continue
+        visited.add(page)
+        item = RUSTDOC_ITEM.fullmatch(page.name)
+        owner = item.group(1) if item else None
+        if owner:
+            names.add(owner)
+        elif page.name == 'index.html':
+            names.add(page.parent.name)
+        parser = HtmlAnchors()
+        parser.feed(page.read_text(encoding='utf-8'))
+        for anchor in parser.found:
+            member = RUSTDOC_MEMBER.fullmatch(anchor)
+            if member:
+                name = member.group(1)
+                names.add(name)
+                if owner:
+                    qualified.add(f'{owner}::{name}')
+        for link in parser.links:
+            parsed = urlsplit(link)
+            if parsed.scheme or parsed.netloc or not parsed.path:
+                continue
+            target = (page.parent / unquote(parsed.path)).resolve()
+            if target.is_relative_to(crate) and target.suffix == '.html' and target.is_file():
+                pending.append(target)
+    return names, qualified
+
+
+def guide_api_name_violations(root, directory):
+    """Reject stale API identifiers in prose code spans, excluding history."""
+    root, directory = root.resolve(), directory.resolve()
+    if not (directory / 'grafton_ndi/index.html').is_file():
+        return ['missing generated rustdoc crate index: grafton_ndi/index.html']
+    names, qualified = documented_api_names(directory)
+    # Guide link labels also use Cargo example target names without .rs.
+    names.update(example.stem for example in (root / 'examples').glob('*.rs'))
+    found = []
+    for source in documents(root):
+        relative = source.relative_to(root)
+        if source.name == 'CHANGELOG.md' or relative == Path('docs/api-conventions.md') or relative.parts[:2] == ('docs', 'migration'):
+            continue
+        text = source.read_text(encoding='utf-8')
+        excluded = set()
+        for first, last, _, _ in fences(text):
+            excluded.update(range(first, (last or len(text.splitlines())) + 1))
+        for line, content in enumerate(text.splitlines(), 1):
+            if line in excluded:
+                continue
+            for span in re.finditer(r'(?P<ticks>`+)(?P<code>.+?)(?P=ticks)', content):
+                token = span.group('code').strip()
+                if token in NON_API_CODE_NAMES:
+                    continue
+                # Paths, files, target triples and globs cannot match either
+                # identifier form. Module paths contain no uppercase owner.
+                member = re.fullmatch(r'(?:[a-z_]\w*::)*([A-Z]\w*)::([A-Za-z_]\w*)(?:\([^()]*\)?)?', token)
+                call = re.fullmatch(r'([a-z]\w*)\([^()]*\)?', token)
+                snake = re.fullmatch(r'[a-z][a-z0-9]*(?:_[a-z0-9]+)+', token)
+                if member:
+                    present = f'{member.group(1)}::{member.group(2)}' in qualified
+                elif call:
+                    present = call.group(1) in names
+                elif snake:
+                    present = token in names
+                else:
+                    continue
+                if not present:
+                    found.append(f'{relative}:{line}: unknown documented API name: {token}')
     return found
 
 
@@ -781,6 +869,7 @@ def main():
     if args.rustdoc:
         found.extend(rustdoc_violations(ROOT, args.rustdoc))
         found.extend(parameter_name_violations(ROOT, args.rustdoc))
+        found.extend(guide_api_name_violations(ROOT, args.rustdoc))
     if not found and args.compile:
         found.extend(compile_snippets(ROOT, snippets))
     for message in found:

@@ -28,7 +28,20 @@
 //! 2. the directory containing the running executable;
 //! 3. the absolute directory named by `NDI_RUNTIME_DIR_V6`; relative values
 //!    are recorded as refused locations and never searched;
-//! 4. the platform loader's own search for the library name.
+//! 4. platform-specific locations: Windows expands absolute `PATH` directories,
+//!    then performs a System32-only name lookup; macOS tries `@rpath/<name>`
+//!    and absolute `DYLD_LIBRARY_PATH` directories; Linux and Android retain
+//!    the native loader search (`rpath`, `LD_LIBRARY_PATH` and system locations).
+//!
+//! Windows and macOS never add the working directory to this search. Relative
+//! or empty `PATH`/`DYLD_LIBRARY_PATH` entries are recorded as refused locations.
+//! On macOS, any relative or empty `DYLD_LIBRARY_PATH` entry refuses the whole
+//! default search before opening a library: dyld applies these overrides even
+//! to absolute and `@rpath` requests. Explicit paths retain dyld's own policy.
+//! In unrestricted macOS processes dyld can substitute `DYLD_LIBRARY_PATH`
+//! even for an absolute path; the crate refuses a substitute with
+//! [`crate::LoadRefusal::ResolvedToAnotherFile`]. Native dependencies still
+//! follow platform loader rules.
 //!
 //! When nothing is usable, [`Error::RuntimeLoadFailed`] carries a
 //! [`crate::LoadFailure`] for [`crate::LibraryKind::File`], with each attempted
@@ -74,8 +87,12 @@
 //! only when it is [`FinishStatus::Closed`], and inspect the [`RecordingReport`]
 //! for errors during the session. [`RecordingReport::stopped_by_sdk`] says
 //! whether the SDK ended the session before it was asked to stop. Dropping a
-//! recorder whose session is still open performs the same stop and wait,
-//! bounded by [`FileRecorderOptions::drop_wait`], but cannot report the outcome.
+//! recorder whose session is still open requests the stop and waits within
+//! [`FileRecorderOptions::drop_wait`], but cannot report the outcome. This
+//! budget starts at drop (or async close submission) and includes the native
+//! stop; after it returns, only the remaining budget is available for events.
+//! Synchronous [`FileRecorder::finish`] instead measures its event wait from
+//! the stop's return, giving finalization the full requested wait.
 //!
 //! After a finalization timeout, [`FileRecorder::reset`] explicitly abandons
 //! the uncertain session and replaces its native instance. The old report is
@@ -169,6 +186,8 @@ mod out_param;
 mod player;
 mod recorder;
 mod types;
+#[cfg(windows)]
+mod windows_permissions;
 
 pub use asynchronous::{
     AsyncFileOptions, AsyncFilePlayer, AsyncFileRecorder, FileEventFuture, FileOperation,

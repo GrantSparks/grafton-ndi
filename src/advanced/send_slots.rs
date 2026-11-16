@@ -1,6 +1,6 @@
 //! Stable native descriptor storage with move-only initialization rights.
 
-use std::{mem::MaybeUninit, sync::Arc};
+use std::{cell::UnsafeCell, mem::MaybeUninit, sync::Arc};
 
 use super::aliasable::AliasableBox;
 use crate::{sender::in_flight::Destroyed, sys::bindings::NDIlib_video_frame_v2_t};
@@ -9,11 +9,11 @@ use crate::{Error, Result};
 
 #[cfg(any(test, ndi_has_advanced_send_completion, ndi_has_advanced_scatter_send))]
 pub(super) fn unavailable(_: std::collections::TryReserveError) -> Error {
-    Error::InvalidInput(crate::InputDefect::CompletionStorage)
+    crate::error::allocation_failed(crate::AllocationKind::QueuedCompletions, None)
 }
 
 struct Slot {
-    header: MaybeUninit<NDIlib_video_frame_v2_t>,
+    header: UnsafeCell<MaybeUninit<NDIlib_video_frame_v2_t>>,
 }
 
 pub(super) struct DescriptorSlots {
@@ -26,8 +26,9 @@ pub(super) struct DescriptorSlots {
 // creates a lease that can initialize the slot, and a native-release proof is
 // required to recover its key. Shared access never reads descriptor bytes.
 unsafe impl Send for DescriptorSlots {}
-// SAFETY: native loans use disjoint slots; moving/sharing the owner does not
-// create references into descriptor storage or duplicate initialization rights.
+// SAFETY: native loans use disjoint slots, and each slot is initialized only
+// through its UnsafeCell by its sole key. Shared access cannot read descriptor
+// bytes or duplicate initialization rights.
 unsafe impl Sync for DescriptorSlots {}
 
 /// Exclusive initialization rights to one slot of one storage allocation.
@@ -44,7 +45,7 @@ impl SlotKey {
         // SAFETY: this sole move-only key grants exclusive initialization of
         // its aligned slot. The resulting lease permits no further writes.
         unsafe {
-            std::ptr::addr_of_mut!((*slot).header)
+            UnsafeCell::raw_get(std::ptr::addr_of!((*slot).header))
                 .cast::<NDIlib_video_frame_v2_t>()
                 .write(descriptor)
         };
@@ -75,7 +76,7 @@ impl DescriptorSlots {
         let mut storage = Vec::new();
         storage.try_reserve_exact(len).map_err(unavailable)?;
         storage.resize_with(len, || Slot {
-            header: MaybeUninit::uninit(),
+            header: UnsafeCell::new(MaybeUninit::uninit()),
         });
         let owner = Arc::new(Self {
             storage: AliasableBox::new(storage.into_boxed_slice()),
@@ -112,13 +113,40 @@ impl DescriptorLease {
         let slot = self.key.owner.slot(self.key.index);
         // SAFETY: claim initialized this lease's stable slot. Forming its
         // address borrows no descriptor bytes while native code reads them.
-        unsafe { std::ptr::addr_of!((*slot).header).cast::<NDIlib_video_frame_v2_t>() }
+        unsafe {
+            UnsafeCell::raw_get(std::ptr::addr_of!((*slot).header))
+                .cast::<NDIlib_video_frame_v2_t>()
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A safe shared view of the whole allocation may coexist with writes to
+    /// another key's slot: only the UnsafeCell contents are initialized.
+    #[test]
+    fn shared_slot_storage_allows_another_key_to_initialize_its_cell() {
+        #[inline(never)]
+        fn claim_while_shared(slots: &[Slot], key: SlotKey) {
+            let descriptor = NDIlib_video_frame_v2_t {
+                xres: 1920,
+                yres: 1080,
+                ..Default::default()
+            };
+            let lease = key.claim(descriptor);
+            // SAFETY: this test owns the lease, and has not lent it to native
+            // code. The descriptor was initialized by claim and is live.
+            assert_eq!(unsafe { (*lease.as_ptr()).xres }, 1920);
+            assert_eq!(slots.len(), 2);
+        }
+
+        let mut keys = DescriptorSlots::allocate_keys(2).unwrap();
+        let key = keys.pop().unwrap();
+        let owner = Arc::clone(&keys[0].owner);
+        claim_while_shared(&owner.storage, key);
+    }
 
     /// Compile the actual storage module and release-proof declarations.
     /// The accepted fixture rules out unrelated imports or privacy failures;
@@ -222,6 +250,17 @@ mod send_slots;
             }
         }
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn impossible_descriptor_reservation_reports_storage_exhaustion() {
+        assert!(matches!(
+            DescriptorSlots::allocate_keys(usize::MAX),
+            Err(Error::AllocationFailed(crate::AllocationFailure {
+                kind: crate::AllocationKind::QueuedCompletions,
+                bytes: None,
+            }))
+        ));
     }
 
     #[test]

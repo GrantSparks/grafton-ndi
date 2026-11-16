@@ -20,7 +20,7 @@ shows nothing about the wrapper. A timeout or any other outcome still fails, and
 so does a refused public TCP connection.
 
 Only the calling process is exercised. What each runner confines beyond that,
-and what it does not, is described in ci/README.md.
+and what it does not, is described in (ci/README.md, "Loopback-only test runs").
 """
 import argparse
 import errno

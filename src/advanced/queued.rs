@@ -607,6 +607,38 @@ impl CallbackState {
         Ok(())
     }
 
+    /// Publish failure under the same lock that orders a waiter's check and
+    /// park. Recover poison because a bookkeeping panic also reaches here.
+    #[cfg(any(test, ndi_has_advanced_send_completion))]
+    fn publish_protocol_failure(&self) {
+        let _state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.protocol_error.store(true, Ordering::Release);
+        self.changed.notify_all();
+    }
+
+    fn next_completed(&self, deadline: Deadline) -> Result<Option<CompletedVideo>> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(frame) = take_completed(&mut state) {
+                return Ok(Some(frame));
+            }
+            if self.protocol_error.load(Ordering::Acquire) {
+                return Err(Error::UnexpectedSdkResult(
+                    crate::SdkResultDefect::UnknownCompletion,
+                ));
+            }
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|p| p.into_inner());
+            state = next;
+        }
+    }
+
     /// Record that the SDK has finished with the frame whose data is at
     /// `address`. Runs on an SDK thread.
     ///
@@ -629,7 +661,11 @@ impl CallbackState {
             }
             // No frame in flight has this data: the SDK named a frame twice,
             // or one it was never given.
-            None => self.protocol_error.store(true, Ordering::Release),
+            None => {
+                drop(state);
+                self.publish_protocol_failure();
+                return;
+            }
         }
         self.changed.notify_all();
     }
@@ -649,8 +685,7 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
     // `QueuedSender` releases the state only after that.
     let state = unsafe { &*opaque.cast::<CallbackState>() };
     if frame.is_null() {
-        state.protocol_error.store(true, Ordering::Release);
-        state.changed.notify_all();
+        state.publish_protocol_failure();
         return;
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -660,8 +695,7 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
         state.complete(unsafe { (*frame).p_data } as usize);
     }));
     if result.is_err() {
-        state.protocol_error.store(true, Ordering::Release);
-        state.changed.notify_all();
+        state.publish_protocol_failure();
     }
 }
 
@@ -669,8 +703,14 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 ///
 /// An ordinary asynchronous send must wait for the previous frame before it
 /// can accept the next. This sender instead keeps every submitted frame until
-/// the SDK reports it complete, so submission never waits on a slow
-/// connection, up to the limits in [`QueueLimits`]. No application code runs
+/// the SDK reports it complete, so accepting another frame does not require
+/// waiting for an earlier completion, up to the limits in [`QueueLimits`].
+/// With [`SenderOptions::clock_video`] enabled, the default, the SDK still
+/// paces video inside each submission call: the first can return immediately,
+/// while later calls wait for the next frame time. Set `clock_video(false)`
+/// and pace submissions in the application, or use [`super::Genlock`], to
+/// avoid that frame-rate wait. Native back-pressure can also block a call.
+/// No application code runs
 /// on an SDK thread: completed frames are collected with
 /// [`try_next_completed`](Self::try_next_completed) or
 /// [`next_completed`](Self::next_completed) and can be reused.
@@ -703,7 +743,8 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 /// let ndi = Ndi::new()?;
 /// let mut sender = QueuedSender::new(
 ///     &ndi,
-///     &SenderOptions::new("Queued"),
+///     // Completion-based sends are paced by the application.
+///     &SenderOptions::new("Queued").clock_video(false),
 ///     &QueueLimits::default().max_frames(4),
 /// )?;
 /// let id = sender.try_submit(VideoFrame::builder().resolution(1920, 1080).build()?)?;
@@ -759,7 +800,8 @@ impl QueuedSender {
     ///
     /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
     /// build without the Advanced SDK), [`Error::InvalidInput`] for
-    /// limits outside their range, and the errors of [`Sender::new`].
+    /// limits outside their range, [`Error::AllocationFailed`] when completion
+    /// storage cannot be reserved, and the errors of [`Sender::new`].
     #[doc(alias = "NDIlib_send_set_video_async_completion")]
     pub fn new(ndi: &Ndi, options: &SenderOptions, limits: &QueueLimits) -> Result<Self> {
         let table = ndi.table::<SendCompletion>()?;
@@ -783,6 +825,7 @@ impl QueuedSender {
     /// limits outside their range or a sender that is registered with an
     /// advertiser (a registration keeps the native sender alive after this
     /// value is dropped, when the completion state no longer exists).
+    /// [`Error::AllocationFailed`] when completion storage cannot be reserved.
     #[doc(alias = "NDIlib_send_set_video_async_completion")]
     pub fn from_sender(
         sender: Sender,
@@ -874,6 +917,12 @@ impl QueuedSender {
     }
 
     /// Queue a frame without waiting for an earlier submission to complete.
+    ///
+    /// With [`SenderOptions::clock_video`] enabled, the default, the SDK paces
+    /// video to its frame rate inside this call. The first submission can
+    /// return immediately; subsequent calls wait for the next frame time.
+    /// Disable video clocking and pace the application, or use
+    /// [`super::Genlock`], to avoid this wait. SDK back-pressure can still block.
     ///
     /// The queue owns the frame until it is collected: the SDK writes to a
     /// compressed frame's bytes while it sends them. A collected frame can be
@@ -998,34 +1047,7 @@ impl QueuedVideo<'_> {
     ///
     /// As for [`QueuedSender::next_completed`].
     pub fn next_completed(&mut self, timeout: Duration) -> Result<Option<CompletedVideo>> {
-        let deadline = Deadline::after(timeout)?;
-        let mut state = self
-            .pair
-            .loans()
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        loop {
-            if let Some(frame) = take_completed(&mut state) {
-                return Ok(Some(frame));
-            }
-            if self.pair.loans().protocol_error.load(Ordering::Acquire) {
-                return Err(Error::UnexpectedSdkResult(
-                    crate::SdkResultDefect::UnknownCompletion,
-                ));
-            }
-            let remaining = deadline.remaining();
-            if remaining.is_zero() {
-                return Ok(None);
-            }
-            let (next, _) = self
-                .pair
-                .loans()
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|p| p.into_inner());
-            state = next;
-        }
+        self.pair.loans().next_completed(Deadline::after(timeout)?)
     }
 
     /// See [`QueuedSender::retained_frames`].
@@ -1051,6 +1073,42 @@ fn take_completed(state: &mut State) -> Option<CompletedVideo> {
 mod tests {
     use super::*;
     use crate::frames::VideoPartsExt;
+
+    #[test]
+    fn completed_packet_debug_is_bounded_by_fields_not_payload() {
+        use crate::advanced::{
+            packets::testing::assert_bounded_debug, EnvelopeCodec, PacketEnvelope, VideoCodec,
+            VideoPacketFormat,
+        };
+        let summaries = |size| {
+            let bytes =
+                PacketEnvelope::encode(EnvelopeCodec::H264, 17, 13, true, &vec![7; size], &[1, 2])
+                    .unwrap();
+            let format = VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap();
+            [
+                QueuedVideoFrame::Compressed(
+                    CompressedVideoFrame::new(format, bytes.clone()).unwrap(),
+                ),
+                QueuedVideoFrame::Scatter(
+                    ScatterVideoFrame::new(
+                        format,
+                        vec![bytes[..44].to_vec(), bytes[44..].to_vec()],
+                    )
+                    .unwrap(),
+                ),
+            ]
+            .map(|frame| {
+                format!(
+                    "{:?}",
+                    CompletedVideo {
+                        id: SubmissionId(1),
+                        frame
+                    }
+                )
+            })
+        };
+        assert_bounded_debug(&summaries(1024), &summaries(1024 * 1024));
+    }
 
     #[test]
     fn split_submission_reuses_reserved_descriptors() {

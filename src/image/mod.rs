@@ -5,9 +5,13 @@
 //! exposes `encode_image`, `encode_image_to` and `encode_image_data_url`.
 //! [`ImageWorkspace`] reuses conversion storage across repeated encodes.
 //!
-//! Encoding validates the frame and options before writing output. YUV input
-//! follows the SDK color conventions by default; explicit options select other
-//! color handling and HDR code values.
+//! Encoding validates the frame and options before writing output. By default,
+//! YUV input uses the matrix in readable `ndi_color_info`, or BT.709 limited
+//! range when untagged. The SDK's own YUV-to-RGB conversion always uses BT.709
+//! limited range, ignoring that tag. RGB-received frames already carry that
+//! conversion; the tag still controls HDR refusal and a PNG's `cICP` chunk.
+//! Receive YUV when its tagged matrix or original HDR code values matter; see
+//! the color and HDR guidance on [`ImageOptions`].
 
 mod color;
 mod downscale;
@@ -346,16 +350,19 @@ std::thread_local! {
 
 /// Resize only after checked geometry; retain capacity between encodes.
 fn resize_scratch<T: Default + Clone>(scratch: &mut Vec<T>, len: usize) -> Result<()> {
+    let unavailable = || {
+        crate::error::allocation_failed(
+            crate::AllocationKind::ImageScratch,
+            len.checked_mul(size_of::<T>()),
+        )
+    };
     #[cfg(test)]
     if len > scratch.capacity() && FAIL_SCRATCH_RESERVATION.with(|fail| fail.replace(false)) {
-        let error = Vec::<u8>::new().try_reserve_exact(usize::MAX).unwrap_err();
-        return Err(Error::InvalidFrame(
-            crate::FrameDefect::ImageScratchAllocation(error),
-        ));
+        return Err(unavailable());
     }
     scratch
         .try_reserve_exact(len.saturating_sub(scratch.len()))
-        .map_err(|error| Error::InvalidFrame(crate::FrameDefect::ImageScratchAllocation(error)))?;
+        .map_err(|_| unavailable())?;
     scratch.resize(len, T::default());
     Ok(())
 }
@@ -607,17 +614,20 @@ impl<'a> Plan<'a> {
         // Preserve codec dimension diagnostics before checking conversion storage.
         match format {
             ImageFormat::Png => {}
-            ImageFormat::Jpeg(_) => {
-                check_size(crate::ImageCodec::Jpeg, width, height, jpeg::MAX_DIMENSION)?
-            }
+            ImageFormat::Jpeg(_) => check_size(
+                crate::ImageCodecKind::Jpeg,
+                width,
+                height,
+                jpeg::MAX_DIMENSION,
+            )?,
             ImageFormat::WebpLossless => check_size(
-                crate::ImageCodec::Webp,
+                crate::ImageCodecKind::Webp,
                 width,
                 height,
                 webp::MAX_LOSSLESS_DIMENSION,
             )?,
             ImageFormat::WebpLossy(_) => check_size(
-                crate::ImageCodec::Webp,
+                crate::ImageCodecKind::Webp,
                 width,
                 height,
                 webp::MAX_LOSSY_DIMENSION,
@@ -738,10 +748,10 @@ fn cicp(color: &ColorInfo) -> Option<[u8; 4]> {
 }
 
 /// Refuse an image larger than its codec can write.
-fn check_size(codec: crate::ImageCodec, width: usize, height: usize, max: usize) -> Result<()> {
+fn check_size(codec: crate::ImageCodecKind, width: usize, height: usize, max: usize) -> Result<()> {
     for (dimension, length) in [
-        (crate::ImageDimension::Width, width),
-        (crate::ImageDimension::Height, height),
+        (crate::ImageAxisKind::Width, width),
+        (crate::ImageAxisKind::Height, height),
     ] {
         if length > max {
             return Err(Error::InvalidFrame(crate::FrameDefect::ImageDimension {

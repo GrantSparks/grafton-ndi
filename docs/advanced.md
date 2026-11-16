@@ -103,6 +103,9 @@ received storage into a sendable frame; a refusal returns the original packet.
 Borrowed packets also convert through `TryFrom<&CompressedVideoRef>` and its
 audio equivalent, checking admission before copying. Their `try_copy_into`
 methods reuse an existing sendable frame and leave it unchanged on refusal.
+Contiguous compressed frames and packets expose `envelope()` as a validated
+view of H.264, HEVC or AAC headers and payloads; SpeedHQ and Opus return `None`.
+
 `validate_for_send` is available on the lossless received packet types for
 inspection; constructed compressed frames carry the sendability guarantee.
 Protection flags describe packet conventions and do not encrypt content.
@@ -149,6 +152,13 @@ frames without waiting for the previous frame's completion on each submission.
 yet collected and spare payload/metadata capacity. Check defaults and exact
 accounting in [`QueueLimits`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.QueueLimits.html).
 Pass limits by reference to `QueuedSender::new` or `from_sender`.
+
+With `clock_video` enabled, the default, the SDK paces video inside every
+submission call. The first can return immediately; later calls wait for the
+next frame time. Set `clock_video(false)` and pace submissions in the
+application, or use [Genlock](#synchronization), to avoid that frame-rate wait.
+SDK back-pressure can still block a call, so consider submission as well as
+teardown when choosing work for an async executor.
 
 `try_submit` returns a `SubmissionId` or the rejected frame. For `QueueFull`,
 collect completions and retry. A frame whose retained allocation capacity
@@ -224,7 +234,7 @@ on the SDK thread.
 
 `AllocatorService::attach_packets` gives packet capture the same application
 buffers. Use `AllocatedPacketReceiver::capture_any_ref` to inspect those buffers
-in place; owned `capture` copies them. Keeping a packet reference retains its
+in place; owned `capture_any` copies them. Keeping a packet reference retains its
 allocation and usage charge until the SDK releases that buffer after the
 reference is dropped. For example, after constructing `service` and `packets`:
 
@@ -268,9 +278,11 @@ to prevent safe early release of a copied descriptor. Do not infer memory
 validity from address, capacity or alignment checks alone.
 
 Release and the pool's final destructor can run on any SDK free thread, outside
-the registry lock. Release must not panic. The registry contains a panic during
-reclamation and leaves that block's count and bytes charged, since cleanup may
-be incomplete.
+the registry lock. They can also run on the allocating thread when publication
+refuses a pool buffer. Release must not panic. A panic while reclaiming a
+published block is contained and leaves that block's count and bytes charged,
+since cleanup may be incomplete. A refused buffer has never been charged; its
+release panic is contained by the allocation callback.
 
 Recover the receiver with `into_receiver()` or `into_packet_receiver()`;
 outstanding SDK allocations still retain their policies. See

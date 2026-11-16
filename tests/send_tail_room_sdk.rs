@@ -10,13 +10,15 @@
 //! bytes after a caller's buffer reach the picture only when the caller
 //! offers them as room.
 //!
-//! Frames hold slowly varying levels, as pictures do.
+//! Exact-length buffers also pin the zero-room formats, final-row padding
+//! counted as UYVY/UYVA room, and strided planar audio ending at its last
+//! active sample. Frames hold slowly varying levels, as pictures do.
 #![cfg(target_os = "linux")]
 
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name, loopback);
+common_helpers!(runtime, name, loopback, unsupported);
 
 // Standard 6.1.1 produces different lossy pixels for identical initialized
 // submissions when this binary's guard-page stress sender runs concurrently.
@@ -25,8 +27,9 @@ common_helpers!(runtime, name, loopback);
 static NATIVE_WORKLOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use grafton_ndi::{
-    BorrowedVideoFrame, Ndi, PixelFormat, Receiver, ReceiverColorFormat, ReceiverOptions, ScanType,
-    Sender, SenderOptions,
+    audio_conversion::{AudioConverter, AudioReferenceLevel},
+    BorrowedAudioFrame, BorrowedVideoFrame, Ndi, PixelFormat, Receiver, ReceiverColorFormat,
+    ReceiverOptions, RuntimeFeature, ScanType, Sender, SenderOptions,
 };
 use std::{
     sync::atomic::{AtomicBool, Ordering},
@@ -74,6 +77,15 @@ impl Guarded {
         // zeroed by the kernel, borrowed with `self`.
         unsafe { std::slice::from_raw_parts_mut(self.data, self.len) }
     }
+
+    fn samples(&mut self) -> &mut [f32] {
+        assert!(self.len.is_multiple_of(size_of::<f32>()));
+        assert_eq!(self.data.align_offset(align_of::<f32>()), 0);
+        // SAFETY: the mapping is aligned for f32 because both the guard page
+        // and its preceding byte length are. It starts zeroed (valid f32),
+        // and this mutable borrow excludes every other view of the storage.
+        unsafe { std::slice::from_raw_parts_mut(self.data.cast(), self.len / size_of::<f32>()) }
+    }
 }
 
 impl Drop for Guarded {
@@ -107,6 +119,17 @@ fn uyvy_receiver(ndi: &Ndi, sender: &Sender) -> Receiver {
     .unwrap()
 }
 
+fn wait_for_receiver(sender: &Sender) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while sender
+        .wait_for_connection(Duration::from_millis(100))
+        .unwrap()
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "no receiver connected");
+    }
+}
+
 /// The room the crate keeps after a frame: the format's, and two rows more
 /// for an interlaced or single-field frame whose height is not a multiple of
 /// four.
@@ -138,14 +161,7 @@ fn frames_that_end_where_memory_ends_are_sent() {
     // The SDK compresses what it is sent whether or not anything receives
     // it; a receiver makes the test independent of that.
     let _receiver = uyvy_receiver(&ndi, &sender);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while sender
-        .wait_for_connection(Duration::from_millis(100))
-        .unwrap()
-        .is_none()
-    {
-        assert!(Instant::now() < deadline, "no receiver connected");
-    }
+    wait_for_receiver(&sender);
     let sizes = [
         (18, 16),
         (642, 32),
@@ -201,6 +217,194 @@ fn frames_that_end_where_memory_ends_are_sent() {
                 let returned = sender.submit_video(owned).unwrap();
                 assert!(returned.is_some(), "{case}");
                 assert!(sender.reclaim_video().is_some(), "{case}");
+            }
+        }
+    }
+}
+
+/// Every format with zero trailing room is sent in place from an allocation
+/// ending exactly at its declared storage, including padded and planar rows.
+#[test]
+fn zero_room_formats_end_exactly_at_the_guard_page() {
+    let _workload = NATIVE_WORKLOAD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    let sender = sender(&ndi, "zero room formats at the end of memory");
+    let _receiver = uyvy_receiver(&ndi, &sender);
+    wait_for_receiver(&sender);
+    let planar_444 = ndi.capabilities().supports(RuntimeFeature::Planar444Video);
+    for format in [
+        PixelFormat::P216,
+        PixelFormat::Pa16,
+        PixelFormat::Yv12,
+        PixelFormat::I420,
+        PixelFormat::Nv12,
+        PixelFormat::Bgra,
+        PixelFormat::Bgrx,
+        PixelFormat::Rgba,
+        PixelFormat::Rgbx,
+        PixelFormat::Na48,
+        PixelFormat::Nb48,
+        PixelFormat::Na4g,
+        PixelFormat::Nb4g,
+    ] {
+        if !planar_444
+            && matches!(
+                format,
+                PixelFormat::Na48 | PixelFormat::Nb48 | PixelFormat::Na4g | PixelFormat::Nb4g
+            )
+        {
+            common::unsupported(&format!("{format:?} requires Planar444Video"));
+            continue;
+        }
+        assert_eq!(format.send_tail_room(), 0);
+        for (width, height) in [(18, 16), (642, 32), (720, 480), (1920, 1080)] {
+            for padding in [0, 2, 64] {
+                let stride = format.line_stride_bytes(width).unwrap() + padding;
+                let len = format.buffer_len(width, height, Some(stride)).unwrap();
+                let mut guarded = Guarded::new(len);
+                smooth(guarded.bytes());
+                let frame = BorrowedVideoFrame::builder(guarded.bytes(), width, height, format)
+                    .line_stride_bytes(stride)
+                    .allow_send_from_padding_and_tail(true)
+                    .build()
+                    .unwrap();
+                assert!(
+                    frame.sends_in_place(),
+                    "{format:?} {width}x{height} padding {padding}"
+                );
+                sender.send_video(&frame).unwrap();
+            }
+        }
+    }
+}
+
+/// The final row's padding counts as readable room, so only the remainder is
+/// mapped after the layout's storage, for progressive and field-based sends.
+#[test]
+fn final_row_padding_counts_towards_the_guarded_send_room() {
+    let _workload = NATIVE_WORKLOAD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    let sender = sender(&ndi, "padding as guarded video room");
+    let _receiver = uyvy_receiver(&ndi, &sender);
+    wait_for_receiver(&sender);
+    for format in [PixelFormat::Uyvy, PixelFormat::Uyva] {
+        for (width, height) in [(18, 16), (642, 32), (720, 480), (720, 486), (1920, 1080)] {
+            for padding in [64, 128] {
+                let stride = format.line_stride_bytes(width).unwrap() + padding;
+                let len = format.buffer_len(width, height, Some(stride)).unwrap();
+                let trailing_padding = if format == PixelFormat::Uyva {
+                    padding / 2
+                } else {
+                    padding
+                };
+                for scan in [
+                    ScanType::Progressive,
+                    ScanType::Interlaced,
+                    ScanType::Field0,
+                    ScanType::Field1,
+                ] {
+                    let room = format
+                        .send_buffer_len(width, height, Some(stride), scan)
+                        .unwrap()
+                        - len;
+                    let extra = room.saturating_sub(trailing_padding);
+                    let mut guarded = Guarded::new(len + extra);
+                    smooth(guarded.bytes());
+                    let frame = BorrowedVideoFrame::builder(guarded.bytes(), width, height, format)
+                        .line_stride_bytes(stride)
+                        .scan_type(scan)
+                        .allow_send_from_padding_and_tail(true)
+                        .build()
+                        .unwrap();
+                    let last_plane = frame.planes().last().unwrap();
+                    assert_eq!(
+                        last_plane.row_stride_bytes() - last_plane.active_row_bytes(),
+                        trailing_padding
+                    );
+                    assert!(
+                        frame.sends_in_place(),
+                        "{format:?} {width}x{height} {scan:?} padding {padding}"
+                    );
+                    sender.send_video(&frame).unwrap();
+                }
+            }
+        }
+    }
+}
+
+/// FLTP's last channel ends at its last sample, without a full final stride.
+/// Native send and all three converters must respect that validated extent.
+#[test]
+fn strided_audio_ends_at_its_last_sample_before_the_guard_page() {
+    let _workload = NATIVE_WORKLOAD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    let converter = AudioConverter::new(&ndi).unwrap();
+    let sender = Sender::new(
+        &ndi,
+        &SenderOptions::new(common::unique_name("strided audio at the end of memory"))
+            .clock_video(false)
+            .clock_audio(false),
+    )
+    .unwrap();
+    let _receiver = uyvy_receiver(&ndi, &sender);
+    wait_for_receiver(&sender);
+    for channels in [1, 2, 4, 8] {
+        for samples in [1, 3, 17, 257, 1024] {
+            for padding in [0, 1, 7, 64] {
+                let stride = samples + padding;
+                let extent = (channels - 1) * stride + samples;
+                let mut guarded = Guarded::new(extent * size_of::<f32>());
+                let data = guarded.samples();
+                data.fill(0.875);
+                for channel in 0..channels {
+                    for sample in 0..samples {
+                        data[channel * stride + sample] = ((channel + sample) % 3 + 1) as f32 / 8.0;
+                    }
+                }
+                let frame =
+                    BorrowedAudioFrame::builder(data, 48_000, channels as u32, samples as u32)
+                        .channel_stride_bytes(stride * size_of::<f32>())
+                        .build()
+                        .unwrap();
+                sender.send_audio(&frame);
+                let count = channels * samples;
+                let mut floats = vec![0.0; count];
+                assert_eq!(
+                    converter.to_interleaved_f32(&frame, &mut floats).unwrap(),
+                    count
+                );
+                for sample in 0..samples {
+                    for channel in 0..channels {
+                        assert_eq!(
+                            floats[sample * channels + channel],
+                            ((channel + sample) % 3 + 1) as f32 / 8.0
+                        );
+                    }
+                }
+                assert_eq!(
+                    converter
+                        .to_interleaved_i16(&frame, &mut vec![0; count], AudioReferenceLevel::SEND,)
+                        .unwrap(),
+                    count
+                );
+                assert_eq!(
+                    converter
+                        .to_interleaved_i32(&frame, &mut vec![0; count], AudioReferenceLevel::SEND,)
+                        .unwrap(),
+                    count
+                );
             }
         }
     }

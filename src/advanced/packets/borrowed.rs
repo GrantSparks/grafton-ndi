@@ -90,6 +90,7 @@ impl<'rx> CompressedVideoRef<'rx> {
     }
 
     borrowed_extras!();
+    video_envelope_accessor!();
 
     /// The packet's codec and video format.
     pub fn format(&self) -> VideoPacketFormat {
@@ -166,6 +167,7 @@ impl<'rx> CompressedAudioRef<'rx> {
     }
 
     borrowed_extras!();
+    audio_envelope_accessor!();
 
     /// The compressed audio codec.
     pub fn codec(&self) -> AudioCodec {
@@ -249,31 +251,10 @@ impl<'rx> CompressedAudioRef<'rx> {
     }
 }
 
-impl std::fmt::Debug for CompressedVideoRef<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompressedVideoRef")
-            .field("format", &self.format())
-            .field("bytes", &self.frame.parts().len)
-            .field("timecode", &self.timecode())
-            .field("timestamp", &self.timestamp())
-            .field("metadata_status", &self.metadata_status())
-            .finish()
-    }
-}
-
-impl std::fmt::Debug for CompressedAudioRef<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompressedAudioRef")
-            .field("codec", &self.codec())
-            .field("protected", &self.is_protected())
-            .field("parameters", &self.frame.parts().parameters)
-            .field("bytes", &self.frame.parts().len)
-            .field("timecode", &self.timecode())
-            .field("timestamp", &self.timestamp())
-            .field("metadata_status", &self.metadata_status())
-            .finish()
-    }
-}
+packet_debug!(CompressedVideoRef<'_>, "CompressedVideoRef", frame, video, frame.timestamp();
+    "bytes" = frame.data().len());
+packet_debug!(CompressedAudioRef<'_>, "CompressedAudioRef", frame, audio, frame.timestamp();
+    "bytes" = frame.data().len());
 
 impl TryFrom<&CompressedVideoRef<'_>> for CompressedVideoFrame {
     type Error = Error;

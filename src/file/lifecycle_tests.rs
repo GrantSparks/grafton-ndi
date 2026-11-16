@@ -471,6 +471,7 @@ fn a_recorder_that_never_started_is_destroyed_without_a_stop() {
         &FileRecorderOptions::new(SourceSpec::new("mock source").unwrap()),
     )
     .unwrap();
+    assert_eq!(recorder.report().session(), 0);
     assert_eq!(recorder.request_stop(), StopRequest::NotStarted);
     assert!(matches!(
         recorder.finish(Duration::ZERO),
@@ -646,9 +647,27 @@ fn a_family_the_library_lacks_is_refused_as_that_capability_by_the_entry_point_i
     ));
     // Refused before anything is checked or called, even for a path that
     // would be refused too.
+    let async_probe_error = |path| {
+        use std::{
+            future::Future,
+            pin::Pin,
+            task::{Context, Poll, Waker},
+        };
+        let mut probe = AsyncFilePlayer::probe(&api, path).submit();
+        let Poll::Ready(result) =
+            Pin::new(&mut probe).poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("a missing playback family queued probe work");
+        };
+        result.unwrap_err()
+    };
     for error in [
         crate::file::FilePlayer::probe(&api, "recording.mkv").unwrap_err(),
         crate::file::FilePlayer::probe(&api, "").unwrap_err(),
+        crate::file::FilePlayer::probe(&api, "bad\0path.mkv").unwrap_err(),
+        async_probe_error("recording.mkv"),
+        async_probe_error(""),
+        async_probe_error("bad\0path.mkv"),
         crate::file::FilePlayer::new(&api, &FilePlayerOptions::new("mock player")).unwrap_err(),
         crate::file::FilePlayer::new(&api, &FilePlayerOptions::new("")).unwrap_err(),
     ] {
@@ -882,6 +901,23 @@ fn finish_starts_its_wait_once_the_stop_has_returned() {
     let mut recorder = recording_on(&device);
     let outcome = recorder.finish(Duration::from_millis(250)).unwrap();
     assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+}
+
+#[test]
+fn drop_spends_its_cleanup_budget_on_the_native_stop_before_waiting_for_closure() {
+    let device = mock::Recorder::new(Closing::AfterSlowStop(
+        Duration::from_millis(300),
+        Duration::from_millis(50),
+    ));
+    let recorder = recording_with(
+        &device,
+        FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
+            .drop_wait(Duration::from_millis(250)),
+    );
+    drop(recorder);
+    assert_eq!(device.stops.load(Ordering::Acquire), 1);
+    assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    assert!(!device.closed_before_destroy.load(Ordering::Acquire));
 }
 
 #[test]
@@ -1246,6 +1282,103 @@ fn the_directory_a_pattern_names_is_checked_before_the_sdk_sees_it() {
     );
     assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
     assert_eq!(recorder.state(), RecorderState::Recording);
+}
+
+/// Exercise the public start and rollover paths against a permission-restricted
+/// child directory, keeping the active session outside that directory.
+#[cfg(any(unix, windows))]
+fn unwritable_directory_is_refused_before_native_calls(directory: &Directory) {
+    let device = mock::Recorder::new(Closing::AtStop);
+    device.install();
+    let mut recorder = FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
+    let denied = directory.target("denied/take.mkv");
+    let error = recorder
+        .start(&denied, RecordingTimecode::Preserve)
+        .unwrap_err();
+    assert!(error.to_string().contains("cannot be written to"));
+    assert_eq!(
+        io_kind::<()>(Err(error)),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(device.starts.load(Ordering::Acquire), 0);
+    assert_eq!(recorder.state(), RecorderState::Idle);
+
+    recorder
+        .start(&directory.target("live.mkv"), RecordingTimecode::Preserve)
+        .unwrap();
+    assert_eq!(
+        io_kind(recorder.rollover(&denied)),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
+    assert_eq!(recorder.state(), RecorderState::Recording);
+    assert_eq!(
+        std::fs::read_dir(directory.0.join("denied"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unwritable_unix_recording_directories_never_reach_the_sdk() {
+    use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let directory = Directory::new("unwritable-unix");
+    let denied = directory.0.join("denied");
+    std::fs::create_dir(&denied).unwrap();
+    let _restore = Restore(denied.clone());
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let path = std::ffi::CString::new(denied.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `path` retains a NUL-terminated directory path for this query.
+    if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } == 0 {
+        eprintln!("skipped: this process can override directory write permissions");
+        return;
+    }
+    unwritable_directory_is_refused_before_native_calls(&directory);
+}
+
+#[cfg(windows)]
+#[test]
+fn acl_denied_windows_recording_directories_never_reach_the_sdk() {
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let restored = std::process::Command::new("icacls")
+                .arg(&self.0)
+                .args(["/remove:d", "*S-1-1-0", "/q"])
+                .output()
+                .unwrap();
+            assert!(
+                restored.status.success(),
+                "{}",
+                String::from_utf8_lossy(&restored.stderr)
+            );
+        }
+    }
+    let directory = Directory::new("unwritable-windows");
+    let denied = directory.0.join("denied");
+    std::fs::create_dir(&denied).unwrap();
+    let _restore = Restore(denied.clone());
+    // Deny Everyone's write-data/add-file right on this test-owned directory.
+    // A SID avoids dependence on the runner's account name or Windows language.
+    let restricted = std::process::Command::new("icacls")
+        .arg(&denied)
+        .args(["/deny", "*S-1-1-0:(WD)", "/q"])
+        .output()
+        .unwrap();
+    assert!(
+        restricted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restricted.stderr)
+    );
+    unwritable_directory_is_refused_before_native_calls(&directory);
 }
 
 #[test]

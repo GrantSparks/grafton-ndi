@@ -11,7 +11,7 @@ use crate::{Error, Result};
 /// included), immutable, and cheap to clone. Most objects take it through an
 /// options value's `config` setter, such as
 /// [`SenderOptions::config`](crate::SenderOptions::config).
-/// [`Genlock::new`](super::Genlock::new) takes it directly as an argument.
+/// Genlock uses [`GenlockOptions::config`](super::GenlockOptions::config).
 ///
 /// A configuration can carry vendor credentials or network details, so its
 /// `Debug` output shows no content and no error message quotes it.
@@ -34,7 +34,7 @@ impl AdvancedConfig {
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when the text is too large, is not
-    /// valid JSON, is not an object, or contains a NUL.
+    /// valid JSON (including a raw NUL byte), or is not an object.
     pub fn parse(json: impl AsRef<str>) -> Result<Self> {
         Self::parse_with_limit(json, 1024 * 1024)
     }
@@ -57,9 +57,6 @@ impl AdvancedConfig {
             return Err(Error::InvalidInput(
                 crate::InputDefect::ConfigurationNotObject,
             ));
-        }
-        if json.contains('\0') {
-            return Err(Error::InvalidInput(crate::InputDefect::ConfigurationNul));
         }
         let mut terminated = String::with_capacity(json.len() + 1);
         terminated.push_str(json);
@@ -119,11 +116,18 @@ mod tests {
         assert_eq!(native.to_str().unwrap(), input);
         assert_eq!(native.to_bytes(), config.expose_json().as_bytes());
         assert_eq!(config.expose_json().as_ptr(), config.as_ptr().cast());
-        // JSON validation retains precedence over the interior-NUL check.
-        assert!(matches!(
-            AdvancedConfig::parse("{\"label\":\"\0\"}"),
-            Err(Error::InvalidInput(crate::InputDefect::ConfigurationJson))
-        ));
+        // Raw NUL is invalid JSON at every position, including before and
+        // after the object. An escaped \\u0000 remains valid above.
+        for position in 0..=input.len() {
+            if input.is_char_boundary(position) {
+                let mut with_nul = input.to_owned();
+                with_nul.insert(position, '\0');
+                assert!(matches!(
+                    AdvancedConfig::parse(with_nul),
+                    Err(Error::InvalidInput(crate::InputDefect::ConfigurationJson))
+                ));
+            }
+        }
     }
 
     #[test]

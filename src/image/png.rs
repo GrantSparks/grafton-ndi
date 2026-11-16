@@ -83,7 +83,7 @@ fn png_error(error: ::png::EncodingError) -> Error {
     match error {
         ::png::EncodingError::IoError(error) => Error::Io(error),
         error => Error::InvalidFrame(crate::FrameDefect::EncodingFailed {
-            codec: crate::ImageCodec::Png,
+            codec: crate::ImageCodecKind::Png,
             diagnostic: error.to_string().into_boxed_str(),
         }),
     }

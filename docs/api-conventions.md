@@ -111,6 +111,8 @@ its identity, such as name, source or mode, and ends with
 `finish_non_exhaustive()`. Formatting makes no SDK call, takes no blocking
 lock, and prints no pointers. Value types implement `Clone`, `Copy`,
 `PartialEq`, `Eq` and `Hash` where their fields allow.
+Media values summarize payloads by length and print no memory addresses;
+use their data and block accessors to inspect the contents.
 
 Thread traits follow the native object's contract:
 

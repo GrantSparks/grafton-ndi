@@ -21,6 +21,9 @@ cargo build --locked --examples --all-features
 cargo test --locked --all-features
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+for features in "" image-encoding tokio smol advanced file-io advanced,file-io; do
+    RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --no-default-features ${features:+--features "$features"}
+done
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 ```
 
@@ -29,6 +32,30 @@ initialization errors still fail. A successful SDK-free run therefore does
 not establish native transport coverage. The configured platform/runtime
 matrix is in [the CI workflow](../.github/workflows/rust.yml); execution results
 are available in [GitHub Actions](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml).
+
+### Memory checkers
+
+The required `miri` job runs synthetic frame, metadata and guard tests with
+`nightly-2026-11-10`, using both Stacked Borrows and Tree Borrows. Its filters
+exclude native calls and source-parsing/subprocess tests. Miri uses one padded
+layout and one PNG encoding per format; native tests retain their full matrices.
+Run a focused case locally with:
+
+```sh
+cargo +nightly-2026-11-10 miri test --locked --lib receiver::mixed_tests
+MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly-2026-11-10 miri test --locked --lib receiver::mixed_tests
+```
+
+The Ubuntu `test` job runs the scripted capture fixtures and full encoder padding
+matrix under Valgrind Memcheck. It traces child test processes, skips compiler
+children and fails on errors. The Standard 6.3.2 Linux SDK row also checks live
+padding through the loopback runner. A narrowly scoped suppression covers only
+glibc loader token comparisons reported by Valgrind 3.19:
+
+```sh
+cargo test --locked --all-features --config 'target.x86_64-unknown-linux-gnu.runner=["valgrind","--tool=memcheck","--error-exitcode=99","--trace-children=yes","--trace-children-skip=*/rustc,*/rustc-*"]' --test mixed_capture_boundary --test frame_metadata_boundary
+GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --locked --features image-encoding --config ci/offline.toml --config 'target.x86_64-unknown-linux-gnu.runner=["ci/offline/linux.sh","valgrind","--tool=memcheck","--error-exitcode=99","--suppressions=ci/valgrind.supp"]' --test video_padding_sdk -- --test-threads=1
+```
 
 ## Test against an installed runtime
 
@@ -51,8 +78,8 @@ GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --locked --all-features --config ci/off
 | `advanced` | Advanced runtime and compiled Advanced declarations |
 | `file` | Usable separate File library, with `file-io` enabled |
 | `discovery-server` | Compatible runtime and SDK Discovery Server, on Linux |
-| `h264-decoder` | Runtime can decode the H.264 fixture, with `advanced` enabled |
-| `hevc-444-decoder` | Runtime can decode the HEVC 4:4:4 fixture, with `advanced` enabled |
+| `h264-decoder` | Implies `advanced`; runtime can decode the H.264 fixture |
+| `hevc-444-decoder` | Implies `advanced`; runtime can decode the HEVC 4:4:4 fixture with the 6.4 Best444 receiver |
 
 For example, use `advanced,file` when both are installed. Unknown tokens and
 requirements that the build cannot exercise are errors. Decoder fixtures do
@@ -92,3 +119,23 @@ with a different version. Inspect actual skips and results for your platform.
 When reporting a problem, include the crate version, platform, Rust version,
 Cargo features, runtime version/edition, command and error output. Do not
 include SDK archives, credentials or private recordings.
+
+## Release controls
+
+Workflows cannot establish repository settings. Before publishing, verify these
+controls in order:
+
+1. The `crates-io` environment requires reviewers, an appropriate self-review
+   rule, and deployment restricted to `v*` tags.
+2. A tag ruleset restricts creating, moving and deleting `v*` tags.
+3. Protection of `main` requires pull requests, Code Owner review and
+   `required-ci`. [CODEOWNERS](../.github/CODEOWNERS) covers files that control CI
+   and publishing.
+4. The crates.io trusted publisher binds this repository, `publish.yml` and the
+   `crates-io` environment.
+5. SDK CI has `NDI_SDK_SOURCES_JSON`, a scoped `NDI_SDK_ARCHIVE_TOKEN`, and
+   `NDI_CI_RELEASED=true` when enabled.
+
+Anyone who can replace a workflow on a tag or branch can replace its checks.
+Repository rules and review enforce these boundaries; the tag-on-main check
+catches mistakes.

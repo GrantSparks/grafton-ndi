@@ -1741,7 +1741,7 @@ fn unreadable_color_metadata_is_refused_unless_the_caller_overrides() {
             matches!(
                 message,
                 crate::FrameDefect::ColorMetadata {
-                    issue: crate::ColorMetadataIssue::UndefinedValue,
+                    issue: crate::ColorMetadataDefect::UndefinedValue,
                     ..
                 }
             ),
@@ -2041,8 +2041,8 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
             crate::image_encoding::ImageFormat::Jpeg(85)
         ))),
         crate::FrameDefect::ImageDimension {
-            codec: crate::ImageCodec::Jpeg,
-            dimension: crate::ImageDimension::Width,
+            codec: crate::ImageCodecKind::Jpeg,
+            dimension: crate::ImageAxisKind::Width,
             length: 65536,
             ..
         }
@@ -2062,8 +2062,8 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
             crate::image_encoding::ImageFormat::Jpeg(85)
         ))),
         crate::FrameDefect::ImageDimension {
-            codec: crate::ImageCodec::Jpeg,
-            dimension: crate::ImageDimension::Height,
+            codec: crate::ImageCodecKind::Jpeg,
+            dimension: crate::ImageAxisKind::Height,
             length: 65536,
             ..
         }
@@ -2076,8 +2076,8 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
     assert!(matches!(
         invalid_frame(webp.encode_image(&options(ImageFormat::WebpLossless))),
         crate::FrameDefect::ImageDimension {
-            codec: crate::ImageCodec::Webp,
-            dimension: crate::ImageDimension::Width,
+            codec: crate::ImageCodecKind::Webp,
+            dimension: crate::ImageAxisKind::Width,
             length: 16386,
             ..
         }
@@ -2097,7 +2097,7 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
         let message =
             invalid_frame(frame.encode_image_to(&options(ImageFormat::WebpLossy(75)), &mut out));
         assert!(
-            matches!(message,crate::FrameDefect::ImageDimension {codec:crate::ImageCodec::Webp,dimension:found,length:16384,..} if found == if dimension=="width" {crate::ImageDimension::Width} else {crate::ImageDimension::Height}),
+            matches!(message,crate::FrameDefect::ImageDimension {codec:crate::ImageCodecKind::Webp,dimension:found,length:16384,..} if found == if dimension=="width" {crate::ImageAxisKind::Width} else {crate::ImageAxisKind::Height}),
             "{message}"
         );
         assert_eq!(out.written, 0);
@@ -2260,7 +2260,6 @@ fn conversion_geometry_overflow_is_refused_before_output_or_row_access() {
             | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
             | crate::FrameDefect::Layout(crate::LayoutDefect::VideoStrideOverflow { .. })
             | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
-            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoPayloadOverflow)
             | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
             | crate::FrameDefect::ImageScratchOverflow
             | crate::FrameDefect::ImageDimensionOverflow
@@ -3015,7 +3014,10 @@ fn png_scratch_failure_precedes_every_output_byte() {
                 .unwrap_err();
             assert!(matches!(
                 error,
-                Error::InvalidFrame(crate::FrameDefect::ImageScratchAllocation(_))
+                Error::AllocationFailed(crate::AllocationFailure {
+                    kind: crate::AllocationKind::ImageScratch,
+                    ..
+                })
             ));
             assert!(output.is_empty(), "{depth:?} HDR={hdr}");
         }

@@ -138,6 +138,14 @@ impl FilePlayer {
     pub fn probe(api: &FileApi, path: impl AsRef<Path>) -> Result<FileInfo> {
         let playback = api.table::<sys::FilePlayback>()?;
         let path = types::path_string(path.as_ref())?;
+        Self::probe_checked(playback, &path)
+    }
+
+    /// Probe with the family and path already proved at submission.
+    pub(super) fn probe_checked(
+        playback: &sys::FilePlayback,
+        path: &types::FileText,
+    ) -> Result<FileInfo> {
         let info = out_param::required_fill(|info| {
             // SAFETY: `path` is a NUL-terminated string that outlives the
             // call; the helper keeps guarded info storage writable through it.
@@ -163,11 +171,18 @@ impl FilePlayer {
     /// # Errors
     ///
     /// [`Error::NativeOperationFailed`] when the SDK cannot open the file,
-    /// [`Error::InvalidInput`] when the path is empty or is not UTF-8, and
-    /// [`Error::InvalidCString`] when it contains a NUL.
+    /// [`Error::InvalidInput`] when the path is empty or is not UTF-8,
+    /// [`Error::InvalidCString`] when it contains a NUL, and [`Error::Io`] when
+    /// a relative path cannot be resolved because the current directory is
+    /// unavailable.
     #[doc(alias = "NDIlib_file_player_start")]
     pub fn start(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = types::path_string(path.as_ref())?;
+        self.start_checked(&path)
+    }
+
+    /// Start with the path already resolved and validated at submission.
+    pub(super) fn start_checked(&mut self, path: &types::FileText) -> Result<()> {
         // SAFETY: the player is live and `path` is a NUL-terminated string
         // that outlives the call.
         let started = unsafe {
