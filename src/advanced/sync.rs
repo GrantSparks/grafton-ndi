@@ -6,9 +6,9 @@ use std::{cell::Cell, marker::PhantomData, sync::Arc};
 
 use super::{invalid_input, sdk_quantity, AdvancedConfig, AvSyncAttached, ReceiverControls};
 use crate::{
-    capture::AvSyncAudioFree,
+    capture::{AvSyncAudioFree, Guard},
     finder::RawSource,
-    frames::AudioRef,
+    frames::ValidatedAudio,
     frames::MAX_AUDIO_BYTES,
     receiver::{ReceiverCore, Released},
     sys::{
@@ -27,10 +27,7 @@ use crate::sys::advanced::GenlockHandle;
 #[cfg(any(doc, test, ndi_has_advanced_av_sync, ndi_has_advanced_genlock))]
 use crate::Error;
 #[cfg(any(test, ndi_has_advanced_av_sync))]
-use crate::{
-    capture::{AvSyncAudioInstance, Guard},
-    frames::{ReturnedAudio, ValidatedAudio},
-};
+use crate::{capture::AvSyncAudioInstance, frames::ReturnedAudio};
 
 /// What audio an [`AvSync::synchronize`] call asks for.
 ///
@@ -159,7 +156,7 @@ pub enum AvSyncOutcome {
 /// Several references may be retained across later synchronizations and freed
 /// in any order. The synchronizer remains borrowed until all are released.
 pub struct AvSyncAudioRef<'a> {
-    pub(crate) inner: AudioRef<'a, AvSyncAudioFree>,
+    pub(crate) inner: ValidatedAudio<Guard<'a, AvSyncAudioFree>>,
 }
 
 /// A synchronization outcome whose audio remains borrowed from the SDK.

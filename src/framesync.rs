@@ -78,8 +78,8 @@ use std::{fmt, num::NonZeroU32, sync::Arc};
 use crate::{
     capture::{FrameSyncAudioFree, FrameSyncVideoFree, Guard},
     frames::{
-        validate_returned_audio, AudioFrame, AudioRef, ReturnedAudio, ScanType,
-        ValidatedAudioLayout, VideoFrame, VideoRef,
+        validate_returned_audio, AudioFrame, ReturnedAudio, ScanType, ValidatedAudio,
+        ValidatedAudioLayout, ValidatedVideo, VideoFrame,
     },
     receiver::{FrameSyncAttached, Receiver, ReceiverCore, Released},
     sys::bindings::*,
@@ -94,7 +94,7 @@ use crate::{
 /// This owning reference is neither `Send` nor `Sync`; its immutable plane/row
 /// views support scoped worker reads while it stays borrowed on this thread.
 pub struct FrameSyncVideoRef<'fs> {
-    pub(crate) inner: VideoRef<'fs, FrameSyncVideoFree>,
+    pub(crate) inner: ValidatedVideo<Guard<'fs, FrameSyncVideoFree>>,
 }
 
 /// A zero-copy borrowed audio frame from a [`FrameSync`] capture.
@@ -104,7 +104,7 @@ pub struct FrameSyncVideoRef<'fs> {
 /// automatically freed when dropped via `NDIlib_framesync_free_audio_v2`.
 /// This owning reference is neither `Send` nor `Sync`.
 pub struct FrameSyncAudioRef<'fs> {
-    pub(crate) inner: AudioRef<'fs, FrameSyncAudioFree>,
+    pub(crate) inner: ValidatedAudio<Guard<'fs, FrameSyncAudioFree>>,
 }
 
 /// The format of the audio a [`FrameSync`] is receiving, as reported by

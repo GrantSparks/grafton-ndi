@@ -47,7 +47,7 @@ impl AudioTest for FrameSyncAudioFree {
 impl AudioTest for AvSyncAudioFree {
     type Ref<'a> = AvSyncAudioRef<'a>;
     fn wrap<'a>(guard: Guard<'a, Self>) -> Result<Self::Ref<'a>> {
-        Ok(AvSyncAudioRef::from_validated(ValidatedAudio::audio(
+        Ok(AvSyncAudioRef::from_validated(ValidatedAudio::validate(
             guard,
         )?))
     }

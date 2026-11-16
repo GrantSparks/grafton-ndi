@@ -1,23 +1,7 @@
-error[E0603]: struct `AudioRef` is private
+error[E0432]: unresolved imports `grafton_ndi::frames::AudioRef`, `grafton_ndi::frames::VideoRef`
  --> tests/ui/fail/frame_cores_are_private.rs:1:27
   |
 1 | use grafton_ndi::frames::{AudioRef, VideoRef};
-  |                           ^^^^^^^^ private struct
-  |
-note: the struct `AudioRef` is defined here
- --> src/frames.rs
-  |
-  | pub(crate) use borrowed::{AudioRef, VideoRef};
-  |                           ^^^^^^^^
-
-error[E0603]: struct `VideoRef` is private
- --> tests/ui/fail/frame_cores_are_private.rs:1:37
-  |
-1 | use grafton_ndi::frames::{AudioRef, VideoRef};
-  |                                     ^^^^^^^^ private struct
-  |
-note: the struct `VideoRef` is defined here
- --> src/frames.rs
-  |
-  | pub(crate) use borrowed::{AudioRef, VideoRef};
-  |                                     ^^^^^^^^
+  |                           ^^^^^^^^  ^^^^^^^^ no `VideoRef` in `frames`
+  |                           |
+  |                           no `AudioRef` in `frames`

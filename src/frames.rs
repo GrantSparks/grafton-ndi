@@ -667,7 +667,7 @@ impl VideoHeader {
 /// layout, header, pixels and metadata through it. [`video_accessors!`]
 /// generates their public accessors and `Debug`, so each is written and
 /// documented once. Each implementation takes every part from one value that
-/// was validated as a whole; the generic VideoRef implementation covers both
+/// was validated as a whole; the validated video implementation covers both
 /// receiver and FrameSync guards.
 ///
 /// # Safety
@@ -1947,7 +1947,7 @@ impl VideoFrameBuilder {
 /// views lend their validated layout, timing, samples and metadata through it.
 /// [`audio_accessors!`] generates their public accessors and `Debug`, so each
 /// is written and documented once. Each implementation takes every part from
-/// one value that was validated as a whole; the generic AudioRef
+/// one value that was validated as a whole; the validated audio
 /// implementation covers receiver and synchronizer guards.
 ///
 /// # Safety
@@ -4444,6 +4444,15 @@ pub(crate) trait SdkDescriptor {
     fn timestamp(&self) -> Option<i64> {
         None
     }
+
+    /// Standalone text is implemented only by its matching descriptor type.
+    ///
+    /// # Safety
+    /// The descriptor's declared text extent must remain readable for this call.
+    unsafe fn standalone_metadata(&self, _sender: bool) -> Result<Option<MetadataText<'_>>> {
+        // Media parts never select a standalone metadata rule.
+        Ok(None)
+    }
 }
 
 impl SdkDescriptor for NDIlib_video_frame_v2_t {
@@ -4469,6 +4478,19 @@ impl SdkDescriptor for NDIlib_audio_frame_v3_t {
 impl SdkDescriptor for NDIlib_metadata_frame_t {
     fn metadata_pointer(&self) -> *const c_char {
         self.p_data
+    }
+
+    unsafe fn standalone_metadata(&self, sender: bool) -> Result<Option<MetadataText<'_>>> {
+        // SAFETY: the caller retains the declared extent for the selected
+        // capture family's length and termination convention.
+        let text = unsafe {
+            if sender {
+                validate_sender_metadata(self)?
+            } else {
+                validate_metadata_layout(self)?
+            }
+        };
+        Ok(text)
     }
 }
 
@@ -4515,13 +4537,78 @@ impl<D: SdkDescriptor> HoldsDescriptor for &D {
     }
 }
 
+/// Implementations are restricted to the crate's audited descriptor validators.
+pub(crate) mod descriptor_parts_sealed {
+    pub trait Sealed {}
+}
+
+/// Parts validated from the exact descriptor whose storage a holder retains.
+///
+/// # Safety
+///
+/// A successful validator must derive every extent, offset and format in its
+/// result from `descriptor`, and never describe storage outside the allocation
+/// it names. Its metadata rule must match that descriptor's capture family.
+pub(crate) unsafe trait DescriptorParts<D: SdkDescriptor>:
+    descriptor_parts_sealed::Sealed + Sized
+{
+    const METADATA: MetadataKind = MetadataKind::Embedded;
+
+    /// Derive the parts that downstream views may trust without revalidation.
+    ///
+    /// # Safety
+    ///
+    /// Every non-null pointer in `descriptor` must retain the readable,
+    /// initialized active payload it describes for this call; row/channel
+    /// padding need not be initialized. Shape validation may reject a
+    /// descriptor, but cannot establish the validity of its raw pointers.
+    unsafe fn validate(descriptor: &D) -> Result<Self>;
+}
+
+/// Text rules differ between attached metadata, receive metadata and sender
+/// metadata (whose positive length may exclude its terminating NUL).
+pub(crate) enum MetadataKind {
+    Embedded,
+    Standalone,
+    Sender,
+}
+
+impl descriptor_parts_sealed::Sealed for (ValidatedVideoLayout, VideoHeader) {}
+// SAFETY: the validator derives this layout and header from this descriptor,
+// checking every dimension, stride and active extent before returning them.
+unsafe impl DescriptorParts<NDIlib_video_frame_v2_t> for (ValidatedVideoLayout, VideoHeader) {
+    unsafe fn validate(descriptor: &NDIlib_video_frame_v2_t) -> Result<Self> {
+        validate_video_frame(descriptor)
+    }
+}
+
+impl descriptor_parts_sealed::Sealed for ValidatedAudioLayout {}
+// SAFETY: the validator checks this descriptor's format, alignment, sample
+// counts and channel stride, and returns only its checked sample layout.
+unsafe impl DescriptorParts<NDIlib_audio_frame_v3_t> for ValidatedAudioLayout {
+    unsafe fn validate(descriptor: &NDIlib_audio_frame_v3_t) -> Result<Self> {
+        validate_audio_layout(descriptor)
+    }
+}
+
+impl descriptor_parts_sealed::Sealed for () {}
+// SAFETY: standalone metadata has no media parts. The shared constructor scans
+// exactly this descriptor with the standalone metadata length/terminator rule.
+unsafe impl DescriptorParts<NDIlib_metadata_frame_t> for () {
+    const METADATA: MetadataKind = MetadataKind::Standalone;
+
+    unsafe fn validate(_: &NDIlib_metadata_frame_t) -> Result<Self> {
+        Ok(())
+    }
+}
+
 /// An SDK frame validated as a whole: the holder `F` of its descriptor, what
 /// was validated from that descriptor, `V`, and its cached metadata state.
 ///
 /// Only the validation functions construct one, each from the one descriptor
-/// its holder holds: [`ValidatedVideo::video`], [`ValidatedAudio::audio`],
-/// [`ValidatedAudio::returned_audio`], [`ValidatedMetadata::metadata_frame`]
-/// and [`ValidatedFrame::validate`] for compressed packet parts. A layout or text validated from
+/// its holder holds: [`ValidatedFrame::validate`],
+/// [`ValidatedAudio::returned_audio`] and [`ValidatedMetadata::metadata_frame`].
+/// A layout or text validated from
 /// another descriptor therefore cannot be paired with it, and every view and
 /// owned copy of a received frame takes its parts from here.
 ///
@@ -4552,17 +4639,19 @@ impl<F: HoldsDescriptor, V> ValidatedFrame<F, V> {
     /// # Safety
     ///
     /// `frame` must retain this descriptor and every allocation the returned
-    /// parts describe, initialized and unchanged until it is dropped. The
-    /// validator must establish those parts from the descriptor it receives.
+    /// parts describe, initialized and unchanged until it is dropped.
     /// A non-null metadata pointer must remain readable through its first NUL
     /// or [`MAX_METADATA_BYTES`], whichever comes first.
-    unsafe fn validate_held(
-        frame: F,
-        validate: impl FnOnce(&F::Descriptor) -> Result<V>,
-    ) -> Result<Self> {
-        let validated = validate(frame.descriptor())?;
-        // SAFETY: the caller retains the exact descriptor and its metadata.
-        unsafe { Self::with_frame_metadata(frame, validated) }
+    unsafe fn validate_held(frame: F) -> Result<Self>
+    where
+        V: DescriptorParts<F::Descriptor>,
+    {
+        // SAFETY: the holder's storage validity is the caller's obligation;
+        // DescriptorParts derives its result only from this exact descriptor.
+        let validated = unsafe { V::validate(frame.descriptor())? };
+        // SAFETY: the caller retains this descriptor and its metadata; the
+        // sealed validator selects the descriptor's matching metadata rule.
+        unsafe { Self::with_frame_metadata(frame, validated, V::METADATA) }
     }
 
     /// Parts validated from this exact held descriptor.
@@ -4581,14 +4670,27 @@ impl<F: HoldsDescriptor, V> ValidatedFrame<F, V> {
     ///
     /// # Safety
     ///
-    /// The descriptor's metadata pointer must be null, or readable up to its
-    /// first NUL or [`MAX_METADATA_BYTES`], with those bytes live and
-    /// unchanged until `frame` is dropped, and `frame` must hold that one
-    /// descriptor for as long as it lives.
-    unsafe fn with_frame_metadata(frame: F, validated: V) -> Result<Self> {
-        // SAFETY: forwarded to the caller.
-        let metadata_state =
-            unsafe { FrameMetadataState::scan(frame.descriptor().metadata_pointer()) };
+    /// `validated` must have been derived from this exact held descriptor.
+    /// The holder must keep its descriptor and every allocation described by
+    /// those parts initialized, live and unchanged until it is dropped. Its
+    /// metadata must be readable for `kind`'s bounded length/terminator rule,
+    /// which must match the descriptor's capture family.
+    unsafe fn with_frame_metadata(frame: F, validated: V, kind: MetadataKind) -> Result<Self> {
+        // SAFETY: the caller retains this descriptor's metadata for the
+        // matching capture rule, including its declared standalone extent.
+        let metadata_state = unsafe {
+            match kind {
+                MetadataKind::Embedded => {
+                    FrameMetadataState::scan(frame.descriptor().metadata_pointer())
+                }
+                MetadataKind::Standalone => {
+                    FrameMetadataState::from_text(frame.descriptor().standalone_metadata(false)?)
+                }
+                MetadataKind::Sender => {
+                    FrameMetadataState::from_text(frame.descriptor().standalone_metadata(true)?)
+                }
+            }
+        };
         Ok(Self {
             metadata_state,
             frame,
@@ -4632,7 +4734,7 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_video_frame_v2_t>> ValidatedVideo<F>
     #[cfg(test)]
     unsafe fn video_held(frame: F) -> Result<Self> {
         // SAFETY: forwarded to the caller for this held video descriptor.
-        unsafe { Self::validate_held(frame, validate_video_frame) }
+        unsafe { Self::validate_held(frame) }
     }
 }
 
@@ -4650,7 +4752,7 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> ValidatedAudio<F>
     #[cfg(test)]
     unsafe fn audio_held(frame: F) -> Result<Self> {
         // SAFETY: forwarded to the caller for this held audio descriptor.
-        unsafe { Self::validate_held(frame, validate_audio_layout) }
+        unsafe { Self::validate_held(frame) }
     }
 
     /// Validate audio the SDK returned where no samples is a valid answer:
@@ -4659,15 +4761,15 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> ValidatedAudio<F>
     ///
     /// # Safety
     ///
-    /// As for [`Self::audio`], for a descriptor that holds samples.
+    /// As for [`Self::validate_held`], for a descriptor that holds samples.
     #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_av_sync)))]
     unsafe fn returned_audio_held(frame: F) -> Result<ReturnedAudio<Self>> {
         Ok(match validate_returned_audio(frame.descriptor())? {
             ReturnedAudio::Empty(format) => ReturnedAudio::Empty(format),
             // SAFETY: forwarded to the caller for a frame of samples.
-            ReturnedAudio::Samples(validated) => {
-                ReturnedAudio::Samples(unsafe { Self::with_frame_metadata(frame, validated)? })
-            }
+            ReturnedAudio::Samples(validated) => ReturnedAudio::Samples(unsafe {
+                Self::with_frame_metadata(frame, validated, MetadataKind::Embedded)?
+            }),
         })
     }
 }
@@ -4683,13 +4785,8 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_metadata_frame_t>> ValidatedMetadata
     /// storage for the declared length, or a NUL-terminated string within
     /// the metadata cap when the length is zero, live and unchanged.
     unsafe fn metadata_frame_held(frame: F) -> Result<Self> {
-        // SAFETY: forwarded to the caller.
-        let text = unsafe { validate_metadata_layout(frame.descriptor())? };
-        Ok(Self {
-            metadata_state: FrameMetadataState::from_text(text),
-            frame,
-            validated: (),
-        })
+        // SAFETY: the caller retains this standalone descriptor's text.
+        unsafe { Self::validate_held(frame) }
     }
 }
 
@@ -4698,31 +4795,17 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_metadata_frame_t>> ValidatedMetadata
 impl<'a, S: FrameFree, V> ValidatedFrame<Guard<'a, S>, V>
 where
     S::RawFrame: SdkDescriptor,
+    V: DescriptorParts<S::RawFrame>,
 {
     /// Validate this delivered guard's descriptor and cache its metadata.
-    pub(crate) fn validate(
-        frame: Guard<'a, S>,
-        validate: impl FnOnce(&S::RawFrame) -> Result<V>,
-    ) -> Result<Self> {
-        // SAFETY: Guard retains its descriptor and the initialized storage
-        // every non-null pointer describes, unchanged until matching release.
-        unsafe { Self::validate_held(frame, validate) }
-    }
-}
-
-impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> ValidatedVideo<Guard<'a, S>> {
-    /// Validate the video descriptor and initialized active rows Guard retains.
-    pub(crate) fn video(frame: Guard<'a, S>) -> Result<Self> {
-        Self::validate(frame, validate_video_frame)
+    pub(crate) fn validate(frame: Guard<'a, S>) -> Result<Self> {
+        // SAFETY: Guard retains its descriptor and initialized storage until
+        // matching release. The sealed validator derives V from that descriptor.
+        unsafe { Self::validate_held(frame) }
     }
 }
 
 impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> ValidatedAudio<Guard<'a, S>> {
-    /// Validate the descriptor and initialized channel samples Guard retains.
-    pub(crate) fn audio(frame: Guard<'a, S>) -> Result<Self> {
-        Self::validate(frame, validate_audio_layout)
-    }
-
     /// Validate a guarded synchronization result, including an empty answer.
     #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_av_sync)))]
     pub(crate) fn returned_audio(frame: Guard<'a, S>) -> Result<ReturnedAudio<Self>> {
@@ -4747,13 +4830,16 @@ impl<'a, D: SdkDescriptor, V> ValidatedFrame<&'a D, V> {
     ///
     /// # Safety
     /// Every pointer and initialized extent described by `frame` must stay
-    /// valid and unchanged for `'a`, including bounded metadata text.
+    /// valid and unchanged for `'a`, including bounded metadata text. The
+    /// validator must derive its parts from the descriptor it receives.
     pub(crate) unsafe fn validate_descriptor(
         frame: &'a D,
         validate: impl FnOnce(&D) -> Result<V>,
     ) -> Result<Self> {
-        // SAFETY: forwarded to the test caller retaining the descriptor.
-        unsafe { Self::validate_held(frame, validate) }
+        let validated = validate(frame)?;
+        // SAFETY: the test caller retains this descriptor and guarantees its
+        // validator derives these parts from that descriptor.
+        unsafe { Self::with_frame_metadata(frame, validated, MetadataKind::Embedded) }
     }
 }
 
@@ -5010,26 +5096,6 @@ impl<'a> Iterator for VideoPlanes<'a> {
 impl ExactSizeIterator for VideoPlanes<'_> {}
 impl std::iter::FusedIterator for VideoPlanes<'_> {}
 
-mod borrowed {
-    use super::*;
-
-    #[allow(private_bounds)]
-    pub(crate) struct VideoRef<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> {
-        /// The captured frame and the layout, header and metadata text validated
-        /// from it once, when it was captured; accessors read the cached values.
-        pub(super) frame: ValidatedVideo<Guard<'a, S>>,
-    }
-
-    #[allow(private_bounds)]
-    pub(crate) struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
-        /// The captured frame and the layout and metadata text validated from it
-        /// once, when it was captured; accessors read the cached values.
-        pub(super) frame: ValidatedAudio<Guard<'a, S>>,
-    }
-}
-
-pub(crate) use borrowed::{AudioRef, VideoRef};
-
 /// A zero-copy video frame captured from a [`Receiver`](crate::Receiver).
 ///
 /// Borrows its receiver and frees the SDK buffer when dropped. It can be moved
@@ -5040,73 +5106,14 @@ pub(crate) use borrowed::{AudioRef, VideoRef};
 /// prevent a contiguous view. Use `planes()` and each plane's rows for padded layouts.
 /// See [`crate::FrameSyncVideoRef`] for clock-driven capture.
 pub struct VideoFrameRef<'rx> {
-    inner: VideoRef<'rx, VideoKind>,
-}
-
-#[allow(private_bounds)]
-impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
-    /// Create a borrowed video frame from an RAII guard.
-    ///
-    /// Validates the frame including:
-    /// - Valid pixel format (FourCC)
-    /// - Non-null data pointer
-    /// - Valid dimensions and stride
-    /// - Valid frame rate, picture aspect ratio and scan type
-    /// - Buffer size within `MAX_VIDEO_BYTES` limit
-    /// - Metadata text
-    ///
-    /// The validated layout, header and text are cached so that accessors
-    /// return them without re-computation or unchecked arithmetic.
-    pub(crate) fn new(guard: Guard<'a, S>) -> Result<Self> {
-        let frame = ValidatedVideo::video(guard)?;
-        Ok(Self { frame })
-    }
-
-    /// The SDK descriptor of this frame, exactly as its capture delivered it,
-    /// for an SDK call that reads a captured frame in place. The guard keeps
-    /// every buffer it points to allocated and unchanged for as long as
-    /// `self` is borrowed.
-    #[cfg(feature = "advanced")]
-    pub(crate) fn raw(&self) -> &NDIlib_video_frame_v2_t {
-        self.frame.descriptor()
-    }
-}
-
-// Specialize methods on the public aliases so rustdoc shows their full API
-// even though the generic frame core has no public path.
-// SAFETY: The validated frame holds a Guard that keeps the SDK allocation
-// alive until matching release. Every part delegates to that one validated
-// descriptor, whose initialized active pixels/text remain unchanged for the
-// borrow. Default descriptors/direct-send checks preserve its storage bounds.
-unsafe impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoParts for VideoRef<'_, S> {
-    #[inline]
-    fn layout(&self) -> &ValidatedVideoLayout {
-        self.frame.layout()
-    }
-    #[inline]
-    fn header(&self) -> &VideoHeader {
-        self.frame.header()
-    }
-    #[inline]
-    fn pixels(&self) -> *const u8 {
-        self.frame.pixels()
-    }
-    #[inline]
-    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
-        self.frame.frame_metadata()
-    }
-
-    #[inline]
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
-        self.frame.sdk_timestamp()
-    }
+    inner: ValidatedVideo<Guard<'rx, VideoKind>>,
 }
 
 macro_rules! borrowed_video_accessors {
     ($name:ident, $strategy:ty) => {
         impl<'a> $name<'a> {
             pub(crate) fn new(guard: Guard<'a, $strategy>) -> Result<Self> {
-                Ok(Self { inner: VideoRef::new(guard)? })
+                Ok(Self { inner: ValidatedVideo::validate(guard)? })
             }
 
         }
@@ -5140,7 +5147,7 @@ macro_rules! borrowed_video_accessors {
                 /// [`Self::to_owned`] for a tightly packed owned buffer. A single packed
                 /// row can be borrowed even when its stride includes trailing padding.
             } {
-        self.inner.frame.active_data()
+        self.inner.active_data()
     }
             to_owned(self) {
                 /// Copy this borrowed frame into an owned `VideoFrame`.
@@ -5155,7 +5162,7 @@ macro_rules! borrowed_video_accessors {
                 /// The copy cannot fail: capture validated everything it relies on, and
                 /// the packed layout of a valid frame is valid.
             } {
-        self.inner.frame.owned_copy()
+        self.inner.owned_copy()
     }
             copy_into {
                 /// Copy this borrowed frame into `destination`, reusing its allocations.
@@ -5207,7 +5214,7 @@ borrowed_video_accessors!(FrameSyncVideoRef, FrameSyncVideoFree);
 impl VideoFrameRef<'_> {
     /// The original receiver descriptor retained by this frame's guard.
     pub(crate) fn raw(&self) -> &NDIlib_video_frame_v2_t {
-        self.inner.raw()
+        self.inner.descriptor()
     }
 }
 
@@ -5221,61 +5228,7 @@ impl VideoFrameRef<'_> {
 /// audio frame has at least one channel and one sample per channel.
 /// See [`crate::FrameSyncAudioRef`] for clock-driven capture.
 pub struct AudioFrameRef<'rx> {
-    inner: AudioRef<'rx, AudioKind>,
-}
-
-#[allow(private_bounds)]
-impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
-    /// Validate the frame an RAII guard owns, for either family's `new`.
-    ///
-    /// Validates the frame layout including:
-    /// - Valid audio format (FourCC)
-    /// - Non-null, `f32`-aligned data pointer
-    /// - Positive sample rate, channel count, and sample count
-    /// - Channel stride and buffer size within the `MAX_AUDIO_BYTES` limit
-    ///
-    /// and the frame metadata. Both are cached so that accessors return
-    /// slices without re-computation or unchecked arithmetic. A descriptor
-    /// without samples is rejected.
-    fn from_guard(guard: Guard<'a, S>) -> Result<Self> {
-        let frame = ValidatedAudio::audio(guard)?;
-        Ok(Self { frame })
-    }
-
-    /// Wrap audio already validated while its guard retains the native loan.
-    #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_av_sync)))]
-    pub(crate) fn from_validated(frame: ValidatedAudio<Guard<'a, S>>) -> Self {
-        Self { frame }
-    }
-}
-
-// Specialize methods on the public aliases so rustdoc shows their full API
-// even though the generic frame core has no public path.
-// SAFETY: The validated frame holds a Guard that keeps the SDK allocation
-// alive until matching release. All parts delegate to that one validated
-// descriptor, with aligned initialized active samples and bounded terminated
-// text unchanged for the borrow; the default descriptor preserves the bounds.
-unsafe impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioParts for AudioRef<'_, S> {
-    #[inline]
-    fn layout(&self) -> &ValidatedAudioLayout {
-        self.frame.layout()
-    }
-    #[inline]
-    fn audio_timecode(&self) -> Timecode {
-        self.frame.audio_timecode()
-    }
-    #[inline]
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
-        self.frame.sdk_timestamp()
-    }
-    #[inline]
-    fn samples(&self) -> *const f32 {
-        self.frame.samples()
-    }
-    #[inline]
-    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
-        self.frame.frame_metadata()
-    }
+    inner: ValidatedAudio<Guard<'rx, AudioKind>>,
 }
 
 macro_rules! borrowed_audio_accessors {
@@ -5322,7 +5275,7 @@ macro_rules! borrowed_audio_accessors {
                     /// Use [`channel_data`](Self::channel_data) or [`channels`](Self::channels)
                     /// for those buffers.
                 } {
-            self.inner.frame.contiguous_samples()
+            self.inner.contiguous_samples()
         }
                 to_owned(self) {
                     /// Copy this borrowed frame into an owned `AudioFrame`.
@@ -5336,7 +5289,7 @@ macro_rules! borrowed_audio_accessors {
                     ///
                     /// The copy cannot fail: capture validated everything it relies on.
                 } {
-            self.inner.frame.owned_copy()
+            self.inner.owned_copy()
         }
                 copy_into {
                     /// Copy this borrowed frame into `destination`, reusing its allocations.
@@ -5371,7 +5324,7 @@ borrowed_audio_accessors!(AvSyncAudioRef, AvSyncAudioFree);
 impl<'rx> AudioFrameRef<'rx> {
     pub(crate) fn new(guard: RecvAudioGuard<'rx>) -> Result<Self> {
         Ok(Self {
-            inner: AudioRef::from_guard(guard)?,
+            inner: ValidatedAudio::validate(guard)?,
         })
     }
 }
@@ -5379,7 +5332,7 @@ impl<'rx> AudioFrameRef<'rx> {
 impl<'fs> FrameSyncAudioRef<'fs> {
     pub(crate) fn new(guard: Guard<'fs, FrameSyncAudioFree>) -> Result<Self> {
         Ok(Self {
-            inner: AudioRef::from_guard(guard)?,
+            inner: ValidatedAudio::validate(guard)?,
         })
     }
 }
@@ -5387,9 +5340,7 @@ impl<'fs> FrameSyncAudioRef<'fs> {
 #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_av_sync)))]
 impl<'a> AvSyncAudioRef<'a> {
     pub(crate) fn from_validated(frame: ValidatedAudio<Guard<'a, AvSyncAudioFree>>) -> Self {
-        Self {
-            inner: AudioRef::from_validated(frame),
-        }
+        Self { inner: frame }
     }
 }
 
@@ -5494,16 +5445,10 @@ impl<'rx> MetadataFrameRef<'rx> {
             guard: ManuallyDrop::new(guard),
             lease: ManuallyDrop::new(lease),
         };
-        // SAFETY: the sender guard retains its delivered descriptor and the
-        // SDK's NUL-terminated UTF-8 storage through matching native release.
-        // Sender captures permit a positive count that excludes the terminator.
-        let metadata_state =
-            FrameMetadataState::from_text(unsafe { validate_sender_metadata(guard.descriptor())? });
-        let frame = ValidatedMetadata {
-            frame: guard,
-            metadata_state,
-            validated: (),
-        };
+        // SAFETY: this holder retains the sender's descriptor and text through
+        // matching release, with a positive length that may exclude the NUL.
+        let frame =
+            unsafe { ValidatedMetadata::with_frame_metadata(guard, (), MetadataKind::Sender)? };
         Ok(Self {
             frame: MetadataLoan::Sender(frame),
         })
@@ -10476,3 +10421,9 @@ pub(crate) mod descriptor_tests;
 #[cfg(test)]
 #[path = "frames/metadata_tests.rs"]
 mod metadata_tests;
+
+// Compile in the real module so a missing DescriptorParts bound, rather than
+// visibility of crate internals, refuses unvalidated caller-selected parts.
+#[cfg(ndi_test_descriptor_parts)]
+#[path = "../tests/ui/internal/descriptor_parts.rs"]
+mod descriptor_parts_fixture;

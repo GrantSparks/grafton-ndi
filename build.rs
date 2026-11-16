@@ -41,6 +41,7 @@ fn main() {
         "ndi_test_send_ownership",
         "ndi_test_send_ownership_control",
         "ndi_test_send_ownership_types",
+        "ndi_test_descriptor_parts",
         "ndi_test_finder_snapshot_guard",
         "ndi_test_foreign_snapshot_guard",
     ] {
