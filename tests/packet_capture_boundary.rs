@@ -9,7 +9,10 @@
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
-use grafton_ndi::{advanced::*, Error, Ndi, ReceiverOptions, RuntimeOptions, Source};
+use grafton_ndi::{
+    advanced::*, Error, Ndi, ReceiverEvent, ReceiverOptions, RuntimeOptions, SdkResultDefect,
+    Source,
+};
 use std::{fs, process::Command, time::Duration};
 
 #[test]
@@ -117,6 +120,53 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
             capture.join().unwrap();
         });
         std::env::remove_var("GRAFTON_FAKE_CAPTURE_DELAY_MS");
+
+        // A malformed status snapshot must not pin the shared AllSlots kernel
+        // ahead of source notifications or either compressed media family.
+        std::env::set_var("GRAFTON_FAKE_NEGATIVE_COUNT", "connections");
+        std::env::set_var(
+            "GRAFTON_FAKE_CAPTURE_SCRIPT",
+            "27:status,source,packet-video,packet-audio",
+        );
+        assert!(matches!(
+            packets.capture_any_ref(Duration::ZERO),
+            Err(Error::UnexpectedSdkResult(SdkResultDefect::NegativeCount { operation, value }))
+                if operation.name().to_str().unwrap() == "NDIlib_recv_get_no_connections"
+                    && value.get() == -1
+        ));
+        assert!(matches!(
+            packets.capture_any(Duration::ZERO).unwrap(),
+            Some(PacketItem::Event(ReceiverEvent::SourceChanged))
+        ));
+        let captures = || {
+            log()
+                .lines()
+                .filter(|line| line.starts_with("capture:"))
+                .count()
+        };
+        let before = captures();
+        assert!(matches!(
+            packets.capture_any_ref(Duration::ZERO).unwrap(),
+            Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(_)))
+        ));
+        assert_eq!(
+            captures(),
+            before + 1,
+            "packet capture did not reach the SDK"
+        );
+        assert!(matches!(
+            packets.capture_any(Duration::ZERO).unwrap(),
+            Some(PacketItem::Audio(ReceivedAudio::Compressed(_)))
+        ));
+        std::env::remove_var("GRAFTON_FAKE_NEGATIVE_COUNT");
+        let before = captures();
+        assert!(matches!(
+            packets.capture_any(Duration::ZERO).unwrap(),
+            Some(PacketItem::Event(ReceiverEvent::StatusChanged(status)))
+                if status.connections() == 0
+        ));
+        assert_eq!(captures(), before, "recovered status was not retained");
+        assert!(packets.capture_any_ref(Duration::ZERO).unwrap().is_none());
         return;
     }
     let dir = fixture::FixtureDir::create("packet-capture");
