@@ -42,13 +42,13 @@ RUST_IDENTIFIER = re.compile(r'(?:r#)?[A-Za-z_][A-Za-z_0-9]*')
 
 # These entry points have no public operation: ownership releases resources
 # automatically, while selection caches the native version before exposing info.
+# Public aliases make an exemption unnecessary and are reported as such.
 # Exact names keep a new entry point from inheriting an exception accidentally.
 INTERNAL_SDK_ENTRY_POINTS = {
     'NDIlib_version': 'runtime selection caches the version in RuntimeInfo',
     'NDIlib_destroy': 'the runtime initialization owner releases initialization on drop',
     'NDIlib_find_destroy': 'Finder releases its instance on drop',
     'NDIlib_recv_destroy': 'Receiver releases its instance on drop',
-    'NDIlib_send_destroy': 'Sender releases its instance on drop',
     'NDIlib_framesync_destroy': 'FrameSync releases its instance on drop',
     'NDIlib_avsync_destroy': 'AvSync releases its instance on drop',
     'NDIlib_genlock_destroy': 'Genlock releases its instance on drop',
@@ -57,8 +57,6 @@ INTERNAL_SDK_ENTRY_POINTS = {
     'NDIlib_recv_advertiser_destroy': 'RecvAdvertiser releases its instance on drop',
     'NDIlib_send_listener_destroy': 'SendListener releases its instance on drop',
     'NDIlib_recv_listener_destroy': 'RecvListener releases its instance on drop',
-    'NDIlib_file_player_destroy': 'FilePlayer releases its instance on its owner thread',
-    'NDIlib_file_recorder_destroy': 'FileRecorder releases its instance on its owner thread',
     'NDIlib_recv_free_video_v2': 'the receiver video guard releases its frame on drop',
     'NDIlib_recv_free_audio_v3': 'the receiver audio guard releases its frame on drop',
     'NDIlib_recv_free_metadata': 'the receiver metadata guard releases its frame on drop',
@@ -224,9 +222,9 @@ def public_function_at(words, start):
     return words[start:start + 1] == ['fn']
 
 
-def production_words(words):
+def production_words(words, *, with_indices=False):
     """Exclude inline #[cfg(test)] items as well as separate test source files."""
-    result, index = [], 0
+    result, indices, index = [], [], 0
     while index < len(words):
         attributes, after = token_attributes(words, index)
         if ['cfg', '(', 'test', ')'] in attributes:
@@ -236,9 +234,11 @@ def production_words(words):
             if index < len(words):
                 index = token_group_end(words, index) if words[index] == '{' else index + 1
         else:
-            result.extend(words[index:after] if after > index else words[index:index + 1])
-            index = after if after > index else index + 1
-    return result
+            end = after if after > index else index + 1
+            result.extend(words[index:end])
+            indices.extend(range(index, end))
+            index = end
+    return (result, indices) if with_indices else result
 
 
 def macro_public_attribute_slots(words):
@@ -278,13 +278,14 @@ def macro_public_attribute_slots(words):
 
 
 def public_sdk_aliases(words):
-    aliases = set()
-    words = production_words(words)
+    """Map public native aliases to their original token index."""
+    aliases = {}
+    words, indices = production_words(words, with_indices=True)
     macros = macro_public_attribute_slots(words)
     for index in range(len(words)):
         attributes, after = token_attributes(words, index)
         if attributes and public_function_at(words, after):
-            aliases.update(attribute_aliases(attributes))
+            aliases.update({alias: indices[index] for alias in attribute_aliases(attributes)})
         if words[index] not in macros or words[index + 1:index + 2] != ['!']:
             continue
         opening = index + 2
@@ -296,21 +297,30 @@ def public_sdk_aliases(words):
                 continue
             attrs, tail = token_attributes(argument, 0)
             if len(argument[tail:]) == 1 and RUST_IDENTIFIER.fullmatch(argument[tail]):
-                aliases.update(attribute_aliases(attrs))
+                aliases.update({alias: indices[index] for alias in attribute_aliases(attrs)})
     return aliases
 
 
 def sdk_alias_violations(root):
     """Every registered SDK call is publicly searchable or explicitly internal."""
-    entries, aliases = native_sdk_entries(root), set()
+    entries, aliases = native_sdk_entries(root), {}
     for path in sorted((root / 'src').rglob('*.rs')):
         if (path.is_relative_to(root / 'src/sys') or path.stem.endswith('_tests')
                 or 'test_support' in path.parts or path.stem in {'tests', 'test_support'}):
             continue
         text = path.read_text(encoding='utf-8')
         if re.search(r'\bdoc\s*\(\s*alias', text):
-            aliases.update(public_sdk_aliases([word for word, _ in rust_tokens(text)]))
+            tokens = rust_tokens(text)
+            for alias, index in public_sdk_aliases([word for word, _ in tokens]).items():
+                aliases.setdefault(alias, (path, text.count('\n', 0, tokens[index][1]) + 1))
     found = []
+    for name in sorted(INTERNAL_SDK_ENTRY_POINTS):
+        if name in aliases:
+            path, line = aliases[name]
+            found.append(f'{path.relative_to(root)}:{line}: SDK entry point {name} '
+                         'is aliased publicly; remove its internal exemption')
+        elif name not in entries:
+            found.append(f'ci/docs.py: internal exemption {name} names no registered SDK entry point')
     for name, (path, line) in sorted(entries.items()):
         if name not in aliases and name not in INTERNAL_SDK_ENTRY_POINTS:
             found.append(f'{path.relative_to(root)}:{line}: SDK entry point {name} '

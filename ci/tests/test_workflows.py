@@ -762,7 +762,7 @@ class Repository(unittest.TestCase):
         lines = (ROOT / '.github' / 'CODEOWNERS').read_text(encoding='utf-8').splitlines()
         owned = {line.split()[0]: line.split()[1:] for line in lines if line.strip() and not line.startswith('#')}
         self.assertEqual(set(owned), {'/.github/', '/ci/', '/scripts/', '/.cargo/', '/rust-toolchain.toml',
-                                      '/Cargo.toml', '/Cargo.lock'})
+                                      '/Cargo.toml', '/Cargo.lock', '/xtask/'})
         self.assertEqual({owner for owners in owned.values() for owner in owners}, {'@GrantSparks'})
 
 
