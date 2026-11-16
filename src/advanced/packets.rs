@@ -89,17 +89,11 @@ pub enum VideoCodec {
     HevcAlpha,
 }
 
-impl VideoCodec {
-    const ALL: [Self; 7] = [
-        Self::SpeedHq420,
-        Self::SpeedHq422,
-        Self::SpeedHq422Alpha,
-        Self::H264,
-        Self::Hevc,
-        Self::H264Alpha,
-        Self::HevcAlpha,
-    ];
+crate::media::decoded_variants!(VideoCodec:
+    SpeedHq420, SpeedHq422, SpeedHq422Alpha, H264, Hevc, H264Alpha, HevcAlpha,
+);
 
+impl VideoCodec {
     /// The FourCC a frame of this codec is sent with.
     pub(crate) const fn outer(self, tier: StreamTier, protected: bool) -> u32 {
         let bytes = match (self, tier) {
@@ -156,6 +150,8 @@ pub enum EnvelopeCodec {
     Aac,
 }
 
+crate::media::decoded_variants!(EnvelopeCodec: H264, Hevc, Aac);
+
 impl EnvelopeCodec {
     const fn raw_fourcc(self) -> u32 {
         match self {
@@ -182,7 +178,7 @@ impl TryFrom<FourCc> for EnvelopeCodec {
     ///
     /// [`Error::InvalidFrame`] when the FourCC names no supported envelope codec.
     fn try_from(fourcc: FourCc) -> Result<Self> {
-        [Self::H264, Self::Hevc, Self::Aac]
+        Self::ALL
             .into_iter()
             .find(|&codec| FourCc::from(codec) == fourcc)
             .ok_or_else(|| {
@@ -1034,6 +1030,8 @@ pub enum AudioCodec {
     Opus,
 }
 
+crate::media::decoded_variants!(AudioCodec: Aac, Opus);
+
 /// The sample rate, channel count and samples per channel of one compressed
 /// audio frame, each in `1..=i32::MAX`, the range of the SDK's signed fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1195,7 +1193,7 @@ impl AudioCodec {
     /// The codec and protection a frame FourCC names, if it is compressed
     /// audio this module knows.
     pub(crate) fn from_outer(value: u32) -> Option<(Self, bool)> {
-        [Self::Aac, Self::Opus].into_iter().find_map(|codec| {
+        Self::ALL.into_iter().find_map(|codec| {
             [false, true]
                 .into_iter()
                 .find(|protected| value == codec.outer(*protected))
@@ -1897,7 +1895,7 @@ mod tests {
         let p = PacketEnvelope::parse(&unknown).unwrap();
         assert_eq!(p.codec(), None);
         assert_eq!(p.fourcc(), FourCc::from_raw(u32::from_ne_bytes(*b"AV01")));
-        for codec in [EnvelopeCodec::H264, EnvelopeCodec::Hevc, EnvelopeCodec::Aac] {
+        for codec in EnvelopeCodec::ALL {
             assert_eq!(EnvelopeCodec::try_from(FourCc::from(codec)).unwrap(), codec);
         }
         assert!(matches!(
@@ -1909,6 +1907,14 @@ mod tests {
 
     #[test]
     fn codec_outer_roundtrips_and_opus_is_not_an_envelope() {
+        for codec in AudioCodec::ALL {
+            for protected in [false, true] {
+                assert_eq!(
+                    AudioCodec::from_outer(codec.outer(protected)),
+                    Some((codec, protected))
+                );
+            }
+        }
         for codec in VideoCodec::ALL {
             for tier in [StreamTier::Program, StreamTier::Preview] {
                 for protected in [false, true] {
