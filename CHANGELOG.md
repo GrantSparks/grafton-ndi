@@ -17,6 +17,19 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- Explicit zero video strides are refused consistently by sizing and borrowed
+  builders. Use `None` or `clear_line_stride_bytes()` for packed rows; received
+  SDK descriptors retain their documented zero-stride sentinel.
+- Allocation failures use `Error::AllocationFailed(AllocationFailure)` across
+  discovery, image scratch, receive buffers and Advanced bookkeeping. Error
+  payload names follow the public conventions, unreachable error leaves are
+  removed, and spawn/queue errors exist only with their producing features.
+- Default Windows and macOS runtime and File searches no longer implicitly
+  load a library from the working directory. Windows expands absolute `PATH`
+  entries; macOS retains `@rpath` and expands absolute `DYLD_LIBRARY_PATH`
+  entries. Relative and empty directory entries are recorded as refused;
+  unsafe dyld entries refuse the entire default search before any native open.
+
 - Public APIs follow one [set of conventions](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/api-conventions.md)
   for construction, options, capture, events, waits and paths. Receiver and async
   typed capture use `capture_video`, `capture_audio`, `capture_metadata` and
@@ -199,6 +212,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Added
 
+- Validated contiguous compressed frames and borrowed/received packets expose
+  `envelope()` without repeating fallible envelope parsing.
+
 - `ExternalPool`, `PoolBlock` and unsafe `AllocationBuffer::from_pool` lend
   preallocated receive buffers without boxing a handle on SDK threads.
 
@@ -278,6 +294,23 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   recording and playback. See the [examples index](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/README.md).
 
 ### Performance and correctness
+
+- Submitted async recorder completion waits, including queued waits, receive
+  the finalization evidence gathered by concurrent close or last-handle drop.
+- Async probes retain their runtime initialization lease through queued work
+  and native completion. File playback paths are validated once at submission,
+  and Windows recorder preflight checks directory write permission.
+- Abandoned async receiver waits retain their events and source-name changes
+  for the next consumer. Failed status snapshots report once per publication
+  while other notifications and subsequent media capture remain available.
+- Descriptor slots initialize through interior mutability, completion failures
+  wake collectors under the queue lock, and sender metadata frees before its
+  capture gate is released. Discovery subscriptions retain identifier storage
+  until native unsubscription or destruction.
+- Interleaved audio uses the shared zero-count errors and allocates conversion
+  destinations from their validated shape without repeating validation.
+- Owned compressed packet formatting summarizes byte lengths rather than
+  exposing complete payloads or native descriptor addresses.
 
 - Validation, timeout, HDR, withheld-metadata and completion refusals retain
   typed evidence without formatting allocations. Wide cold-path evidence uses
@@ -392,6 +425,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   conversion, reconnect-friendly status polling and NV12 stride validation.
 
 ### Build and platform support
+
+- Required CI checks include Miri and Memcheck padding regressions, rustdoc
+  for every linted feature combination, and warnings-denied Apple mobile lint.
+  Promising an NDI|HX decoder also requires its Advanced runtime prerequisites.
 
 - Rust 1.88 remains the minimum. Default desktop/Android builds need no SDK,
   bindgen or `libclang`. Advanced native operations require Advanced headers

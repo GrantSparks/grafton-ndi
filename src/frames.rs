@@ -1304,7 +1304,7 @@ macro_rules! video_accessors {
                 ///
                 /// Returns [`Error::InvalidInput`](crate::Error::InvalidInput)
                 /// for unsuitable options, [`Error::InvalidFrame`](crate::Error::InvalidFrame)
-                /// for frame or codec refusals, or `Error::AllocationFailed` for
+                /// for frame or codec refusals, or [`Error::AllocationFailed`](crate::Error::AllocationFailed) for
                 /// conversion scratch storage. The complete conditions are in the
                 /// [ImageOptions error table](crate::image_encoding::ImageOptions#errors).
                 ///

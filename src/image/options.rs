@@ -224,7 +224,7 @@ impl ImageFormat {
 /// | An image wider or taller than JPEG's 65,535, lossless WebP's 16,384 or lossy WebP's 16,383 pixels | [`Error::InvalidFrame`] |
 /// | Writing or flushing the writer given to `encode_image_to` fails | [`Error::Io`] |
 /// | The required conversion scratch size overflows | [`Error::InvalidFrame`] |
-/// | Conversion scratch cannot be allocated | `Error::AllocationFailed` |
+/// | Conversion scratch cannot be allocated | [`Error::AllocationFailed`] |
 /// | The codec fails for another reason | [`Error::InvalidFrame`] |
 ///
 /// `ImageOptions` holds settings only, no buffers, so one value serves any
@@ -232,6 +232,7 @@ impl ImageFormat {
 ///
 /// [`VideoFrame::encode_image`]: crate::VideoFrame::encode_image
 /// [`Error::InvalidInput`]: crate::Error::InvalidInput
+/// [`Error::AllocationFailed`]: crate::Error::AllocationFailed
 /// [`Error::InvalidFrame`]: crate::Error::InvalidFrame
 /// [`Error::Io`]: crate::Error::Io
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
