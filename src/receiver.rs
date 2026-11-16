@@ -35,6 +35,7 @@ use crate::RuntimeFeature;
 use crate::advanced::{AvSyncAttached, PacketAttached};
 
 use std::{
+    collections::VecDeque,
     ffi::CString,
     marker::PhantomData,
     os::raw::c_char,
@@ -1152,7 +1153,9 @@ pub(crate) struct ReceiverCore {
     pending_status: PendingStatus,
     pending_source: AtomicBool,
     pending_unknown: Mutex<Option<u32>>,
-    source_query_guard: Mutex<()>,
+    // Serialize native one-shot queries and retain any results abandoned by an
+    // async caller. The queue allocates only when a completed result is replayed.
+    source_query_guard: Mutex<VecDeque<SourceNameChange>>,
     connection_metadata: Mutex<ConnectionMetadata>,
     _name: Option<CString>,
     #[cfg(feature = "advanced")]
@@ -1280,7 +1283,7 @@ impl<M: CreatableMode> Receiver<M> {
                 pending_status: PendingStatus::default(),
                 pending_source: AtomicBool::new(false),
                 pending_unknown: Mutex::new(None),
-                source_query_guard: Mutex::new(()),
+                source_query_guard: Mutex::new(VecDeque::new()),
                 connection_metadata: Mutex::new(ConnectionMetadata::default()),
                 _name,
                 #[cfg(feature = "advanced")]
@@ -2051,6 +2054,23 @@ impl ReceiverCore {
         }
     }
 
+    /// Return an undelivered async event to the shared coalescing mechanism.
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn retain_event(&self, event: ReceiverEvent) {
+        self.retain(match event {
+            ReceiverEvent::StatusChanged(_) => Notification::StatusChanged,
+            ReceiverEvent::SourceChanged => Notification::SourceChanged,
+            ReceiverEvent::Unknown(value) => Notification::Unknown(value),
+        });
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn retain_source_name_change(&self, change: SourceNameChange) {
+        // Several workers can finish before their futures are polled. Keep all
+        // abandoned changes rather than overwriting another worker's result.
+        self.source_query_guard.lock().push_back(change);
+    }
+
     fn take_pending_event(&self) -> Result<Option<ReceiverEvent>> {
         if let Some(event) = self.pending_status.take_or_else_with(
             || self.current_status().map(ReceiverEvent::StatusChanged),
@@ -2103,9 +2123,12 @@ impl ReceiverCore {
         stop: impl Stop,
     ) -> Result<Option<SourceNameChange>> {
         capture_within(deadline, stop, |attempt| {
-            let Some(_query) = self.source_query_guard.try_lock_until(attempt.0.end()) else {
+            let Some(mut query) = self.source_query_guard.try_lock_until(attempt.0.end()) else {
                 return Ok(None);
             };
+            if let Some(change) = query.pop_front() {
+                return Ok(Some(change));
+            }
             let mut pointer = ptr::null();
             let remaining = attempt.0.remaining_ms();
             // SAFETY: the receiver instance is live for this borrow and `pointer` is
@@ -2504,7 +2527,7 @@ const _: () = {
 
 // A panic cannot leave a receiver's shared state half-changed: of its locks,
 // the target and pending unknown event are replaced whole; the string-query
-// lock guards `()`. The rest of its mutable state is atomic, and no
+// lock protects complete retained changes. The rest of its mutable state is atomic, and no
 // application code runs while a
 // lock is held. The `parking_lot` locks do not poison and so do not declare
 // this themselves, which would otherwise leave `Receiver` short of
@@ -3270,6 +3293,56 @@ mod tests {
             .unwrap()
             .is_none());
         CALLS.with(|calls| assert_eq!(calls.borrow().len(), 1));
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    #[test]
+    fn retained_source_names_precede_native_queries_without_overwriting_each_other() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn get_source_name(
+            _instance: NDIlib_recv_instance_t,
+            name: *mut *const c_char,
+            _timeout_ms: u32,
+        ) -> bool {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            unsafe { name.write(ptr::null()) };
+            false
+        }
+        unsafe extern "C" fn free(_instance: NDIlib_recv_instance_t, _name: *const c_char) {}
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        let source_name = sys::ReceiverSourceName {
+            NDIlib_recv_get_source_name: get_source_name,
+        };
+        let strings = sys::ReceiverStrings {
+            NDIlib_recv_free_string: free,
+        };
+        let changes = [
+            SourceNameChange::Connected("first".into()),
+            SourceNameChange::Disconnected,
+        ];
+        for change in &changes {
+            receiver.core.retain_source_name_change(change.clone());
+        }
+        let poll = || {
+            receiver
+                .core
+                .wait_for_source_name_change_with(
+                    &source_name,
+                    &strings,
+                    Deadline::after(Duration::ZERO).unwrap(),
+                    NeverStop,
+                )
+                .unwrap()
+        };
+        for change in changes {
+            assert_eq!(poll(), Some(change));
+            assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+        }
+        assert!(poll().is_none());
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
     }
 
     /// A source no receiver can connect to: no name and no address.
