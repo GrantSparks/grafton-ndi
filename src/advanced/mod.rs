@@ -101,8 +101,10 @@ pub use packets::*;
 pub(crate) use queued::QueueLoans;
 pub use queued::*;
 pub use receive::*;
+#[cfg(ndi_has_advanced_scatter_send)]
+pub(crate) use send::ScatterVideoLoan;
 pub use send::*;
-pub(crate) use send::{PendingStreams, PendingVideo};
+pub(crate) use send::{PendingStreams, PendingVideo, ScatterSendable};
 pub use sync::*;
 
 /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) with its typed `cause`: a frame

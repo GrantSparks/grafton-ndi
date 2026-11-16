@@ -82,18 +82,21 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             frame.set_timecode(Timecode::from_ticks(number));
             let key = frame.storage.blocks[0].as_mut_ptr();
             let length = frame.storage.blocks[0].len() as i32;
-            frames.push(PendingVideo::Scatter {
-                frame,
-                table: scatter,
-            });
-            let Lent::Scatter {
-                frame,
-                scatter: list,
-                ..
-            } = frames.last_mut().unwrap().lend_for_queue()
-            else {
+            frames.push(PendingVideo::Scatter(
+                ScatterSendable::for_test(frame, Some(scatter)).unwrap(),
+            ));
+            let pending = frames.last_mut().unwrap();
+            let Lent::Scatter(mut proof) = pending.lend() else {
                 unreachable!("a scatter frame was prepared");
             };
+            let PendingVideo::Scatter(frame) = pending else {
+                unreachable!()
+            };
+            let (pointer, size) = frame.completion_key();
+            proof.descriptor_mut().p_data = pointer;
+            proof.descriptor_mut().__bindgen_anon_1.data_size_in_bytes = size;
+            let frame = proof.frame.descriptor;
+            let list = proof.frame.scatter;
             assert_eq!(frame.p_data, key);
             assert_eq!(unsafe { frame.__bindgen_anon_1.data_size_in_bytes }, length);
             expected.push((key as usize, number, length));

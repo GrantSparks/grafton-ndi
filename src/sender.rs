@@ -421,7 +421,7 @@ pub(crate) mod in_flight {
     use super::Exclusive;
     use super::{async_flush_frame_ptr, PreparedVideo, SendHandle, SenderResource};
     #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
-    use crate::sys::advanced::{FrameScatter, ScatterSend};
+    use crate::advanced::{ScatterSendable, ScatterVideoLoan};
     use crate::{frames::Sendable, sys::bindings::NDIlib_video_frame_v2_t, VideoFrame};
     use crate::{frames::VideoSource, pixels::Pixels, Result};
     use std::sync::{Arc, Mutex};
@@ -665,22 +665,13 @@ pub(crate) mod in_flight {
         #[allow(clippy::result_large_err)]
         pub(crate) fn submit_scatter(
             &mut self,
-            _frame: crate::advanced::ScatterVideoFrame,
+            frame: crate::advanced::ScatterVideoFrame,
         ) -> std::result::Result<
             Option<crate::advanced::SubmittedVideo>,
             crate::Rejected<crate::advanced::ScatterVideoFrame>,
         > {
-            use crate::sys::advanced::{native, ScatterSend};
-            let table = match self.sender.runtime().table::<ScatterSend>() {
-                Ok(table) => table,
-                Err(error) => return Err(crate::Rejected::new(error, _frame)),
-            };
-            native!(ScatterSend, table => {
-                Ok(self.submit_prepared(crate::advanced::PendingVideo::Scatter {
-                    frame: _frame,
-                    table,
-                }))
-            })
+            let proof = crate::advanced::ScatterSendable::new(frame, self.sender.runtime())?;
+            Ok(self.submit_prepared(crate::advanced::PendingVideo::Scatter(proof)))
         }
 
         fn submit_prepared(
@@ -774,11 +765,7 @@ pub(crate) mod in_flight {
         /// frame's blocks, for `NDIlib_send_send_video_scatter_async`. No
         /// header says the SDK copies the list, so the frame owns it too.
         #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
-        Scatter {
-            table: &'static ScatterSend,
-            frame: NDIlib_video_frame_v2_t,
-            scatter: *const FrameScatter,
-        },
+        Scatter(ScatterSendable<ScatterVideoLoan>),
     }
 
     impl Lent {
@@ -786,14 +773,15 @@ pub(crate) mod in_flight {
             match self {
                 Self::Frame(frame) => frame,
                 #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
-                Self::Scatter { frame, .. } => frame,
+                Self::Scatter(proof) => proof.descriptor(),
             }
         }
 
         #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
         pub(crate) fn descriptor_mut(&mut self) -> &mut NDIlib_video_frame_v2_t {
             match self {
-                Self::Frame(frame) | Self::Scatter { frame, .. } => frame,
+                Self::Frame(frame) => frame,
+                Self::Scatter(proof) => proof.descriptor_mut(),
             }
         }
 
@@ -822,16 +810,10 @@ pub(crate) mod in_flight {
                     };
                 }
                 #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
-                Self::Scatter { table, scatter, .. } => {
+                Self::Scatter(proof) => {
                     // SAFETY: the same lifetime contract also covers the stable
                     // scatter list and the arrays and payload it names.
-                    unsafe {
-                        table.NDIlib_send_send_video_scatter_async(
-                            sender.instance.0,
-                            descriptor,
-                            *scatter,
-                        )
-                    };
+                    unsafe { proof.submit(sender.instance.0, descriptor) };
                 }
             }
         }
