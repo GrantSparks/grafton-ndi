@@ -686,6 +686,7 @@ mod objects {
 
         fn NDIlib_send_advertiser_del_sender(_p_instance: NDIlib_send_advertiser_instance_t, _p_sender: NDIlib_send_instance_t) -> bool {
             if refuses_removal() {
+                log("send-advertiser-remove-refused");
                 return false;
             }
             log("send-advertiser-remove");
@@ -702,7 +703,13 @@ mod objects {
 
         fn NDIlib_recv_advertiser_destroy(p_instance: NDIlib_recv_advertiser_instance_t) {
             log("recv-advertiser-destroy");
-            drop(unsafe { Box::from_raw(p_instance.cast::<RecvAdvertiser>()) });
+            let advertiser = unsafe { Box::from_raw(p_instance.cast::<RecvAdvertiser>()) };
+            // A refused removal leaves the SDK reading this registration
+            // through destruction, including its borrowed input-group name.
+            for &(_, group) in &advertiser.groups {
+                log(&format!("recv-advertiser-destroy-group {}", unsafe { bytes(group) }));
+            }
+            drop(advertiser);
         }
 
         fn NDIlib_recv_advertiser_add_receiver(p_instance: NDIlib_recv_advertiser_instance_t, p_receiver: NDIlib_recv_instance_t, allow_controlling: bool, allow_monitoring: bool, p_input_group_name: *const c_char) -> bool {
@@ -715,6 +722,7 @@ mod objects {
 
         fn NDIlib_recv_advertiser_del_receiver(p_instance: NDIlib_recv_advertiser_instance_t, p_receiver: NDIlib_recv_instance_t) -> bool {
             if refuses_removal() {
+                log("recv-advertiser-remove-refused");
                 return false;
             }
             let advertiser = unsafe { &mut *p_instance.cast::<RecvAdvertiser>() };

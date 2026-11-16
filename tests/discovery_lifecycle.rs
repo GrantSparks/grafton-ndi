@@ -14,10 +14,10 @@ use grafton_ndi::{
     advanced::AdvancedConfig,
     capabilities::RuntimeFeature,
     discovery_server::{
-        AdvertiserOptions, ListenerOptions, RecvAdvertiser, RecvListener, SendAdvertiser,
-        SendListener,
+        AdvertiserOptions, ListenerOptions, ReceiverId, RecvAdvertisement, RecvAdvertiser,
+        RecvListener, SendAdvertisement, SendAdvertiser, SendListener, SenderId,
     },
-    Error, Ndi, RuntimeOptions,
+    Error, Ndi, Receiver, ReceiverOptions, RuntimeOptions, Sender, SenderOptions, Source,
 };
 use std::{fs, path::PathBuf, process::Command};
 
@@ -72,16 +72,82 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
             );
             return;
         }
-        let owners = (
+        let mut owners = (
             SendAdvertiser::new(&ndi, &advertisers).unwrap(),
             RecvAdvertiser::new(&ndi, &advertisers).unwrap(),
             SendListener::new(&ndi, &listeners).unwrap(),
             RecvListener::new(&ndi, &listeners).unwrap(),
         );
+        let removal_refused = std::env::var_os("GRAFTON_LIFECYCLE_REMOVE_REFUSED").is_some();
+        std::env::set_var("GRAFTON_FAKE_RETAIN_SOURCES", "1");
+        let sender = Sender::new(&ndi, &SenderOptions::new("lifecycle sender")).unwrap();
+        let receiver = Receiver::new(
+            &ndi,
+            &ReceiverOptions::new(Source::new("lifecycle source").unwrap()),
+        )
+        .unwrap();
+        owners
+            .0
+            .register(&sender, &SendAdvertisement::default())
+            .unwrap();
+        owners
+            .1
+            .register(
+                &receiver,
+                &RecvAdvertisement::default().input_group("retained group"),
+            )
+            .unwrap();
+        let sender_id = SenderId::new("retained sender").unwrap();
+        let receiver_id = ReceiverId::new("retained receiver").unwrap();
+        owners.2.subscribe(&sender_id);
+        owners.3.subscribe(&receiver_id);
+        drop((sender_id, receiver_id, sender, receiver));
         drop(advertisers);
         drop(listeners);
+        drop(ndi);
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(
+            !log.lines()
+                .any(|line| matches!(line, "sender-destroy" | "receiver-destroy" | "destroy")),
+            "{log}"
+        );
         drop(owners);
         let log = fs::read_to_string(log_path).unwrap();
+        let position = |event: &str| {
+            log.lines()
+                .position(|line| line == event)
+                .unwrap_or_else(|| panic!("missing {event}: {log}"))
+        };
+        for (kind, member) in [("send", "sender"), ("recv", "receiver")] {
+            let remove = if removal_refused {
+                format!("{kind}-advertiser-remove-refused")
+            } else if kind == "recv" {
+                "recv-advertiser-remove group=72657461696e65642067726f7570".into()
+            } else {
+                "send-advertiser-remove".into()
+            };
+            let destroy = format!("{kind}-advertiser-destroy");
+            assert!(position(&remove) < position(&destroy), "{log}");
+            assert!(
+                position(&destroy) < position(&format!("{member}-destroy")),
+                "{log}"
+            );
+            assert_eq!(
+                log.lines().filter(|line| *line == remove).count(),
+                1,
+                "{log}"
+            );
+            assert!(
+                log.contains(&format!("{kind}-listener-retained-destroy 1\n")),
+                "{log}"
+            );
+        }
+        assert_eq!(log.lines().last(), Some("destroy"), "{log}");
+        assert_eq!(
+            log.contains("recv-advertiser-destroy-group 72657461696e65642067726f7570\n"),
+            removal_refused,
+            "{log}"
+        );
         for object in [
             "send-advertiser",
             "recv-advertiser",
@@ -137,35 +203,43 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
         }
         .build(&library);
         for configured in [false, true] {
-            let mut command = Command::new(std::env::current_exe().unwrap());
-            command
-                .args([
-                    "--exact",
-                    "every_server_object_shares_plain_and_configured_creation_and_destruction",
-                    "--nocapture",
-                ])
-                .env("GRAFTON_LIFECYCLE_LIBRARY", &library)
-                .env(
-                    "GRAFTON_FAKE_NDI_LOG",
-                    variant.join(if configured {
-                        "configured.log"
-                    } else {
-                        "plain.log"
-                    }),
+            for removal_refused in [false, true] {
+                if refused && removal_refused {
+                    continue;
+                }
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "every_server_object_shares_plain_and_configured_creation_and_destruction",
+                        "--nocapture",
+                    ])
+                    .env("GRAFTON_LIFECYCLE_LIBRARY", &library)
+                    .env(
+                        "GRAFTON_FAKE_NDI_LOG",
+                        variant.join(format!(
+                            "configured-{configured}-removal-refused-{removal_refused}.log"
+                        )),
+                    );
+                if configured {
+                    command.env("GRAFTON_LIFECYCLE_CONFIGURED", "1");
+                }
+                if refused {
+                    command.env("GRAFTON_LIFECYCLE_REFUSED", "1");
+                }
+                if removal_refused {
+                    command
+                        .env("GRAFTON_LIFECYCLE_REMOVE_REFUSED", "1")
+                        .env("GRAFTON_FAKE_ADVERTISER_REMOVE", "refuse");
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
                 );
-            if configured {
-                command.env("GRAFTON_LIFECYCLE_CONFIGURED", "1");
             }
-            if refused {
-                command.env("GRAFTON_LIFECYCLE_REFUSED", "1");
-            }
-            let output = command.output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
         }
     }
 }

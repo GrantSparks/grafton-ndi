@@ -345,9 +345,27 @@ server_api!(
     ReceiverListenerConfiguration::NDIlib_recv_listener_create_ex
 );
 
+/// State the SDK may read until its native object has been destroyed.
+/// The owner calls this hook while both the object and all retained values are
+/// live, then destroys the object before any retained value is dropped.
+///
+/// # Safety
+/// `Default` must start with no native registrations. An implementation must
+/// retain everything its native object can read until the owner destroys it.
+unsafe trait Retained<A: ServerApi>: Default {
+    /// # Safety
+    /// `instance` is this state's live owner, created through `api`. Every
+    /// retained registration belongs to that instance and remains live for
+    /// the call; no operation on the instance overlaps this hook or teardown.
+    unsafe fn before_destroy(&mut self, _api: &A, _instance: A::Instance) {}
+}
+// SAFETY: unit retains no native state and its hook does nothing.
+unsafe impl<A: ServerApi> Retained<A> for () {}
+
 /// Own every value the SDK may retain until its object is destroyed.
-struct ServerObject<A: ServerApi> {
-    instance: Option<A::Instance>,
+struct ServerObject<A: ServerApi, R: Retained<A> = ()> {
+    instance: A::Instance,
+    retained: R,
     api: &'static A,
     _url: Option<std::ffi::CString>,
     #[cfg(feature = "advanced")]
@@ -355,7 +373,7 @@ struct ServerObject<A: ServerApi> {
     _ndi: crate::Ndi,
 }
 
-impl<A: ServerApi> ServerObject<A> {
+impl<A: ServerApi, R: Retained<A>> ServerObject<A, R> {
     fn new(ndi: &crate::Ndi, options: &A::Options) -> crate::Result<Self> {
         #[cfg(feature = "advanced")]
         if let Some(config) = options.config() {
@@ -377,6 +395,7 @@ impl<A: ServerApi> ServerObject<A> {
             Self::create(
                 ndi,
                 options,
+                R::default(),
                 #[cfg(feature = "advanced")]
                 None,
                 |api, settings| api.create(settings),
@@ -386,9 +405,12 @@ impl<A: ServerApi> ServerObject<A> {
 
     /// # Safety
     /// `create` obeys ServerApi's fresh-instance and settings lifetime contract.
+    /// `retained` starts with no native registrations or is already paired
+    /// with the fresh returned instance under Retained's hook contract.
     unsafe fn create(
         ndi: &crate::Ndi,
         options: &A::Options,
+        retained: R,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(&'static A, &A::Settings) -> sys::table::Called<A::Instance>,
     ) -> crate::Result<Self> {
@@ -409,7 +431,8 @@ impl<A: ServerApi> ServerObject<A> {
             return Err(not_created(A::OBJECT, server));
         }
         Ok(Self {
-            instance: Some(instance),
+            instance,
+            retained,
             api,
             _url: url,
             #[cfg(feature = "advanced")]
@@ -417,23 +440,24 @@ impl<A: ServerApi> ServerObject<A> {
             _ndi: ndi.clone(),
         })
     }
+}
 
+impl<A: ServerApi, R: Retained<A>> ServerObject<A, R> {
     fn instance(&self) -> A::Instance {
-        // Only teardown consumes the handle, after the owner's last operation.
-        self.instance.expect("live Discovery Server object")
+        self.instance
     }
 
-    fn destroy(&mut self) {
-        if let Some(instance) = self.instance.take() {
-            // SAFETY: this owner destroys its object once, while all retained
-            // creation storage and the selected runtime are still alive.
-            unsafe { self.api.destroy(instance) };
-        }
+    fn retained(&self) -> &R {
+        &self.retained
+    }
+
+    fn retained_mut(&mut self) -> &mut R {
+        &mut self.retained
     }
 }
 
 #[cfg(feature = "advanced")]
-impl<A: ServerApi> crate::advanced::Configurable for ServerObject<A> {
+impl<A: ServerApi, R: Retained<A>> crate::advanced::Configurable for ServerObject<A, R> {
     type Options = A::Options;
     type Settings = A::Settings;
     type Instance = A::Instance;
@@ -444,12 +468,25 @@ impl<A: ServerApi> crate::advanced::Configurable for ServerObject<A> {
         create: impl FnOnce(&Self::Settings) -> sys::table::Called<Self::Instance>,
     ) -> crate::Result<Self> {
         // SAFETY: forwarded to the caller's fresh-instance obligation.
-        unsafe { Self::create(ndi, options, Some(config), |_, settings| create(settings)) }
+        unsafe {
+            Self::create(ndi, options, R::default(), Some(config), |_, settings| {
+                create(settings)
+            })
+        }
     }
 }
 
-impl<A: ServerApi> Drop for ServerObject<A> {
+impl<A: ServerApi, R: Retained<A>> Drop for ServerObject<A, R> {
     fn drop(&mut self) {
-        self.destroy();
+        // SAFETY: creation starts with empty retained state, and all later
+        // registrations go through this owner's native instance and API.
+        // Exclusive ownership excludes overlapping operations. The hook keeps
+        // those registrations live until native destruction returns.
+        unsafe { self.retained.before_destroy(self.api, self.instance) };
+        // SAFETY: this owner destroys its non-null instance exactly once. All
+        // retained state, creation strings, configuration and runtime are live
+        // throughout destruction. Fields are dropped only after this returns,
+        // so retained state never depends on field order for native teardown.
+        unsafe { self.api.destroy(self.instance) };
     }
 }
