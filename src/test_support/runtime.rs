@@ -12,6 +12,10 @@ use super::{
 /// `let Some(ndi) = ndi() else { return };`. Every failure other than a missing
 /// runtime library panics.
 pub fn ndi() -> Option<Ndi> {
+    if cfg!(miri) {
+        skip(Requirement::Runtime, "Miri cannot load native libraries");
+        return None;
+    }
     match Ndi::new() {
         Ok(ndi) => {
             assert_expected_identity(ndi.info());

@@ -145,7 +145,14 @@ jobs:
           sudo apt-get install --yes --no-install-recommends valgrind
           runner='target.x86_64-unknown-linux-gnu.runner=["valgrind","--tool=memcheck","--error-exitcode=99","--trace-children=yes","--trace-children-skip=*/rustc,*/rustc-*"]'
           cargo test --locked --all-features --config "$runner" --test mixed_capture_boundary --test frame_metadata_boundary -- --test-threads=1
-          cargo test --locked --all-features --config "$runner" --lib frames::tests::video_padding_encoders -- --test-threads=1
+          for filter in frames::tests::video_padding_encoders; do
+            selected=$(cargo test --locked --all-features --lib -- --list "$filter")
+            if ! grep -q ': test$' <<< "$selected"; then
+              echo "::error::No tests selected for filter: $filter"
+              exit 1
+            fi
+            cargo test --locked --all-features --config "$runner" --lib "$filter" -- --test-threads=1
+          done
 
   miri:
     name: miri (${{ matrix.model }})
@@ -165,6 +172,16 @@ jobs:
           cargo +nightly-2026-11-10 miri setup
       - name: Initialized rows, metadata and synthetic native guards
         run: |
+          skips=(descriptor_admission_and_collection_stay_allocation_free_under_churn)
+          skip_args=()
+          for skip in "${skips[@]}"; do
+            selected=$(cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio -- --list "$skip")
+            if ! grep -q ': test$' <<< "$selected"; then
+              echo "::error::No tests selected for skip: $skip"
+              exit 1
+            fi
+            skip_args+=(--skip "$skip")
+          done
           for filter in \
             frames::tests::video_padding_all_formats \
             frames::tests::video_padding_single_rows \
@@ -178,8 +195,20 @@ jobs:
             framesync::tests::test_framesync_audio_ref_supports \
             advanced::sync::tests::returned_audio_is_released \
             advanced::sync::tests::borrowed_avsync_audio \
-            advanced::send_slots::tests::; do
-            cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio "$filter" -- --skip slot_keys_cannot_be_reused_or_cloned
+            advanced::send_slots::tests:: \
+            advanced::aliasable::tests:: \
+            advanced::packets::received::tests:: \
+            advanced::queued::boundary_tests:: \
+            sender::in_flight::tests:: \
+            advanced::send::tests:: \
+            advanced::queued::tests:: \
+            sender::tests::; do
+            selected=$(cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio -- --list "$filter" "${skip_args[@]}")
+            if ! grep -q ': test$' <<< "$selected"; then
+              echo "::error::No tests selected for filter: $filter"
+              exit 1
+            fi
+            cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio "$filter" -- "${skip_args[@]}"
           done
 
   cross:

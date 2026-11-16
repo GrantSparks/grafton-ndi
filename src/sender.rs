@@ -987,22 +987,20 @@ pub(crate) mod in_flight {
 
         #[test]
         fn an_unproven_drop_leaks_the_native_loan() {
-            use std::sync::{
-                atomic::{AtomicUsize, Ordering},
-                Arc,
-            };
-            struct Counted(Arc<AtomicUsize>);
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static DROPS: AtomicUsize = AtomicUsize::new(0);
+            struct Counted;
             impl Drop for Counted {
                 fn drop(&mut self) {
-                    self.0.fetch_add(1, Ordering::Relaxed);
+                    DROPS.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            let drops = Arc::new(AtomicUsize::new(0));
-            let slot = InFlight(State::InFlight(Counted(Arc::clone(&drops))));
+            DROPS.store(0, Ordering::Relaxed);
+            let slot = InFlight(State::InFlight(Counted));
             let result = std::panic::catch_unwind(|| drop(slot));
             assert_eq!(result.is_err(), cfg!(debug_assertions));
             assert_eq!(
-                drops.load(Ordering::Relaxed),
+                DROPS.load(Ordering::Relaxed),
                 0,
                 "native pointees must remain allocated"
             );
