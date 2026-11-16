@@ -829,22 +829,11 @@ fn check_directory(directory: &Path) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        // A directory handle with FILE_ADD_FILE checks the caller's right to
-        // create a child without creating one. Directory handles require
-        // FILE_FLAG_BACKUP_SEMANTICS; read-only attributes do not answer this.
-        const FILE_ADD_FILE: u32 = 0x0002;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        if let Err(error) = std::fs::OpenOptions::new()
-            .access_mode(FILE_ADD_FILE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(directory)
-        {
-            // Unusual filesystems may not support directory handles. Only
-            // access denial proves this preflight's writability refusal.
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
-                return Err(refuse(error.kind(), "cannot be written to"));
-            }
+        if !super::windows_permissions::check_directory(directory)? {
+            return Err(refuse(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot be written to",
+            ));
         }
     }
     Ok(())

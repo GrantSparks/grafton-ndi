@@ -1118,6 +1118,7 @@ impl FileRecorder {
     ///   does not exist or cannot be written to, or, with an exact file name,
     ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
     ///   that file exists. The SDK is not called.
+    ///   On Windows, also reports security queries that could not be completed.
     /// * [`Error::NativeOperationFailed`] when the SDK cannot start the source
     ///   or open the first file. `Processing.NDI.Lib.File.Recorder.h` specifies
     ///   an open-failed event for an output-file open failure; source-start
@@ -1645,6 +1646,7 @@ impl FileRecorder {
     ///   does not exist or cannot be written to, or, with an exact file name,
     ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
     ///   that file exists. The SDK is not called and the session goes on.
+    ///   On Windows, also reports security queries that could not be completed.
     /// * [`Error::NativeOperationFailed`] when the SDK refuses the target.
     #[doc(alias = "NDIlib_file_recorder_rollover")]
     pub fn rollover(&mut self, target: &RecordingTarget) -> Result<()> {

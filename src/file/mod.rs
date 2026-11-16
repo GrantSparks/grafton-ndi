@@ -186,6 +186,8 @@ mod out_param;
 mod player;
 mod recorder;
 mod types;
+#[cfg(windows)]
+mod windows_permissions;
 
 pub use asynchronous::{
     AsyncFileOptions, AsyncFilePlayer, AsyncFileRecorder, FileEventFuture, FileOperation,
