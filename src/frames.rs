@@ -246,8 +246,8 @@ impl PixelFormat {
 
     /// The complete readable allocation size for sending this layout.
     ///
-    /// `line_stride_bytes` is `None` for tightly packed rows, or the byte
-    /// distance between rows. The returned size includes every plane and
+    /// `line_stride_bytes` is `None` for tightly packed rows, or a positive
+    /// byte distance between rows that holds the active width. The returned size includes every plane and
     /// the extra readable bytes required by the format and scan type. It is
     /// suitable for allocating external buffers used with
     /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`](crate::BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail).
@@ -531,11 +531,6 @@ impl PixelFormat {
         height: u32,
         line_stride_bytes: Option<usize>,
     ) -> Result<usize> {
-        if line_stride_bytes == Some(0) {
-            return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
-                crate::LayoutDefect::VideoZeroStride,
-            )));
-        }
         let layout =
             ValidatedVideoLayout::new_uncompressed(self, width, height, line_stride_bytes)?;
         Ok(layout.data_len_bytes)
@@ -3497,8 +3492,8 @@ impl ValidatedVideoLayout {
         self.line_stride_bytes
     }
 
-    /// Validate an uncompressed layout. A `line_stride` of `None` or zero
-    /// selects the packed stride.
+    /// Validate an uncompressed layout. Only `None` selects the packed stride;
+    /// an explicit stride must be positive and hold the active row.
     pub(crate) fn new_uncompressed(
         pixel_format: PixelFormat,
         width: u32,
@@ -3518,7 +3513,8 @@ impl ValidatedVideoLayout {
 
         let min_stride = min_video_line_stride_checked(pixel_format, width as usize)?;
         let line_stride = match line_stride {
-            None | Some(0) => min_stride,
+            None => min_stride,
+            Some(0) => return Err(crate::LayoutDefect::VideoZeroStride),
             Some(stride) if stride < min_stride => {
                 return Err(crate::LayoutDefect::VideoShortStride {
                     stride,
@@ -3578,7 +3574,7 @@ impl ValidatedVideoLayout {
             pixel_format,
             width.unsigned_abs(),
             height.unsigned_abs(),
-            Some(line_stride),
+            (line_stride != 0).then_some(line_stride),
         )
     }
 
@@ -6483,7 +6479,7 @@ mod tests {
             PixelFormat::P216,
             PixelFormat::Pa16,
         ] {
-            let tight = ValidatedVideoLayout::new_uncompressed(format, 2, 1, Some(0)).unwrap();
+            let tight = ValidatedVideoLayout::new_uncompressed(format, 2, 1, None).unwrap();
             assert!(VideoPlaneLayout::contiguous(tight.planes()).is_some());
             let active = format.line_stride_bytes(2).unwrap();
             let padded =
@@ -6527,7 +6523,7 @@ mod tests {
             assert_eq!(frame.to_owned().data(), vec![42; tight.payload_len_bytes]);
         }
         for format in [PixelFormat::Yv12, PixelFormat::I420, PixelFormat::Nv12] {
-            let tight = ValidatedVideoLayout::new_uncompressed(format, 4, 2, Some(0)).unwrap();
+            let tight = ValidatedVideoLayout::new_uncompressed(format, 4, 2, None).unwrap();
             assert!(VideoPlaneLayout::contiguous(tight.planes()).is_some());
             let padded = ValidatedVideoLayout::new_uncompressed(format, 4, 2, Some(8)).unwrap();
             assert!(VideoPlaneLayout::contiguous(padded.planes()).is_none()); // Chroma is one row, but plane gaps remain.
@@ -6966,6 +6962,50 @@ mod tests {
                 .buffer_len(1920, 1080, Some(7680))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn explicit_zero_video_stride_is_refused_at_every_application_entry() {
+        let expected = crate::FrameDefect::Layout(crate::LayoutDefect::VideoZeroStride);
+        for format in PixelFormat::ALL {
+            assert!(
+                matches!(format.buffer_len(16, 16, Some(0)), Err(Error::InvalidFrame(defect)) if defect == expected),
+                "{format:?} buffer_len"
+            );
+            let packed = format.buffer_len(16, 16, None).unwrap();
+            let data = vec![0; packed];
+            for scan in ScanType::ALL {
+                assert!(
+                    matches!(format.send_buffer_len(16, 16, Some(0), scan), Err(Error::InvalidFrame(defect)) if defect == expected),
+                    "{format:?} {scan:?} send_buffer_len"
+                );
+                let frame = crate::BorrowedVideoFrame::builder(&data, 16, 16, format)
+                    .scan_type(scan)
+                    .line_stride_bytes(0)
+                    .build();
+                assert!(
+                    matches!(frame, Err(Error::InvalidFrame(defect)) if defect == expected),
+                    "{format:?} {scan:?} builder"
+                );
+                let reset = crate::BorrowedVideoFrame::builder(&data, 16, 16, format)
+                    .scan_type(scan)
+                    .line_stride_bytes(0)
+                    .clear_line_stride_bytes()
+                    .build()
+                    .unwrap();
+                assert_eq!(
+                    reset.line_stride_bytes(),
+                    format.line_stride_bytes(16).unwrap()
+                );
+            }
+            // SDK input alone keeps the documented zero-means-packed sentinel.
+            let sdk = ValidatedVideoLayout::from_sdk(format, 16, 16, 0).unwrap();
+            assert_eq!(sdk.data_len_bytes(), packed);
+            assert_eq!(
+                sdk.line_stride_bytes(),
+                format.line_stride_bytes(16).unwrap()
+            );
+        }
     }
 
     #[test]
