@@ -678,6 +678,13 @@ struct Lease {
     _generation: Arc<Generation>,
 }
 
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
+type Leases = super::reserved_map::ReservedMap<(usize, usize), Lease>;
+// Without allocator callbacks no lease can be published, so retain the empty
+// table without reserving a workspace that this build can never use.
+#[cfg(not(any(test, ndi_has_advanced_receive_allocators)))]
+type Leases = HashMap<(usize, usize), Lease>;
+
 #[derive(Default)]
 struct State {
     active: HashMap<usize, Arc<Generation>>,
@@ -690,11 +697,7 @@ struct State {
     /// can release only an allocation of the generation it names, so a
     /// repeated free cannot release a later allocation that happens to reuse
     /// the address under another generation.
-    leases: HashMap<(usize, usize), Lease>,
-    /// Reserved off the SDK threads to rebuild a lease table whose removal
-    /// tombstones have consumed its insertion capacity.
-    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-    rehash: Vec<((usize, usize), Lease)>,
+    leases: Leases,
     bytes: usize,
     #[cfg(any(test, ndi_has_advanced_receive_allocators))]
     reserved_bytes: usize,
@@ -708,18 +711,6 @@ impl State {
     fn decline(&mut self, reason: AllocationDecline) {
         let count = &mut self.declines[reason.index()];
         *count = count.saturating_add(1);
-    }
-
-    /// Draining resets tombstones in the existing allocation. Both containers
-    /// were reserved for every allowed lease before any SDK callback could run.
-    fn rebuild_leases(&mut self) {
-        debug_assert!(self.rehash.is_empty());
-        debug_assert!(self.rehash.capacity() >= self.leases.len());
-        self.rehash.extend(self.leases.drain());
-        for (key, lease) in self.rehash.drain(..) {
-            self.leases.insert(key, lease);
-        }
-        debug_assert!(self.leases.capacity() > self.leases.len());
     }
 }
 
@@ -786,24 +777,20 @@ impl Registry {
     fn new(limits: AllocatorLimits) -> Result<Self> {
         let unavailable =
             |_| crate::error::allocation_failed(crate::AllocationKind::AllocatorLeases, None);
-        let mut leases = HashMap::new();
-        leases
-            .try_reserve(limits.max_allocations)
-            .map_err(unavailable)?;
         #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-        let rehash = {
-            let mut rehash = Vec::new();
-            rehash
-                .try_reserve_exact(limits.max_allocations)
+        let leases = Leases::try_with_capacity(limits.max_allocations).map_err(unavailable)?;
+        #[cfg(not(any(test, ndi_has_advanced_receive_allocators)))]
+        let leases = {
+            let mut leases = Leases::new();
+            leases
+                .try_reserve(limits.max_allocations)
                 .map_err(unavailable)?;
-            rehash
+            leases
         };
         Ok(Self {
             limits,
             state: Mutex::new(State {
                 leases,
-                #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-                rehash,
                 ..State::default()
             }),
             generations: Arc::new(AtomicUsize::new(0)),
@@ -974,24 +961,24 @@ impl Registry {
             s.decline(AllocationDecline::GenerationUnavailable);
             return None;
         }
-        if s.leases.contains_key(&(token, pointer.as_ptr() as usize)) {
+        let lease = Lease {
+            _buffer: allocation,
+            bytes: capacity,
+            _generation: generation,
+        };
+        if let Err((_, lease)) = s
+            .leases
+            .insert_new((token, pointer.as_ptr() as usize), lease)
+        {
             s.decline(AllocationDecline::BufferRefused);
+            // Policy destructors must run after releasing the registry lock.
+            drop(s);
+            drop(lease);
             return None;
         }
         // The buffer takes the place of the grant that covered it.
         reservation.release(&mut s);
         s.bytes += capacity;
-        if s.leases.capacity() == s.leases.len() {
-            s.rebuild_leases();
-        }
-        s.leases.insert(
-            (token, pointer.as_ptr() as usize),
-            Lease {
-                _buffer: allocation,
-                bytes: capacity,
-                _generation: generation,
-            },
-        );
         drop(s);
         Some((pointer, stride))
     }
