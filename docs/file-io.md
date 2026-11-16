@@ -217,6 +217,9 @@ Await `finish`, inspect its report, then await `close` to shut down all clones
 without blocking the executor. **Dropping the last clone blocks** until its
 worker exits. Its `drop_wait` budget includes the native stop, which can
 itself outlast that budget; native destruction can also take longer.
+While a submitted close has a live future, dropping the last clone does not
+wait because that future reports completion. Dropping the close future restores
+the blocking last-drop guarantee.
 When an executor callback drops the last clone on a File owner, timer or probe
 thread, it requests shutdown without waiting. This lets those threads keep
 delivering notifications; await `close` when cleanup must have completed.

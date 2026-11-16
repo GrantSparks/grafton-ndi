@@ -17,6 +17,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Fixed
 
+- Async File handles wait for native cleanup on last drop after a submitted
+  close future is discarded; live closes still report cleanup without blocking
+  handle drops.
 - Abandoned async source-name and unknown-event reports are redelivered only
   while no newer report has superseded them. Replaying a source-name result
   never waits for another poller's native query.

@@ -260,7 +260,9 @@ enum Stage<T> {
 /// only discards the result. Dropping a creation operation before receiving
 /// its handle never waits for owner shutdown, including after creation has
 /// completed. Submitted requests to stop, finish or close run
-/// even if their future is dropped, as those methods say.
+/// even if their future is dropped, as those methods say. A last-handle drop
+/// waits for cleanup unless a submitted close still has a live future to report
+/// completion. Dropping that close future restores the blocking drop guarantee.
 ///
 /// An unsubmitted command does not keep an existing player or recorder alive.
 /// Dropping the last handle still shuts down the owner as that handle documents;
@@ -1042,8 +1044,21 @@ impl Control {
         future
     }
 
+    /// Whether a last-handle drop must observe native destruction itself.
+    /// A live close reports completion instead. Once native destruction has
+    /// completed, no join is needed even if the owner is still dropping queued
+    /// command captures.
+    fn needs_cleanup_join(&self) -> bool {
+        match &*lock(&self.closing) {
+            Closing::Waiting(replies) => replies
+                .iter()
+                .all(|reply| reply.shared.cancelled.load(Ordering::Acquire)),
+            Closing::Complete(_) => false,
+        }
+    }
+
     /// Publish the request and its budget start as one fact. Return whether
-    /// shutdown had already been requested, as last-handle drops need to know.
+    /// shutdown had already been requested, to avoid redundant wake messages.
     fn request_shutdown(&self) -> bool {
         self.request_shutdown_at(Instant::now())
     }
@@ -1541,7 +1556,10 @@ impl<H: Owner> Drop for Worker<H> {
         // A File thread may release this last handle through an executor's
         // waker callback. It must not stall the timer/probe thread or join
         // an owner that could join it back while releasing another handle.
-        if self.control.claimed.load(Ordering::Acquire) && !closing && !FILE_THREAD.get() {
+        if self.control.claimed.load(Ordering::Acquire)
+            && !FILE_THREAD.get()
+            && self.control.needs_cleanup_join()
+        {
             // A panic on the owner thread was already reported to its commands.
             let _ = thread.0.join();
         }
@@ -2012,6 +2030,9 @@ impl ProbeQueue {
 /// returns, the source is gone. A caller that must not block, such as a task
 /// on an async executor, awaits [`close`](Self::close) instead, which does the
 /// same without blocking; dropping the clones afterwards does not block.
+/// While a submitted close still has a live future, last-clone drop does not
+/// wait because that future reports completion. Dropping the future makes the
+/// last-clone drop wait for cleanup again.
 /// A last-clone drop performed by an executor callback on a File owner, timer
 /// or probe thread requests shutdown without waiting, so those threads can
 /// keep delivering notifications. Await `close` to observe cleanup completing.
@@ -2237,6 +2258,9 @@ impl AsyncFilePlayer {
 /// be reported. A caller that must not block, such as a task on an async
 /// executor, awaits [`close`](Self::close) instead, which does the same
 /// without blocking; dropping the clones afterwards does not block.
+/// While a submitted close still has a live future, last-clone drop does not
+/// wait because that future reports completion. Dropping the future makes the
+/// last-clone drop wait for cleanup again.
 /// A last-clone drop performed by an executor callback on a File owner, timer
 /// or probe thread requests shutdown without waiting for finalization or
 /// destruction. Await `close` to observe cleanup completing.
@@ -5178,6 +5202,109 @@ mod tests {
         assert_eq!(device.stops.load(Ordering::Acquire), 1);
         assert_eq!(device.destroys.load(Ordering::Acquire), 1);
         assert!(device.closed_before_destroy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_dropped_close_does_not_let_the_last_drop_skip_finalization() {
+        let (device, recorder) = mock_recorder(Closing::After(Duration::from_millis(150)));
+        drop(recorder.close().submit());
+        drop(recorder);
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        assert!(device.closed_before_destroy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn an_awaited_close_keeps_the_last_drop_nonblocking() {
+        let (device, recorder) = mock_recorder(Closing::WhenTold);
+        let closed = recorder.close().submit();
+        drop(recorder);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 0);
+        assert!(!closed.is_completed());
+        await_stop(&device);
+        device.close();
+        block_on(closed).unwrap();
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        assert!(device.closed_before_destroy.load(Ordering::Acquire));
+    }
+
+    fn mock_player() -> (Arc<AtomicUsize>, AsyncFilePlayer) {
+        use crate::sys::{self, bindings::*};
+        thread_local! {
+            static DESTROYS: std::cell::RefCell<Option<Arc<AtomicUsize>>> = const {
+                std::cell::RefCell::new(None)
+            };
+        }
+        unsafe extern "C" fn create(
+            _: *const NDIlib_file_player_create_t,
+        ) -> NDIlib_file_player_instance_t {
+            DESTROYS.with(|count| {
+                Box::into_raw(Box::new(count.borrow().as_ref().unwrap().clone())).cast()
+            })
+        }
+        unsafe extern "C" fn destroy(instance: NDIlib_file_player_instance_t) {
+            // SAFETY: create transferred this Box to the sole native owner.
+            let count = unsafe { Box::from_raw(instance.cast::<Arc<AtomicUsize>>()) };
+            count.fetch_add(1, Ordering::Release);
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let installed = Arc::clone(&count);
+        let player = block_on(spawn_owner(
+            "file-test-player",
+            move || {
+                DESTROYS.with(|count| *count.borrow_mut() = Some(installed));
+                FilePlayer::new(
+                    &FileApi::with_tables(
+                        sys::FilePlayback {
+                            NDIlib_file_player_create: create,
+                            NDIlib_file_player_destroy: destroy,
+                            ..mock::playback()
+                        },
+                        mock::recording(),
+                    ),
+                    &FilePlayerOptions::new("mock player"),
+                )
+            },
+            AsyncFileOptions::new(),
+            |worker| AsyncFilePlayer { worker },
+        ))
+        .unwrap();
+        (count, player)
+    }
+
+    #[test]
+    fn a_dropped_player_close_makes_the_last_drop_wait_for_destruction() {
+        let (destroys, player) = mock_player();
+        let (blocked, release) = block_owner(&player.worker);
+        drop(player.close().submit());
+        let (returned, returning) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(player);
+            returned.send(()).unwrap();
+        });
+        let early = returning.recv_timeout(Duration::from_millis(100));
+        release.send(()).unwrap();
+        block_on(blocked).unwrap();
+        dropper.join().unwrap();
+        assert!(
+            early.is_err(),
+            "last drop returned before native destruction"
+        );
+        assert_eq!(destroys.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn an_awaited_player_close_keeps_the_last_drop_nonblocking() {
+        let (destroys, player) = mock_player();
+        let (blocked, release) = block_owner(&player.worker);
+        let closed = player.close().submit();
+        drop(player);
+        assert_eq!(destroys.load(Ordering::Acquire), 0);
+        assert!(!closed.is_completed());
+        release.send(()).unwrap();
+        block_on(blocked).unwrap();
+        block_on(closed).unwrap();
+        assert_eq!(destroys.load(Ordering::Acquire), 1);
     }
 
     #[test]
