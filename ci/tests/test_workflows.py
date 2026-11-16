@@ -175,10 +175,12 @@ def repeated_feature_violations(rust):
     names = [step.get('name') for step in steps]
     owner = next((step for step in steps if step.get('name') == 'Tests, all features'), {})
     found = differs('rust.yml: fixed compiler owner', owner.get('run'), 'cargo test --locked --all-features')
-    if owner.get('if'):
+    if 'if' in owner:
         found.append('rust.yml: fixed compiler owner must run on every test host')
     for name, command, stem in REPEATED_FEATURE_TESTS:
         step = next((step for step in steps if step.get('name') == name), {})
+        if 'if' in step:
+            found.append(f'rust.yml: repeated feature step {name} must run on every test host')
         for setting in ('env', 'working-directory'):
             if step.get(setting) != owner.get(setting):
                 found.append(f'rust.yml: repeated feature step {name} changes fixed compiler inputs: {setting}')
@@ -1306,7 +1308,8 @@ class RepeatedFeatureScopes(unittest.TestCase):
                     step['run'] = step['run'].replace(operation, '')
                     self.assertTrue(repeated_feature_violations(broken))
             for setting, value in (('env', {'NDI_SDK_DIR': 'a-different-header-build'}),
-                                   ('working-directory', 'another-workspace')):
+                                   ('working-directory', 'another-workspace'),
+                                   ('if', 'false'), ('if', False)):
                 with self.subTest(step=name, changed=setting):
                     broken = copy.deepcopy(rust)
                     step = next(step for step in broken['jobs']['test']['steps'] if step.get('name') == name)
