@@ -231,14 +231,22 @@ def memory_checker_violations(rust):
                     'cargo +nightly-2026-11-10 miri setup'):
         if command not in setup:
             found.append('rust.yml: Miri setup does not pin the checked nightly and components')
-    if 'cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio "$filter"' not in run:
-        found.append('rust.yml: Miri does not execute the selected synthetic fixtures')
-    for fixture in ('frames::tests::video_padding_all_formats', 'frames::tests::video_padding_encoders',
-                    'receiver::mixed_tests', 'asynchronous::scoped_tests', 'advanced::send_slots::tests::',
+    command = 'cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio'
+    for selection in ('"$filter"', '-- --list "$filter"', '-- --list "$skip"'):
+        if f'{command} {selection}' not in run:
+            found.append('rust.yml: Miri does not build and execute the selected synthetic fixtures with file-io')
+    selection = re.search(r'for filter in (.*?); do', run, re.DOTALL)
+    filters = set(shlex.split(selection.group(1).replace('\\\n', ' '))) if selection else set()
+    for fixture in ('sdk_copy::tests::', 'source_retention::tests::', 'finder::budget::tests::',
+                    'file::out_param::tests::',
+                    'frames::tests::video_padding_all_formats', 'frames::tests::video_padding_encoders',
+                    'receiver::mixed_tests', 'receiver::latest_report_tests::',
+                    'advanced::kvm::ownership_tests::', 'advanced::reserved_map::tests::',
+                    'asynchronous::scoped_tests', 'advanced::send_slots::tests::',
                     'advanced::aliasable::tests::', 'advanced::packets::received::tests::',
                     'advanced::queued::boundary_tests::', 'sender::in_flight::tests::',
                     'advanced::send::tests::', 'advanced::queued::tests::', 'sender::tests::'):
-        if fixture not in run:
+        if fixture not in filters:
             found.append(f'rust.yml: Miri omits {fixture}')
 
     test = next((step for step in jobs['test']['steps']
@@ -738,6 +746,21 @@ esac
         missing_send_module = copy.deepcopy(rust)
         missing_send_module['jobs']['miri']['steps'][2]['run'] = rust['jobs']['miri']['steps'][2]['run'].replace('advanced::aliasable::tests::', '')
         variants.append((missing_send_module, 'Miri omits advanced::aliasable'))
+        for fixture in ('sdk_copy::tests::', 'source_retention::tests::',
+                        'finder::budget::tests::', 'file::out_param::tests::',
+                        'receiver::latest_report_tests::', 'advanced::kvm::ownership_tests::',
+                        'advanced::reserved_map::tests::'):
+            missing_reads = copy.deepcopy(rust)
+            step = missing_reads['jobs']['miri']['steps'][2]
+            step['run'] = step['run'].replace(fixture + ' \\\n', '')
+            variants.append((missing_reads, f'Miri omits {fixture}'))
+        for selection in ('"$filter"', '-- --list "$filter"', '-- --list "$skip"'):
+            missing_file = copy.deepcopy(rust)
+            step = missing_file['jobs']['miri']['steps'][2]
+            step['run'] = step['run'].replace(
+                f'--features advanced,file-io,image-encoding,tokio {selection}',
+                f'--features advanced,image-encoding,tokio {selection}')
+            variants.append((missing_file, 'synthetic fixtures with file-io'))
         ungated = copy.deepcopy(rust)
         ungated['jobs']['required-ci']['needs'].remove('miri')
         variants.append((ungated, 'Miri is not required'))

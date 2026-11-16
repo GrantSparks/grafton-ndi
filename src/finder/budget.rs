@@ -134,6 +134,43 @@ mod tests {
     }
 
     #[test]
+    fn small_source_text_budgets_check_exact_copy_and_scan_bounds() {
+        let bytes = c"a\xff";
+        let charged = bytes.to_bytes_with_nul().len() + 4 + SourceText::STORAGE_OVERHEAD;
+        let budget = |remaining| {
+            SnapshotBudget(CopyBudget::new(
+                remaining,
+                ResourceKind::FinderSnapshotBytes,
+            ))
+        };
+        let mut exact = budget(charged);
+        // SAFETY: the literal remains live through its NUL terminator.
+        let copied = unsafe { exact.text(bytes.as_ptr()) }.unwrap().unwrap();
+        assert_eq!(copied.as_str(), "a\u{fffd}");
+        assert_eq!(exact.0.remaining(), 0);
+
+        let mut short = budget(charged - 1);
+        let (result, allocations) = crate::test_alloc::allocation_count(|| {
+            // SAFETY: the literal remains live through its NUL terminator.
+            unsafe { short.text(bytes.as_ptr()) }
+        });
+        assert!(matches!(result, Err(Error::ResourceLimit { .. })));
+        assert_eq!(allocations, 0);
+
+        let unterminated = [b'x'; 8];
+        let mut scan = budget(unterminated.len());
+        // SAFETY: every byte within this budget's scan bound is live.
+        let result = unsafe { scan.text(unterminated.as_ptr().cast()) };
+        assert!(matches!(result, Err(Error::ResourceLimit { .. })));
+        assert_eq!(scan.0.remaining(), 0);
+        assert_eq!(descriptor_bytes(MAX_SOURCES, 16).unwrap(), MAX_SOURCES * 16);
+        assert!(matches!(
+            descriptor_bytes(MAX_SOURCES + 1, 16),
+            Err(Error::ResourceLimit { .. })
+        ));
+    }
+
+    #[test]
     fn snapshot_builds_each_source_string_in_two_allocations() {
         let mut entry = named(c"HOST (Camera)".as_ptr());
         entry.__bindgen_anon_1.p_url_address = c"192.0.2.7:5961".as_ptr();

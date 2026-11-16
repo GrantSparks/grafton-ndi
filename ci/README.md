@@ -69,12 +69,15 @@ mobile nightlies have their own pins.
 
 ### Memory checkers
 
-The required `miri` job runs synthetic frame, metadata, guard and send-path
-aliasing tests with `nightly-2026-11-10`, using both Stacked Borrows and Tree
-Borrows. Native tests report visible skips under Miri; source-parsing and
-subprocess tests are outside its filters. The long descriptor churn test is
-explicitly skipped. Both memory-checker steps list each filter before running
-it and fail if it selects no tests; Miri also checks every skip name. This keeps
+The required `miri` job checks synthetic frames, metadata, bounded SDK reads,
+descriptor retention, guards and send-path aliasing with `nightly-2026-11-10`,
+using both Stacked Borrows and Tree Borrows. Native tests report visible skips
+under Miri; source-parsing and subprocess tests are outside its filters. The
+long descriptor churn, exhaustive UTF-8 pairs and multi-megabyte copy-budget
+fixtures are explicitly skipped; smaller synthetic tests retain their exact
+charges, malformed-entry handling and scan bounds. Both memory-checker steps
+list each filter before running it and fail if it selects no tests; Miri also
+checks every skip name. This keeps
 fixture renames from silently removing coverage. The pinned nightly detects a
 `Box`-owned `AliasableBox` regression; it does not yet support the Miri option
 needed to enforce `AliasableVec`'s unique-pointer contract. Miri uses one padded

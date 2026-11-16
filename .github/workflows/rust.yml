@@ -194,10 +194,20 @@ jobs:
           cargo +nightly-2026-11-10 miri setup
       - name: Initialized rows, metadata and synthetic native guards
         run: |
-          skips=(descriptor_admission_and_collection_stay_allocation_free_under_churn)
+          skips=(
+            descriptor_admission_and_collection_stay_allocation_free_under_churn
+            exact_copies_match_standard_utf8_replacement
+            sdk_copy::tests::expanded_text_cannot_allocate_past_the_snapshot_limit
+            sdk_copy::tests::omitting_malformed_entries_keeps_their_scan_cost_and_fatal_errors
+            sdk_copy::tests::rejected_scans_stay_charged_and_short_budgets_are_fatal
+            finder::budget::tests::aggregate_bytes_are_checked_before_string_allocation
+            finder::budget::tests::count_and_span_are_checked_before_dereferencing_or_reserving
+            finder::budget::tests::lossy_expansion_is_charged_before_allocating_the_output
+            finder::budget::tests::rejected_entries_still_consume_the_scan_budget
+          )
           skip_args=()
           for skip in "${skips[@]}"; do
-            selected=$(cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio -- --list "$skip")
+            selected=$(cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio -- --list "$skip")
             if ! grep -q ': test$' <<< "$selected"; then
               echo "::error::No tests selected for skip: $skip"
               exit 1
@@ -205,6 +215,10 @@ jobs:
             skip_args+=(--skip "$skip")
           done
           for filter in \
+            sdk_copy::tests:: \
+            source_retention::tests:: \
+            finder::budget::tests:: \
+            file::out_param::tests:: \
             frames::tests::video_padding_all_formats \
             frames::tests::video_padding_single_rows \
             frames::tests::video_padding_encoders \
@@ -212,6 +226,9 @@ jobs:
             frames::metadata_tests::owned_metadata_states \
             frames::metadata_tests::audio_timestamp \
             receiver::mixed_tests \
+            receiver::latest_report_tests:: \
+            advanced::kvm::ownership_tests:: \
+            advanced::reserved_map::tests:: \
             asynchronous::scoped_tests \
             framesync::tests::test_framesync_video_ref_uses \
             framesync::tests::test_framesync_audio_ref_supports \
@@ -225,12 +242,12 @@ jobs:
             advanced::send::tests:: \
             advanced::queued::tests:: \
             sender::tests::; do
-            selected=$(cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio -- --list "$filter" "${skip_args[@]}")
+            selected=$(cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio -- --list "$filter" "${skip_args[@]}")
             if ! grep -q ': test$' <<< "$selected"; then
               echo "::error::No tests selected for filter: $filter"
               exit 1
             fi
-            cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio "$filter" -- "${skip_args[@]}"
+            cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio "$filter" -- "${skip_args[@]}"
           done
 
   cross:

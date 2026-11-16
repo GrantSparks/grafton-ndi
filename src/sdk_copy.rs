@@ -183,7 +183,7 @@ impl CopyBudget {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "advanced"))]
+    #[cfg(test)]
     pub(crate) fn remaining(&self) -> usize {
         self.remaining
     }
@@ -690,6 +690,67 @@ mod tests {
                 wide.len() - 1
             );
             limit_error(budget(COPY_LIMIT).slice(wide.as_ptr(), wide.len() as u32));
+        }
+    }
+
+    #[test]
+    fn small_omitted_entries_keep_their_charge_and_propagate_exhaustion() {
+        for remaining in [18, 17] {
+            let mut budget = budget(remaining);
+            let result = budget.collect_entries(&[false, true], |keep, budget| {
+                // Eight consumed input bytes stay charged even if this entry
+                // is malformed; a later budget failure must remain fatal.
+                budget.take(8)?;
+                if *keep {
+                    Ok(9u8)
+                } else {
+                    Err(CopyError::Malformed)
+                }
+            });
+            if remaining == 18 {
+                assert_eq!(result.unwrap(), [9]);
+                assert_eq!(budget.remaining(), 0);
+            } else {
+                limit_error(result);
+            }
+        }
+    }
+
+    #[test]
+    fn small_rejected_scans_exhaust_the_remaining_budget() {
+        let mut exact = budget(4);
+        // SAFETY: the literal remains live through its NUL terminator.
+        assert_eq!(
+            unsafe { exact.c_str(c"abc".as_ptr()) }.unwrap(),
+            Some(c"abc")
+        );
+        assert_eq!(exact.remaining(), 0);
+        let unterminated = [b'x'; 4];
+        let mut short = budget(unterminated.len());
+        // SAFETY: each byte within the remaining scan bound is readable.
+        limit_error(unsafe { short.c_str(unterminated.as_ptr().cast()) });
+        assert_eq!(short.remaining(), 0);
+    }
+
+    #[test]
+    fn representative_copies_share_the_exact_lossy_length() {
+        for bytes in [
+            &b""[..],
+            &b"ASCII"[..],
+            &b"caf\xc3\xa9"[..],
+            &b"\xe2\x82\xac\xf0\x9f\xa6\x80"[..],
+            &b"\xe2\x82"[..],
+            &b"\xed\xa0\x80"[..],
+            &b"\xf4\x90\x80\x80"[..],
+            &b"\xe2\x82A\xff\xf0\x9f\xa6\x80"[..],
+        ] {
+            let expected = String::from_utf8_lossy(bytes);
+            let text = LossyText::new(bytes);
+            assert_eq!(text.len(), expected.len());
+            assert_eq!(text.copy().unwrap(), expected);
+            let mut copied = String::new();
+            text.push_to(&mut copied);
+            assert_eq!(copied, expected);
         }
     }
 
