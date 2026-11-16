@@ -1,6 +1,7 @@
 //! Input ownership at the native boundary, including failed release and drop.
 
 use super::*;
+use std::time::Duration;
 use crate::{sys::advanced::Kvm, ReceiverOptions};
 use std::{cell::RefCell, ffi::CStr};
 
