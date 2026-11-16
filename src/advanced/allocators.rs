@@ -3077,8 +3077,9 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        let format = AudioFormat::Fltp;
         let request = audio_request(&NDIlib_audio_frame_v3_t {
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: format.to_sdk(),
             sample_rate: 48_000,
             no_channels: 2,
             no_samples: 1024,
