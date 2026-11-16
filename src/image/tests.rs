@@ -1741,7 +1741,7 @@ fn unreadable_color_metadata_is_refused_unless_the_caller_overrides() {
             matches!(
                 message,
                 crate::FrameDefect::ColorMetadata {
-                    issue: crate::ColorMetadataIssue::UndefinedValue,
+                    issue: crate::ColorMetadataDefect::UndefinedValue,
                     ..
                 }
             ),
@@ -2041,8 +2041,8 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
             crate::image_encoding::ImageFormat::Jpeg(85)
         ))),
         crate::FrameDefect::ImageDimension {
-            codec: crate::ImageCodec::Jpeg,
-            dimension: crate::ImageDimension::Width,
+            codec: crate::ImageCodecKind::Jpeg,
+            dimension: crate::ImageAxisKind::Width,
             length: 65536,
             ..
         }
@@ -2062,8 +2062,8 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
             crate::image_encoding::ImageFormat::Jpeg(85)
         ))),
         crate::FrameDefect::ImageDimension {
-            codec: crate::ImageCodec::Jpeg,
-            dimension: crate::ImageDimension::Height,
+            codec: crate::ImageCodecKind::Jpeg,
+            dimension: crate::ImageAxisKind::Height,
             length: 65536,
             ..
         }
@@ -2076,8 +2076,8 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
     assert!(matches!(
         invalid_frame(webp.encode_image(&options(ImageFormat::WebpLossless))),
         crate::FrameDefect::ImageDimension {
-            codec: crate::ImageCodec::Webp,
-            dimension: crate::ImageDimension::Width,
+            codec: crate::ImageCodecKind::Webp,
+            dimension: crate::ImageAxisKind::Width,
             length: 16386,
             ..
         }
@@ -2097,7 +2097,7 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
         let message =
             invalid_frame(frame.encode_image_to(&options(ImageFormat::WebpLossy(75)), &mut out));
         assert!(
-            matches!(message,crate::FrameDefect::ImageDimension {codec:crate::ImageCodec::Webp,dimension:found,length:16384,..} if found == if dimension=="width" {crate::ImageDimension::Width} else {crate::ImageDimension::Height}),
+            matches!(message,crate::FrameDefect::ImageDimension {codec:crate::ImageCodecKind::Webp,dimension:found,length:16384,..} if found == if dimension=="width" {crate::ImageAxisKind::Width} else {crate::ImageAxisKind::Height}),
             "{message}"
         );
         assert_eq!(out.written, 0);

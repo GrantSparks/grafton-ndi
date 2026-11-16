@@ -37,6 +37,8 @@ impl std::fmt::Debug for NativeFunction {
     }
 }
 
+impl std::error::Error for NativeFunction {}
+
 impl PartialEq<&CStr> for NativeFunction {
     fn eq(&self, other: &&CStr) -> bool {
         self.0 == *other

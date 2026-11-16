@@ -34,7 +34,7 @@ pub(super) fn encode_lossless(
         .map_err(|error| match error {
             image_webp::EncodingError::IoError(error) => Error::Io(error),
             error => Error::InvalidFrame(crate::FrameDefect::EncodingFailed {
-                codec: crate::ImageCodec::Webp,
+                codec: crate::ImageCodecKind::Webp,
                 diagnostic: error.to_string().into_boxed_str(),
             }),
         })
@@ -72,7 +72,7 @@ pub(super) fn encode_lossy(
     )
     .map_err(|error| {
         Error::InvalidFrame(crate::FrameDefect::EncodingFailed {
-            codec: crate::ImageCodec::Webp,
+            codec: crate::ImageCodecKind::Webp,
             diagnostic: error.to_string().into_boxed_str(),
         })
     })
