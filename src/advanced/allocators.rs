@@ -1659,7 +1659,9 @@ fn audio_request(
         if AudioCodec::from_outer(frame.FourCC).is_none() {
             return Err(AllocationDecline::RequestNotRepresentable);
         }
-        // SAFETY: for a compressed frame the union holds the data size.
+        // SAFETY: for compressed audio the union holds the exact packet size;
+        // tests/advanced_runtime.rs::compressed_audio_packets_use_exact_custom_allocator_grants
+        // pins the AAC/Opus request format, extent and delivered application memory.
         let size = compressed_size(unsafe { frame.__bindgen_anon_1.data_size_in_bytes })?;
         return Ok(AllocationRequest {
             bytes: size,

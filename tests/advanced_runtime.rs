@@ -36,6 +36,8 @@ use grafton_ndi::{
     SourceCache, StreamTier, Tally, Timecode, VideoFrame, VideoFrameRef,
 };
 use std::{
+    alloc::{alloc_zeroed, dealloc, Layout},
+    ptr::NonNull,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, MutexGuard,
@@ -3750,44 +3752,42 @@ fn a_genlock_moves_between_threads() {
     });
 }
 
+/// Aligned external storage shared by the native packet allocator tests.
+struct PacketStorage {
+    pointer: NonNull<u8>,
+    layout: Layout,
+    freed: Arc<AtomicBool>,
+}
+// SAFETY: PacketStorage exclusively owns its aligned initialized allocation;
+// transfer between SDK threads changes no pointer or storage extent.
+unsafe impl Send for PacketStorage {}
+// SAFETY: alloc_zeroed provides 64-byte aligned initialized memory, the
+// pointer/extent never change, and only the SDK accesses it before Drop.
+unsafe impl ExternalAllocation for PacketStorage {
+    fn pointer(&self) -> NonNull<u8> {
+        self.pointer
+    }
+    fn capacity(&self) -> usize {
+        self.layout.size()
+    }
+}
+impl Drop for PacketStorage {
+    fn drop(&mut self) {
+        // SAFETY: this value owns the allocation made with this Layout,
+        // and the SDK has released its last lease before dropping it.
+        unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
+        self.freed.store(true, Ordering::Release);
+    }
+}
+
 /// A borrowed compressed packet stays in the exact application allocation
 /// granted to the native receiver, until its receive guard is released.
 #[test]
 fn borrowed_packet_payload_stays_in_external_allocator_memory() {
-    use std::{
-        alloc::{alloc_zeroed, dealloc, Layout},
-        ptr::NonNull,
-    };
     let Some(ndi) = common::advanced_ndi() else {
         return;
     };
     let _turn = sockets();
-    struct Storage {
-        pointer: NonNull<u8>,
-        layout: Layout,
-        freed: Arc<AtomicBool>,
-    }
-    // SAFETY: Storage exclusively owns its aligned initialized allocation;
-    // transfer between SDK threads changes no pointer or storage extent.
-    unsafe impl Send for Storage {}
-    // SAFETY: alloc_zeroed provides 64-byte aligned initialized memory, the
-    // pointer/extent never change, and only the SDK accesses it before Drop.
-    unsafe impl ExternalAllocation for Storage {
-        fn pointer(&self) -> NonNull<u8> {
-            self.pointer
-        }
-        fn capacity(&self) -> usize {
-            self.layout.size()
-        }
-    }
-    impl Drop for Storage {
-        fn drop(&mut self) {
-            // SAFETY: this value owns the allocation made with this Layout,
-            // and the SDK has released its last lease before dropping it.
-            unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
-            self.freed.store(true, Ordering::Release);
-        }
-    }
     let buffers = Arc::new(Mutex::new(Vec::new()));
     let mut sender = CompressedSender::new(&ndi, &options("borrowed-external-packet")).unwrap();
     let receiver = PacketReceiver::new(
@@ -3812,7 +3812,7 @@ fn borrowed_packet_payload_stays_in_external_allocator_memory() {
                 .push((pointer.as_ptr() as usize, layout.size(), freed.clone()));
             AllocationBuffer::from_external(
                 request,
-                Storage {
+                PacketStorage {
                     pointer,
                     layout,
                     freed,
@@ -3863,7 +3863,7 @@ fn borrowed_packet_payload_stays_in_external_allocator_memory() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    // The exact buffer is now released, but Storage::drop sets its flag
+    // The exact buffer is now released, but PacketStorage::drop sets its flag
     // before the registry finishes bookkeeping, and the SDK may still own
     // other queued buffers. Destroying the receiver drains those callbacks
     // and prevents new grants before inspecting the process-wide counters.
@@ -3879,6 +3879,134 @@ fn borrowed_packet_payload_stays_in_external_allocator_memory() {
         ),
         (0, 0, 0, 0),
         "an allocation or generation outlived its receiver: {usage:?}"
+    );
+}
+
+#[test]
+fn compressed_audio_packets_use_exact_custom_allocator_grants() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("external-compressed-audio")).unwrap();
+    let receiver = PacketReceiver::new(
+        &ndi,
+        &ReceiverOptions::new(loopback(&ndi, &sender.sender().source().unwrap())),
+        PassthroughPreset::ProtectedWithAudio,
+    )
+    .unwrap();
+    let service =
+        AllocatorService::new(ndi.process_lifetime(), &AllocatorLimits::default()).unwrap();
+    let mut receiver = service.attach_packets(receiver).unwrap();
+    receiver
+        .set_video_allocator(AllocationBuffer::zeroed)
+        .unwrap();
+    let grants = Arc::new(Mutex::new(Vec::new()));
+    let audio_grants = grants.clone();
+    receiver
+        .set_audio_allocator(move |request: AllocationRequest| {
+            let layout = Layout::from_size_align(request.minimum_bytes(), 64).unwrap();
+            // SAFETY: the callback's request bounds this positive initialized
+            // allocation, and its native lease owns the resulting buffer.
+            let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).expect("test allocation");
+            let freed = Arc::new(AtomicBool::new(false));
+            audio_grants
+                .lock()
+                .unwrap()
+                .push((pointer.as_ptr() as usize, request, freed.clone()));
+            AllocationBuffer::from_external(
+                request,
+                PacketStorage {
+                    pointer,
+                    layout,
+                    freed,
+                },
+            )
+            .map_err(|error| error.into_error())
+        })
+        .unwrap();
+    let declines = service.usage().declined_allocations();
+    for (index, (codec, samples)) in [(AudioCodec::Aac, 1024), (AudioCodec::Opus, 960)]
+        .into_iter()
+        .enumerate()
+    {
+        let timecode = FIRST_TIMECODE + index as i64;
+        let bytes = audio_bytes(codec, 48_000, 2, timecode);
+        let mut audio = CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes).unwrap();
+        audio.set_timecode(Timecode::from_ticks(timecode));
+        let mut video = keyframe(VideoCodec::H264, StreamTier::Program, timecode);
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no custom-allocated {codec:?} audio arrived: {}",
+                link(receiver.receiver()),
+            );
+            sender.send_video(&mut video);
+            sender.sender().send_compressed_audio(&mut audio);
+            if let Some(PacketItemRef::Audio(ReceivedAudioRef::Compressed(packet))) =
+                receiver.capture_any_ref(SLICE).unwrap()
+            {
+                if packet.timecode().ticks() != timecode {
+                    continue;
+                }
+                assert_eq!(packet.codec(), codec);
+                assert_eq!(
+                    (
+                        packet.sample_rate(),
+                        packet.num_channels(),
+                        packet.num_samples()
+                    ),
+                    (48_000, 2, samples),
+                );
+                let pointer = packet.data().as_ptr() as usize;
+                let length = packet.data().len();
+                let grants = grants.lock().unwrap();
+                let (_, request, _) = grants
+                    .iter()
+                    .find(|(start, request, freed)| {
+                        !freed.load(Ordering::Acquire)
+                            && *start <= pointer
+                            && pointer + length <= start + request.minimum_bytes()
+                    })
+                    .expect("compressed audio must remain inside a live application grant");
+                let fourcc = match codec {
+                    AudioCodec::Aac => 0xff,
+                    AudioCodec::Opus => u32::from_le_bytes(*b"Opus"),
+                    _ => unreachable!("the test sends AAC and Opus only"),
+                };
+                assert_eq!(
+                    request.format(),
+                    AllocationFormat::CompressedAudio(grafton_ndi::FourCc::from_raw(fourcc)),
+                );
+                assert_eq!(request.minimum_bytes(), length, "{codec:?} request size");
+                assert_eq!(request.stride_bytes(), length, "{codec:?} size union");
+                assert_eq!((request.width(), request.height()), (samples, 2));
+                assert_eq!(service.usage().declined_allocations(), declines);
+                break;
+            }
+        }
+    }
+    drop(receiver);
+    drop(sender);
+    assert!(grants
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(_, _, freed)| freed.load(Ordering::Acquire)));
+    let usage = service.usage();
+    assert_eq!(usage.declined_allocations(), declines, "{usage:?}");
+    assert_eq!(
+        (
+            usage.retained_allocations(),
+            usage.retained_bytes(),
+            usage.generations(),
+            usage.active_generations(),
+            usage.in_progress_allocations(),
+            usage.in_progress_reclamations(),
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "compressed audio storage outlived its receiver: {usage:?}",
     );
 }
 
