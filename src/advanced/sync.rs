@@ -7,8 +7,8 @@ use std::{cell::Cell, marker::PhantomData};
 use super::{invalid_input, sdk_quantity, AdvancedConfig, AvSyncAttached, ReceiverControls};
 use crate::{
     capture::{AvSyncAudioFree, Guard},
-    frames::ValidatedAudio,
     frames::MAX_AUDIO_BYTES,
+    frames::{ValidatedAudio, VideoPartsExt},
     receiver::{
         attached::{sealed, Attached, Resource, Synchronizer},
         ReceiverCore,
@@ -465,6 +465,10 @@ impl AvSync {
     /// storage when present. [`Self::synchronize_ref`] borrows those samples
     /// directly and offers allocation-free copying into reusable storage.
     ///
+    /// Matching uses the video's timestamp and geometry, independently of
+    /// whether this runtime can send its pixel format. Owned and borrowed
+    /// planar 4:4:4 frames therefore follow the same rule on older runtimes.
+    ///
     /// One call synchronizes at a time, on the thread that holds this
     /// `AvSync`, which is not `Sync`. Other threads may meanwhile capture
     /// video or metadata or use the controls through the receiver it lends.
@@ -472,9 +476,6 @@ impl AvSync {
     /// tests also exercise for [`FrameSync`](crate::FrameSync).
     ///
     /// # Errors
-    ///
-    /// [`Error::UnsupportedCapability`] when an owned video uses planar 4:4:4
-    /// on a runtime without [`crate::RuntimeFeature::Planar444Video`].
     ///
     /// [`Error::InvalidFrame`] when the audio the SDK returned fails
     /// validation, [`Error::NativeOperationFailed`] when the SDK reports an
@@ -608,7 +609,7 @@ impl<'a> AvSyncCapture<'a> {
             // A copy of the frame's descriptor, pointing into the frame's own
             // buffers, which the borrow keeps allocated for the call, and
             // carrying the timestamp `AvSyncVideo::new` checked.
-            let video = _video.map(|video| video.descriptor(&self.resource.receiver._ndi)).transpose()?;
+            let video = _video.map(|video| video.descriptor());
             let (handle, table) = (self.resource.handle, self.resource.table);
             let mut audio = _request.raw();
             let status = {
@@ -745,7 +746,7 @@ mod video_sealed {
     pub trait Sealed: Sync + std::panic::RefUnwindSafe {
         /// A copy of the frame's SDK descriptor, which points into buffers
         /// that the borrow of `self` keeps allocated and unchanged.
-        fn descriptor(&self, ndi: &crate::Ndi) -> crate::Result<NDIlib_video_frame_v2_t>;
+        fn descriptor(&self) -> NDIlib_video_frame_v2_t;
 
         /// The time the frame's sender submitted it, when known.
         fn receive_timestamp(&self) -> Option<SdkTimestamp>;
@@ -760,8 +761,8 @@ mod video_sealed {
 pub trait AvSyncFrame: video_sealed::Sealed {}
 
 impl video_sealed::Sealed for VideoFrame {
-    fn descriptor(&self, ndi: &crate::Ndi) -> crate::Result<NDIlib_video_frame_v2_t> {
-        Ok(crate::frames::Sendable::borrowed(self, ndi)?.video_descriptor())
+    fn descriptor(&self) -> NDIlib_video_frame_v2_t {
+        self.video_descriptor()
     }
 
     fn receive_timestamp(&self) -> Option<SdkTimestamp> {
@@ -772,10 +773,8 @@ impl video_sealed::Sealed for VideoFrame {
 impl AvSyncFrame for VideoFrame {}
 
 impl video_sealed::Sealed for VideoFrameRef<'_> {
-    fn descriptor(&self, _: &crate::Ndi) -> crate::Result<NDIlib_video_frame_v2_t> {
-        let mut raw = *self.raw();
-        raw.p_metadata = crate::frames::VideoParts::frame_metadata(self).as_ptr();
-        Ok(raw)
+    fn descriptor(&self) -> NDIlib_video_frame_v2_t {
+        self.video_descriptor()
     }
 
     fn receive_timestamp(&self) -> Option<SdkTimestamp> {
@@ -845,11 +844,11 @@ impl<'a> AvSyncVideo<'a> {
 
     /// The frame's descriptor, carrying the timestamp [`Self::new`] checked.
     #[cfg(any(test, ndi_has_advanced_av_sync))]
-    fn descriptor(&self, ndi: &crate::Ndi) -> crate::Result<NDIlib_video_frame_v2_t> {
-        Ok(NDIlib_video_frame_v2_t {
+    fn descriptor(&self) -> NDIlib_video_frame_v2_t {
+        NDIlib_video_frame_v2_t {
             timestamp: self.timestamp.ticks(),
-            ..self.frame.descriptor(ndi)?
-        })
+            ..self.frame.descriptor()
+        }
     }
 }
 
@@ -1494,9 +1493,6 @@ mod tests {
     /// timestamp that was checked.
     #[test]
     fn only_a_frame_with_a_timestamp_can_be_synchronized() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
         let built = VideoFrame::builder().resolution(64, 32).build().unwrap();
         assert!(AvSyncVideo::new(&built).is_none());
 
@@ -1510,7 +1506,7 @@ mod tests {
         let frame = captured(&mut pixels, sent);
         let video = AvSyncVideo::new(&frame).unwrap();
         assert_eq!(video.timestamp(), SdkTimestamp::from_ticks(sent));
-        let descriptor = video.descriptor(&ndi).unwrap();
+        let descriptor = video.descriptor();
         assert_eq!(descriptor.timestamp, sent);
         assert_eq!(descriptor.p_data.cast_const(), start);
         assert!(format!("{video:?}").contains("timestamp"));
@@ -1519,31 +1515,27 @@ mod tests {
         let owned = frame.to_owned();
         let video = AvSyncVideo::new(&owned).unwrap();
         assert_eq!(video.timestamp(), SdkTimestamp::from_ticks(sent));
-        assert_eq!(video.descriptor(&ndi).unwrap().timestamp, sent);
+        assert_eq!(video.descriptor().timestamp, sent);
         assert_eq!(
-            video.descriptor(&ndi).unwrap().p_data.cast_const(),
+            video.descriptor().p_data.cast_const(),
             owned.data().as_ptr()
         );
     }
 
+    /// Native AV sync matches timestamps independently of the runtime's send
+    /// formats. In particular Advanced 6.3.2 cannot send these four formats.
     #[test]
-    fn owned_planar_444_avsync_checks_the_receiver_runtime() {
+    fn avsync_accepts_owned_and_borrowed_planar_444_without_a_send_gate() {
         use crate::{
             capture::{CaptureStrategy, Guard, VideoKind},
             PixelFormat, ReceiverOptions, Source,
         };
-        let Some(ndi) = crate::test_support::ndi() else {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
             return;
         };
-        if !ndi.capabilities().supports(crate::RuntimeFeature::AvSync) {
-            return;
-        }
         let receiver =
             Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
         let mut sync = AvSync::new(receiver).unwrap();
-        let supported = ndi
-            .capabilities()
-            .supports(crate::RuntimeFeature::Planar444Video);
         for format in [
             PixelFormat::Na48,
             PixelFormat::Nb48,
@@ -1557,34 +1549,26 @@ mod tests {
                 .unwrap();
             let mut raw = backing.as_test_raw();
             raw.timestamp = 1234;
-            // SAFETY: backing owns the descriptor's complete validated storage
-            // throughout this synthetic capture and copy; no-op free owns nothing.
+            // SAFETY: backing retains this descriptor's complete initialized
+            // storage through both synthetic capture and synchronization.
             let captured = VideoKind::make_ref(unsafe {
                 Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})
             })
             .unwrap();
             let owned = captured.to_owned();
-            let video = AvSyncVideo::new(&owned).unwrap();
-            for result in [
-                sync.synchronize(video, AvSyncRequest::automatic()),
-                sync.split()
-                    .0
-                    .synchronize(video, AvSyncRequest::automatic()),
+            for video in [
+                AvSyncVideo::new(&captured).unwrap(),
+                AvSyncVideo::new(&owned).unwrap(),
             ] {
-                if supported {
-                    assert!(result.is_ok(), "{format:?}: {result:?}");
-                } else {
+                assert_eq!(video.descriptor().FourCC, raw.FourCC);
+                for result in [
+                    sync.synchronize(video, AvSyncRequest::automatic()),
+                    sync.split()
+                        .0
+                        .synchronize(video, AvSyncRequest::automatic()),
+                ] {
                     assert!(
-                        matches!(
-                            result,
-                            Err(Error::UnsupportedCapability {
-                                capability: crate::Capability::Runtime(
-                                    crate::RuntimeFeature::Planar444Video
-                                ),
-                                refusal: crate::CapabilityRefusal::RuntimeTooOld { .. },
-                                ..
-                            })
-                        ),
+                        matches!(result, Ok(AvSyncOutcome::NoAudioStream)),
                         "{format:?}: {result:?}"
                     );
                 }
@@ -1592,11 +1576,152 @@ mod tests {
         }
     }
 
+    /// Supply real received timestamps with planar storage that the source
+    /// runtime cannot send. Successful audio matching proves the ungated
+    /// descriptors work beyond the no-audio outcome checked above.
     #[test]
-    fn avsync_descriptors_fit_owned_copies_of_padded_sources() {
+    fn avsync_matches_live_audio_for_owned_and_borrowed_planar_frames() {
+        use crate::{
+            capture::{CaptureStrategy, VideoKind},
+            Finder, FinderOptions, PixelFormat, ReceiverOptions, Sender, SenderOptions,
+            SourceAddress,
+        };
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::{Duration, Instant},
+        };
         let Some(ndi) = crate::test_support::advanced_ndi() else {
             return;
         };
+        let sender = Sender::new(
+            &ndi,
+            &SenderOptions::new(crate::test_support::unique_name("planar AV-sync"))
+                .clock_video(true)
+                .clock_audio(false),
+        )
+        .unwrap();
+        let name = sender.source().unwrap().name().to_owned();
+        let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips(["127.0.0.1"])).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let source = loop {
+            if let Some((source, port)) = finder
+                .current_sources()
+                .unwrap()
+                .into_iter()
+                .filter(|source| source.name() == name)
+                .find_map(|source| {
+                    source
+                        .address()
+                        .and_then(|address| address.port())
+                        .map(|port| (source, port))
+                })
+            {
+                break source
+                    .with_address(SourceAddress::new(format!("127.0.0.1:{port}")).unwrap());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "local planar AV-sync sender not discovered"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let sync =
+            AvSync::new(Receiver::new(&ndi, &ReceiverOptions::new(source)).unwrap()).unwrap();
+        let video = VideoFrame::builder()
+            .resolution(64, 32)
+            .frame_rate(FrameRate::new(30, 1).unwrap())
+            .build()
+            .unwrap();
+        let audio = AudioFrame::builder()
+            .sample_rate(48_000)
+            .num_channels(2)
+            .num_samples(1600)
+            .build()
+            .unwrap();
+        let stop = AtomicBool::new(false);
+        struct Stop<'a>(&'a AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        std::thread::scope(|scope| {
+            let _stop = Stop(&stop);
+            scope.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    sender.send_video(&video).unwrap();
+                    sender.send_audio(&audio);
+                }
+            });
+            for format in [
+                PixelFormat::Na48,
+                PixelFormat::Nb48,
+                PixelFormat::Na4g,
+                PixelFormat::Nb4g,
+            ] {
+                let backing = VideoFrame::builder()
+                    .resolution(64, 32)
+                    .frame_rate(FrameRate::new(30, 1).unwrap())
+                    .pixel_format(format)
+                    .build()
+                    .unwrap();
+                for owned in [false, true] {
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    loop {
+                        assert!(
+                            Instant::now() < deadline,
+                            "no audio for {format:?}, owned={owned}"
+                        );
+                        let Some(received) = sync
+                            .receiver()
+                            .capture_video_ref(Duration::from_millis(100))
+                            .unwrap()
+                        else {
+                            continue;
+                        };
+                        let mut raw = backing.as_test_raw();
+                        raw.timestamp = received
+                            .timestamp()
+                            .expect("native sender timestamp")
+                            .ticks();
+                        raw.timecode = received.timecode().ticks();
+                        // SAFETY: backing retains the full initialized planar
+                        // allocation; the no-op free owns no native buffer.
+                        let captured = VideoKind::make_ref(unsafe {
+                            Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})
+                        })
+                        .unwrap();
+                        let copied = captured.to_owned();
+                        let video = if owned {
+                            AvSyncVideo::new(&copied)
+                        } else {
+                            AvSyncVideo::new(&captured)
+                        }
+                        .unwrap();
+                        match sync.synchronize(video, AvSyncRequest::automatic()).unwrap() {
+                            AvSyncOutcome::Audio { frame, .. } => {
+                                assert_eq!(
+                                    (frame.sample_rate(), frame.num_channels()),
+                                    (48_000, 2)
+                                );
+                                assert!(frame.num_samples() > 0);
+                                break;
+                            }
+                            AvSyncOutcome::NoAudioStream
+                            | AvSyncOutcome::NoMatchingSamples
+                            | AvSyncOutcome::Empty { .. } => {}
+                            other => panic!(
+                                "unexpected outcome for {format:?}, owned={owned}: {other:?}"
+                            ),
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn avsync_descriptors_fit_owned_copies_of_padded_sources() {
         for (format, stride) in [
             (crate::PixelFormat::Bgra, 512),
             (crate::PixelFormat::Uyvy, 256),
@@ -1613,7 +1738,7 @@ mod tests {
                 .build()
                 .unwrap();
             let frame = crate::VideoSource::to_owned(&borrowed);
-            let raw = video_sealed::Sealed::descriptor(&frame, &ndi).unwrap();
+            let raw = video_sealed::Sealed::descriptor(&frame);
             crate::frames::descriptor_tests::assert_extent(
                 &raw,
                 frame.data().as_ptr(),

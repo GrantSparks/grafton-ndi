@@ -533,13 +533,13 @@ impl PixelFormat {
     /// [`RuntimeFeature::Planar444Video`]: crate::RuntimeFeature::Planar444Video
     pub(crate) fn require_sendable(
         self,
-        ndi: &crate::Ndi,
+        planar444: impl FnOnce() -> Result<&'static sys::Planar444Video>,
     ) -> Result<Option<&'static sys::Planar444Video>> {
         if matches!(
             self.info().category(),
             FormatCategory::Planar444 | FormatCategory::Planar444Alpha
         ) {
-            return ndi.table::<sys::Planar444Video>().map(Some);
+            return planar444().map(Some);
         }
         Ok(None)
     }
@@ -740,6 +740,31 @@ unsafe impl<T: VideoParts + ?Sized> VideoParts for &T {
 
 /// Shared operations whose blanket implementation prevents per-frame overrides.
 pub(crate) trait VideoPartsExt: VideoParts {
+    /// Describe this validated frame without imposing a send capability.
+    /// The pointer fields borrow the same storage as the frame's accessors.
+    fn video_descriptor(&self) -> NDIlib_video_frame_v2_t {
+        let frame = self;
+        let layout = frame.layout();
+        let header = frame.header();
+        let (frame_rate_n, frame_rate_d) = header.frame_rate.to_sdk();
+        NDIlib_video_frame_v2_t {
+            xres: layout.sdk_width(),
+            yres: layout.sdk_height(),
+            FourCC: FourCc::from(layout.pixel_format()).raw(),
+            frame_rate_N: frame_rate_n,
+            frame_rate_D: frame_rate_d,
+            picture_aspect_ratio: header.picture_aspect_ratio.to_sdk(),
+            frame_format_type: header.scan_type.to_sdk(),
+            timecode: header.timecode.ticks(),
+            p_data: frame.pixels().cast_mut(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: layout.sdk_line_stride(),
+            },
+            p_metadata: frame.frame_metadata().as_ptr(),
+            timestamp: SdkTimestamp::to_sdk(frame.sdk_timestamp()),
+        }
+    }
+
     /// Whether one complete SDK read fits the owner's initialized extent.
     fn can_send_direct(&self) -> bool {
         let layout = self.layout();
@@ -1562,7 +1587,7 @@ impl VideoFrame {
 
     #[cfg(test)]
     pub(crate) fn as_test_raw(&self) -> NDIlib_video_frame_v2_t {
-        Sendable::for_test(self).video_descriptor()
+        self.video_descriptor()
     }
 
     /// Set the timecode without reallocating the pixels.
@@ -3345,7 +3370,11 @@ impl<F> std::ops::Deref for Sendable<F> {
 
 impl<F: VideoParts> Sendable<F> {
     fn checked(frame: F, ndi: &crate::Ndi) -> std::result::Result<Self, (Error, F)> {
-        match frame.layout().pixel_format().require_sendable(ndi) {
+        match frame
+            .layout()
+            .pixel_format()
+            .require_sendable(|| ndi.table::<sys::Planar444Video>())
+        {
             Ok(planar444) => Ok(Self {
                 frame,
                 _planar444: planar444,
@@ -3363,29 +3392,6 @@ impl<F: VideoParts> Sendable<F> {
     }
     pub(crate) fn into_frame(self) -> F {
         self.frame
-    }
-
-    pub(crate) fn video_descriptor(&self) -> NDIlib_video_frame_v2_t {
-        let frame = &self.frame;
-        let layout = frame.layout();
-        let header = frame.header();
-        let (frame_rate_n, frame_rate_d) = header.frame_rate.to_sdk();
-        NDIlib_video_frame_v2_t {
-            xres: layout.sdk_width(),
-            yres: layout.sdk_height(),
-            FourCC: FourCc::from(layout.pixel_format()).raw(),
-            frame_rate_N: frame_rate_n,
-            frame_rate_D: frame_rate_d,
-            picture_aspect_ratio: header.picture_aspect_ratio.to_sdk(),
-            frame_format_type: header.scan_type.to_sdk(),
-            timecode: header.timecode.ticks(),
-            p_data: frame.pixels().cast_mut(),
-            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                line_stride_in_bytes: layout.sdk_line_stride(),
-            },
-            p_metadata: frame.frame_metadata().as_ptr(),
-            timestamp: SdkTimestamp::to_sdk(frame.sdk_timestamp()),
-        }
     }
 
     /// Copies preserve the pixel format that the capability authorizes.
@@ -3412,17 +3418,11 @@ impl<F: VideoParts> Sendable<F> {
 
     #[cfg(test)]
     pub(crate) fn for_test(frame: F) -> Self {
-        let pixel_format = frame.layout().pixel_format();
-        let planar444 = if matches!(
-            pixel_format.info().category(),
-            FormatCategory::Planar444 | FormatCategory::Planar444Alpha
-        ) {
-            Some(sys::with_test_evidence("6.4.0.2", |evidence| {
-                sys::Planar444Video::check(evidence).unwrap()
-            }))
-        } else {
-            None
-        };
+        let planar444 = frame
+            .layout()
+            .pixel_format()
+            .require_sendable(|| sys::with_test_evidence("6.4.0.2", sys::Planar444Video::check))
+            .unwrap();
         Self {
             frame,
             _planar444: planar444,
@@ -5210,14 +5210,6 @@ macro_rules! borrowed_video_accessors {
 borrowed_video_accessors!(VideoFrameRef, VideoKind);
 borrowed_video_accessors!(FrameSyncVideoRef, FrameSyncVideoFree);
 
-#[cfg(feature = "advanced")]
-impl VideoFrameRef<'_> {
-    /// The original receiver descriptor retained by this frame's guard.
-    pub(crate) fn raw(&self) -> &NDIlib_video_frame_v2_t {
-        self.inner.descriptor()
-    }
-}
-
 /// A zero-copy audio frame captured from a [`Receiver`](crate::Receiver).
 ///
 /// Borrows its receiver and frees the SDK buffer when dropped. It can be moved
@@ -5779,7 +5771,7 @@ mod tests {
                 format,
                 PixelFormat::Na48 | PixelFormat::Nb48 | PixelFormat::Na4g | PixelFormat::Nb4g
             );
-            let result = format.require_sendable(&ndi);
+            let result = format.require_sendable(|| ndi.table::<sys::Planar444Video>());
             if planar_444 && !supported {
                 assert!(
                     matches!(

@@ -307,7 +307,10 @@ retains the historical measurements and their limits.
 and reserves audio capture; capture video through `sync.receiver()`, then pass
 it to `synchronize` as an `AvSyncVideo`. `AvSyncVideo::new` accepts a borrowed
 capture or an owned copy of one, and returns `None` for a frame without its
-sender's timestamp, such as one the application built. `queued_audio` takes
+sender's timestamp, such as one the application built. Matching reads the
+video's timing independently of send-format capabilities: owned and borrowed
+planar 4:4:4 video can both synchronize on older Advanced runtimes.
+`queued_audio` takes
 the queued audio without a frame. `AvSyncRequest::automatic()` lets the SDK
 choose audio shape. `AvSyncOutcome` distinguishes audio, no matching
 samples, format changes and absent audio; SDK internal failures return

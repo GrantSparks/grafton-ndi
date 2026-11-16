@@ -1383,7 +1383,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
 
     #[cfg(test)]
     fn to_raw(self) -> NDIlib_video_frame_v2_t {
-        Sendable::for_test(&self).video_descriptor()
+        self.video_descriptor()
     }
 }
 
@@ -2809,7 +2809,7 @@ mod tests {
             let captured = unsafe {
                 VideoFrameRef::new(Guard::with_test_free(
                     ptr::null_mut(),
-                    Sendable::for_test(&frame).video_descriptor(),
+                    frame.video_descriptor(),
                     |_, _| {},
                 ))
             }

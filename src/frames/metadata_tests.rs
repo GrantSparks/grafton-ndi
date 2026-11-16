@@ -97,10 +97,7 @@ where
         }
         assert_eq!(VideoSource::data(&frame), Some(pixels.as_slice()));
         assert_eq!(
-            Sendable::for_test(&frame)
-                .video_descriptor()
-                .p_metadata
-                .is_null(),
+            frame.video_descriptor().p_metadata.is_null(),
             status != FrameMetadataStatus::Text
         );
     });
@@ -457,17 +454,13 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
     let captured_video = VideoFrameRef::new(unsafe {
         Guard::with_test_free(
             ptr::null_mut(),
-            Sendable::for_test(&present_video).video_descriptor(),
+            present_video.video_descriptor(),
             count_free,
         )
     })
     .unwrap();
     let captured_bare_video = VideoFrameRef::new(unsafe {
-        Guard::with_test_free(
-            ptr::null_mut(),
-            Sendable::for_test(&absent_video).video_descriptor(),
-            count_free,
-        )
+        Guard::with_test_free(ptr::null_mut(), absent_video.video_descriptor(), count_free)
     })
     .unwrap();
     let captured_audio = AudioFrameRef::new(unsafe {

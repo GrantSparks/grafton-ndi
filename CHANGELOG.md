@@ -377,9 +377,11 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Discovery Server connection requests inspect only receiver identifiers and
   the matched receiver's commands. Unrelated malformed fields or snapshot-copy
   limits no longer prevent an otherwise valid request.
-- Runtime-authorized layouts now guard caller video descriptors, including
-  owned AV-sync input. Older runtimes reject planar 4:4:4 video consistently
-  before native calls; receiver settings carry the same structural checks.
+- Runtime-authorized layouts guard native video send paths. Older runtimes
+  reject sending planar 4:4:4 video before native calls; receiver settings
+  carry the same structural checks. Descriptor construction, V210/P216
+  conversion and AV-sync timestamp matching need no send-format capability.
+  AV sync accepts owned and borrowed planar 4:4:4 frames consistently.
 - Dropped async receiver waits stop before their next bounded attempt, releasing
   their receiver and blocking worker without waiting for the original timeout.
   Source-name polling now uses the same bounded attempts.
