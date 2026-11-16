@@ -1641,16 +1641,14 @@ mod tests {
         }
     }
 
-    /// Only `Sync` is withheld, which
-    /// tests/ui/advanced/pass/av_sync_is_send_but_not_sync.rs checks.
+    /// Only `Sync` is withheld, as pinned in tests/public_auto_traits.rs.
     #[test]
     fn av_sync_is_send_and_unwind_safe() {
         fn traits<T: Send + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
         traits::<AvSync>();
     }
 
-    /// As for AvSync; tests/ui/advanced/pass/genlock_is_send_but_not_sync.rs
-    /// checks that `Sync` is withheld.
+    /// As for AvSync, tests/public_auto_traits.rs pins the withheld `Sync`.
     #[test]
     fn genlock_is_send_and_unwind_safe() {
         fn traits<T: Send + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}

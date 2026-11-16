@@ -164,6 +164,7 @@ fn crate_root_types_keep_their_auto_traits() {
         video_conversion::V210Layout: Send, Sync, UnwindSafe, RefUnwindSafe;
         video_conversion::VideoConverter: Send, Sync, UnwindSafe, RefUnwindSafe;
     }
+    lacks! { routing::Router: Sync; }
 }
 
 /// The public types of the `image-encoding` feature.
@@ -245,6 +246,12 @@ fn discovery_types_keep_their_auto_traits() {
         SendListener: Send, UnwindSafe, RefUnwindSafe;
         SendRegistration: Send, Sync, UnwindSafe, RefUnwindSafe;
         SenderId: Send, Sync, UnwindSafe, RefUnwindSafe;
+    }
+    lacks! {
+        RecvAdvertiser: Sync;
+        RecvListener: Sync;
+        SendAdvertiser: Sync;
+        SendListener: Sync;
     }
 }
 
@@ -336,6 +343,12 @@ fn advanced_types_keep_their_auto_traits() {
         VideoPacketFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         WheelAxis: Send, Sync, UnwindSafe, RefUnwindSafe;
     }
+    lacks! {
+        AudioClock<'static>: Sync;
+        AvSync: Sync;
+        Genlock: Sync;
+        VideoClock<'static>: Sync;
+    }
 }
 
 /// The public types of the `file` module.
@@ -377,5 +390,11 @@ fn file_types_keep_their_auto_traits() {
         StateConflict: Send, Sync, UnwindSafe, RefUnwindSafe;
         StopRequest: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoTrack: Send, Sync, UnwindSafe, RefUnwindSafe;
+    }
+    lacks! {
+        FilePlayer: Send;
+        FilePlayer: Sync;
+        FileRecorder: Send;
+        FileRecorder: Sync;
     }
 }
