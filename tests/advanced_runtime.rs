@@ -3053,6 +3053,10 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
         return;
     };
     if ndi.require_feature(RuntimeFeature::ReceiveBest444).is_err() {
+        common::skip(
+            Hevc444Decoder,
+            "HEVC 4:4:4 decoding needs the NDI 6.4 Best444 receiver",
+        );
         return;
     }
     // A decoder known to be missing skips here, and one that is missing

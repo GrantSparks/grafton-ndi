@@ -59,6 +59,15 @@ impl Requirement {
         Self::Hevc444Decoder,
     ];
 
+    /// Prerequisites promised by this token, including transitive ones.
+    pub(super) const fn implied(self) -> &'static [Self] {
+        match self {
+            Self::Runtime => &[],
+            Self::Advanced | Self::File | Self::DiscoveryServer => &[Self::Runtime],
+            Self::H264Decoder | Self::Hevc444Decoder => &[Self::Runtime, Self::Advanced],
+        }
+    }
+
     /// Its spelling in `GRAFTON_NDI_REQUIRE_RUNTIME`.
     pub(super) fn token(self) -> &'static str {
         match self {
@@ -111,12 +120,11 @@ impl Requirement {
             .collect()
     }
 
-    /// Whether the environment promises to provide it. Any entry promises a
-    /// runtime.
-    fn is_promised(self) -> bool {
+    /// Whether a token or one of its implications promises this requirement.
+    pub(super) fn is_promised(self) -> bool {
         Self::promised()
             .into_iter()
-            .any(|named| named == self || self == Self::Runtime)
+            .any(|named| named == self || named.implied().contains(&self))
     }
 }
 
