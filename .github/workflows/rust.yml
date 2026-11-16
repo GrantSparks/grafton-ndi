@@ -323,6 +323,9 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
       fail-fast: false
+      # Primary rows own complete build/configuration checks. The two crossed
+      # directions are separate runners, with both baseline editions retained
+      # in each: six added jobs, including two additional macOS jobs.
       # `require` lists what the row's SDK lets an all-features build check. The
       # tests read it from GRAFTON_NDI_REQUIRE_RUNTIME and fail where they would
       # otherwise skip:
@@ -342,105 +345,166 @@ jobs:
       # row that does not set it.
       matrix:
         include:
-          - name: linux-x64 standard-6.1.1
+          - role: primary
+            name: linux-x64 standard-6.1.1
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             package: 6.1.1-standard-linux
             require: '1'
-          - name: linux-x64 standard-6.3.2
+          - role: primary
+            name: linux-x64 standard-6.3.2
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             package: 6.3.2-standard-linux
             require: '1'
-          - name: linux-x64 advanced-6.3.2
+          - role: primary
+            name: linux-x64 advanced-6.3.2
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             package: 6.3.2-advanced-linux
             require: advanced
-          - name: linux-x64 standard-6.4
+          - role: primary
+            name: linux-x64 standard-6.4
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             package: current-standard-linux
             require: 1,discovery-server
             require-no-default: 1,discovery-server
             bindings: true
-          - name: linux-x64 advanced-6.4
+          - role: primary
+            name: linux-x64 advanced-6.4
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             package: current-advanced-linux
             hx-driver: current-hx-driver-linux
-            compatibility: 6.1.1-standard-linux
-            compatibility-advanced: 6.3.2-advanced-linux
             require: advanced,file,discovery-server,h264-decoder,hevc-444-decoder
             require-no-default: 1,discovery-server
-          - name: linux-x86 standard-6.4
+          - role: primary
+            name: linux-x86 standard-6.4
             runner: ubuntu-24.04
             target: i686-unknown-linux-gnu
             package: current-standard-linux
             require: 1,discovery-server
             require-no-default: 1,discovery-server
-          - name: linux-arm64 standard-6.4
+          - role: primary
+            name: linux-arm64 standard-6.4
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             package: current-standard-linux
             require: 1,discovery-server
             require-no-default: 1,discovery-server
-          - name: windows-x64 standard-6.3.2
+          - role: primary
+            name: windows-x64 standard-6.3.2
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             package: 6.3.2-standard-windows
             require: '1'
-          - name: windows-x64 advanced-6.3.2
+          - role: primary
+            name: windows-x64 advanced-6.3.2
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             package: 6.3.2-advanced-windows
             require: advanced,h264-decoder
-          - name: windows-x64 standard-6.4
+          - role: primary
+            name: windows-x64 standard-6.4
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             package: current-standard-windows
             require: 1,file
-          - name: windows-x64 advanced-6.4
+          - role: primary
+            name: windows-x64 advanced-6.4
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            package: current-advanced-windows
+            require: advanced,file,h264-decoder
+          - role: primary
+            name: windows-x86 advanced-6.4
+            runner: windows-2025
+            target: i686-pc-windows-msvc
+            package: current-advanced-windows
+            require: advanced,h264-decoder
+          - role: primary
+            name: macos-arm64 standard-6.3.2
+            runner: macos-15
+            target: aarch64-apple-darwin
+            package: 6.3.2-standard-apple
+            require: '1'
+          - role: primary
+            name: macos-arm64 advanced-6.3.2
+            runner: macos-15
+            target: aarch64-apple-darwin
+            package: 6.3.2-advanced-apple
+            require: advanced,h264-decoder
+          - role: primary
+            name: macos-arm64 standard-6.4
+            runner: macos-15
+            target: aarch64-apple-darwin
+            package: current-standard-apple
+            require: '1'
+            apple-mobile: true
+          - role: primary
+            name: macos-arm64 advanced-6.4
+            runner: macos-15
+            target: aarch64-apple-darwin
+            package: current-advanced-apple
+            require: advanced,file,h264-decoder,hevc-444-decoder
+            apple-mobile: true
+          - role: primary
+            name: macos-x64 standard-6.4
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            package: current-standard-apple
+            require: '1'
+          - role: current-headers
+            name: linux-x64 current-headers
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: current-advanced-linux
+            compatibility: 6.1.1-standard-linux
+            compatibility-advanced: 6.3.2-advanced-linux
+            require: advanced,file,discovery-server,h264-decoder,hevc-444-decoder
+            hx-driver: current-hx-driver-linux
+          - role: baseline-headers
+            name: linux-x64 baseline-headers
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: current-advanced-linux
+            compatibility: 6.1.1-standard-linux
+            compatibility-advanced: 6.3.2-advanced-linux
+            require: advanced,file,discovery-server,h264-decoder,hevc-444-decoder
+            hx-driver: current-hx-driver-linux
+          - role: current-headers
+            name: windows-x64 current-headers
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             package: current-advanced-windows
             compatibility: 6.3.2-standard-windows
             compatibility-advanced: 6.3.2-advanced-windows
             require: advanced,file,h264-decoder
-          - name: windows-x86 advanced-6.4
+          - role: baseline-headers
+            name: windows-x64 baseline-headers
             runner: windows-2025
-            target: i686-pc-windows-msvc
+            target: x86_64-pc-windows-msvc
             package: current-advanced-windows
-            require: advanced,h264-decoder
-          - name: macos-arm64 standard-6.3.2
-            runner: macos-15
-            target: aarch64-apple-darwin
-            package: 6.3.2-standard-apple
-            require: '1'
-          - name: macos-arm64 advanced-6.3.2
-            runner: macos-15
-            target: aarch64-apple-darwin
-            package: 6.3.2-advanced-apple
-            require: advanced,h264-decoder
-          - name: macos-arm64 standard-6.4
-            runner: macos-15
-            target: aarch64-apple-darwin
-            package: current-standard-apple
-            require: '1'
-            apple-mobile: true
-          - name: macos-arm64 advanced-6.4
+            compatibility: 6.3.2-standard-windows
+            compatibility-advanced: 6.3.2-advanced-windows
+            require: advanced,file,h264-decoder
+          - role: current-headers
+            name: macos-arm64 current-headers
             runner: macos-15
             target: aarch64-apple-darwin
             package: current-advanced-apple
             compatibility: 6.3.2-standard-apple
             compatibility-advanced: 6.3.2-advanced-apple
             require: advanced,file,h264-decoder,hevc-444-decoder
-            apple-mobile: true
-          - name: macos-x64 standard-6.4
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-            package: current-standard-apple
-            require: '1'
+          - role: baseline-headers
+            name: macos-arm64 baseline-headers
+            runner: macos-15
+            target: aarch64-apple-darwin
+            package: current-advanced-apple
+            compatibility: 6.3.2-standard-apple
+            compatibility-advanced: 6.3.2-advanced-apple
+            require: advanced,file,h264-decoder,hevc-444-decoder
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
@@ -509,7 +573,7 @@ jobs:
           if [ -n "${{ matrix.hx-driver }}" ]; then
             python ci/sdk.py install-driver "${{ matrix.hx-driver }}" --sdk "$RUNNER_TEMP/ndi-sdk" --target "$TARGET"
           fi
-          if [ -n "${{ matrix.compatibility }}" ]; then
+          if [ "${{ matrix.role }}" != primary ]; then
             python ci/sdk.py install "${{ matrix.compatibility }}" --dest "$RUNNER_TEMP/ndi-compat" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-standard.env"
             python ci/sdk.py install "${{ matrix.compatibility-advanced }}" --dest "$RUNNER_TEMP/ndi-compat-advanced" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-advanced.env"
           fi
@@ -523,21 +587,20 @@ jobs:
             macOS) python ci/offline/check.py --online && ci/offline/macos.sh python3 ci/offline/check.py ;;
             Windows) echo 'Windows runs the runtime tests without a loopback-only runner.' ;;
           esac
-      # Each runtime step is bounded well inside the job's limit (it takes 7
-      # minutes at most when it passes), so that a test that never returns
-      # fails its step, and every test binary runs, so that one failing does
-      # not hide the outcomes of the rest. For the same reason every step from here on runs
+      # Each runtime step is bounded inside the job's limit, so a test that
+      # never returns fails its step. Every test binary runs, so one failing
+      # does not hide the rest. Every step from here on runs
       # whatever the steps before it did, once the runner was shown to isolate:
       # a run then reports everything that is wrong with a row, not the first
       # thing.
       - name: Tests against the real runtime, all features
-        if: ${{ !cancelled() && steps.isolation.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.role == 'primary' }}
         timeout-minutes: 20
         env:
           GRAFTON_NDI_REQUIRE_RUNTIME: ${{ matrix.require }}
         run: cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features
       - name: Tests against the real runtime, no default features
-        if: ${{ !cancelled() && steps.isolation.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.role == 'primary' }}
         timeout-minutes: 10
         env:
           GRAFTON_NDI_REQUIRE_RUNTIME: ${{ matrix.require-no-default || '1' }}
@@ -553,7 +616,7 @@ jobs:
       # Without the Advanced headers the advanced feature compiles to stubs, so
       # only a build that has them lints and documents the real implementation.
       - name: Lint and document the Advanced implementation
-        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && contains(matrix.package, 'advanced') }}
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.role == 'primary' && contains(matrix.package, 'advanced') }}
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
@@ -571,25 +634,33 @@ jobs:
         run: ci/apple-mobile.sh
 
       - name: Current Advanced headers with baseline runtimes
-        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.compatibility }}
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.role == 'current-headers' }}
         timeout-minutes: 25
         run: |
           export GRAFTON_NDI_PEER_RUNTIME="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_RUNTIME }}"
           export GRAFTON_NDI_PEER_VERSION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_VERSION }}"
           export GRAFTON_NDI_PEER_EDITION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_EDITION }}"
+          # Compiler fixtures are owned by the primary row for this target and
+          # header package. Validate exact skips against this compiled inventory.
+          inventory="$RUNNER_TEMP/ndi-current-headers-tests.txt"
+          skip_file="$RUNNER_TEMP/ndi-current-headers-skips.txt"
+          cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- --list > "$inventory"
+          python ci/sdk_test_scope.py --inventory "$inventory" --target "$TARGET" --headers advanced --output "$skip_file"
+          skip_args=()
+          while IFS= read -r argument; do skip_args+=("$argument"); done < "$skip_file"
           failed=0
           for edition in standard advanced; do
             while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
             export NDI_SDK_DIR="${{ steps.sdk.outputs.NDI_SDK_DIR }}"
             if [ "$edition" = advanced ]; then export GRAFTON_NDI_REQUIRE_RUNTIME=advanced; else export GRAFTON_NDI_REQUIRE_RUNTIME=1; fi
-            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features || failed=1
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}" || failed=1
           done
           exit "$failed"
       # A Standard baseline SDK has no headers a build reads, so its pass is a
       # build without Advanced declarations, which cannot check `advanced`. No
       # compatibility pass promises an NDI|HX decoder; the row's own runs do.
       - name: Baseline SDK builds with the current Advanced runtime
-        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.compatibility }}
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.role == 'baseline-headers' }}
         timeout-minutes: 25
         run: |
           failed=0
@@ -606,7 +677,13 @@ jobs:
             require="${require/,h264-decoder/}"; require="${require/,hevc-444-decoder/}"
             if [ "$edition" = standard ]; then require="${require/advanced/1}"; fi
             export GRAFTON_NDI_REQUIRE_RUNTIME="$require"
-            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features || failed=1
+            inventory="$RUNNER_TEMP/ndi-baseline-$edition-tests.txt"
+            skip_file="$RUNNER_TEMP/ndi-baseline-$edition-skips.txt"
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- --list > "$inventory" || { failed=1; continue; }
+            python ci/sdk_test_scope.py --inventory "$inventory" --target "$TARGET" --headers "$edition" --output "$skip_file" || { failed=1; continue; }
+            skip_args=()
+            while IFS= read -r argument; do skip_args+=("$argument"); done < "$skip_file"
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}" || failed=1
           done
           exit "$failed"
 

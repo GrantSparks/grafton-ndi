@@ -198,22 +198,108 @@ def local_recipe_violations(rust, readme):
     return found
 
 
+# The native obligations are independent of their scheduling roles. Keep the
+# original configurations explicit so deleting a row cannot shrink coverage.
+PRIMARY_SDK_CONFIGURATIONS = {
+    ('linux-x64 standard-6.1.1', 'x86_64-unknown-linux-gnu', '6.1.1-standard-linux'),
+    ('linux-x64 standard-6.3.2', 'x86_64-unknown-linux-gnu', '6.3.2-standard-linux'),
+    ('linux-x64 advanced-6.3.2', 'x86_64-unknown-linux-gnu', '6.3.2-advanced-linux'),
+    ('linux-x64 standard-6.4', 'x86_64-unknown-linux-gnu', 'current-standard-linux'),
+    ('linux-x64 advanced-6.4', 'x86_64-unknown-linux-gnu', 'current-advanced-linux'),
+    ('linux-x86 standard-6.4', 'i686-unknown-linux-gnu', 'current-standard-linux'),
+    ('linux-arm64 standard-6.4', 'aarch64-unknown-linux-gnu', 'current-standard-linux'),
+    ('windows-x64 standard-6.3.2', 'x86_64-pc-windows-msvc', '6.3.2-standard-windows'),
+    ('windows-x64 advanced-6.3.2', 'x86_64-pc-windows-msvc', '6.3.2-advanced-windows'),
+    ('windows-x64 standard-6.4', 'x86_64-pc-windows-msvc', 'current-standard-windows'),
+    ('windows-x64 advanced-6.4', 'x86_64-pc-windows-msvc', 'current-advanced-windows'),
+    ('windows-x86 advanced-6.4', 'i686-pc-windows-msvc', 'current-advanced-windows'),
+    ('macos-arm64 standard-6.3.2', 'aarch64-apple-darwin', '6.3.2-standard-apple'),
+    ('macos-arm64 advanced-6.3.2', 'aarch64-apple-darwin', '6.3.2-advanced-apple'),
+    ('macos-arm64 standard-6.4', 'aarch64-apple-darwin', 'current-standard-apple'),
+    ('macos-arm64 advanced-6.4', 'aarch64-apple-darwin', 'current-advanced-apple'),
+    ('macos-x64 standard-6.4', 'x86_64-apple-darwin', 'current-standard-apple'),
+}
+COMPATIBILITY_PACKAGES = {
+    'x86_64-unknown-linux-gnu': ('current-advanced-linux', '6.1.1-standard-linux', '6.3.2-advanced-linux'),
+    'x86_64-pc-windows-msvc': ('current-advanced-windows', '6.3.2-standard-windows', '6.3.2-advanced-windows'),
+    'aarch64-apple-darwin': ('current-advanced-apple', '6.3.2-standard-apple', '6.3.2-advanced-apple'),
+}
+COMPATIBILITY_ROLES = {'current-headers', 'baseline-headers'}
+
+
+def sdk_matrix_violations(rust):
+    """Every crossed build has exactly one primary compiler/configuration owner."""
+    rows = rust['jobs']['sdk']['strategy']['matrix']['include']
+    primary = [row for row in rows if row.get('role') == 'primary']
+    actual = {(row.get('name'), row.get('target'), row.get('package')) for row in primary}
+    found = differs('rust.yml: primary SDK configurations', actual, PRIMARY_SDK_CONFIGURATIONS)
+    if len(primary) != len(actual) or len({row.get('name') for row in rows}) != len(rows):
+        found.append('rust.yml: SDK row names and primary configurations must be unique')
+    if any(row.get('role') not in {'primary', *COMPATIBILITY_ROLES} for row in rows):
+        found.append('rust.yml: an SDK row has an unknown scheduling role')
+    crossed = [row for row in rows if row.get('role') in COMPATIBILITY_ROLES]
+    actual_crossed = {(row['role'], row.get('target'), row.get('package'),
+                       row.get('compatibility'), row.get('compatibility-advanced')) for row in crossed}
+    expected_crossed = {(role, target, *packages)
+                        for target, packages in COMPATIBILITY_PACKAGES.items() for role in COMPATIBILITY_ROLES}
+    found += differs('rust.yml: independent SDK compatibility directions', actual_crossed, expected_crossed)
+    if len(crossed) != len(expected_crossed):
+        found.append('rust.yml: SDK compatibility directions must appear exactly once')
+    for row in crossed:
+        headers = ([row.get('package')] if row['role'] == 'current-headers'
+                   else [row.get('compatibility'), row.get('compatibility-advanced')])
+        for package in headers:
+            owners = [owner for owner in primary
+                      if (owner.get('target'), owner.get('package')) == (row.get('target'), package)]
+            if len(owners) != 1:
+                found.append(f'rust.yml: {row.get("name")} header package {package} has no unique primary build owner')
+    for field, owners in (
+        ('bindings', {'linux-x64 standard-6.4'}),
+        ('apple-mobile', {'macos-arm64 standard-6.4', 'macos-arm64 advanced-6.4'}),
+    ):
+        found += differs(f'rust.yml: {field} configuration owners',
+                         {row.get('name') for row in rows if row.get(field) == 'true'}, owners)
+    if any('compatibility' in row or 'compatibility-advanced' in row for row in primary):
+        found.append('rust.yml: primary SDK rows still provision compatibility packages')
+    return found
+
+
 def implementation_coverage_violations(rust):
     """Real Advanced code and both compatibility editions must be checked."""
     named = {step.get('name'): step for step in rust['jobs']['sdk']['steps']}
-    advanced = named.get('Lint and document the Advanced implementation', {}).get('run', '')
-    found = []
+    advanced = named.get('Lint and document the Advanced implementation', {})
+    found = sdk_matrix_violations(rust)
+    found += differs('rust.yml: Advanced implementation owner', advanced.get('if'),
+                     when("matrix.role == 'primary' && contains(matrix.package, 'advanced')"))
     for command in ('rustup toolchain install 1.88.0 --profile minimal --target "$TARGET"',
                     'cargo +1.88.0 check --locked --all-targets --target "$TARGET" --all-features'):
-        if command not in advanced:
+        if command not in advanced.get('run', ''):
             found.append('rust.yml: Advanced implementation has no MSRV check with installed headers')
-    for name in ('Current Advanced headers with baseline runtimes',
-                 'Baseline SDK builds with the current Advanced runtime'):
-        script = named.get(name, {}).get('run', '')
-        for required in ('failed=0', '--all-features || failed=1', 'exit "$failed"'):
+    for role, name in (
+        ('current-headers', 'Current Advanced headers with baseline runtimes'),
+        ('baseline-headers', 'Baseline SDK builds with the current Advanced runtime'),
+    ):
+        step = named.get(name, {})
+        script = step.get('run', '')
+        found += differs(f'rust.yml: {name} scheduling role', step.get('if'), when(f"matrix.role == '{role}'"))
+        for required in ('failed=0', '--all-features -- "${skip_args[@]}" || failed=1', 'exit "$failed"'):
             if required not in script:
                 found.append(f'rust.yml: {name} does not accumulate compatibility failures')
+        headers = 'advanced' if role == 'current-headers' else '"$edition"'
+        required = ('--all-features -- --list > "$inventory"',
+                    'python ci/sdk_test_scope.py --inventory "$inventory" --target "$TARGET" '
+                    f'--headers {headers} --output "$skip_file"',
+                    'while IFS= read -r argument; do skip_args+=("$argument"); done < "$skip_file"')
+        if any(command not in script for command in required):
+            found.append(f'rust.yml: {name} lacks validated runtime-independent selection')
+    for name in ('Tests against the real runtime, all features',
+                 'Tests against the real runtime, no default features'):
+        step = named.get(name, {})
+        found += differs(f'rust.yml: {name} primary owner', step.get('if'), when("matrix.role == 'primary'"))
+        if '--skip' in step.get('run', '') or 'sdk_test_scope' in step.get('run', ''):
+            found.append(f'rust.yml: {name} omits the primary configuration checks')
     return found
+
 
 
 def memory_checker_violations(rust):
@@ -339,8 +425,8 @@ WRONG_EDITS = (
      '          cargo +1.88.0 check --locked --all-targets --target "$TARGET" --all-features\n', '',
      'MSRV check with installed headers'),
     ('compatibility failure stops later editions', 'rust.yml',
-     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features || failed=1\n          done\n          exit "$failed"\n      # A Standard',
-     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features\n          done\n          exit "$failed"\n      # A Standard',
+     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}" || failed=1\n          done\n          exit "$failed"\n      # A Standard',
+     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}"\n          done\n          exit "$failed"\n      # A Standard',
      'accumulate compatibility failures'),
     ('toolchain differs from contributor pin', 'publish.yml', '          toolchain: 1.100.0\n',
      '          toolchain: 1.99.1\n', 'toolchain of verify'),
@@ -530,9 +616,11 @@ class SdkJob(unittest.TestCase):
         cls.job = workflows.load(cls.texts['rust.yml'])['jobs']['sdk']
         cls.rows = cls.job['strategy']['matrix']['include']
         cls.pins = sdk.load_pins()
+        cls.primary = [row for row in cls.rows if row['role'] == 'primary']
 
     def test_matrix_rows_use_pinned_packages_for_their_target(self):
-        self.assertGreaterEqual(len(self.rows), 9)
+        self.assertEqual(len(self.rows), 23)
+        self.assertEqual(sdk_matrix_violations(workflows.load(self.texts['rust.yml'])), [])
         for row in self.rows:
             with self.subTest(row=row['name']):
                 self.assertEqual(sdk.RUNTIMES[row['target']][0], self.pins[row['package']]['platform'])
@@ -541,7 +629,8 @@ class SdkJob(unittest.TestCase):
 
     def test_a_row_installs_only_a_driver_built_for_its_runtime(self):
         rows = [row for row in self.rows if 'hx-driver' in row]
-        self.assertEqual([row['name'] for row in rows], ['linux-x64 advanced-6.4'])
+        self.assertEqual({row['name'] for row in rows},
+                         {'linux-x64 advanced-6.4', 'linux-x64 current-headers', 'linux-x64 baseline-headers'})
         for row in rows:
             driver, package = self.pins[row['hx-driver']], self.pins[row['package']]
             self.assertEqual((driver['platform'], driver['version']), (package['platform'], package['version']))
@@ -552,7 +641,7 @@ class SdkJob(unittest.TestCase):
 
     def test_each_step_promises_exactly_what_its_build_can_check(self):
         """A promise no test in the build can check fails that build; a missing one lets tests skip."""
-        for row in self.rows:
+        for row in self.primary:
             pin, target, driver = self.pins[row['package']], row['target'], self.pins.get(row.get('hx-driver'))
             for step, promise, all_features in (('all features', row['require'], True),
                                                 ('no default features', row.get('require-no-default', '1'), False)):
@@ -583,12 +672,14 @@ class SdkJob(unittest.TestCase):
                 self.assertTrue(step.get('if', '').startswith('${{ ' + ROW_READY),
                                 f"{step['name']} runs on {step.get('if')!r}")
         self.assertEqual({step['name']: step['if'] for step in after if 'matrix.' in step['if']}, {
+            'Tests against the real runtime, all features': when("matrix.role == 'primary'"),
+            'Tests against the real runtime, no default features': when("matrix.role == 'primary'"),
             'Memcheck over SDK padding': when("matrix.name == 'linux-x64 standard-6.3.2'"),
-            'Lint and document the Advanced implementation': when("contains(matrix.package, 'advanced')"),
+            'Lint and document the Advanced implementation': when("matrix.role == 'primary' && contains(matrix.package, 'advanced')"),
             'Vendored bindings are current': when('matrix.bindings'),
             'Build for the statically linked Apple mobile targets': when('matrix.apple-mobile'),
-            'Current Advanced headers with baseline runtimes': when('matrix.compatibility'),
-            'Baseline SDK builds with the current Advanced runtime': when('matrix.compatibility')})
+            'Current Advanced headers with baseline runtimes': when("matrix.role == 'current-headers'"),
+            'Baseline SDK builds with the current Advanced runtime': when("matrix.role == 'baseline-headers'")})
 
     def test_every_test_step_is_bounded_inside_the_job(self):
         """A test that never returns fails its own step, well before the job's limit, and a failing test binary
@@ -617,7 +708,8 @@ class SdkJob(unittest.TestCase):
                             sdk.version_tuple(self.pins[row['package']]['version']))
             self.assertEqual(self.pins[row['compatibility']]['platform'],
                              self.pins[row['package']]['platform'])
-        steps = [step for step in self.job['steps'] if step.get('if') == when('matrix.compatibility')]
+        steps = [step for step in self.job['steps'] if step.get('if') in {when("matrix.role == 'current-headers'"),
+                                                 when("matrix.role == 'baseline-headers'")}]
         self.assertEqual(len(steps), 2)
         for step in steps:
             self.assertNotIn('env', step)
@@ -637,20 +729,97 @@ class SdkJob(unittest.TestCase):
             self.assertIn(f'export {name}="${{{{ steps.sdk.outputs.{name} }}}}"', steps[1]['run'])
 
     def test_compatibility_loops_run_the_second_edition_after_a_failure(self):
-        steps = [step for step in self.job['steps'] if step.get('if') == when('matrix.compatibility')]
+        steps = [step for step in self.job['steps'] if step.get('if') in {
+            when("matrix.role == 'current-headers'"), when("matrix.role == 'baseline-headers'")}]
         for step in steps:
-            # Keep the actual loop and failure policy; replace environment setup
-            # and the native test command with a deterministic failing first pass.
-            script = step['run']
-            start = script.index('failed=0')
-            script = script[start:]
-            script = re.sub(r'^  (?!cargo test).+$', '', script, flags=re.MULTILINE)
-            script = re.sub(r'cargo test .+?( \|\| failed=1)',
-                            r'echo "$edition"; test "$edition" = advanced\1', script)
-            with self.subTest(step=step['name']):
-                result = subprocess.run(['bash', '-eo', 'pipefail', '-c', script], text=True, capture_output=True)
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertEqual(result.stdout.splitlines(), ['standard', 'advanced'])
+            # Retain the actual loop and its failure policy. Native execution,
+            # or one baseline build's preparation, deterministically fails first.
+            cases = ['runtime']
+            if step['if'] == when("matrix.role == 'baseline-headers'"):
+                cases += ['inventory', 'scope']
+            for failure in cases:
+                script = step['run'][step['run'].index('failed=0'):]
+                lines = []
+                for line in script.splitlines():
+                    if not line.startswith('  '):
+                        lines.append(line)
+                    elif '-- "${skip_args[@]}" || failed=1' in line:
+                        check = 'test "$edition" = advanced' if failure == 'runtime' else 'true'
+                        lines.append(f'  echo "$edition"; {check} || failed=1')
+                    elif failure == 'inventory' and '-- --list' in line:
+                        lines.append(re.sub(r'cargo test .*? > "\$inventory"',
+                                            'test "$edition" = advanced', line))
+                    elif failure == 'scope' and 'python ci/sdk_test_scope.py' in line:
+                        lines.append(re.sub(r'python ci/sdk_test_scope.py .*?(?= \|\|)',
+                                            'test "$edition" = advanced', line))
+                with self.subTest(step=step['name'], failure=failure):
+                    result = subprocess.run(['bash', '-eo', 'pipefail', '-c', '\n'.join(lines)],
+                                            text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    expected = ['standard', 'advanced'] if failure == 'runtime' else ['advanced']
+                    self.assertEqual(result.stdout.splitlines(), expected)
+
+    def test_matrix_guards_reject_removed_or_ambiguous_coverage(self):
+        rust = workflows.load(self.texts['rust.yml'])
+        rows = rust['jobs']['sdk']['strategy']['matrix']['include']
+        self.assertEqual(sdk_matrix_violations(rust), [])
+        for index, row in enumerate(rows):
+            with self.subTest(removed=row['name']):
+                missing = copy.deepcopy(rust)
+                del missing['jobs']['sdk']['strategy']['matrix']['include'][index]
+                self.assertTrue(sdk_matrix_violations(missing))
+        for mutation, expected in (
+            ('duplicate owner', 'unique primary build owner'),
+            ('missing owner', 'unique primary build owner'),
+            ('unknown role', 'unknown scheduling role'),
+            ('different baseline', 'independent SDK compatibility directions'),
+            ('mobile check removed', 'apple-mobile configuration owners'),
+            ('bindings check removed', 'bindings configuration owners'),
+        ):
+            changed = copy.deepcopy(rust)
+            altered = changed['jobs']['sdk']['strategy']['matrix']['include']
+            if mutation == 'duplicate owner':
+                duplicate = copy.deepcopy(next(row for row in altered
+                                               if row['name'] == 'linux-x64 advanced-6.4'))
+                duplicate['name'] += ' duplicate'
+                altered.append(duplicate)
+            elif mutation == 'missing owner':
+                altered.remove(next(row for row in altered if row['name'] == 'linux-x64 standard-6.1.1'))
+            elif mutation == 'unknown role':
+                altered[-1]['role'] = 'unknown'
+            elif mutation == 'different baseline':
+                altered[-1]['compatibility'] = '6.1.1-standard-linux'
+            elif mutation == 'mobile check removed':
+                del next(row for row in altered if row['name'] == 'macos-arm64 advanced-6.4')['apple-mobile']
+            else:
+                del next(row for row in altered if row['name'] == 'linux-x64 standard-6.4')['bindings']
+            with self.subTest(mutation=mutation):
+                self.assertTrue(any(expected in line for line in sdk_matrix_violations(changed)))
+
+    def test_compatibility_selection_guards_require_inventory_and_scoped_arguments(self):
+        rust = workflows.load(self.texts['rust.yml'])
+        self.assertEqual(implementation_coverage_violations(rust), [])
+        names = ('Current Advanced headers with baseline runtimes',
+                 'Baseline SDK builds with the current Advanced runtime')
+        for name in names:
+            for old, new in (
+                ('-- --list > "$inventory"', '> "$inventory"'),
+                ('python ci/sdk_test_scope.py', 'python ci/misspelled.py'),
+                ('--target "$TARGET" --headers', '--headers'),
+                ('done < "$skip_file"', 'done < /dev/null'),
+                ('--all-features -- "${skip_args[@]}" || failed=1', '--all-features || failed=1'),
+            ):
+                changed = copy.deepcopy(rust)
+                step = next(step for step in changed['jobs']['sdk']['steps'] if step.get('name') == name)
+                self.assertIn(old, step['run'])
+                step['run'] = step['run'].replace(old, new)
+                with self.subTest(step=name, removed=old):
+                    self.assertTrue(implementation_coverage_violations(changed))
+        changed = copy.deepcopy(rust)
+        step = next(step for step in changed['jobs']['sdk']['steps']
+                    if step.get('name') == 'Tests against the real runtime, all features')
+        step['run'] += ' --skip compile_contracts'
+        self.assertTrue(any('omits the primary' in line for line in implementation_coverage_violations(changed)))
 
     def test_each_compatibility_pass_promises_exactly_what_it_can_check(self):
         """The first step builds with the row's headers against each baseline runtime, the second with each
@@ -658,7 +827,8 @@ class SdkJob(unittest.TestCase):
         the row's own runtime has the row's driver beside it. Neither step promises an NDI|HX decoder: the
         row's own runs do, and the decode tests still run, and pass or skip visibly, in the crossed builds."""
         baseline_runtimes, baseline_headers = [step for step in self.job['steps']
-                                               if step.get('if') == when('matrix.compatibility')]
+                                               if step.get('if') in {when("matrix.role == 'current-headers'"),
+                                                 when("matrix.role == 'baseline-headers'")}]
         for row in (row for row in self.rows if 'compatibility' in row):
             current, target, driver = self.pins[row['package']], row['target'], self.pins.get(row.get('hx-driver'))
             baselines = {'standard': self.pins[row['compatibility']], 'advanced': self.pins[row['compatibility-advanced']]}
