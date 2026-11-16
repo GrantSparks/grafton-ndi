@@ -61,17 +61,11 @@ fn framesync_pulls_leave_sequenced_metadata_for_the_attached_receiver() -> Resul
         });
         let _stop = Stop(&stop);
         let mut received = BTreeSet::new();
-        let mut video_pulls = 0;
-        let mut audio_pulls = 0;
-        let mut pull = |received: &mut BTreeSet<u64>| -> Result<(), Error> {
-            if framesync
+        let pull = |received: &mut BTreeSet<u64>| -> Result<bool, Error> {
+            let live_video = framesync
                 .capture_video_ref(ScanType::Progressive)?
-                .is_some()
-            {
-                video_pulls += 1;
-            }
+                .is_some();
             let _audio = framesync.capture_audio_ref(request)?;
-            audio_pulls += 1;
             while let Some(metadata) = framesync.receiver().capture_metadata_ref(Duration::ZERO)? {
                 if let Some(sequence) = metadata
                     .data()
@@ -81,17 +75,28 @@ fn framesync_pulls_leave_sequenced_metadata_for_the_attached_receiver() -> Resul
                     received.insert(sequence.parse().expect("a sequence sent by this test"));
                 }
             }
-            Ok(())
+            Ok(live_video)
         };
         let startup = Instant::now() + Duration::from_secs(15);
-        while received.is_empty() {
-            pull(&mut received)?;
-            assert!(Instant::now() < startup, "no sequenced metadata arrived");
+        let mut live_video = false;
+        // Metadata can arrive before video decoding is ready. Establish the
+        // first video and metadata before starting the continuity window.
+        while !live_video || received.is_empty() {
+            live_video |= pull(&mut received)?;
+            assert!(
+                Instant::now() < startup,
+                "stream did not become ready: live video={live_video}, {} metadata frames",
+                received.len()
+            );
             std::thread::sleep(Duration::from_millis(16));
         }
+        // Startup and final-drain pulls cannot satisfy steady-state coverage.
+        let mut video_pulls = 0;
+        let mut audio_pulls = 0;
         let observe = Instant::now() + Duration::from_secs(3);
         while Instant::now() < observe {
-            pull(&mut received)?;
+            video_pulls += usize::from(pull(&mut received)?);
+            audio_pulls += 1;
             std::thread::sleep(Duration::from_millis(16));
         }
         stop.store(true, Ordering::Relaxed);
