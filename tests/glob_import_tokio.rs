@@ -6,6 +6,8 @@
 
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/nested_cargo.rs"]
+mod nested_cargo;
 
 #[cfg(feature = "tokio")]
 use grafton_ndi::*;
@@ -23,7 +25,7 @@ fn glob_import_leaves_the_tokio_crate_nameable() {
 
 #[test]
 fn root_glob_import_keeps_external_crates_unambiguous() {
-    use std::{fs, path::PathBuf, process::Command};
+    use std::{fs, path::PathBuf};
 
     let directory = fixture::FixtureDir::create("glob-import");
     let root = directory.path();
@@ -110,33 +112,16 @@ fn root_glob_import_keeps_external_crates_unambiguous() {
     )
     .unwrap();
     fs::copy(manifest.join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .map(|path| {
-            if path.is_absolute() {
-                path
-            } else {
-                manifest.join(path)
-            }
-        })
-        .unwrap_or_else(|| manifest.join("target"))
-        .join("glob-import");
     for name in ["valid", "bad-image", "bad-tokio", "bad-smol"] {
-        let output = Command::new(env!("CARGO"))
-            .current_dir(root)
-            .env("CARGO_TARGET_DIR", &target)
-            .env("CARGO_BUILD_JOBS", "1")
-            .env("CARGO_TERM_COLOR", "never")
-            .args([
-                "check",
-                "--offline",
-                "--package",
-                name,
-                "--target",
-                env!("GRAFTON_NDI_TARGET"),
-            ])
-            .output()
-            .expect("compile the glob import consumer");
+        let output = nested_cargo::command(
+            "external-consumer",
+            "check",
+            Some(env!("GRAFTON_NDI_TARGET")),
+            Some(root),
+        )
+        .args(["--package", name])
+        .output()
+        .expect("compile the glob import consumer");
         let diagnostics = String::from_utf8_lossy(&output.stderr);
         if name == "valid" {
             assert!(

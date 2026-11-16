@@ -1,21 +1,12 @@
 //! Compile the actual owner, slot and queue modules at their privacy boundary.
+#[path = "support/nested_cargo.rs"]
+mod nested_cargo;
+
 #[test]
 fn native_loans_and_slot_keys_require_their_owner() {
-    use std::{path::PathBuf, process::Command};
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
-        .join("internal-send-ownership");
     let compile = |cfg| {
-        Command::new(env!("CARGO"))
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .env("CARGO_TARGET_DIR", &target)
-            .env("CARGO_BUILD_JOBS", "1")
-            .env("CARGO_TERM_COLOR", "never")
+        nested_cargo::command("features-advanced", "rustc", None, None)
             .args([
-                "rustc",
-                "--offline",
-                "--locked",
                 "--lib",
                 "--no-default-features",
                 "--features",

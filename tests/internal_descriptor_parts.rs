@@ -1,20 +1,11 @@
 //! The real validated-frame constructor refuses unchecked or foreign parts.
+#[path = "support/nested_cargo.rs"]
+mod nested_cargo;
+
 #[test]
 fn frame_parts_require_the_matching_descriptor_validator() {
-    use std::{path::PathBuf, process::Command};
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
-        .join("internal-descriptor-parts");
-    let output = Command::new(env!("CARGO"))
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .env("CARGO_TARGET_DIR", target)
-        .env("CARGO_BUILD_JOBS", "4")
-        .env("CARGO_TERM_COLOR", "never")
+    let output = nested_cargo::command("no-default-features", "rustc", None, None)
         .args([
-            "rustc",
-            "--offline",
-            "--locked",
             "--lib",
             "--no-default-features",
             "--",

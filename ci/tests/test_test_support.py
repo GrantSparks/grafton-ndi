@@ -63,6 +63,24 @@ def skip_violations(root):
     return found
 
 
+def nested_cargo_violations(root):
+    found = []
+    invocation = ['Command', ':', ':', 'new', '(', 'env', '!', '(', '"CARGO"', ')', ')']
+    for directory in (root / 'src', root / 'tests'):
+        for path in sorted(directory.rglob('*.rs')):
+            if path == root / 'tests/support/nested_cargo.rs':
+                continue
+            text = path.read_text(encoding='utf-8')
+            tokens = rust_tokens(text)
+            words = [word for word, _ in tokens]
+            for index in range(len(words) - len(invocation) + 1):
+                if words[index:index + len(invocation)] == invocation:
+                    line = text.count('\n', 0, tokens[index][1]) + 1
+                    found.append(f'{path.relative_to(root)}:{line}: '
+                                 'run nested cargo through tests/support/nested_cargo.rs')
+    return found
+
+
 class VisibleSkips(unittest.TestCase):
     def test_repository_native_tests_report_their_skips(self):
         self.assertEqual(skip_violations(ROOT), [])
@@ -100,6 +118,26 @@ class VisibleSkips(unittest.TestCase):
                 if !common::require_feature(ndi.require_feature(feature)) { return; }
             ''')
             self.assertEqual(skip_violations(root), [])
+
+
+class NestedCargo(unittest.TestCase):
+    def test_repository_uses_the_shared_nested_cargo_policy(self):
+        self.assertEqual(nested_cargo_violations(ROOT), [])
+
+    def test_direct_cargo_invocations_are_rejected_outside_the_helper(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            helper = root / 'tests/support/nested_cargo.rs'
+            helper.parent.mkdir(parents=True)
+            invocation = 'std::process::Command::new(env!("CARGO"));'
+            helper.write_text(invocation)
+            source = root / 'tests/check.rs'
+            source.write_text('// ' + invocation + '\nconst EXAMPLE: &str = r#"' + invocation + '"#;')
+            self.assertEqual(nested_cargo_violations(root), [])
+            source.write_text('fn check() { ' + invocation + ' }')
+            errors = nested_cargo_violations(root)
+            self.assertEqual(len(errors), 1)
+            self.assertIn('tests/check.rs:1:', errors[0])
 
 
 if __name__ == '__main__':
