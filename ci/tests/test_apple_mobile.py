@@ -6,16 +6,18 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / 'ci' / 'apple-mobile.sh'
+PINNED_TOOLCHAIN = tomllib.loads((ROOT / 'rust-toolchain.toml').read_text(encoding='utf-8'))['toolchain']['channel']
 CI_CHOICES = {
-    'aarch64-apple-ios': ('stable', '16.0'),
-    'x86_64-apple-ios': ('stable', '16.0'),
-    'aarch64-apple-tvos': ('stable', '16.0'),
-    'aarch64-apple-visionos': ('stable', '1.0'),
+    'aarch64-apple-ios': (PINNED_TOOLCHAIN, '16.0'),
+    'x86_64-apple-ios': (PINNED_TOOLCHAIN, '16.0'),
+    'aarch64-apple-tvos': (PINNED_TOOLCHAIN, '16.0'),
+    'aarch64-apple-visionos': (PINNED_TOOLCHAIN, '1.0'),
     'x86_64-apple-tvos': ('nightly-2026-11-10', '16.0'),
 }
 
@@ -61,7 +63,9 @@ if pathlib.Path(sys.argv[0]).name == 'cargo' and 'check' in sys.argv:
             executable = root / tool
             executable.write_text(recorder, encoding='utf-8')
             executable.chmod(0o755)
-        source = root / 'apple-mobile.sh'
+        (root / 'ci').mkdir()
+        (root / 'rust-toolchain.toml').write_text((ROOT / 'rust-toolchain.toml').read_text(encoding='utf-8'))
+        source = root / 'ci' / 'apple-mobile.sh'
         source.write_text(script, encoding='utf-8')
         environment = {
             **os.environ,
@@ -89,7 +93,7 @@ def lint_violations(recorded, table=None, documentation=None):
         failures.append('documented Apple static targets differ from the build table')
     negative = [command['arguments'] for command in recorded
                 if command['tool'] == 'cargo' and 'check' in command['arguments']]
-    if negative != [['+stable', 'check', '--locked', '--lib', '--target', 'aarch64-apple-ios-sim']]:
+    if negative != [[f'+{PINNED_TOOLCHAIN}', 'check', '--locked', '--lib', '--target', 'aarch64-apple-ios-sim']]:
         failures.append('must reject the ARM64 simulator with the build-script diagnostic')
     if len(cargo) != 2 * len(table):
         failures.append('every target must lint both feature sets')
@@ -128,22 +132,25 @@ class AppleMobileTests(unittest.TestCase):
 
     def test_missing_target_lint_is_rejected(self):
         source = SCRIPT.read_text(encoding='utf-8').replace(
-            'lint stable aarch64-apple-ios IPHONEOS_DEPLOYMENT_TARGET 16.0', '')
+            'lint "$release" aarch64-apple-ios IPHONEOS_DEPLOYMENT_TARGET 16.0', '')
         self.assertTrue(lint_violations(commands(source)))
 
     def test_wrong_deployment_variable_is_rejected(self):
         source = SCRIPT.read_text(encoding='utf-8').replace(
-            'lint stable aarch64-apple-ios IPHONEOS_DEPLOYMENT_TARGET',
-            'lint stable aarch64-apple-ios TVOS_DEPLOYMENT_TARGET')
+            'lint "$release" aarch64-apple-ios IPHONEOS_DEPLOYMENT_TARGET',
+            'lint "$release" aarch64-apple-ios TVOS_DEPLOYMENT_TARGET')
         self.assertTrue(lint_violations(commands(source)))
 
     def test_every_static_target_denies_warnings_with_both_feature_sets(self):
         recorded = commands(SCRIPT.read_text(encoding='utf-8'))
         self.assertEqual(lint_violations(recorded), [])
         rustup = [command['arguments'] for command in recorded if command['tool'] == 'rustup']
-        self.assertIn(['component', 'add', '--toolchain', 'stable', 'clippy'], rustup)
+        self.assertIn(['component', 'add', '--toolchain', PINNED_TOOLCHAIN, 'clippy'], rustup)
         self.assertIn(['toolchain', 'install', 'nightly-2026-11-10', '--profile', 'minimal',
                        '--component', 'rust-src', '--component', 'clippy'], rustup)
+        for command in rustup:
+            if '--toolchain' in command:
+                self.assertEqual(command[command.index('--toolchain') + 1], PINNED_TOOLCHAIN)
 
     def test_missing_warning_denial_is_rejected(self):
         source = SCRIPT.read_text(encoding='utf-8').replace('-- -D warnings', '')
