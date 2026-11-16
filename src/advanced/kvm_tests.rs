@@ -124,8 +124,10 @@ pub(super) static TABLE: Kvm = Kvm {
 };
 
 /// The same callbacks are usable without an Advanced SDK declaration table.
+#[cfg(not(ndi_has_advanced_kvm))]
 struct TestSender;
 
+#[cfg(not(ndi_has_advanced_kvm))]
 impl InputSender for TestSender {
     fn key(&self, instance: NDIlib_recv_instance_t, value: i32, down: bool) -> Result<()> {
         let (accepted, operation) = if down {
@@ -189,6 +191,19 @@ impl InputSender for TestSender {
     }
 }
 
+// With declarations, these same pure tests exercise the production table's
+// dispatch too; without them, they still test every held-input transition.
+fn sender() -> &'static impl InputSender {
+    #[cfg(ndi_has_advanced_kvm)]
+    {
+        &TABLE
+    }
+    #[cfg(not(ndi_has_advanced_kvm))]
+    {
+        &TestSender
+    }
+}
+
 struct TestSession {
     instance: NDIlib_recv_instance_t,
     held: HeldInputs,
@@ -204,19 +219,19 @@ impl TestSession {
 
     fn key_down(&mut self, keysym: u32) -> Result<()> {
         self.held
-            .key(self.instance, &TestSender, key_symbol(keysym)?, true)
+            .key(self.instance, sender(), key_symbol(keysym)?, true)
     }
 
     fn mouse_down(&mut self, button: MouseButton) -> Result<()> {
-        self.held.mouse(self.instance, &TestSender, button, true)
+        self.held.mouse(self.instance, sender(), button, true)
     }
 
     fn touch(&mut self, points: &[[f32; 2]]) -> Result<()> {
-        self.held.touch(self.instance, &TestSender, points)
+        self.held.touch(self.instance, sender(), points)
     }
 
     fn release_all(&mut self) -> Result<()> {
-        self.held.release_all(self.instance, &TestSender)
+        self.held.release_all(self.instance, sender())
     }
 }
 
@@ -224,7 +239,7 @@ impl Drop for TestSession {
     fn drop(&mut self) {
         // The native session retries these same held inputs before its
         // receiver borrow ends; this session lends only synthetic storage.
-        self.held.release_on_drop(self.instance, &TestSender);
+        self.held.release_on_drop(self.instance, sender());
     }
 }
 
