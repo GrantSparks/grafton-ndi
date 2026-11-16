@@ -24,7 +24,7 @@ use crate::{
     frames::copy_sdk_string,
     sys::{self, bindings::*},
     timeout::{Deadline, NeverStop, Stop, POLL_INTERVAL},
-    to_ms_checked, Error, Ndi, ResourceKind, Result,
+    Error, Ndi, ResourceKind, Result,
 };
 
 /// Configuration for NDI source discovery.
@@ -828,9 +828,9 @@ impl Finder {
     /// An empty name or a name containing a NUL is refused with
     /// [`Error::InvalidInput`] before inspecting a snapshot.
     pub fn find_source_by_name(&self, name: &str, timeout: Duration) -> Result<Option<Source>> {
-        to_ms_checked(timeout)?;
+        let deadline = Deadline::after(timeout)?;
         validate_source_name(name)?;
-        self.find_source(timeout, |source| source.name() == name)
+        self.find_source_until(deadline, NeverStop, |source| source.name() == name)
     }
 
     /// Discovers sources for up to `timeout`, returning the complete set.
@@ -926,13 +926,6 @@ pub(crate) fn validate_source_name(name: &str) -> Result<()> {
     } else {
         Ok(())
     }
-}
-
-#[cfg(any(feature = "tokio", feature = "smol"))]
-pub(crate) fn validate_host_query(host: &str) -> Result<()> {
-    HostQuery::parse(host)
-        .map(|_| ())
-        .ok_or(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))
 }
 
 fn accumulate_sources(
@@ -1034,13 +1027,26 @@ fn parse_authority(address: &str) -> Option<Authority<'_>> {
 }
 
 #[derive(Clone, Copy)]
-enum HostQuery<'a> {
+pub(crate) enum HostQuery<'a> {
     Ip(IpAddr),
     Host(&'a str),
     Machine(&'a str),
 }
 
 impl<'a> HostQuery<'a> {
+    pub(crate) fn checked(host: &'a str) -> Result<Self> {
+        Self::parse(host).ok_or(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn into_owned(self) -> OwnedHostQuery {
+        match self {
+            Self::Ip(ip) => OwnedHostQuery::Ip(ip),
+            Self::Host(name) => OwnedHostQuery::Host(name.to_owned()),
+            Self::Machine(name) => OwnedHostQuery::Machine(name.to_owned()),
+        }
+    }
+
     fn parse(host: &'a str) -> Option<Self> {
         let ip_text = if host.starts_with('[') {
             host.strip_prefix('[')?.strip_suffix(']')?
@@ -1085,6 +1091,26 @@ impl<'a> HostQuery<'a> {
                 .strip_suffix('.')
                 .unwrap_or(candidate)
                 .eq_ignore_ascii_case(name),
+        }
+    }
+}
+
+/// A parsed query that can cross a blocking-pool dispatch without reparsing
+/// text or borrowing the async caller's string.
+#[cfg(any(feature = "tokio", feature = "smol"))]
+pub(crate) enum OwnedHostQuery {
+    Ip(IpAddr),
+    Host(String),
+    Machine(String),
+}
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+impl OwnedHostQuery {
+    pub(crate) fn as_query(&self) -> HostQuery<'_> {
+        match self {
+            Self::Ip(ip) => HostQuery::Ip(*ip),
+            Self::Host(name) => HostQuery::Host(name),
+            Self::Machine(name) => HostQuery::Machine(name),
         }
     }
 }
@@ -1662,9 +1688,12 @@ impl SourceCache {
     /// result the cache cannot store is returned uncached. IP hints must already
     /// be configured on the finder; this method does not change its scope.
     pub fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
+        // Preserve the synchronous API's host-before-timeout validation order.
+        let query = HostQuery::checked(host)?;
+        let deadline = Deadline::after(timeout)?;
         self.entries
-            .find_sources_by_host_with(host, timeout, |query| {
-                match self.discover_host_until(query, Deadline::after(timeout)?, NeverStop)? {
+            .find_sources_by_host_with(query, deadline, |query, deadline| {
+                match self.discover_host_until(query, deadline, NeverStop)? {
                     HostDiscovery::Complete(sources) => Ok(sources),
                     HostDiscovery::Stopped => unreachable!("a synchronous discovery cannot stop"),
                 }
@@ -1674,12 +1703,12 @@ impl SourceCache {
     #[cfg(any(feature = "tokio", feature = "smol"))]
     pub(crate) fn find_sources_by_host_until(
         &self,
-        host: &str,
+        query: HostQuery<'_>,
         deadline: Deadline,
         stop: impl Stop,
     ) -> Result<Vec<Source>> {
         self.entries
-            .find_sources_by_host_with(host, deadline.remaining(), |query| {
+            .find_sources_by_host_with(query, deadline, |query, deadline| {
                 match self.discover_host_until(query, deadline, stop)? {
                     HostDiscovery::Complete(sources) => Ok(sources),
                     HostDiscovery::Stopped => {
@@ -1755,23 +1784,20 @@ fn copy_sources(sources: &[Source]) -> Result<Vec<Source>> {
 impl CachedSources {
     fn find_sources_by_host_with(
         &self,
-        host: &str,
-        timeout: Duration,
-        discover: impl FnOnce(HostQuery<'_>) -> Result<Vec<Source>>,
+        query: HostQuery<'_>,
+        deadline: Deadline,
+        discover: impl FnOnce(HostQuery<'_>, Deadline) -> Result<Vec<Source>>,
     ) -> Result<Vec<Source>> {
-        self.find_sources_by_host_with_copy(host, timeout, discover, copy_sources)
+        self.find_sources_by_host_with_copy(query, deadline, discover, copy_sources)
     }
 
     fn find_sources_by_host_with_copy(
         &self,
-        host: &str,
-        timeout: Duration,
-        discover: impl FnOnce(HostQuery<'_>) -> Result<Vec<Source>>,
+        query: HostQuery<'_>,
+        deadline: Deadline,
+        discover: impl FnOnce(HostQuery<'_>, Deadline) -> Result<Vec<Source>>,
         mut copy: impl FnMut(&[Source]) -> Result<Vec<Source>>,
     ) -> Result<Vec<Source>> {
-        let query = HostQuery::parse(host)
-            .ok_or(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))?;
-        to_ms_checked(timeout)?;
         let key = HostKeyBuffer::new(query);
         let (snapshot, generation) = {
             let cache = self
@@ -1785,7 +1811,7 @@ impl CachedSources {
         }
         // SDK waits and user discovery run outside the cache mutex. Invalidation
         // changes the generation, so an old result cannot repopulate the cache.
-        let sources = discover(query)?;
+        let sources = discover(query, deadline)?;
         if !sources.is_empty() {
             {
                 let cache = self
@@ -1864,6 +1890,31 @@ impl CachedSources {
 
 #[cfg(test)]
 mod tests {
+    // Exercise the cache with the same checked inputs as the synchronous
+    // boundary, while letting individual tests supply discovery and copying.
+    impl CachedSources {
+        fn lookup(
+            &self,
+            host: &str,
+            timeout: Duration,
+            discover: impl FnOnce(HostQuery<'_>) -> Result<Vec<Source>>,
+        ) -> Result<Vec<Source>> {
+            self.lookup_with_copy(host, timeout, discover, copy_sources)
+        }
+
+        fn lookup_with_copy(
+            &self,
+            host: &str,
+            timeout: Duration,
+            discover: impl FnOnce(HostQuery<'_>) -> Result<Vec<Source>>,
+            copy: impl FnMut(&[Source]) -> Result<Vec<Source>>,
+        ) -> Result<Vec<Source>> {
+            let query = HostQuery::checked(host)?;
+            let deadline = Deadline::after(timeout)?;
+            self.find_sources_by_host_with_copy(query, deadline, |query, _| discover(query), copy)
+        }
+    }
+
     unsafe fn source_from_raw(
         source: *const NDIlib_source_t,
         function: &'static std::ffi::CStr,
@@ -1873,6 +1924,52 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn cache_discovery_retains_the_deadline_that_precedes_the_lookup() {
+        let cache = CachedSources::default();
+        let deadline = Deadline::starting(
+            std::time::Instant::now() - Duration::from_secs(1),
+            crate::timeout::Timeout::new(Duration::from_millis(1)).unwrap(),
+        )
+        .unwrap();
+        let sources = cache
+            .find_sources_by_host_with(
+                HostQuery::checked("camera").unwrap(),
+                deadline,
+                |query, remaining| {
+                    assert!(matches!(query, HostQuery::Host("camera")));
+                    assert_eq!(remaining.end(), deadline.end());
+                    assert!(remaining.is_expired());
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        assert!(sources.is_empty());
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    #[test]
+    fn owned_host_queries_keep_the_parsed_kind_and_normalized_text() {
+        for (host, kind) in [
+            ("192.0.2.1", 0),
+            ("[2001:db8::1]", 0),
+            ("Camera.LOCAL.", 1),
+            ("Studio A.", 2),
+        ] {
+            let text = host.to_owned();
+            let parsed = HostQuery::checked(&text).unwrap();
+            let expected = HostKeyBuffer::new(parsed).into_owned().unwrap();
+            let owned = parsed.into_owned();
+            drop(text);
+            let query = owned.as_query();
+            assert!(matches!(
+                (kind, query),
+                (0, HostQuery::Ip(_)) | (1, HostQuery::Host(_)) | (2, HostQuery::Machine(_)),
+            ));
+            assert_eq!(HostKeyBuffer::new(query).into_owned().unwrap(), expected);
+        }
+    }
 
     #[test]
     fn source_values_refuse_nul_before_any_native_use() {
@@ -1957,7 +2054,7 @@ mod tests {
         let sources = vec![Source::new("camera (Program)").unwrap()];
         for hit in [false, true] {
             let result = cache
-                .find_sources_by_host_with_copy(
+                .lookup_with_copy(
                     "camera",
                     Duration::ZERO,
                     |_| {
@@ -1977,7 +2074,7 @@ mod tests {
         }
         cache.clear();
         let result = cache
-            .find_sources_by_host_with_copy(
+            .lookup_with_copy(
                 "camera",
                 Duration::ZERO,
                 |_| Ok(sources.clone()),
@@ -1993,7 +2090,7 @@ mod tests {
             "invalidation during snapshot preparation suppresses publication"
         );
         cache
-            .find_sources_by_host_with_copy(
+            .lookup_with_copy(
                 "camera",
                 Duration::ZERO,
                 |_| {
@@ -2011,7 +2108,7 @@ mod tests {
         let sources = vec![Source::new("camera (Program)").unwrap()];
         for invalidate in [false, true] {
             let result = cache
-                .find_sources_by_host_with_copy(
+                .lookup_with_copy(
                     "camera",
                     Duration::ZERO,
                     |_| Ok(sources.clone()),
@@ -2027,9 +2124,9 @@ mod tests {
             assert!(cache.is_empty());
         }
         cache
-            .find_sources_by_host_with("camera", Duration::ZERO, |_| Ok(sources.clone()))
+            .lookup("camera", Duration::ZERO, |_| Ok(sources.clone()))
             .unwrap();
-        let result = cache.find_sources_by_host_with_copy(
+        let result = cache.lookup_with_copy(
             "camera",
             Duration::ZERO,
             |_| panic!("a hit must not run discovery"),
@@ -2053,7 +2150,7 @@ mod tests {
         assert!(cache.is_empty());
         let sources = vec![Source::new("camera (Program)").unwrap()];
         let (result, allocations) = crate::test_alloc::allocation_count(|| {
-            cache.find_sources_by_host_with("camera", Duration::ZERO, |_| Ok(sources))
+            cache.lookup("camera", Duration::ZERO, |_| Ok(sources))
         });
         assert_eq!(result.unwrap().len(), 1);
         // One vector, its Arc header, host key and map storage. The validated
@@ -2288,18 +2385,16 @@ mod tests {
                     .clone()
                     .with_address(SourceAddress::new("192.0.2.1:5961").unwrap());
                 cache
-                    .find_sources_by_host_with(first, Duration::ZERO, |_| Ok(vec![old.clone()]))
+                    .lookup(first, Duration::ZERO, |_| Ok(vec![old.clone()]))
                     .unwrap();
                 let (identical, identical_allocs) = crate::test_alloc::allocation_count(|| {
                     cache
-                        .find_sources_by_host_with(first, Duration::ZERO, |_| panic!("cache hit"))
+                        .lookup(first, Duration::ZERO, |_| panic!("cache hit"))
                         .unwrap()
                 });
                 let (equivalent, equivalent_allocs) = crate::test_alloc::allocation_count(|| {
                     cache
-                        .find_sources_by_host_with(second, Duration::ZERO, |_| {
-                            panic!("equivalent cache hit")
-                        })
+                        .lookup(second, Duration::ZERO, |_| panic!("equivalent cache hit"))
                         .unwrap()
                 });
                 assert_eq!(identical, vec![old.clone()]);
@@ -2308,15 +2403,13 @@ mod tests {
                 assert_eq!(equivalent_allocs, identical_allocs);
                 assert_eq!(cache.len(), 1);
                 assert!(cache
-                    .find_sources_by_host_with(second, Duration::MAX, |_| panic!("invalid timeout"))
+                    .lookup(second, Duration::MAX, |_| panic!("invalid timeout"))
                     .is_err());
                 cache.invalidate(second);
                 assert!(cache.is_empty());
                 assert_eq!(
                     cache
-                        .find_sources_by_host_with(first, Duration::ZERO, |_| Ok(vec![
-                            fresh.clone()
-                        ]))
+                        .lookup(first, Duration::ZERO, |_| Ok(vec![fresh.clone()]))
                         .unwrap(),
                     vec![fresh]
                 );
@@ -2325,12 +2418,12 @@ mod tests {
                 assert_eq!(cache.len(), 1);
                 cache.clear();
                 assert!(cache
-                    .find_sources_by_host_with(first, Duration::ZERO, |_| Err(Error::InvalidInput(
+                    .lookup(first, Duration::ZERO, |_| Err(Error::InvalidInput(
                         crate::InputDefect::InvalidHostQuery
                     )))
                     .is_err());
                 assert!(cache
-                    .find_sources_by_host_with(second, Duration::ZERO, |_| Ok(Vec::new()))
+                    .lookup(second, Duration::ZERO, |_| Ok(Vec::new()))
                     .unwrap()
                     .is_empty());
                 assert!(cache.is_empty());
@@ -2453,7 +2546,7 @@ mod tests {
             .with_address(SourceAddress::new("192.168.1.1:5961").unwrap());
         let timeout = Duration::ZERO;
         let selected = cache
-            .find_sources_by_host_with("192.168.1.1", timeout, |query| {
+            .lookup("192.168.1.1", timeout, |query| {
                 Ok([wrong.clone(), right.clone()]
                     .into_iter()
                     .filter(|s| s.matches_query(query))
@@ -2464,7 +2557,7 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert_eq!(
             cache
-                .find_sources_by_host_with("192.168.1.1", timeout, |_| panic!("cache hit"))
+                .lookup("192.168.1.1", timeout, |_| panic!("cache hit"))
                 .unwrap(),
             vec![right]
         );
@@ -2480,7 +2573,7 @@ mod tests {
             &too_long,
         ] {
             assert!(matches!(
-                cache.find_sources_by_host_with(invalid, timeout, |_| panic!(
+                cache.lookup(invalid, timeout, |_| panic!(
                     "invalid query reached discovery"
                 )),
                 Err(Error::InvalidInput(_))
@@ -2506,7 +2599,7 @@ mod tests {
             let old_result = old.clone();
             let thread = std::thread::spawn(move || {
                 pending
-                    .find_sources_by_host_with("CAMERA.LOCAL.", Duration::ZERO, |_| {
+                    .lookup("CAMERA.LOCAL.", Duration::ZERO, |_| {
                         started_tx.send(()).unwrap();
                         resume_rx.recv().unwrap();
                         Ok(vec![old_result])
@@ -2521,16 +2614,14 @@ mod tests {
             }
             assert_eq!(cache.len(), 0);
             let found = cache
-                .find_sources_by_host_with("camera.local", Duration::ZERO, |_| {
-                    Ok(vec![fresh.clone()])
-                })
+                .lookup("camera.local", Duration::ZERO, |_| Ok(vec![fresh.clone()]))
                 .unwrap();
             assert_eq!(found, vec![fresh.clone()]);
             resume_tx.send(()).unwrap();
             assert_eq!(thread.join().unwrap(), vec![old]);
             assert_eq!(
                 cache
-                    .find_sources_by_host_with("Camera.Local.", Duration::ZERO, |_| panic!(
+                    .lookup("Camera.Local.", Duration::ZERO, |_| panic!(
                         "fresh entry was overwritten"
                     ))
                     .unwrap(),
@@ -2549,7 +2640,7 @@ mod tests {
             let pending = Arc::clone(&cache);
             let thread = std::thread::spawn(move || {
                 pending
-                    .find_sources_by_host_with("camera.local", Duration::ZERO, |_| {
+                    .lookup("camera.local", Duration::ZERO, |_| {
                         started_tx.send(()).unwrap();
                         resume_rx.recv().unwrap();
                         Ok(vec![Source::new("CAMERA (Program)").unwrap()])
@@ -2578,9 +2669,7 @@ mod tests {
             .with_address(SourceAddress::new("192.0.2.1").unwrap());
         assert_eq!(
             cache
-                .find_sources_by_host_with("192.0.2.1", Duration::ZERO, |_| Ok(
-                    vec![source.clone()]
-                ))
+                .lookup("192.0.2.1", Duration::ZERO, |_| Ok(vec![source.clone()]))
                 .unwrap(),
             vec![source]
         );
@@ -2709,7 +2798,7 @@ mod tests {
         );
         for host in ["camera", "not_cached"] {
             assert!(matches!(
-                cache.find_sources_by_host_with(host, Duration::MAX, |_| panic!("invalid timeout")),
+                cache.lookup(host, Duration::MAX, |_| panic!("invalid timeout")),
                 Err(Error::InvalidInput(_))
             ));
         }
@@ -2717,7 +2806,7 @@ mod tests {
         // uses the runtime.
         assert_eq!(
             cache
-                .find_sources_by_host_with("camera", Duration::ZERO, |_| panic!("cache hit"))
+                .lookup("camera", Duration::ZERO, |_| panic!("cache hit"))
                 .unwrap(),
             vec![Source::new("camera").unwrap()]
         );

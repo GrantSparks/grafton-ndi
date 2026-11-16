@@ -3428,7 +3428,7 @@ mod tests {
 
         /// A caller's budget that started when this clock did.
         fn deadline(&self, budget: Duration) -> Deadline {
-            Deadline::starting(self.start, budget).unwrap()
+            Deadline::starting(self.start, crate::timeout::Timeout::new(budget).unwrap()).unwrap()
         }
 
         /// What is left of `attempt` now: the timeout its SDK call would get,

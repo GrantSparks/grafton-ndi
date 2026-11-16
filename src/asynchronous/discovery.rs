@@ -1,7 +1,7 @@
 //! Owned discovery adapters sharing the receivers' blocking-pool stop rule.
 use super::{private, with_deadline_budget, with_timeout_budget, AsyncRuntime};
 use crate::{
-    finder::{validate_host_query, validate_source_name},
+    finder::{validate_source_name, HostQuery},
     timeout::Deadline,
     Finder, Result, Source, SourceCache,
 };
@@ -199,11 +199,10 @@ impl<R: AsyncRuntime> AsyncFinder<R, SourceCache> {
     #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub async fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
         let deadline = Deadline::after(timeout)?;
-        validate_host_query(host)?;
-        let host = host.to_owned();
+        let query = HostQuery::checked(host)?.into_owned();
         let inner = Arc::clone(&self.inner);
         with_deadline_budget::<R, _, _>(deadline, move |deadline, stop| {
-            inner.find_sources_by_host_until(&host, deadline, stop)
+            inner.find_sources_by_host_until(query.as_query(), deadline, stop)
         })
         .await
     }
@@ -330,16 +329,13 @@ mod tests {
         let _ = futures_are_send::<super::super::Smol>;
     }
 
-    #[cfg(feature = "tokio")]
-    #[test]
-    fn invalid_discovery_inputs_are_refused_without_runtime_context() {
-        use super::super::Tokio;
+    fn assert_invalid_discovery_inputs<R: AsyncRuntime>() {
         use crate::{Error, InputDefect};
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let adapter = AsyncFinder::<Tokio>::new(finder(&ndi));
-        let cache = AsyncFinder::<Tokio, SourceCache>::new(SourceCache::new(finder(&ndi)));
+        let adapter = AsyncFinder::<R>::new(finder(&ndi));
+        let cache = AsyncFinder::<R, SourceCache>::new(SourceCache::new(finder(&ndi)));
         let mut context = Context::from_waker(Waker::noop());
         let excessive = crate::MAX_TIMEOUT + Duration::from_nanos(1);
         assert!(matches!(
@@ -364,6 +360,12 @@ mod tests {
         }
         for host in ["", "http://camera", "bad\0host"] {
             assert!(matches!(
+                Box::pin(cache.find_sources_by_host(host, excessive))
+                    .as_mut()
+                    .poll(&mut context),
+                Poll::Ready(Err(Error::InvalidInput(InputDefect::TimeoutTooLong { .. })))
+            ));
+            assert!(matches!(
                 Box::pin(cache.find_sources_by_host(host, Duration::ZERO))
                     .as_mut()
                     .poll(&mut context),
@@ -377,6 +379,18 @@ mod tests {
                 .poll(&mut context),
             Poll::Ready(Err(Error::InvalidInput(InputDefect::TimeoutTooLong { .. })))
         ));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn invalid_discovery_inputs_are_refused_without_tokio_context() {
+        assert_invalid_discovery_inputs::<super::super::Tokio>();
+    }
+
+    #[cfg(feature = "smol")]
+    #[test]
+    fn invalid_discovery_inputs_are_refused_without_smol_context() {
+        assert_invalid_discovery_inputs::<super::super::Smol>();
     }
 
     async fn cancelled_native_discovery_releases_its_owner<R: AsyncRuntime>() {

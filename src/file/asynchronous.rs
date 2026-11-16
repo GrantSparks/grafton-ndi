@@ -4488,8 +4488,13 @@ mod tests {
         // clock already past both. Any expiry recheck during reply delivery
         // would incorrectly time out the later waiter using the first drain.
         let at = Instant::now() - Duration::from_secs(1);
-        let first_deadline = Deadline::starting(at, Duration::ZERO).unwrap();
-        let later_deadline = Deadline::starting(at, Duration::from_nanos(1)).unwrap();
+        let first_deadline =
+            Deadline::starting(at, crate::timeout::Timeout::new(Duration::ZERO).unwrap()).unwrap();
+        let later_deadline = Deadline::starting(
+            at,
+            crate::timeout::Timeout::new(Duration::from_nanos(1)).unwrap(),
+        )
+        .unwrap();
         let (device, mut owner, first) = local_finishing_recorder(first_deadline);
         let mut first = Box::pin(first);
         let waker = Waker::from(Arc::new(QueueClosure(Arc::clone(&device))));
