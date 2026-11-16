@@ -4206,9 +4206,10 @@ fn pool_backed_receive_releases_every_1080p_block() {
                 .lock()
                 .unwrap()
                 .pop()
-                .ok_or(Error::InvalidInput(
-                    grafton_ndi::InputDefect::AllocatorLeaseStorage,
-                ))?;
+                .ok_or(Error::AllocationFailed(grafton_ndi::AllocationFailure {
+                    kind: grafton_ndi::AllocationKind::AllocatorLeases,
+                    bytes: None,
+                }))?;
             let block = policy_pool.blocks[tag];
             // SAFETY: this slot was removed exclusively from the free list. The
             // pool owns its initialized aligned memory until this loan is released.

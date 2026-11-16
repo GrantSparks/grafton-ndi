@@ -793,7 +793,8 @@ macro_rules! listener_methods {
         /// [`crate::MAX_TIMEOUT`], [`Error::ResourceLimit`] when copying the
         /// batch would exceed its 16 MiB budget, and
         /// [`Error::UnexpectedSdkResult`] when the top-level batch array is
-        /// malformed or storage cannot be reserved. The SDK has already
+        /// malformed, or [`Error::AllocationFailed`] when storage cannot be
+        /// reserved. The SDK has already
         /// handed a rejected batch over, so it is freed and its events are lost.
         #[doc(alias = "NDIlib_send_listener_get_events")]
         #[doc(alias = "NDIlib_recv_listener_get_events")]
@@ -839,7 +840,8 @@ impl SendListener {
     ///
     /// Returns [`Error::ResourceLimit`] when copying would exceed the 16 MiB
     /// budget, and [`Error::UnexpectedSdkResult`] when the top-level snapshot
-    /// array is malformed or storage cannot be reserved.
+    /// array is malformed. [`Error::AllocationFailed`] when storage cannot be
+    /// reserved.
     #[doc(alias = "NDIlib_send_listener_get_senders")]
     pub fn current_senders(&mut self) -> Result<Vec<AdvertisedSender>> {
         let mut budget = copy_budget();
@@ -900,7 +902,8 @@ impl RecvListener {
     ///
     /// Returns [`Error::ResourceLimit`] when copying would exceed the 16 MiB
     /// budget, and [`Error::UnexpectedSdkResult`] when the top-level snapshot
-    /// array is malformed or storage cannot be reserved.
+    /// array is malformed. [`Error::AllocationFailed`] when storage cannot be
+    /// reserved.
     #[doc(alias = "NDIlib_recv_listener_get_receivers")]
     pub fn current_receivers(&mut self) -> Result<Vec<AdvertisedReceiver>> {
         let mut budget = copy_budget();

@@ -2009,9 +2009,10 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(Error::UnexpectedSdkResult(
-                crate::SdkResultDefect::DiscoveryAllocation
-            ))
+            Err(Error::AllocationFailed(crate::AllocationFailure {
+                kind: crate::AllocationKind::DiscoveryResults,
+                ..
+            }))
         ));
         assert_eq!(cache.len(), 1);
     }

@@ -9,7 +9,7 @@ use crate::{Error, Result};
 
 #[cfg(any(test, ndi_has_advanced_send_completion, ndi_has_advanced_scatter_send))]
 pub(super) fn unavailable(_: std::collections::TryReserveError) -> Error {
-    Error::InvalidInput(crate::InputDefect::CompletionStorage)
+    crate::error::allocation_failed(crate::AllocationKind::QueuedCompletions, None)
 }
 
 struct Slot {
@@ -222,6 +222,17 @@ mod send_slots;
             }
         }
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn impossible_descriptor_reservation_reports_storage_exhaustion() {
+        assert!(matches!(
+            DescriptorSlots::allocate_keys(usize::MAX),
+            Err(Error::AllocationFailed(crate::AllocationFailure {
+                kind: crate::AllocationKind::QueuedCompletions,
+                bytes: None,
+            }))
+        ));
     }
 
     #[test]

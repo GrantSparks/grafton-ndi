@@ -37,7 +37,8 @@ accept iterables, such as `groups(["Public", "Studio"])` and
 
 Snapshots and accumulated results have bounded, fallible allocations.
 `Error::ResourceLimit` identifies the resource and units through `ResourceKind`.
-Invalid snapshot arrays and allocation failures return `UnexpectedSdkResult`;
+Invalid snapshot arrays return `UnexpectedSdkResult`, and storage allocation
+failures return `AllocationFailed` with their `AllocationFailure`;
 individual malformed descriptors can be skipped. See
 [`Finder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.Finder.html)
 for exact limits. Run [`find_sources`](../examples/find_sources.rs) to inspect the

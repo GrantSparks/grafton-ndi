@@ -3015,7 +3015,10 @@ fn png_scratch_failure_precedes_every_output_byte() {
                 .unwrap_err();
             assert!(matches!(
                 error,
-                Error::InvalidFrame(crate::FrameDefect::ImageScratchAllocation(_))
+                Error::AllocationFailed(crate::AllocationFailure {
+                    kind: crate::AllocationKind::ImageScratch,
+                    ..
+                })
             ));
             assert!(output.is_empty(), "{depth:?} HDR={hdr}");
         }

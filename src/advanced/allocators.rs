@@ -420,8 +420,9 @@ impl OwnedStorage {
             .filter(|layout| layout.size() != 0)
             .ok_or_else(|| invalid_input(crate::InputDefect::AllocationLayout { bytes }))?;
         // SAFETY: the layout was just checked not to be zero-sized.
-        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) })
-            .ok_or_else(|| invalid_input(crate::InputDefect::AllocationFailed { bytes }))?;
+        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or_else(|| {
+            crate::error::allocation_failed(crate::AllocationKind::ReceiveBuffer, Some(bytes))
+        })?;
         Ok(Self { pointer, layout })
     }
 }
@@ -514,7 +515,7 @@ impl AllocationBuffer {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`](crate::Error::InvalidInput) when the global
+    /// [`Error::AllocationFailed`](crate::Error::AllocationFailed) when the global
     /// allocator cannot supply that much memory.
     pub fn zeroed(request: AllocationRequest) -> Result<Self> {
         Ok(Self {
@@ -776,7 +777,8 @@ impl Drop for Reservation<'_> {
 
 impl Registry {
     fn new(limits: AllocatorLimits) -> Result<Self> {
-        let unavailable = |_| invalid_input(crate::InputDefect::AllocatorLeaseStorage);
+        let unavailable =
+            |_| crate::error::allocation_failed(crate::AllocationKind::AllocatorLeases, None);
         let mut leases = HashMap::new();
         leases
             .try_reserve(limits.max_allocations)
@@ -1163,8 +1165,9 @@ impl AllocatorService {
     /// # Errors
     ///
     /// [`Error::InvalidInput`](crate::Error::InvalidInput) when the limits are
-    /// out of range, differ from those of an earlier service, or the bounded
-    /// lease bookkeeping cannot be reserved.
+    /// out of range or differ from those of an earlier service.
+    /// [`Error::AllocationFailed`](crate::Error::AllocationFailed) when the
+    /// bounded lease bookkeeping cannot be reserved.
     pub fn new(runtime: ProcessLifetimeRuntime, limits: &AllocatorLimits) -> Result<Self> {
         let limits = (*limits).validate()?;
         let registry = match REGISTRY.get() {
@@ -2158,8 +2161,9 @@ mod tests {
         let token = registry
             .register(move |_: AllocationRequest| -> Result<AllocationBuffer> {
                 calls.fetch_add(1, Ordering::Relaxed);
-                Err(Error::InvalidInput(
-                    crate::InputDefect::AllocatorLeaseStorage,
+                Err(crate::error::allocation_failed(
+                    crate::AllocationKind::AllocatorLeases,
+                    None,
                 ))
             })
             .unwrap();
@@ -2352,14 +2356,17 @@ mod tests {
             assert!(registry.free(token, pointer.as_ptr()));
         }
 
-        // An impossible reservation is an input error, rather than a panic or
+        // An impossible reservation is an allocation failure, rather than a panic or
         // an infallible allocation on the first SDK callback.
         assert!(matches!(
             Registry::new(AllocatorLimits {
                 max_allocations: usize::MAX,
                 ..limits()
             }),
-            Err(Error::InvalidInput(_))
+            Err(Error::AllocationFailed(crate::AllocationFailure {
+                kind: crate::AllocationKind::AllocatorLeases,
+                bytes: None,
+            }))
         ));
     }
 
@@ -2404,8 +2411,9 @@ mod tests {
         let registry = Registry::new(limits()).unwrap();
         let token = registry
             .register(|_: AllocationRequest| -> Result<AllocationBuffer> {
-                Err(Error::InvalidInput(
-                    crate::InputDefect::AllocatorLeaseStorage,
+                Err(crate::error::allocation_failed(
+                    crate::AllocationKind::AllocatorLeases,
+                    None,
                 ))
             })
             .unwrap();
