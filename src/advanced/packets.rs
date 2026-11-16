@@ -333,10 +333,28 @@ impl EnvelopeHeader {
 /// Parsing keeps what it does not understand. Flags, the reserved field and
 /// header bytes added by a later envelope version are all readable, so a
 /// received packet can be inspected or stored without loss.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PacketEnvelope<'a> {
     bytes: &'a [u8],
     header: EnvelopeHeader,
+}
+
+impl std::fmt::Debug for PacketEnvelope<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketEnvelope")
+            .field("codec", &self.codec())
+            .field("fourcc", &self.fourcc())
+            .field("presentation_time", &self.presentation_time())
+            .field("decode_time", &self.decode_time())
+            .field("keyframe", &self.is_keyframe())
+            .field("flags", &self.flags())
+            .field("known_version", &self.is_known_version())
+            .field("header_extension_bytes", &self.header_extension().len())
+            .field("payload_bytes", &self.data().len())
+            .field("configuration_bytes", &self.extra_data().len())
+            .field("trailing_bytes", &self.trailing_bytes().len())
+            .finish()
+    }
 }
 
 impl<'a> PacketEnvelope<'a> {
@@ -888,6 +906,39 @@ macro_rules! frame_extras_accessors {
 }
 pub(crate) use frame_extras_accessors;
 
+/// One field list for each compressed media kind, shared by borrowed, owned
+/// and scatter packets. Storage is always summarized by extent, never contents.
+macro_rules! packet_debug {
+    ($type:ty, $name:literal, $this:ident, $kind:ident, $timestamp:expr;
+        $($field:literal = $value:expr),+ $(,)?) => {
+        impl std::fmt::Debug for $type {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let $this = self;
+                let mut summary = f.debug_struct($name);
+                packet_debug!(@$kind summary, $this);
+                $(summary.field($field, &$value);)+
+                summary
+                    .field("timecode", &$this.timecode())
+                    .field("timestamp", &$timestamp)
+                    .field("metadata_status", &$this.metadata_status())
+                    .finish()
+            }
+        }
+    };
+    (@video $summary:ident, $this:ident) => {
+        $summary.field("format", &$this.format());
+    };
+    (@audio $summary:ident, $this:ident) => {
+        $summary
+            .field("codec", &$this.codec())
+            .field("protected", &$this.is_protected())
+            .field("sample_rate", &$this.sample_rate())
+            .field("num_channels", &$this.num_channels())
+            .field("num_samples", &$this.num_samples());
+    };
+}
+pub(crate) use packet_debug;
+
 macro_rules! video_envelope_accessor {
     () => {
         /// The validated H.264 or HEVC envelope, including alpha variants.
@@ -924,12 +975,15 @@ macro_rules! audio_envelope_accessor {
 /// Sending lends the bytes to the SDK, which writes to them: it stamps the
 /// envelope's reserved field. A send therefore takes the frame exclusively or
 /// by value, and a frame stays sendable however often it has been sent.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CompressedVideoFrame {
     pub(crate) format: VideoPacketFormat,
     pub(crate) bytes: AliasableVec<u8>,
     pub(crate) extras: FrameExtras,
 }
+
+packet_debug!(CompressedVideoFrame, "CompressedVideoFrame", frame, video, frame.timestamp();
+    "bytes" = frame.data().len());
 
 impl CompressedVideoFrame {
     frame_extras_accessors!();
@@ -1250,7 +1304,7 @@ impl AudioCodec {
 ///
 /// Sending lends the bytes to the SDK, which writes to them, so a send takes
 /// the frame exclusively; see [`CompressedVideoFrame`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CompressedAudioFrame {
     pub(crate) codec: AudioCodec,
     pub(crate) protected: bool,
@@ -1258,6 +1312,9 @@ pub struct CompressedAudioFrame {
     pub(crate) parameters: AudioParameters,
     pub(crate) extras: FrameExtras,
 }
+
+packet_debug!(CompressedAudioFrame, "CompressedAudioFrame", frame, audio, frame.timestamp();
+    "bytes" = frame.data().len());
 
 impl CompressedAudioFrame {
     frame_extras_accessors!();
@@ -1626,6 +1683,37 @@ const _: () = {
 pub(crate) mod testing {
     use super::*;
 
+    /// Payload size may change only the numeric extents of bounded summaries.
+    pub(crate) fn assert_bounded_debug(small: &[String], large: &[String]) {
+        fn without_counts(text: &str) -> String {
+            let mut previous_digit = false;
+            text.chars()
+                .filter_map(|character| {
+                    let digit = character.is_ascii_digit();
+                    let emit = !digit || !previous_digit;
+                    previous_digit = digit;
+                    emit.then_some(if digit { '#' } else { character })
+                })
+                .collect()
+        }
+        assert_eq!(small.len(), large.len());
+        for (small, large) in small.iter().zip(large) {
+            for text in [small, large] {
+                assert!(
+                    text.len() < 1024,
+                    "unbounded packet Debug: {} bytes",
+                    text.len()
+                );
+                assert!(
+                    !text.contains("0x"),
+                    "packet Debug contains an address: {text}"
+                );
+            }
+            assert_ne!(small, large, "packet Debug omitted its payload extent");
+            assert_eq!(without_counts(small), without_counts(large));
+        }
+    }
+
     /// A two-byte AAC-LC AudioSpecificConfig for an indexed sample rate and a
     /// channel count the configuration can name.
     pub(crate) fn aac_config(sample_rate: u32, channels: u32) -> [u8; 2] {
@@ -1664,6 +1752,106 @@ mod tests {
 
     fn h264_packet(keyframe: bool, extra_data: &[u8]) -> Vec<u8> {
         PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, keyframe, &[1], extra_data).unwrap()
+    }
+
+    #[test]
+    fn packet_debug_summarizes_every_leaf_and_public_holder() {
+        use crate::advanced::{
+            PacketItem, QueuedVideoFrame, ReceivedAudio, ReceivedVideo, ReclaimedVideo,
+            ScatterAudioFrame, ScatterVideoFrame, SubmittedVideo,
+        };
+        use crate::capture::Guard;
+
+        fn summaries(size: usize) -> Vec<String> {
+            let bytes =
+                PacketEnvelope::encode(EnvelopeCodec::H264, 17, 13, true, &vec![7; size], &[1, 2])
+                    .unwrap();
+            let mut video = CompressedVideoFrame::new(h264_format(), bytes.clone()).unwrap();
+            let raw = video.raw();
+            // SAFETY: video owns the readable descriptor storage until the
+            // synthetic non-owning receive guard is dropped.
+            let guard = unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
+            let borrowed = CompressedVideoRef::new(guard).unwrap();
+            let received = borrowed.to_owned();
+            let debug = format!("{video:?}");
+            for other in [format!("{borrowed:?}"), format!("{received:?}")] {
+                assert_eq!(
+                    debug.split_once(" {").unwrap().1,
+                    other.split_once(" {").unwrap().1
+                );
+            }
+            let scatter = ScatterVideoFrame::new(
+                h264_format(),
+                vec![bytes[..44].to_vec(), bytes[44..].to_vec()],
+            )
+            .unwrap();
+            let mut result = vec![
+                debug,
+                format!("{borrowed:?}"),
+                format!("{received:?}"),
+                format!("{:?}", video.envelope().unwrap()),
+                format!("{scatter:?}"),
+                format!("{:?}", ReceivedVideo::Compressed(received.clone())),
+                format!(
+                    "{:?}",
+                    PacketItem::Video(ReceivedVideo::Compressed(received))
+                ),
+                format!("{:?}", SubmittedVideo::Contiguous(video.clone())),
+                format!("{:?}", SubmittedVideo::Scatter(scatter.clone())),
+                format!("{:?}", QueuedVideoFrame::Compressed(video.clone())),
+                format!("{:?}", QueuedVideoFrame::Scatter(scatter.clone())),
+                format!(
+                    "{:?}",
+                    ReclaimedVideo {
+                        program: Some(SubmittedVideo::Contiguous(video.clone())),
+                        preview: Some(SubmittedVideo::Scatter(scatter)),
+                    }
+                ),
+            ];
+            for codec in AudioCodec::ALL {
+                let (samples, bytes) = match codec {
+                    AudioCodec::Aac => (1024, aac_packet(48_000, 2, &vec![7; size])),
+                    AudioCodec::Opus => (960, vec![7; size]),
+                };
+                let mut audio =
+                    CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes.clone()).unwrap();
+                let raw = audio.raw();
+                // SAFETY: audio owns the readable descriptor storage until
+                // the synthetic non-owning receive guard is dropped.
+                let guard = unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
+                let borrowed = CompressedAudioRef::new(guard).unwrap();
+                let received = borrowed.to_owned();
+                let debug = format!("{audio:?}");
+                for other in [format!("{borrowed:?}"), format!("{received:?}")] {
+                    assert_eq!(
+                        debug.split_once(" {").unwrap().1,
+                        other.split_once(" {").unwrap().1
+                    );
+                }
+                let scatter = ScatterAudioFrame::new(
+                    codec,
+                    48_000,
+                    2,
+                    samples,
+                    vec![bytes[..44].to_vec(), bytes[44..].to_vec()],
+                )
+                .unwrap();
+                result.extend([
+                    debug,
+                    format!("{borrowed:?}"),
+                    format!("{received:?}"),
+                    format!("{scatter:?}"),
+                    format!("{:?}", ReceivedAudio::Compressed(received.clone())),
+                    format!(
+                        "{:?}",
+                        PacketItem::Audio(ReceivedAudio::Compressed(received))
+                    ),
+                ]);
+            }
+            result
+        }
+
+        assert_bounded_debug(&summaries(1024), &summaries(1024 * 1024));
     }
 
     fn aac(sample_rate: u32, channels: u32, samples: u32, packet: Vec<u8>) -> Result<()> {

@@ -1062,6 +1062,42 @@ mod tests {
     use crate::frames::VideoPartsExt;
 
     #[test]
+    fn completed_packet_debug_is_bounded_by_fields_not_payload() {
+        use crate::advanced::{
+            packets::testing::assert_bounded_debug, EnvelopeCodec, PacketEnvelope, VideoCodec,
+            VideoPacketFormat,
+        };
+        let summaries = |size| {
+            let bytes =
+                PacketEnvelope::encode(EnvelopeCodec::H264, 17, 13, true, &vec![7; size], &[1, 2])
+                    .unwrap();
+            let format = VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap();
+            [
+                QueuedVideoFrame::Compressed(
+                    CompressedVideoFrame::new(format, bytes.clone()).unwrap(),
+                ),
+                QueuedVideoFrame::Scatter(
+                    ScatterVideoFrame::new(
+                        format,
+                        vec![bytes[..44].to_vec(), bytes[44..].to_vec()],
+                    )
+                    .unwrap(),
+                ),
+            ]
+            .map(|frame| {
+                format!(
+                    "{:?}",
+                    CompletedVideo {
+                        id: SubmissionId(1),
+                        frame
+                    }
+                )
+            })
+        };
+        assert_bounded_debug(&summaries(1024), &summaries(1024 * 1024));
+    }
+
+    #[test]
     fn split_submission_reuses_reserved_descriptors() {
         let Some(ndi) = crate::test_support::advanced_ndi() else {
             return;

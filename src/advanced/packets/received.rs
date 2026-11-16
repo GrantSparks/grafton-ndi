@@ -6,12 +6,15 @@ use super::*;
 /// Later envelope versions, flags and trailing bytes remain intact. Convert
 /// with [`CompressedVideoFrame::try_from`] before sending; a refusal returns
 /// this packet and its storage in [`Rejected`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ReceivedVideoPacket {
     pub(crate) format: VideoPacketFormat,
     pub(crate) bytes: Vec<u8>,
     pub(crate) extras: FrameExtras,
 }
+
+packet_debug!(ReceivedVideoPacket, "ReceivedVideoPacket", frame, video, frame.timestamp();
+    "bytes" = frame.data().len());
 
 impl ReceivedVideoPacket {
     frame_extras_accessors!();
@@ -88,7 +91,7 @@ impl From<CompressedVideoFrame> for ReceivedVideoPacket {
 /// Convert with [`CompressedAudioFrame::try_from`] before sending. Unknown
 /// envelope details remain available for inspection and storage even when
 /// send admission refuses the packet.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ReceivedAudioPacket {
     pub(crate) codec: AudioCodec,
     pub(crate) protected: bool,
@@ -96,6 +99,9 @@ pub struct ReceivedAudioPacket {
     pub(crate) bytes: Vec<u8>,
     pub(crate) extras: FrameExtras,
 }
+
+packet_debug!(ReceivedAudioPacket, "ReceivedAudioPacket", frame, audio, frame.timestamp();
+    "bytes" = frame.data().len());
 
 impl ReceivedAudioPacket {
     frame_extras_accessors!();
