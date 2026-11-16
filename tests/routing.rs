@@ -81,9 +81,13 @@ fn a_receiver_connects_after_the_route_input_is_dropped() {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         sender.send_video(&frame).unwrap();
+        // The route may first deliver an SDK startup frame. Only our stamped
+        // frame proves that the dropped route input still reaches this sender;
+        // startup frames spend the same original wait budget as native misses.
         if let Some(received) = receiver
             .capture_video_ref(Duration::from_millis(100))
             .unwrap()
+            .filter(|received| received.timecode() == frame.timecode())
         {
             assert_eq!((received.width(), received.height()), (64, 32));
             assert_eq!(received.timecode(), Timecode::from_ticks(72));
