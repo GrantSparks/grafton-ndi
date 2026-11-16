@@ -1607,7 +1607,8 @@ pub struct BorrowedVideoFrameBuilder<'buf> {
 }
 
 impl<'buf> BorrowedVideoFrameBuilder<'buf> {
-    /// Set the first-plane stride in bytes. Zero selects the packed stride.
+    /// Set the first-plane stride in bytes. It must be positive and hold the
+    /// active row. Use [`Self::clear_line_stride_bytes`] for the packed stride.
     #[must_use]
     pub fn line_stride_bytes(mut self, stride: usize) -> Self {
         self.line_stride = Some(stride);
