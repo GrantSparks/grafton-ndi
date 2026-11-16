@@ -1647,8 +1647,8 @@ impl SourceFormat {
     pub(super) fn from_sdk(
         raw: &NDIlib_file_source_format_t,
     ) -> std::result::Result<Self, SdkResultDefect> {
-        let count = usize::try_from(raw.video_track_count)
-            .map_err(|_| SdkResultDefect::FileTrackCountOverflow)?;
+        // Lossless: the SDK count is u32 and supported targets have >=32-bit usize.
+        let count = raw.video_track_count as usize;
         let tracks = raw.video_tracks.get(..count).ok_or({
             SdkResultDefect::FileTrackCount {
                 count: raw.video_track_count,

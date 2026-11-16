@@ -65,15 +65,9 @@ pub enum DiscoveryDefect {
     /// An array's span overflows.
     #[error("SDK discovery array span overflow")]
     ArraySpanOverflow,
-    /// A string has no terminator within the bound.
-    #[error("SDK discovery string exceeds its 4 MiB bound")]
-    UnterminatedString,
     /// A nonempty array has no data.
     #[error("SDK discovery array is null with a nonzero count")]
     NullArray,
-    /// An array count cannot be represented.
-    #[error("SDK discovery array count overflow")]
-    ArrayCountOverflow,
 }
 /// A refusal of the shared media layout and value checks.
 ///
@@ -101,18 +95,9 @@ pub enum LayoutDefect {
     /// Video line stride must be positive, got 0.
     #[error("Video line stride must be positive, got 0")]
     VideoZeroStride,
-    /// Video send allocation size overflow.
-    #[error("Video send allocation size overflow")]
-    VideoAllocationOverflow,
-    /// Video frame has zero calculated size.
-    #[error("Video frame has zero calculated size")]
-    VideoZeroSize,
     /// Video buffer size overflow.
     #[error("Video buffer size overflow")]
     VideoBufferOverflow,
-    /// Video payload size overflow.
-    #[error("Video payload size overflow")]
-    VideoPayloadOverflow,
     /// Audio channel stride exceeds i32 range.
     #[error("Audio channel stride exceeds i32 range")]
     AudioStrideRange,
@@ -272,12 +257,6 @@ pub enum FrameDefect {
     /// Metadata frame has non-zero length with null data pointer.
     #[error("Metadata frame has non-zero length with null data pointer")]
     MetadataNullData,
-    /// Metadata length must include a trailing NUL terminator.
-    #[error("Metadata length must include a trailing NUL terminator")]
-    MetadataEmpty,
-    /// Frame metadata length overflow while adding terminator.
-    #[error("Frame metadata length overflow while adding terminator")]
-    MetadataLengthOverflow,
     /// Video frame has null data pointer.
     #[error("Video frame has null data pointer")]
     NullVideoData,
@@ -429,21 +408,9 @@ pub enum FrameDefect {
         /// The length.
         length: i32,
     },
-    /// Invalid metadata length value: {length}.
-    #[error("Invalid metadata length value: {length}")]
-    MetadataInvalidLength {
-        /// The length.
-        length: i32,
-    },
     /// Metadata exceeds maximum size: {length} bytes > {MAX_METADATA_BYTES} bytes.
     #[error("Metadata exceeds maximum size: {length} bytes > {MAX_METADATA_BYTES} bytes")]
     MetadataTooLarge {
-        /// The length.
-        length: usize,
-    },
-    /// Metadata length {length} exceeds SDK i32 range.
-    #[error("Metadata length {length} exceeds SDK i32 range")]
-    MetadataSdkLength {
         /// The length.
         length: usize,
     },
@@ -518,16 +485,10 @@ pub enum FrameDefect {
         /// The minimum.
         minimum: usize,
     },
-    /// P216 buffer has {actual} bytes, requires {minimum}.
-    #[error("P216 buffer has {actual} bytes, requires {minimum}")]
-    P216BufferTooSmall {
-        /// The actual.
-        actual: usize,
-        /// The minimum.
-        minimum: usize,
-    },
-    /// interleaved audio has {actual} samples, which is not a non-zero multiple of {channels} channels.
-    #[error("interleaved audio has {actual} samples, which is not a non-zero multiple of {channels} channels")]
+    /// interleaved audio has {actual} samples, which is not a multiple of {channels} channels.
+    #[error(
+        "interleaved audio has {actual} samples, which is not a multiple of {channels} channels"
+    )]
     InterleavedAudioLength {
         /// The actual.
         actual: usize,
@@ -704,9 +665,6 @@ pub enum InputDefect {
     /// Advanced configuration must be a JSON object.
     #[error("Advanced configuration must be a JSON object")]
     ConfigurationNotObject,
-    /// Advanced configuration contains NUL.
-    #[error("Advanced configuration contains NUL")]
-    ConfigurationNul,
     /// queue requires 1..=65536 frames and a positive addressable byte limit.
     #[error("queue requires 1..=65536 frames and a positive addressable byte limit")]
     QueueLimits,
@@ -917,9 +875,6 @@ pub enum SdkResultDefect {
         "native completion protocol failed; use QueuedSender::close to recover retained frames"
     )]
     UnknownCompletion,
-    /// video track count does not fit usize.
-    #[error("video track count does not fit usize")]
-    FileTrackCountOverflow,
     /// {operation} returned a negative count: {value}.
     #[error("{operation} returned a negative count: {value}")]
     NegativeCount {
@@ -1003,7 +958,7 @@ pub enum SdkResultDefect {
         kind: u32,
     },
 
-    /// A native discovery descriptor violates its array or text contract.
+    /// A native discovery descriptor violates its array contract.
     #[error("{0}")]
     MalformedDiscoveryData(DiscoveryDefect),
 }

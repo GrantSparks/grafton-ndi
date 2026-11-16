@@ -181,17 +181,14 @@ fn validate_metadata_prefix(raw: &NDIlib_metadata_frame_t) -> Result<usize> {
         return Err(Error::InvalidFrame(crate::FrameDefect::MetadataNullData));
     }
 
-    let len_with_nul = usize::try_from(raw.length).map_err(|_| {
-        Error::InvalidFrame(crate::FrameDefect::MetadataInvalidLength { length: raw.length })
-    })?;
+    // Lossless: the signed SDK length is positive and usize is at least 32 bits.
+    let len_with_nul = raw.length as usize;
     validate_metadata_len_with_nul(len_with_nul)?;
     Ok(len_with_nul)
 }
 
 fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
-    if len_with_nul == 0 {
-        return Err(Error::InvalidFrame(crate::FrameDefect::MetadataEmpty));
-    }
+    debug_assert!(len_with_nul > 0, "metadata includes its terminator");
 
     if len_with_nul > MAX_METADATA_BYTES {
         return Err(Error::InvalidFrame(crate::FrameDefect::MetadataTooLarge {
@@ -199,15 +196,13 @@ fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
         }));
     }
 
-    metadata_len_to_i32(len_with_nul)
+    Ok(metadata_len_to_i32(len_with_nul))
 }
 
-pub(super) fn metadata_len_to_i32(len_with_nul: usize) -> Result<i32> {
-    i32::try_from(len_with_nul).map_err(|_| {
-        Error::InvalidFrame(crate::FrameDefect::MetadataSdkLength {
-            length: len_with_nul,
-        })
-    })
+pub(super) fn metadata_len_to_i32(len_with_nul: usize) -> i32 {
+    debug_assert!(len_with_nul <= MAX_METADATA_BYTES);
+    // Lossless: the metadata limit is smaller than i32::MAX, asserted in frames.
+    len_with_nul as i32
 }
 
 /// Why optional metadata was withheld while retaining otherwise valid media.
@@ -341,9 +336,9 @@ impl TerminatedText {
     }
 
     fn validate_and_terminate(text: &mut String) -> Result<()> {
-        let len_with_nul = text.len().checked_add(1).ok_or(Error::InvalidFrame(
-            crate::FrameDefect::MetadataLengthOverflow,
-        ))?;
+        // A String's length is at most isize::MAX, so adding its terminator
+        // cannot overflow usize on any supported target.
+        let len_with_nul = text.len() + 1;
         validate_metadata_len_with_nul(len_with_nul)?;
         if let Some(position) = text.as_bytes().iter().position(|&byte| byte == 0) {
             return Err(Error::InvalidCString(

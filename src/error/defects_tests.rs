@@ -99,15 +99,13 @@ fn check_cases<E: std::fmt::Display>(name: &str, cases: &[(&str, E, &str)]) {
 fn frame_defect_diagnostics_preserve_their_text() {
     let cases = [
         ("UnknownEnvelopeCodec", FrameDefect::UnknownEnvelopeCodec { fourcc: 1094861636 }, "Unknown packet envelope codec FourCC: 0x41424344"),
-        ("Layout", FrameDefect::Layout(LayoutDefect::VideoZeroSize), "Video frame has zero calculated size"),
+        ("Layout", FrameDefect::Layout(LayoutDefect::VideoZeroStride), "Video line stride must be positive, got 0"),
         ("ImageScratchOverflow", FrameDefect::ImageScratchOverflow, "image scratch size overflow"),
         ("ImageDimensionOverflow", FrameDefect::ImageDimensionOverflow, "image dimension overflow"),
         ("ImageDimension", FrameDefect::ImageDimension { codec: ImageCodec::Jpeg, dimension: ImageDimension::Width, length: 6, maximum: 16 }, "JPEG width 6 exceeds maximum supported value 16"),
         ("MetadataMissingTerminator", FrameDefect::MetadataMissingTerminator, "Metadata frame length does not include a trailing NUL terminator"),
         ("MetadataInteriorNul", FrameDefect::MetadataInteriorNul, "Metadata frame contains an interior NUL byte"),
         ("MetadataNullData", FrameDefect::MetadataNullData, "Metadata frame has non-zero length with null data pointer"),
-        ("MetadataEmpty", FrameDefect::MetadataEmpty, "Metadata length must include a trailing NUL terminator"),
-        ("MetadataLengthOverflow", FrameDefect::MetadataLengthOverflow, "Frame metadata length overflow while adding terminator"),
         ("NullVideoData", FrameDefect::NullVideoData, "Video frame has null data pointer"),
         ("NullAudioData", FrameDefect::NullAudioData, "Audio frame has null data pointer"),
         ("AudioMisaligned", FrameDefect::AudioMisaligned, "Audio data pointer is not aligned for f32"),
@@ -154,9 +152,7 @@ fn frame_defect_diagnostics_preserve_their_text() {
         ("UnknownScanType", FrameDefect::UnknownScanType { code: 1094861636 }, "Unknown scan type: 0x41424344"),
         ("AudioBufferTooSmall", FrameDefect::AudioBufferTooSmall { actual: 5, minimum: 12 }, "Audio buffer has 5 samples, requires at least 12"),
         ("MetadataNegativeLength", FrameDefect::MetadataNegativeLength { length: 6 }, "Metadata frame has negative length: 6"),
-        ("MetadataInvalidLength", FrameDefect::MetadataInvalidLength { length: 6 }, "Invalid metadata length value: 6"),
         ("MetadataTooLarge", FrameDefect::MetadataTooLarge { length: 6 }, "Metadata exceeds maximum size: 6 bytes > 4194304 bytes"),
-        ("MetadataSdkLength", FrameDefect::MetadataSdkLength { length: 6 }, "Metadata length 6 exceeds SDK i32 range"),
         ("MetadataUnterminated", FrameDefect::MetadataUnterminated, "Frame metadata is missing a NUL terminator within 4194304 bytes"),
         ("VideoDataLength", FrameDefect::VideoDataLength { actual: 5, expected: 12 }, "Video data length 5, expected 12 bytes for validated layout"),
         ("AudioDataLength", FrameDefect::AudioDataLength { detail: CompactDiagnostic::new(AudioLengthDefect { actual: 5, expected: 12, channels: 2, samples: 16 }) }, "Audio data length 5, expected 12 samples (2 channels x 16 samples) for validated layout"),
@@ -167,8 +163,7 @@ fn frame_defect_diagnostics_preserve_their_text() {
         ("FrameSyncAudioInput", FrameDefect::FrameSyncAudioInput { channels: 2, samples: 16 }, "FrameSync audio input-format query returned 2 channels of 16 samples"),
         ("VideoBufferTooSmall", FrameDefect::VideoBufferTooSmall { format: PixelFormat::Bgra, actual: 5, minimum: 12 }, "Buffer too small for Bgra: got 5 bytes, expected at least 12"),
         ("V210BufferTooSmall", FrameDefect::V210BufferTooSmall { actual: 5, minimum: 12 }, "V210 buffer has 5 words, requires 12"),
-        ("P216BufferTooSmall", FrameDefect::P216BufferTooSmall { actual: 5, minimum: 12 }, "P216 buffer has 5 bytes, requires 12"),
-        ("InterleavedAudioLength", FrameDefect::InterleavedAudioLength { actual: 5, channels: 2 }, "interleaved audio has 5 samples, which is not a non-zero multiple of 2 channels"),
+        ("InterleavedAudioLength", FrameDefect::InterleavedAudioLength { actual: 5, channels: 2 }, "interleaved audio has 5 samples, which is not a multiple of 2 channels"),
         ("AudioDestinationLength", FrameDefect::AudioDestinationLength { actual: 5, minimum: 12 }, "audio destination has 5 samples, requires 12"),
         ("CompressedAudioQuantities", FrameDefect::CompressedAudioQuantities { detail: CompactDiagnostic::new(CompressedAudioDefect { sample_rate: 48000, channels: 2, samples: 16 }) }, "Compressed audio of 48000 Hz, 2 channels and 16 samples per channel: each must be in 1..=2147483647"),
         ("ColorMetadataWithheld", FrameDefect::ColorMetadataWithheld { status: FrameMetadataStatus::NotUtf8 }, "The frame's color description cannot be read because its metadata was withheld (NotUtf8); ColorPolicy::Override explicitly supplies its color conversion"),
@@ -183,7 +178,7 @@ fn frame_defect_diagnostics_preserve_their_text() {
 #[test]
 fn input_defect_diagnostics_preserve_their_text() {
     let cases = [
-        ("Layout", InputDefect::Layout(LayoutDefect::VideoZeroSize), "Video frame has zero calculated size"),
+        ("Layout", InputDefect::Layout(LayoutDefect::VideoZeroStride), "Video line stride must be positive, got 0"),
         ("InvalidSourceName", InputDefect::InvalidSourceName, "Source name must be nonempty and contain no NUL"),
         ("ListElement", InputDefect::ListElement { setting: "groups", index: 2 }, "groups element 2 must be nonempty and contain neither a comma nor a NUL"),
         ("InvalidHostQuery", InputDefect::InvalidHostQuery, "Host must be a bare hostname, IP address or NDI machine name"),
@@ -215,7 +210,6 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("ConfigurationTooLarge", InputDefect::ConfigurationTooLarge, "Advanced configuration exceeds its byte limit"),
         ("ConfigurationJson", InputDefect::ConfigurationJson, "Invalid Advanced configuration JSON"),
         ("ConfigurationNotObject", InputDefect::ConfigurationNotObject, "Advanced configuration must be a JSON object"),
-        ("ConfigurationNul", InputDefect::ConfigurationNul, "Advanced configuration contains NUL"),
         ("QueueLimits", InputDefect::QueueLimits, "queue requires 1..=65536 frames and a positive addressable byte limit"),
         ("QueueIdentifiersExhausted", InputDefect::QueueIdentifiersExhausted, "queue submission identifiers exhausted"),
         ("QueuedSenderRegistered", InputDefect::QueuedSenderRegistered, "queued conversion requires a sender without advertiser registrations"),
@@ -256,7 +250,6 @@ fn input_defect_diagnostics_preserve_their_text() {
 fn sdk_result_defect_diagnostics_preserve_their_text() {
     let cases = [
         ("UnknownCompletion", SdkResultDefect::UnknownCompletion, "native completion protocol failed; use QueuedSender::close to recover retained frames"),
-        ("FileTrackCountOverflow", SdkResultDefect::FileTrackCountOverflow, "video track count does not fit usize"),
         ("NegativeCount", SdkResultDefect::NegativeCount { operation: crate::sys::table::for_test((), c"native operation").function(), value: (-3).into() }, "native operation returned a negative count: -3"),
         ("UnterminatedText", SdkResultDefect::UnterminatedText { operation: crate::sys::table::for_test((), c"native operation").function() }, "native operation returned a string longer than the 4 MiB one string may be"),
         ("InvalidReceiveDelay", SdkResultDefect::InvalidReceiveDelay { millis: -3 }, "SDK returned invalid receive delay: -3 ms"),
@@ -282,19 +275,9 @@ fn discovery_defect_diagnostics_preserve_their_text() {
             "SDK discovery array span overflow",
         ),
         (
-            "UnterminatedString",
-            DiscoveryDefect::UnterminatedString,
-            "SDK discovery string exceeds its 4 MiB bound",
-        ),
-        (
             "NullArray",
             DiscoveryDefect::NullArray,
             "SDK discovery array is null with a nonzero count",
-        ),
-        (
-            "ArrayCountOverflow",
-            DiscoveryDefect::ArrayCountOverflow,
-            "SDK discovery array count overflow",
         ),
     ];
     check_cases("DiscoveryDefect", &cases);
@@ -405,10 +388,7 @@ fn layout_defect_diagnostics_preserve_their_text() {
         ("FrameRate", LayoutDefect::FrameRate { detail: CompactDiagnostic::new(FrameRateDefect { numerator: 30, denominator: 0 }) }, "Invalid frame rate 30/0: both parts must be in 1..=2147483647"),
         ("CompressedVideoDimensions", LayoutDefect::CompressedVideoDimensions { detail: CompactDiagnostic::new(VideoDimensionsDefect { width: 8, height: 4 }) }, "Compressed video dimensions 8x4 must each be in 1..=2147483647"),
         ("VideoZeroStride", LayoutDefect::VideoZeroStride, "Video line stride must be positive, got 0"),
-        ("VideoAllocationOverflow", LayoutDefect::VideoAllocationOverflow, "Video send allocation size overflow"),
-        ("VideoZeroSize", LayoutDefect::VideoZeroSize, "Video frame has zero calculated size"),
         ("VideoBufferOverflow", LayoutDefect::VideoBufferOverflow, "Video buffer size overflow"),
-        ("VideoPayloadOverflow", LayoutDefect::VideoPayloadOverflow, "Video payload size overflow"),
         ("AudioStrideRange", LayoutDefect::AudioStrideRange, "Audio channel stride exceeds i32 range"),
         ("VideoWidth", LayoutDefect::VideoWidth((-3).into()), "Video frame has invalid width: -3"),
         ("VideoOddWidth", LayoutDefect::VideoOddWidth((-3).into()), "NDI video frames require even width, got -3"),

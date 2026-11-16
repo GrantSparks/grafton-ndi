@@ -268,12 +268,9 @@ impl PixelFormat {
     ) -> Result<usize> {
         let layout =
             ValidatedVideoLayout::new_uncompressed(self, width, height, line_stride_bytes)?;
-        layout
-            .data_len_bytes
-            .checked_add(crate::pixels::send_room(&layout, scan_type))
-            .ok_or(Error::InvalidFrame(crate::FrameDefect::Layout(
-                crate::LayoutDefect::VideoAllocationOverflow,
-            )))
+        // The validated data and the maximum send room fit usize on every
+        // supported target; the bound is asserted beside ValidatedVideoLayout.
+        Ok(layout.data_len_bytes + crate::pixels::send_room(&layout, scan_type))
     }
 
     /// Get compile-time format properties.
@@ -3464,7 +3461,14 @@ impl Sendable<VideoFrame> {
 
 // The width, height and line stride of a valid layout are each at most its
 // storage extent, so every one of them fits the SDK's signed 32-bit fields.
-const _: () = assert!(MAX_VIDEO_BYTES <= i32::MAX as usize);
+const _: () = {
+    assert!(usize::BITS >= 32);
+    assert!(MAX_VIDEO_BYTES <= i32::MAX as usize);
+    // Send room is at most 64 bytes plus two strides. A validated stride is
+    // at most the complete data size, even for a one-row frame.
+    assert!(3 * MAX_VIDEO_BYTES + 64 < usize::MAX);
+    assert!(MAX_METADATA_BYTES < i32::MAX as usize);
+};
 
 impl ValidatedVideoLayout {
     /// Initialized active payload, excluding padding.
@@ -3755,9 +3759,10 @@ fn check_video_data_len(layout: &ValidatedVideoLayout, len: usize) -> Result<()>
 }
 
 fn validate_video_data_len(data_len_bytes: usize) -> LayoutResult<()> {
-    if data_len_bytes == 0 {
-        return Err(crate::LayoutDefect::VideoZeroSize);
-    }
+    debug_assert!(
+        data_len_bytes > 0,
+        "validated dimensions and stride are positive"
+    );
 
     if data_len_bytes > MAX_VIDEO_BYTES {
         return Err(crate::LayoutDefect::VideoBytes(data_len_bytes));
@@ -3884,10 +3889,11 @@ fn video_plane_layouts(
             .checked_mul(row_count)
             .and_then(|n| storage.checked_add(n))
             .ok_or(crate::LayoutDefect::VideoBufferOverflow)?;
-        payload = active_row_bytes
-            .checked_mul(row_count)
-            .and_then(|n| payload.checked_add(n))
-            .ok_or(crate::LayoutDefect::VideoPayloadOverflow)?;
+        // Every active row fits its stride, and the complete storage sum
+        // just passed the overflow check. The active payload cannot exceed it.
+        debug_assert!(active_row_bytes <= row_stride);
+        payload += active_row_bytes * row_count;
+        debug_assert!(payload <= storage);
     }
     Ok((planes, count, storage, payload))
 }
@@ -8272,12 +8278,17 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_raw_length_conversion_is_checked() {
-        assert!(metadata_len_to_i32(i32::MAX as usize).is_ok());
-        assert!(matches!(
-            metadata_len_to_i32(i32::MAX as usize + 1),
-            Err(Error::InvalidFrame(_))
-        ));
+    fn metadata_sdk_length_uses_the_validated_metadata_bound() {
+        assert_eq!(metadata_len_to_i32(1), 1);
+        assert_eq!(
+            metadata_len_to_i32(MAX_METADATA_BYTES),
+            MAX_METADATA_BYTES as i32
+        );
+        let text = "x".repeat(MAX_METADATA_BYTES);
+        let error = MetadataFrame::new(text).unwrap_err().into_error();
+        assert!(
+            matches!(error, Error::InvalidFrame(crate::FrameDefect::MetadataTooLarge { length }) if length == MAX_METADATA_BYTES + 1)
+        );
     }
 
     #[test]
@@ -8677,7 +8688,6 @@ mod tests {
                             crate::LayoutDefect::VideoStrideOverflow { .. }
                         )
                         | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoPayloadOverflow)
                         | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
                         | crate::FrameDefect::ImageScratchOverflow
                         | crate::FrameDefect::ImageDimensionOverflow
@@ -9704,7 +9714,6 @@ mod tests {
                             crate::LayoutDefect::VideoStrideOverflow { .. }
                         )
                         | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoPayloadOverflow)
                         | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
                         | crate::FrameDefect::ImageScratchOverflow
                         | crate::FrameDefect::ImageDimensionOverflow

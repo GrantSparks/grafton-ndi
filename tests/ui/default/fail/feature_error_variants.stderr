@@ -1,0 +1,11 @@
+error[E0599]: no variant, associated function, or constant named `SpawnFailed` found for enum `grafton_ndi::Error` in the current scope
+ --> tests/ui/default/fail/feature_error_variants.rs:4:20
+  |
+4 |     let _ = Error::SpawnFailed;
+  |                    ^^^^^^^^^^^ variant, associated function, or constant not found in `grafton_ndi::Error`
+
+error[E0599]: no variant, associated function, or constant named `QueueFull` found for enum `grafton_ndi::Error` in the current scope
+ --> tests/ui/default/fail/feature_error_variants.rs:5:20
+  |
+5 |     let _ = Error::QueueFull;
+  |                    ^^^^^^^^^ variant, associated function, or constant not found in `grafton_ndi::Error`
