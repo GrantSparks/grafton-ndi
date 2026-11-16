@@ -1664,7 +1664,10 @@ impl SourceCache {
     pub fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
         self.entries
             .find_sources_by_host_with(host, timeout, |query| {
-                self.discover_host_until(query, Deadline::after(timeout)?, NeverStop)
+                match self.discover_host_until(query, Deadline::after(timeout)?, NeverStop)? {
+                    HostDiscovery::Complete(sources) => Ok(sources),
+                    HostDiscovery::Stopped => unreachable!("a synchronous discovery cannot stop"),
+                }
             })
     }
 
@@ -1677,7 +1680,12 @@ impl SourceCache {
     ) -> Result<Vec<Source>> {
         self.entries
             .find_sources_by_host_with(host, deadline.remaining(), |query| {
-                self.discover_host_until(query, deadline, stop)
+                match self.discover_host_until(query, deadline, stop)? {
+                    HostDiscovery::Complete(sources) => Ok(sources),
+                    HostDiscovery::Stopped => {
+                        Err(Error::SpawnFailed(crate::SpawnFailure::TaskCancelled))
+                    }
+                }
             })
     }
 
@@ -1686,7 +1694,7 @@ impl SourceCache {
         query: HostQuery<'_>,
         deadline: Deadline,
         stop: impl Stop,
-    ) -> Result<Vec<Source>> {
+    ) -> Result<HostDiscovery> {
         let mut seen = HashSet::new();
         let mut discovered = Vec::new();
         let mut retained_bytes = 0;
@@ -1698,9 +1706,9 @@ impl SourceCache {
             })?;
         if stop.is_stopped() {
             // An abandoned miss has not observed the full cache window.
-            return Err(Error::SpawnFailed(crate::SpawnFailure::TaskCancelled));
+            return Ok(HostDiscovery::Stopped);
         }
-        Ok(discovered)
+        Ok(HostDiscovery::Complete(discovered))
     }
 
     /// Remove a host's complete result set and suppress pending fills.
@@ -1724,6 +1732,12 @@ impl SourceCache {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// A stop is private control flow; only an async caller turns it into a spawn failure.
+enum HostDiscovery {
+    Complete(Vec<Source>),
+    Stopped,
 }
 
 /// Fallibly reserve descriptor copies while sharing their immutable, validated

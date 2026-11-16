@@ -137,9 +137,8 @@ impl V210Layout {
     /// the crate itself reads P216 samples only as bytes, so their alignment
     /// depends on nothing, including the global allocator.
     ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidFrame`] when `data` is not exactly that frame's size.
+    /// Tests supply exactly the validated size; application input is checked
+    /// by the public frame builders before reaching a descriptor helper.
     #[cfg(test)]
     fn p216_descriptor(self, ndi: &Ndi, data: &[u8]) -> Result<NDIlib_video_frame_v2_t> {
         // `with_line_stride_bytes` validated this layout for these dimensions.
@@ -149,15 +148,11 @@ impl V210Layout {
             self.height,
             None,
         )?;
-        let len = data.len();
-        if len != p216.data_len_bytes() {
-            return Err(Error::InvalidFrame(
-                crate::FrameDefect::P216BufferTooSmall {
-                    actual: len,
-                    minimum: p216.data_len_bytes(),
-                },
-            ));
-        }
+        assert_eq!(
+            data.len(),
+            p216.data_len_bytes(),
+            "test supplies a complete P216 frame"
+        );
         // BorrowedVideoFrame keeps geometry paired with the validated slice.
         // Conversion needs no metadata and uses the builder's valid header.
         let frame =
@@ -432,9 +427,14 @@ mod tests {
         crate::frames::descriptor_tests::assert_extent(&raw, storage.as_ptr(), storage.len());
         let raw = layout.p216_descriptor(&ndi, storage).unwrap();
         crate::frames::descriptor_tests::assert_extent(&raw, storage.as_ptr(), storage.len());
-        assert!(layout
-            .p216_descriptor(&ndi, &storage[..storage.len() - 1])
-            .is_err());
+        assert!(crate::BorrowedVideoFrame::builder(
+            &storage[..storage.len() - 1],
+            12,
+            32,
+            PixelFormat::P216,
+        )
+        .build()
+        .is_err());
     }
 
     #[test]
@@ -630,7 +630,14 @@ mod tests {
                 .unwrap();
             assert_eq!(packed, expected);
 
-            assert!(converter.pack(layout, &p216[1..], &mut packed).is_err());
+            assert!(crate::BorrowedVideoFrame::builder(
+                &p216[1..],
+                width,
+                height,
+                PixelFormat::P216,
+            )
+            .build()
+            .is_err());
         }
     }
 

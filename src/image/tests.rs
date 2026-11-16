@@ -2260,7 +2260,6 @@ fn conversion_geometry_overflow_is_refused_before_output_or_row_access() {
             | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
             | crate::FrameDefect::Layout(crate::LayoutDefect::VideoStrideOverflow { .. })
             | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
-            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoPayloadOverflow)
             | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
             | crate::FrameDefect::ImageScratchOverflow
             | crate::FrameDefect::ImageDimensionOverflow

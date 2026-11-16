@@ -14,3 +14,15 @@ fn compile_contracts() {
     #[cfg(any(feature = "tokio", feature = "smol"))]
     t.compile_fail("tests/ui/async/fail/*.rs");
 }
+
+#[test]
+#[cfg(not(any(
+    feature = "advanced",
+    feature = "file-io",
+    feature = "tokio",
+    feature = "smol"
+)))]
+fn absent_feature_error_variants_are_unavailable() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/default/fail/feature_error_variants.rs");
+}

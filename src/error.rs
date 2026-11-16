@@ -5,6 +5,8 @@ mod allocation_tests;
 mod defects;
 #[cfg(test)]
 mod defects_tests;
+#[cfg(test)]
+mod production_tests;
 pub use crate::sys::table::NativeFunction;
 pub use defects::*;
 
@@ -28,6 +30,7 @@ use crate::capabilities::{Capability, CapabilityRefusal};
 /// failures. This discriminator does not depend on diagnostic text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub enum SpawnFailure {
     /// The Tokio operation was polled outside a Tokio runtime.
     #[error("no Tokio runtime is entered")]
@@ -309,6 +312,7 @@ pub enum Error {
     /// * `file::AsyncFilePlayer::probe`, when the probes waiting for the
     ///   process's probe thread fill its queue ([`QueueLimit::FileProbes`]).
     #[error("Queue full: {0}")]
+    #[cfg(any(feature = "advanced", feature = "file-io"))]
     QueueFull(QueueLimit),
 
     /// A value the SDK returned, other than a frame, breaks the SDK's
@@ -380,6 +384,7 @@ pub enum Error {
     /// }
     /// ```
     #[error("Could not run blocking task: {0}")]
+    #[cfg(any(feature = "tokio", feature = "smol"))]
     SpawnFailed(SpawnFailure),
 
     /// A File API operation is not permitted in the current state of its
@@ -470,6 +475,7 @@ pub enum ResourceKind {
 /// the text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
+#[cfg(any(feature = "advanced", feature = "file-io"))]
 pub enum QueueLimit {
     /// An Advanced `QueuedSender` already holds as many frames as its
     /// `QueueLimits::max_frames` allows.
@@ -521,6 +527,7 @@ mod tests {
         error::<Capability>();
         error::<CapabilityRefusal>();
         error::<crate::CapabilityUnavailable>();
+        #[cfg(any(feature = "advanced", feature = "file-io"))]
         error::<QueueLimit>();
         error::<ResourceKind>();
         error::<SelectionConflict>();
@@ -531,6 +538,7 @@ mod tests {
         error::<AudioLengthDefect>();
         error::<CompressedAudioDefect>();
         error::<PtzDefect>();
+        #[cfg(any(feature = "tokio", feature = "smol"))]
         error::<SpawnFailure>();
         error::<InitializationFailure>();
         error::<AllocationFailure>();
@@ -540,6 +548,7 @@ mod tests {
         value::<Capability>();
         value::<CapabilityRefusal>();
         value::<crate::CapabilityUnavailable>();
+        #[cfg(any(feature = "advanced", feature = "file-io"))]
         value::<QueueLimit>();
         value::<ResourceKind>();
         value::<SelectionConflict>();
@@ -549,6 +558,7 @@ mod tests {
         value::<VideoDimensionsDefect>();
         value::<AudioLengthDefect>();
         value::<CompressedAudioDefect>();
+        #[cfg(any(feature = "tokio", feature = "smol"))]
         value::<SpawnFailure>();
         value::<InitializationFailure>();
         value::<AllocationFailure>();
@@ -606,6 +616,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "advanced", feature = "file-io"))]
     fn a_full_queue_names_its_limit() {
         for (limit, text) in [
             (QueueLimit::Frames, "queued video frame limit reached"),

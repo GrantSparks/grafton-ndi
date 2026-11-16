@@ -71,6 +71,8 @@ fn split_views_stay_on_the_borrowing_thread() {
 fn crate_root_types_keep_their_auto_traits() {
     use grafton_ndi::*;
     has! {
+        AllocationFailure: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AllocationKind: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioChannels<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -112,7 +114,6 @@ fn crate_root_types_keep_their_auto_traits() {
         PixelFormatInfo: Send, Sync, UnwindSafe, RefUnwindSafe;
         ProcessLifetimeRuntime: Send, Sync, UnwindSafe, RefUnwindSafe;
         Ptz<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
-        QueueLimit: Send, Sync, UnwindSafe, RefUnwindSafe;
         ResourceKind: Send, Sync, UnwindSafe, RefUnwindSafe;
         RawCapture: Send, Sync, UnwindSafe, RefUnwindSafe;
         RawSend: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -134,7 +135,6 @@ fn crate_root_types_keep_their_auto_traits() {
         Sender<RawSend>: Send, Sync, UnwindSafe, RefUnwindSafe;
         SenderOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
         SettingChange: Send, Sync, UnwindSafe, RefUnwindSafe;
-        SpawnFailure: Send, Sync, UnwindSafe, RefUnwindSafe;
         Source: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceAddress: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceCache: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -165,6 +165,14 @@ fn crate_root_types_keep_their_auto_traits() {
         video_conversion::VideoConverter: Send, Sync, UnwindSafe, RefUnwindSafe;
     }
     lacks! { routing::Router: Sync; }
+}
+
+#[test]
+fn feature_error_payloads_keep_their_auto_traits() {
+    #[cfg(any(feature = "advanced", feature = "file-io"))]
+    has! { grafton_ndi::QueueLimit: Send, Sync, UnwindSafe, RefUnwindSafe; }
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    has! { grafton_ndi::SpawnFailure: Send, Sync, UnwindSafe, RefUnwindSafe; }
 }
 
 /// The public types of the `image-encoding` feature.
