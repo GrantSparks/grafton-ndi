@@ -106,7 +106,13 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal
           cargo +1.88.0 check --locked --workspace --all-targets --all-features
       - name: Packaged crate builds
-        run: cargo package --locked --package grafton-ndi
+        run: |
+          files=$(cargo package --list --locked --package grafton-ndi)
+          if grep -E '_tests\.rs$|/tests\.rs$|test_support|test_alloc|/mock\.rs$|/sdk_tests/' <<< "$files"; then
+            echo '::error::The package contains test-only sources'
+            exit 1
+          fi
+          cargo package --locked --package grafton-ndi
       # Skipped while the crate's major version is ahead of every published
       # release: nothing constrains a new major version.
       - name: Semver check against the last release

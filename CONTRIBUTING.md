@@ -9,6 +9,9 @@ cargo build --locked
 cargo test --locked
 ```
 
+The test suite runs from the repository. Test-only sources are not published
+in the crate package.
+
 Native tests report a skip when their runtime is unavailable. See
 [testing from source](ci/README.md) for all-feature checks, runtime selection
 and loopback-only test runs.
