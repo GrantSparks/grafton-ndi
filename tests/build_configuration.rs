@@ -188,25 +188,222 @@ fn only_apple_mobile_targets_link_statically() {
     }
 }
 
+fn apple_target(os: &str, arch: &str) -> &'static build_support::StaticTarget {
+    build_support::STATIC_TARGETS
+        .iter()
+        .find(|target| (target.os, target.arch) == (os, arch))
+        .unwrap()
+}
+
+fn inspect_apple(path: &Path, arch: &str, os: &str) -> Result<build_apple::StaticArchive, String> {
+    let target = apple_target(os, arch);
+    build_apple::inspect(path, target.arch, target.platform)
+}
+
+#[test]
+fn static_targets_keep_each_supported_slice_and_deployment_variable() {
+    let supported = [
+        (
+            "aarch64-apple-ios",
+            "ios",
+            "aarch64",
+            "",
+            "iOS",
+            2,
+            "IPHONEOS_DEPLOYMENT_TARGET",
+        ),
+        (
+            "x86_64-apple-ios",
+            "ios",
+            "x86_64",
+            "sim",
+            "iOS",
+            7,
+            "IPHONEOS_DEPLOYMENT_TARGET",
+        ),
+        (
+            "aarch64-apple-tvos",
+            "tvos",
+            "aarch64",
+            "",
+            "tvOS",
+            3,
+            "TVOS_DEPLOYMENT_TARGET",
+        ),
+        (
+            "x86_64-apple-tvos",
+            "tvos",
+            "x86_64",
+            "sim",
+            "tvOS",
+            8,
+            "TVOS_DEPLOYMENT_TARGET",
+        ),
+        (
+            "aarch64-apple-visionos",
+            "visionos",
+            "aarch64",
+            "",
+            "visionOS",
+            11,
+            "XROS_DEPLOYMENT_TARGET",
+        ),
+    ];
+    assert_eq!(build_support::STATIC_TARGETS.len(), supported.len());
+    for (triple, os, arch, abi, subdirectory, platform, variable) in supported {
+        let target = build_support::static_target(triple, os, arch, abi).unwrap();
+        assert_eq!(
+            (
+                target.sdk_subdirectory,
+                target.platform,
+                target.deployment_variable
+            ),
+            (subdirectory, platform, variable),
+            "{triple}"
+        );
+        // Pin the ABI rustc actually gives Cargo, including Intel simulators.
+        let cfg = std::process::Command::new("rustc")
+            .args(["--print", "cfg", "--target", triple])
+            .output()
+            .unwrap();
+        assert!(
+            cfg.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cfg.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&cfg.stdout)
+                .lines()
+                .any(|line| line == format!("target_abi=\"{abi}\"")),
+            "{triple}"
+        );
+    }
+    assert_eq!(
+        build_support::static_deployment_variables().collect::<Vec<_>>(),
+        [
+            "IPHONEOS_DEPLOYMENT_TARGET",
+            "TVOS_DEPLOYMENT_TARGET",
+            "XROS_DEPLOYMENT_TARGET"
+        ]
+    );
+}
+
+#[test]
+fn unsupported_apple_abis_fail_before_the_build_script_opens_an_sdk() {
+    let fixture = Sdk::new("unsupported-apple-build");
+    let executable = fixture
+        .root()
+        .join(format!("build-script{}", std::env::consts::EXE_SUFFIX));
+    let compiled = std::process::Command::new("rustc")
+        .args(["--edition=2021", "--deny=warnings", "build.rs", "-o"])
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for (triple, os, arch, abi) in [
+        ("aarch64-apple-ios-sim", "ios", "aarch64", "sim"),
+        ("aarch64-apple-tvos-sim", "tvos", "aarch64", "sim"),
+        ("aarch64-apple-visionos-sim", "visionos", "aarch64", "sim"),
+        ("aarch64-apple-ios-macabi", "ios", "aarch64", "macabi"),
+        ("x86_64-apple-ios-macabi", "ios", "x86_64", "macabi"),
+    ] {
+        let cfg = std::process::Command::new("rustc")
+            .args(["--print", "cfg", "--target", triple])
+            .output()
+            .unwrap();
+        assert!(
+            cfg.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cfg.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&cfg.stdout)
+                .lines()
+                .any(|line| line == format!("target_abi=\"{abi}\"")),
+            "{triple}"
+        );
+        let output = std::process::Command::new(&executable)
+            .env("TARGET", triple)
+            .env("CARGO_CFG_TARGET_OS", os)
+            .env("CARGO_CFG_TARGET_ARCH", arch)
+            .env("CARGO_CFG_TARGET_ABI", abi)
+            .env("OUT_DIR", fixture.root())
+            // This deliberately invalid path must never be consulted.
+            .env("NDI_SDK_DIR", fixture.root().join("missing-sdk"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{triple}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains(&format!("Unsupported Apple static target {triple};")),
+            "{error}"
+        );
+        assert!(
+            error.contains("docs/setup.md#apple-mobile-targets"),
+            "{error}"
+        );
+        assert!(!error.contains("NDI_SDK_DIR is not an NDI SDK"), "{error}");
+    }
+    // A supported target reaches SDK discovery after emitting all deployment
+    // inputs from the same table; it must not take the unsupported-ABI path.
+    let output = std::process::Command::new(&executable)
+        .env("TARGET", "aarch64-apple-ios")
+        .env("CARGO_CFG_TARGET_OS", "ios")
+        .env("CARGO_CFG_TARGET_ARCH", "aarch64")
+        .env("CARGO_CFG_TARGET_ABI", "")
+        .env("OUT_DIR", fixture.root())
+        .env("NDI_SDK_DIR", fixture.root().join("missing-sdk"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("NDI_SDK_DIR is not an NDI SDK"), "{error}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for target in build_support::STATIC_TARGETS {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line
+                    == format!("cargo:rerun-if-env-changed={}", target.deployment_variable)),
+            "{stdout}"
+        );
+    }
+}
+
 #[test]
 fn mobile_file_is_the_sole_archive_provider_and_old_sdk_remains_usable() {
     let sdk = Sdk::new("mobile-file");
     let core = sdk.artifact("lib/iOS/libndi_ios.a");
-    let selected = build_support::static_library(&sdk.located(), "ios", true).unwrap();
+    let selected =
+        build_support::static_library(&sdk.located(), apple_target("ios", "aarch64"), true)
+            .unwrap();
     assert_eq!(selected.archive, core);
     assert_eq!(selected.link_name, "ndi_ios");
     assert_eq!(selected.edition, Edition::Standard);
 
     let file = sdk.artifact("lib/iOS/libndifile_ios.a");
-    let selected = build_support::static_library(&sdk.located(), "ios", true).unwrap();
+    let selected =
+        build_support::static_library(&sdk.located(), apple_target("ios", "aarch64"), true)
+            .unwrap();
     assert_eq!(selected.archive, file);
     assert_eq!(selected.link_name, "ndifile_ios");
     // Without the feature the File archive is never linked.
-    let selected = build_support::static_library(&sdk.located(), "ios", false).unwrap();
+    let selected =
+        build_support::static_library(&sdk.located(), apple_target("ios", "aarch64"), false)
+            .unwrap();
     assert_eq!(selected.archive, core);
 
-    assert!(build_support::static_library(&sdk.located(), "tvos", true).is_err());
-    assert!(build_support::static_library(&sdk.located(), "linux", true).is_err());
+    assert!(
+        build_support::static_library(&sdk.located(), apple_target("tvos", "aarch64"), true)
+            .is_err()
+    );
+    assert!(
+        build_support::static_target("x86_64-unknown-linux-gnu", "linux", "x86_64", "").is_err()
+    );
 }
 
 #[test]
@@ -215,17 +412,20 @@ fn the_static_archive_of_the_sdk_decides_the_edition() {
     let located = sdk.located();
     // A File archive alone is not a core archive of either edition.
     sdk.artifact("lib/tvOS/libndifile_tvos.a");
-    let error = build_support::static_library(&located, "tvos", true).unwrap_err();
+    let error =
+        build_support::static_library(&located, apple_target("tvos", "aarch64"), true).unwrap_err();
     assert!(error.contains("NDI_SDK_DIR"), "{error}");
 
     let standard = sdk.artifact("lib/tvOS/libndi_tvos.a");
-    let selected = build_support::static_library(&located, "tvos", false).unwrap();
+    let selected =
+        build_support::static_library(&located, apple_target("tvos", "aarch64"), false).unwrap();
     assert_eq!(
         (selected.archive, selected.edition),
         (standard, Edition::Standard)
     );
     let advanced = sdk.artifact("lib/tvOS/libndi_advanced_tvos.a");
-    let selected = build_support::static_library(&located, "tvos", false).unwrap();
+    let selected =
+        build_support::static_library(&located, apple_target("tvos", "aarch64"), false).unwrap();
     assert_eq!(
         (selected.archive, selected.edition),
         (advanced, Edition::Advanced)
@@ -364,18 +564,26 @@ fn apple_static_validator_distinguishes_device_from_simulator_not_just_cpu() {
     let p = sdk.artifact("lib/iOS/test.a");
     fs::write(&p, apple_archive(2)).unwrap();
     assert_eq!(
-        build_apple::inspect(&p, "aarch64", "ios")
+        inspect_apple(&p, "aarch64", "ios")
             .unwrap()
             .deployment_floor,
         16 << 16
     );
     fs::write(&p, apple_archive(7)).unwrap();
-    assert!(build_apple::inspect(&p, "aarch64", "ios")
+    assert!(inspect_apple(&p, "aarch64", "ios")
         .map(|archive| archive.deployment_floor)
         .unwrap_err()
         .contains("device/simulator"));
+    // Match the expected platform even when the object CPU itself is right.
+    let simulator = apple_target("ios", "x86_64");
+    fs::write(&p, apple_cpu_archive(0x0100_0007, 2)).unwrap();
+    assert!(build_apple::inspect(&p, simulator.arch, simulator.platform)
+        .unwrap_err()
+        .contains("device/simulator"));
+    fs::write(&p, apple_cpu_archive(0x0100_0007, 7)).unwrap();
+    assert!(build_apple::inspect(&p, simulator.arch, simulator.platform).is_ok());
     fs::write(&p, &apple_archive(2)[..45]).unwrap();
-    assert!(build_apple::inspect(&p, "aarch64", "ios").is_err());
+    assert!(inspect_apple(&p, "aarch64", "ios").is_err());
 }
 
 #[test]
@@ -426,7 +634,7 @@ fn static_addresses_include_only_defined_external_symbols() {
         archive.push(b'\n');
     }
     fs::write(&p, archive).unwrap();
-    let inventory = build_apple::inspect(&p, "aarch64", "ios").unwrap();
+    let inventory = inspect_apple(&p, "aarch64", "ios").unwrap();
     assert_eq!(
         inventory.symbols,
         std::collections::HashSet::from(["NDIlib_initialize".to_owned()])
@@ -495,7 +703,7 @@ fn apple_thinning_selects_validated_bytes_for_both_fat_widths_and_byte_orders() 
                     big,
                 );
                 fs::write(&source, &original).unwrap();
-                let inspected = build_apple::inspect(&source, arch, "ios").unwrap();
+                let inspected = inspect_apple(&source, arch, "ios").unwrap();
                 assert_eq!(inspected.deployment_floor, 16 << 16);
                 inspected.write_thin(&output).unwrap();
                 assert_eq!(fs::read(&output).unwrap(), *expected);
@@ -509,7 +717,7 @@ fn apple_thinning_selects_validated_bytes_for_both_fat_widths_and_byte_orders() 
         }
     }
     fs::write(&source, &arm).unwrap();
-    build_apple::inspect(&source, "aarch64", "ios")
+    inspect_apple(&source, "aarch64", "ios")
         .unwrap()
         .write_thin(&output)
         .unwrap();
@@ -569,7 +777,7 @@ fn apple_fat_tables_reject_ambiguous_out_of_bounds_and_mismatched_slices() {
     for (index, bytes) in bad.iter().enumerate() {
         fs::write(&source, bytes).unwrap();
         assert!(
-            build_apple::inspect(&source, "aarch64", "ios").is_err(),
+            inspect_apple(&source, "aarch64", "ios").is_err(),
             "accepted invalid fixture {index}"
         );
     }
@@ -591,7 +799,7 @@ fn rustc_can_bundle_the_materialized_archive_without_an_apple_sdk() {
         fat_apple_archives(&[(0x0100_000c, arm), (0x0100_0007, intel)], true, false),
     )
     .unwrap();
-    build_apple::inspect(&original, "aarch64", "ios")
+    inspect_apple(&original, "aarch64", "ios")
         .unwrap()
         .write_thin(&thin)
         .unwrap();

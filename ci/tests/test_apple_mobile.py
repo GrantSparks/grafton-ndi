@@ -19,7 +19,7 @@ TARGETS = {
 }
 
 
-def commands(script):
+def commands(script, rejection='unsupported'):
     """Run the real script without downloads, compilation or an Apple SDK."""
     with tempfile.TemporaryDirectory(prefix='apple-mobile-ci-') as temporary:
         root = Path(temporary)
@@ -31,6 +31,14 @@ with open(os.environ['APPLE_MOBILE_COMMANDS'], 'a', encoding='utf-8') as log:
                           'environment': {name: os.environ.get(name) for name in
                                           ('IPHONEOS_DEPLOYMENT_TARGET', 'TVOS_DEPLOYMENT_TARGET',
                                            'XROS_DEPLOYMENT_TARGET')}}) + '\\n')
+if pathlib.Path(sys.argv[0]).name == 'cargo' and 'check' in sys.argv:
+    rejection = os.environ['APPLE_MOBILE_REJECTION']
+    if rejection == 'accepted':
+        sys.exit(0)
+    message = ('Unsupported Apple static target aarch64-apple-ios-sim; see docs/setup.md'
+               if rejection == 'unsupported' else 'unrelated compilation error')
+    print(message, file=sys.stderr)
+    sys.exit(1)
 '''
         for tool in ('cargo', 'rustup'):
             executable = root / tool
@@ -43,6 +51,7 @@ with open(os.environ['APPLE_MOBILE_COMMANDS'], 'a', encoding='utf-8') as log:
             'PATH': str(root) + os.pathsep + os.environ.get('PATH', os.defpath),
             'NDI_SDK_DIR': str(root / 'sdk'),
             'APPLE_MOBILE_COMMANDS': str(log),
+            'APPLE_MOBILE_REJECTION': rejection,
         }
         subprocess.run(['bash', str(source)], env=environment, check=True,
                        capture_output=True, text=True)
@@ -50,8 +59,13 @@ with open(os.environ['APPLE_MOBILE_COMMANDS'], 'a', encoding='utf-8') as log:
 
 
 def lint_violations(recorded):
-    cargo = [command for command in recorded if command['tool'] == 'cargo']
+    cargo = [command for command in recorded
+             if command['tool'] == 'cargo' and 'clippy' in command['arguments']]
     failures = []
+    negative = [command['arguments'] for command in recorded
+                if command['tool'] == 'cargo' and 'check' in command['arguments']]
+    if negative != [['+stable', 'check', '--locked', '--lib', '--target', 'aarch64-apple-ios-sim']]:
+        failures.append('must reject the ARM64 simulator with the build-script diagnostic')
     if len(cargo) != 2 * len(TARGETS):
         failures.append('every target must lint both feature sets')
     for target, (toolchain, variable, minimum) in TARGETS.items():
@@ -86,6 +100,14 @@ class AppleMobileTests(unittest.TestCase):
     def test_missing_feature_set_is_rejected(self):
         source = SCRIPT.read_text(encoding='utf-8').replace('--all-features ', '')
         self.assertTrue(lint_violations(commands(source)))
+
+    def test_successful_unsupported_target_build_is_rejected(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            commands(SCRIPT.read_text(encoding='utf-8'), rejection='accepted')
+
+    def test_unrelated_build_failure_is_rejected(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            commands(SCRIPT.read_text(encoding='utf-8'), rejection='unrelated')
 
 
 if __name__ == '__main__':
