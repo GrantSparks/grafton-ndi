@@ -244,7 +244,11 @@ pub enum LoadOrigin {
     Executable,
     /// The directory supplied through `NDI_RUNTIME_DIR_V6`.
     RuntimeDirectory,
-    /// A bare name or Apple `@rpath` searched by the platform loader.
+    /// An absolute `PATH` directory on Windows (or a refused relative entry).
+    PathDirectory,
+    /// An absolute `DYLD_LIBRARY_PATH` directory on Apple targets (or a refused relative entry).
+    DyldLibraryDirectory,
+    /// Unix's native search, Apple `@rpath`, or Windows' System32-only search.
     LoaderSearch,
     /// The SDK archive linked into the program at build time.
     LinkedArchive,
@@ -257,6 +261,8 @@ impl fmt::Display for LoadOrigin {
             Self::Companion => "next to the NDI runtime",
             Self::Executable => "next to the executable",
             Self::RuntimeDirectory => "NDI_RUNTIME_DIR_V6",
+            Self::PathDirectory => "PATH",
+            Self::DyldLibraryDirectory => "DYLD_LIBRARY_PATH",
             Self::LoaderSearch => "system library search",
             Self::LinkedArchive => "linked SDK archive",
         })
@@ -337,6 +343,8 @@ pub enum LoadRefusal {
     },
     /// `NDI_RUNTIME_DIR_V6` names a relative directory, which is never searched.
     RelativeRuntimeDirectory,
+    /// A `PATH` or `DYLD_LIBRARY_PATH` entry is relative or empty and was not opened.
+    RelativeSearchDirectory,
 }
 
 struct LoadRefusalDiagnostic<'a>(&'a LoadRefusal);
@@ -367,6 +375,7 @@ impl fmt::Display for LoadRefusalDiagnostic<'_> {
             LoadRefusal::ForeignRuntimeInScope { module } => write!(f,
                 "the process's global symbol scope already holds another NDI runtime ({}); select that runtime or stop linking or preloading it", module.display()),
             LoadRefusal::RelativeRuntimeDirectory => f.write_str("the runtime directory must be absolute"),
+            LoadRefusal::RelativeSearchDirectory => f.write_str("the library search directory must be absolute and nonempty"),
         }
     }
 }
@@ -542,6 +551,7 @@ mod tests {
             (LoadRefusal::BoundToAnotherRuntime, "it is bound to an NDI runtime other than the selected one"),
             (LoadRefusal::ForeignRuntimeInScope { module: "preloaded.so".into() }, "the process's global symbol scope already holds another NDI runtime (preloaded.so); select that runtime or stop linking or preloading it"),
             (LoadRefusal::RelativeRuntimeDirectory, "the runtime directory must be absolute"),
+            (LoadRefusal::RelativeSearchDirectory, "the library search directory must be absolute and nonempty"),
         ];
         for (refusal, expected) in cases {
             assert_eq!(refusal.to_string(), expected, "{refusal:?}");

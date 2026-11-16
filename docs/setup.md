@@ -31,12 +31,22 @@ or run `cargo clean -p grafton-ndi` to trigger a rebuild.
 1. The executable's directory.
 2. An absolute `NDI_RUNTIME_DIR_V6`. Relative values are recorded as refused
    locations and never searched; the platform loader search still runs.
-3. The platform loader's search path (`rpath`, `LD_LIBRARY_PATH`, `PATH` and system directories).
+3. Platform-specific locations: Windows expands absolute `PATH` directories,
+   then performs a System32-only name lookup; macOS tries `@rpath/<name>` and
+   absolute `DYLD_LIBRARY_PATH` directories; Linux and Android retain their
+   native loader search (`rpath`, `LD_LIBRARY_PATH` and system locations).
+
+On Windows and macOS, the working directory is never added to this search.
+Relative or empty `PATH`/`DYLD_LIBRARY_PATH` entries are recorded as refused
+locations and never opened. In unrestricted macOS processes dyld consults
+`DYLD_LIBRARY_PATH` even for an absolute path; the crate refuses a substitute
+with `LoadRefusal::ResolvedToAnotherFile`. Native dependencies still follow
+platform loader rules. On Linux and Android, explicitly configured relative
+or empty `LD_LIBRARY_PATH` entries can still name the working directory.
 
 At each location it tries both edition names unless you [request one](#sdk-editions).
 Builds with `advanced`, or with `file-io` on Linux, macOS or Android, try Advanced
-first; other builds try Standard first. macOS first tries `@rpath/<name>` in
-its platform search. Missing, unloadable or incompatible candidates do not stop
+first; other builds try Standard first. Missing, unloadable or incompatible candidates do not stop
 the search.
 
 | Platform | Standard name | Advanced name |
@@ -131,7 +141,10 @@ fields for decisions and `Display` for diagnostics.
 Package the runtime explicitly; a dynamically loaded library is not a static
 link dependency. **Default search trusts every searched directory:** loading
 native code executes its constructors before symbols or edition can be checked,
-even for rejected candidates. For a service, select an absolute path in an
+even for rejected candidates. Windows and macOS do not implicitly search the
+working directory; their environment search entries must be absolute. Linux
+and Android retain the native loader's environment search. For a service,
+select an absolute path in an
 application-owner-controlled directory before another component selects a runtime:
 
 ```rust

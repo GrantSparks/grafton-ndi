@@ -72,8 +72,17 @@
 //! 1. the directory containing the running executable;
 //! 2. the absolute directory named by `NDI_RUNTIME_DIR_V6`; relative values
 //!    are recorded as refused locations and never searched;
-//! 3. the platform loader's own search for the library name (`rpath`,
-//!    `LD_LIBRARY_PATH`, `PATH` and the system library directories).
+//! 3. platform-specific locations: on Windows, absolute `PATH` directories
+//!    followed by a System32-only name lookup; on macOS, `@rpath/<name>` and
+//!    absolute `DYLD_LIBRARY_PATH` directories; on Linux and Android, the
+//!    native loader search (`rpath`, `LD_LIBRARY_PATH` and system locations).
+//!
+//! Windows and macOS never add the working directory to this search. Relative
+//! or empty `PATH`/`DYLD_LIBRARY_PATH` entries are recorded as refused locations.
+//! On unrestricted macOS processes dyld can substitute `DYLD_LIBRARY_PATH`
+//! even for an absolute path; such substitutions are refused with
+//! [`crate::LoadRefusal::ResolvedToAnotherFile`]. Native dependencies still
+//! follow platform loader rules.
 //!
 //! Each location is tried for the file names of both SDK editions, for
 //! example `libndi.so.6` and `libndi_advanced.so.6` on Linux, unless
