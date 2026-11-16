@@ -11,7 +11,7 @@ use std::{
     ptr,
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -384,132 +384,13 @@ pub struct Sender<M: SenderMode = RawSend> {
     _mode: PhantomData<M>,
 }
 
-/// The video pipeline of a sender that sends uncompressed video: the frame
-/// the SDK may still be reading, or the one it last released, the copy a
-/// synchronous send makes of a frame it cannot send in place.
-///
-/// It owns the native resource it drains through, so that resource remains
-/// alive throughout the pipeline's destructor.
-struct VideoPipeline {
-    owner: Arc<SenderResource>,
-    state: Mutex<VideoState>,
-}
-
-/// What a sender's video operations share, behind one lock.
-#[derive(Default)]
-struct VideoState {
-    /// The frame an asynchronous send lent the SDK.
-    in_flight: InFlight<Sendable<VideoFrame>>,
-    /// The pixels of the last borrowed frame that did not
-    /// [send in place](BorrowedVideoFrame::sends_in_place), which the SDK
-    /// read from here instead. Empty until such a frame is sent, then kept
-    /// for the next one.
-    staging: Pixels,
-    /// A released frame kept for the next asynchronous copy. This is never
-    /// the allocation the SDK is still reading from `in_flight`.
-    spare: Option<VideoFrame>,
-}
-
-impl VideoPipeline {
-    fn new(owner: Arc<SenderResource>) -> Self {
-        Self {
-            owner,
-            state: Mutex::new(VideoState::default()),
-        }
-    }
-
-    /// Lock the video state and make one synchronizing SDK call through `call`.
-    fn synchronize<R>(&self, call: impl FnOnce(&mut VideoState, SendHandle<'_>) -> R) -> R {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        call(&mut state, self.owner.handle())
-    }
-
-    /// Exclusive callers already serialize the state through their borrow.
-    fn exclusive(&mut self) -> (&mut VideoState, SendHandle<'_>) {
-        let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        (state, self.owner.handle())
-    }
-
-    /// Send the checked frame synchronously, completing the previous loan.
-    fn send(&self, frame: Sendable<&(impl VideoSource + ?Sized)>) -> Result<()> {
-        self.synchronize(|state, sender| {
-            let prepared = PreparedVideo::authorized(frame, &mut state.staging);
-            let synchronized = state.in_flight.send(sender, prepared);
-            state.in_flight.completed(synchronized);
-        });
-        Ok(())
-    }
-
-    fn submit(&mut self, frame: Sendable<VideoFrame>) -> Option<VideoFrame> {
-        let (state, sender) = self.exclusive();
-        let (mut displaced, synchronized) = state.in_flight.submit(sender, frame, ());
-        displaced.completed(synchronized);
-        displaced.take_retained().map(Sendable::into_frame)
-    }
-
-    fn copy(&mut self, frame: Sendable<&(impl VideoSource + ?Sized)>) {
-        let (state, sender) = self.exclusive();
-        let owned = frame.copied(state.spare.take());
-        let (mut displaced, synchronized) = state.in_flight.submit(sender, owned, ());
-        displaced.completed(synchronized);
-        state.spare = displaced.take_retained().map(Sendable::into_frame);
-    }
-
-    /// Wait for the SDK to release the frame in flight, which stays retained.
-    fn flush(&self) {
-        self.synchronize(|state, sender| drain(&mut state.in_flight, sender));
-    }
-
-    /// Drain the SDK and take the retained frame.
-    fn finish(&mut self) -> Option<VideoFrame> {
-        let (state, sender) = self.exclusive();
-        drain(&mut state.in_flight, sender);
-        state.spare = None;
-        state.in_flight.take_retained().map(Sendable::into_frame)
-    }
-
-    /// End the pipeline: drain the SDK and take the retained frame.
-    #[cfg(all(feature = "advanced", ndi_has_advanced_send_completion))]
-    fn retire(mut self) -> Option<VideoFrame> {
-        let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        drain(&mut state.in_flight, self.owner.handle());
-        state.in_flight.take_retained().map(Sendable::into_frame)
-        // Dropping the idle pipeline makes no SDK call.
-    }
-}
-
-impl Drop for VideoPipeline {
-    /// Drain the SDK while destruction holds the state exclusively.
-    fn drop(&mut self) {
-        // The native sender may outlive this pipeline when an advertiser
-        // registration shares it, so the pipeline drains the SDK itself
-        // rather than relying on the sender's destruction.
-        let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        drain(&mut state.in_flight, self.owner.handle());
-    }
-}
-
-// SAFETY: The descriptor uses this frame's own validated geometry and borrows
-// its owned initialized pixels and terminated FrameMetadata.
-// owned_video_descriptor reserves the scan-dependent SDK room before lending.
-// Moving the frame moves none of those
-// allocations, which InFlight keeps inaccessible until the SDK releases them.
+// SAFETY: The descriptor borrows this frame's initialized owned storage and
+// terminated metadata; moving it does not move its allocations. The loan's
+// reserved tail remains inaccessible until the owning stream releases it.
 unsafe impl in_flight::Lend for Sendable<VideoFrame> {
-    type Authorization = ();
-    fn lend(&mut self, (): ()) -> in_flight::Lent {
+    fn lend(&mut self) -> in_flight::Lent {
         in_flight::Lent::Frame(self.owned_video_descriptor())
     }
-}
-
-/// Synchronize the SDK if it may still read `state`'s frame, then complete
-/// it: the release a flush, a finish and the pipeline's destruction share.
-fn drain(state: &mut InFlight<Sendable<VideoFrame>>, sender: SendHandle<'_>) {
-    if !state.is_in_flight() {
-        // A retained frame was completed when the SDK released it.
-        return;
-    }
-    let synchronized = state.flush(sender);
-    state.completed(synchronized);
 }
 
 /// Frames an asynchronous video send lends to the SDK, and the SDK calls that
@@ -524,19 +405,12 @@ fn drain(state: &mut InFlight<Sendable<VideoFrame>>, sender: SendHandle<'_>) {
 /// retains each stream's frame until a replacement on that stream returns,
 /// even when another stream's video send has already synchronized the SDK.
 ///
-/// [`InFlight`] holds one stream's lent frame. It hands the frame back only in
-/// exchange for [`in_flight::Synchronized`], the proof that the SDK has returned from a
-/// synchronizing call made after the frame was submitted, or [`Destroyed`],
-/// the proof that its native sender no longer exists. Both proofs have
-/// private fields, so the rest of the crate obtains one only from the
-/// functions here, each of which returns it after the SDK call has returned.
-///
-/// Each synchronizing call takes the slot by `&mut`, so its caller holds the
-/// slot, by a lock or by `&mut`: one slot's calls never overlap. Each takes
-/// `sender`, the live sender whose stream the slot holds. A [`VideoPipeline`]
-/// owns the resource it drains through; exclusively held senders use
-/// [`in_flight::Lending`] to destroy the sender before releasing its loans.
-/// A slot dropped without proof leaks an in-flight frame rather than freeing it.
+/// [`in_flight::InFlight`] retains a stream's frame. Native synchronization and release
+/// happen together through a private [`in_flight::Stream`] paired by its owner
+/// with that owner's live sender. No synchronization token or independently
+/// supplied handle can release another sender's loan. Exclusive senders use
+/// [`in_flight::Lending`] to destroy the sender before releasing all its loans.
+/// A slot dropped without release leaks its frame rather than freeing it.
 ///
 /// [NDI-Send]: https://docs.ndi.video/all/developing-with-ndi/sdk/ndi-send
 pub(crate) mod in_flight {
@@ -544,27 +418,132 @@ pub(crate) mod in_flight {
 
     #[cfg(feature = "advanced")]
     use super::Exclusive;
-    use super::{async_flush_frame_ptr, PreparedVideo, SendHandle};
+    use super::{async_flush_frame_ptr, PreparedVideo, SendHandle, SenderResource};
     #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
     use crate::sys::advanced::{FrameScatter, ScatterSend};
     use crate::{frames::Sendable, sys::bindings::NDIlib_video_frame_v2_t, VideoFrame};
+    use crate::{frames::VideoSource, pixels::Pixels, Result};
+    use std::sync::{Arc, Mutex};
 
-    /// Proof that the SDK has returned from a call that synchronizes a
-    /// stream's asynchronous video: an asynchronous or synchronous video
-    /// send, or a null flush. `Processing.NDI.Send.h` lists subsequent video
-    /// sends; [NDI-Send] additionally documents the null asynchronous flush.
-    /// When the call returns, the SDK no longer reads the previous frame.
-    ///
-    /// [`InFlight::completed`] consumes it, so a frame is released only after
-    /// the call that ended the SDK's access to it.
-    ///
-    /// [NDI-Send]: https://docs.ndi.video/all/developing-with-ndi/sdk/ndi-send
-    #[must_use = "the proof releases the frame the SDK synchronized"]
-    pub(crate) struct Synchronized {
-        _private: (),
+    /// A slot paired by its owning pipeline or loan owner with its sender.
+    /// Fields are private and there is no constructor accepting a free slot
+    /// and handle, so synchronizing callers cannot exchange either half.
+    pub(crate) struct Stream<'a, T> {
+        slot: &'a mut InFlight<T>,
+        sender: SendHandle<'a>,
     }
 
-    const _: () = assert!(std::mem::size_of::<Synchronized>() == 0);
+    /// An uncompressed sender's native owner and all of its video storage.
+    /// Pairing stays in this module, including during destruction.
+    pub(super) struct VideoPipeline {
+        owner: Arc<SenderResource>,
+        state: Mutex<VideoState>,
+    }
+
+    #[derive(Default)]
+    pub(super) struct VideoState {
+        pub(super) in_flight: InFlight<Sendable<VideoFrame>>,
+        pub(super) staging: Pixels,
+        pub(super) spare: Option<VideoFrame>,
+    }
+
+    struct VideoPair<'a> {
+        stream: Stream<'a, Sendable<VideoFrame>>,
+        staging: &'a mut Pixels,
+        spare: &'a mut Option<VideoFrame>,
+    }
+
+    impl VideoPipeline {
+        pub(super) fn new(owner: Arc<SenderResource>) -> Self {
+            Self {
+                owner,
+                state: Mutex::new(VideoState::default()),
+            }
+        }
+
+        fn synchronize<R>(&self, call: impl FnOnce(VideoPair<'_>) -> R) -> R {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let VideoState {
+                in_flight,
+                staging,
+                spare,
+            } = &mut *state;
+            call(VideoPair {
+                stream: Stream {
+                    slot: in_flight,
+                    sender: self.owner.handle(),
+                },
+                staging,
+                spare,
+            })
+        }
+
+        fn exclusive(&mut self) -> VideoPair<'_> {
+            let VideoState {
+                in_flight,
+                staging,
+                spare,
+            } = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+            VideoPair {
+                stream: Stream {
+                    slot: in_flight,
+                    sender: self.owner.handle(),
+                },
+                staging,
+                spare,
+            }
+        }
+
+        pub(super) fn send(&self, frame: Sendable<&(impl VideoSource + ?Sized)>) -> Result<()> {
+            self.synchronize(|mut pair| {
+                let prepared = PreparedVideo::authorized(frame, pair.staging);
+                pair.stream.send(prepared);
+            });
+            Ok(())
+        }
+
+        pub(super) fn submit(&mut self, frame: Sendable<VideoFrame>) -> Option<VideoFrame> {
+            self.exclusive()
+                .stream
+                .submit(frame)
+                .map(Sendable::into_frame)
+        }
+
+        pub(super) fn copy(&mut self, frame: Sendable<&(impl VideoSource + ?Sized)>) {
+            let mut pair = self.exclusive();
+            let owned = frame.copied(pair.spare.take());
+            *pair.spare = pair.stream.submit(owned).map(Sendable::into_frame);
+        }
+
+        pub(super) fn flush(&self) {
+            self.synchronize(|mut pair| pair.stream.flush());
+        }
+
+        pub(super) fn finish(&mut self) -> Option<VideoFrame> {
+            let mut pair = self.exclusive();
+            pair.stream.flush();
+            *pair.spare = None;
+            pair.stream.slot.take_retained().map(Sendable::into_frame)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_state(&self) -> std::sync::MutexGuard<'_, VideoState> {
+            self.state.lock().unwrap()
+        }
+
+        #[cfg(all(feature = "advanced", ndi_has_advanced_send_completion))]
+        pub(super) fn retire(mut self) -> Option<VideoFrame> {
+            self.finish()
+        }
+    }
+
+    impl Drop for VideoPipeline {
+        fn drop(&mut self) {
+            // Advertisements may retain the native resource, so drain this
+            // pipeline while its own owner and every pointee remain live.
+            self.exclusive().stream.flush();
+        }
+    }
 
     /// Proof that a native sender has been destroyed, which ends the SDK's
     /// access to every frame it was lent, on every stream.
@@ -708,20 +687,29 @@ pub(crate) mod in_flight {
             next: crate::advanced::PendingVideo,
         ) -> Option<crate::advanced::SubmittedVideo> {
             let tier = next.tier();
-            let (displaced, synchronized) =
-                self.loans.slot(tier).submit(self.sender.handle(), next, ());
-            self.loans.reclaim_displaced(tier, displaced, synchronized)
+            Stream {
+                slot: self.loans.slot(tier),
+                sender: self.sender.handle(),
+            }
+            .submit(next)
+            .map(crate::advanced::PendingVideo::into_submitted)
         }
 
         /// A null asynchronous flush synchronizes this sender's two streams
-        /// together. Keep its one proof inside this paired operation until
-        /// both slots are marked released, then recover their owned frames.
+        /// together. Release both slots inside this owner operation, then
+        /// recover their owned frames.
         pub(crate) fn finish(&mut self) -> crate::advanced::ReclaimedVideo {
             use crate::StreamTier::{Preview, Program};
             if self.loans.slot(Program).is_in_flight() || self.loans.slot(Preview).is_in_flight() {
-                let synchronized = self.loans.slot(Program).flush(self.sender.handle());
-                let _ = self.loans.slot(Program).completed_with(&synchronized);
-                let _ = self.loans.slot(Preview).completed_with(&synchronized);
+                // One native flush synchronizes both slots of this paired
+                // sender. Keep both releases inside this owner operation.
+                let mut program = Stream {
+                    slot: self.loans.slot(Program),
+                    sender: self.sender.handle(),
+                };
+                program.flush_native();
+                program.slot.mark_released();
+                self.loans.slot(Preview).mark_released();
             }
             self.loans.take_retained()
         }
@@ -773,10 +761,7 @@ pub(crate) mod in_flight {
     /// SDK goes on using them after the frame has moved into its slot, and
     /// the slot gives no access to a frame in flight.
     pub(crate) unsafe trait Lend {
-        /// The descriptors that lend this frame to the SDK.
-        type Authorization;
-
-        fn lend(&mut self, authorization: Self::Authorization) -> Lent;
+        fn lend(&mut self) -> Lent;
     }
 
     /// What an asynchronous video send hands the SDK.
@@ -821,7 +806,7 @@ pub(crate) mod in_flight {
         /// including metadata, scatter list, arrays and payload, stays allocated
         /// and inaccessible until native synchronization or completion ends
         /// the loan. Any displaced loan stays live through this call's return.
-        pub(super) unsafe fn submit(
+        unsafe fn submit(
             &self,
             sender: SendHandle<'_>,
             descriptor: *const NDIlib_video_frame_v2_t,
@@ -851,17 +836,8 @@ pub(crate) mod in_flight {
         }
     }
 
-    /// One stream's asynchronously sent frame, and whether the SDK may still
-    /// read it.
-    ///
-    /// A frame in flight always exists, so the slot cannot say "in flight"
-    /// without the allocation the SDK is reading. A frame leaves the in-flight
-    /// state only through [`Self::completed`], which takes the proof that the
-    /// SDK has synchronized, by being displaced by [`Self::submit`], which
-    /// hands it back only with that proof, or through
-    /// [`Self::into_released`], which takes the proof that the sender was
-    /// destroyed. Only a retained frame can be taken out. The state is
-    /// private to this module, so no other code can reach a frame in flight.
+    /// One stream's retained storage. Only its private owner-bound Stream
+    /// can synchronize native access and mark an in-flight frame released.
     pub(crate) struct InFlight<T>(State<T>);
 
     #[derive(Default)]
@@ -886,19 +862,7 @@ pub(crate) mod in_flight {
             matches!(self.0, State::InFlight(_))
         }
 
-        /// Mark the frame in flight as released, returning it. Returns `None`
-        /// when no frame was in flight.
-        ///
-        /// `_synchronized` proves that the SDK has returned from a
-        /// synchronizing call on this slot's stream made after the frame was
-        /// submitted.
-        pub(crate) fn completed(&mut self, _synchronized: Synchronized) -> Option<&T> {
-            self.completed_with(&_synchronized)
-        }
-
-        /// Only this module may share a sender-wide synchronization proof
-        /// across the slots belonging to the paired sender that minted it.
-        fn completed_with(&mut self, _synchronized: &Synchronized) -> Option<&T> {
+        fn mark_released(&mut self) -> Option<&T> {
             match mem::take(&mut self.0) {
                 State::InFlight(frame) => {
                     self.0 = State::Retained(frame);
@@ -907,30 +871,6 @@ pub(crate) mod in_flight {
                 other => {
                     self.0 = other;
                     None
-                }
-            }
-        }
-
-        /// Release the frame `synchronized` proves the SDK has finished with,
-        /// and take it, or the frame already retained.
-        #[cfg(feature = "advanced")]
-        #[cfg(test)]
-        pub(crate) fn release(self, synchronized: Synchronized) -> Option<T> {
-            self.release_with(synchronized, |frame, _| frame)
-        }
-
-        /// Consume a synchronization proof while releasing both a frame and
-        /// any descriptor keys it owns through the same proven operation.
-        #[cfg(feature = "advanced")]
-        pub(crate) fn release_with<R>(
-            mut self,
-            synchronized: Synchronized,
-            release: impl FnOnce(T, &Synchronized) -> R,
-        ) -> Option<R> {
-            match mem::take(&mut self.0) {
-                State::Idle => None,
-                State::Retained(frame) | State::InFlight(frame) => {
-                    Some(release(frame, &synchronized))
                 }
             }
         }
@@ -988,69 +928,52 @@ pub(crate) mod in_flight {
         }
     }
 
-    impl<T: Lend> InFlight<T> {
-        /// Make `next` the frame in flight and lend it to the SDK. Returns
-        /// the state it displaced, whose frame the SDK has released, with the
-        /// proof of that release.
-        pub(super) fn submit(
-            &mut self,
-            sender: SendHandle<'_>,
-            mut next: T,
-            authorization: T::Authorization,
-        ) -> (Self, Synchronized) {
-            let lent = next.lend(authorization);
-            // The slot owns the new frame before the SDK sees it. Moving the
-            // frame does not move what `lent` points to (the contract of
-            // `Lend`).
-            let displaced = Self(mem::replace(&mut self.0, State::InFlight(next)));
-            // SAFETY: the slot owns the new payload and stable scatter list;
-            // this call-scoped header stays readable through submission. The
-            // displaced frame remains owned across this call and is returned
-            // only with the synchronization proof produced after it returns.
-            unsafe { lent.submit(sender, lent.descriptor()) };
-            (displaced, Synchronized { _private: () })
+    impl<T: Lend> Stream<'_, T> {
+        /// Install the new loan before dispatch and return displaced storage
+        /// only after this same sender's synchronizing call has returned.
+        fn submit(&mut self, mut next: T) -> Option<T> {
+            let lent = next.lend();
+            let mut displaced = InFlight(mem::replace(&mut self.slot.0, State::InFlight(next)));
+            // SAFETY: pairing is private to the slot's owning pipeline or
+            // LoanPair. Both new and displaced allocations remain owned
+            // through dispatch; Lend's contract retains every stable pointee.
+            unsafe { lent.submit(self.sender, lent.descriptor()) };
+            displaced.mark_released();
+            displaced.take_retained()
         }
     }
 
-    impl<T> InFlight<T> {
-        /// Wait for the SDK to release the frame in flight by passing a true
-        /// NULL frame pointer, the SDK's documented request to drain the
-        /// asynchronous buffer.
-        pub(super) fn flush(&mut self, sender: SendHandle<'_>) -> Synchronized {
-            // SAFETY: `sender` is the live sender whose stream this slot
-            // holds, and a null frame pointer is the SDK's documented request
-            // to drain the async buffer.
+    impl<T> Stream<'_, T> {
+        fn flush_native(&mut self) {
+            // SAFETY: this pair's owner retains its live sender and slots.
+            // A true null descriptor drains that sender's asynchronous loans.
             unsafe {
-                sender
-                    .core
-                    .NDIlib_send_send_video_async_v2(sender.instance.0, async_flush_frame_ptr())
+                self.sender.core.NDIlib_send_send_video_async_v2(
+                    self.sender.instance.0,
+                    async_flush_frame_ptr(),
+                )
             };
-            Synchronized { _private: () }
+        }
+
+        fn flush(&mut self) {
+            if self.slot.is_in_flight() {
+                self.flush_native();
+                self.slot.mark_released();
+            }
         }
     }
 
-    impl InFlight<Sendable<VideoFrame>> {
-        /// Send `frame` synchronously. When this returns, the SDK has
-        /// finished reading `frame` and has released the frame in flight.
-        pub(super) fn send(
-            &mut self,
-            sender: SendHandle<'_>,
-            frame: PreparedVideo<'_>,
-        ) -> Synchronized {
-            let raw = frame.raw;
-            // SAFETY: `sender` is the live sender whose stream this slot
-            // holds. `raw` points into pixels and metadata that `frame`
-            // borrows for longer than this call, and the pixels are followed
-            // by the room the SDK reads after a frame of their format, which
-            // the caller checked or made by staging the frame; the SDK has
-            // finished reading them when the synchronous send returns and
-            // keeps no reference afterwards.
+    impl Stream<'_, Sendable<VideoFrame>> {
+        fn send(&mut self, frame: PreparedVideo<'_>) {
+            // SAFETY: the pair retains the slot's live sender. PreparedVideo
+            // borrows initialized input or padded staging through this call;
+            // the synchronous send also ends this sender's previous loan.
             unsafe {
-                sender
+                self.sender
                     .core
-                    .NDIlib_send_send_video_v2(sender.instance.0, &raw)
+                    .NDIlib_send_send_video_v2(self.sender.instance.0, &frame.raw)
             };
-            Synchronized { _private: () }
+            self.slot.mark_released();
         }
     }
 
@@ -1078,116 +1001,6 @@ pub(crate) mod in_flight {
     #[cfg(test)]
     mod tests {
         use super::*;
-
-        /// Native dispatch is confined to the owner module, whose opaque
-        /// pairs accept fresh frames rather than foreign handles or admissions.
-        #[test]
-        fn native_loan_dispatch_stays_inside_the_sender_owner() {
-            use syn::{ImplItem, Item, Type, Visibility};
-            let file = syn::parse_file(include_str!("sender.rs")).unwrap();
-            let owner = file
-                .items
-                .iter()
-                .find_map(|item| match item {
-                    Item::Mod(module) if module.ident == "in_flight" => {
-                        module.content.as_ref().map(|(_, items)| items)
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            let type_name = |ty: &Type| match ty {
-                Type::Path(path) => path.path.segments.last().unwrap().ident.to_string(),
-                _ => String::new(),
-            };
-            for item in &file.items {
-                if let Item::Struct(handle) = item {
-                    if handle.ident == "SendHandle" {
-                        assert!(matches!(handle.vis, Visibility::Inherited));
-                    }
-                }
-                if let Item::Impl(implementation) = item {
-                    if type_name(&implementation.self_ty) == "Sender" {
-                        for item in &implementation.items {
-                            if let ImplItem::Fn(method) = item {
-                                if method.sig.ident == "handle" {
-                                    assert!(matches!(method.vis, Visibility::Inherited));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let mut primitives = Vec::new();
-            let mut paired = Vec::new();
-            for item in owner {
-                if let Item::Struct(pair) = item {
-                    if pair.ident == "LoanPair" {
-                        assert!(pair
-                            .fields
-                            .iter()
-                            .all(|field| matches!(field.vis, Visibility::Inherited)));
-                    }
-                }
-                let Item::Impl(implementation) = item else {
-                    continue;
-                };
-                let name = type_name(&implementation.self_ty);
-                for item in &implementation.items {
-                    let ImplItem::Fn(method) = item else { continue };
-                    let method_name = method.sig.ident.to_string();
-                    if name == "Lending" && method_name == "close" {
-                        assert_eq!(
-                            method.sig.inputs.len(),
-                            1,
-                            "close must not expose a raw destruction proof to a callback"
-                        );
-                    }
-                    if name == "LoanPair"
-                        && ["submit_pending", "submit_scatter", "try_submit_queued"]
-                            .contains(&method_name.as_str())
-                    {
-                        assert_eq!(
-                            method.sig.inputs.len(),
-                            2,
-                            "paired submission takes only its owner and fresh frame"
-                        );
-                    }
-                    if name == "LoanPair" && method_name == "finish" {
-                        assert_eq!(
-                            method.sig.inputs.len(),
-                            1,
-                            "paired finishing must derive its sender and slots from its owner"
-                        );
-                    }
-                    if name == "LoanPair" && ["sender", "loans"].contains(&method_name.as_str()) {
-                        let syn::ReturnType::Type(_, ty) = &method.sig.output else {
-                            panic!("paired accessor must be immutable")
-                        };
-                        let Type::Reference(reference) = &**ty else {
-                            panic!("paired accessor must borrow")
-                        };
-                        assert!(reference.mutability.is_none());
-                    }
-                    if (name == "InFlight"
-                        && ["submit", "send", "flush"].contains(&method_name.as_str()))
-                        || (name == "Lent" && method_name == "submit")
-                    {
-                        let Visibility::Restricted(visibility) = &method.vis else {
-                            panic!("{name}::{method_name} escaped the sender owner");
-                        };
-                        assert!(visibility.path.is_ident("super"));
-                        primitives.push((name.clone(), method_name.clone()));
-                    }
-                    if name == "LoanPair" && !matches!(method.vis, Visibility::Inherited) {
-                        assert!(["sender", "loans", "shared", "submit_pending", "submit_scatter", "finish", "try_submit_queued"].contains(&method_name.as_str()),
-                            "new paired operation needs an ownership-contract review: {method_name}");
-                        paired.push(method_name);
-                    }
-                }
-            }
-            assert_eq!(primitives.len(), 4);
-            assert_eq!(paired.len(), 7);
-        }
 
         #[test]
         fn an_unproven_drop_leaks_the_native_loan() {
@@ -1219,9 +1032,9 @@ pub(crate) mod in_flight {
             let mut slot = InFlight(State::InFlight(1u8));
             assert!(slot.take_retained().is_none());
             assert!(slot.is_in_flight());
-            assert_eq!(slot.completed(Synchronized { _private: () }), Some(&1));
+            assert_eq!(slot.mark_released(), Some(&1));
             assert!(!slot.is_in_flight());
-            assert_eq!(slot.completed(Synchronized { _private: () }), None);
+            assert_eq!(slot.mark_released(), None);
             assert_eq!(slot.take_retained(), Some(1));
             assert!(slot.take_retained().is_none());
             assert!(slot.frame().is_none());
@@ -1230,7 +1043,11 @@ pub(crate) mod in_flight {
         #[cfg(feature = "advanced")]
         #[test]
         fn a_displaced_or_destroyed_slot_hands_back_what_it_held() {
-            let release = |state| InFlight(state).release(Synchronized { _private: () });
+            let release = |state| {
+                let mut slot = InFlight(state);
+                slot.mark_released();
+                slot.take_retained()
+            };
             assert_eq!(release(State::InFlight(1u8)), Some(1));
             assert_eq!(release(State::Retained(2)), Some(2));
             assert_eq!(release(State::Idle), None);
@@ -1243,7 +1060,7 @@ pub(crate) mod in_flight {
     }
 }
 
-use in_flight::InFlight;
+use in_flight::VideoPipeline;
 
 impl<M: SenderMode> fmt::Debug for Sender<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2838,7 +2655,7 @@ mod tests {
         assert_ne!(raw.p_data.cast_const(), frame.data().as_ptr());
         assert_extent(&raw, staging.as_ptr(), staging.len() + staging.room());
         let mut owned = Sendable::for_test(frame);
-        let lent = in_flight::Lend::lend(&mut owned, ());
+        let lent = in_flight::Lend::lend(&mut owned);
         assert!(owned.frame().can_send_direct());
         assert_eq!(
             owned.tail_room(),
@@ -3018,7 +2835,7 @@ mod tests {
             // its authorization is still that of the padded source.
             let mut owned = Sendable::for_test(&frame).copied(None);
             #[allow(irrefutable_let_patterns)]
-            let in_flight::Lent::Frame(raw) = in_flight::Lend::lend(&mut owned, ()) else {
+            let in_flight::Lent::Frame(raw) = in_flight::Lend::lend(&mut owned) else {
                 panic!("pixels")
             };
             assert_eq!(
@@ -3033,7 +2850,7 @@ mod tests {
             if let Some(mut sender) = test_sender() {
                 sender.submit_video_copy(&frame).unwrap();
                 {
-                    let state = sender.native.video.state.lock().unwrap();
+                    let state = sender.native.video.test_state();
                     let retained = state.in_flight.frame().unwrap();
                     assert_extent(
                         &retained.as_test_raw(),
@@ -3105,7 +2922,7 @@ mod tests {
         let metadata = first.metadata_cstr().unwrap().as_ptr();
         assert!(sender.submit_video(first).unwrap().is_none());
         {
-            let video = sender.native.video.state.lock().unwrap();
+            let video = sender.native.video.test_state();
             let Some(frame) = video.in_flight.frame() else {
                 panic!("missing owned frame")
             };
@@ -3187,7 +3004,7 @@ mod tests {
         assert_eq!(copy.picture_aspect_ratio().get(), 1.25);
         assert_eq!(copy.timecode(), Timecode::from_ticks(1234));
         assert_eq!(copy.metadata(), Some("<metadata/>"));
-        assert!(sender.native.video.state.lock().unwrap().spare.is_none());
+        assert!(sender.native.video.test_state().spare.is_none());
         assert!(sender.reclaim_video().is_none());
     }
 
@@ -3212,7 +3029,7 @@ mod tests {
         sender.submit_video_copy(&present).unwrap();
         // Exclusive async sends do not lock the state. Warm this test's
         // inspection lock, whose first use may allocate on some platforms.
-        drop(sender.native.video.state.lock().unwrap());
+        drop(sender.native.video.test_state());
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
             for _ in 0..4 {
                 for (source, expected) in [
@@ -3221,7 +3038,7 @@ mod tests {
                     (&present, Some("<metadata/>")),
                 ] {
                     sender.submit_video_copy(source).unwrap();
-                    let state = sender.native.video.state.lock().unwrap();
+                    let state = sender.native.video.test_state();
                     assert_eq!(state.in_flight.frame().unwrap().metadata(), expected);
                 }
             }
@@ -3587,7 +3404,7 @@ mod tests {
             return;
         };
         let staging = |sender: &Sender| {
-            let state = sender.native.video.state.lock().unwrap();
+            let state = sender.native.video.test_state();
             (
                 state.staging.as_ptr(),
                 state.staging.as_slice().to_vec(),
@@ -3714,7 +3531,7 @@ mod tests {
             sender.submit_video_copy(&borrowed).unwrap();
         }
         {
-            let video = sender.native.video.state.lock().unwrap();
+            let video = sender.native.video.test_state();
             let Some(copy) = video.in_flight.frame() else {
                 panic!("missing copied snapshot")
             };
@@ -3727,7 +3544,7 @@ mod tests {
         drop(data);
         drop(metadata);
         {
-            let video = sender.native.video.state.lock().unwrap();
+            let video = sender.native.video.test_state();
             let Some(copy) = video.in_flight.frame() else {
                 panic!("missing copied snapshot")
             };
@@ -3747,16 +3564,7 @@ mod tests {
         let Some(mut sender) = test_sender() else {
             return;
         };
-        let in_flight = |sender: &Sender| {
-            sender
-                .native
-                .video
-                .state
-                .lock()
-                .unwrap()
-                .in_flight
-                .is_in_flight()
-        };
+        let in_flight = |sender: &Sender| sender.native.video.test_state().in_flight.is_in_flight();
         let frame = |value| {
             let frame = test_owned_frame(value);
             let pixels = frame.data().as_ptr();
@@ -3834,9 +3642,7 @@ mod tests {
                 sender
                     .native
                     .video
-                    .state
-                    .lock()
-                    .unwrap()
+                    .test_state()
                     .spare
                     .as_ref()
                     .unwrap()
@@ -3861,14 +3667,7 @@ mod tests {
             assert!(unsupported(
                 &sender.submit_video_copy(&borrowed).unwrap_err()
             ));
-            assert!(sender
-                .native
-                .video
-                .state
-                .lock()
-                .unwrap()
-                .in_flight
-                .is_in_flight());
+            assert!(sender.native.video.test_state().in_flight.is_in_flight());
         }
         assert!(sender.reclaim_video().is_some());
     }
@@ -4210,3 +4009,11 @@ mod tests {
         }
     }
 }
+
+#[cfg(any(
+    ndi_test_send_ownership,
+    ndi_test_send_ownership_control,
+    ndi_test_send_ownership_types
+))]
+#[path = "../tests/ui/internal/send_ownership.rs"]
+mod ownership_contract;

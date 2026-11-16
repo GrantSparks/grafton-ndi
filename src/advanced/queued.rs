@@ -274,11 +274,9 @@ impl QueuedStorage {
 // value moves none of its allocations; Entry excludes access until completion
 // or destruction has ended the native loan.
 unsafe impl Lend for QueuedStorage {
-    type Authorization = ();
-
-    fn lend(&mut self, (): ()) -> Lent {
+    fn lend(&mut self) -> Lent {
         match self {
-            Self::Pixels(frame) => frame.lend(()),
+            Self::Pixels(frame) => frame.lend(),
             Self::Packet(frame) => frame.lend_for_queue(),
         }
     }
@@ -393,7 +391,7 @@ impl State {
         bytes: usize,
         protocol_error: &AtomicBool,
     ) -> std::result::Result<Admitted, Rejected<QueuedVideoFrame>> {
-        self.admit_with_lend(frame, bytes, protocol_error, |frame| frame.lend(()))
+        self.admit_with_lend(frame, bytes, protocol_error, |frame| frame.lend())
     }
 
     /// Derive the completion key from the very descriptor handed to the SDK.
@@ -1157,7 +1155,7 @@ mod tests {
                 |frame| {
                     Lent::Frame(NDIlib_video_frame_v2_t {
                         p_data: key as *mut u8,
-                        ..*frame.lend(()).descriptor()
+                        ..*frame.lend().descriptor()
                     })
                 },
             )

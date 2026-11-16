@@ -11,7 +11,7 @@ use super::{
     CompressedVideoFrame, VideoPacketFormat, MAX_PACKET_BYTES,
 };
 use crate::{
-    sender::in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans, Synchronized},
+    sender::in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans},
     sys::{
         advanced::{native, ScatterSend},
         bindings::*,
@@ -507,7 +507,7 @@ impl PendingVideo {
     /// Supported runtimes ignore these fields for scatter input and report
     /// them unchanged in completion callbacks, including destruction callbacks.
     pub(super) fn lend_for_queue(&mut self) -> Lent {
-        let lent = self.lend(());
+        let lent = self.lend();
         #[cfg(ndi_has_advanced_scatter_send)]
         {
             let mut lent = lent;
@@ -532,7 +532,7 @@ impl PendingVideo {
         }
     }
 
-    pub(super) fn into_submitted(self) -> SubmittedVideo {
+    pub(crate) fn into_submitted(self) -> SubmittedVideo {
         match self {
             Self::Contiguous(frame) => SubmittedVideo::Contiguous(frame),
             #[cfg(ndi_has_advanced_scatter_send)]
@@ -546,9 +546,7 @@ impl PendingVideo {
 // pointer and size arrays. Moving PendingVideo
 // moves none of those allocations. InFlight prevents access until release.
 unsafe impl Lend for PendingVideo {
-    type Authorization = ();
-
-    fn lend(&mut self, (): ()) -> Lent {
+    fn lend(&mut self) -> Lent {
         match self {
             Self::Contiguous(frame) => Lent::Frame(frame.raw()),
             #[cfg(ndi_has_advanced_scatter_send)]
@@ -596,16 +594,6 @@ impl PendingStreams {
             StreamTier::Program => &mut self.program,
             StreamTier::Preview => &mut self.preview,
         }
-    }
-
-    /// Recover the previous frame with the proof minted by this owner's send.
-    pub(crate) fn reclaim_displaced(
-        &mut self,
-        _tier: StreamTier,
-        displaced: InFlight<PendingVideo>,
-        synchronized: Synchronized,
-    ) -> Option<SubmittedVideo> {
-        displaced.release_with(synchronized, |frame, _proof| frame.into_submitted())
     }
 
     /// Both streams' frames, once their native sender has been destroyed.
@@ -1349,7 +1337,7 @@ mod tests {
         let frame = CompressedVideoFrame::new(format, bytes.clone()).unwrap();
         let data = frame.data().as_ptr();
         let mut pending = PendingVideo::Contiguous(frame);
-        let (lent, allocations) = crate::test_alloc::allocation_count(|| pending.lend(()));
+        let (lent, allocations) = crate::test_alloc::allocation_count(|| pending.lend());
         assert_eq!(allocations, 0);
         #[cfg(not(ndi_has_advanced_scatter_send))]
         let Lent::Frame(descriptor) = lent;
@@ -1375,13 +1363,13 @@ mod tests {
         let (mut pending, allocations) =
             crate::test_alloc::allocation_count(|| PendingVideo::Scatter { frame, table });
         assert_eq!(allocations, 0, "the list already belongs to the frame");
-        let Lent::Scatter { scatter, .. } = pending.lend(()) else {
+        let Lent::Scatter { scatter, .. } = pending.lend() else {
             panic!("a scatter frame is lent with its scatter list");
         };
         // Moving the entry, as its stream's slot does, leaves the list where
         // the SDK was told it is, still naming the frame's arrays.
         let mut moved = Box::new(pending);
-        let Lent::Scatter { scatter: after, .. } = moved.lend(()) else {
+        let Lent::Scatter { scatter: after, .. } = moved.lend() else {
             panic!("a scatter frame is lent with its scatter list");
         };
         assert_eq!(after, scatter);
