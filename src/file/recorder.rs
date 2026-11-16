@@ -1429,12 +1429,16 @@ impl FileRecorder {
         &mut self,
         requested: Instant,
         waiters: &mut FinishWaiters<R>,
+        queued: impl IntoIterator<Item = (Deadline, R)>,
         tick: Duration,
         sink: &mut impl FnMut(Result<RecorderEvent>),
         closing: impl Fn() -> bool,
     ) {
         let mut budget = self.begin_cleanup(requested);
         self.request_stop();
+        for (deadline, reply) in queued {
+            waiters.register(self, deadline, reply);
+        }
         waiters.retain();
         while self.cleanup_pending() || !waiters.is_empty() {
             let polled = self.pump(&mut budget, waiters.wait_timeout(tick), sink);
@@ -1738,6 +1742,7 @@ impl Drop for FileRecorder {
             self.drain_cleanup(
                 Instant::now(),
                 &mut FinishWaiters::<LocalFinish<'_>>::new(),
+                std::iter::empty(),
                 FINISH_POLL,
                 &mut |_| {},
                 || false,
