@@ -111,11 +111,11 @@ pub use {
     error::*,
     finder::{Finder, FinderOptions, Source, SourceAddress, SourceCache, SourceWatch},
     frames::{
-        AudioChannels, AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout,
-        AudioSource, BorrowedAudioFrame, BorrowedAudioFrameBuilder, FormatCategory,
-        FrameMetadataStatus, MetadataFrame, MetadataFrameRef, MetadataSource, PixelFormat,
-        PixelFormatInfo, ScanType, VideoFrame, VideoFrameBuilder, VideoFrameRef, VideoPlane,
-        VideoPlanes, VideoRows, VideoSource,
+        AudioChannels, AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioSource,
+        BorrowedAudioFrame, BorrowedAudioFrameBuilder, FormatCategory, FrameMetadataStatus,
+        MetadataFrame, MetadataFrameRef, MetadataSource, PixelFormat, PixelFormatInfo, ScanType,
+        VideoFrame, VideoFrameBuilder, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows,
+        VideoSource,
     },
     framesync::{
         AudioInputFormat, FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncCapture,

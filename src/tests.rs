@@ -160,18 +160,10 @@ fn test_audio_frame_drop_no_double_free() {
 
 #[test]
 fn test_audio_frame_channel_data_interleaved() {
-    use crate::AudioLayout;
-
     // Interleaved input: [C0S0, C1S0, C0S1, C1S1, C0S2, C1S2]
     let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-    let frame = AudioFrame::builder()
-        .sample_rate(48000)
-        .num_channels(2)
-        .num_samples(3)
-        .data(data)
-        .layout(AudioLayout::Interleaved)
-        .build()
-        .unwrap();
+    let input = crate::audio_conversion::InterleavedAudioF32::new(48000, 2, &data).unwrap();
+    let frame = AudioFrame::from_interleaved(&input);
 
     // Data is converted to planar at build time, stride is always set
     assert_eq!(frame.channel_stride_bytes(), 12); // 3 samples * 4 bytes
@@ -188,14 +180,11 @@ fn test_audio_frame_channel_data_interleaved() {
 
 #[test]
 fn test_audio_frame_builder_data_length_validation() {
-    use crate::AudioLayout;
-
     // Too few samples
     let result = AudioFrame::builder()
         .num_channels(2)
         .num_samples(3)
         .data(vec![1.0, 2.0, 3.0]) // 3 instead of 6
-        .layout(AudioLayout::Planar)
         .build();
 
     assert!(result.is_err());
@@ -216,7 +205,6 @@ fn test_audio_frame_builder_data_length_validation() {
         .num_channels(2)
         .num_samples(3)
         .data(vec![1.0; 10])
-        .layout(AudioLayout::Interleaved)
         .build();
 
     assert!(result.is_err());
@@ -235,15 +223,12 @@ fn test_audio_frame_builder_data_length_validation() {
 
 #[test]
 fn test_audio_frame_channel_data_planar() {
-    use crate::AudioLayout;
-
     let data = vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0];
     let frame = AudioFrame::builder()
         .sample_rate(48000)
         .num_channels(2)
         .num_samples(3)
         .data(data)
-        .layout(AudioLayout::Planar)
         .build()
         .unwrap();
 

@@ -2590,9 +2590,7 @@ audio_accessors! {
         /// It is one channel's samples, since an owned frame has no padding.
     }
     channel_data {
-        /// Data is always stored in planar format internally. If
-        /// `AudioLayout::Interleaved` was specified at build time, the data
-        /// was converted to planar during construction.
+        /// Samples for this channel are contiguous in the packed planar data.
     }
     data(self -> &[f32] => Some) {
         /// Get tightly packed planar audio as 32-bit floats.
@@ -2615,6 +2613,28 @@ audio_accessors! {
 }
 
 impl AudioFrame {
+    /// Copy validated interleaved floating-point samples into packed planar audio.
+    ///
+    /// This conversion needs no NDI runtime and allocates only the output
+    /// samples. It preserves the input's timecode; metadata is absent and the
+    /// SDK timestamp is `None`. Use [`Self::set_metadata`] to attach metadata.
+    pub fn from_interleaved(source: &crate::audio_conversion::InterleavedAudioF32<'_>) -> Self {
+        let mut frame = Self::from_validated_silence(source.layout(), source.timecode());
+        let channels = frame.layout.no_channels();
+        let samples = frame.layout.no_samples();
+        // The input's validated shape proves it contains exactly `samples`
+        // groups of `channels` initialized interleaved values.
+        for (channel, output) in frame.data.chunks_exact_mut(samples).enumerate() {
+            for (destination, &sample) in output
+                .iter_mut()
+                .zip(source.data()[channel..].iter().step_by(channels))
+            {
+                *destination = sample;
+            }
+        }
+        frame
+    }
+
     /// Allocate silent packed samples for a shape that is already validated.
     /// Metadata and receive timestamp keep the ordinary outbound defaults.
     pub(crate) fn from_validated_silence(layout: ValidatedAudioLayout, timecode: Timecode) -> Self {
@@ -2639,7 +2659,6 @@ impl AudioFrame {
             num_channels: 2,
             num_samples: 1024,
             timecode: Timecode::SYNTHESIZE,
-            layout: AudioLayout::Planar,
             data: None,
             metadata: None,
         }
@@ -2737,7 +2756,6 @@ pub struct AudioFrameBuilder {
     num_channels: u32,
     num_samples: u32,
     timecode: Timecode,
-    layout: AudioLayout,
     data: Option<Vec<f32>>,
     metadata: Option<String>,
 }
@@ -2771,37 +2789,11 @@ impl AudioFrameBuilder {
         self
     }
 
-    /// Set the audio data layout (planar or interleaved)
+    /// Set packed planar 32-bit samples, with every sample of channel 0 first,
+    /// then every sample of channel 1, and so on.
     ///
-    /// - **Planar**: All samples for channel 0, then all for channel 1, etc.
-    /// - **Interleaved**: Samples from all channels are interleaved.
-    ///
-    /// Defaults to `AudioLayout::Planar` which is the native format for FLTP.
-    ///
-    /// # Example
-    /// ```
-    /// use grafton_ndi::{AudioFrame, AudioLayout};
-    ///
-    /// // Planar layout (default)
-    /// let frame = AudioFrame::builder()
-    ///     .num_channels(2)
-    ///     .num_samples(100)
-    ///     .layout(AudioLayout::Planar)
-    ///     .build()
-    ///     .unwrap();
-    /// ```
-    #[must_use]
-    pub fn layout(mut self, layout: AudioLayout) -> Self {
-        self.layout = layout;
-        self
-    }
-
-    /// Set the audio data as 32-bit floats
-    ///
-    /// The data length must equal `num_channels * num_samples`. The layout must match
-    /// the configured `AudioLayout`:
-    /// - **Planar**: `[C0S0, C0S1, ..., C1S0, C1S1, ...]`
-    /// - **Interleaved**: `[C0S0, C1S0, C0S1, C1S1, ...]` (converted to planar at build time)
+    /// The length must equal `num_channels * num_samples`. For interleaved
+    /// input, use [`AudioFrame::from_interleaved`].
     #[must_use]
     pub fn data(mut self, data: Vec<f32>) -> Self {
         self.data = Some(data);
@@ -2819,7 +2811,7 @@ impl AudioFrameBuilder {
         self
     }
 
-    /// The caller-supplied samples in their configured input layout.
+    /// The caller-supplied packed planar samples.
     pub fn supplied_data(&self) -> Option<&[f32]> {
         self.data.as_deref()
     }
@@ -2834,8 +2826,8 @@ impl AudioFrameBuilder {
 
     /// Recover the original supplied samples, retaining allocation and capacity.
     ///
-    /// A rejected builder retains the input layout and untouched samples,
-    /// including interleaved input. Returns `None` for default silent input.
+    /// A rejected builder retains untouched samples. Returns `None` for default
+    /// silent input.
     pub fn into_data(self) -> Option<Vec<f32>> {
         self.data
     }
@@ -2869,10 +2861,8 @@ impl AudioFrameBuilder {
 
     /// Build the audio frame.
     ///
-    /// Unset fields keep the defaults [`AudioFrame::builder`] lists. When
-    /// `AudioLayout::Interleaved` is set, the input data is converted to
-    /// planar format in Rust. The resulting frame always stores planar data
-    /// with channels `num_samples * 4` bytes apart.
+    /// Unset fields keep the defaults [`AudioFrame::builder`] lists. The frame
+    /// stores packed planar data with channels `num_samples * 4` bytes apart.
     ///
     /// # Errors
     ///
@@ -2893,7 +2883,7 @@ impl AudioFrameBuilder {
                 check_audio_data_len(&layout, data.len())?;
             }
             // Transfer metadata only after every rejection check, before
-            // interleaving conversion or changing sample storage.
+            // changing sample storage.
             let metadata = OwnedFrameMetadata::take_from(&mut self.metadata)?;
             Ok((layout, metadata))
         };
@@ -2903,29 +2893,7 @@ impl AudioFrameBuilder {
         };
         let sample_count = audio_layout.sample_count;
 
-        let data = if let Some(input_data) = self.data {
-            match self.layout {
-                AudioLayout::Planar => input_data,
-                AudioLayout::Interleaved => {
-                    let nc = audio_layout.no_channels;
-                    let ns = audio_layout.no_samples;
-                    // The validated layout and the length check above make
-                    // `input_data` exactly `ns` frames of `nc` interleaved
-                    // samples; channel `ch` is every `nc`th sample from `ch`.
-                    let mut planar = vec![0.0f32; sample_count];
-                    for (ch, out) in planar.chunks_exact_mut(ns).enumerate() {
-                        for (dst, &sample) in
-                            out.iter_mut().zip(input_data[ch..].iter().step_by(nc))
-                        {
-                            *dst = sample;
-                        }
-                    }
-                    planar
-                }
-            }
-        } else {
-            vec![0.0f32; sample_count]
-        };
+        let data = self.data.unwrap_or_else(|| vec![0.0; sample_count]);
 
         Ok(AudioFrame {
             layout: audio_layout,
@@ -2971,29 +2939,6 @@ impl AudioFormat {
             Self::Fltp => NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
         }
     }
-}
-
-/// Audio data layout format
-///
-/// Determines how multi-channel audio samples are arranged in memory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AudioLayout {
-    /// Planar format: All samples for channel 0, then all for channel 1, etc.
-    ///
-    /// Memory layout for 2 channels, 3 samples:
-    /// `[C0S0, C0S1, C0S2, C1S0, C1S1, C1S2]`
-    ///
-    /// This is the native format for FLTP and is efficient for per-channel processing.
-    Planar,
-
-    /// Interleaved format: Samples from all channels are interleaved.
-    ///
-    /// Input memory layout for 2 channels, 3 samples:
-    /// `[C0S0, C1S0, C0S1, C1S1, C0S2, C1S2]`
-    ///
-    /// Interleaved data is converted to planar format in Rust at build time,
-    /// so the resulting `AudioFrame` always stores planar data.
-    Interleaved,
 }
 
 /// Maximum allowed size for supported video frame data (256 MiB).
@@ -5744,6 +5689,7 @@ mod tests {
             (3, 7),
             (3, 1),
             (5, 11),
+            (8, 3),
         ] {
             // Value encodes (channel, sample) so any misplacement is visible.
             let value = |ch: usize, s: usize| (ch * 1000 + s) as f32;
@@ -5753,14 +5699,20 @@ mod tests {
                     interleaved.push(value(ch, s));
                 }
             }
-            let frame = AudioFrame::builder()
-                .sample_rate(48_000)
-                .num_channels(channels as u32)
-                .num_samples(samples as u32)
-                .layout(AudioLayout::Interleaved)
-                .data(interleaved)
-                .build()
-                .unwrap();
+            let input = crate::audio_conversion::InterleavedAudioF32::new(
+                48_000,
+                channels as u32,
+                &interleaved,
+            )
+            .unwrap()
+            .with_timecode(Timecode::from_ticks(123));
+            let (frame, allocations) =
+                crate::test_alloc::allocation_count(|| AudioFrame::from_interleaved(&input));
+            assert_eq!(allocations, 1);
+            assert_eq!(frame.channel_stride_bytes(), samples * size_of::<f32>());
+            assert_eq!(frame.timecode(), input.timecode());
+            assert_eq!(frame.timestamp(), None);
+            assert_eq!(frame.metadata(), None);
             let expected: Vec<f32> = (0..channels)
                 .flat_map(|ch| (0..samples).map(move |s| value(ch, s)))
                 .collect();
@@ -5772,14 +5724,8 @@ mod tests {
                 assert_eq!(samples, &expected[ch * samples.len()..][..samples.len()]);
             }
         }
-        // A wrong input length is still rejected before any transposition.
-        assert!(AudioFrame::builder()
-            .num_channels(3)
-            .num_samples(4)
-            .layout(AudioLayout::Interleaved)
-            .data(vec![0.0; 11])
-            .build()
-            .is_err());
+        // The input validates divisibility before a conversion is possible.
+        assert!(crate::audio_conversion::InterleavedAudioF32::new(48_000, 3, &[0.0; 11]).is_err());
     }
 
     /// Every audio path reports a bad sample rate with the same message.
@@ -7998,7 +7944,6 @@ mod tests {
             let builder = AudioFrame::builder()
                 .num_channels(2)
                 .num_samples(2)
-                .layout(AudioLayout::Interleaved)
                 .data(samples)
                 .metadata(audio_text)
                 .build()

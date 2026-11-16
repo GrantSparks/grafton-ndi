@@ -1,7 +1,5 @@
 //! Owned storage returns to the application on rejection and after frame use.
-use grafton_ndi::{
-    AudioFrame, AudioLayout, BorrowedVideoFrame, Error, PixelFormat, ScanType, VideoFrame,
-};
+use grafton_ndi::{AudioFrame, BorrowedVideoFrame, Error, PixelFormat, ScanType, VideoFrame};
 
 #[test]
 fn rejected_builders_keep_original_storage_and_can_be_repaired() {
@@ -27,7 +25,6 @@ fn rejected_builders_keep_original_storage_and_can_be_repaired() {
     let rejected = AudioFrame::builder()
         .num_channels(2)
         .num_samples(2)
-        .layout(AudioLayout::Interleaved)
         .data(samples)
         .metadata("invalid\0metadata")
         .build()
@@ -40,13 +37,12 @@ fn rejected_builders_keep_original_storage_and_can_be_repaired() {
     let frame = AudioFrame::builder()
         .num_channels(2)
         .num_samples(2)
-        .layout(AudioLayout::Interleaved)
         .data(samples)
         .metadata("invalid\0metadata")
         .clear_metadata()
         .build()
         .unwrap();
-    assert_eq!(frame.data(), [1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(frame.data(), [1.0, 3.0, 2.0, 4.0]);
 }
 
 #[test]

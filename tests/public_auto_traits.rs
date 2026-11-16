@@ -79,7 +79,6 @@ fn crate_root_types_keep_their_auto_traits() {
         AudioFrameBuilder: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioFrameRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioInputFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
-        AudioLayout: Send, Sync, UnwindSafe, RefUnwindSafe;
         BorrowedAudioFrame<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         BorrowedAudioFrameBuilder<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         BorrowedVideoFrame<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;

@@ -206,11 +206,17 @@ interleaved_input!(
     NDIlib_audio_frame_interleaved_32f_t
 );
 
+impl InterleavedAudioF32<'_> {
+    pub(crate) fn layout(&self) -> ValidatedAudioLayout {
+        self.shape.0
+    }
+}
+
 /// Native audio conversion operations, resolved together from one live runtime.
 ///
-/// Construction fails if any current v3 conversion helper is missing. It does
-/// not silently substitute old v2 operations or Rust's existing f32 builder
-/// conversion. Methods take caller-owned output storage for reuse.
+/// Construction fails if any current v3 conversion helper is missing. Methods
+/// take caller-owned output storage for reuse. For a runtime-free floating-point
+/// conversion, use [`AudioFrame::from_interleaved`].
 pub struct AudioConverter {
     _ndi: Ndi,
     audio: &'static sys::InterleavedAudio,
@@ -771,6 +777,9 @@ mod tests {
         let (frame, allocations) =
             crate::test_alloc::allocation_count(|| converter.from_interleaved_f32(&input).unwrap());
         assert_eq!(allocations, 1);
+        let rust_frame = AudioFrame::from_interleaved(&input);
+        assert_eq!(rust_frame.data(), frame.data());
+        assert_eq!(rust_frame.timecode(), frame.timecode());
         assert_eq!(frame.data(), &[0.125, 0.25, 0.5, -0.5, -0.25, -0.125]);
         assert_eq!(frame.timecode(), Timecode::from_ticks(1234));
         assert_eq!(frame.metadata(), None);

@@ -17,6 +17,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- Interleaved floating-point input uses `AudioFrame::from_interleaved` with
+  validated `InterleavedAudioF32`; `AudioLayout` and the audio builder's `layout`
+  setter are removed. Audio builders accept packed planar samples.
+
 - Custom allocator receivers use `advanced::AllocatedReceiver<M = RawCapture>`.
   Replace `AllocatedPacketReceiver` with `AllocatedReceiver<PacketAttached>`;
   allocator methods are shared, while capture and recovery follow the mode.
