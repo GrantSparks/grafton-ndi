@@ -414,7 +414,7 @@ mod tests {
             no_channels: 2,
             no_samples: 3,
             timecode: 1234,
-            FourCC: crate::AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: samples.as_mut_ptr().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 32,
@@ -494,7 +494,7 @@ mod tests {
             no_channels: 2,
             no_samples: 3,
             timecode: 1234,
-            FourCC: crate::AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: samples.as_ptr().cast_mut().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 32,

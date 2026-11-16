@@ -17,6 +17,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- `AudioFormat` converts through `FourCc`; audio descriptors use their validated
+  format. `PictureAspectRatio` normalizes negative zero and implements `Eq` and
+  `Hash`, as do video packet formats and File track, format and event values.
+
 - Interleaved floating-point input uses `AudioFrame::from_interleaved` with
   validated `InterleavedAudioF32`; `AudioLayout` and the audio builder's `layout`
   setter are removed. Audio builders accept packed planar samples.

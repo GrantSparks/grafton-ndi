@@ -1816,7 +1816,7 @@ impl VideoFrameBuilder {
     }
 
     /// Set the picture aspect ratio, width over height as displayed; `0.0`
-    /// means square pixels. It must be finite and nonnegative.
+    /// means square pixels.
     #[must_use]
     pub fn picture_aspect_ratio(mut self, ratio: PictureAspectRatio) -> Self {
         self.picture_aspect_ratio = ratio;
@@ -2010,7 +2010,7 @@ pub(crate) trait AudioPartsExt: AudioParts {
             no_channels: layout.sdk_num_channels(),
             no_samples: layout.sdk_num_samples(),
             timecode: self.audio_timecode().ticks(),
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: layout.format().to_sdk(),
             p_data: self.samples().cast_mut().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: layout.sdk_channel_stride(),
@@ -2931,6 +2931,8 @@ pub enum AudioFormat {
     /// 32-bit floating point planar audio (FLTP).
     Fltp,
 }
+
+crate::media::decoded_variants!(AudioFormat: Fltp);
 
 impl AudioFormat {
     /// The SDK's FourCC for this format.
@@ -4306,14 +4308,7 @@ pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<R
 }
 
 fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioFormat> {
-    match fourcc {
-        sys::bindings::NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => {
-            Ok(AudioFormat::Fltp)
-        }
-        _ => Err(Error::InvalidFrame(
-            crate::FrameDefect::UnknownAudioFormat { fourcc },
-        )),
-    }
+    AudioFormat::try_from(FourCc::from_raw(fourcc))
 }
 
 // ============================================================================
@@ -5541,7 +5536,7 @@ mod tests {
                 sample_rate: 48_000,
                 no_channels: channels,
                 no_samples: 5,
-                FourCC: AudioFormat::Fltp.to_sdk(),
+                FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
                 p_data: samples.as_ptr().cast_mut().cast(),
                 __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                     channel_stride_in_bytes: stride * 4,
@@ -5730,6 +5725,27 @@ mod tests {
 
     /// Every audio path reports a bad sample rate with the same message.
     #[test]
+    fn audio_descriptors_use_the_validated_format() {
+        let frame = AudioFrame::builder()
+            .num_channels(2)
+            .num_samples(3)
+            .build()
+            .unwrap();
+        assert_eq!(
+            frame.audio_descriptor().FourCC,
+            FourCc::from(frame.format()).raw()
+        );
+        let samples = [0.0; 6];
+        let frame = BorrowedAudioFrame::builder(&samples, 48_000, 2, 3)
+            .build()
+            .unwrap();
+        assert_eq!(
+            frame.audio_descriptor().FourCC,
+            FourCc::from(frame.format()).raw()
+        );
+    }
+
+    #[test]
     fn audio_sample_rate_check_is_shared_with_one_message() {
         let message = |result: Result<()>| match result {
             Err(Error::InvalidFrame(msg)) => msg,
@@ -5770,7 +5786,7 @@ mod tests {
                 sample_rate: rate,
                 no_channels: 1,
                 no_samples: 1,
-                FourCC: AudioFormat::Fltp.to_sdk(),
+                FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
                 p_data: (&mut sample as *mut f32).cast(),
                 __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                     channel_stride_in_bytes: 4,
@@ -7363,7 +7379,7 @@ mod tests {
             no_channels: num_channels,
             no_samples: num_samples,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: num_samples * 4,
@@ -8346,7 +8362,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 123,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: no_samples * 4,
@@ -8517,7 +8533,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: dummy_data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: no_samples * 4,
@@ -8575,7 +8591,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 12345,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: no_samples * 4,
@@ -9165,7 +9181,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: no_samples * 4,
@@ -9195,7 +9211,7 @@ mod tests {
             sample_rate: 48000,
             no_channels: 2,
             no_samples: 3,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: storage.as_mut_ptr().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 24,
@@ -9244,7 +9260,7 @@ mod tests {
             sample_rate: 48000,
             no_channels: 1,
             no_samples: 1,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: unsafe { storage.as_mut_ptr().cast::<u8>().add(1) },
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 4,
@@ -9273,7 +9289,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: stride_samples * 4,
@@ -9294,7 +9310,7 @@ mod tests {
     fn returned_audio_accepts_the_no_source_state() {
         let unset = NDIlib_audio_frame_v3_t::default();
         let set = NDIlib_audio_frame_v3_t {
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             ..unset
         };
         for raw in [unset, set] {
@@ -9312,7 +9328,7 @@ mod tests {
         let raw = NDIlib_audio_frame_v3_t {
             sample_rate: 48000,
             no_channels: 2,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             ..Default::default()
         };
         match validate_returned_audio(&raw) {
@@ -9332,7 +9348,7 @@ mod tests {
             sample_rate: 48000,
             no_channels: 2,
             no_samples: 4,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 16,
@@ -9360,7 +9376,7 @@ mod tests {
         let format_only = NDIlib_audio_frame_v3_t {
             sample_rate: 48000,
             no_channels: 2,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             ..Default::default()
         };
         for raw in [NDIlib_audio_frame_v3_t::default(), format_only] {
@@ -9385,7 +9401,7 @@ mod tests {
         let format = NDIlib_audio_frame_v3_t {
             sample_rate: 48000,
             no_channels: 2,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             ..Default::default()
         };
         let mut sample = 0.0f32;
@@ -9453,7 +9469,7 @@ mod tests {
             no_channels: 2,
             no_samples: 1024,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 1024 * 4 - 4,
@@ -9474,7 +9490,7 @@ mod tests {
             no_channels: 2,
             no_samples: 1024,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: ptr::null_mut(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 1024 * 4,
@@ -9506,7 +9522,7 @@ mod tests {
             no_channels: 2,
             no_samples: -1, // Negative
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 1024 * 4,
@@ -9544,7 +9560,7 @@ mod tests {
             no_channels: i32::MAX,
             no_samples: 1024,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 1024 * 4,
@@ -9682,7 +9698,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 12345,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: no_samples * 4,
@@ -10153,7 +10169,7 @@ mod tests {
             sample_rate: 48_000,
             no_channels: channels as i32,
             no_samples: samples as i32,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: storage.as_mut_ptr().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: (stride * 4) as i32,

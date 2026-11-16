@@ -1573,7 +1573,7 @@ fn video_request(
 fn audio_request(
     frame: &NDIlib_audio_frame_v3_t,
 ) -> std::result::Result<AllocationRequest, AllocationDecline> {
-    if frame.FourCC != NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP {
+    if frame.FourCC != crate::FourCc::from(crate::AudioFormat::Fltp).raw() {
         if AudioCodec::from_outer(frame.FourCC).is_none() {
             return Err(AllocationDecline::RequestNotRepresentable);
         }
@@ -2121,7 +2121,7 @@ mod tests {
         // FLTP extents are multiples of four: the first representable excess
         // over the 64 MiB capture cap is four bytes, not one byte.
         let audio = NDIlib_audio_frame_v3_t {
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             sample_rate: 48_000,
             no_channels: 1,
             no_samples: (crate::frames::MAX_AUDIO_BYTES / size_of::<f32>()) as i32 + 1,
@@ -2184,7 +2184,7 @@ mod tests {
     #[test]
     fn audio_request_at_capture_limit_uses_the_shared_packed_layout() {
         let frame = NDIlib_audio_frame_v3_t {
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             sample_rate: 48_000,
             no_channels: 1,
             no_samples: (crate::frames::MAX_AUDIO_BYTES / size_of::<f32>()) as i32,

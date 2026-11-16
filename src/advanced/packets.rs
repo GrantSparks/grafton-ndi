@@ -546,7 +546,7 @@ impl<'a> PacketEnvelope<'a> {
 /// assert!(VideoPacketFormat::new(VideoCodec::Hevc, 0, 1080).is_err());
 /// # Ok::<(), grafton_ndi::Error>(())
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VideoPacketFormat {
     codec: VideoCodec,
     tier: StreamTier,

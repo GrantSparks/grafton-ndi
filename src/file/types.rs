@@ -1088,7 +1088,7 @@ impl FileDuration {
 /// A recorder's events describe the source's declared format, and a probe the
 /// track header of the file. A value the SDK does not know yet is zero or
 /// `None`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VideoTrack {
     tier: StreamTier,
     width: u32,
@@ -1146,7 +1146,7 @@ impl VideoTrack {
 ///
 /// A value the SDK does not know, or that does not apply, such as the audio
 /// of a source without audio, is zero.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceFormat {
     video_tracks: Vec<VideoTrack>,
     audio_sample_rate: u32,
@@ -1190,7 +1190,7 @@ impl SourceFormat {
 }
 
 /// A non-advertising file probe result.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileInfo {
     pub(super) duration: FileDuration,
     pub(super) track_count: u32,
@@ -1274,7 +1274,7 @@ impl PlayerEventKind {
 }
 
 /// An owned player event. Inline SDK strings are copied within their bounds.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PlayerEvent {
     pub(super) kind: PlayerEventKind,
     pub(super) path: EventText,
@@ -1393,7 +1393,7 @@ impl RecorderEventKind {
 }
 
 /// An owned recorder event, including original bounded diagnostic text.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RecorderEvent {
     pub(super) kind: RecorderEventKind,
     pub(super) path: EventText,

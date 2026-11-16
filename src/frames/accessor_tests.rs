@@ -98,7 +98,7 @@ fn captured_audio_surfaces_agree_for_packed_and_padded_channels() {
             sample_rate: 48_000,
             no_channels: 2,
             no_samples: 2,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: samples.as_mut_ptr().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: (stride * 4) as i32,

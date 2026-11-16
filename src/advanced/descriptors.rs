@@ -31,7 +31,7 @@ pub(crate) fn audio_frame() -> NDIlib_audio_frame_v3_t {
         sample_rate: 48_000,
         no_channels: 2,
         timecode: NDIlib_send_timecode_synthesize,
-        FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+        FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
         ..Default::default()
     }
 }

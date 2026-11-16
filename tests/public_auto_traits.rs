@@ -405,3 +405,20 @@ fn file_types_keep_their_auto_traits() {
         FileRecorder: Sync;
     }
 }
+
+#[test]
+fn media_descriptions_are_hashable_values() {
+    fn value<T: Eq + std::hash::Hash>() {}
+    value::<grafton_ndi::PictureAspectRatio>();
+    #[cfg(feature = "advanced")]
+    value::<grafton_ndi::advanced::VideoPacketFormat>();
+    #[cfg(feature = "file-io")]
+    {
+        use grafton_ndi::file::{FileInfo, PlayerEvent, RecorderEvent, SourceFormat, VideoTrack};
+        value::<VideoTrack>();
+        value::<SourceFormat>();
+        value::<FileInfo>();
+        value::<PlayerEvent>();
+        value::<RecorderEvent>();
+    }
+}

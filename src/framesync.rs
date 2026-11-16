@@ -1575,7 +1575,7 @@ mod tests {
     /// state and to the format otherwise; samples in the answer are refused.
     #[test]
     fn input_format_maps_no_source_and_format_states() {
-        let fltp = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP;
+        let fltp = crate::FourCc::from(crate::AudioFormat::Fltp).raw();
         // No source yet, with the FourCC unset or set.
         let no_source = NDIlib_audio_frame_v3_t::default();
         assert_eq!(input_format(&no_source).unwrap(), None);
@@ -1655,7 +1655,7 @@ mod tests {
         let format_only = NDIlib_audio_frame_v3_t {
             sample_rate: 48_000,
             no_channels: 2,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             ..no_source
         };
         for raw in [no_source, format_only] {
@@ -1694,7 +1694,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: stride_samples * 4,
@@ -1734,7 +1734,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: no_samples * 4,
