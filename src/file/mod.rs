@@ -35,6 +35,9 @@
 //!
 //! Windows and macOS never add the working directory to this search. Relative
 //! or empty `PATH`/`DYLD_LIBRARY_PATH` entries are recorded as refused locations.
+//! On macOS, any relative or empty `DYLD_LIBRARY_PATH` entry refuses the whole
+//! default search before opening a library: dyld applies these overrides even
+//! to absolute and `@rpath` requests. Explicit paths retain dyld's own policy.
 //! In unrestricted macOS processes dyld can substitute `DYLD_LIBRARY_PATH`
 //! even for an absolute path; the crate refuses a substitute with
 //! [`crate::LoadRefusal::ResolvedToAnotherFile`]. Native dependencies still
