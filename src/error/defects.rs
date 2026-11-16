@@ -678,14 +678,6 @@ pub enum InputDefect {
         /// The capacity.
         capacity: usize,
     },
-    /// Allocator stride {stride} is smaller than the requested stride {minimum}.
-    #[error("Allocator stride {stride} is smaller than the requested stride {minimum}")]
-    AllocatorShortStride {
-        /// The stride.
-        stride: usize,
-        /// The minimum.
-        minimum: usize,
-    },
     /// An allocation of {bytes} bytes exceeds the capacity limit of {limit} bytes.
     #[error("An allocation of {bytes} bytes exceeds the capacity limit of {limit} bytes")]
     AllocationTooLarge {
@@ -693,12 +685,6 @@ pub enum InputDefect {
         bytes: usize,
         /// The limit.
         limit: usize,
-    },
-    /// No allocation can hold {bytes} bytes.
-    #[error("No allocation can hold {bytes} bytes")]
-    AllocationLayout {
-        /// The bytes.
-        bytes: usize,
     },
     /// KVM key symbol {keysym:#x} exceeds the SDK's range, 0..=0x7fffffff.
     #[error("KVM key symbol {keysym:#x} exceeds the SDK's range, 0..=0x7fffffff")]

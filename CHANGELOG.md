@@ -37,6 +37,11 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 - All relative environment library directories use `LoadRefusal::RelativeSearchDirectory`;
   `LoadAttempt::origin()` identifies the variable that supplied the directory.
+- Allocator strides use the frame layout's causes for every uncompressed
+  format; compressed strides must equal the packet size. Replacing a padded
+  stride may narrow it to any valid layout. Remove the allocator-only short
+  stride and unreachable allocation-layout error leaves.
+
 - Advanced audio formats, AV sync and clock requests share frame audio rate
   and count causes. API formats now report `InvalidInput(Layout)`. Construct
   `AudioClockRequest` once and pass it to `AudioClock::wait`, which returns

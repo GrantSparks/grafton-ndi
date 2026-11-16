@@ -197,11 +197,25 @@ impl AllocatorLimits {
 pub struct AllocationRequest {
     bytes: usize,
     stride: usize,
-    format: AllocationFormat,
+    layout: RequestLayout,
     width: u32,
     height: u32,
     capacity_limit: usize,
-    audio_layout: Option<ValidatedAudioLayout>,
+}
+
+/// The format and, for audio, its validated channel layout are one value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    not(any(test, ndi_has_advanced_receive_allocators)),
+    expect(
+        dead_code,
+        reason = "only native allocator callbacks construct requests"
+    )
+)]
+enum RequestLayout {
+    Video(PixelFormat),
+    Audio(ValidatedAudioLayout),
+    Compressed(AllocationFormat),
 }
 
 /// The kind of frame an [`AllocationRequest`] is for.
@@ -240,7 +254,11 @@ impl AllocationRequest {
 
     /// The kind of frame.
     pub fn format(self) -> AllocationFormat {
-        self.format
+        match self.layout {
+            RequestLayout::Video(pixel) => AllocationFormat::Video(pixel),
+            RequestLayout::Audio(_) => AllocationFormat::AudioPlanarF32,
+            RequestLayout::Compressed(format) => format,
+        }
     }
 
     /// Width in pixels of video; samples per channel of audio.
@@ -253,51 +271,47 @@ impl AllocationRequest {
         self.height
     }
 
-    /// The same request with a larger line or channel stride, for buffers
-    /// that need padding or alignment. The minimum size grows to match.
+    /// The same request with the chosen line or channel stride, for buffers
+    /// that need padding or alignment. The minimum size changes to match.
+    ///
+    /// A new choice replaces an earlier stride. It may be narrower when the
+    /// frame layout allows it; the SDK's original request uses the packed minimum.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidInput`](crate::Error::InvalidInput) when the stride is
-    /// smaller than requested, is not one the frame's layout allows (an audio
+    /// not one the frame's layout allows (an audio
     /// stride is a multiple of four bytes; a 4:2:0 or UYVA video stride is even),
     /// a compressed frame is given a stride other than its size, or the buffer would exceed
     /// the [`capacity_limit`](Self::capacity_limit).
     pub fn with_stride_bytes(self, stride: usize) -> Result<Self> {
-        let audio_layout = self
-            .audio_layout
-            .map(|layout| layout.with_channel_stride_bytes(stride))
-            .transpose()
-            .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?;
-        if stride < self.stride {
-            return Err(invalid_input(crate::InputDefect::AllocatorShortStride {
-                stride,
-                minimum: self.stride,
-            }));
-        }
-        let bytes = match self.format {
-            AllocationFormat::Video(pixel) => {
-                ValidatedVideoLayout::new_uncompressed_checked(
+        let (bytes, layout) = match self.layout {
+            RequestLayout::Video(pixel) => {
+                let layout = ValidatedVideoLayout::new_uncompressed_checked(
                     pixel,
                     self.width,
                     self.height,
                     Some(stride),
                 )
-                // This is an input stride refusal, retaining the layout evidence.
-                .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?
-                .data_len_bytes()
+                .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?;
+                (layout.data_len_bytes(), self.layout)
             }
-            AllocationFormat::AudioPlanarF32 => {
-                let layout = audio_layout.expect("audio requests retain their validated layout");
+            RequestLayout::Audio(layout) => {
+                let layout = layout
+                    .with_channel_stride_bytes(stride)
+                    .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?;
                 // The layout caps its active extent at 64 MiB and its stride at
-                // i32::MAX. Including the final channel's padding still fits usize.
-                layout.channel_stride_bytes() * layout.no_channels()
+                // i32::MAX. Including final channel padding still fits usize.
+                (
+                    layout.channel_stride_bytes() * layout.no_channels(),
+                    RequestLayout::Audio(layout),
+                )
             }
-            _ if stride == self.stride => self.bytes,
-            _ => {
+            RequestLayout::Compressed(_) if stride == self.stride => (self.bytes, self.layout),
+            RequestLayout::Compressed(_) => {
                 return Err(invalid_input(
                     crate::InputDefect::CompressedAllocationStride,
-                ))
+                ));
             }
         };
         if bytes > self.capacity_limit {
@@ -309,7 +323,7 @@ impl AllocationRequest {
         Ok(Self {
             bytes,
             stride,
-            audio_layout,
+            layout,
             ..self
         })
     }
@@ -419,17 +433,20 @@ struct OwnedStorage {
     layout: Layout,
 }
 
+// Rounding a valid request up to its 64-byte alignment remains representable
+// in Layout's signed allocation-size bound on every supported target.
+const _: () = assert!(MAX_ALLOCATION <= isize::MAX as usize - 63);
+
 impl OwnedStorage {
-    /// Allocate `bytes` zeroed bytes aligned to 64.
-    fn zeroed(bytes: usize) -> Result<Self> {
-        let layout = Layout::from_size_align(bytes, 64)
-            .ok()
-            .filter(|layout| layout.size() != 0)
-            .ok_or_else(|| invalid_input(crate::InputDefect::AllocationLayout { bytes }))?;
-        // SAFETY: the layout was just checked not to be zero-sized.
-        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or_else(|| {
-            crate::error::allocation_failed(crate::AllocationKind::ReceiveBuffer, Some(bytes))
-        })?;
+    /// Allocate this validated, non-zero request aligned to 64.
+    fn zeroed(request: AllocationRequest) -> Result<Self> {
+        let bytes = request.minimum_bytes();
+        let failed =
+            || crate::error::allocation_failed(crate::AllocationKind::ReceiveBuffer, Some(bytes));
+        let layout = Layout::from_size_align(bytes, 64).map_err(|_| failed())?;
+        // SAFETY: every AllocationRequest describes a validated non-zero
+        // extent; its constructors and stride changes keep that invariant.
+        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or_else(failed)?;
         Ok(Self { pointer, layout })
     }
 }
@@ -526,7 +543,7 @@ impl AllocationBuffer {
     /// allocator cannot supply that much memory.
     pub fn zeroed(request: AllocationRequest) -> Result<Self> {
         Ok(Self {
-            storage: AllocationStorage::Owned(OwnedStorage::zeroed(request.bytes)?),
+            storage: AllocationStorage::Owned(OwnedStorage::zeroed(request)?),
             #[cfg(any(test, ndi_has_advanced_receive_allocators))]
             request,
         })
@@ -945,14 +962,15 @@ impl Registry {
             return None;
         }
         // At most the capacity, which is at most MAX_ALLOCATION.
-        let stride = if let Some(layout) = actual.audio_layout {
-            layout.sdk_channel_stride()
-        } else {
-            let Ok(stride) = i32::try_from(actual.stride) else {
-                self.decline(AllocationDecline::BufferRefused);
-                return None;
-            };
-            stride
+        let stride = match actual.layout {
+            RequestLayout::Audio(layout) => layout.sdk_channel_stride(),
+            RequestLayout::Video(_) | RequestLayout::Compressed(_) => {
+                let Ok(stride) = i32::try_from(actual.stride) else {
+                    self.decline(AllocationDecline::BufferRefused);
+                    return None;
+                };
+                stride
+            }
         };
         // Membership serializes publication against closing. An admitted policy
         // may have blocked while replacement began; it must not publish late.
@@ -1552,11 +1570,10 @@ fn video_request(
         return Ok(AllocationRequest {
             bytes: size,
             stride: size,
-            format: AllocationFormat::CompressedVideo(fourcc),
+            layout: RequestLayout::Compressed(AllocationFormat::CompressedVideo(fourcc)),
             width: compressed_dimension(frame.xres)?,
             height: compressed_dimension(frame.yres)?,
             capacity_limit: MAX_ALLOCATION,
-            audio_layout: None,
         });
     }
     let pixel =
@@ -1566,11 +1583,10 @@ fn video_request(
     Ok(AllocationRequest {
         bytes: layout.data_len_bytes(),
         stride: layout.line_stride_bytes(),
-        format: AllocationFormat::Video(pixel),
+        layout: RequestLayout::Video(pixel),
         width: layout.width(),
         height: layout.height(),
         capacity_limit: MAX_ALLOCATION,
-        audio_layout: None,
     })
 }
 
@@ -1590,11 +1606,12 @@ fn audio_request(
         return Ok(AllocationRequest {
             bytes: size,
             stride: size,
-            format: AllocationFormat::CompressedAudio(FourCc::from_raw(frame.FourCC)),
+            layout: RequestLayout::Compressed(AllocationFormat::CompressedAudio(FourCc::from_raw(
+                frame.FourCC,
+            ))),
             width: compressed_dimension(frame.no_samples)?,
             height: compressed_dimension(frame.no_channels)?,
             capacity_limit: MAX_ALLOCATION,
-            audio_layout: None,
         });
     }
     // The callback chooses a packed stride. The incoming data pointer and
@@ -1610,11 +1627,10 @@ fn audio_request(
     Ok(AllocationRequest {
         bytes: layout.sample_count() * size_of::<f32>(),
         stride: layout.channel_stride_bytes(),
-        format: AllocationFormat::AudioPlanarF32,
+        layout: RequestLayout::Audio(layout),
         width: layout.num_samples(),
         height: layout.num_channels(),
         capacity_limit: MAX_ALLOCATION,
-        audio_layout: Some(layout),
     })
 }
 /// The SDK's request for video memory. `opaque` is the generation token.
@@ -1721,7 +1737,7 @@ mod tests {
     impl TestPool {
         fn new(count: usize, bytes: usize) -> Arc<Self> {
             let storage = (0..count)
-                .map(|_| OwnedStorage::zeroed(bytes).unwrap())
+                .map(|_| OwnedStorage::zeroed(request_of(bytes)).unwrap())
                 .collect::<Vec<_>>();
             let blocks = storage
                 .iter()
@@ -2033,23 +2049,21 @@ mod tests {
     }
 
     fn request_of(bytes: usize) -> AllocationRequest {
+        let layout = ValidatedAudioLayout::new_uncompressed(
+            AudioFormat::Fltp,
+            48_000,
+            2,
+            (bytes / 8) as u32,
+            None,
+        )
+        .unwrap();
         AllocationRequest {
             bytes,
             stride: bytes / 2,
-            format: AllocationFormat::AudioPlanarF32,
+            layout: RequestLayout::Audio(layout),
             width: (bytes / 8) as u32,
             height: 2,
             capacity_limit: MAX_ALLOCATION,
-            audio_layout: Some(
-                ValidatedAudioLayout::new_uncompressed(
-                    AudioFormat::Fltp,
-                    48_000,
-                    2,
-                    (bytes / 8) as u32,
-                    None,
-                )
-                .unwrap(),
-            ),
         }
     }
 
@@ -2244,11 +2258,9 @@ mod tests {
     #[test]
     fn successful_preboxed_external_allocation_needs_no_bookkeeping_allocation() {
         let registry = Registry::new(limits()).unwrap();
-        let buffer = AllocationBuffer::from_external(
-            request(),
-            OwnedStorage::zeroed(request().minimum_bytes()).unwrap(),
-        )
-        .unwrap();
+        let buffer =
+            AllocationBuffer::from_external(request(), OwnedStorage::zeroed(request()).unwrap())
+                .unwrap();
         let buffer = Mutex::new(Some(buffer));
         // Some platforms allocate a native mutex on its first lock. Initialize
         // this application policy's pool lock outside the measured callback;
@@ -2416,7 +2428,7 @@ mod tests {
                     let drops = drops.clone();
                     move |request: AllocationRequest| {
                         let storage = InspectionPanics {
-                            storage: OwnedStorage::zeroed(request.minimum_bytes())?,
+                            storage: OwnedStorage::zeroed(request)?,
                             pointer_calls: Cell::new(0),
                             capacity_calls: Cell::new(0),
                             panic_in_pointer,
@@ -2488,7 +2500,7 @@ mod tests {
             }
         }
         let registry = Registry::new(limits()).unwrap();
-        let storage = Arc::new(Mutex::new(OwnedStorage::zeroed(64).unwrap()));
+        let storage = Arc::new(Mutex::new(OwnedStorage::zeroed(request_of(64)).unwrap()));
         let token = registry
             .register(move |request| {
                 Ok(AllocationBuffer::from_external(
@@ -3035,16 +3047,16 @@ mod tests {
             assert_eq!(rejected.into_inner().pointer(), address);
         };
         refused(
-            OwnedStorage::zeroed(32).unwrap(),
+            OwnedStorage::zeroed(request_of(32)).unwrap(),
             crate::InputDefect::ExternalAllocationTooSmall,
         );
         refused(
-            OwnedStorage::zeroed(192).unwrap(),
+            OwnedStorage::zeroed(request_of(192)).unwrap(),
             crate::InputDefect::ExternalAllocationTooLarge,
         );
         let rejected = AllocationBuffer::from_external(
             request,
-            Misaligned(OwnedStorage::zeroed(128).unwrap()),
+            Misaligned(OwnedStorage::zeroed(request_of(128)).unwrap()),
         )
         .expect_err("the storage is misaligned");
         assert!(matches!(
@@ -3053,10 +3065,55 @@ mod tests {
         ));
         assert_eq!(rejected.into_inner().0.capacity(), 128);
 
-        let buffer =
-            AllocationBuffer::from_external(request, OwnedStorage::zeroed(128).unwrap()).unwrap();
+        let buffer = AllocationBuffer::from_external(
+            request,
+            OwnedStorage::zeroed(request_of(128)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(buffer.capacity(), 128);
-        assert!(OwnedStorage::zeroed(0).is_err());
+    }
+
+    #[test]
+    fn every_native_request_constructor_requires_a_nonzero_extent() {
+        let video = NDIlib_video_frame_v2_t {
+            FourCC: FourCc::from(PixelFormat::Bgra).raw(),
+            xres: 2,
+            yres: 1,
+            ..Default::default()
+        };
+        let audio = NDIlib_audio_frame_v3_t {
+            FourCC: AudioFormat::Fltp.to_sdk(),
+            sample_rate: 48_000,
+            no_channels: 1,
+            no_samples: 1,
+            ..Default::default()
+        };
+        assert!(video_request(&video).unwrap().minimum_bytes() > 0);
+        assert!(audio_request(&audio).unwrap().minimum_bytes() > 0);
+        assert!(video_request(&NDIlib_video_frame_v2_t { xres: 0, ..video }).is_err());
+        assert!(audio_request(&NDIlib_audio_frame_v3_t {
+            no_samples: 0,
+            ..audio
+        })
+        .is_err());
+        for size in [0, 1] {
+            let compressed_video = NDIlib_video_frame_v2_t {
+                FourCC: VideoCodec::H264.outer(StreamTier::Program, false),
+                __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                    data_size_in_bytes: size,
+                },
+                ..Default::default()
+            };
+            let compressed_audio = NDIlib_audio_frame_v3_t {
+                FourCC: AudioCodec::Opus.outer(false),
+                __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                    data_size_in_bytes: size,
+                },
+                ..Default::default()
+            };
+            assert_eq!(video_request(&compressed_video).is_ok(), size != 0);
+            assert_eq!(audio_request(&compressed_audio).is_ok(), size != 0);
+        }
     }
 
     #[test]
@@ -3123,19 +3180,27 @@ mod tests {
             (padded.stride_bytes(), padded.minimum_bytes()),
             (32, 32 * 16 * 3 / 2)
         );
-        assert!(matches!(
-            input(planar.with_stride_bytes(15)),
-            crate::InputDefect::AllocatorShortStride { .. }
-        ));
-        let crate::InputDefect::Layout(input_cause) = input(planar.with_stride_bytes(17)) else {
-            panic!("expected the shared layout cause")
-        };
-        let Err(Error::InvalidFrame(crate::FrameDefect::Layout(frame_cause))) =
-            PixelFormat::I420.send_buffer_len(16, 16, Some(17), crate::ScanType::Progressive)
-        else {
-            panic!("expected the same frame layout refusal")
-        };
-        assert_eq!(input_cause, frame_cause);
+        for stride in [0, 15, 17] {
+            let crate::InputDefect::Layout(input_cause) = input(planar.with_stride_bytes(stride))
+            else {
+                panic!("expected the shared layout cause")
+            };
+            let Err(Error::InvalidFrame(crate::FrameDefect::Layout(frame_cause))) =
+                PixelFormat::I420.send_buffer_len(
+                    16,
+                    16,
+                    Some(stride),
+                    crate::ScanType::Progressive,
+                )
+            else {
+                panic!("expected the same frame layout refusal")
+            };
+            assert_eq!(input_cause, frame_cause);
+            if stride == 0 {
+                assert_eq!(input_cause, crate::LayoutDefect::VideoZeroStride);
+            }
+        }
+        assert_eq!(padded.with_stride_bytes(16).unwrap(), planar);
 
         let audio = request();
         for stride in [0, 30, 34, i32::MAX as usize + 1] {
@@ -3165,18 +3230,38 @@ mod tests {
             crate::InputDefect::AllocationTooLarge { .. }
         ));
 
-        let compressed = AllocationRequest {
-            format: AllocationFormat::CompressedAudio(FourCc::from_raw(
-                AudioCodec::Opus.outer(false),
-            )),
-            audio_layout: None,
-            ..audio
-        };
+        let compressed = audio_request(&NDIlib_audio_frame_v3_t {
+            FourCC: AudioCodec::Opus.outer(false),
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                data_size_in_bytes: 32,
+            },
+            ..Default::default()
+        })
+        .unwrap();
         assert_eq!(compressed.with_stride_bytes(32).unwrap(), compressed);
-        assert!(matches!(
-            input(compressed.with_stride_bytes(36)),
-            crate::InputDefect::CompressedAllocationStride
-        ));
+        for stride in [0, 31, 36] {
+            assert!(matches!(
+                input(compressed.with_stride_bytes(stride)),
+                crate::InputDefect::CompressedAllocationStride
+            ));
+        }
+        let audio = audio_request(&NDIlib_audio_frame_v3_t {
+            FourCC: AudioFormat::Fltp.to_sdk(),
+            sample_rate: 48_000,
+            no_channels: 2,
+            no_samples: 4,
+            ..Default::default()
+        })
+        .unwrap();
+        let narrowed = audio
+            .with_stride_bytes(32)
+            .unwrap()
+            .with_stride_bytes(20)
+            .unwrap();
+        assert_eq!(
+            (narrowed.stride_bytes(), narrowed.minimum_bytes()),
+            (20, 40)
+        );
     }
 
     #[test]
@@ -3416,7 +3501,7 @@ mod tests {
                 let gate = gate.clone();
                 move |request: AllocationRequest| {
                     let storage = DelayedStorage {
-                        storage: OwnedStorage::zeroed(request.minimum_bytes())?,
+                        storage: OwnedStorage::zeroed(request)?,
                         gate: gate.clone(),
                     };
                     Ok(AllocationBuffer::from_external(request, storage)?)
