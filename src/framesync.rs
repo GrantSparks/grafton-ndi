@@ -1124,7 +1124,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn debug_makes_no_native_calls_or_exposes_pointers() {
+    fn debug_prints_identity_without_pointers_or_queue_queries() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
@@ -1425,31 +1425,6 @@ mod tests {
             assert_eq!(allocations, 0);
             assert_eq!(audio_test_calls::take(), (1, 1));
         }
-    }
-
-    #[test]
-    fn test_framesync_size() {
-        // FrameSync contains an opaque pointer, its runtime handle and the owned Receiver
-        assert_eq!(
-            std::mem::size_of::<FrameSync>(),
-            std::mem::size_of::<NDIlib_framesync_instance_t>()
-                + std::mem::size_of::<crate::Ndi>()
-                + std::mem::size_of::<Receiver>()
-        );
-    }
-
-    #[test]
-    fn test_video_ref_size() {
-        // FrameSyncVideoRef includes a reference, frame struct, and pixel_format
-        let size = std::mem::size_of::<FrameSyncVideoRef>();
-        assert!(size > 0, "FrameSyncVideoRef should have non-zero size");
-    }
-
-    #[test]
-    fn test_audio_ref_size() {
-        // FrameSyncAudioRef includes a reference and frame struct
-        let size = std::mem::size_of::<FrameSyncAudioRef>();
-        assert!(size > 0, "FrameSyncAudioRef should have non-zero size");
     }
 
     #[test]

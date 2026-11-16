@@ -1092,15 +1092,6 @@ impl<M: ReceiverMode> std::fmt::Debug for Receiver<M> {
     }
 }
 
-// Preserve the owned receiver's pre-Arc unwind contract. Its private core keeps
-// a valid native handle throughout every operation; Rust locks are released on
-// unwind, pending notifications are individually committed, and no public method
-// runs caller code while mutating protected receiver state. Sharing ownership for
-// advertisements therefore introduces no new partially updated public invariant.
-// ReceiverCore separately implements RefUnwindSafe for shared borrows; together
-// these preserve both unwind traits, as tests/public_auto_traits.rs asserts.
-impl<M: ReceiverMode + std::panic::UnwindSafe> std::panic::UnwindSafe for Receiver<M> {}
-
 /// Only a receiver's connection lock can issue this permit.
 struct ConnectionPermit;
 

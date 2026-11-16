@@ -769,16 +769,14 @@ fn test_video_frame_builder_creates_line_stride_bytes() {
     assert_eq!(frame.line_stride_bytes(), 640 * 4);
 }
 
-/// Tests for the lock-free atomic RuntimeManager implementation.
-/// These tests verify that the atomic refcount and Once-based initialization
-/// work correctly under concurrent access.
+/// Concurrent handle cloning and dropping, interleaved runtime acquisition and
+/// release, and live-handle status exercise the Mutex/Condvar runtime lifecycle.
 mod runtime_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
 
-    /// Test that concurrent cloning of NDI handles works correctly.
-    /// This verifies the atomic refcount increment path.
+    /// Concurrent handles retain the initialized runtime while cloning.
     #[test]
     fn test_concurrent_clone_does_not_panic() {
         let Some(ndi) = crate::test_support::ndi().map(Arc::new) else {
@@ -809,8 +807,7 @@ mod runtime_tests {
         assert_eq!(clone_count.load(Ordering::Relaxed), 1000);
     }
 
-    /// Test that concurrent drop of NDI handles works correctly.
-    /// This verifies the atomic refcount decrement path.
+    /// Concurrent drops release handles while another live handle retains the runtime.
     #[test]
     fn test_concurrent_drop_does_not_panic() {
         let Some(ndi) = crate::test_support::ndi() else {
@@ -836,9 +833,7 @@ mod runtime_tests {
         }
     }
 
-    /// Test that mixed acquire/release operations work correctly.
-    /// This verifies that the lock-free implementation handles interleaved
-    /// operations from multiple threads.
+    /// Runtime acquisition and release remain valid when threads interleave them.
     #[test]
     fn test_mixed_acquire_release_concurrent() {
         use crate::Ndi;
@@ -892,7 +887,5 @@ mod runtime_tests {
         assert!(Ndi::is_running());
 
         drop(ndi);
-        // After dropping all handles, state depends on test isolation.
-        let _final_state = Ndi::is_running();
     }
 }
