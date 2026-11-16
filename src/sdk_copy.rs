@@ -357,29 +357,31 @@ impl CopyBudget {
 
 /// Borrowed SDK text with the exact size of its lossy UTF-8 representation.
 /// Callers charge `len()` to their snapshot budget before asking for a copy.
-pub(crate) enum LossyText<'a> {
+pub(crate) struct LossyText<'a>(ClassifiedText<'a>);
+
+enum ClassifiedText<'a> {
     Valid(&'a str),
     Invalid { bytes: &'a [u8], len: usize },
 }
 
 impl<'a> LossyText<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        match std::str::from_utf8(bytes) {
-            Ok(text) => Self::Valid(text),
+        Self(match std::str::from_utf8(bytes) {
+            Ok(text) => ClassifiedText::Valid(text),
             Err(_) => {
                 let len = bytes
                     .utf8_chunks()
                     .map(|chunk| chunk.valid().len() + usize::from(!chunk.invalid().is_empty()) * 3)
                     .sum();
-                Self::Invalid { bytes, len }
+                ClassifiedText::Invalid { bytes, len }
             }
-        }
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
-        match self {
-            Self::Valid(text) => text.len(),
-            Self::Invalid { len, .. } => *len,
+        match &self.0 {
+            ClassifiedText::Valid(text) => text.len(),
+            ClassifiedText::Invalid { len, .. } => *len,
         }
     }
 
@@ -392,9 +394,9 @@ impl<'a> LossyText<'a> {
 
     /// Append the classified text into storage already reserved by the caller.
     pub(crate) fn push_to(&self, text: &mut String) {
-        match self {
-            Self::Valid(valid) => text.push_str(valid),
-            Self::Invalid { bytes, .. } => {
+        match &self.0 {
+            ClassifiedText::Valid(valid) => text.push_str(valid),
+            ClassifiedText::Invalid { bytes, .. } => {
                 for chunk in bytes.utf8_chunks() {
                     text.push_str(chunk.valid());
                     if !chunk.invalid().is_empty() {
