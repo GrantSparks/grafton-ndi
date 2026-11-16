@@ -78,8 +78,8 @@ GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --locked --all-features --config ci/off
 | `advanced` | Advanced runtime and compiled Advanced declarations |
 | `file` | Usable separate File library, with `file-io` enabled |
 | `discovery-server` | Compatible runtime and SDK Discovery Server, on Linux |
-| `h264-decoder` | Runtime can decode the H.264 fixture, with `advanced` enabled |
-| `hevc-444-decoder` | Runtime can decode the HEVC 4:4:4 fixture, with `advanced` enabled |
+| `h264-decoder` | Implies `advanced`; runtime can decode the H.264 fixture |
+| `hevc-444-decoder` | Implies `advanced`; runtime can decode the HEVC 4:4:4 fixture with the 6.4 Best444 receiver |
 
 For example, use `advanced,file` when both are installed. Unknown tokens and
 requirements that the build cannot exercise are errors. Decoder fixtures do
