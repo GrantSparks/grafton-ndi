@@ -1130,11 +1130,15 @@ impl AllocatorUsage {
     }
 
     /// Allocations the SDK holds, including those being released.
+    /// A release whose policy code panicked stays counted, because its storage
+    /// may have leaked.
     pub fn retained_allocations(self) -> usize {
         self.retained_allocations
     }
 
     /// Bytes the SDK holds, including those being released.
+    /// A release whose policy code panicked stays counted, because its storage
+    /// may have leaked.
     pub fn retained_bytes(self) -> usize {
         self.retained_bytes
     }
@@ -1145,6 +1149,9 @@ impl AllocatorUsage {
     }
 
     /// Buffers whose release is running at this moment.
+    /// A release whose policy code panicked stays counted, because its storage
+    /// may have leaked. This count therefore does not return to zero after
+    /// such a panic.
     pub fn in_progress_reclamations(self) -> usize {
         self.reclaiming
     }
