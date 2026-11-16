@@ -3272,3 +3272,23 @@ fn lossy_webp_conversion_storage_failure_reports_image_scratch() {
         })
     ));
 }
+
+#[test]
+fn eight_bit_yuv_png_conversion_preserves_sixteen_bit_precision() {
+    let frame = VideoFrame::builder()
+        .resolution(2, 2)
+        .pixel_format(PixelFormat::Uyvy)
+        .data([128, 17, 128, 17].repeat(2))
+        .build()
+        .unwrap();
+    for (depth, expected) in [(SampleDepth::Eight, 1), (SampleDepth::Sixteen, 299)] {
+        let encoded = frame
+            .encode_image(&options(ImageFormat::Png).depth(depth))
+            .unwrap();
+        let decoded = decode_png(&encoded);
+        assert_eq!((decoded.width, decoded.height), (2, 2));
+        for pixel in decoded.samples.chunks_exact(decoded.channels) {
+            assert_eq!(&pixel[..3], &[expected; 3]);
+        }
+    }
+}

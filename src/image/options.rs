@@ -475,8 +475,9 @@ pub enum SampleDepth {
     #[default]
     Eight,
     /// 16 bits a channel, for PNG only. P216, PA16, NA4G and NB4G frames
-    /// keep their precision, and 8-bit sources are scaled exactly (times
-    /// 257). Receivers set to [`ReceiverColorFormat::Best`] or
+    /// keep their precision. Eight-bit RGB and alpha samples scale exactly
+    /// by 257; YUV sources are converted at 16-bit precision.
+    /// Receivers set to [`ReceiverColorFormat::Best`] or
     /// [`ReceiverColorFormat::Best444`] get such frames from a
     /// high-bit-depth source.
     ///

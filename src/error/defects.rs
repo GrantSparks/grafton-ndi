@@ -75,7 +75,9 @@ pub enum DiscoveryDefect {
 /// aspect ratios, frame rates, compressed video formats and allocation strides
 /// instead use [`InputDefect::Layout`]. Layout validators used by SDK allocator
 /// callbacks construct only allocation-free variants. The two wide diagnostic
-/// variants are constructed only by their standalone value checks.
+/// variants arise from standalone value checks and validation of delivered video
+/// headers and compressed formats, never from the `from_sdk_checked` validators
+/// that allocator callbacks use.
 #[derive(Debug, Clone, PartialEq, Error)]
 #[non_exhaustive]
 pub enum LayoutDefect {
@@ -847,8 +849,7 @@ pub enum InputDefect {
 }
 /// Typed causes of [`crate::Error::UnexpectedSdkResult`].
 ///
-/// Ordinary causes retain their evidence inline without allocating. Boxed
-/// diagnostic fields retain caller or SDK text only for the documented exceptions.
+/// Causes retain their evidence inline without allocating.
 #[derive(Debug, Clone, PartialEq, Error, Copy, Eq, Hash)]
 #[non_exhaustive]
 pub enum SdkResultDefect {

@@ -272,9 +272,13 @@ pub enum Error {
     ///   is out of range, or a format cannot be used for the operation. This
     ///   includes a compressed frame the SDK would discard instead of
     ///   delivering it.
+    /// * A frame's colour description is malformed, conflicting or withheld
+    ///   with its metadata; its HDR transfer is refused; its image dimensions
+    ///   exceed the codec's limits; or an image encoder fails.
     ///
     /// Unreadable optional video/audio metadata is withheld instead of failing
-    /// capture; [`crate::FrameMetadataStatus`] reports its condition.
+    /// capture; [`crate::FrameMetadataStatus`] reports its condition. Withheld
+    /// metadata can still fail a later colour-description read.
     ///
     /// A value that describes no one frame, such as a compressed video format
     /// or an allocation, AV sync, clock or remote-control value of the
