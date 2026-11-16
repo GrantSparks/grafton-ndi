@@ -34,8 +34,8 @@
 //! * `fake_blocking_connect` — hold the `Blocked` receiver connection request
 //!   between `entered` and `release` files in `GRAFTON_FAKE_CONNECT_GATE`;
 
-//! * `fake_capability_descriptors` — log synchronous sends, receiver settings
-//!   and Advanced AV sync descriptors after their capability checks;
+//! * `fake_capability_descriptors` — log send and receiver format gates, and
+//!   validated AV-sync descriptors after checking synchronization availability;
 //! * `fake_capture` — script native media/notification delivery with
 //!   `GRAFTON_FAKE_CAPTURE_SCRIPT`; only active rows/channels are initialized;
 //! * `fake_receiver_controls` — clocked capture, stream controls and KVM log
