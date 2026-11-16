@@ -1,4 +1,4 @@
-//! Version-gated enum values reach native descriptors only after authorization.
+//! Sending and receiver options apply format gates; AV sync uses validated timing.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
 #[cfg(feature = "advanced")]
@@ -375,25 +375,48 @@ fn advanced(ndi: &Ndi, modern: bool) {
         }
         let owned = captured.to_owned();
         drop(captured);
+        // Capture through the split receiver too, retaining a native-call
+        // count assertion for the borrowed split-view path on every runtime.
+        std::env::set_var(
+            "GRAFTON_FAKE_CAPTURE_SCRIPT",
+            format!("split-{serial}:{token}"),
+        );
+        {
+            let (capture, controls) = sync.split();
+            let borrowed = controls
+                .receiver()
+                .capture_video_ref(Duration::ZERO)
+                .unwrap()
+                .unwrap();
+            let before = calls("avsync-synchronize:");
+            assert!(matches!(
+                capture.synchronize(
+                    AvSyncVideo::new(&borrowed).unwrap(),
+                    AvSyncRequest::automatic()
+                ),
+                Ok(AvSyncOutcome::NoAudioStream)
+            ));
+            assert_eq!(calls("avsync-synchronize:"), before + 1);
+        }
         for request in [
             AvSyncRequest::automatic(),
             AvSyncRequest::new(Some(48_000), Some(1600)).unwrap(),
         ] {
             let before = calls("avsync-synchronize:");
-            accepted(
+            // AV sync matches this frame's validated timing independently of
+            // the runtime's ability to send its planar pixel format.
+            assert!(matches!(
                 sync.synchronize(AvSyncVideo::new(&owned).unwrap(), request),
-                modern,
-                RuntimeFeature::Planar444Video,
-            );
-            assert_eq!(calls("avsync-synchronize:"), before + usize::from(modern));
+                Ok(AvSyncOutcome::NoAudioStream)
+            ));
+            assert_eq!(calls("avsync-synchronize:"), before + 1);
             let (capture, _) = sync.split();
             let before = calls("avsync-synchronize:");
-            accepted(
+            assert!(matches!(
                 capture.synchronize(AvSyncVideo::new(&owned).unwrap(), request),
-                modern,
-                RuntimeFeature::Planar444Video,
-            );
-            assert_eq!(calls("avsync-synchronize:"), before + usize::from(modern));
+                Ok(AvSyncOutcome::NoAudioStream)
+            ));
+            assert_eq!(calls("avsync-synchronize:"), before + 1);
         }
     }
 }

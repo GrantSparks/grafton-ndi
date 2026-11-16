@@ -232,9 +232,9 @@ Audio requests above the 64 MiB capture limit are declined as
 policy. Unrepresentable video and audio requests are declined without allocating
 on the SDK thread.
 
-`AllocatorService::attach_packets` gives packet capture the same application
-buffers. Use `AllocatedPacketReceiver::capture_any_ref` to inspect those buffers
-in place; owned `capture_any` copies them. Keeping a packet reference retains its
+`AllocatorService::attach_packets` returns `AllocatedReceiver<PacketAttached>`
+with the same application buffers. Use its `capture_any_ref` to inspect those
+buffers in place; owned `capture_any` copies them. Keeping a packet reference retains its
 allocation and usage charge until the SDK releases that buffer after the
 reference is dropped. For example, after constructing `service` and `packets`:
 
@@ -307,7 +307,10 @@ retains the historical measurements and their limits.
 and reserves audio capture; capture video through `sync.receiver()`, then pass
 it to `synchronize` as an `AvSyncVideo`. `AvSyncVideo::new` accepts a borrowed
 capture or an owned copy of one, and returns `None` for a frame without its
-sender's timestamp, such as one the application built. `queued_audio` takes
+sender's timestamp, such as one the application built. Matching reads the
+video's timing independently of send-format capabilities: owned and borrowed
+planar 4:4:4 video can both synchronize on older Advanced runtimes.
+`queued_audio` takes
 the queued audio without a frame. `AvSyncRequest::automatic()` lets the SDK
 choose audio shape. `AvSyncOutcome` distinguishes audio, no matching
 samples, format changes and absent audio; SDK internal failures return

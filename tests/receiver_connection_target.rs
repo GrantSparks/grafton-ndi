@@ -43,6 +43,74 @@ fn connection_target_tracks_native_requests() {
     );
 }
 
+#[test]
+fn connection_target_snapshot_does_not_wait_for_a_native_connection_request() {
+    if let Some(library) = std::env::var_os("GRAFTON_TARGET_BLOCKED_CHILD") {
+        let ndi = Ndi::with_options(
+            &RuntimeOptions::new().library_path(std::path::PathBuf::from(library)),
+        )
+        .unwrap();
+        let initial = Source::new("Initial").unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::new(initial.clone())).unwrap();
+        let gate = std::path::PathBuf::from(std::env::var_os("GRAFTON_FAKE_CONNECT_GATE").unwrap());
+        struct Release(std::path::PathBuf);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                fs::write(self.0.join("release"), b"").unwrap();
+            }
+        }
+        let blocked = Source::new("Blocked").unwrap();
+        std::thread::scope(|scope| {
+            let receiver = &receiver;
+            let release = Release(gate.clone());
+            scope.spawn(|| receiver.connect_to(&blocked));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !gate.join("entered").exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "native request did not start"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let (send, receive) = std::sync::mpsc::channel();
+            scope.spawn(move || send.send(receiver.connection_target()).unwrap());
+            let snapshot = receive.recv_timeout(std::time::Duration::from_secs(1));
+            // Release native work before asserting so a lock regression fails
+            // cleanly rather than hanging either scoped worker.
+            drop(release);
+            assert_eq!(
+                snapshot.expect("snapshot waited for native connect"),
+                initial
+            );
+        });
+        assert_eq!(receiver.connection_target(), blocked);
+        return;
+    }
+    let directory = fixture::FixtureDir::create("connection-target-blocked");
+    let library = directory.path().join("libndi_blocked.so");
+    runtime_fixture::FakeRuntime {
+        cfgs: vec!["fake_objects", "fake_blocking_connect"],
+        ..Default::default()
+    }
+    .build(&library);
+    let result = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "connection_target_snapshot_does_not_wait_for_a_native_connection_request",
+            "--nocapture",
+        ])
+        .env("GRAFTON_TARGET_BLOCKED_CHILD", &library)
+        .env("GRAFTON_FAKE_CONNECT_GATE", directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
 fn exercise_target() {
     let path = std::path::PathBuf::from(std::env::var_os("GRAFTON_TARGET_CHILD").unwrap());
     let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(path)).unwrap();

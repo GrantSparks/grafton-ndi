@@ -196,7 +196,90 @@ impl Sdk {
 
 /// Whether `os` links the SDK into the application instead of loading it.
 pub fn links_statically(os: &str) -> bool {
-    matches!(os, "ios" | "tvos" | "visionos")
+    STATIC_TARGETS.iter().any(|target| target.os == os)
+}
+
+/// One supported Rust target and the Apple SDK slice it must link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaticTarget {
+    pub os: &'static str,
+    pub arch: &'static str,
+    pub abi: &'static str,
+    pub sdk_subdirectory: &'static str,
+    pub platform: u32,
+    pub deployment_variable: &'static str,
+}
+
+/// The vendor's fat archives supply device ARM64 and Intel simulator slices.
+/// ARM64 simulators (`sim`) and Mac Catalyst (`macabi`) need a different SDK
+/// layout; matching their CPU alone would incorrectly accept a device slice.
+pub const STATIC_TARGETS: &[StaticTarget] = &[
+    StaticTarget {
+        os: "ios",
+        arch: "aarch64",
+        abi: "",
+        sdk_subdirectory: "iOS",
+        platform: 2,
+        deployment_variable: "IPHONEOS_DEPLOYMENT_TARGET",
+    },
+    StaticTarget {
+        os: "ios",
+        arch: "x86_64",
+        abi: "sim",
+        sdk_subdirectory: "iOS",
+        platform: 7,
+        deployment_variable: "IPHONEOS_DEPLOYMENT_TARGET",
+    },
+    StaticTarget {
+        os: "tvos",
+        arch: "aarch64",
+        abi: "",
+        sdk_subdirectory: "tvOS",
+        platform: 3,
+        deployment_variable: "TVOS_DEPLOYMENT_TARGET",
+    },
+    StaticTarget {
+        os: "tvos",
+        arch: "x86_64",
+        abi: "sim",
+        sdk_subdirectory: "tvOS",
+        platform: 8,
+        deployment_variable: "TVOS_DEPLOYMENT_TARGET",
+    },
+    StaticTarget {
+        os: "visionos",
+        arch: "aarch64",
+        abi: "",
+        sdk_subdirectory: "visionOS",
+        platform: 11,
+        deployment_variable: "XROS_DEPLOYMENT_TARGET",
+    },
+];
+
+/// Select the complete target before reading any SDK archive.
+pub fn static_target(
+    target: &str,
+    os: &str,
+    arch: &str,
+    abi: &str,
+) -> Result<&'static StaticTarget, String> {
+    STATIC_TARGETS
+        .iter()
+        .find(|entry| (entry.os, entry.arch, entry.abi) == (os, arch, abi))
+        .ok_or_else(|| {
+            format!(
+                "Unsupported Apple static target {target}; see docs/setup.md#apple-mobile-targets (ARM64 Apple simulators and Mac Catalyst are not supported)"
+            )
+        })
+}
+
+/// Environment inputs used by any supported static target, without duplicates.
+pub fn static_deployment_variables() -> impl Iterator<Item = &'static str> {
+    STATIC_TARGETS
+        .iter()
+        .map(|target| target.deployment_variable)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
 }
 
 /// The vendor archive a statically linked target uses.
@@ -213,14 +296,13 @@ pub struct StaticLibrary {
 /// decides the edition; a directory holding both links the Advanced one. A
 /// mobile File archive already contains the core, so it replaces the core
 /// archive instead of being linked beside it.
-pub fn static_library(sdk: &Sdk, os: &str, file_io: bool) -> Result<StaticLibrary, String> {
-    let (subdirectory, platform) = match os {
-        "ios" => ("iOS", "ios"),
-        "tvos" => ("tvOS", "tvos"),
-        "visionos" => ("visionOS", "visionos"),
-        _ => return Err(format!("{os} does not link the NDI SDK statically")),
-    };
-    let directory = directory(&sdk.root, "lib", "Lib")?.join(subdirectory);
+pub fn static_library(
+    sdk: &Sdk,
+    target: &StaticTarget,
+    file_io: bool,
+) -> Result<StaticLibrary, String> {
+    let platform = target.os;
+    let directory = directory(&sdk.root, "lib", "Lib")?.join(target.sdk_subdirectory);
     let archive = |name: &str| directory.join(format!("lib{name}.a"));
     let (edition, core) = [
         (Edition::Advanced, format!("ndi_advanced_{platform}")),
@@ -230,7 +312,7 @@ pub fn static_library(sdk: &Sdk, os: &str, file_io: bool) -> Result<StaticLibrar
     .find(|(_, name)| archive(name).is_file())
     .ok_or_else(|| {
         format!(
-            "No NDI static library for {os} in {}; set NDI_SDK_DIR to a complete Apple SDK",
+            "No NDI static library for {platform} in {}; set NDI_SDK_DIR to a complete Apple SDK",
             directory.display()
         )
     })?;

@@ -110,20 +110,12 @@ fn archive_range(data: &[u8], cpu: u32) -> Result<Range<usize>, String> {
 }
 
 /// Return the largest deployment floor declared by objects in this slice.
-pub fn inspect(path: &Path, arch: &str, os: &str) -> Result<StaticArchive, String> {
+pub fn inspect(path: &Path, arch: &str, platform: u32) -> Result<StaticArchive, String> {
     let data = fs::read(path).map_err(|e| format!("Read {}: {e}", path.display()))?;
     let cpu = match arch {
         "aarch64" => 0x0100_000c,
         "x86_64" => 0x0100_0007,
         _ => return Err("Unsupported Apple CPU".into()),
-    };
-    let platform = match (os, arch) {
-        ("ios", "aarch64") => 2,
-        ("ios", "x86_64") => 7,
-        ("tvos", "aarch64") => 3,
-        ("tvos", "x86_64") => 8,
-        ("visionos", "aarch64") => 11,
-        _ => return Err("No supplied Apple platform/simulator slice".into()),
     };
     let archive = &data[archive_range(&data, cpu)?];
     if !archive.starts_with(b"!<arch>\n") {
@@ -218,8 +210,9 @@ pub fn inspect(path: &Path, arch: &str, os: &str) -> Result<StaticArchive, Strin
                     floor = floor.max(u32_at(object, at + 12, false)?);
                     saw_platform = true;
                 } else if matches!(cmd, 0x25 | 0x2f) {
-                    let legacy_os = if cmd == 0x25 { "ios" } else { "tvos" };
-                    if legacy_os != os {
+                    // Legacy commands name the OS family; their CPU selects
+                    // device versus simulator, unlike LC_BUILD_VERSION.
+                    if !matches!((cmd, platform), (0x25, 2 | 7) | (0x2f, 3 | 8)) {
                         return Err("Legacy Apple platform does not match target".into());
                     }
                     floor = floor.max(u32_at(object, at + 8, false)?);

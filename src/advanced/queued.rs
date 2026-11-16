@@ -13,16 +13,19 @@ use std::{
 #[cfg(any(test, ndi_has_advanced_send_completion))]
 use std::ffi::c_void;
 
+use super::send::ScatterSendable;
 use super::{
     send::PendingVideo,
     send_slots::{DescriptorLease, Released, SlotKey},
     CompressedVideoFrame, QueueAttached, ScatterVideoFrame, SubmittedVideo,
 };
+#[cfg(test)]
+use crate::sys::advanced::ScatterSend;
 use crate::{
     frames::Sendable,
     sender::in_flight::{Destroyed, Lend, Lending, Lent, LoanPair, Loans},
     sys::{
-        advanced::{native, ScatterSend, SendCompletion},
+        advanced::{native, SendCompletion},
         bindings::*,
     },
     timeout::Deadline,
@@ -163,86 +166,43 @@ impl QueuedVideoFrame {
     fn authorize(
         self,
         sender: &Sender<QueueAttached>,
-    ) -> std::result::Result<AuthorizedVideo, Rejected<Self>> {
+    ) -> std::result::Result<QueuedStorage, Rejected<Self>> {
         self.authorize_with(
             |frame| sender.require_video_layout(frame),
-            || sender.runtime().table::<ScatterSend>(),
+            |frame| ScatterSendable::checked(frame, sender.runtime()),
         )
     }
 
-    /// The same structural authorization with capability lookup supplied by
-    /// the caller, so SDK-free boundary tests exercise the production arms.
     fn authorize_with(
         self,
         pixels: impl FnOnce(
             VideoFrame,
         ) -> std::result::Result<Sendable<VideoFrame>, Rejected<VideoFrame>>,
-        scatter: impl FnOnce() -> Result<&'static ScatterSend>,
-    ) -> std::result::Result<AuthorizedVideo, Rejected<Self>> {
+        scatter: impl FnOnce(
+            ScatterVideoFrame,
+        ) -> std::result::Result<
+            ScatterSendable<ScatterVideoFrame>,
+            (Error, ScatterVideoFrame),
+        >,
+    ) -> std::result::Result<QueuedStorage, Rejected<Self>> {
         match self {
             Self::Pixels(frame) => pixels(frame)
-                .map(AuthorizedVideo::Pixels)
+                .map(QueuedStorage::Pixels)
                 .map_err(|rejected| rejected.map(Self::Pixels)),
-            Self::Compressed(frame) => Ok(AuthorizedVideo::Compressed(frame)),
-            Self::Scatter(frame) => {
-                let table = match scatter() {
-                    Ok(table) => table,
-                    Err(error) => return Err(Rejected::new(error, Self::Scatter(frame))),
-                };
-                native!(ScatterSend, table => {
-                    Ok(AuthorizedVideo::Scatter { frame, table })
-                })
-            }
+            Self::Compressed(frame) => Ok(QueuedStorage::Packet(PendingVideo::Contiguous(frame))),
+            Self::Scatter(frame) => scatter(frame)
+                .map(|proof| QueuedStorage::Packet(PendingVideo::Scatter(proof)))
+                .map_err(|(error, frame)| Rejected::new(error, Self::Scatter(frame))),
         }
     }
 
     #[cfg(test)]
-    fn authorize_for_test(self, scatter: Option<&'static ScatterSend>) -> AuthorizedVideo {
+    fn authorize_for_test(self, scatter: Option<&'static ScatterSend>) -> QueuedStorage {
         self.authorize_with(
             |frame| Ok(Sendable::for_test(frame)),
-            || {
-                scatter.ok_or(Error::UnsupportedCapability {
-                    capability: crate::Capability::Runtime(crate::RuntimeFeature::ScatterSend),
-                    refusal: crate::CapabilityRefusal::SymbolUnavailable(
-                        c"NDIlib_send_send_video_scatter",
-                    ),
-                })
-            },
+            |frame| ScatterSendable::for_test(frame, scatter),
         )
         .unwrap()
-    }
-}
-
-/// Authorized payloads do not acquire descriptor storage until admitted.
-enum AuthorizedVideo {
-    Pixels(Sendable<VideoFrame>),
-    Compressed(CompressedVideoFrame),
-    #[cfg(ndi_has_advanced_scatter_send)]
-    Scatter {
-        frame: ScatterVideoFrame,
-        table: &'static ScatterSend,
-    },
-}
-
-impl AuthorizedVideo {
-    fn into_frame(self) -> QueuedVideoFrame {
-        match self {
-            Self::Pixels(frame) => frame.into_frame().into(),
-            Self::Compressed(frame) => frame.into(),
-            #[cfg(ndi_has_advanced_scatter_send)]
-            Self::Scatter { frame, .. } => frame.into(),
-        }
-    }
-
-    fn retain(self) -> QueuedStorage {
-        match self {
-            Self::Pixels(frame) => QueuedStorage::Pixels(frame),
-            Self::Compressed(frame) => QueuedStorage::Packet(PendingVideo::Contiguous(frame)),
-            #[cfg(ndi_has_advanced_scatter_send)]
-            Self::Scatter { frame, table } => {
-                QueuedStorage::Packet(PendingVideo::Scatter { frame, table })
-            }
-        }
     }
 }
 
@@ -274,12 +234,25 @@ impl QueuedStorage {
 // value moves none of its allocations; Entry excludes access until completion
 // or destruction has ended the native loan.
 unsafe impl Lend for QueuedStorage {
-    type Authorization = ();
-
-    fn lend(&mut self, (): ()) -> Lent {
+    fn lend(&mut self) -> Lent {
         match self {
-            Self::Pixels(frame) => frame.lend(()),
-            Self::Packet(frame) => frame.lend_for_queue(),
+            Self::Pixels(frame) => frame.lend(),
+            Self::Packet(frame) => {
+                let lent = frame.lend();
+                #[cfg(ndi_has_advanced_scatter_send)]
+                {
+                    let mut lent = lent;
+                    if let PendingVideo::Scatter(proof) = frame {
+                        let (pointer, length) = proof.completion_key();
+                        let descriptor = lent.descriptor_mut();
+                        descriptor.p_data = pointer;
+                        descriptor.__bindgen_anon_1.data_size_in_bytes = length;
+                    }
+                    lent
+                }
+                #[cfg(not(ndi_has_advanced_scatter_send))]
+                lent
+            }
         }
     }
 }
@@ -389,18 +362,18 @@ impl State {
     /// initialize a free stable slot and record ownership before dispatch.
     fn admit(
         &mut self,
-        frame: AuthorizedVideo,
+        frame: QueuedStorage,
         bytes: usize,
         protocol_error: &AtomicBool,
     ) -> std::result::Result<Admitted, Rejected<QueuedVideoFrame>> {
-        self.admit_with_lend(frame, bytes, protocol_error, |frame| frame.lend(()))
+        self.admit_with_lend(frame, bytes, protocol_error, |frame| frame.lend())
     }
 
     /// Derive the completion key from the very descriptor handed to the SDK.
     /// Lending needs no header slot: scatter lists belong to their frames.
     fn admit_with_lend(
         &mut self,
-        frame: AuthorizedVideo,
+        frame: QueuedStorage,
         bytes: usize,
         protocol_error: &AtomicBool,
         lend: impl FnOnce(&mut QueuedStorage) -> Lent,
@@ -429,7 +402,7 @@ impl State {
                 frame.into_frame(),
             ));
         };
-        let mut frame = frame.retain();
+        let mut frame = frame;
         let lent = lend(&mut frame);
         let key = lent.descriptor().p_data as usize;
         if self.in_flight.capacity() == self.in_flight.len() {
@@ -1111,6 +1084,39 @@ mod tests {
     }
 
     #[test]
+    fn scatter_authorization_refusal_recovers_the_original_queued_frame() {
+        let format =
+            super::super::VideoPacketFormat::new(super::super::VideoCodec::SpeedHq422, 16, 16)
+                .unwrap();
+        let frame = ScatterVideoFrame::new(format, vec![vec![1, 2, 3, 4], vec![5, 6]]).unwrap();
+        let blocks: Vec<_> = frame.blocks().map(|block| block.as_ptr()).collect();
+        let rejected = QueuedVideoFrame::Scatter(frame)
+            .authorize_with(
+                |_| panic!("a scatter frame must use the scatter proof"),
+                |frame| ScatterSendable::for_test(frame, None),
+            )
+            .err()
+            .unwrap();
+        assert!(matches!(
+            rejected.error(),
+            Error::UnsupportedCapability {
+                capability: crate::Capability::Runtime(crate::RuntimeFeature::ScatterSend),
+                ..
+            }
+        ));
+        let QueuedVideoFrame::Scatter(frame) = rejected.into_inner() else {
+            panic!("the original scatter input is recovered")
+        };
+        assert_eq!(
+            frame
+                .blocks()
+                .map(|block| block.as_ptr())
+                .collect::<Vec<_>>(),
+            blocks
+        );
+    }
+
+    #[test]
     fn split_submission_reuses_reserved_descriptors() {
         let Some(ndi) = crate::test_support::advanced_ndi() else {
             return;
@@ -1157,7 +1163,7 @@ mod tests {
                 |frame| {
                     Lent::Frame(NDIlib_video_frame_v2_t {
                         p_data: key as *mut u8,
-                        ..*frame.lend(()).descriptor()
+                        ..*frame.lend().descriptor()
                     })
                 },
             )

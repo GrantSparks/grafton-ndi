@@ -48,7 +48,7 @@ fn descriptor_uses_only_the_frame_bound_to_its_authorization() {
         .pixel_format(PixelFormat::Uyvy)
         .build()
         .unwrap();
-    let other = Sendable::for_test(&uyvy).video_descriptor();
+    let other = uyvy.video_descriptor();
     assert_eq!(other.FourCC, FourCc::from(PixelFormat::Uyvy).raw());
     assert_eq!(other.p_data.cast_const(), uyvy.data().as_ptr());
     assert_eq!(checked.video_descriptor().p_data, raw.p_data);

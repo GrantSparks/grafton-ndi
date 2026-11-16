@@ -57,11 +57,14 @@ use crate::{
     connection_metadata::ConnectionMetadata,
     finder::{RawSource, Source},
     frames::MetadataPartsExt,
+    source_retention::RetainedSource,
     sys::{self, bindings::*},
     timeout::{self, Deadline, NeverStop, Stop, POLL_INTERVAL},
     AudioFrame, AudioFrameRef, Error, MetadataFrame, MetadataFrameRef, MetadataSource, Ndi, Result,
     VideoFrame, VideoFrameRef,
 };
+
+pub(crate) mod attached;
 
 /// A string the receiver API returned, released when dropped.
 struct RecvStringGuard<'a> {
@@ -939,41 +942,6 @@ impl SynchronizerMode for FrameSyncAttached {}
 #[cfg(feature = "advanced")]
 impl SynchronizerMode for AvSyncAttached {}
 
-/// Proof that this receiver's native synchronizer has been destroyed.
-/// Construction consumes a native resource; retained core identity prevents
-/// another synchronizer's release from restoring raw capture on a live one.
-pub(crate) struct Released<M: SynchronizerMode> {
-    core: Arc<ReceiverCore>,
-    _mode: PhantomData<fn() -> M>,
-}
-
-impl Released<FrameSyncAttached> {
-    pub(crate) fn release(resource: crate::framesync::FrameSyncResource) -> Self {
-        // Keep this exact core allocated through identity validation. Cloning
-        // avoids manual field extraction from a resource with a native Drop.
-        let core = Arc::clone(resource.receiver_core());
-        drop(resource);
-        Self {
-            core,
-            _mode: PhantomData,
-        }
-    }
-}
-
-#[cfg(feature = "advanced")]
-impl Released<AvSyncAttached> {
-    pub(crate) fn release(resource: crate::advanced::AvResource) -> Self {
-        // Keep this exact core allocated through identity validation. Cloning
-        // avoids manual field extraction from a resource with a native Drop.
-        let core = Arc::clone(resource.receiver_core());
-        drop(resource);
-        Self {
-            core,
-            _mode: PhantomData,
-        }
-    }
-}
-
 /// Ordinary receiver mode, permitting raw video capture.
 #[derive(Debug)]
 pub enum RawCapture {}
@@ -1068,24 +1036,6 @@ impl<M: ReceiverMode> std::fmt::Debug for Receiver<M> {
 // these preserve both unwind traits, as tests/public_auto_traits.rs asserts.
 impl<M: ReceiverMode + std::panic::UnwindSafe> std::panic::UnwindSafe for Receiver<M> {}
 
-/// A requested target and the native descriptor already validated for it.
-/// Replaced as one value under the target lock, so neither half can be stale.
-pub(crate) struct ConnectionTarget {
-    source: Source,
-    // Keep both the descriptor and its strings at stable addresses until a
-    // replacement request returns, or the native receiver is destroyed.
-    raw: Box<RawSource>,
-}
-
-impl ConnectionTarget {
-    pub(crate) fn new(source: &Source) -> Self {
-        Self {
-            source: source.clone(),
-            raw: Box::new(source.to_raw()),
-        }
-    }
-}
-
 /// Only a receiver's connection lock can issue this permit.
 struct ConnectionPermit;
 
@@ -1098,13 +1048,13 @@ struct Connection<'a> {
 }
 
 enum ConnectionRequest {
-    Connect(ConnectionTarget),
+    Connect(RetainedSource),
     Reconnect,
     Disconnect,
 }
 
 impl Connection<'_> {
-    fn connect(&self, next: ConnectionTarget) {
+    fn connect(&self, next: RetainedSource) {
         self.request(ConnectionRequest::Connect(next));
     }
 
@@ -1117,27 +1067,28 @@ impl Connection<'_> {
     }
 
     fn request(&self, request: ConnectionRequest) {
-        // Only reconnect needs the target during the call. Snapshots share this
-        // read lock, and every writer holds this Connection's exclusive permit.
-        let target =
-            matches!(request, ConnectionRequest::Reconnect).then(|| self.core.target.read());
-        let source = match &request {
-            ConnectionRequest::Connect(next) => ptr::from_ref(next.raw.as_raw()),
-            ConnectionRequest::Reconnect => ptr::from_ref(target.as_ref().unwrap().raw.as_raw()),
-            ConnectionRequest::Disconnect => ptr::null(),
+        // The connection permit serializes writers. Clone only the retained
+        // allocation under the read lock; snapshots can continue throughout
+        // native work, and the write lock covers only the final replacement.
+        let call = |source| {
+            // SAFETY: this permit fixes the live receiver and serializes native
+            // requests. RetainedSource keeps the descriptors and text alive
+            // through this call and until replacement or native destruction.
+            unsafe {
+                self.core
+                    .sdk()
+                    .NDIlib_recv_connect(self.core.instance.0, source)
+            };
         };
-        // SAFETY: this permit fixes the live receiver and serializes requests.
-        // A connect passes the box moved into target below; reconnect passes
-        // the stored box under a read lock; disconnect passes null. The old
-        // target remains owned until this call returns, without assuming copies.
-        unsafe {
-            self.core
-                .sdk()
-                .NDIlib_recv_connect(self.core.instance.0, source)
-        };
-        drop(target);
-        if let ConnectionRequest::Connect(next) = request {
-            *self.core.target.write() = next;
+        match request {
+            ConnectionRequest::Connect(next) => {
+                let mut target = self.core.target.read().clone();
+                target.replace(next, call);
+                *self.core.target.write() = target;
+            }
+            ConnectionRequest::Reconnect => self.core.target.read().reissue(call),
+            // Disconnect deliberately preserves the last target for reconnect.
+            ConnectionRequest::Disconnect => call(ptr::null()),
         }
     }
 }
@@ -1165,7 +1116,7 @@ pub(crate) struct ReceiverCore {
     /// The latest requested target. Connection serializes its writers;
     /// snapshots never take it and therefore never wait for a capture or a queued
     /// connection change. Writers hold this lock only to replace the value.
-    target: RwLock<ConnectionTarget>,
+    target: RwLock<RetainedSource>,
     pending_status: PendingStatus,
     pending_source: AtomicBool,
     pending_unknown: Mutex<Option<u32>>,
@@ -1280,7 +1231,7 @@ impl<M: CreatableMode> Receiver<M> {
         ) -> sys::table::Called<NDIlib_recv_instance_t>,
     ) -> Result<Self> {
         let RawRecvCreateV3 {
-            _source,
+            _source: _,
             _name,
             raw,
         } = options.to_raw(ndi)?;
@@ -1292,10 +1243,7 @@ impl<M: CreatableMode> Receiver<M> {
                 instance: RecvInstance(instance),
                 _ndi: ndi.clone(),
                 connection_guard: Mutex::new(ConnectionPermit),
-                target: RwLock::new(ConnectionTarget {
-                    source: options.source.clone(),
-                    raw: Box::new(_source),
-                }),
+                target: RwLock::new(RetainedSource::new(&options.source)),
                 pending_status: PendingStatus::default(),
                 pending_source: AtomicBool::new(false),
                 pending_unknown: Mutex::new(None),
@@ -1311,30 +1259,9 @@ impl<M: CreatableMode> Receiver<M> {
 }
 
 impl Receiver<RawCapture> {
-    pub(crate) fn attach<M: SynchronizerMode>(self) -> Receiver<M> {
-        Receiver {
-            core: self.core,
-            _mode: PhantomData,
-        }
-    }
-
     /// Synthetic packet-mode receiver for tests without a passthrough SDK.
     #[cfg(all(test, feature = "advanced"))]
     pub(crate) fn into_packet_for_test(self) -> Receiver<PacketAttached> {
-        Receiver {
-            core: self.core,
-            _mode: PhantomData,
-        }
-    }
-}
-
-#[allow(private_bounds)]
-impl<M: SynchronizerMode> Receiver<M> {
-    pub(crate) fn detach(self, released: Released<M>) -> Receiver<RawCapture> {
-        assert!(
-            Arc::ptr_eq(&self.core, &released.core),
-            "synchronizer release belongs to another receiver"
-        );
         Receiver {
             core: self.core,
             _mode: PhantomData,
@@ -1623,11 +1550,11 @@ impl<M: ReceiverMode> Receiver<M> {
     /// remains.
     #[doc(alias = "NDIlib_recv_connect")]
     pub fn connect_to(&self, source: &Source) {
-        self.connect_target(ConnectionTarget::new(source));
+        self.connect_target(RetainedSource::new(source));
     }
 
     /// Apply an input already validated on the synchronous or async caller.
-    pub(crate) fn connect_target(&self, target: ConnectionTarget) {
+    pub(crate) fn connect_target(&self, target: RetainedSource) {
         self.core.lock_connection().connect(target);
     }
 
@@ -1806,7 +1733,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # }
     /// ```
     pub fn connection_target(&self) -> Source {
-        self.core.target.read().source.clone()
+        self.core.target.read().current().clone()
     }
 
     /// Get connection and performance statistics for this receiver.
@@ -3428,7 +3355,7 @@ mod tests {
 
         /// A caller's budget that started when this clock did.
         fn deadline(&self, budget: Duration) -> Deadline {
-            Deadline::starting(self.start, budget).unwrap()
+            Deadline::starting(self.start, crate::timeout::Timeout::new(budget).unwrap()).unwrap()
         }
 
         /// What is left of `attempt` now: the timeout its SDK call would get,

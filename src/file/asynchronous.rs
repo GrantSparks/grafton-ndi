@@ -395,9 +395,13 @@ impl<T> Drop for FileOperation<T> {
 
 struct Reply<T> {
     shared: Arc<Shared<T>>,
-    /// A command dropped without a result reports a failed owner if its
-    /// thread failed, rather than reporting an ordinary close.
-    owner: Option<Arc<Control>>,
+}
+
+/// A command always retains the control that records its owner's failure.
+/// Commands left queued after unwinding must report that failure too.
+struct CommandReply<T> {
+    shared: Arc<Shared<T>>,
+    owner: Arc<Control>,
 }
 
 fn operation<T>() -> (Reply<T>, Live<T>) {
@@ -405,18 +409,17 @@ fn operation<T>() -> (Reply<T>, Live<T>) {
 }
 
 fn operation_with_hook<T>(on_take: Option<Arc<dyn OnTake>>) -> (Reply<T>, Live<T>) {
+    let (shared, future) = shared_operation(on_take);
+    (Reply { shared }, future)
+}
+
+fn shared_operation<T>(on_take: Option<Arc<dyn OnTake>>) -> (Arc<Shared<T>>, Live<T>) {
     let shared = Arc::new(Shared {
         cancelled: AtomicBool::new(false),
         slot: Mutex::new(Slot::Pending(WakerSlot::default())),
         on_take,
     });
-    (
-        Reply {
-            shared: Arc::clone(&shared),
-            owner: None,
-        },
-        Live::Waiting(shared),
-    )
+    (Arc::clone(&shared), Live::Waiting(shared))
 }
 
 fn deliver<T>(shared: &Shared<T>, value: Result<T>) {
@@ -505,8 +508,23 @@ impl<T> Drop for Reply<T> {
         if !self.shared.cancelled.load(Ordering::Acquire) {
             // The slot alone records whether completion was delivered. A
             // destructor can supply the fallback only while it is Pending.
-            let failed =
-                std::thread::panicking() || self.owner.as_ref().is_some_and(|owner| owner.failed());
+            deliver(&self.shared, Err(stopped(std::thread::panicking())));
+        }
+    }
+}
+
+impl<T> CommandReply<T> {
+    fn complete(self, value: Result<T>) {
+        if !self.shared.cancelled.load(Ordering::Acquire) {
+            deliver(&self.shared, value);
+        }
+    }
+}
+
+impl<T> Drop for CommandReply<T> {
+    fn drop(&mut self) {
+        if !self.shared.cancelled.load(Ordering::Acquire) {
+            let failed = std::thread::panicking() || self.owner.failed();
             deliver(&self.shared, Err(stopped(failed)));
         }
     }
@@ -935,7 +953,7 @@ enum EventEnd {
 /// A close submitted during failed cleanup still waits for destruction.
 enum Closing {
     Waiting(Vec<Reply<()>>),
-    Complete,
+    Complete(OwnerExit),
 }
 
 struct Control {
@@ -965,6 +983,28 @@ impl Control {
         }
     }
 
+    fn command<T>(self: &Arc<Self>) -> (CommandReply<T>, Live<T>) {
+        let (shared, future) = shared_operation(None);
+        (
+            CommandReply {
+                shared,
+                owner: Arc::clone(self),
+            },
+            future,
+        )
+    }
+
+    /// Refuse work once the owner failed or shutdown was requested. Failure
+    /// takes precedence, including while failed native cleanup is running.
+    fn gate(&self) -> Result<()> {
+        let failed = self.failed();
+        if failed || self.shutdown_requested() {
+            Err(stopped(failed))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Ask the owner thread to end, and complete once it has destroyed its
     /// object. Every close, including one made while another is awaited,
     /// completes then.
@@ -983,17 +1023,18 @@ impl Control {
         let (reply, future) = operation();
         {
             let mut closing = lock(&self.closing);
-            let Closing::Waiting(replies) = &mut *closing else {
-                let outcome = *self
-                    .outcome
-                    .get()
-                    .expect("completed cleanup has an outcome");
-                drop(closing);
-                reply.complete(outcome.result());
-                return future;
-            };
-            replies.retain(|reply| !reply.shared.cancelled.load(Ordering::Acquire));
-            replies.push(reply);
+            match &mut *closing {
+                Closing::Waiting(replies) => {
+                    replies.retain(|reply| !reply.shared.cancelled.load(Ordering::Acquire));
+                    replies.push(reply);
+                }
+                Closing::Complete(outcome) => {
+                    let outcome = *outcome;
+                    drop(closing);
+                    reply.complete(outcome.result());
+                    return future;
+                }
+            }
         }
         if !self.request_shutdown_at(requested) {
             wake();
@@ -1018,8 +1059,8 @@ impl Control {
     /// using the same mutex that already owns close replies.
     fn submit_finish<T>(&self, enqueue: impl FnOnce() -> Live<T>) -> Live<T> {
         let _submission = lock(&self.closing);
-        if self.failed() || self.shutdown_requested() {
-            return Live::failed(stopped(self.failed()));
+        if let Err(error) = self.gate() {
+            return Live::failed(error);
         }
         enqueue()
     }
@@ -1047,9 +1088,9 @@ impl Control {
         events.close(outcome.event_end());
         let replies = {
             let mut closing = lock(&self.closing);
-            match std::mem::replace(&mut *closing, Closing::Complete) {
+            match std::mem::replace(&mut *closing, Closing::Complete(outcome)) {
                 Closing::Waiting(replies) => replies,
-                Closing::Complete => return,
+                Closing::Complete(_) => return,
             }
         };
         for reply in replies {
@@ -1062,6 +1103,7 @@ impl Control {
 /// its native cleanup.
 trait Owner: 'static {
     type Event: Send + 'static;
+    type Finish: Send + 'static;
 
     /// Take the next native event without waiting.
     fn poll_native(&mut self) -> Result<Option<Self::Event>>;
@@ -1082,8 +1124,8 @@ trait Owner: 'static {
     /// Fail registered work before the native cleanup of a panicked owner.
     fn fail_pending(&mut self) {}
 
-    /// Run a recorder finish command. Only recorder workers construct these jobs.
-    fn finish(&mut self, _deadline: Deadline, _stop: bool, _reply: FinishResponse) {}
+    /// Run the finish protocol specific to this owner.
+    fn finish(&mut self, finish: Self::Finish);
 
     /// Finish registered work and cleanup within the original close budget.
     fn shutdown(
@@ -1099,6 +1141,10 @@ trait Owner: 'static {
 }
 
 impl Owner for FilePlayer {
+    type Finish = std::convert::Infallible;
+    fn finish(&mut self, finish: Self::Finish) {
+        match finish {}
+    }
     type Event = PlayerEvent;
     fn poll_native(&mut self) -> Result<Option<Self::Event>> {
         self.next_event(Duration::ZERO)
@@ -1112,11 +1158,18 @@ struct RecorderOwner {
     waiters: FinishWaiters<FinishResponse>,
 }
 
+/// A recorder finish command retains its submission budget and response.
+struct RecorderFinish {
+    deadline: Deadline,
+    stop: bool,
+    reply: FinishResponse,
+}
+
 /// Preserve the finish driver's single registry while condition waits expose
 /// only settled outcomes. Mapping a reply never starts or queues another job.
 enum FinishResponse {
-    Finish(Reply<FinishStatus>),
-    Wait(Reply<Option<FinishStatus>>),
+    Finish(CommandReply<FinishStatus>),
+    Wait(CommandReply<Option<FinishStatus>>),
 }
 
 impl FinishReply for FinishResponse {
@@ -1224,6 +1277,7 @@ impl RecorderOwner {
 
 impl Owner for RecorderOwner {
     type Event = RecorderEvent;
+    type Finish = RecorderFinish;
 
     fn poll_native(&mut self) -> Result<Option<Self::Event>> {
         self.recorder.next_event(Duration::ZERO)
@@ -1241,8 +1295,8 @@ impl Owner for RecorderOwner {
         self.waiters.fail(StateConflict::OwnerFailed);
     }
 
-    fn finish(&mut self, deadline: Deadline, stop: bool, reply: FinishResponse) {
-        RecorderOwner::finish(self, deadline, stop, reply);
+    fn finish(&mut self, finish: RecorderFinish) {
+        RecorderOwner::finish(self, finish.deadline, finish.stop, finish.reply);
     }
 
     fn shutdown(
@@ -1253,15 +1307,21 @@ impl Owner for RecorderOwner {
         queued: &mut [Job<Self>],
     ) {
         self.waiters.retain();
-        let notify = self.waiters.notifies_cleanup()
-            || queued.iter().any(|job| matches!(job, Job::Finish { .. }));
+        let notify =
+            self.waiters.notifies_cleanup() || queued.iter().any(|job| job.finish().is_some());
         if !notify {
             events.close(EventEnd::Stopped);
         }
         self.recorder.drain_cleanup(
             requested,
             &mut self.waiters,
-            queued.iter_mut().filter_map(Job::take_finish),
+            queued
+                .iter_mut()
+                .filter_map(Job::take_finish)
+                .map(|(place, finish)| {
+                    drop(place);
+                    (finish.deadline, finish.reply)
+                }),
             TICK,
             &mut |event| {
                 if notify {
@@ -1336,14 +1396,9 @@ impl HandleOwner for RecorderOwner {
 
 /// Finish requests retain their deadline and reply even if shutdown preempts
 /// ordinary command execution. Wake messages carry no admission place.
-enum Job<H> {
+enum Job<H: Owner> {
     Run(Box<dyn FnOnce(&mut H) + Send + 'static>),
-    Finish {
-        deadline: Deadline,
-        stop: bool,
-        reply: FinishResponse,
-        place: Place,
-    },
+    Finish { finish: H::Finish, place: Place },
     Wake,
 }
 
@@ -1351,36 +1406,31 @@ impl<H: Owner> Job<H> {
     fn run(self, owner: &mut H) {
         match self {
             Self::Run(work) => work(owner),
-            Self::Finish {
-                deadline,
-                stop,
-                reply,
-                place,
-            } => {
+            Self::Finish { finish, place } => {
                 drop(place);
-                owner.finish(deadline, stop, reply);
+                owner.finish(finish);
             }
             Self::Wake => {}
         }
     }
 
+    fn finish(&self) -> Option<&H::Finish> {
+        match self {
+            Self::Finish { finish, .. } => Some(finish),
+            Self::Run(_) | Self::Wake => None,
+        }
+    }
+
     /// Called by cleanup only after it has requested the native stop. Ordinary
     /// commands remain held until destruction publishes the owner's outcome.
-    fn take_finish(&mut self) -> Option<(Deadline, FinishResponse)> {
-        if !matches!(self, Self::Finish { .. }) {
-            return None;
+    fn take_finish(&mut self) -> Option<(Place, H::Finish)> {
+        match std::mem::replace(self, Self::Wake) {
+            Self::Finish { finish, place } => Some((place, finish)),
+            other => {
+                *self = other;
+                None
+            }
         }
-        let Self::Finish {
-            deadline,
-            reply,
-            place,
-            ..
-        } = std::mem::replace(self, Self::Wake)
-        else {
-            unreachable!()
-        };
-        drop(place);
-        Some((deadline, reply))
     }
 }
 
@@ -1524,7 +1574,7 @@ impl<H: Owner> Worker<H> {
         self.prepare_reply(
             move || {
                 let work = prepare()?;
-                Ok(move |owner: &mut H, reply: Reply<T>| {
+                Ok(move |owner: &mut H, reply: CommandReply<T>| {
                     reply.complete(work(owner));
                 })
             },
@@ -1538,7 +1588,7 @@ impl<H: Owner> Worker<H> {
         stop: bool,
     ) -> FileOperation<T>
     where
-        W: FnOnce(&mut H, Reply<T>) + Send + 'static,
+        W: FnOnce(&mut H, CommandReply<T>) + Send + 'static,
     {
         // Keep submission state, not Worker: an unpolled future must not
         // delay last-handle shutdown or make its own drop join the owner.
@@ -1548,11 +1598,8 @@ impl<H: Owner> Worker<H> {
         FileOperation::deferred(move || {
             // A dead owner takes precedence over argument validation, exactly
             // as a command submitted directly to it does.
-            if control.failed() {
-                return Live::failed(stopped(true));
-            }
-            if control.shutdown_requested() {
-                return Live::failed(stopped(false));
+            if let Err(error) = control.gate() {
+                return Live::failed(error);
             }
             let work = match prepare() {
                 Ok(work) => work,
@@ -1567,30 +1614,39 @@ impl<H: Owner> Worker<H> {
         admission: &Arc<Admission>,
         control: &Arc<Control>,
         stop: bool,
-        work: impl FnOnce(&mut H, Reply<T>) + Send + 'static,
+        work: impl FnOnce(&mut H, CommandReply<T>) + Send + 'static,
     ) -> Live<T> {
-        if control.failed() {
-            return Live::failed(stopped(true));
-        }
-        if control.shutdown_requested() {
-            return Live::failed(stopped(false));
+        Self::enqueue(sender, admission, control, stop, move |reply, place| {
+            let shared = Arc::clone(&reply.shared);
+            Job::Run(Box::new(move |owner| {
+                // The command leaves the queue as it starts.
+                drop(place);
+                if !stop && shared.cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                work(owner, reply);
+            }))
+        })
+    }
+
+    /// Admit and deliver every command through the same owner-bound reply.
+    /// This kernel never locks `closing`: finish holds it across this call.
+    fn enqueue<T>(
+        sender: &Sender<Job<H>>,
+        admission: &Arc<Admission>,
+        control: &Arc<Control>,
+        stop: bool,
+        build: impl FnOnce(CommandReply<T>, Place) -> Job<H>,
+    ) -> Live<T> {
+        if let Err(error) = control.gate() {
+            return Live::failed(error);
         }
         let place = match admission.admit(stop) {
             Ok(place) => place,
             Err(error) => return Live::failed(error),
         };
-        let (mut reply, future) = operation();
-        reply.owner = Some(Arc::clone(control));
-        let shared = Arc::clone(&reply.shared);
-        let job = Job::Run(Box::new(move |owner| {
-            // The command leaves the queue as it starts.
-            drop(place);
-            if !stop && shared.cancelled.load(Ordering::Acquire) {
-                return;
-            }
-            work(owner, reply);
-        }));
-        if sender.send(job).is_err() {
+        let (reply, future) = control.command();
+        if sender.send(build(reply, place)).is_err() {
             return Live::failed(stopped(control.failed()));
         }
         future
@@ -2326,7 +2382,7 @@ impl AsyncFileRecorder {
         &self,
         timeout: Duration,
         stop: bool,
-        finish_response: fn(Reply<T>) -> FinishResponse,
+        finish_response: fn(CommandReply<T>) -> FinishResponse,
     ) -> FileOperation<T> {
         let sender = self.worker.sender.clone();
         let admission = Arc::clone(&self.worker.admission);
@@ -2341,22 +2397,16 @@ impl AsyncFileRecorder {
                     Ok(deadline) => deadline,
                     Err(error) => return Live::failed(error),
                 };
-                let place = match admission.admit(stop) {
-                    Ok(place) => place,
-                    Err(error) => return Live::failed(error),
-                };
-                let (mut reply, future) = operation();
-                reply.owner = Some(Arc::clone(&control));
-                let job = Job::Finish {
-                    deadline,
-                    stop,
-                    reply: finish_response(reply),
-                    place,
-                };
-                if sender.send(job).is_err() {
-                    return Live::failed(stopped(control.failed()));
-                }
-                future
+                Worker::enqueue(&sender, &admission, &control, stop, |reply, place| {
+                    Job::Finish {
+                        finish: RecorderFinish {
+                            deadline,
+                            stop,
+                            reply: finish_response(reply),
+                        },
+                        place,
+                    }
+                })
             })
         })
     }
@@ -2548,6 +2598,10 @@ mod tests {
     }
 
     impl Owner for BurstOwner {
+        type Finish = std::convert::Infallible;
+        fn finish(&mut self, finish: Self::Finish) {
+            match finish {}
+        }
         type Event = usize;
         fn poll_native(&mut self) -> Result<Option<usize>> {
             self.polls += 1;
@@ -2562,6 +2616,16 @@ mod tests {
             self.remaining -= 1;
             Ok(Some(self.polls))
         }
+    }
+
+    #[test]
+    fn player_finish_is_uninhabited() {
+        fn require_uninhabited(job: Job<FilePlayer>) {
+            if let Job::Finish { finish, .. } = job {
+                match finish {}
+            }
+        }
+        let _: fn(Job<FilePlayer>) = require_uninhabited;
     }
 
     #[test]
@@ -2680,6 +2744,10 @@ mod tests {
         _not_send: Rc<()>,
     }
     impl Owner for LocalOwner {
+        type Finish = std::convert::Infallible;
+        fn finish(&mut self, finish: Self::Finish) {
+            match finish {}
+        }
         type Event = usize;
         fn poll_native(&mut self) -> Result<Option<usize>> {
             Ok(None)
@@ -3280,6 +3348,10 @@ mod tests {
             finished: Sender<()>,
         }
         impl Owner for HeldDrop {
+            type Finish = std::convert::Infallible;
+            fn finish(&mut self, finish: Self::Finish) {
+                match finish {}
+            }
             type Event = ();
             fn poll_native(&mut self) -> Result<Option<()>> {
                 Ok(None)
@@ -3662,13 +3734,15 @@ mod tests {
             )
             .unwrap();
         let mut owner = RecorderOwner::new(recorder);
-        let control = Control::new();
+        let control = Arc::new(Control::new());
         let events = EventQueue::new(16);
-        let (reply, future) = operation();
+        let (reply, future) = control.command();
         let mut finish = Some(Job::Finish {
-            deadline: Deadline::after(Duration::from_secs(5)).unwrap(),
-            stop: true,
-            reply: FinishResponse::Finish(reply),
+            finish: RecorderFinish {
+                deadline: Deadline::after(Duration::from_secs(5)).unwrap(),
+                stop: true,
+                reply: FinishResponse::Finish(reply),
+            },
             place: Arc::new(Admission::new(1)).admit(true).unwrap(),
         });
         let dequeued = run_owner_wait(&mut owner, &control, &events, |_, _| {
@@ -3775,8 +3849,7 @@ mod tests {
         let control = Arc::clone(&recorder.worker.control);
         let sender = recorder.worker.sender.clone();
         let place = recorder.worker.admission.admit(true).unwrap();
-        let (mut reply, finishing) = operation();
-        reply.owner = Some(Arc::clone(&control));
+        let (reply, finishing) = control.command();
         let (entered, admitted) = mpsc::channel();
         let (release_submission, proceed) = mpsc::channel();
         let (closing_sent, closing_received) = mpsc::channel();
@@ -3789,9 +3862,11 @@ mod tests {
                     proceed.recv_timeout(Duration::from_secs(5)).unwrap();
                     sender
                         .send(Job::Finish {
-                            deadline: Deadline::after(Duration::from_secs(5)).unwrap(),
-                            stop: true,
-                            reply: FinishResponse::Finish(reply),
+                            finish: RecorderFinish {
+                                deadline: Deadline::after(Duration::from_secs(5)).unwrap(),
+                                stop: true,
+                                reply: FinishResponse::Finish(reply),
+                            },
                             place,
                         })
                         .unwrap_or_else(|_| panic!("owner queue closed"));
@@ -3832,20 +3907,24 @@ mod tests {
     }
 
     #[test]
-    fn queued_finishes_still_report_owner_failure_after_a_panic() {
+    fn queued_commands_finishes_and_waits_report_owner_failure_after_a_panic() {
         let (_, recorder) = mock_recorder(Closing::AtStop);
         let (blocked, release) = block_owner(&recorder.worker);
         let panic = recorder
             .worker
             .call::<()>(|_| panic!("owner failed"))
             .submit();
+        let command = recorder.worker.call(|owner| Ok(owner.state())).submit();
         let finishing = recorder.finish(Duration::from_secs(5)).submit();
         let waiting = recorder.wait_for_finish(Duration::from_secs(5)).submit();
         release.send(()).unwrap();
         block_on(blocked).unwrap();
         owner_failed(block_on(panic));
+        owner_failed(block_on(command));
         owner_failed(block_on(finishing));
         owner_failed(block_on(waiting));
+        owner_failed(block_on(recorder.state()));
+        owner_failed(block_on(recorder.finish(Duration::ZERO)));
         owner_failed(block_on(recorder.close()));
     }
 
@@ -3880,7 +3959,7 @@ mod tests {
             )
             .unwrap();
         let mut owner = RecorderOwner::new(recorder);
-        let (reply, finishing) = operation();
+        let (reply, finishing) = Arc::new(Control::new()).command();
         let finishing = FileOperation::live(finishing);
         owner.finish(
             Deadline::after(Duration::from_secs(2)).unwrap(),
@@ -4043,7 +4122,7 @@ mod tests {
             device.push(mock::FIRST_FRAME, mock::TAKE);
         }
         let mut owner = RecorderOwner::new(recorder);
-        let (reply, finishing) = operation();
+        let (reply, finishing) = Arc::new(Control::new()).command();
         let finishing = FileOperation::live(finishing);
         owner.finish(
             Deadline::after(Duration::from_secs(30)).unwrap(),
@@ -4198,7 +4277,7 @@ mod tests {
             device.push(mock::FIRST_FRAME, mock::TAKE);
         }
         let mut owner = RecorderOwner::new(recorder);
-        let (reply, finishing) = operation();
+        let (reply, finishing) = Arc::new(Control::new()).command();
         let finishing = FileOperation::live(finishing);
         owner.finish(
             Deadline::after(Duration::ZERO).unwrap(),
@@ -4245,7 +4324,7 @@ mod tests {
             .unwrap();
         recorder.next_event(Duration::ZERO).unwrap();
         let mut owner = RecorderOwner::new(recorder);
-        let (reply, finishing) = operation();
+        let (reply, finishing) = Arc::new(Control::new()).command();
         let finishing = FileOperation::live(finishing);
         owner.finish(deadline, true, FinishResponse::Finish(reply));
         (device, owner, finishing)
@@ -4278,7 +4357,7 @@ mod tests {
             .unwrap();
         recorder.next_event(Duration::ZERO).unwrap();
         let mut owner = RecorderOwner::new(recorder);
-        let (reply, finishing) = operation();
+        let (reply, finishing) = Arc::new(Control::new()).command();
         let finishing = FileOperation::live(finishing);
         owner.finish(
             Deadline::after(Duration::from_secs(30)).unwrap(),
@@ -4409,8 +4488,13 @@ mod tests {
         // clock already past both. Any expiry recheck during reply delivery
         // would incorrectly time out the later waiter using the first drain.
         let at = Instant::now() - Duration::from_secs(1);
-        let first_deadline = Deadline::starting(at, Duration::ZERO).unwrap();
-        let later_deadline = Deadline::starting(at, Duration::from_nanos(1)).unwrap();
+        let first_deadline =
+            Deadline::starting(at, crate::timeout::Timeout::new(Duration::ZERO).unwrap()).unwrap();
+        let later_deadline = Deadline::starting(
+            at,
+            crate::timeout::Timeout::new(Duration::from_nanos(1)).unwrap(),
+        )
+        .unwrap();
         let (device, mut owner, first) = local_finishing_recorder(first_deadline);
         let mut first = Box::pin(first);
         let waker = Waker::from(Arc::new(QueueClosure(Arc::clone(&device))));
@@ -4418,7 +4502,7 @@ mod tests {
             .as_mut()
             .poll(&mut Context::from_waker(&waker))
             .is_pending());
-        let (reply, later) = operation();
+        let (reply, later) = Arc::new(Control::new()).command();
         let later = FileOperation::live(later);
         owner.finish(later_deadline, false, FinishResponse::Finish(reply));
         let events = EventQueue::new(16);
@@ -4572,8 +4656,7 @@ mod tests {
         for outcome in [OwnerExit::Closed, OwnerExit::Failed] {
             let control = Arc::new(Control::new());
             let events = Arc::new(EventQueue::<()>::new(1));
-            let (mut reply, command) = operation::<()>();
-            reply.owner = Some(Arc::clone(&control));
+            let (reply, command) = control.command::<()>();
             let closing = control.request_close(|| {}).submit();
             control.exit(outcome, &events);
             drop(reply);
@@ -5974,6 +6057,10 @@ mod tests {
     fn refused_creation_options_and_families_complete_at_submission() {
         struct NeverCreated;
         impl Owner for NeverCreated {
+            type Finish = std::convert::Infallible;
+            fn finish(&mut self, finish: Self::Finish) {
+                match finish {}
+            }
             type Event = ();
             fn poll_native(&mut self) -> Result<Option<()>> {
                 unreachable!()

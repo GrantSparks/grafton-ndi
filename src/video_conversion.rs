@@ -9,7 +9,10 @@
 use std::ptr;
 
 use crate::{
-    frames::{FrameMetadataRef, ValidatedVideoLayout, VideoHeader, VideoParts, MAX_VIDEO_BYTES},
+    frames::{
+        FrameMetadataRef, ValidatedVideoLayout, VideoHeader, VideoParts, VideoPartsExt,
+        MAX_VIDEO_BYTES,
+    },
     sys::{self, bindings::NDIlib_video_frame_v2_t},
     Error, Ndi, PictureAspectRatio, PixelFormat, Result, ScanType, Timecode, VideoFrame,
     VideoSource,
@@ -140,7 +143,7 @@ impl V210Layout {
     /// Tests supply exactly the validated size; application input is checked
     /// by the public frame builders before reaching a descriptor helper.
     #[cfg(test)]
-    fn p216_descriptor(self, ndi: &Ndi, data: &[u8]) -> Result<NDIlib_video_frame_v2_t> {
+    fn p216_descriptor(self, data: &[u8]) -> Result<NDIlib_video_frame_v2_t> {
         // `with_line_stride_bytes` validated this layout for these dimensions.
         let p216 = ValidatedVideoLayout::new_uncompressed(
             PixelFormat::P216,
@@ -158,21 +161,14 @@ impl V210Layout {
         let frame =
             crate::BorrowedVideoFrame::builder(data, self.width, self.height, PixelFormat::P216)
                 .build()?;
-        Ok(crate::frames::Sendable::borrowed(&frame, ndi)?.video_descriptor())
+        Ok(frame.video_descriptor())
     }
 
     /// Borrow writable P216 storage without deriving the output pointer from
     /// a shared slice: the native converter writes through the original
     /// exclusive borrow's pointer.
-    fn p216_output_descriptor(
-        self,
-        ndi: &Ndi,
-        destination: &mut VideoFrame,
-    ) -> Result<NDIlib_video_frame_v2_t> {
-        let frame = P216Output::new(destination);
-        // The caller checked P216, which the planar-4:4:4 capability gate
-        // never refuses. Descriptor creation stays at the shared Sendable gate.
-        Ok(crate::frames::Sendable::borrowed(&frame, ndi)?.video_descriptor())
+    fn p216_output_descriptor(self, destination: &mut VideoFrame) -> NDIlib_video_frame_v2_t {
+        P216Output::new(destination).video_descriptor()
     }
 
     /// The SDK descriptor of this layout's V210 words at `data`: `p216`, the
@@ -304,7 +300,7 @@ impl VideoConverter {
     /// Unpack `source` into the checked destination frame's own P216 layout.
     fn unpack(&self, layout: V210Layout, source: &[u32], p216: &mut VideoFrame) -> Result<()> {
         layout.check_storage(source.len())?;
-        let mut output = layout.p216_output_descriptor(&self._ndi, p216)?;
+        let mut output = layout.p216_output_descriptor(p216);
         let input = layout.v210_descriptor(output, source.as_ptr());
         // SAFETY: `source` holds every word of the layout's rows and `p216`
         // exactly the P216 frame `output` describes, both initialized and
@@ -343,18 +339,14 @@ impl VideoConverter {
         destination: &mut [u32],
     ) -> Result<()> {
         layout.check_p216(source)?;
-        self.pack_descriptor(
-            layout,
-            crate::frames::Sendable::borrowed(source, &self._ndi)?.video_descriptor(),
-            destination,
-        )
+        self.pack_descriptor(layout, source.video_descriptor(), destination)
     }
 
     /// Pack `p216`, the samples of the packed P216 frame of `layout`'s
     /// dimensions, which may start at any address, into `destination`.
     #[cfg(test)]
     fn pack(&self, layout: V210Layout, p216: &[u8], destination: &mut [u32]) -> Result<()> {
-        let input = layout.p216_descriptor(&self._ndi, p216)?;
+        let input = layout.p216_descriptor(p216)?;
         self.pack_descriptor(layout, input, destination)
     }
 
@@ -411,21 +403,16 @@ mod tests {
 
     #[test]
     fn p216_conversion_descriptor_fits_its_borrowed_storage() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
         let layout = V210Layout::new(12, 32).unwrap();
         let mut destination = VideoFrame::builder()
             .resolution(12, 32)
             .pixel_format(PixelFormat::P216)
             .build()
             .unwrap();
-        let raw = layout
-            .p216_output_descriptor(&ndi, &mut destination)
-            .unwrap();
+        let raw = layout.p216_output_descriptor(&mut destination);
         let storage = destination.data();
         crate::frames::descriptor_tests::assert_extent(&raw, storage.as_ptr(), storage.len());
-        let raw = layout.p216_descriptor(&ndi, storage).unwrap();
+        let raw = layout.p216_descriptor(storage).unwrap();
         crate::frames::descriptor_tests::assert_extent(&raw, storage.as_ptr(), storage.len());
         assert!(crate::BorrowedVideoFrame::builder(
             &storage[..storage.len() - 1],
@@ -608,7 +595,7 @@ mod tests {
             // Test the native utility's odd-address output independently of
             // the public API, whose destination is an owned frame. Substitute
             // this equally sized exclusive slice into the validated descriptor.
-            let mut output = layout.p216_output_descriptor(&ndi, &mut frame).unwrap();
+            let mut output = layout.p216_output_descriptor(&mut frame);
             output.p_data = p216.as_mut_ptr();
             crate::frames::descriptor_tests::assert_extent(&output, p216.as_ptr(), p216.len());
             let input = layout.v210_descriptor(output, source.as_ptr());
@@ -697,7 +684,7 @@ mod tests {
                             .metadata(c"<p216/>")
                             .build()
                             .unwrap();
-                    let raw = crate::frames::Sendable::for_test(&borrowed).video_descriptor();
+                    let raw = borrowed.video_descriptor();
                     // SAFETY: Both synthetic guards borrow storage and static
                     // metadata for this test, and neither callback frees them.
                     let receiver = unsafe {
@@ -724,12 +711,7 @@ mod tests {
                         .p216_to_v210(&owned, layout, &mut expected[1..])
                         .unwrap();
                     for source in [&borrowed as &dyn VideoSource, &receiver, &framesync] {
-                        assert_eq!(
-                            crate::frames::Sendable::for_test(source)
-                                .video_descriptor()
-                                .p_data,
-                            raw.p_data
-                        );
+                        assert_eq!(source.video_descriptor().p_data, raw.p_data);
                         let mut destination = vec![0x9e37_79b9; layout.required_words() + 2];
                         let (result, allocations) = crate::test_alloc::allocation_count(|| {
                             converter.p216_to_v210(source, layout, &mut destination[1..])

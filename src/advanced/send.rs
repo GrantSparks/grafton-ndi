@@ -11,7 +11,7 @@ use super::{
     CompressedVideoFrame, VideoPacketFormat, MAX_PACKET_BYTES,
 };
 use crate::{
-    sender::in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans, Synchronized},
+    sender::in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans},
     sys::{
         advanced::{native, ScatterSend},
         bindings::*,
@@ -471,6 +471,133 @@ pub struct ReclaimedVideo {
     pub preview: Option<SubmittedVideo>,
 }
 
+/// A scatter input together with the exact native capability that admits it.
+/// The table is uninhabited when this build lacks scatter declarations, so
+/// successful construction also proves the native send methods are compiled.
+pub(crate) struct ScatterSendable<F> {
+    frame: F,
+    table: &'static ScatterSend,
+}
+
+impl<F> ScatterSendable<F> {
+    fn with_table(
+        frame: F,
+        table: Result<&'static ScatterSend>,
+    ) -> std::result::Result<Self, (crate::Error, F)> {
+        match table {
+            Ok(table) => Ok(Self { frame, table }),
+            Err(error) => Err((error, frame)),
+        }
+    }
+
+    pub(super) fn checked(frame: F, ndi: &Ndi) -> std::result::Result<Self, (crate::Error, F)> {
+        Self::with_table(frame, ndi.table::<ScatterSend>())
+    }
+
+    pub(crate) fn new(frame: F, ndi: &Ndi) -> std::result::Result<Self, Rejected<F>> {
+        Self::checked(frame, ndi).map_err(|(error, frame)| Rejected::new(error, frame))
+    }
+
+    fn into_frame(self) -> F {
+        self.frame
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(
+        frame: F,
+        table: Option<&'static ScatterSend>,
+    ) -> std::result::Result<Self, (crate::Error, F)> {
+        let table = table.ok_or(crate::Error::UnsupportedCapability {
+            capability: crate::Capability::Runtime(crate::RuntimeFeature::ScatterSend),
+            refusal: crate::CapabilityRefusal::SymbolUnavailable(c"NDIlib_send_send_video_scatter"),
+        });
+        Self::with_table(frame, table)
+    }
+}
+
+impl<'a, F> ScatterSendable<&'a mut F> {
+    fn borrowed(frame: &'a mut F, ndi: &Ndi) -> Result<Self> {
+        Self::checked(frame, ndi).map_err(|(error, _)| error)
+    }
+}
+
+impl ScatterSendable<&mut ScatterVideoFrame> {
+    fn send_video(self, sender: NDIlib_send_instance_t) {
+        native!(ScatterSend, self.table, uses(self, sender) => {
+            let descriptor = self.frame.descriptor();
+            let scatter = self.frame.storage.descriptor();
+            // SAFETY: the caller's live sender borrows this frame exclusively
+            // through the synchronous call, including its stable scatter list.
+            unsafe { self.table.NDIlib_send_send_video_scatter(sender, &descriptor, scatter) };
+        })
+    }
+}
+
+impl ScatterSendable<&mut ScatterAudioFrame> {
+    fn send_audio(self, sender: NDIlib_send_instance_t) {
+        native!(ScatterSend, self.table, uses(self, sender) => {
+            let descriptor = self.frame.descriptor();
+            let scatter = self.frame.storage.descriptor();
+            // SAFETY: the caller retains its live sender and this exclusive
+            // frame borrow, including every block and list, until return.
+            unsafe { self.table.NDIlib_send_send_audio_scatter(sender, &descriptor, scatter) };
+        })
+    }
+}
+
+/// Call-scoped descriptors derived from an owned scatter proof. The owning
+/// frame retains every pointee until its stream's native loan has ended.
+#[cfg(ndi_has_advanced_scatter_send)]
+pub(crate) struct ScatterVideoLoan {
+    descriptor: NDIlib_video_frame_v2_t,
+    scatter: *const FrameScatter,
+}
+
+impl ScatterSendable<ScatterVideoFrame> {
+    fn lend(&mut self) -> Lent {
+        native!(ScatterSend, self.table, uses(self) => {
+            let descriptor = self.frame.descriptor();
+            let scatter = self.frame.storage.descriptor();
+            Lent::Scatter(ScatterSendable {
+                frame: ScatterVideoLoan { descriptor, scatter },
+                table: self.table,
+            })
+        })
+    }
+
+    #[cfg(ndi_has_advanced_scatter_send)]
+    pub(super) fn completion_key(&mut self) -> (*mut u8, i32) {
+        let first = &mut self.frame.storage.blocks[0];
+        (first.as_mut_ptr(), first.len() as i32)
+    }
+}
+
+#[cfg(ndi_has_advanced_scatter_send)]
+impl ScatterSendable<ScatterVideoLoan> {
+    pub(crate) fn descriptor(&self) -> &NDIlib_video_frame_v2_t {
+        &self.frame.descriptor
+    }
+
+    pub(crate) fn descriptor_mut(&mut self) -> &mut NDIlib_video_frame_v2_t {
+        &mut self.frame.descriptor
+    }
+
+    /// # Safety
+    /// The live sender owns the native loan. The descriptor and all of this
+    /// proof's pointees remain initialized and retained through native release.
+    pub(crate) unsafe fn submit(
+        &self,
+        sender: NDIlib_send_instance_t,
+        descriptor: *const NDIlib_video_frame_v2_t,
+    ) {
+        // SAFETY: caller supplies the complete native-loan lifetime contract.
+        unsafe {
+            self.table
+                .NDIlib_send_send_video_scatter_async(sender, descriptor, self.frame.scatter)
+        };
+    }
+}
+
 /// A frame the SDK may still be using, with what it accesses through the
 /// descriptor it was given.
 ///
@@ -490,11 +617,7 @@ pub(crate) enum PendingVideo {
     /// A frame submitted with [`CompressedSender::submit_video`].
     Contiguous(CompressedVideoFrame),
     /// A frame submitted with [`CompressedSender::submit_scatter_video`].
-    #[cfg(ndi_has_advanced_scatter_send)]
-    Scatter {
-        frame: ScatterVideoFrame,
-        table: &'static ScatterSend,
-    },
+    Scatter(ScatterSendable<ScatterVideoFrame>),
 }
 
 const _: () = {
@@ -503,40 +626,18 @@ const _: () = {
 };
 
 impl PendingVideo {
-    /// Lend a queue entry using the original first block as completion key.
-    /// Supported runtimes ignore these fields for scatter input and report
-    /// them unchanged in completion callbacks, including destruction callbacks.
-    pub(super) fn lend_for_queue(&mut self) -> Lent {
-        let lent = self.lend(());
-        #[cfg(ndi_has_advanced_scatter_send)]
-        {
-            let mut lent = lent;
-            if let Self::Scatter { frame, .. } = self {
-                let first = &mut frame.storage.blocks[0];
-                let descriptor = lent.descriptor_mut();
-                descriptor.p_data = first.as_mut_ptr();
-                descriptor.__bindgen_anon_1.data_size_in_bytes = first.len() as i32;
-            }
-            lent
-        }
-        #[cfg(not(ndi_has_advanced_scatter_send))]
-        lent
-    }
-
     /// The stream the frame is sent on.
     pub(crate) fn tier(&self) -> StreamTier {
         match self {
             Self::Contiguous(frame) => frame.format().tier(),
-            #[cfg(ndi_has_advanced_scatter_send)]
-            Self::Scatter { frame, .. } => frame.format().tier(),
+            Self::Scatter(proof) => proof.frame.format().tier(),
         }
     }
 
-    pub(super) fn into_submitted(self) -> SubmittedVideo {
+    pub(crate) fn into_submitted(self) -> SubmittedVideo {
         match self {
             Self::Contiguous(frame) => SubmittedVideo::Contiguous(frame),
-            #[cfg(ndi_has_advanced_scatter_send)]
-            Self::Scatter { frame, .. } => SubmittedVideo::Scatter(frame),
+            Self::Scatter(proof) => SubmittedVideo::Scatter(proof.into_frame()),
         }
     }
 }
@@ -546,17 +647,10 @@ impl PendingVideo {
 // pointer and size arrays. Moving PendingVideo
 // moves none of those allocations. InFlight prevents access until release.
 unsafe impl Lend for PendingVideo {
-    type Authorization = ();
-
-    fn lend(&mut self, (): ()) -> Lent {
+    fn lend(&mut self) -> Lent {
         match self {
             Self::Contiguous(frame) => Lent::Frame(frame.raw()),
-            #[cfg(ndi_has_advanced_scatter_send)]
-            Self::Scatter { frame, table } => Lent::Scatter {
-                table,
-                frame: frame.descriptor(),
-                scatter: frame.storage.descriptor(),
-            },
+            Self::Scatter(proof) => proof.lend(),
         }
     }
 }
@@ -596,16 +690,6 @@ impl PendingStreams {
             StreamTier::Program => &mut self.program,
             StreamTier::Preview => &mut self.preview,
         }
-    }
-
-    /// Recover the previous frame with the proof minted by this owner's send.
-    pub(crate) fn reclaim_displaced(
-        &mut self,
-        _tier: StreamTier,
-        displaced: InFlight<PendingVideo>,
-        synchronized: Synchronized,
-    ) -> Option<SubmittedVideo> {
-        displaced.release_with(synchronized, |frame, _proof| frame.into_submitted())
     }
 
     /// Both streams' frames, once their native sender has been destroyed.
@@ -904,17 +988,8 @@ impl CompressedVideo<'_> {
     /// As for [`CompressedSender::send_scatter_video`].
     #[doc(alias = "NDIlib_send_send_video_scatter")]
     pub fn send_scatter_video(&mut self, frame: &mut ScatterVideoFrame) -> Result<()> {
-        let table = self.pair.sender().runtime().table::<ScatterSend>()?;
-        native!(ScatterSend, table, uses(frame) => {
-            let descriptor = frame.descriptor();
-            let scatter = frame.storage.descriptor();
-            // SAFETY: the sender is live, and both descriptors lend `frame`, which
-            // is borrowed exclusively for longer than this synchronous call.
-            unsafe {
-                table.NDIlib_send_send_video_scatter(self.instance(), &descriptor, scatter)
-            };
-            Ok(())
-        })
+        ScatterSendable::borrowed(frame, self.pair.sender().runtime())?.send_video(self.instance());
+        Ok(())
     }
 
     /// See [`CompressedSender::submit_scatter_video`].
@@ -956,17 +1031,8 @@ impl<M: CompressedAudioSendMode> Sender<M> {
     /// unavailable in the selected runtime or build headers.
     #[doc(alias = "NDIlib_send_send_audio_scatter")]
     pub fn send_scatter_audio(&self, frame: &mut ScatterAudioFrame) -> Result<()> {
-        let table = self.runtime().table::<ScatterSend>()?;
-        native!(ScatterSend, table, uses(frame) => {
-            let descriptor = frame.descriptor();
-            let scatter = frame.storage.descriptor();
-            // SAFETY: both descriptors point only into this exclusively
-            // borrowed frame, retained until the synchronous call returns.
-            unsafe {
-                table.NDIlib_send_send_audio_scatter(self.native_instance(), &descriptor, scatter)
-            };
-            Ok(())
-        })
+        ScatterSendable::borrowed(frame, self.runtime())?.send_audio(self.native_instance());
+        Ok(())
     }
 }
 
@@ -1339,6 +1405,102 @@ mod tests {
         assert_eq!(bytes_at::<1>(&blocks, 6), None);
     }
 
+    #[test]
+    fn refused_scatter_proofs_return_every_original_block() {
+        let (format, bytes) = h264();
+        let video = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
+        let video_blocks: Vec<_> = video
+            .blocks()
+            .map(|block| (block.as_ptr(), block.len()))
+            .collect();
+        let (error, video) = ScatterSendable::for_test(video, None).err().unwrap();
+        assert!(matches!(
+            error,
+            crate::Error::UnsupportedCapability {
+                capability: crate::Capability::Runtime(crate::RuntimeFeature::ScatterSend),
+                ..
+            }
+        ));
+        assert_eq!(
+            video
+                .blocks()
+                .map(|block| (block.as_ptr(), block.len()))
+                .collect::<Vec<_>>(),
+            video_blocks
+        );
+
+        let audio = ScatterAudioFrame::new(
+            AudioCodec::Opus,
+            48_000,
+            2,
+            960,
+            vec![vec![1, 2], vec![3, 4]],
+        )
+        .unwrap();
+        let audio_blocks: Vec<_> = audio
+            .blocks()
+            .map(|block| (block.as_ptr(), block.len()))
+            .collect();
+        let audio = ScatterSendable::for_test(audio, None).err().unwrap().1;
+        assert_eq!(
+            audio
+                .blocks()
+                .map(|block| (block.as_ptr(), block.len()))
+                .collect::<Vec<_>>(),
+            audio_blocks
+        );
+    }
+
+    #[test]
+    fn missing_scatter_capability_preserves_owned_and_borrowed_inputs() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        if ndi.table::<ScatterSend>().is_ok() {
+            return;
+        }
+        let (format, bytes) = h264();
+        let mut video = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
+        let pointers: Vec<_> = video.blocks().map(|block| block.as_ptr()).collect();
+        let (result, allocations) =
+            crate::test_alloc::allocation_count(|| ScatterSendable::borrowed(&mut video, &ndi));
+        assert!(matches!(
+            result,
+            Err(crate::Error::UnsupportedCapability { .. })
+        ));
+        assert_eq!(allocations, 0, "borrowed refusal does not box its input");
+        let rejected = ScatterSendable::new(video, &ndi).err().unwrap();
+        assert!(matches!(
+            rejected.error(),
+            crate::Error::UnsupportedCapability { .. }
+        ));
+        let video = rejected.into_inner();
+        assert_eq!(
+            video
+                .blocks()
+                .map(|block| block.as_ptr())
+                .collect::<Vec<_>>(),
+            pointers
+        );
+
+        let mut audio = ScatterAudioFrame::new(
+            AudioCodec::Opus,
+            48_000,
+            2,
+            960,
+            vec![vec![1, 2], vec![3, 4]],
+        )
+        .unwrap();
+        assert!(matches!(
+            ScatterSendable::borrowed(&mut audio, &ndi),
+            Err(crate::Error::UnsupportedCapability { .. })
+        ));
+        assert_eq!(
+            audio.blocks().collect::<Vec<_>>(),
+            [&[1, 2][..], &[3, 4][..]]
+        );
+    }
+
     /// The SDK reads an asynchronous send's video descriptor during the call,
     /// so a submission lends what the descriptor points to and not the
     /// descriptor: the frame, and for a scatter frame its scatter list, all of
@@ -1349,7 +1511,7 @@ mod tests {
         let frame = CompressedVideoFrame::new(format, bytes.clone()).unwrap();
         let data = frame.data().as_ptr();
         let mut pending = PendingVideo::Contiguous(frame);
-        let (lent, allocations) = crate::test_alloc::allocation_count(|| pending.lend(()));
+        let (lent, allocations) = crate::test_alloc::allocation_count(|| pending.lend());
         assert_eq!(allocations, 0);
         #[cfg(not(ndi_has_advanced_scatter_send))]
         let Lent::Frame(descriptor) = lent;
@@ -1372,19 +1534,21 @@ mod tests {
         let frame = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
         let pointers = frame.storage.pointers.array.as_ptr().cast::<*const u8>();
         let sizes = frame.storage.sizes.as_ptr().cast::<i32>();
-        let (mut pending, allocations) =
-            crate::test_alloc::allocation_count(|| PendingVideo::Scatter { frame, table });
+        let (mut pending, allocations) = crate::test_alloc::allocation_count(|| {
+            PendingVideo::Scatter(ScatterSendable::for_test(frame, Some(table)).unwrap())
+        });
         assert_eq!(allocations, 0, "the list already belongs to the frame");
-        let Lent::Scatter { scatter, .. } = pending.lend(()) else {
+        let Lent::Scatter(lent) = pending.lend() else {
             panic!("a scatter frame is lent with its scatter list");
         };
+        let scatter = lent.frame.scatter;
         // Moving the entry, as its stream's slot does, leaves the list where
         // the SDK was told it is, still naming the frame's arrays.
         let mut moved = Box::new(pending);
-        let Lent::Scatter { scatter: after, .. } = moved.lend(()) else {
+        let Lent::Scatter(lent) = moved.lend() else {
             panic!("a scatter frame is lent with its scatter list");
         };
-        assert_eq!(after, scatter);
+        assert_eq!(lent.frame.scatter, scatter);
         native!(ScatterSend, table => {
             // SAFETY: the moved entry owns the list.
             let list = unsafe { &*scatter };
@@ -1409,7 +1573,7 @@ mod tests {
         )
         .unwrap();
         let list = |stream: &InFlight<PendingVideo>| match stream.frame().unwrap() {
-            PendingVideo::Scatter { frame, .. } => frame.storage.pointers.list.as_ptr(),
+            PendingVideo::Scatter(proof) => proof.frame.storage.pointers.list.as_ptr(),
             _ => panic!("scatter stream"),
         };
         let mut first = make(StreamTier::Program);

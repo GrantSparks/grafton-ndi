@@ -1,10 +1,10 @@
 //! Snapshots of, events from, and connection requests to what a Discovery
 //! Server advertises.
 
-use super::{ServerApi, ServerObject};
+use super::{Retained, ServerApi, ServerObject};
 use crate::{
     frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
-    sdk_copy::{CopyBudget, CopyError, COPY_LIMIT},
+    sdk_copy::{CopyBudget, SpanError, COPY_LIMIT},
     sys::{self, bindings::*},
     to_ms_checked, Error, Ndi, ResourceKind, Result,
 };
@@ -42,8 +42,14 @@ trait ListenerApi: ServerApi {
 macro_rules! listener_api {
     (
         $Table:ty, $Entry:ty, $Id:ty,
-        $is_connected:ident, $server_url:ident, $entries:ident,
-        $wait:ident, $subscribe:ident, $unsubscribe:ident, $events:ident, $free_events:ident
+        is_connected = $is_connected:ident,
+        server_url = $server_url:ident,
+        entries = $entries:ident,
+        wait = $wait:ident,
+        subscribe = $subscribe:ident,
+        unsubscribe = $unsubscribe:ident,
+        events = $events:ident,
+        free_events = $free_events:ident
     ) => {
         impl ListenerApi for $Table {
             type Entry = $Entry;
@@ -93,27 +99,27 @@ listener_api!(
     sys::SenderDiscovery,
     NDIlib_sender_t,
     SenderId,
-    NDIlib_send_listener_is_connected,
-    NDIlib_send_listener_get_server_url,
-    NDIlib_send_listener_get_senders,
-    NDIlib_send_listener_wait_for_senders,
-    NDIlib_send_listener_subscribe_events,
-    NDIlib_send_listener_unsubscribe_events,
-    NDIlib_send_listener_get_events,
-    NDIlib_send_listener_free_events
+    is_connected = NDIlib_send_listener_is_connected,
+    server_url = NDIlib_send_listener_get_server_url,
+    entries = NDIlib_send_listener_get_senders,
+    wait = NDIlib_send_listener_wait_for_senders,
+    subscribe = NDIlib_send_listener_subscribe_events,
+    unsubscribe = NDIlib_send_listener_unsubscribe_events,
+    events = NDIlib_send_listener_get_events,
+    free_events = NDIlib_send_listener_free_events
 );
 listener_api!(
     sys::ReceiverDiscovery,
     NDIlib_receiver_t,
     ReceiverId,
-    NDIlib_recv_listener_is_connected,
-    NDIlib_recv_listener_get_server_url,
-    NDIlib_recv_listener_get_receivers,
-    NDIlib_recv_listener_wait_for_receivers,
-    NDIlib_recv_listener_subscribe_events,
-    NDIlib_recv_listener_unsubscribe_events,
-    NDIlib_recv_listener_get_events,
-    NDIlib_recv_listener_free_events
+    is_connected = NDIlib_recv_listener_is_connected,
+    server_url = NDIlib_recv_listener_get_server_url,
+    entries = NDIlib_recv_listener_get_receivers,
+    wait = NDIlib_recv_listener_wait_for_receivers,
+    subscribe = NDIlib_recv_listener_subscribe_events,
+    unsubscribe = NDIlib_recv_listener_unsubscribe_events,
+    events = NDIlib_recv_listener_get_events,
+    free_events = NDIlib_recv_listener_free_events
 );
 
 /// The Discovery Server a listener connects to.
@@ -521,10 +527,10 @@ pub(crate) unsafe fn require_receiver_connect(
     let commands =
         match unsafe { budget.slice(receiver.p_commands.cast_const(), receiver.num_commands) } {
             Ok(commands) => commands,
-            Err(CopyError::Malformed(_)) => {
+            Err(SpanError::Array(_)) => {
                 return Err(Error::ReceiverRequestNotAccepted { advertised: true });
             }
-            Err(CopyError::Failed(error)) => return Err(error),
+            Err(SpanError::Failed(error)) => return Err(error),
         };
     if commands.contains(&NDIlib_receiver_command_e_NDIlib_receiver_command_connect) {
         Ok(())
@@ -552,7 +558,11 @@ unsafe fn endpoint(url: *const c_char) -> Option<String> {
 }
 
 /// A listener adds membership operations to the shared lifecycle owner.
-struct Listener<A: ListenerApi>(ServerObject<A>, BTreeSet<A::Id>);
+struct Listener<A: ListenerApi>(ServerObject<A, BTreeSet<A::Id>>);
+
+// SAFETY: the default set is empty. Subscription changes retain each ID until
+// its own listener unsubscribes or is destroyed; no pre-destroy calls are needed.
+unsafe impl<A: ListenerApi> Retained<A> for BTreeSet<A::Id> {}
 
 const _: () = {
     const fn assert_send<T: Send>() {}
@@ -565,7 +575,7 @@ where
     A: ServerApi<Options = ListenerOptions>,
 {
     fn new(ndi: &Ndi, options: &ListenerOptions) -> Result<Self> {
-        ServerObject::new(ndi, options).map(|server| Self(server, BTreeSet::new()))
+        ServerObject::new(ndi, options).map(Self)
     }
 }
 
@@ -596,15 +606,18 @@ impl<A: ListenerApi> Listener<A> {
         let mut count = 0;
         // SAFETY: the exclusive borrow keeps the SDK-owned array unchanged for
         // `'a`; the budget validates the pointer and count before use.
-        unsafe { budget.slice(self.0.api.entries(self.0.instance(), &mut count), count) }
-            .map_err(CopyError::into_error)
+        Ok(unsafe { budget.slice(self.0.api.entries(self.0.instance(), &mut count), count) }?)
     }
     fn subscription(&mut self, id: &A::Id, subscribe: bool) {
         if subscribe {
-            if !self.1.contains(id) {
-                self.1.insert(id.clone());
+            if !self.0.retained().contains(id) {
+                self.0.retained_mut().insert(id.clone());
             }
-            let retained = self.1.get(id).expect("subscribed identifier was retained");
+            let retained = self
+                .0
+                .retained()
+                .get(id)
+                .expect("subscribed identifier was retained");
             // SAFETY: the listener and its stable identifier allocation stay
             // live until unsubscribe returns or after native destruction.
             unsafe {
@@ -613,7 +626,7 @@ impl<A: ListenerApi> Listener<A> {
                     .subscribe(self.0.instance(), retained.as_c_str().as_ptr())
             };
         } else {
-            let retained = self.1.get(id).unwrap_or(id);
+            let retained = self.0.retained().get(id).unwrap_or(id);
             // SAFETY: a retained identifier stays live through unsubscribe;
             // an identifier never subscribed is borrowed only for this call.
             unsafe {
@@ -621,7 +634,7 @@ impl<A: ListenerApi> Listener<A> {
                     .api
                     .unsubscribe(self.0.instance(), retained.as_c_str().as_ptr())
             };
-            self.1.remove(id);
+            self.0.retained_mut().remove(id);
         }
     }
     fn next_events(&mut self, timeout: Duration) -> Result<Vec<ListenerEvent<A::Id>>> {
@@ -649,7 +662,7 @@ impl<A: ListenerApi> Listener<A> {
             // No event arrived only if the count agrees. A null batch with
             // a positive count is malformed, as a membership snapshot is.
             // SAFETY: null is permitted and checked without dereferencing.
-            unsafe { budget.slice(events, count) }.map_err(CopyError::into_error)?;
+            unsafe { budget.slice(events, count) }?;
             return Ok(Vec::new());
         }
         let batch = Batch {
@@ -657,7 +670,7 @@ impl<A: ListenerApi> Listener<A> {
             events,
         };
         // SAFETY: the batch stays allocated until `batch` is dropped below.
-        let raw = unsafe { budget.slice(batch.events, count) }.map_err(CopyError::into_error)?;
+        let raw = unsafe { budget.slice(batch.events, count) }?;
         budget.collect_entries(raw, |event, budget| {
             // SAFETY: the strings belong to the batch, which is still
             // allocated.
@@ -669,16 +682,6 @@ impl<A: ListenerApi> Listener<A> {
                 })
             }
         })
-    }
-}
-
-impl<A: ListenerApi> Drop for Listener<A> {
-    fn drop(&mut self) {
-        // The native listener may read every subscribed identifier while it
-        // is destroyed. Release their allocations only after that returns,
-        // independently of the order of this owner's fields.
-        self.0.destroy();
-        self.1.clear();
     }
 }
 
@@ -879,7 +882,7 @@ impl SendListener {
             // until the next call on this listener, after this copy.
             unsafe {
                 let groups = budget.slice(sender.p_groups.cast_const(), sender.num_groups)?;
-                let groups = budget.collect(groups, |group, budget| budget.text(*group))?;
+                let groups = budget.collect(groups, |group, budget| Ok(budget.text(*group)?))?;
                 Ok(AdvertisedSender {
                     id: budget.id(sender.p_uuid)?.map(SenderId::from_exact),
                     name: budget.text(sender.p_name)?,
@@ -1165,7 +1168,7 @@ mod tests {
             budget.text(text.as_ptr()).unwrap();
             assert!(matches!(
                 budget.text(text.as_ptr()),
-                Err(CopyError::Failed(Error::ResourceLimit {
+                Err(crate::sdk_copy::TextError::Failed(Error::ResourceLimit {
                     resource: ResourceKind::DiscoveryServerCopyBytes,
                     ..
                 }))

@@ -1,6 +1,6 @@
 //! Registration of senders and receivers with a Discovery Server.
 
-use super::{ServerApi, ServerObject};
+use super::{Retained, ServerApi, ServerObject};
 use crate::{
     receiver::{ReceiverCore, ReceiverMode},
     sender::SenderResource,
@@ -279,13 +279,21 @@ impl AdvertiserApi for sys::ReceiverAdvertising {
 /// a registration can only ever name an entry of the advertiser that issued it.
 static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
 
+/// The objects the SDK can read until their advertiser is destroyed.
+struct Members<A: AdvertiserApi>(BTreeMap<u64, A::Member>);
+
+impl<A: AdvertiserApi> Default for Members<A> {
+    fn default() -> Self {
+        Self(BTreeMap::new())
+    }
+}
+
 /// A native advertiser and the objects registered with it.
 ///
 /// The advertiser is the single owner of its registrations: each one keeps its
 /// sender or receiver alive until it is removed or the advertiser is dropped.
 struct Advertiser<A: AdvertiserApi> {
-    server: ServerObject<A>,
-    members: BTreeMap<u64, A::Member>,
+    server: ServerObject<A, Members<A>>,
 }
 
 const _: () = {
@@ -301,7 +309,6 @@ where
     fn new(ndi: &Ndi, options: &AdvertiserOptions) -> Result<Self> {
         Ok(Self {
             server: ServerObject::new(ndi, options)?,
-            members: BTreeMap::new(),
         })
     }
 }
@@ -309,7 +316,9 @@ where
 impl<A: AdvertiserApi> Advertiser<A> {
     fn register(&mut self, member: A::Member, options: &A::Advertisement) -> Result<u64> {
         if self
-            .members
+            .server
+            .retained()
+            .0
             .values()
             .any(|existing| A::same_member(existing, &member))
         {
@@ -331,7 +340,7 @@ impl<A: AdvertiserApi> Advertiser<A> {
     /// Keep a newly registered `member` alive and return its identifier.
     fn retain(&mut self, member: A::Member) -> u64 {
         let id = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed);
-        self.members.insert(id, member);
+        self.server.retained_mut().0.insert(id, member);
         id
     }
 
@@ -346,7 +355,7 @@ impl<A: AdvertiserApi> Advertiser<A> {
     /// [`Error::NativeOperationFailed`] when the SDK removes nothing because
     /// it does not know the registered object.
     fn release<R>(&mut self, id: u64, registration: R) -> std::result::Result<(), Rejected<R>> {
-        let Some(member) = self.members.get(&id) else {
+        let Some(member) = self.server.retained().0.get(&id) else {
             return Err(Rejected::new(
                 Error::InvalidInput(crate::InputDefect::ForeignRegistration),
                 registration,
@@ -359,21 +368,20 @@ impl<A: AdvertiserApi> Advertiser<A> {
             return Err(Rejected::new(error, registration));
         }
         // The SDK has forgotten the object, so it may be released.
-        self.members.remove(&id);
+        self.server.retained_mut().0.remove(&id);
         Ok(())
     }
 }
 
-impl<A: AdvertiserApi> Drop for Advertiser<A> {
-    fn drop(&mut self) {
-        // End registrations, destroy their native advertiser, then release the
-        // retained members. Explicit destruction makes this independent of fields.
-        for member in self.members.values() {
-            // SAFETY: the advertiser and every member remain live through this call.
-            unsafe { self.server.api.remove(self.server.instance(), member) };
+// SAFETY: the default map is empty. Registered members stay owned through
+// removal or native destruction, including when a pre-destroy removal fails.
+unsafe impl<A: AdvertiserApi> Retained<A> for Members<A> {
+    unsafe fn before_destroy(&mut self, api: &A, instance: A::Instance) {
+        for member in self.0.values() {
+            // SAFETY: the owner calls this hook before native destruction,
+            // retaining every registered object and its advertisement strings.
+            unsafe { api.remove(instance, member) };
         }
-        self.server.destroy();
-        self.members.clear();
     }
 }
 
@@ -478,7 +486,7 @@ impl fmt::Debug for SendAdvertiser {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SendAdvertiser")
             .field("server", &self.inner.server._url)
-            .field("registrations", &self.inner.members.len())
+            .field("registrations", &self.inner.server.retained().0.len())
             .finish_non_exhaustive()
     }
 }
@@ -486,7 +494,7 @@ impl fmt::Debug for RecvAdvertiser {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecvAdvertiser")
             .field("server", &self.inner.server._url)
-            .field("registrations", &self.inner.members.len())
+            .field("registrations", &self.inner.server.retained().0.len())
             .finish_non_exhaustive()
     }
 }

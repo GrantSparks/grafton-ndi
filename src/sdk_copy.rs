@@ -13,39 +13,68 @@ use crate::{
 
 pub(crate) const COPY_LIMIT: usize = 16 * 1024 * 1024;
 
-/// Malformed peer data can omit one entry. Resource and allocation failures
-/// instead stop the complete copy, including when found in a nested array.
+/// Array failures have a total public conversion at snapshot boundaries.
 #[derive(Debug)]
-pub(crate) enum CopyError {
-    Malformed(CopyOmission),
+pub(crate) enum SpanError {
+    Array(crate::DiscoveryDefect),
     Failed(Error),
 }
+pub(crate) type SpanResult<T> = std::result::Result<T, SpanError>;
 
-/// A malformed entry can be omitted without publishing a public error cause.
-#[derive(Debug)]
-pub(crate) enum CopyOmission {
-    Array(crate::DiscoveryDefect),
-    UnterminatedText,
-}
-
-pub(crate) type CopyResult<T> = std::result::Result<T, CopyError>;
-
-impl CopyError {
-    pub(crate) fn into_error(self) -> Error {
-        match self {
-            Self::Malformed(CopyOmission::Array(reason)) => {
-                Error::UnexpectedSdkResult(crate::SdkResultDefect::MalformedDiscoveryData(reason))
+impl From<SpanError> for Error {
+    fn from(error: SpanError) -> Self {
+        match error {
+            SpanError::Array(reason) => {
+                Self::UnexpectedSdkResult(crate::SdkResultDefect::MalformedDiscoveryData(reason))
             }
-            // String callers consume malformed entries in collect_entries or
-            // SnapshotBudget::text; only array boundaries publish a refusal.
-            Self::Malformed(CopyOmission::UnterminatedText) => {
-                unreachable!("unterminated discovery text is omitted before the public boundary")
-            }
-            Self::Failed(error) => error,
+            SpanError::Failed(error) => error,
         }
     }
 }
+impl From<Error> for SpanError {
+    fn from(error: Error) -> Self {
+        Self::Failed(error)
+    }
+}
 
+/// Text callers must handle an omitted entry explicitly. There is deliberately
+/// no conversion to the public Error, which would erase that omission policy.
+#[derive(Debug)]
+pub(crate) enum TextError {
+    Unterminated,
+    Failed(Error),
+}
+pub(crate) type TextResult<T> = std::result::Result<T, TextError>;
+impl From<Error> for TextError {
+    fn from(error: Error) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// Per-entry copies can omit malformed data from either producer. Resource
+/// and allocation failures instead stop the complete snapshot copy.
+#[derive(Debug)]
+pub(crate) enum CopyError {
+    Malformed,
+    Failed(Error),
+}
+pub(crate) type CopyResult<T> = std::result::Result<T, CopyError>;
+impl From<SpanError> for CopyError {
+    fn from(error: SpanError) -> Self {
+        match error {
+            SpanError::Array(_) => Self::Malformed,
+            SpanError::Failed(error) => Self::Failed(error),
+        }
+    }
+}
+impl From<TextError> for CopyError {
+    fn from(error: TextError) -> Self {
+        match error {
+            TextError::Unterminated => Self::Malformed,
+            TextError::Failed(error) => Self::Failed(error),
+        }
+    }
+}
 impl From<Error> for CopyError {
     fn from(error: Error) -> Self {
         Self::Failed(error)
@@ -94,18 +123,16 @@ impl CopyBudget {
     }
 
     /// Check spans before pointer arithmetic or reservation, on every target.
-    pub(crate) fn span_bytes(count: usize, element_size: usize) -> CopyResult<usize> {
+    pub(crate) fn span_bytes(count: usize, element_size: usize) -> SpanResult<usize> {
         count
             .checked_mul(element_size)
             .filter(|&bytes| bytes <= isize::MAX as usize)
-            .ok_or(CopyError::Malformed(CopyOmission::Array(
-                crate::DiscoveryDefect::ArraySpanOverflow,
-            )))
+            .ok_or(SpanError::Array(crate::DiscoveryDefect::ArraySpanOverflow))
     }
 
     /// Charge complete owned element storage before reserving it, including
     /// elements whose contents may be omitted during conversion.
-    pub(crate) fn reserve<T>(&mut self, count: usize) -> CopyResult<Vec<T>> {
+    pub(crate) fn reserve<T>(&mut self, count: usize) -> SpanResult<Vec<T>> {
         self.take(Self::span_bytes(count, size_of::<T>())?)?;
         let mut values = Vec::new();
         values
@@ -136,12 +163,15 @@ impl CopyBudget {
         source: &[S],
         mut copy: impl FnMut(&S, &mut Self) -> CopyResult<T>,
     ) -> Result<Vec<T>> {
-        self.collect(source, |value, budget| match copy(value, budget) {
-            Ok(value) => Ok(Some(value)),
-            Err(CopyError::Malformed(_)) => Ok(None),
-            Err(error) => Err(error),
-        })
-        .map_err(CopyError::into_error)
+        let mut values = self.reserve(source.len())?;
+        for value in source {
+            match copy(value, self) {
+                Ok(value) => values.push(value),
+                Err(CopyError::Malformed) => {}
+                Err(CopyError::Failed(error)) => return Err(error),
+            }
+        }
+        Ok(values)
     }
 
     /// Borrow bounded SDK text without scanning its bytes a second time.
@@ -152,7 +182,7 @@ impl CopyBudget {
     pub(crate) unsafe fn c_str<'a>(
         &mut self,
         value: *const c_char,
-    ) -> CopyResult<Option<&'a CStr>> {
+    ) -> TextResult<Option<&'a CStr>> {
         if value.is_null() {
             return Ok(None);
         }
@@ -164,7 +194,7 @@ impl CopyBudget {
             return Err(if limit < MAX_SDK_STRING_BYTES {
                 self.exceeded().into()
             } else {
-                CopyError::Malformed(CopyOmission::UnterminatedText)
+                TextError::Unterminated
             });
         };
         self.take(bytes.len() + 1)?;
@@ -180,7 +210,7 @@ impl CopyBudget {
     ///
     /// # Safety
     /// As for [`Self::c_str`].
-    pub(crate) unsafe fn text(&mut self, value: *const c_char) -> CopyResult<Option<String>> {
+    pub(crate) unsafe fn text(&mut self, value: *const c_char) -> TextResult<Option<String>> {
         // SAFETY: forwarded to the caller's obligations.
         let text = unsafe { self.c_str(value)? };
         text.map(|text| {
@@ -195,11 +225,18 @@ impl CopyBudget {
     ///
     /// # Safety
     /// As for [`Self::c_str`].
-    pub(crate) unsafe fn id(&mut self, value: *const c_char) -> CopyResult<Option<CString>> {
+    pub(crate) unsafe fn id(&mut self, value: *const c_char) -> TextResult<Option<CString>> {
         // SAFETY: forwarded to the caller's obligations.
         let id = unsafe { self.c_str(value)? };
         id.map(|id| {
-            let mut bytes = self.reserve(id.to_bytes_with_nul().len())?;
+            // The bounded string scan already caps this byte allocation below
+            // isize::MAX; only budget or allocation failure can occur here.
+            let len = id.to_bytes_with_nul().len();
+            self.take(len)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(len)
+                .map_err(|_| allocation_failed())?;
             bytes.extend_from_slice(id.to_bytes_with_nul());
             // SAFETY: these are exactly the bytes of the validated C string.
             Ok(unsafe { CString::from_vec_with_nul_unchecked(bytes) })
@@ -217,14 +254,12 @@ impl CopyBudget {
         &mut self,
         value: *const T,
         count: u32,
-    ) -> CopyResult<&'a [T]> {
+    ) -> SpanResult<&'a [T]> {
         if count == 0 {
             return Ok(&[]);
         }
         if value.is_null() {
-            return Err(CopyError::Malformed(CopyOmission::Array(
-                crate::DiscoveryDefect::NullArray,
-            )));
+            return Err(SpanError::Array(crate::DiscoveryDefect::NullArray));
         }
         // Lossless: SDK counts are u32 and supported targets have >=32-bit usize.
         let count = count as usize;
@@ -279,9 +314,9 @@ mod tests {
         budget
     }
 
-    fn limit_error<T>(result: CopyResult<T>) {
+    fn limit_error<T, E: Into<CopyError>>(result: std::result::Result<T, E>) {
         assert!(matches!(
-            result,
+            result.map_err(Into::into),
             Err(CopyError::Failed(Error::ResourceLimit {
                 resource: ResourceKind::DiscoveryServerCopyBytes,
                 limit: COPY_LIMIT,
@@ -299,7 +334,7 @@ mod tests {
             assert_eq!(budget.id(ptr::null()).unwrap(), None);
             assert!(matches!(
                 budget.slice::<u32>(ptr::null(), 1),
-                Err(CopyError::Malformed(_))
+                Err(SpanError::Array(_))
             ));
             assert!(budget.slice::<u32>(ptr::null(), 0).unwrap().is_empty());
         }
@@ -323,7 +358,7 @@ mod tests {
                     Some("abc")
                 );
                 assert_eq!(budget.remaining, 0);
-                let Err(CopyError::Failed(Error::ResourceLimit {
+                let Err(TextError::Failed(Error::ResourceLimit {
                     resource: reported,
                     limit: 14,
                 })) = budget.text(c"a".as_ptr())
@@ -407,11 +442,11 @@ mod tests {
         assert_eq!(allocations, 0);
         assert!(matches!(
             budget(COPY_LIMIT).reserve::<u64>(usize::MAX),
-            Err(CopyError::Malformed(_))
+            Err(SpanError::Array(_))
         ));
         assert!(matches!(
             CopyBudget::span_bytes(2, isize::MAX as usize),
-            Err(CopyError::Malformed(_))
+            Err(SpanError::Array(_))
         ));
     }
 
@@ -425,7 +460,7 @@ mod tests {
             let raw = unsafe { budget.slice(pointers.as_ptr(), pointers.len() as u32) }.unwrap();
             let result = budget.collect(raw, |pointer, budget| {
                 // SAFETY: each literal remains live and NUL-terminated.
-                unsafe { budget.text(*pointer) }
+                Ok(unsafe { budget.text(*pointer)? })
             });
             if remaining == bytes {
                 assert_eq!(result.unwrap(), ["\u{fffd}", ""]);
@@ -445,7 +480,7 @@ mod tests {
             // SAFETY: the array and all strings stay live through the copy.
             unsafe {
                 let raw = budget.slice(pointers.as_ptr(), pointers.len() as u32)?;
-                budget.collect(raw, |pointer, budget| budget.text(*pointer))
+                budget.collect(raw, |pointer, budget| Ok(budget.text(*pointer)?))
             }
         });
         limit_error(result);
@@ -465,7 +500,7 @@ mod tests {
             assert_eq!(full.remaining, COPY_LIMIT - MAX_SDK_STRING_BYTES);
             assert!(matches!(
                 full.c_str(too_long.as_ptr().cast()),
-                Err(CopyError::Malformed(_))
+                Err(TextError::Unterminated)
             ));
             assert_eq!(full.remaining, COPY_LIMIT - 2 * MAX_SDK_STRING_BYTES);
             let mut exact = budget(4);
@@ -485,7 +520,7 @@ mod tests {
         let copied = full
             .collect_entries(&pointers, |pointer, budget| {
                 // SAFETY: both strings remain readable through their bound.
-                unsafe { budget.text(*pointer) }
+                Ok(unsafe { budget.text(*pointer)? })
             })
             .unwrap();
         assert_eq!(copied, [Some("survivor".into())]);
@@ -497,7 +532,7 @@ mod tests {
         let error = budget(COPY_LIMIT)
             .collect_entries(&rejected, |pointer, budget| {
                 // SAFETY: every buffer remains readable through the bound.
-                unsafe { budget.text(*pointer) }
+                Ok(unsafe { budget.text(*pointer)? })
             })
             .unwrap_err();
         assert!(matches!(

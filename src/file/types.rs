@@ -563,7 +563,7 @@ impl FileRecorderOptions {
     /// rollover, and [`Error::InvalidCString`] when the filename pattern
     /// contains a NUL.
     pub(super) fn resolve(&self) -> Result<ResolvedRecorderOptions> {
-        crate::to_ms_checked(self.drop_wait)?;
+        let drop_wait = crate::timeout::Timeout::new(self.drop_wait)?;
         if self.tracks.is_empty() {
             return Err(Error::InvalidInput(
                 crate::InputDefect::EmptyRecordingTracks,
@@ -592,6 +592,7 @@ impl FileRecorderOptions {
             }
         }
         Ok(ResolvedRecorderOptions {
+            drop_wait,
             format_change_rollover: self.format_change_rollover.unwrap_or(!naming.is_exact()),
             naming,
             pattern,
@@ -602,6 +603,7 @@ impl FileRecorderOptions {
 /// What a recorder's options settle once they are checked against each other.
 #[derive(Debug)]
 pub(super) struct ResolvedRecorderOptions {
+    pub(super) drop_wait: crate::timeout::Timeout,
     pub(super) naming: NamePattern,
     /// The pattern the SDK is given, or `None` for its own indexed default.
     pub(super) pattern: Option<CString>,

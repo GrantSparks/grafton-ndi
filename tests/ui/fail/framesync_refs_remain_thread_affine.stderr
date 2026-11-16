@@ -24,11 +24,6 @@ note: required because it appears within the type `frames::ValidatedFrame<grafto
   |
   | pub(crate) struct ValidatedFrame<F, V> {
   |                   ^^^^^^^^^^^^^^
-note: required because it appears within the type `frames::borrowed::VideoRef<'static, grafton_ndi::capture::FrameSyncVideoFree>`
- --> src/frames.rs
-  |
-  |     pub(crate) struct VideoRef<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> {
-  |                       ^^^^^^^^
 note: required because it appears within the type `FrameSyncVideoRef<'static>`
  --> src/framesync.rs
   |
@@ -66,11 +61,6 @@ note: required because it appears within the type `frames::ValidatedFrame<grafto
   |
   | pub(crate) struct ValidatedFrame<F, V> {
   |                   ^^^^^^^^^^^^^^
-note: required because it appears within the type `frames::borrowed::AudioRef<'static, grafton_ndi::capture::FrameSyncAudioFree>`
- --> src/frames.rs
-  |
-  |     pub(crate) struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
-  |                       ^^^^^^^^
 note: required because it appears within the type `FrameSyncAudioRef<'static>`
  --> src/framesync.rs
   |
@@ -108,11 +98,6 @@ note: required because it appears within the type `frames::ValidatedFrame<grafto
   |
   | pub(crate) struct ValidatedFrame<F, V> {
   |                   ^^^^^^^^^^^^^^
-note: required because it appears within the type `frames::borrowed::VideoRef<'static, grafton_ndi::capture::FrameSyncVideoFree>`
- --> src/frames.rs
-  |
-  |     pub(crate) struct VideoRef<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> {
-  |                       ^^^^^^^^
 note: required because it appears within the type `FrameSyncVideoRef<'static>`
  --> src/framesync.rs
   |
@@ -150,11 +135,6 @@ note: required because it appears within the type `frames::ValidatedFrame<grafto
   |
   | pub(crate) struct ValidatedFrame<F, V> {
   |                   ^^^^^^^^^^^^^^
-note: required because it appears within the type `frames::borrowed::AudioRef<'static, grafton_ndi::capture::FrameSyncAudioFree>`
- --> src/frames.rs
-  |
-  |     pub(crate) struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
-  |                       ^^^^^^^^
 note: required because it appears within the type `FrameSyncAudioRef<'static>`
  --> src/framesync.rs
   |

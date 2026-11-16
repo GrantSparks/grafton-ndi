@@ -148,110 +148,6 @@ mod tests {
         claim_while_shared(&owner.storage, key);
     }
 
-    /// Compile the actual storage module and release-proof declarations.
-    /// The accepted fixture rules out unrelated imports or privacy failures;
-    /// rejected fixtures pin move-only keys and owner-private proof constructors.
-    #[test]
-    fn slot_keys_cannot_be_reused_or_cloned() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let proof_declaration = |name: &str| {
-            let source = include_str!("../sender.rs");
-            let marker = format!("pub(crate) struct {name} {{");
-            let start = source.find(&marker).unwrap();
-            let declaration = &source[start..];
-            &declaration[..declaration.find("\n    }").unwrap() + 6]
-        };
-        let prelude = format!(
-            r#"
-#![allow(dead_code, unused_imports, non_camel_case_types, non_snake_case, non_upper_case_globals)]
-use std::sync::Arc;
-#[path = {bindings:?}]
-pub(crate) mod bindings;
-mod sys {{ pub(crate) use crate::bindings; }}
-mod sender {{
-    pub trait SenderMode {{}}
-    pub struct Sender<M: SenderMode>(std::marker::PhantomData<M>);
-    pub mod in_flight {{
-    {synchronized}
-    {destroyed}
-    {pair}
-}} }}
-mod queued {{
-    {completion}
-}}
-#[path = {aliasable:?}]
-mod aliasable;
-#[path = {slots:?}]
-mod send_slots;
-"#,
-            bindings = root.join("src/sys/bindings.rs"),
-            aliasable = root.join("src/advanced/aliasable.rs"),
-            slots = root.join("src/advanced/send_slots.rs"),
-            synchronized = proof_declaration("Synchronized"),
-            destroyed = proof_declaration("Destroyed"),
-            pair = {
-                let source = include_str!("../sender.rs");
-                let start = source.find("pub(crate) struct LoanPair<").unwrap();
-                let tail = &source[start..];
-                // Find the specialized mode, then its gating attribute;
-                // rustfmt may place the impl header on several lines.
-                let specialized = tail.find("crate::advanced::CompressedAttached").unwrap();
-                let end = tail[..specialized]
-                    .rfind("#[cfg(feature = \"advanced\")]")
-                    .unwrap();
-                tail[..end].replace("#[cfg(feature = \"advanced\")]", "")
-            },
-            completion = {
-                let source = include_str!("queued.rs");
-                let start = source.find("pub(super) struct Completion {").unwrap();
-                let declaration = &source[start..];
-                &declaration[..declaration.find("\n}").unwrap() + 2]
-            }
-        );
-        let moved = include_str!(
-            "../../tests/ui/internal/fail/descriptor_slot_key_is_consumed_by_claim.rs"
-        );
-        let cloned =
-            include_str!("../../tests/ui/internal/fail/descriptor_slot_key_cannot_be_cloned.rs");
-        let directory =
-            std::env::temp_dir().join(format!("grafton-slot-key-contract-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        for (name, fixture, expected) in [
-            (
-                "once",
-                moved.replace("    let _second = key.claim(Default::default());\n", ""),
-                None,
-            ),
-            ("moved", moved.to_owned(), Some("E0382")),
-            ("cloned", cloned.to_owned(), Some("E0599")),
-            ("pair_private", include_str!("../../tests/ui/internal/fail/send_loan_pair_requires_its_owner.rs").to_owned(), Some("E0451")),
-            ("foreign_dispatch", include_str!("../../tests/ui/internal/fail/send_loan_pair_cannot_extract_foreign_dispatch.rs").to_owned(), Some("E0599")),
-            ("synchronized_private", include_str!("../../tests/ui/internal/fail/synchronization_requires_its_owner.rs").to_owned(), Some("E0451")),
-            ("destroyed_private", include_str!("../../tests/ui/internal/fail/destruction_requires_its_owner.rs").to_owned(), Some("E0451")),
-            ("completion_private", include_str!("../../tests/ui/internal/fail/completion_requires_its_queue.rs").to_owned(), Some("E0451")),
-            ("foreign_storage", include_str!("../../tests/ui/internal/fail/descriptor_slot_key_cannot_claim_other_storage.rs").to_owned(), Some("E0599")),
-        ] {
-            let path = directory.join(format!("{name}.rs"));
-            std::fs::write(&path, format!("{prelude}\n{fixture}")).unwrap();
-            let output = std::process::Command::new("rustc")
-                .args(["--edition=2021", "--emit=metadata", "--out-dir"])
-                .arg(&directory)
-                .arg(&path)
-                .output()
-                .unwrap();
-            let error = String::from_utf8(output.stderr).unwrap();
-            if let Some(expected) = expected {
-                assert!(
-                    !output.status.success() && error.contains(expected),
-                    "{name}: {error}"
-                );
-            } else {
-                assert!(output.status.success(), "accepted fixture: {error}");
-            }
-        }
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
     #[test]
     fn impossible_descriptor_reservation_reports_storage_exhaustion() {
         assert!(matches!(
@@ -281,3 +177,11 @@ mod send_slots;
         }
     }
 }
+
+#[cfg(any(
+    ndi_test_send_ownership,
+    ndi_test_send_ownership_control,
+    ndi_test_send_ownership_types
+))]
+#[path = "../../tests/ui/internal/send_slot_ownership.rs"]
+mod ownership_contract;

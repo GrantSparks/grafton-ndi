@@ -23,7 +23,7 @@ mod build_apple;
 #[allow(dead_code)]
 mod build_support;
 
-use build_support::{Edition, Sdk};
+use build_support::{Edition, Sdk, StaticTarget};
 
 fn main() {
     for path in [
@@ -38,6 +38,10 @@ fn main() {
         "ndi_link_static",
         "ndi_has_advanced_header",
         "ndi_test_capture_permissions",
+        "ndi_test_send_ownership",
+        "ndi_test_send_ownership_control",
+        "ndi_test_send_ownership_types",
+        "ndi_test_descriptor_parts",
         "ndi_test_finder_snapshot_guard",
         "ndi_test_foreign_snapshot_guard",
     ] {
@@ -50,10 +54,15 @@ fn main() {
     let target = env::var("TARGET").expect("Cargo TARGET missing");
     let os = env::var("CARGO_CFG_TARGET_OS").expect("Cargo target OS missing");
     let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo target architecture missing");
+    let abi = env::var("CARGO_CFG_TARGET_ABI").unwrap_or_default();
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR missing"));
     println!("cargo:rustc-env=GRAFTON_NDI_TARGET={target}");
 
     let links_statically = build_support::links_statically(&os);
+    let static_target = links_statically.then(|| {
+        build_support::static_target(&target, &os, &arch, &abi)
+            .unwrap_or_else(|error| panic!("{error}"))
+    });
     // Only the Advanced headers and a static archive come from an SDK; any
     // other build ignores whatever is installed, and the variables that
     // describe it.
@@ -66,11 +75,7 @@ fn main() {
     }
     if links_statically {
         println!("cargo:rerun-if-changed=src/sys/declarations.rs");
-        for name in [
-            "IPHONEOS_DEPLOYMENT_TARGET",
-            "TVOS_DEPLOYMENT_TARGET",
-            "XROS_DEPLOYMENT_TARGET",
-        ] {
+        for name in build_support::static_deployment_variables() {
             println!("cargo:rerun-if-env-changed={name}");
         }
     }
@@ -103,11 +108,11 @@ fn main() {
         println!("cargo:rustc-cfg=ndi_has_advanced_header");
     }
 
-    if links_statically {
+    if let Some(static_target) = static_target {
         let sdk = sdk.as_ref().unwrap_or_else(|| {
             panic!("{target} links the NDI SDK statically; set NDI_SDK_DIR to the Apple SDK")
         });
-        let edition = link_static(sdk, &os, &arch, advanced_declarations.as_deref(), &out);
+        let edition = link_static(sdk, static_target, advanced_declarations.as_deref(), &out);
         println!("cargo:rustc-env=GRAFTON_NDI_EDITION={}", edition.as_str());
     }
 }
@@ -116,26 +121,19 @@ fn main() {
 /// provider's symbol map. Returns the archive's edition.
 fn link_static(
     sdk: &Sdk,
-    os: &str,
-    arch: &str,
+    target: &StaticTarget,
     advanced_declarations: Option<&str>,
     out: &Path,
 ) -> Edition {
     let library =
-        build_support::static_library(sdk, os, env::var_os("CARGO_FEATURE_FILE_IO").is_some())
+        build_support::static_library(sdk, target, env::var_os("CARGO_FEATURE_FILE_IO").is_some())
             .unwrap_or_else(|error| panic!("{error}"));
     println!("cargo:rerun-if-changed={}", library.archive.display());
-    let archive = build_apple::inspect(&library.archive, arch, os)
+    let archive = build_apple::inspect(&library.archive, target.arch, target.platform)
         .unwrap_or_else(|error| panic!("Invalid Apple static SDK artifact: {error}"));
 
-    let (deployment_variable, floor) = (
-        match os {
-            "ios" => "IPHONEOS_DEPLOYMENT_TARGET",
-            "tvos" => "TVOS_DEPLOYMENT_TARGET",
-            _ => "XROS_DEPLOYMENT_TARGET",
-        },
-        archive.deployment_floor,
-    );
+    let deployment_variable = target.deployment_variable;
+    let floor = archive.deployment_floor;
     // An unset deployment target is left to the application's linker, which
     // rejects objects built for a newer OS than it targets.
     if let Ok(value) = env::var(deployment_variable) {

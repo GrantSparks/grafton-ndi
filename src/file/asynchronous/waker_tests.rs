@@ -365,6 +365,10 @@ struct HeldOwner {
 }
 
 impl Owner for HeldOwner {
+    type Finish = std::convert::Infallible;
+    fn finish(&mut self, finish: Self::Finish) {
+        match finish {}
+    }
     type Event = ();
 
     fn poll_native(&mut self) -> Result<Option<()>> {

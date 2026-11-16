@@ -132,7 +132,7 @@ fn captured_audio_surfaces_agree_for_packed_and_padded_channels() {
         {
             // SAFETY: this synthetic no-op loan borrows that same live storage.
             let avsync = unsafe {
-                ValidatedAudio::audio(Guard::<AvSyncAudioFree>::with_test_free(
+                ValidatedAudio::validate(Guard::<AvSyncAudioFree>::with_test_free(
                     crate::capture::AvSyncAudioInstance::Synthetic(std::ptr::null()),
                     raw,
                     |_, _| {},

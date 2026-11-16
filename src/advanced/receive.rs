@@ -794,7 +794,7 @@ mod tests {
     fn packet_receivers_are_send_sync_and_unwind_safe() {
         fn traits<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
         traits::<PacketReceiver>();
-        traits::<crate::advanced::AllocatedPacketReceiver>();
+        traits::<crate::advanced::AllocatedReceiver<PacketAttached>>();
     }
 }
 

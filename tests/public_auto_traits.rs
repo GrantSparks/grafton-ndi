@@ -288,7 +288,7 @@ fn advanced_types_keep_their_auto_traits() {
     has! {
         PoolBlock: Send, Sync, UnwindSafe, RefUnwindSafe;
         AdvancedConfig: Send, Sync, UnwindSafe, RefUnwindSafe;
-        AllocatedPacketReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AllocatedReceiver<PacketAttached>: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocatedReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocationBuffer: Send;
         AllocationDecline: Send, Sync, UnwindSafe, RefUnwindSafe;

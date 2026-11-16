@@ -18,7 +18,7 @@ use super::{FileFamily, FileNaming};
 use crate::{
     frames::MetadataPartsExt,
     sys::{self, bindings::*},
-    timeout::Deadline,
+    timeout::{Deadline, Timeout},
     Error, MediaTypes, MetadataSource, Result,
 };
 
@@ -248,14 +248,22 @@ struct OpenFile {
 enum CleanupBudget {
     Skip,
     Spent,
-    For(Duration),
+    For(Timeout),
 }
 
 impl CleanupBudget {
     fn begin(&mut self, requested: Instant) -> DrainBudget {
         match std::mem::replace(self, Self::Spent) {
             Self::For(wait) => {
-                Deadline::starting(requested, wait).map_or(DrainBudget::Spent, DrainBudget::new)
+                Deadline::starting(requested, wait).map_or(
+                    // At the clock's representable limit, spend the checked
+                    // duration using elapsed time instead of skipping cleanup.
+                    DrainBudget::Relative {
+                        start: requested,
+                        wait,
+                    },
+                    DrainBudget::new,
+                )
             }
             Self::Skip | Self::Spent => DrainBudget::Spent,
         }
@@ -266,6 +274,7 @@ impl CleanupBudget {
 /// Reading expiry once per step keeps the native poll and settlement in agreement.
 pub(super) enum DrainBudget {
     Ahead(Deadline),
+    Relative { start: Instant, wait: Timeout },
     Late { polls: usize },
     Spent,
 }
@@ -286,13 +295,21 @@ impl DrainBudget {
     /// The poll and its result belong to the same step: only this operation
     /// can spend the budget, whether the late phase is empty or reaches its limit.
     fn poll_at(&mut self, step: Duration, at: Instant, poll: impl FnOnce(u32) -> bool) -> Pumped {
-        if matches!(self, Self::Ahead(deadline) if deadline.end() <= at) {
+        let expired = match self {
+            Self::Ahead(deadline) => deadline.end() <= at,
+            Self::Relative { start, wait } => wait.remaining_at(*start, at).is_zero(),
+            Self::Late { .. } | Self::Spent => false,
+        };
+        if expired {
             *self = Self::late();
         }
         let (wait, late) = match self {
-            Self::Ahead(deadline) => (
-                crate::timeout::sdk_millis(deadline.remaining_at(at).min(step))
-                    .expect("a drain step is within the validated deadline"),
+            Self::Ahead(deadline) => (deadline.step_ms_at(at, step), false),
+            Self::Relative { start, wait } => (
+                // The remainder is bounded by a checked Timeout even when
+                // the clock cannot represent its end.
+                crate::timeout::sdk_millis(wait.remaining_at(*start, at).min(step))
+                    .unwrap_or(wait.millis()),
                 false,
             ),
             Self::Late { .. } => (0, true),
@@ -957,7 +974,6 @@ pub(super) struct CheckedRecorderOptions {
     planar_audio: bool,
     proxy: bool,
     rollover_size: u64,
-    drop_wait: Duration,
     resolved: ResolvedRecorderOptions,
 }
 
@@ -970,7 +986,6 @@ impl CheckedRecorderOptions {
             planar_audio: options.planar_audio,
             proxy: options.proxy,
             rollover_size: options.rollover_size,
-            drop_wait: options.drop_wait,
             resolved,
         })
     }
@@ -1004,7 +1019,7 @@ impl PreparedRecorder {
             recording,
             handle,
             tracks: options.tracks,
-            cleanup: CleanupBudget::For(options.drop_wait),
+            cleanup: CleanupBudget::For(resolved.drop_wait),
             accepted_source: Some(options.source),
             naming: resolved.naming,
             ledger: Ledger::idle(),
@@ -1323,9 +1338,11 @@ impl FileRecorder {
     pub fn finish(&mut self, timeout: Duration) -> Result<FinishStatus> {
         // Checked here, so that a timeout out of range leaves the session
         // recording; the wait driver's budget starts only after the stop.
-        crate::to_ms_checked(timeout)?;
+        let timeout = Timeout::new(timeout)?;
         self.request_stop();
-        self.wait_until(Deadline::after(timeout)?)
+        // Synchronous finish's documented event-wait budget begins after
+        // the native stop returns. The checked duration survives that call.
+        self.wait_until(Deadline::starting(Instant::now(), timeout)?)
     }
 
     /// Wait up to `timeout` for a stopping session to end.
@@ -1766,6 +1783,63 @@ impl Drop for FileRecorder {
 mod tests {
     use super::*;
 
+    #[test]
+    fn checked_cleanup_waits_keep_their_budget_until_it_is_spent() {
+        let start = Instant::now();
+        for wait in [Duration::from_nanos(1), FINISH_POLL, crate::MAX_TIMEOUT] {
+            let mut cleanup = CleanupBudget::For(Timeout::new(wait).unwrap());
+            let mut budget = cleanup.begin(start);
+            assert!(!matches!(budget, DrainBudget::Spent));
+            assert_eq!(
+                budget.poll_at(FINISH_POLL, start, |millis| {
+                    assert!(millis > 0);
+                    false
+                }),
+                Pumped::Took { late: false },
+            );
+            assert!(matches!(cleanup.begin(start), DrainBudget::Spent));
+        }
+    }
+
+    #[test]
+    fn an_unrepresentable_cleanup_end_spends_the_checked_wait_using_elapsed_time() {
+        // Find an instant at the platform clock's upper boundary without
+        // relying on a particular Instant representation.
+        let now = Instant::now();
+        let (mut low, mut high) = (0_u64, u64::MAX);
+        while low < high {
+            let middle = low + (high - low) / 2 + 1;
+            if now.checked_add(Duration::from_secs(middle)).is_some() {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        let start = now.checked_add(Duration::from_secs(low)).unwrap();
+        let wait = Timeout::new(Duration::from_secs(2)).unwrap();
+        assert!(Deadline::starting(start, wait).is_err());
+        let mut budget = CleanupBudget::For(wait).begin(start);
+        assert!(matches!(budget, DrainBudget::Relative { .. }));
+        assert_eq!(
+            budget.poll_at(FINISH_POLL, start, |millis| {
+                assert_eq!(millis, 25);
+                false
+            }),
+            Pumped::Took { late: false },
+        );
+
+        // The same fallback remains bounded when the clock can advance.
+        let mut budget = DrainBudget::Relative { start: now, wait };
+        assert_eq!(
+            budget.poll_at(FINISH_POLL, now + Duration::from_secs(2), |millis| {
+                assert_eq!(millis, 0);
+                true
+            }),
+            Pumped::Empty { late: true },
+        );
+        assert!(matches!(budget, DrainBudget::Spent));
+    }
+
     fn path(text: &str) -> EventText {
         let mut buffer = [0 as std::ffi::c_char; 64];
         for (slot, byte) in buffer.iter_mut().zip(text.bytes()) {
@@ -1785,7 +1859,8 @@ mod tests {
     #[test]
     fn every_drain_uses_one_expiry_read_and_one_bounded_late_phase() {
         let at = Instant::now();
-        let deadline = Deadline::starting(at, Duration::from_millis(7)).unwrap();
+        let deadline =
+            Deadline::starting(at, Timeout::new(Duration::from_millis(7)).unwrap()).unwrap();
         let mut budget = DrainBudget::new(deadline);
         for (step, expected) in [(FINISH_POLL, 7), (SETTLE_POLL, 1)] {
             assert_eq!(

@@ -1,5 +1,5 @@
 use grafton_ndi::{
-    advanced::{AllocatedPacketReceiver, AllocatedReceiver, AvSync, PacketReceiver},
+    advanced::{AllocatedReceiver, AvSync, PacketAttached, PacketReceiver},
     FrameSync, Source,
 };
 
@@ -23,7 +23,7 @@ fn allocated(receiver: &mut AllocatedReceiver, next: &Source) {
     session.receiver().connect_to(next);
 }
 
-fn allocated_packets(packets: &mut AllocatedPacketReceiver) {
+fn allocated_packets(packets: &mut AllocatedReceiver<PacketAttached>) {
     let session = packets.controls().kvm().unwrap();
     session.receiver().disconnect();
 }

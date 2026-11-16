@@ -25,7 +25,7 @@
 #![warn(missing_docs)]
 
 use crate::{
-    finder::RawSource,
+    source_retention::RetainedSources,
     sys::{self, bindings::*},
     to_ms_checked, Ndi, Result, Source,
 };
@@ -132,8 +132,7 @@ pub struct Router {
     _name: CString,
     _groups: Option<CString>,
     // The SDK may retain both an effective route and its last refused request.
-    route: Option<Box<RawSource>>,
-    refused_route: Option<Box<RawSource>>,
+    sources: RetainedSources,
     #[cfg(feature = "advanced")]
     #[cfg_attr(
         not(ndi_has_advanced_router_connection_metadata),
@@ -230,8 +229,7 @@ impl Router {
             routing,
             _name: name,
             _groups: groups,
-            route: None,
-            refused_route: None,
+            sources: RetainedSources::default(),
             #[cfg(feature = "advanced")]
             connection_metadata: crate::connection_metadata::ConnectionMetadata::default(),
             #[cfg(feature = "advanced")]
@@ -260,25 +258,15 @@ impl Router {
     /// the change.
     #[doc(alias = "NDIlib_routing_change")]
     pub fn set_route(&mut self, source: &Source) -> Result<()> {
-        let raw = Box::new(source.to_raw());
-        // SAFETY: the boxed descriptor and its strings stay owned by this
-        // router until a later request has returned, or native destruction.
-        // Both previous descriptors remain owned throughout this call.
-        let changed = unsafe {
-            self.routing
-                .named()
-                .NDIlib_routing_change(self.instance.0, raw.as_raw())
-        };
-        if *changed.value() {
-            self.route = Some(raw);
-            self.refused_route = None;
-            Ok(())
-        } else {
-            // A refusal preserves the effective route. No SDK text says what
-            // it retained from this request, so keep that descriptor too.
-            self.refused_route = Some(raw);
-            Err(changed.failed())
-        }
+        self.sources.replace_if(Some(source), |source| {
+            // SAFETY: this router is live and the retention helper owns both
+            // the effective and replacement descriptors through the call.
+            unsafe {
+                self.routing
+                    .named()
+                    .NDIlib_routing_change(self.instance.0, source)
+            }
+        })
     }
     /// Stop routing to any source. Receivers stay connected to the router.
     ///
@@ -287,15 +275,11 @@ impl Router {
     /// Returns [`crate::Error::NativeOperationFailed`] when the SDK rejects the change.
     #[doc(alias = "NDIlib_routing_clear")]
     pub fn clear_route(&mut self) -> Result<()> {
-        // SAFETY: the router instance is live for this borrow.
-        let cleared = unsafe { self.routing.named().NDIlib_routing_clear(self.instance.0) };
-        if *cleared.value() {
-            self.route = None;
-            self.refused_route = None;
-            Ok(())
-        } else {
-            Err(cleared.failed())
-        }
+        self.sources.replace_if(None, |_| {
+            // SAFETY: this router is live and the retention helper keeps both
+            // previously retained descriptors alive until clear returns.
+            unsafe { self.routing.named().NDIlib_routing_clear(self.instance.0) }
+        })
     }
     /// Count the receivers currently connected to this router without waiting.
     /// This count does not establish progress of their media streams.

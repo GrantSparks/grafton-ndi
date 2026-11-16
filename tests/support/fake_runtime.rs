@@ -31,9 +31,11 @@
 //! * `fake_changes` — consumable Finder and Advanced keyframe changes, with
 //!   explicit source announcements and one native wake per change;
 //! * `fake_tally` — poll/wait share a consumable tally change on each sender;
+//! * `fake_blocking_connect` — hold the `Blocked` receiver connection request
+//!   between `entered` and `release` files in `GRAFTON_FAKE_CONNECT_GATE`;
 
-//! * `fake_capability_descriptors` — log synchronous sends, receiver settings
-//!   and Advanced AV sync descriptors after their capability checks;
+//! * `fake_capability_descriptors` — log send and receiver format gates, and
+//!   validated AV-sync descriptors after checking synchronization availability;
 //! * `fake_capture` — script native media/notification delivery with
 //!   `GRAFTON_FAKE_CAPTURE_SCRIPT`; only active rows/channels are initialized;
 //! * `fake_receiver_controls` — clocked capture, stream controls and KVM log
@@ -247,6 +249,14 @@ export! {
             }
         };
         log(&format!("receiver-connect:{name}"));
+        #[cfg(fake_blocking_connect)]
+        if name == "Blocked" {
+            let gate = std::path::PathBuf::from(std::env::var_os("GRAFTON_FAKE_CONNECT_GATE").unwrap());
+            std::fs::write(gate.join("entered"), b"").unwrap();
+            while !gate.join("release").exists() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         #[cfg(fake_objects)]
         unsafe { objects::connect_source(_p_instance, p_src) };
         #[cfg(fake_receiver_controls)]
@@ -676,6 +686,7 @@ mod objects {
 
         fn NDIlib_send_advertiser_del_sender(_p_instance: NDIlib_send_advertiser_instance_t, _p_sender: NDIlib_send_instance_t) -> bool {
             if refuses_removal() {
+                log("send-advertiser-remove-refused");
                 return false;
             }
             log("send-advertiser-remove");
@@ -692,7 +703,13 @@ mod objects {
 
         fn NDIlib_recv_advertiser_destroy(p_instance: NDIlib_recv_advertiser_instance_t) {
             log("recv-advertiser-destroy");
-            drop(unsafe { Box::from_raw(p_instance.cast::<RecvAdvertiser>()) });
+            let advertiser = unsafe { Box::from_raw(p_instance.cast::<RecvAdvertiser>()) };
+            // A refused removal leaves the SDK reading this registration
+            // through destruction, including its borrowed input-group name.
+            for &(_, group) in &advertiser.groups {
+                log(&format!("recv-advertiser-destroy-group {}", unsafe { bytes(group) }));
+            }
+            drop(advertiser);
         }
 
         fn NDIlib_recv_advertiser_add_receiver(p_instance: NDIlib_recv_advertiser_instance_t, p_receiver: NDIlib_recv_instance_t, allow_controlling: bool, allow_monitoring: bool, p_input_group_name: *const c_char) -> bool {
@@ -705,6 +722,7 @@ mod objects {
 
         fn NDIlib_recv_advertiser_del_receiver(p_instance: NDIlib_recv_advertiser_instance_t, p_receiver: NDIlib_recv_instance_t) -> bool {
             if refuses_removal() {
+                log("recv-advertiser-remove-refused");
                 return false;
             }
             let advertiser = unsafe { &mut *p_instance.cast::<RecvAdvertiser>() };

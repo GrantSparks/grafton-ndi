@@ -2,15 +2,18 @@
 
 #[cfg(any(test, ndi_has_advanced_av_sync, ndi_has_advanced_genlock))]
 use std::ptr;
-use std::{cell::Cell, marker::PhantomData, sync::Arc};
+use std::{cell::Cell, marker::PhantomData};
 
 use super::{invalid_input, sdk_quantity, AdvancedConfig, AvSyncAttached, ReceiverControls};
 use crate::{
-    capture::AvSyncAudioFree,
-    finder::RawSource,
-    frames::AudioRef,
+    capture::{AvSyncAudioFree, Guard},
     frames::MAX_AUDIO_BYTES,
-    receiver::{ReceiverCore, Released},
+    frames::{ValidatedAudio, VideoPartsExt},
+    receiver::{
+        attached::{sealed, Attached, Resource, Synchronizer},
+        ReceiverCore,
+    },
+    source_retention::RetainedSources,
     sys::{
         advanced::{native, AvSync as AvSyncTable, Genlock as GenlockTable},
         bindings::*,
@@ -27,10 +30,7 @@ use crate::sys::advanced::GenlockHandle;
 #[cfg(any(doc, test, ndi_has_advanced_av_sync, ndi_has_advanced_genlock))]
 use crate::Error;
 #[cfg(any(test, ndi_has_advanced_av_sync))]
-use crate::{
-    capture::{AvSyncAudioInstance, Guard},
-    frames::{ReturnedAudio, ValidatedAudio},
-};
+use crate::{capture::AvSyncAudioInstance, frames::ReturnedAudio};
 
 /// What audio an [`AvSync::synchronize`] call asks for.
 ///
@@ -159,7 +159,7 @@ pub enum AvSyncOutcome {
 /// Several references may be retained across later synchronizations and freed
 /// in any order. The synchronizer remains borrowed until all are released.
 pub struct AvSyncAudioRef<'a> {
-    pub(crate) inner: AudioRef<'a, AvSyncAudioFree>,
+    pub(crate) inner: ValidatedAudio<Guard<'a, AvSyncAudioFree>>,
 }
 
 /// A synchronization outcome whose audio remains borrowed from the SDK.
@@ -233,12 +233,15 @@ enum Synchronized {
 }
 
 /// A native synchronizer, destroyed when dropped.
-pub(crate) struct AvResource {
-    receiver: Arc<ReceiverCore>,
+pub(crate) struct AvSyncKind {
     #[cfg(ndi_has_advanced_av_sync)]
     handle: AvSyncInstance,
     table: &'static AvSyncTable,
+    // Keep the public Send + !Sync contract even without native declarations.
+    _not_sync: NotSync,
 }
+
+type AvResource = Resource<AvSyncKind>;
 
 #[cfg(ndi_has_advanced_av_sync)]
 #[derive(Clone, Copy)]
@@ -260,26 +263,29 @@ const _: () = {
     send::<AvResource>();
 };
 
-impl AvResource {
-    pub(crate) fn receiver_core(&self) -> &Arc<ReceiverCore> {
-        &self.receiver
-    }
+impl sealed::Sealed for AvSyncKind {}
 
-    fn release(self) -> Released<AvSyncAttached> {
-        Released::<AvSyncAttached>::release(self)
-    }
-}
+// SAFETY: adoption retains the receiver from which this handle was created.
+// The view borrows the same resource and exposes no ownership transition.
+unsafe impl Synchronizer for AvSyncKind {
+    type Mode = AvSyncAttached;
+    type Capture<'a> = AvSyncCapture<'a>;
 
-impl Drop for AvResource {
-    fn drop(&mut self) {
-        // SAFETY: the handle was created by this table and is destroyed once,
-        // while this resource still owns the receiver it reads.
+    unsafe fn destroy(&mut self, _receiver: &ReceiverCore) {
         native!(AvSync, self.table => {
-            // SAFETY: this resource retains the receiver through destruction.
+            // SAFETY: Resource retains the creating receiver and runtime, and
+            // invokes this destruction once for the uniquely owned handle.
             unsafe { self.table.NDIlib_avsync_destroy(self.handle.0) };
             #[cfg(test)]
             crate::receiver::lifecycle_test_events::record("avsync");
         });
+    }
+
+    fn capture(resource: &AvResource) -> AvSyncCapture<'_> {
+        AvSyncCapture {
+            resource,
+            _thread: PhantomData,
+        }
     }
 }
 
@@ -341,15 +347,7 @@ impl Drop for AvResource {
 /// # }
 /// ```
 pub struct AvSync {
-    resource: AvResource,
-    receiver: Receiver<AvSyncAttached>,
-    // `synchronize` takes `&self`, so withholding Sync keeps two
-    // synchronizations of one synchronizer from running at once, which
-    // neither Processing.NDI.AVSync.h nor the Advanced SDK manual (25.6)
-    // documents as safe. AvSyncInstance withholds Sync when its native
-    // handle is present; this also states it without Advanced declarations.
-    // Send comes from the fields.
-    _not_sync: NotSync,
+    inner: Attached<AvSyncKind>,
 }
 
 /// A field that withholds [`Sync`] from the type that holds it, and nothing
@@ -383,17 +381,19 @@ impl AvSync {
             Err(error) => return Err(Rejected::new(error, receiver)),
         };
         native!(AvSync, table => {
-            // SAFETY: the receiver instance is live, and this value keeps it
-            // alive for longer than the synchronizer.
-            let handle = match unsafe { table.named().NDIlib_avsync_create(receiver.core.instance.0) }.created() {
-                Ok(handle) => handle.as_ptr(),
-                Err(error) => return Err(Rejected::new(error, receiver)),
-            };
-            Ok(Self {
-                resource: AvResource { handle: AvSyncInstance(handle), table, receiver: Arc::clone(&receiver.core) },
-                receiver: receiver.attach(),
-                _not_sync: NotSync(PhantomData),
-            })
+            // SAFETY: this creates a uniquely owned synchronizer from the
+            // supplied receiver, using that receiver's runtime table.
+            unsafe {
+                Attached::adopt(receiver, |core| {
+                    let handle = table.named().NDIlib_avsync_create(core.instance.0)
+                        .created()?.as_ptr();
+                    Ok(AvSyncKind {
+                        handle: AvSyncInstance(handle),
+                        table,
+                        _not_sync: NotSync(PhantomData),
+                    })
+                })
+            }.map(|inner| Self { inner })
         })
     }
 
@@ -425,14 +425,14 @@ impl AvSync {
     /// controls and KVM; [`split`](Self::split) keeps synchronization usable
     /// while a KVM session holds the receiver borrow.
     pub fn receiver(&self) -> &Receiver<AvSyncAttached> {
-        &self.receiver
+        self.inner.receiver()
     }
 
     /// Borrow exclusive receiver controls without permitting receiver replacement.
     /// This allocates nothing and makes no SDK call. Use [`Self::split`] to
     /// synchronize while a KVM session retains the receiver borrow.
     pub fn controls(&mut self) -> ReceiverControls<'_, AvSyncAttached> {
-        ReceiverControls::new(&mut self.receiver)
+        self.inner.controls()
     }
 
     /// Lend synchronization and exclusive receiver controls independently.
@@ -443,22 +443,13 @@ impl AvSync {
     /// Release held inputs before changing source, and drop both views before
     /// recovering the receiver.
     pub fn split(&mut self) -> (AvSyncCapture<'_>, ReceiverControls<'_, AvSyncAttached>) {
-        (
-            AvSyncCapture {
-                resource: &self.resource,
-                _thread: PhantomData,
-            },
-            ReceiverControls::new(&mut self.receiver),
-        )
+        self.inner.split()
     }
 
     /// Stop synchronizing and return the receiver, with its own audio
     /// capture again.
     pub fn into_receiver(self) -> Receiver {
-        let Self {
-            resource, receiver, ..
-        } = self;
-        receiver.detach(resource.release())
+        self.inner.into_receiver()
     }
 
     /// Fetch the audio that belongs to `video`.
@@ -474,6 +465,10 @@ impl AvSync {
     /// storage when present. [`Self::synchronize_ref`] borrows those samples
     /// directly and offers allocation-free copying into reusable storage.
     ///
+    /// Matching uses the video's timestamp and geometry, independently of
+    /// whether this runtime can send its pixel format. Owned and borrowed
+    /// planar 4:4:4 frames therefore follow the same rule on older runtimes.
+    ///
     /// One call synchronizes at a time, on the thread that holds this
     /// `AvSync`, which is not `Sync`. Other threads may meanwhile capture
     /// video or metadata or use the controls through the receiver it lends.
@@ -481,9 +476,6 @@ impl AvSync {
     /// tests also exercise for [`FrameSync`](crate::FrameSync).
     ///
     /// # Errors
-    ///
-    /// [`Error::UnsupportedCapability`] when an owned video uses planar 4:4:4
-    /// on a runtime without [`crate::RuntimeFeature::Planar444Video`].
     ///
     /// [`Error::InvalidFrame`] when the audio the SDK returned fails
     /// validation, [`Error::NativeOperationFailed`] when the SDK reports an
@@ -537,10 +529,7 @@ impl AvSync {
     /// The synchronization view of this owner, which `&self` keeps on its
     /// thread for as long as it is borrowed.
     fn capture(&self) -> AvSyncCapture<'_> {
-        AvSyncCapture {
-            resource: &self.resource,
-            _thread: PhantomData,
-        }
+        self.inner.capture()
     }
 }
 
@@ -620,8 +609,8 @@ impl<'a> AvSyncCapture<'a> {
             // A copy of the frame's descriptor, pointing into the frame's own
             // buffers, which the borrow keeps allocated for the call, and
             // carrying the timestamp `AvSyncVideo::new` checked.
-            let video = _video.map(|video| video.descriptor(&self.resource.receiver._ndi)).transpose()?;
-            let AvResource { handle, table, .. } = *self.resource;
+            let video = _video.map(|video| video.descriptor());
+            let (handle, table) = (self.resource.handle, self.resource.table);
             let mut audio = _request.raw();
             let status = {
                 // SAFETY: the synchronizer is live, and so is the receiver it
@@ -757,7 +746,7 @@ mod video_sealed {
     pub trait Sealed: Sync + std::panic::RefUnwindSafe {
         /// A copy of the frame's SDK descriptor, which points into buffers
         /// that the borrow of `self` keeps allocated and unchanged.
-        fn descriptor(&self, ndi: &crate::Ndi) -> crate::Result<NDIlib_video_frame_v2_t>;
+        fn descriptor(&self) -> NDIlib_video_frame_v2_t;
 
         /// The time the frame's sender submitted it, when known.
         fn receive_timestamp(&self) -> Option<SdkTimestamp>;
@@ -772,8 +761,8 @@ mod video_sealed {
 pub trait AvSyncFrame: video_sealed::Sealed {}
 
 impl video_sealed::Sealed for VideoFrame {
-    fn descriptor(&self, ndi: &crate::Ndi) -> crate::Result<NDIlib_video_frame_v2_t> {
-        Ok(crate::frames::Sendable::borrowed(self, ndi)?.video_descriptor())
+    fn descriptor(&self) -> NDIlib_video_frame_v2_t {
+        self.video_descriptor()
     }
 
     fn receive_timestamp(&self) -> Option<SdkTimestamp> {
@@ -784,10 +773,8 @@ impl video_sealed::Sealed for VideoFrame {
 impl AvSyncFrame for VideoFrame {}
 
 impl video_sealed::Sealed for VideoFrameRef<'_> {
-    fn descriptor(&self, _: &crate::Ndi) -> crate::Result<NDIlib_video_frame_v2_t> {
-        let mut raw = *self.raw();
-        raw.p_metadata = crate::frames::VideoParts::frame_metadata(self).as_ptr();
-        Ok(raw)
+    fn descriptor(&self) -> NDIlib_video_frame_v2_t {
+        self.video_descriptor()
     }
 
     fn receive_timestamp(&self) -> Option<SdkTimestamp> {
@@ -857,11 +844,11 @@ impl<'a> AvSyncVideo<'a> {
 
     /// The frame's descriptor, carrying the timestamp [`Self::new`] checked.
     #[cfg(any(test, ndi_has_advanced_av_sync))]
-    fn descriptor(&self, ndi: &crate::Ndi) -> crate::Result<NDIlib_video_frame_v2_t> {
-        Ok(NDIlib_video_frame_v2_t {
+    fn descriptor(&self) -> NDIlib_video_frame_v2_t {
+        NDIlib_video_frame_v2_t {
             timestamp: self.timestamp.ticks(),
-            ..self.frame.descriptor(ndi)?
-        })
+            ..self.frame.descriptor()
+        }
     }
 }
 
@@ -900,8 +887,7 @@ struct GenResource {
     handle: GenlockInstance,
     table: &'static GenlockTable,
     _ndi: Ndi,
-    source: Option<Source>,
-    _raw_source: Option<Box<RawSource>>,
+    source: RetainedSources,
     _config: Option<AdvancedConfig>,
 }
 
@@ -1050,7 +1036,7 @@ pub struct Genlock {
 impl std::fmt::Debug for Genlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Genlock")
-            .field("source", &self.resource.source)
+            .field("source", &self.resource.source.current())
             .finish_non_exhaustive()
     }
 }
@@ -1069,22 +1055,23 @@ impl Genlock {
     pub fn new(ndi: &Ndi, options: &GenlockOptions) -> Result<Self> {
         let table = ndi.table::<GenlockTable>()?;
         native!(Genlock, table, uses(options) => {
-            let source = options.source.as_ref().map(Source::to_raw).map(Box::new);
-            // SAFETY: the source descriptor and configuration point to strings
-            // this resource retains until after native destruction.
-            let handle = unsafe {
-                table.named().NDIlib_genlock_create(
-                    source.as_ref().map_or(ptr::null(), |source| source.as_raw()),
-                    options.config.as_ref().map_or(ptr::null(), AdvancedConfig::as_ptr),
-                )
-            }.created()?.as_ptr();
+            let mut source = RetainedSources::default();
+            let handle = source.replace(options.source.as_ref(), |source| {
+                // SAFETY: the retention helper keeps the descriptor and text
+                // at stable addresses until after native destruction.
+                unsafe {
+                    table.named().NDIlib_genlock_create(
+                        source,
+                        options.config.as_ref().map_or(ptr::null(), AdvancedConfig::as_ptr),
+                    )
+                }
+            }).created()?.as_ptr();
             Ok(Self {
                 resource: GenResource {
                     handle: GenlockInstance(handle),
                     table,
                     _ndi: ndi.clone(),
-                    source: options.source.clone(),
-                    _raw_source: source,
+                    source,
                     _config: options.config.clone(),
                 },
                 _not_sync: NotSync(PhantomData),
@@ -1108,20 +1095,13 @@ impl Genlock {
     }
 
     fn connect_source(&mut self, source: Option<&Source>) {
-        let raw_source = source.map(Source::to_raw).map(Box::new);
-        native!(Genlock, self.resource.table, uses(source, raw_source) => {
-            let GenResource { handle, table, .. } = self.resource;
-            // SAFETY: the genlock is live with no wait in progress. Both the old
-            // and replacement descriptors remain alive through this call; the
-            // replacement is retained before the earlier one is released.
-            unsafe {
-                table.NDIlib_genlock_connect(
-                    handle.0,
-                    raw_source.as_ref().map_or(ptr::null(), |source| source.as_raw()),
-                )
-            };
-            self.resource._raw_source = raw_source;
-            self.resource.source = source.cloned();
+        native!(Genlock, self.resource.table, uses(source) => {
+            let GenResource { handle, table, source: retained, .. } = &mut self.resource;
+            retained.replace(source, |source| {
+                // SAFETY: the genlock is live with no wait in progress, and
+                // the retention helper owns both descriptors through this call.
+                unsafe { table.NDIlib_genlock_connect(handle.0, source) };
+            });
         })
     }
 
@@ -1513,9 +1493,6 @@ mod tests {
     /// timestamp that was checked.
     #[test]
     fn only_a_frame_with_a_timestamp_can_be_synchronized() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
         let built = VideoFrame::builder().resolution(64, 32).build().unwrap();
         assert!(AvSyncVideo::new(&built).is_none());
 
@@ -1529,7 +1506,7 @@ mod tests {
         let frame = captured(&mut pixels, sent);
         let video = AvSyncVideo::new(&frame).unwrap();
         assert_eq!(video.timestamp(), SdkTimestamp::from_ticks(sent));
-        let descriptor = video.descriptor(&ndi).unwrap();
+        let descriptor = video.descriptor();
         assert_eq!(descriptor.timestamp, sent);
         assert_eq!(descriptor.p_data.cast_const(), start);
         assert!(format!("{video:?}").contains("timestamp"));
@@ -1538,31 +1515,27 @@ mod tests {
         let owned = frame.to_owned();
         let video = AvSyncVideo::new(&owned).unwrap();
         assert_eq!(video.timestamp(), SdkTimestamp::from_ticks(sent));
-        assert_eq!(video.descriptor(&ndi).unwrap().timestamp, sent);
+        assert_eq!(video.descriptor().timestamp, sent);
         assert_eq!(
-            video.descriptor(&ndi).unwrap().p_data.cast_const(),
+            video.descriptor().p_data.cast_const(),
             owned.data().as_ptr()
         );
     }
 
+    /// Native AV sync matches timestamps independently of the runtime's send
+    /// formats. In particular Advanced 6.3.2 cannot send these four formats.
     #[test]
-    fn owned_planar_444_avsync_checks_the_receiver_runtime() {
+    fn avsync_accepts_owned_and_borrowed_planar_444_without_a_send_gate() {
         use crate::{
             capture::{CaptureStrategy, Guard, VideoKind},
             PixelFormat, ReceiverOptions, Source,
         };
-        let Some(ndi) = crate::test_support::ndi() else {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
             return;
         };
-        if !ndi.capabilities().supports(crate::RuntimeFeature::AvSync) {
-            return;
-        }
         let receiver =
             Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
         let mut sync = AvSync::new(receiver).unwrap();
-        let supported = ndi
-            .capabilities()
-            .supports(crate::RuntimeFeature::Planar444Video);
         for format in [
             PixelFormat::Na48,
             PixelFormat::Nb48,
@@ -1576,34 +1549,26 @@ mod tests {
                 .unwrap();
             let mut raw = backing.as_test_raw();
             raw.timestamp = 1234;
-            // SAFETY: backing owns the descriptor's complete validated storage
-            // throughout this synthetic capture and copy; no-op free owns nothing.
+            // SAFETY: backing retains this descriptor's complete initialized
+            // storage through both synthetic capture and synchronization.
             let captured = VideoKind::make_ref(unsafe {
                 Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})
             })
             .unwrap();
             let owned = captured.to_owned();
-            let video = AvSyncVideo::new(&owned).unwrap();
-            for result in [
-                sync.synchronize(video, AvSyncRequest::automatic()),
-                sync.split()
-                    .0
-                    .synchronize(video, AvSyncRequest::automatic()),
+            for video in [
+                AvSyncVideo::new(&captured).unwrap(),
+                AvSyncVideo::new(&owned).unwrap(),
             ] {
-                if supported {
-                    assert!(result.is_ok(), "{format:?}: {result:?}");
-                } else {
+                assert_eq!(video.descriptor().FourCC, raw.FourCC);
+                for result in [
+                    sync.synchronize(video, AvSyncRequest::automatic()),
+                    sync.split()
+                        .0
+                        .synchronize(video, AvSyncRequest::automatic()),
+                ] {
                     assert!(
-                        matches!(
-                            result,
-                            Err(Error::UnsupportedCapability {
-                                capability: crate::Capability::Runtime(
-                                    crate::RuntimeFeature::Planar444Video
-                                ),
-                                refusal: crate::CapabilityRefusal::RuntimeTooOld { .. },
-                                ..
-                            })
-                        ),
+                        matches!(result, Ok(AvSyncOutcome::NoAudioStream)),
                         "{format:?}: {result:?}"
                     );
                 }
@@ -1611,11 +1576,152 @@ mod tests {
         }
     }
 
+    /// Supply real received timestamps with planar storage that the source
+    /// runtime cannot send. Successful audio matching proves the ungated
+    /// descriptors work beyond the no-audio outcome checked above.
     #[test]
-    fn avsync_descriptors_fit_owned_copies_of_padded_sources() {
+    fn avsync_matches_live_audio_for_owned_and_borrowed_planar_frames() {
+        use crate::{
+            capture::{CaptureStrategy, VideoKind},
+            Finder, FinderOptions, PixelFormat, ReceiverOptions, Sender, SenderOptions,
+            SourceAddress,
+        };
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::{Duration, Instant},
+        };
         let Some(ndi) = crate::test_support::advanced_ndi() else {
             return;
         };
+        let sender = Sender::new(
+            &ndi,
+            &SenderOptions::new(crate::test_support::unique_name("planar AV-sync"))
+                .clock_video(true)
+                .clock_audio(false),
+        )
+        .unwrap();
+        let name = sender.source().unwrap().name().to_owned();
+        let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips(["127.0.0.1"])).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let source = loop {
+            if let Some((source, port)) = finder
+                .current_sources()
+                .unwrap()
+                .into_iter()
+                .filter(|source| source.name() == name)
+                .find_map(|source| {
+                    source
+                        .address()
+                        .and_then(|address| address.port())
+                        .map(|port| (source, port))
+                })
+            {
+                break source
+                    .with_address(SourceAddress::new(format!("127.0.0.1:{port}")).unwrap());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "local planar AV-sync sender not discovered"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let sync =
+            AvSync::new(Receiver::new(&ndi, &ReceiverOptions::new(source)).unwrap()).unwrap();
+        let video = VideoFrame::builder()
+            .resolution(64, 32)
+            .frame_rate(FrameRate::new(30, 1).unwrap())
+            .build()
+            .unwrap();
+        let audio = AudioFrame::builder()
+            .sample_rate(48_000)
+            .num_channels(2)
+            .num_samples(1600)
+            .build()
+            .unwrap();
+        let stop = AtomicBool::new(false);
+        struct Stop<'a>(&'a AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        std::thread::scope(|scope| {
+            let _stop = Stop(&stop);
+            scope.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    sender.send_video(&video).unwrap();
+                    sender.send_audio(&audio);
+                }
+            });
+            for format in [
+                PixelFormat::Na48,
+                PixelFormat::Nb48,
+                PixelFormat::Na4g,
+                PixelFormat::Nb4g,
+            ] {
+                let backing = VideoFrame::builder()
+                    .resolution(64, 32)
+                    .frame_rate(FrameRate::new(30, 1).unwrap())
+                    .pixel_format(format)
+                    .build()
+                    .unwrap();
+                for owned in [false, true] {
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    loop {
+                        assert!(
+                            Instant::now() < deadline,
+                            "no audio for {format:?}, owned={owned}"
+                        );
+                        let Some(received) = sync
+                            .receiver()
+                            .capture_video_ref(Duration::from_millis(100))
+                            .unwrap()
+                        else {
+                            continue;
+                        };
+                        let mut raw = backing.as_test_raw();
+                        raw.timestamp = received
+                            .timestamp()
+                            .expect("native sender timestamp")
+                            .ticks();
+                        raw.timecode = received.timecode().ticks();
+                        // SAFETY: backing retains the full initialized planar
+                        // allocation; the no-op free owns no native buffer.
+                        let captured = VideoKind::make_ref(unsafe {
+                            Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})
+                        })
+                        .unwrap();
+                        let copied = captured.to_owned();
+                        let video = if owned {
+                            AvSyncVideo::new(&copied)
+                        } else {
+                            AvSyncVideo::new(&captured)
+                        }
+                        .unwrap();
+                        match sync.synchronize(video, AvSyncRequest::automatic()).unwrap() {
+                            AvSyncOutcome::Audio { frame, .. } => {
+                                assert_eq!(
+                                    (frame.sample_rate(), frame.num_channels()),
+                                    (48_000, 2)
+                                );
+                                assert!(frame.num_samples() > 0);
+                                break;
+                            }
+                            AvSyncOutcome::NoAudioStream
+                            | AvSyncOutcome::NoMatchingSamples
+                            | AvSyncOutcome::Empty { .. } => {}
+                            other => panic!(
+                                "unexpected outcome for {format:?}, owned={owned}: {other:?}"
+                            ),
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn avsync_descriptors_fit_owned_copies_of_padded_sources() {
         for (format, stride) in [
             (crate::PixelFormat::Bgra, 512),
             (crate::PixelFormat::Uyvy, 256),
@@ -1632,7 +1738,7 @@ mod tests {
                 .build()
                 .unwrap();
             let frame = crate::VideoSource::to_owned(&borrowed);
-            let raw = video_sealed::Sealed::descriptor(&frame, &ndi).unwrap();
+            let raw = video_sealed::Sealed::descriptor(&frame);
             crate::frames::descriptor_tests::assert_extent(
                 &raw,
                 frame.data().as_ptr(),
@@ -1783,7 +1889,8 @@ mod tests {
         let receiver =
             Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new("").unwrap())).unwrap();
         let sync = AvSync::new(receiver).unwrap();
-        let AvResource { handle, table, .. } = &sync.resource;
+        let resource = sync.inner.resource();
+        let (handle, table) = (resource.handle, resource.table);
         let mut raw = AvSyncRequest::automatic().raw();
         raw.timestamp = 12345;
         let status = unsafe {

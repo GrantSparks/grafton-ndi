@@ -2,7 +2,9 @@
 use super::*;
 use crate::{
     capture::{AudioKind, Guard, VideoKind},
-    frames::{FrameMetadataRef, MetadataText, ValidatedFrame},
+    frames::{
+        descriptor_parts_sealed, DescriptorParts, FrameMetadataRef, MetadataText, ValidatedFrame,
+    },
     FrameMetadataStatus,
 };
 
@@ -72,20 +74,26 @@ macro_rules! borrowed_extras {
     };
 }
 
+impl descriptor_parts_sealed::Sealed for VideoPacketParts {}
+// SAFETY: the codec, parameters and payload length are validated from this
+// exact descriptor. No returned extent can exceed its declared allocation.
+unsafe impl DescriptorParts<NDIlib_video_frame_v2_t> for VideoPacketParts {
+    unsafe fn validate(raw: &NDIlib_video_frame_v2_t) -> Result<Self> {
+        let format = VideoPacketFormat::from_sdk(raw)?;
+        // SAFETY: the delivered size union names the guard's readable
+        // initialized allocation; packet_bytes checks its extent.
+        let bytes = unsafe { packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
+        validate_video_packet(format, bytes, Use::Receive)?;
+        Ok(Self {
+            format,
+            len: bytes.len(),
+        })
+    }
+}
+
 impl<'rx> CompressedVideoRef<'rx> {
     pub(crate) fn new(frame: Guard<'rx, VideoKind>) -> Result<Self> {
-        let frame = ValidatedFrame::validate(frame, |raw| {
-            let format = VideoPacketFormat::from_sdk(raw)?;
-            // SAFETY: the delivered size union names the guard's readable
-            // initialized allocation; packet_bytes checks its extent.
-            let bytes =
-                unsafe { packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
-            validate_video_packet(format, bytes, Use::Receive)?;
-            Ok(VideoPacketParts {
-                format,
-                len: bytes.len(),
-            })
-        })?;
+        let frame = ValidatedFrame::validate(frame)?;
         Ok(Self { frame })
     }
 
@@ -145,24 +153,30 @@ impl<'rx> CompressedVideoRef<'rx> {
     }
 }
 
+impl descriptor_parts_sealed::Sealed for AudioPacketParts {}
+// SAFETY: the codec, parameters and payload length are validated from this
+// exact descriptor. No returned extent can exceed its declared allocation.
+unsafe impl DescriptorParts<NDIlib_audio_frame_v3_t> for AudioPacketParts {
+    unsafe fn validate(raw: &NDIlib_audio_frame_v3_t) -> Result<Self> {
+        let (codec, protected) = AudioCodec::from_outer(raw.FourCC)
+            .ok_or_else(|| invalid_frame(crate::FrameDefect::UnknownCompressedAudio))?;
+        let parameters = AudioParameters::from_sdk(raw)?;
+        // SAFETY: this delivered union names the guard's initialized
+        // readable payload; packet_bytes checks the positive extent.
+        let bytes = unsafe { packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
+        validate_received_audio(codec, bytes)?;
+        Ok(Self {
+            codec,
+            protected,
+            parameters,
+            len: bytes.len(),
+        })
+    }
+}
+
 impl<'rx> CompressedAudioRef<'rx> {
     pub(crate) fn new(frame: Guard<'rx, AudioKind>) -> Result<Self> {
-        let frame = ValidatedFrame::validate(frame, |raw| {
-            let (codec, protected) = AudioCodec::from_outer(raw.FourCC)
-                .ok_or_else(|| invalid_frame(crate::FrameDefect::UnknownCompressedAudio))?;
-            let parameters = AudioParameters::from_sdk(raw)?;
-            // SAFETY: this delivered union names the guard's initialized
-            // readable payload; packet_bytes checks the positive extent.
-            let bytes =
-                unsafe { packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
-            validate_received_audio(codec, bytes)?;
-            Ok(AudioPacketParts {
-                codec,
-                protected,
-                parameters,
-                len: bytes.len(),
-            })
-        })?;
+        let frame = ValidatedFrame::validate(frame)?;
         Ok(Self { frame })
     }
 
