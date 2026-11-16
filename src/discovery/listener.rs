@@ -3,8 +3,9 @@
 
 use super::{Retained, ServerApi, ServerObject};
 use crate::{
-    frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
-    sdk_copy::{CopyBudget, SpanError, COPY_LIMIT},
+    sdk_copy::{
+        bounded_sdk_text, copy_lossy, CopyBudget, SpanError, COPY_LIMIT, MAX_SDK_STRING_BYTES,
+    },
     sys::{self, bindings::*},
     to_ms_checked, Error, Ndi, ResourceKind, Result,
 };
@@ -554,7 +555,7 @@ unsafe fn endpoint(url: *const c_char) -> Option<String> {
     }
     // SAFETY: forwarded to the caller's obligation for a non-null pointer.
     let bytes = unsafe { bounded_sdk_text(url, MAX_SDK_STRING_BYTES) }?;
-    Some(String::from_utf8_lossy(bytes).into_owned())
+    Some(copy_lossy(bytes))
 }
 
 /// A listener adds membership operations to the shared lifecycle owner.

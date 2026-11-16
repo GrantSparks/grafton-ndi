@@ -102,7 +102,7 @@ pub(super) fn copy_string(text: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::{
-        finder::snapshot_entry, frames::MAX_SDK_STRING_BYTES, sys::bindings::NDIlib_source_t,
+        finder::snapshot_entry, sdk_copy::MAX_SDK_STRING_BYTES, sys::bindings::NDIlib_source_t,
         Source,
     };
     use std::{ffi::CString, ptr};

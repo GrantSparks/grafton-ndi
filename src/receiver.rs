@@ -76,7 +76,7 @@ impl RecvStringGuard<'_> {
     /// The string's bytes before its terminator, or `None` for a null string.
     ///
     /// The scan for the terminator is bounded by
-    /// [`MAX_SDK_STRING_BYTES`](crate::frames::MAX_SDK_STRING_BYTES); a string
+    /// [`MAX_SDK_STRING_BYTES`](crate::sdk_copy::MAX_SDK_STRING_BYTES); a string
     /// without one within it is an [`Error::UnexpectedSdkResult`].
     fn bytes(&self) -> Result<Option<&[u8]>> {
         if self.string.value().is_null() {
@@ -84,7 +84,7 @@ impl RecvStringGuard<'_> {
         }
         // SAFETY: the SDK returned a readable NUL-terminated string, which
         // this guard keeps allocated for as long as it is borrowed.
-        let bytes = unsafe { crate::frames::sdk_text(self.string) }?;
+        let bytes = unsafe { crate::sdk_copy::sdk_text(self.string) }?;
         Ok(Some(bytes))
     }
 
@@ -103,9 +103,7 @@ impl RecvStringGuard<'_> {
     ///
     /// For a value the SDK reports only once, where an error would lose it.
     fn copy_lossy(&self) -> Result<Option<String>> {
-        Ok(self
-            .bytes()?
-            .map(|bytes| String::from_utf8_lossy(bytes).into_owned()))
+        Ok(self.bytes()?.map(crate::sdk_copy::copy_lossy))
     }
 }
 impl Drop for RecvStringGuard<'_> {
@@ -3091,7 +3089,7 @@ mod tests {
         let strings = sys::ReceiverStrings {
             NDIlib_recv_free_string: keep,
         };
-        let max = crate::frames::MAX_SDK_STRING_BYTES;
+        let max = crate::sdk_copy::MAX_SDK_STRING_BYTES;
         let copy = |bytes: &[u8]| {
             RecvStringGuard {
                 core: &receiver.core,

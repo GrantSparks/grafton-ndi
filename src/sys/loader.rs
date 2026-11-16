@@ -13,8 +13,8 @@ use super::{
 };
 use crate::{
     capabilities::{RuntimeInfo, SdkEdition, SdkVersion},
-    frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
     runtime::RuntimeOptions,
+    sdk_copy::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
     Error, LoadRefusal, Result, SelectionFailure,
 };
 

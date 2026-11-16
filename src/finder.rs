@@ -21,7 +21,7 @@ use std::{
 
 use crate::{
     change_feed::ChangeFeed,
-    frames::copy_sdk_string,
+    sdk_copy::copy_sdk_string,
     sys::{self, bindings::*},
     timeout::{Deadline, NeverStop, Stop, POLL_INTERVAL},
     Error, Ndi, ResourceKind, Result,
@@ -470,7 +470,7 @@ fn source_pointers(source: &NDIlib_source_t) -> (*const c_char, *const c_char) {
 /// # Safety
 ///
 /// Each non-null pointer must stay readable through its first NUL or
-/// [`crate::frames::MAX_SDK_STRING_BYTES`] bytes, whichever comes first,
+/// [`crate::sdk_copy::MAX_SDK_STRING_BYTES`] bytes, whichever comes first,
 /// until its copy finishes. The copy policy must preserve those lifetimes.
 pub(crate) unsafe fn decode_source(
     name: *const c_char,
@@ -2931,7 +2931,7 @@ mod tests {
         let ip = c"192.0.2.1:5960".as_ptr();
         let url = c"ndi://camera.local:5960".as_ptr();
         let empty = c"".as_ptr();
-        let unterminated = vec![b'x'; crate::frames::MAX_SDK_STRING_BYTES];
+        let unterminated = vec![b'x'; crate::sdk_copy::MAX_SDK_STRING_BYTES];
         let malformed = unterminated.as_ptr().cast();
         let cases = [
             (
@@ -3057,7 +3057,7 @@ mod tests {
 
     #[test]
     fn source_strings_are_bounded_by_the_sdk_string_limit() {
-        use crate::frames::MAX_SDK_STRING_BYTES;
+        use crate::sdk_copy::MAX_SDK_STRING_BYTES;
         // The longest name that fits: its terminator is the last byte the
         // scan may read. One byte longer, the terminator lies past the limit.
         let mut longest = vec![b'x'; MAX_SDK_STRING_BYTES];
@@ -3102,7 +3102,7 @@ mod tests {
             return;
         };
         let finder = Finder::new(&ndi, &FinderOptions::default()).unwrap();
-        let mut too_long = vec![b'x'; crate::frames::MAX_SDK_STRING_BYTES + 1];
+        let mut too_long = vec![b'x'; crate::sdk_copy::MAX_SDK_STRING_BYTES + 1];
         *too_long.last_mut().unwrap() = 0;
         let named = |name: *const std::ffi::c_char| NDIlib_source_t {
             p_ndi_name: name,
