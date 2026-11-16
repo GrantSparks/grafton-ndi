@@ -61,6 +61,42 @@ fn working_directory_libraries_never_run_constructors() {
                 let error = Runtime::select(&RuntimeOptions::new()).unwrap_err();
                 failed(error, &working);
             }
+            #[cfg(target_os = "macos")]
+            scenario if scenario.starts_with("dyld-") && scenario != "dyld-absolute" => {
+                let error = if scenario.ends_with("-file") {
+                    #[cfg(feature = "file-io")]
+                    {
+                        use grafton_ndi::{
+                            file::{FileApi, FileApiOptions},
+                            Ndi,
+                        };
+                        // The core's unique leaf has no DYLD override. Its
+                        // companion File name does, and is also planted
+                        // beside it to detect any premature companion open.
+                        let ndi = Ndi::with_options(
+                            &RuntimeOptions::new()
+                                .library_path(root.join("trusted-file/core-for-file.dylib")),
+                        )
+                        .unwrap();
+                        FileApi::new(&ndi, &FileApiOptions::new()).unwrap_err()
+                    }
+                    #[cfg(not(feature = "file-io"))]
+                    panic!("File scenario requires file-io")
+                } else {
+                    Runtime::select(&RuntimeOptions::new()).unwrap_err()
+                };
+                let failure = failed(error, &working);
+                assert!(!failure.loaded_any(), "{failure}");
+                assert!(!failure.attempts().is_empty(), "{failure}");
+                assert!(
+                    failure.attempts().iter().all(|attempt| {
+                        attempt.origin() == grafton_ndi::LoadOrigin::DyldLibraryDirectory
+                            && attempt.refusal()
+                                == &grafton_ndi::LoadRefusal::RelativeSearchDirectory
+                    }),
+                    "{failure}"
+                );
+            }
             #[cfg(feature = "file-io")]
             "file" => {
                 use grafton_ndi::{
@@ -74,7 +110,7 @@ fn working_directory_libraries_never_run_constructors() {
                 let error = FileApi::new(&ndi, &FileApiOptions::new()).unwrap_err();
                 failed(error, &working);
             }
-            "path" => {
+            "path" | "dyld-absolute" => {
                 let runtime = Runtime::select(&RuntimeOptions::new()).unwrap();
                 assert_eq!(
                     runtime
@@ -104,7 +140,15 @@ fn working_directory_libraries_never_run_constructors() {
 
     let directory = FixtureDir::create("working-directory-loader");
     let root = directory.path();
-    for name in ["bin", "working", "trusted", "loader"] {
+    for name in [
+        "bin",
+        "trusted-bin",
+        "working",
+        "working/relative",
+        "trusted",
+        "trusted-file",
+        "loader",
+    ] {
         fs::create_dir(root.join(name)).unwrap();
     }
     let working = root.join("working");
@@ -115,26 +159,62 @@ fn working_directory_libraries_never_run_constructors() {
     for name in [ADVANCED, FILE] {
         fs::copy(working.join(STANDARD), working.join(name)).unwrap();
     }
+    for name in [STANDARD, ADVANCED, FILE] {
+        fs::copy(working.join(STANDARD), working.join("relative").join(name)).unwrap();
+    }
     FakeRuntime {
         cfgs: vec!["fake_advanced"],
         ..Default::default()
     }
     .build(&root.join("trusted").join(ADVANCED));
+    fs::copy(
+        root.join("trusted").join(ADVANCED),
+        root.join("trusted-bin").join(ADVANCED),
+    )
+    .unwrap();
+    #[cfg(target_os = "macos")]
+    FakeRuntime {
+        cfgs: vec!["fake_advanced"],
+        ..Default::default()
+    }
+    .build(&root.join("trusted-file/core-for-file.dylib"));
+    fs::copy(working.join(STANDARD), root.join("trusted-file").join(FILE)).unwrap();
     FakeRuntime::default().build(&root.join("loader").join(STANDARD));
     let executable = root
         .join("bin")
         .join(if cfg!(windows) { "probe.exe" } else { "probe" });
     fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+    let trusted_executable = root.join("trusted-bin").join("probe");
+    fs::copy(std::env::current_exe().unwrap(), &trusted_executable).unwrap();
 
-    for scenario in ["runtime", "file", "path", "detector"] {
-        if (scenario == "file" && !cfg!(feature = "file-io"))
+    for scenario in [
+        "runtime",
+        "file",
+        "path",
+        "detector",
+        "dyld-relative-runtime",
+        "dyld-empty-runtime",
+        "dyld-mixed-runtime",
+        "dyld-trailing-empty-runtime",
+        "dyld-relative-file",
+        "dyld-empty-file",
+        "dyld-absolute",
+    ] {
+        if (scenario.ends_with("file") && !cfg!(feature = "file-io"))
             || (scenario == "path" && !cfg!(windows))
+            || (scenario.starts_with("dyld-") && !cfg!(target_os = "macos"))
         {
             continue;
         }
         let marker = root.join("marker");
         let _ = fs::remove_file(&marker);
-        let mut command = Command::new(&executable);
+        let mut command = Command::new(
+            if scenario.starts_with("dyld-") && scenario != "dyld-absolute" {
+                &trusted_executable
+            } else {
+                &executable
+            },
+        );
         command
             .args([
                 "--exact",
@@ -156,6 +236,20 @@ fn working_directory_libraries_never_run_constructors() {
                     root.join("empty")
                 },
             );
+        if scenario.starts_with("dyld-") {
+            let value = if scenario == "dyld-absolute" {
+                root.join("loader").into_os_string()
+            } else if scenario.contains("relative") {
+                "relative".into()
+            } else if scenario.contains("mixed") {
+                std::env::join_paths([root.join("loader"), "relative".into()]).unwrap()
+            } else if scenario.contains("trailing-empty") {
+                std::env::join_paths([root.join("loader"), "".into()]).unwrap()
+            } else {
+                "".into()
+            };
+            command.env("DYLD_LIBRARY_PATH", value);
+        }
         let output = command.output().unwrap();
         assert!(
             output.status.success(),

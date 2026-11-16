@@ -660,6 +660,9 @@ mod shared {
     /// loader finds on its own. Each location is tried for every name, in
     /// order, before the next location: where a library is installed matters
     /// more than which of the names it has.
+    /// Apple default searches refuse all locations before opening any when
+    /// `DYLD_LIBRARY_PATH` contains a relative or empty entry: dyld would apply
+    /// that override even to an otherwise exact path.
     pub(super) fn search_plan(
         explicit: Option<&Path>,
         companion_directory: Option<&Path>,
@@ -673,6 +676,24 @@ mod shared {
                 location: path.to_owned(),
                 origin: Origin::Explicit,
             }];
+        }
+        // dyld applies DYLD_LIBRARY_PATH leaf overrides even to absolute
+        // paths and @rpath before resolving the requested location. Recording
+        // a bad entry later in the plan cannot prevent its initializer from
+        // running through an earlier companion/executable/@rpath candidate.
+        // Refuse the whole default search before any native open instead.
+        #[cfg(target_vendor = "apple")]
+        if let Some(directories) = loader_directories {
+            let refused: Vec<_> = std::env::split_paths(directories)
+                .filter(|directory| !directory.is_absolute())
+                .map(|location| Candidate {
+                    location,
+                    origin: Origin::DyldLibraryDirectory,
+                })
+                .collect();
+            if !refused.is_empty() {
+                return refused;
+            }
         }
         let mut plan: Vec<Candidate> = Vec::new();
         let mut add = |location: PathBuf, origin| {
@@ -1066,11 +1087,19 @@ mod shared {
                 .iter()
                 .filter(|candidate| candidate.origin == origin)
                 .collect();
-            assert_eq!(entries.len(), 4);
-            assert_eq!(entries[0].location, absolute.join("first"));
-            assert_eq!(entries[1].location, absolute.join("second"));
-            assert_eq!(entries[2].location, Path::new("relative"));
-            assert!(entries[3].location.as_os_str().is_empty());
+            let refused = if cfg!(windows) {
+                assert_eq!(entries.len(), 4);
+                assert_eq!(entries[0].location, absolute.join("first"));
+                assert_eq!(entries[1].location, absolute.join("second"));
+                &entries[2..]
+            } else {
+                // No absolute or @rpath attempt may precede the refusal:
+                // dyld could apply the relative override to that attempt.
+                assert_eq!(plan.len(), 2);
+                &entries[..]
+            };
+            assert_eq!(refused[0].location, Path::new("relative"));
+            assert!(refused[1].location.as_os_str().is_empty());
             let search = Search {
                 kind: LibraryKind::Runtime,
                 explicit: None,
@@ -1079,7 +1108,7 @@ mod shared {
                 anchor: CORE_ANCHOR,
                 description: "NDI runtime",
             };
-            for candidate in &entries[2..] {
+            for candidate in refused {
                 let refusal = match candidate.open(&search) {
                     Ok(_) => panic!("relative search directory was opened"),
                     Err(refusal) => refusal,
@@ -1089,6 +1118,24 @@ mod shared {
                 let diagnostic = candidate.describe(refusal).to_string();
                 assert!(diagnostic.contains(&origin.to_string()), "{diagnostic}");
                 assert!(diagnostic.contains("absolute and nonempty"), "{diagnostic}");
+            }
+        }
+
+        #[cfg(target_vendor = "apple")]
+        #[test]
+        fn unsafe_dyld_entries_block_every_default_location_before_opening() {
+            for directories in ["relative", "", "/trusted:relative", "/trusted:"] {
+                let plan = search_plan(
+                    None,
+                    Some(Path::new("/core")),
+                    Some(Path::new("/app")),
+                    Some(runtime_directory()),
+                    Some(OsStr::new(directories)),
+                    &["libndi.dylib", "libndi_advanced.dylib"],
+                );
+                assert_eq!(plan.len(), 1, "{directories:?}: {plan:?}");
+                assert_eq!(plan[0].origin, Origin::DyldLibraryDirectory);
+                assert!(!plan[0].location.is_absolute());
             }
         }
 
