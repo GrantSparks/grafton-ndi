@@ -2317,8 +2317,12 @@ impl AsyncFileRecorder {
         let admission = Arc::clone(&self.worker.admission);
         let control = Arc::clone(&self.worker.control);
         FileOperation::deferred(move || {
+            // Start at submission, including contention with another close or
+            // finish. Validate the result inside the gate to preserve the
+            // precedence of an already closed or failed owner.
+            let deadline = Deadline::after(timeout);
             control.submit_finish(|| {
-                let deadline = match Deadline::after(timeout) {
+                let deadline = match deadline {
                     Ok(deadline) => deadline,
                     Err(error) => return Live::failed(error),
                 };
