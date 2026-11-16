@@ -13,10 +13,10 @@
 //!   [`Guard<'owner, S>`](Guard) is written once against it, so every owning
 //!   surface — receiver capture, FrameSync and Advanced AV sync — shares one
 //!   guard rather than hand-rolling its own.
-//! - [`CaptureKind`] exposes only the borrowed and owned frame types.
+//! - [`CaptureKind`] selects the borrowed frame type.
 //! - `CaptureStrategy` privately connects each receiver kind to its slot of
-//!   the SDK capture call and its frame-type discriminant, and copies a
-//!   borrowed frame into an owned one. The capture itself is made only through
+//!   the SDK capture call and its frame-type discriminant, wrapping and
+//!   freeing the matching raw frame family. The capture itself is made only through
 //!   a [`CaptureLock`], which fixes the receiver, runtime and remaining wait
 //!   after the mode's permissions have been checked. [`capture_raw`]
 //!   (one kind) and `capture_any` (a sealed set of all media slots or none)
@@ -112,7 +112,7 @@ type TestFrameFree<S> = unsafe fn(<S as FrameFree>::Instance, &mut <S as FrameFr
 /// A sealed receiver capture kind with its borrowed frame type.
 ///
 /// Implemented for [`VideoKind`], [`AudioKind`], and [`MetadataKind`]. Raw SDK
-/// routing, freeing and copying are private implementation details. The receiver kernels
+/// routing, wrapping and freeing are private implementation details. The receiver kernels
 /// use this trait to select the borrowed result type.
 ///
 /// Receiver frame references implement `Send + Sync` and can move to scoped
@@ -125,7 +125,7 @@ pub(crate) trait CaptureKind: CaptureStrategy + Sized {
 }
 
 /// Private SDK routing paired with the corresponding free strategy.
-/// Implementations must capture, wrap, free and copy the same raw frame family.
+/// Implementations must route, wrap and free the same raw frame family.
 pub(crate) trait CaptureStrategy:
     FrameFree<Instance = NDIlib_recv_instance_t> + Sized
 {
