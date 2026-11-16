@@ -166,9 +166,8 @@ fn run_child(directory: &Path, library: &Path, case: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
     // A build without Advanced declarations still exercises Finder changes.
-    if !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    }
+    // Forward child skips directly: eprint! would let libtest hide them again.
+    let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &output.stderr);
 }
 
 // Exercise the real Rust Finder constructor even without an installed SDK,
