@@ -6,7 +6,7 @@ use std::ptr;
 use super::{
     aliasable::AliasableVec,
     invalid_frame,
-    packets::{frame_extras_accessors, AudioParameters, FrameExtras},
+    packets::{frame_extras_accessors, packet_debug, AudioParameters, FrameExtras},
     AdvancedConfig, AudioCodec, CompressedAttached, CompressedAudioFrame, CompressedAudioSendMode,
     CompressedVideoFrame, VideoPacketFormat, MAX_PACKET_BYTES,
 };
@@ -37,7 +37,6 @@ mod scatter_completion_tests;
 /// The SDK writes to the blocks it sends, as it does to a contiguous frame,
 /// and keeps the addresses of the blocks and of both arrays while an
 /// asynchronous send is pending.
-#[derive(Debug)]
 struct ScatterStorage {
     blocks: Box<[AliasableVec<u8>]>,
     #[cfg(any(test, ndi_has_advanced_scatter_send))]
@@ -49,7 +48,6 @@ struct ScatterStorage {
 
 /// Addresses lent to the SDK, never dereferenced by Rust.
 #[cfg(any(test, ndi_has_advanced_scatter_send))]
-#[derive(Debug)]
 struct BlockPointers {
     array: AliasableBox<[*const u8]>,
     #[cfg(ndi_has_advanced_scatter_send)]
@@ -229,12 +227,15 @@ fn bytes_at<const N: usize>(blocks: &[Vec<u8>], offset: usize) -> Option<[u8; N]
 /// assert_eq!(frame.total_bytes(), packet.len());
 /// # Ok::<(), grafton_ndi::Error>(())
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ScatterVideoFrame {
     format: VideoPacketFormat,
     storage: ScatterStorage,
     extras: FrameExtras,
 }
+
+packet_debug!(ScatterVideoFrame, "ScatterVideoFrame", frame, video, frame.extras.timestamp();
+    "blocks" = frame.blocks().len(), "bytes" = frame.total_bytes());
 
 impl ScatterVideoFrame {
     frame_extras_accessors!();
@@ -317,7 +318,7 @@ impl ScatterVideoFrame {
 ///
 /// For AAC the first block must hold the complete 44-byte packet envelope
 /// header; Opus has no envelope.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ScatterAudioFrame {
     codec: AudioCodec,
     storage: ScatterStorage,
@@ -325,6 +326,9 @@ pub struct ScatterAudioFrame {
     protected: bool,
     extras: FrameExtras,
 }
+
+packet_debug!(ScatterAudioFrame, "ScatterAudioFrame", frame, audio, frame.extras.timestamp();
+    "blocks" = frame.blocks().len(), "bytes" = frame.total_bytes());
 
 impl ScatterAudioFrame {
     frame_extras_accessors!();
