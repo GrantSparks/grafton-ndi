@@ -98,6 +98,28 @@ impl Called<bool> {
     }
 }
 
+impl Called<i32> {
+    pub(crate) fn count(self) -> crate::Result<u32> {
+        u32::try_from(self.value).map_err(|_| {
+            crate::Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
+                operation: self.function,
+                value: self.value.into(),
+            })
+        })
+    }
+}
+
+impl Called<i64> {
+    pub(crate) fn count(self) -> crate::Result<u64> {
+        u64::try_from(self.value).map_err(|_| {
+            crate::Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
+                operation: self.function,
+                value: self.value.into(),
+            })
+        })
+    }
+}
+
 #[allow(dead_code)]
 impl<T> Called<*mut T> {
     pub(crate) fn created(self) -> crate::Result<NonNull<T>> {
@@ -282,6 +304,36 @@ mod tests {
         struct Pair from crate::sys::declarations {
             fn NDIlib_initialize() -> bool;
             fn NDIlib_recv_destroy(p_instance: NDIlib_recv_instance_t);
+        }
+    }
+
+    #[test]
+    fn counts_preserve_signed_evidence_without_allocating() {
+        fn negative(result: crate::Result<impl std::fmt::Debug>, value: i64) {
+            assert!(matches!(result,
+                Err(crate::Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
+                    operation, value: evidence,
+                })) if operation == c"native count" && evidence.get() == value));
+        }
+        for value in [0, i32::MAX, -1, i32::MIN] {
+            let (result, allocations) =
+                crate::test_alloc::allocation_count(|| for_test(value, c"native count").count());
+            assert_eq!(allocations, 0);
+            if value < 0 {
+                negative(result, i64::from(value));
+            } else {
+                assert_eq!(result.unwrap(), u32::try_from(value).unwrap());
+            }
+        }
+        for value in [0, i64::MAX, -1, i64::MIN] {
+            let (result, allocations) =
+                crate::test_alloc::allocation_count(|| for_test(value, c"native count").count());
+            assert_eq!(allocations, 0);
+            if value < 0 {
+                negative(result, value);
+            } else {
+                assert_eq!(result.unwrap(), u64::try_from(value).unwrap());
+            }
         }
     }
 

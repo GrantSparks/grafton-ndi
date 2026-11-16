@@ -137,19 +137,6 @@ fn receiver_delay(millis: i32) -> Result<Duration> {
         })
 }
 
-/// Reject a signed native count while keeping its exact producing entry point.
-/// The returned u64 covers both the SDK's i32 counts and i64 performance totals.
-pub(crate) fn native_count<T: Into<i64>>(count: sys::table::Called<T>) -> Result<u64> {
-    let (value, operation) = count.into_parts();
-    let value = value.into();
-    u64::try_from(value).map_err(|_| {
-        Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
-            operation,
-            value: value.into(),
-        })
-    })
-}
-
 /// A consumable report carries its publication order across an async worker.
 /// The sequence is private: only the state that published it can admit a replay.
 #[derive(Debug)]
@@ -1741,14 +1728,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// [`Self::connection_stats`] to inspect that SDK contract error.
     #[doc(alias = "NDIlib_recv_get_no_connections")]
     pub fn is_connected(&self) -> bool {
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
-        unsafe {
-            self.core
-                .sdk()
-                .NDIlib_recv_get_no_connections(self.core.instance.0)
-                > 0
-        }
+        self.core.connections().is_ok_and(|count| count > 0)
     }
 
     /// Re-establish this receiver's connection to its latest requested target,
@@ -1853,14 +1833,7 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_get_performance")]
     #[doc(alias = "NDIlib_recv_get_queue")]
     pub fn connection_stats(&self) -> Result<ConnectionStats> {
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
-        let connections = unsafe {
-            self.core
-                .sdk()
-                .named()
-                .NDIlib_recv_get_no_connections(self.core.instance.0)
-        };
+        let connections = self.core.connections()?;
 
         let mut total = NDIlib_recv_performance_t::default();
         let mut dropped = NDIlib_recv_performance_t::default();
@@ -1885,16 +1858,16 @@ impl<M: ReceiverMode> Receiver<M> {
         };
 
         Ok(ConnectionStats {
-            connections: native_count(connections)? as u32,
-            video_frames_received: native_count(performance.map(|()| total.video_frames))?,
-            audio_frames_received: native_count(performance.map(|()| total.audio_frames))?,
-            metadata_frames_received: native_count(performance.map(|()| total.metadata_frames))?,
-            video_frames_dropped: native_count(performance.map(|()| dropped.video_frames))?,
-            audio_frames_dropped: native_count(performance.map(|()| dropped.audio_frames))?,
-            metadata_frames_dropped: native_count(performance.map(|()| dropped.metadata_frames))?,
-            video_frames_queued: native_count(queued.map(|()| queue.video_frames))? as u32,
-            audio_frames_queued: native_count(queued.map(|()| queue.audio_frames))? as u32,
-            metadata_frames_queued: native_count(queued.map(|()| queue.metadata_frames))? as u32,
+            connections,
+            video_frames_received: performance.map(|()| total.video_frames).count()?,
+            audio_frames_received: performance.map(|()| total.audio_frames).count()?,
+            metadata_frames_received: performance.map(|()| total.metadata_frames).count()?,
+            video_frames_dropped: performance.map(|()| dropped.video_frames).count()?,
+            audio_frames_dropped: performance.map(|()| dropped.audio_frames).count()?,
+            metadata_frames_dropped: performance.map(|()| dropped.metadata_frames).count()?,
+            video_frames_queued: queued.map(|()| queue.video_frames).count()?,
+            audio_frames_queued: queued.map(|()| queue.audio_frames).count()?,
+            metadata_frames_queued: queued.map(|()| queue.metadata_frames).count()?,
         })
     }
 }
@@ -2083,15 +2056,19 @@ impl ReceiverCore {
         self.pending_status.take_with(|| self.current_status())
     }
 
-    fn current_status(&self) -> Result<ReceiverStatus> {
+    fn connections(&self) -> Result<u32> {
         // SAFETY: the receiver is live for this nonblocking native query.
-        let count = unsafe {
+        unsafe {
             self.sdk()
                 .named()
                 .NDIlib_recv_get_no_connections(self.instance.0)
-        };
+        }
+        .count()
+    }
+
+    fn current_status(&self) -> Result<ReceiverStatus> {
         Ok(ReceiverStatus {
-            connections: native_count(count)? as u32,
+            connections: self.connections()?,
         })
     }
 
@@ -3623,24 +3600,6 @@ mod tests {
         check::<VideoKind>(&receiver);
         check::<AudioKind>(&receiver);
         check::<MetadataKind>(&receiver);
-    }
-
-    #[test]
-    fn native_counts_preserve_signed_evidence_without_allocating() {
-        for value in [0, 7, -1, i64::MIN] {
-            let (result, allocations) = crate::test_alloc::allocation_count(|| {
-                native_count(sys::table::for_test(value, c"native count"))
-            });
-            assert_eq!(allocations, 0);
-            if value < 0 {
-                assert!(
-                    matches!(result, Err(Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount { operation, value: evidence }))
-                    if operation == c"native count" && evidence.get() == value)
-                );
-            } else {
-                assert_eq!(result.unwrap(), value as u64);
-            }
-        }
     }
 
     #[test]

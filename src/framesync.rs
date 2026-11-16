@@ -536,7 +536,7 @@ impl<'a> FrameSyncCapture<'a> {
                 .named()
                 .NDIlib_framesync_audio_queue_depth(self.resource.instance.0)
         };
-        crate::receiver::native_count(depth).map(|depth| depth as u32)
+        depth.count()
     }
 }
 
