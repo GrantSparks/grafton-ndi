@@ -356,7 +356,11 @@ impl SourceCursor {
         snapshot: impl FnOnce(&Finder) -> Result<T>,
         completed: impl FnOnce(&T) -> bool,
     ) -> Result<(T, Option<SourceObservation>)> {
-        Self::observe_snapshot(|| finder.generation(), || snapshot(finder), completed)
+        Self::observe_snapshot(
+            || finder.changes.generation(),
+            || snapshot(finder),
+            completed,
+        )
     }
 
     // Read before copying, but acknowledge only after the owner receives the
@@ -380,7 +384,7 @@ impl SourceCursor {
         stop: impl Stop,
     ) -> (bool, Option<SourceObservation>) {
         Self::observe_wait(
-            || finder.generation(),
+            || finder.changes.generation(),
             || finder.wait_for_sources_since(observed, deadline, stop),
         )
     }
