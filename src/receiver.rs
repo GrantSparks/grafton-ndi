@@ -1348,7 +1348,8 @@ macro_rules! receiver_capture_methods {
                 #[doc = concat!("Wait up to `timeout` for ", $label, " and copy it into an owned frame.")]
                 ///
                 /// A zero timeout makes one nonblocking SDK attempt. Early SDK
-                /// status and source reports are retained for `next_event`, and
+                /// status and source reports are retained for `next_event`, or, on an
+                /// attached receiver, for the raw receiver that detaching returns;
                 /// capture continues until a frame arrives or the budget expires.
                 /// Each native attempt waits at most 100 ms; validation and copying
                 /// can finish after the budget. `None` alone does not establish
@@ -1366,7 +1367,8 @@ macro_rules! receiver_capture_methods {
                 ///
                 /// The returned frame borrows the receiver and releases its SDK
                 /// buffer when dropped. Capture retains status and source reports
-                /// for `next_event`. A zero timeout makes one nonblocking attempt;
+                /// for `next_event`, or, on an attached receiver, for the raw
+                /// receiver that detaching returns. A zero timeout makes one nonblocking attempt;
                 /// each other attempt waits at most 100 ms within the shared budget.
                 ///
                 /// # Errors
@@ -1521,6 +1523,11 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Accepts owned or captured metadata. The receiver keeps its own copy,
     /// so the input need not outlive the registration.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedCapability`] without
+    /// [`RuntimeFeature::ReceiverConnectionMetadata`](crate::RuntimeFeature::ReceiverConnectionMetadata).
     #[doc(alias = "NDIlib_recv_add_connection_metadata")]
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let table = self.core.connection_metadata()?;
@@ -1533,6 +1540,11 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 
     /// Clear metadata registered for subsequent receiver connections.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedCapability`] without
+    /// [`RuntimeFeature::ReceiverConnectionMetadata`](crate::RuntimeFeature::ReceiverConnectionMetadata).
     #[doc(alias = "NDIlib_recv_clear_connection_metadata")]
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.core.connection_metadata()?;
@@ -1545,6 +1557,14 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 
     /// Copy the optional device web-control URL. This does not open the URL.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedCapability`] without
+    /// [`RuntimeFeature::ReceiverWebControl`](crate::RuntimeFeature::ReceiverWebControl),
+    /// [`Error::InvalidUtf8`] for an invalid URL encoding, and
+    /// [`Error::UnexpectedSdkResult`] when the SDK does not terminate the URL
+    /// within the bounded string scan.
     #[doc(alias = "NDIlib_recv_get_web_control")]
     pub fn web_control_url(&self) -> Result<Option<String>> {
         // The query comes with the function that releases what it returns.
@@ -1574,6 +1594,14 @@ impl<M: ReceiverMode> Receiver<M> {
     /// The SDK reports each change once, so a name that is not valid UTF-8 is
     /// not an error: invalid sequences are replaced with U+FFFD, as
     /// [`Finder`](crate::Finder) does for discovered source names.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
+    /// [`Error::UnsupportedCapability`] without
+    /// [`RuntimeFeature::ConnectedSourceName`](crate::RuntimeFeature::ConnectedSourceName),
+    /// and [`Error::UnexpectedSdkResult`] when the SDK does not terminate the
+    /// name within the bounded string scan.
     #[doc(alias = "NDIlib_recv_get_source_name")]
     pub fn wait_for_source_name_change(
         &self,

@@ -652,13 +652,9 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// # Errors
     ///
-    /// The errors of [`Receiver::wait_for_source_name_change`]:
-    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
-    /// [`Error::UnsupportedCapability`] without
-    /// [`RuntimeFeature::ConnectedSourceName`](crate::RuntimeFeature::ConnectedSourceName),
-    /// and [`Error::UnexpectedSdkResult`] for a name the SDK did not
-    /// terminate; and [`Error::SpawnFailed`] for a missing runtime context or
-    /// cancelled blocking task.
+    /// The errors of [`Receiver::wait_for_source_name_change`], and
+    /// [`Error::SpawnFailed`] for a missing runtime context or cancelled
+    /// blocking task.
     ///
     /// Input and capability errors are reported before work is submitted.
     ///
