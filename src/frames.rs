@@ -388,8 +388,10 @@ impl PixelFormat {
     /// a multiple of 16. The SDK documents no such requirement, and it
     /// compresses what it reads there into the picture's last blocks. The
     /// 64-bit ARM Linux build reads every frame exactly. The figures are
-    /// measured with the Linux runtimes 6.1.1, 6.3.2 and 6.4.0.2, and checked
-    /// against the native SDK by `tests/send_tail_room_sdk.rs`. Every build
+    /// measured with the Linux runtimes 6.1.1, 6.3.2 and 6.4.0.2.
+    /// `tests/send_tail_room_sdk.rs` checks these room figures against the
+    /// native SDK for its listed packed, padded and planar video layouts,
+    /// and the exact extents of its strided audio layouts. Every build
     /// but the 64-bit ARM Linux one takes the
     /// x86 figure, the 32-bit x86 Linux build included.
     ///
