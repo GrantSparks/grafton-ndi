@@ -520,6 +520,11 @@ mod tests {
         error::<LoadFailure>();
         error::<LoadRefusal>();
         error::<DiscoveryAddressFailure>();
+        error::<NativeFunction>();
+        error::<DiscoveryDefect>();
+        error::<ImageCodecKind>();
+        error::<ImageAxisKind>();
+        error::<AudioCountKind>();
         error::<InputDefect>();
         error::<FrameDefect>();
         error::<LayoutDefect>();
@@ -532,7 +537,7 @@ mod tests {
         error::<ResourceKind>();
         error::<SelectionConflict>();
         error::<LibraryKind>();
-        error::<ColorMetadataIssue>();
+        error::<ColorMetadataDefect>();
         error::<FrameRateDefect>();
         error::<VideoDimensionsDefect>();
         error::<AudioLengthDefect>();
@@ -545,6 +550,11 @@ mod tests {
         error::<AllocationKind>();
 
         value::<SdkResultDefect>();
+        value::<NativeFunction>();
+        value::<DiscoveryDefect>();
+        value::<ImageCodecKind>();
+        value::<ImageAxisKind>();
+        value::<AudioCountKind>();
         value::<Capability>();
         value::<CapabilityRefusal>();
         value::<crate::CapabilityUnavailable>();
@@ -553,7 +563,7 @@ mod tests {
         value::<ResourceKind>();
         value::<SelectionConflict>();
         value::<LibraryKind>();
-        value::<ColorMetadataIssue>();
+        value::<ColorMetadataDefect>();
         value::<FrameRateDefect>();
         value::<VideoDimensionsDefect>();
         value::<AudioLengthDefect>();

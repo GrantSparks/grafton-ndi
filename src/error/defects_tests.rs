@@ -102,7 +102,7 @@ fn frame_defect_diagnostics_preserve_their_text() {
         ("Layout", FrameDefect::Layout(LayoutDefect::VideoZeroStride), "Video line stride must be positive, got 0"),
         ("ImageScratchOverflow", FrameDefect::ImageScratchOverflow, "image scratch size overflow"),
         ("ImageDimensionOverflow", FrameDefect::ImageDimensionOverflow, "image dimension overflow"),
-        ("ImageDimension", FrameDefect::ImageDimension { codec: ImageCodec::Jpeg, dimension: ImageDimension::Width, length: 6, maximum: 16 }, "JPEG width 6 exceeds maximum supported value 16"),
+        ("ImageDimension", FrameDefect::ImageDimension { codec: ImageCodecKind::Jpeg, dimension: ImageAxisKind::Width, length: 6, maximum: 16 }, "JPEG width 6 exceeds maximum supported value 16"),
         ("MetadataMissingTerminator", FrameDefect::MetadataMissingTerminator, "Metadata frame length does not include a trailing NUL terminator"),
         ("MetadataInteriorNul", FrameDefect::MetadataInteriorNul, "Metadata frame contains an interior NUL byte"),
         ("MetadataNullData", FrameDefect::MetadataNullData, "Metadata frame has non-zero length with null data pointer"),
@@ -169,8 +169,8 @@ fn frame_defect_diagnostics_preserve_their_text() {
         ("ColorMetadataWithheld", FrameDefect::ColorMetadataWithheld { status: FrameMetadataStatus::NotUtf8 }, "The frame's color description cannot be read because its metadata was withheld (NotUtf8); ColorPolicy::Override explicitly supplies its color conversion"),
         ("ConflictingColorMetadata", FrameDefect::ConflictingColorMetadata { first: color("<ndi_color_info transfer='bt_709'/>"), second: color("<ndi_color_info transfer='bt_2100_hlg'/>") }, "The frame's metadata holds ndi_color_info elements that differ: ColorInfo { primaries: None, transfer: Some(Bt709), matrix: None } and ColorInfo { primaries: None, transfer: Some(Hlg), matrix: None }"),
         ("HdrRefused", FrameDefect::HdrRefused { transfer: TransferFunction::Pq }, "The frame's ndi_color_info gives the PQ transfer function; HdrPolicy::CodeValues encodes its code values to a tagged PNG"),
-        ("ColorMetadata", FrameDefect::ColorMetadata { issue: ColorMetadataIssue::UndefinedValue, diagnostic: "peer diagnostic".into() }, "peer diagnostic"),
-        ("EncodingFailed", FrameDefect::EncodingFailed { codec: ImageCodec::Jpeg, diagnostic: "peer diagnostic".into() }, "JPEG encoding failed: peer diagnostic"),
+        ("ColorMetadata", FrameDefect::ColorMetadata { issue: ColorMetadataDefect::UndefinedValue, diagnostic: "peer diagnostic".into() }, "peer diagnostic"),
+        ("EncodingFailed", FrameDefect::EncodingFailed { codec: ImageCodecKind::Jpeg, diagnostic: "peer diagnostic".into() }, "JPEG encoding failed: peer diagnostic"),
     ];
     check_cases("FrameDefect", &cases);
 }
@@ -286,20 +286,20 @@ fn discovery_defect_diagnostics_preserve_their_text() {
 #[test]
 fn image_codec_diagnostics_preserve_their_text() {
     let cases = [
-        ("Png", ImageCodec::Png, "PNG"),
-        ("Jpeg", ImageCodec::Jpeg, "JPEG"),
-        ("Webp", ImageCodec::Webp, "WebP"),
+        ("Png", ImageCodecKind::Png, "PNG"),
+        ("Jpeg", ImageCodecKind::Jpeg, "JPEG"),
+        ("Webp", ImageCodecKind::Webp, "WebP"),
     ];
-    check_cases("ImageCodec", &cases);
+    check_cases("ImageCodecKind", &cases);
 }
 
 #[test]
 fn image_dimension_diagnostics_preserve_their_text() {
     let cases = [
-        ("Width", ImageDimension::Width, "width"),
-        ("Height", ImageDimension::Height, "height"),
+        ("Width", ImageAxisKind::Width, "width"),
+        ("Height", ImageAxisKind::Height, "height"),
     ];
-    check_cases("ImageDimension", &cases);
+    check_cases("ImageAxisKind", &cases);
 }
 
 #[test]
@@ -322,13 +322,13 @@ fn initialization_diagnostics_preserve_their_text() {
 #[test]
 fn color_metadata_issue_diagnostics_preserve_supplied_peer_text() {
     for issue in [
-        ColorMetadataIssue::UnclosedElement,
-        ColorMetadataIssue::AttributeStart,
-        ColorMetadataIssue::MissingValue,
-        ColorMetadataIssue::UnquotedValue,
-        ColorMetadataIssue::UnclosedValue,
-        ColorMetadataIssue::DuplicateAttribute,
-        ColorMetadataIssue::UndefinedValue,
+        ColorMetadataDefect::UnclosedElement,
+        ColorMetadataDefect::AttributeStart,
+        ColorMetadataDefect::MissingValue,
+        ColorMetadataDefect::UnquotedValue,
+        ColorMetadataDefect::UnclosedValue,
+        ColorMetadataDefect::DuplicateAttribute,
+        ColorMetadataDefect::UndefinedValue,
     ] {
         let cause = FrameDefect::ColorMetadata {
             issue,

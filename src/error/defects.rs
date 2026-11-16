@@ -7,7 +7,7 @@ use thiserror::Error;
 /// The syntactic defect in an `ndi_color_info` element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
-pub enum ColorMetadataIssue {
+pub enum ColorMetadataDefect {
     /// The element is not closed.
     #[error("the element is not closed")]
     UnclosedElement,
@@ -34,7 +34,7 @@ pub enum ColorMetadataIssue {
 /// The image encoder that refused output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
-pub enum ImageCodec {
+pub enum ImageCodecKind {
     /// PNG.
     #[error("PNG")]
     Png,
@@ -240,9 +240,9 @@ pub enum FrameDefect {
     #[error("{codec} {dimension} {length} exceeds maximum supported value {maximum}")]
     ImageDimension {
         /// The codec.
-        codec: ImageCodec,
+        codec: ImageCodecKind,
         /// The dimension.
-        dimension: ImageDimension,
+        dimension: ImageAxisKind,
         /// The actual length.
         length: usize,
         /// The codec's maximum.
@@ -536,7 +536,7 @@ pub enum FrameDefect {
     #[error("{diagnostic}")]
     ColorMetadata {
         /// The syntax or value refusal.
-        issue: ColorMetadataIssue,
+        issue: ColorMetadataDefect,
         /// Original text, including the bounded peer-text excerpt.
         diagnostic: Box<str>,
     },
@@ -544,7 +544,7 @@ pub enum FrameDefect {
     #[error("{codec} encoding failed: {diagnostic}")]
     EncodingFailed {
         /// The encoder.
-        codec: ImageCodec,
+        codec: ImageCodecKind,
         /// The library diagnostic.
         diagnostic: Box<str>,
     },
@@ -966,7 +966,7 @@ pub enum SdkResultDefect {
 /// The image axis that exceeded an encoder limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
-pub enum ImageDimension {
+pub enum ImageAxisKind {
     /// Width.
     #[error("width")]
     Width,

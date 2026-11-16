@@ -614,17 +614,20 @@ impl<'a> Plan<'a> {
         // Preserve codec dimension diagnostics before checking conversion storage.
         match format {
             ImageFormat::Png => {}
-            ImageFormat::Jpeg(_) => {
-                check_size(crate::ImageCodec::Jpeg, width, height, jpeg::MAX_DIMENSION)?
-            }
+            ImageFormat::Jpeg(_) => check_size(
+                crate::ImageCodecKind::Jpeg,
+                width,
+                height,
+                jpeg::MAX_DIMENSION,
+            )?,
             ImageFormat::WebpLossless => check_size(
-                crate::ImageCodec::Webp,
+                crate::ImageCodecKind::Webp,
                 width,
                 height,
                 webp::MAX_LOSSLESS_DIMENSION,
             )?,
             ImageFormat::WebpLossy(_) => check_size(
-                crate::ImageCodec::Webp,
+                crate::ImageCodecKind::Webp,
                 width,
                 height,
                 webp::MAX_LOSSY_DIMENSION,
@@ -745,10 +748,10 @@ fn cicp(color: &ColorInfo) -> Option<[u8; 4]> {
 }
 
 /// Refuse an image larger than its codec can write.
-fn check_size(codec: crate::ImageCodec, width: usize, height: usize, max: usize) -> Result<()> {
+fn check_size(codec: crate::ImageCodecKind, width: usize, height: usize, max: usize) -> Result<()> {
     for (dimension, length) in [
-        (crate::ImageDimension::Width, width),
-        (crate::ImageDimension::Height, height),
+        (crate::ImageAxisKind::Width, width),
+        (crate::ImageAxisKind::Height, height),
     ] {
         if length > max {
             return Err(Error::InvalidFrame(crate::FrameDefect::ImageDimension {
