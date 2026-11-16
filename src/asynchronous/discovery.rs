@@ -1,11 +1,11 @@
 //! Owned discovery adapters sharing the receivers' blocking-pool stop rule.
 use super::{private, with_deadline_budget, with_timeout_budget, AsyncRuntime};
 use crate::{
-    finder::{validate_source_name, HostQuery},
+    finder::{validate_source_name, HostQuery, SourceCursor},
     timeout::Deadline,
     Finder, Result, Source, SourceCache,
 };
-use std::{cell::Cell, marker::PhantomData, sync::Arc, time::Duration};
+use std::{marker::PhantomData, sync::Arc, time::Duration};
 
 mod sealed {
     pub trait SourceDiscovery {
@@ -108,7 +108,7 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncFinder<R, D> {
     pub fn watch(&self) -> AsyncSourceWatch<R, D> {
         AsyncSourceWatch {
             inner: Arc::clone(&self.inner),
-            observed: Cell::new(self.finder().generation()),
+            cursor: SourceCursor::new(self.finder().generation()),
             _runtime: PhantomData,
         }
     }
@@ -223,7 +223,7 @@ impl<R: AsyncRuntime> AsyncFinder<R, SourceCache> {
 /// This also keeps the finder and its runtime alive until the cursor is dropped.
 pub struct AsyncSourceWatch<R: AsyncRuntime, D: SourceDiscovery = Finder> {
     inner: Arc<D>,
-    observed: Cell<u64>,
+    cursor: SourceCursor,
     _runtime: PhantomData<R>,
 }
 
@@ -250,15 +250,15 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncSourceWatch<R, D> {
     #[doc(alias = "NDIlib_find_get_current_sources")]
     pub async fn current_sources(&mut self) -> Result<Vec<Source>> {
         let inner = Arc::clone(&self.inner);
-        let (generation, sources) = R::spawn_stoppable(private::Token, move |stop| {
-            let finder = sealed::SourceDiscovery::finder(&*inner);
-            let generation = finder.generation();
-            finder
-                .current_sources_stoppable(stop)
-                .map(|sources| (generation, sources))
+        let (sources, observation) = R::spawn_stoppable(private::Token, move |stop| {
+            SourceCursor::snapshot(
+                sealed::SourceDiscovery::finder(&*inner),
+                |finder| finder.current_sources_stoppable(stop),
+                |_| true,
+            )
         })
         .await??;
-        self.observed.set(generation);
+        self.cursor.commit(observation);
         Ok(sources)
     }
 
@@ -275,18 +275,19 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncSourceWatch<R, D> {
     /// [`crate::Error::SpawnFailed`]. Failure leaves this cursor unchanged.
     #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub async fn wait_for_change(&mut self, timeout: Duration) -> Result<bool> {
-        let observed = self.observed.get();
+        let observed = self.cursor.observed();
         let inner = Arc::clone(&self.inner);
-        let (changed, generation) =
+        let (changed, observation) =
             with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-                let finder = sealed::SourceDiscovery::finder(&*inner);
-                let changed = finder.wait_for_sources_since(observed, deadline, stop);
-                Ok((changed, finder.generation()))
+                Ok(SourceCursor::wait(
+                    sealed::SourceDiscovery::finder(&*inner),
+                    observed,
+                    deadline,
+                    stop,
+                ))
             })
             .await?;
-        if changed {
-            self.observed.set(generation);
-        }
+        self.cursor.commit(observation);
         Ok(changed)
     }
 }

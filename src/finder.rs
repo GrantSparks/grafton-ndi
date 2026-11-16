@@ -324,6 +324,78 @@ impl SnapshotGuard<'_> {
     }
 }
 
+/// The shared two-step cursor protocol. Workers observe; only the owner commits.
+/// A Cell keeps each cursor Send but not Sync, matching its single consumer.
+pub(crate) struct SourceCursor {
+    observed: Cell<u64>,
+}
+
+/// Evidence that one worker completed an observation. Only the protocol below
+/// can construct it; dropping it leaves the owner's cursor unchanged.
+pub(crate) struct SourceObservation(u64);
+
+impl SourceCursor {
+    pub(crate) fn new(generation: u64) -> Self {
+        Self {
+            observed: Cell::new(generation),
+        }
+    }
+
+    pub(crate) fn observed(&self) -> u64 {
+        self.observed.get()
+    }
+
+    pub(crate) fn commit(&self, observation: Option<SourceObservation>) {
+        if let Some(SourceObservation(generation)) = observation {
+            self.observed.set(generation);
+        }
+    }
+
+    pub(crate) fn snapshot<T>(
+        finder: &Finder,
+        snapshot: impl FnOnce(&Finder) -> Result<T>,
+        completed: impl FnOnce(&T) -> bool,
+    ) -> Result<(T, Option<SourceObservation>)> {
+        Self::observe_snapshot(|| finder.generation(), || snapshot(finder), completed)
+    }
+
+    // Read before copying, but acknowledge only after the owner receives the
+    // result. Reports during copying remain outstanding; failure or an
+    // incomplete internal snapshot creates no observation to commit.
+    fn observe_snapshot<T>(
+        generation: impl FnOnce() -> u64,
+        snapshot: impl FnOnce() -> Result<T>,
+        completed: impl FnOnce(&T) -> bool,
+    ) -> Result<(T, Option<SourceObservation>)> {
+        let observed = generation();
+        let value = snapshot()?;
+        let observation = completed(&value).then_some(SourceObservation(observed));
+        Ok((value, observation))
+    }
+
+    pub(crate) fn wait(
+        finder: &Finder,
+        observed: u64,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> (bool, Option<SourceObservation>) {
+        Self::observe_wait(
+            || finder.generation(),
+            || finder.wait_for_sources_since(observed, deadline, stop),
+        )
+    }
+
+    // A successful wait acknowledges the generation read after its report.
+    fn observe_wait(
+        generation: impl FnOnce() -> u64,
+        wait: impl FnOnce() -> bool,
+    ) -> (bool, Option<SourceObservation>) {
+        let changed = wait();
+        let observation = changed.then(|| SourceObservation(generation()));
+        (changed, observation)
+    }
+}
+
 /// One consumer's cursor over a finder's source-list changes.
 ///
 /// Take snapshots and wait through the same watch, so reports published by
@@ -347,8 +419,7 @@ impl SnapshotGuard<'_> {
 /// ```
 pub struct SourceWatch<'finder> {
     finder: &'finder Finder,
-    // Cell makes a cursor Send but not Sync: one consumer advances it.
-    observed: Cell<u64>,
+    cursor: SourceCursor,
 }
 
 impl fmt::Debug for SourceWatch<'_> {
@@ -393,31 +464,21 @@ impl SourceWatch<'_> {
         )
     }
 
-    // Capture the generation before copying, but acknowledge it only when the
-    // caller receives a snapshot. Reports during copying remain outstanding.
     fn snapshot<T>(
         &mut self,
         snapshot: impl FnOnce(&Finder) -> Result<T>,
         completed: impl FnOnce(&T) -> bool,
     ) -> Result<T> {
-        let observed = self.finder.changes.generation();
-        let value = snapshot(self.finder)?;
-        if completed(&value) {
-            self.observed.set(observed);
-        }
+        let (value, observation) = SourceCursor::snapshot(self.finder, snapshot, completed)?;
+        self.cursor.commit(observation);
         Ok(value)
     }
 
     fn wait_until(&mut self, deadline: Deadline, stop: impl Stop) -> bool {
-        if self
-            .finder
-            .wait_for_sources_since(self.observed.get(), deadline, stop)
-        {
-            self.observed.set(self.finder.changes.generation());
-            true
-        } else {
-            false
-        }
+        let (changed, observation) =
+            SourceCursor::wait(self.finder, self.cursor.observed(), deadline, stop);
+        self.cursor.commit(observation);
+        changed
     }
 }
 
@@ -664,7 +725,7 @@ impl Finder {
     pub fn watch(&self) -> SourceWatch<'_> {
         SourceWatch {
             finder: self,
-            observed: Cell::new(self.changes.generation()),
+            cursor: SourceCursor::new(self.changes.generation()),
         }
     }
 
@@ -1993,6 +2054,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_cursor_commits_only_completed_observations_in_protocol_order() {
+        let cursor = SourceCursor::new(1);
+        let generation = Cell::new(10);
+        let (_, observation) = SourceCursor::observe_snapshot(
+            || generation.get(),
+            || {
+                generation.set(11);
+                Ok(())
+            },
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(cursor.observed(), 1, "a worker cannot commit its result");
+        cursor.commit(observation);
+        assert_eq!(cursor.observed(), 10, "snapshot observes before copying");
+
+        let failed = SourceCursor::observe_snapshot(
+            || generation.get(),
+            || Err::<(), _>(Error::InvalidInput(crate::InputDefect::InvalidHostQuery)),
+            |_| true,
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            cursor.observed(),
+            10,
+            "failure does not acknowledge a report"
+        );
+        let (_, incomplete) =
+            SourceCursor::observe_snapshot(|| generation.get(), || Ok(None::<()>), Option::is_some)
+                .unwrap();
+        cursor.commit(incomplete);
+        assert_eq!(
+            cursor.observed(),
+            10,
+            "an incomplete internal copy is not success"
+        );
+
+        let (changed, observation) = SourceCursor::observe_wait(
+            || generation.get(),
+            || {
+                generation.set(12);
+                true
+            },
+        );
+        assert!(changed);
+        assert_eq!(cursor.observed(), 10);
+        cursor.commit(observation);
+        assert_eq!(cursor.observed(), 12, "wait observes after its report");
+        let (changed, observation) = SourceCursor::observe_wait(
+            || panic!("an unchanged wait has no generation to acknowledge"),
+            || false,
+        );
+        assert!(!changed);
+        cursor.commit(observation);
+        assert_eq!(cursor.observed(), 12);
+        let (_, abandoned) = SourceCursor::observe_snapshot(|| 13, || Ok(()), |_| true).unwrap();
+        let _ = abandoned; // A dropped async future never calls commit.
+        assert_eq!(cursor.observed(), 12);
+    }
+
+    #[test]
     fn discovery_window_charges_shared_source_strings_once() {
         let source = Source::new("HOST (Camera)")
             .unwrap()
@@ -2350,7 +2472,7 @@ mod tests {
         let (watch, allocations) = crate::test_alloc::allocation_count(|| finder.watch());
         assert_eq!(allocations, 0);
         assert!(std::ptr::eq(watch.finder, &finder));
-        assert_eq!(watch.observed.get(), 0);
+        assert_eq!(watch.cursor.observed(), 0);
     }
 
     #[test]
