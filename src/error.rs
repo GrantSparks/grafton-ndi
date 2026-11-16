@@ -165,6 +165,9 @@ pub enum Error {
     /// * The runtime options name a library file other than the selected one,
     ///   ask for the Advanced SDK when the selected runtime is not one, or
     ///   name any file when the SDK is linked into the program.
+    /// * On dynamically loaded, non-Apple ELF targets, an explicit runtime
+    ///   path is refused while another NDI runtime occupies the process's
+    ///   global symbol scope, with [`SelectionConflict::ForeignRuntimeInScope`].
     /// * Loading a native library re-entered runtime selection on the same
     ///   thread.
     /// * The File API options name a File library other than the selected one,
