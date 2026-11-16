@@ -34,12 +34,14 @@ pub(crate) unsafe fn bounded_sdk_text<'a>(text: *const c_char, limit: usize) -> 
 /// advertised metadata.
 pub(crate) const MAX_SDK_STRING_BYTES: usize = 4 * 1024 * 1024;
 
-/// Copy an SDK string of at most [`MAX_SDK_STRING_BYTES`], terminator
-/// included, replacing bytes that are not UTF-8.
+/// Copy SDK source text of at most [`MAX_SDK_STRING_BYTES`], terminator
+/// included, into shared native storage, replacing bytes that are not UTF-8.
 ///
 /// # Errors
 ///
-/// [`Error::UnexpectedSdkResult`] naming the SDK function retained by `text`, when there is no terminator within the limit.
+/// [`Error::UnexpectedSdkResult`] naming the SDK function retained by `text`,
+/// when there is no terminator within the limit, and [`Error::AllocationFailed`]
+/// when the final source string storage cannot be reserved.
 ///
 /// # Safety
 ///

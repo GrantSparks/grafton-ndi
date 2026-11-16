@@ -1590,7 +1590,8 @@ impl Source {
     /// Returns [`Error::NativeOperationFailed`] naming the call's function when the
     /// descriptor is null, or names neither a source nor an address, and
     /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
-    /// the 4 MiB one SDK string may be.
+    /// the 4 MiB one SDK string may be. [`Error::AllocationFailed`] when the
+    /// source text storage cannot be reserved.
     ///
     /// # Safety
     ///
