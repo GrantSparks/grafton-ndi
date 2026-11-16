@@ -3798,19 +3798,22 @@ mod tests {
             PixelFormat::Nv12,
         ] {
             for stride in [
-                0,
-                format.line_stride_bytes(4).unwrap(),
-                format.line_stride_bytes(4).unwrap() + 8,
+                None,
+                Some(format.line_stride_bytes(4).unwrap()),
+                Some(format.line_stride_bytes(4).unwrap() + 8),
             ] {
-                let layout =
-                    ValidatedVideoLayout::new_uncompressed(format, 4, 4, Some(stride)).unwrap();
+                let layout = ValidatedVideoLayout::new_uncompressed(format, 4, 4, stride).unwrap();
                 // A longer buffer is accepted; the frame is its layout's extent.
                 let data = vec![19; layout.data_len_bytes() + 3];
                 let metadata = c"<pixels>é</pixels>";
                 let rate = FrameRate::new(30000, 1001).unwrap();
                 let (borrowed, allocations) = crate::test_alloc::allocation_count(|| {
-                    let frame = BorrowedVideoFrame::builder(&data, 4, 4, format)
-                        .line_stride_bytes(stride)
+                    let builder = BorrowedVideoFrame::builder(&data, 4, 4, format);
+                    let builder = match stride {
+                        Some(stride) => builder.line_stride_bytes(stride),
+                        None => builder,
+                    };
+                    let frame = builder
                         .frame_rate(rate)
                         .picture_aspect_ratio(PictureAspectRatio::new(1.25).unwrap())
                         .scan_type(ScanType::Interlaced)
@@ -3844,17 +3847,15 @@ mod tests {
                 assert_eq!(allocations, 0);
                 assert_eq!(raw.p_metadata, owned.as_test_raw().p_metadata);
                 assert_eq!(raw.p_data, owned.as_test_raw().p_data);
-                assert!(BorrowedVideoFrame::builder(
-                    &data[..layout.data_len_bytes() - 1],
-                    4,
-                    4,
-                    format
-                )
-                .line_stride_bytes(stride)
-                .build()
-                .is_err());
+                let short =
+                    BorrowedVideoFrame::builder(&data[..layout.data_len_bytes() - 1], 4, 4, format);
+                let short = match stride {
+                    Some(stride) => short.line_stride_bytes(stride),
+                    None => short,
+                };
+                assert!(short.build().is_err());
             }
-            for stride in [1, i32::MAX.unsigned_abs() as usize, usize::MAX] {
+            for stride in [0, 1, i32::MAX.unsigned_abs() as usize, usize::MAX] {
                 let expected = ValidatedVideoLayout::new_uncompressed(format, 4, 4, Some(stride));
                 let result = BorrowedVideoFrame::builder(&[], 4, 4, format)
                     .line_stride_bytes(stride)
