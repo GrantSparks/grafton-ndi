@@ -346,16 +346,19 @@ std::thread_local! {
 
 /// Resize only after checked geometry; retain capacity between encodes.
 fn resize_scratch<T: Default + Clone>(scratch: &mut Vec<T>, len: usize) -> Result<()> {
+    let unavailable = || {
+        crate::error::allocation_failed(
+            crate::AllocationKind::ImageScratch,
+            len.checked_mul(size_of::<T>()),
+        )
+    };
     #[cfg(test)]
     if len > scratch.capacity() && FAIL_SCRATCH_RESERVATION.with(|fail| fail.replace(false)) {
-        let error = Vec::<u8>::new().try_reserve_exact(usize::MAX).unwrap_err();
-        return Err(Error::InvalidFrame(
-            crate::FrameDefect::ImageScratchAllocation(error),
-        ));
+        return Err(unavailable());
     }
     scratch
         .try_reserve_exact(len.saturating_sub(scratch.len()))
-        .map_err(|error| Error::InvalidFrame(crate::FrameDefect::ImageScratchAllocation(error)))?;
+        .map_err(|_| unavailable())?;
     scratch.resize(len, T::default());
     Ok(())
 }

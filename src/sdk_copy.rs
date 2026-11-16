@@ -41,7 +41,7 @@ impl From<Error> for CopyError {
 }
 
 pub(crate) fn allocation_failed() -> Error {
-    Error::UnexpectedSdkResult(crate::SdkResultDefect::DiscoveryAllocation)
+    crate::error::allocation_failed(crate::AllocationKind::DiscoveryResults, None)
 }
 
 /// One budget for native bytes scanned and owned storage reserved. Individual

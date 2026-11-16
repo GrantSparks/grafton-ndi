@@ -245,9 +245,6 @@ pub enum FrameDefect {
     /// A refusal of the shared media layout or value checks.
     #[error(transparent)]
     Layout(LayoutDefect),
-    /// A scratch buffer could not be reserved.
-    #[error("image scratch allocation failed: {0}")]
-    ImageScratchAllocation(std::collections::TryReserveError),
     /// Scratch dimensions overflow the address space.
     #[error("image scratch size overflow")]
     ImageScratchOverflow,
@@ -689,9 +686,6 @@ pub enum InputDefect {
     /// External allocation is not aligned to 64 bytes.
     #[error("External allocation is not aligned to 64 bytes")]
     ExternalAllocationAlignment,
-    /// Unable to reserve bounded allocator lease storage.
-    #[error("Unable to reserve bounded allocator lease storage")]
-    AllocatorLeaseStorage,
     /// Process allocator generation budget exhausted.
     #[error("Process allocator generation budget exhausted")]
     AllocatorGenerationBudget,
@@ -722,9 +716,6 @@ pub enum InputDefect {
     /// queued conversion requires a sender without advertiser registrations.
     #[error("queued conversion requires a sender without advertiser registrations")]
     QueuedSenderRegistered,
-    /// unable to allocate bounded completion storage.
-    #[error("unable to allocate bounded completion storage")]
-    CompletionStorage,
     /// AVSync request exceeds the supported audio storage limit.
     #[error("AVSync request exceeds the supported audio storage limit")]
     AvSyncStorageLimit,
@@ -809,12 +800,6 @@ pub enum InputDefect {
     /// No allocation can hold {bytes} bytes.
     #[error("No allocation can hold {bytes} bytes")]
     AllocationLayout {
-        /// The bytes.
-        bytes: usize,
-    },
-    /// The global allocator did not supply {bytes} bytes.
-    #[error("The global allocator did not supply {bytes} bytes")]
-    AllocationFailed {
         /// The bytes.
         bytes: usize,
     },
@@ -927,9 +912,6 @@ pub enum InputDefect {
 #[derive(Debug, Clone, PartialEq, Error, Copy, Eq, Hash)]
 #[non_exhaustive]
 pub enum SdkResultDefect {
-    /// could not reserve memory for discovery results.
-    #[error("could not reserve memory for discovery results")]
-    DiscoveryAllocation,
     /// native completion protocol failed; use QueuedSender::close to recover retained frames.
     #[error(
         "native completion protocol failed; use QueuedSender::close to recover retained frames"

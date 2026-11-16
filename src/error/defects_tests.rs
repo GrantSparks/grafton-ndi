@@ -7,12 +7,55 @@ use super::*;
 use crate::{ColorInfo, FrameMetadataStatus, PixelFormat, TransferFunction};
 use std::time::Duration;
 
-fn color(metadata: &str) -> ColorInfo {
-    crate::color_info::parse(Some(metadata)).unwrap().unwrap()
+#[test]
+fn allocation_kinds_describe_storage_without_misclassifying_the_input() {
+    let cases = [
+        (
+            "DiscoveryResults",
+            AllocationKind::DiscoveryResults,
+            "discovery results",
+        ),
+        (
+            "ImageScratch",
+            AllocationKind::ImageScratch,
+            "image scratch storage",
+        ),
+        (
+            "AllocatorLeases",
+            AllocationKind::AllocatorLeases,
+            "allocator lease storage",
+        ),
+        (
+            "QueuedCompletions",
+            AllocationKind::QueuedCompletions,
+            "completion storage",
+        ),
+        (
+            "ReceiveBuffer",
+            AllocationKind::ReceiveBuffer,
+            "receive buffer",
+        ),
+    ];
+    check_cases("AllocationKind", &cases);
+    for (_, kind, description) in cases {
+        for bytes in [None, Some(4096)] {
+            let (error, count) =
+                crate::test_alloc::allocation_count(|| allocation_failed(kind, bytes));
+            assert_eq!(count, 0);
+            assert!(
+                matches!(error, Error::AllocationFailed(cause) if cause == AllocationFailure { kind, bytes })
+            );
+            let expected = format!(
+                "Allocation failed: could not allocate {description}{}",
+                if bytes.is_some() { " (4096 bytes)" } else { "" }
+            );
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 }
 
-fn reserve_capacity_error() -> std::collections::TryReserveError {
-    Vec::<u8>::new().try_reserve(usize::MAX).unwrap_err()
+fn color(metadata: &str) -> ColorInfo {
+    crate::color_info::parse(Some(metadata)).unwrap().unwrap()
 }
 
 fn check_cases<E: std::fmt::Display>(name: &str, cases: &[(&str, E, &str)]) {
@@ -20,7 +63,7 @@ fn check_cases<E: std::fmt::Display>(name: &str, cases: &[(&str, E, &str)]) {
         assert_eq!(cause.to_string(), *expected, "{name}::{variant}");
     }
     // Keep the hand-written goldens exhaustive as the public taxonomy grows.
-    let source = if name == "InitializationFailure" {
+    let source = if matches!(name, "InitializationFailure" | "AllocationKind") {
         include_str!("../error.rs")
     } else {
         include_str!("defects.rs")
@@ -57,7 +100,6 @@ fn frame_defect_diagnostics_preserve_their_text() {
     let cases = [
         ("UnknownEnvelopeCodec", FrameDefect::UnknownEnvelopeCodec { fourcc: 1094861636 }, "Unknown packet envelope codec FourCC: 0x41424344"),
         ("Layout", FrameDefect::Layout(LayoutDefect::VideoZeroSize), "Video frame has zero calculated size"),
-        ("ImageScratchAllocation", FrameDefect::ImageScratchAllocation(reserve_capacity_error()), "image scratch allocation failed: memory allocation failed because the computed capacity exceeded the collection's maximum"),
         ("ImageScratchOverflow", FrameDefect::ImageScratchOverflow, "image scratch size overflow"),
         ("ImageDimensionOverflow", FrameDefect::ImageDimensionOverflow, "image dimension overflow"),
         ("ImageDimension", FrameDefect::ImageDimension { codec: ImageCodec::Jpeg, dimension: ImageDimension::Width, length: 6, maximum: 16 }, "JPEG width 6 exceeds maximum supported value 16"),
@@ -167,7 +209,6 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("ExternalAllocationTooSmall", InputDefect::ExternalAllocationTooSmall, "External allocation is smaller than the request's minimum"),
         ("ExternalAllocationTooLarge", InputDefect::ExternalAllocationTooLarge, "External allocation is larger than the request's capacity limit"),
         ("ExternalAllocationAlignment", InputDefect::ExternalAllocationAlignment, "External allocation is not aligned to 64 bytes"),
-        ("AllocatorLeaseStorage", InputDefect::AllocatorLeaseStorage, "Unable to reserve bounded allocator lease storage"),
         ("AllocatorGenerationBudget", InputDefect::AllocatorGenerationBudget, "Process allocator generation budget exhausted"),
         ("AllocatorTokensExhausted", InputDefect::AllocatorTokensExhausted, "Allocator token space exhausted"),
         ("AllocatorLimitsDiffer", InputDefect::AllocatorLimitsDiffer, "Allocator limits differ from the existing process allocator service"),
@@ -178,7 +219,6 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("QueueLimits", InputDefect::QueueLimits, "queue requires 1..=65536 frames and a positive addressable byte limit"),
         ("QueueIdentifiersExhausted", InputDefect::QueueIdentifiersExhausted, "queue submission identifiers exhausted"),
         ("QueuedSenderRegistered", InputDefect::QueuedSenderRegistered, "queued conversion requires a sender without advertiser registrations"),
-        ("CompletionStorage", InputDefect::CompletionStorage, "unable to allocate bounded completion storage"),
         ("AvSyncStorageLimit", InputDefect::AvSyncStorageLimit, "AVSync request exceeds the supported audio storage limit"),
         ("TimeoutTooLong", InputDefect::TimeoutTooLong { requested: Duration::from_millis(4_294_967_295).into() }, "timeout 4294967.295s exceeds MAX_TIMEOUT (4294967294 ms, about 49.7 days)"),
         ("TimeoutInstantOverflow", InputDefect::TimeoutInstantOverflow { requested: Duration::from_millis(4_294_967_295).into() }, "timeout 4294967.295s ends at an instant this platform cannot represent"),
@@ -193,7 +233,6 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("AllocatorAudioStride", InputDefect::AllocatorAudioStride { stride: 7 }, "Audio allocator stride 7 is not a whole number of samples"),
         ("AllocationTooLarge", InputDefect::AllocationTooLarge { bytes: 268435457, limit: 268435456 }, "An allocation of 268435457 bytes exceeds the capacity limit of 268435456 bytes"),
         ("AllocationLayout", InputDefect::AllocationLayout { bytes: 268435457 }, "No allocation can hold 268435457 bytes"),
-        ("AllocationFailed", InputDefect::AllocationFailed { bytes: 268435457 }, "The global allocator did not supply 268435457 bytes"),
         ("KvmKeySymbol", InputDefect::KvmKeySymbol { keysym: 2147483648 }, "KVM key symbol 0x80000000 exceeds the SDK's range, 0..=0x7fffffff"),
         ("KvmPosition", InputDefect::KvmPosition { x: 1.25, y: -0.5 }, "KVM position (1.25, -0.5) is not within 0..=1 on each axis"),
         ("KvmWheel", InputDefect::KvmWheel { units: 2.5 }, "KVM wheel units 2.5 are not finite"),
@@ -216,7 +255,6 @@ fn input_defect_diagnostics_preserve_their_text() {
 #[test]
 fn sdk_result_defect_diagnostics_preserve_their_text() {
     let cases = [
-        ("DiscoveryAllocation", SdkResultDefect::DiscoveryAllocation, "could not reserve memory for discovery results"),
         ("UnknownCompletion", SdkResultDefect::UnknownCompletion, "native completion protocol failed; use QueuedSender::close to recover retained frames"),
         ("FileTrackCountOverflow", SdkResultDefect::FileTrackCountOverflow, "video track count does not fit usize"),
         ("NegativeCount", SdkResultDefect::NegativeCount { operation: crate::sys::table::for_test((), c"native operation").function(), value: (-3).into() }, "native operation returned a negative count: -3"),

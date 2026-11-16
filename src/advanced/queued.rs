@@ -793,7 +793,8 @@ impl QueuedSender {
     ///
     /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
     /// build without the Advanced SDK), [`Error::InvalidInput`] for
-    /// limits outside their range, and the errors of [`Sender::new`].
+    /// limits outside their range, [`Error::AllocationFailed`] when completion
+    /// storage cannot be reserved, and the errors of [`Sender::new`].
     #[doc(alias = "NDIlib_send_set_video_async_completion")]
     pub fn new(ndi: &Ndi, options: &SenderOptions, limits: &QueueLimits) -> Result<Self> {
         let table = ndi.table::<SendCompletion>()?;
@@ -817,6 +818,7 @@ impl QueuedSender {
     /// limits outside their range or a sender that is registered with an
     /// advertiser (a registration keeps the native sender alive after this
     /// value is dropped, when the completion state no longer exists).
+    /// [`Error::AllocationFailed`] when completion storage cannot be reserved.
     #[doc(alias = "NDIlib_send_set_video_async_completion")]
     pub fn from_sender(
         sender: Sender,

@@ -49,6 +49,55 @@ pub enum InitializationFailure {
     HandleCountExhausted,
 }
 
+/// The storage an operation could not allocate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[non_exhaustive]
+pub enum AllocationKind {
+    /// Finder or Discovery Server snapshot and discovery-result storage.
+    #[error("discovery results")]
+    DiscoveryResults,
+    /// Reusable image encoder scratch storage.
+    #[error("image scratch storage")]
+    ImageScratch,
+    /// Custom allocator lease bookkeeping.
+    #[error("allocator lease storage")]
+    AllocatorLeases,
+    /// Queued sender descriptors and completion bookkeeping.
+    #[error("completion storage")]
+    QueuedCompletions,
+    /// A crate-owned custom receive buffer.
+    #[error("receive buffer")]
+    ReceiveBuffer,
+}
+
+/// An allocation failed after the operation passed its validation and budgets.
+///
+/// This describes storage exhaustion, rather than invalid input or malformed
+/// SDK data. It also covers a collection refusing an unrepresentable capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[error("could not allocate {kind}{requested}", requested = RequestedBytes(*.bytes))]
+pub struct AllocationFailure {
+    /// Which storage could not be supplied.
+    pub kind: AllocationKind,
+    /// The requested allocation size in bytes, when known.
+    pub bytes: Option<usize>,
+}
+
+struct RequestedBytes(Option<usize>);
+
+impl std::fmt::Display for RequestedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(bytes) = self.0 {
+            write!(f, " ({bytes} bytes)")?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn allocation_failed(kind: AllocationKind, bytes: Option<usize>) -> Error {
+    Error::AllocationFailed(AllocationFailure { kind, bytes })
+}
+
 /// Every error this crate reports, from the core API, the `advanced` module
 /// and the File API alike.
 ///
@@ -156,6 +205,16 @@ pub enum Error {
     #[error("Failed to initialize the NDI runtime: {0}")]
     InitializationFailed(InitializationFailure),
 
+    /// Storage could not be allocated for an otherwise valid operation.
+    ///
+    /// [`AllocationFailure`] identifies the storage and its requested size
+    /// when known. Discovery copies, image encoding scratch, queued sender
+    /// bookkeeping, allocator leases and crate-owned receive buffers all
+    /// report this condition here. A configured budget refusal is instead
+    /// [`Error::ResourceLimit`].
+    #[error("Allocation failed: {0}")]
+    AllocationFailed(AllocationFailure),
+
     /// The selected NDI runtime cannot run on this CPU.
     ///
     /// The runtime did not start and reports that the CPU lacks instructions
@@ -253,7 +312,7 @@ pub enum Error {
     QueueFull(QueueLimit),
 
     /// A value the SDK returned, other than a frame, breaks the SDK's
-    /// documented contract, or owned storage could not be reserved for it.
+    /// documented contract.
     /// [`SdkResultDefect`] identifies that contract breach.
     ///
     /// For example a negative connection count, a receive delay outside the
@@ -474,6 +533,8 @@ mod tests {
         error::<PtzDefect>();
         error::<SpawnFailure>();
         error::<InitializationFailure>();
+        error::<AllocationFailure>();
+        error::<AllocationKind>();
 
         value::<SdkResultDefect>();
         value::<Capability>();
@@ -490,6 +551,8 @@ mod tests {
         value::<CompressedAudioDefect>();
         value::<SpawnFailure>();
         value::<InitializationFailure>();
+        value::<AllocationFailure>();
+        value::<AllocationKind>();
     }
 
     #[test]
