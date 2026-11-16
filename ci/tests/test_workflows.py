@@ -130,7 +130,7 @@ def docs_violations(docs):
             + differs('rust.yml: deployment environment', deploy.get('environment'),
                       {'name': 'github-pages', 'url': '${{ steps.deployment.outputs.page_url }}'})
             + differs('rust.yml: deployment scripts', [step for step in deploy['steps'] if 'run' in step], [])
-            + rustdoc_feature_violations(jobs['lint']['steps']))
+            + rustdoc_feature_violations(jobs['lint']['steps']) + implementation_coverage_violations(docs))
 
 
 def rustdoc_feature_violations(steps):
@@ -150,6 +150,24 @@ def rustdoc_feature_violations(steps):
     names = [step.get('name') for step in steps]
     if 'Rustdoc feature combinations' not in names or names.index('Rustdoc feature combinations') >= names.index('Rustdoc'):
         found.append('rust.yml: all-features rustdoc must be built last for checking and publication')
+    return found
+
+
+def implementation_coverage_violations(rust):
+    """Real Advanced code and both compatibility editions must be checked."""
+    named = {step.get('name'): step for step in rust['jobs']['sdk']['steps']}
+    advanced = named.get('Lint and document the Advanced implementation', {}).get('run', '')
+    found = []
+    for command in ('rustup toolchain install 1.88.0 --profile minimal --target "$TARGET"',
+                    'cargo +1.88.0 check --locked --all-targets --target "$TARGET" --all-features'):
+        if command not in advanced:
+            found.append('rust.yml: Advanced implementation has no MSRV check with installed headers')
+    for name in ('Current Advanced headers with baseline runtimes',
+                 'Baseline SDK builds with the current Advanced runtime'):
+        script = named.get(name, {}).get('run', '')
+        for required in ('failed=0', '--all-features || failed=1', 'exit "$failed"'):
+            if required not in script:
+                found.append(f'rust.yml: {name} does not accumulate compatibility failures')
     return found
 
 
@@ -260,6 +278,13 @@ def publish_violations(publish):
 
 # Plausible wrong edits: (name, workflow, text to replace, replacement, words the report must contain).
 WRONG_EDITS = (
+    ('Advanced MSRV check removed', 'rust.yml',
+     '          cargo +1.88.0 check --locked --all-targets --target "$TARGET" --all-features\n', '',
+     'MSRV check with installed headers'),
+    ('compatibility failure stops later editions', 'rust.yml',
+     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features || failed=1\n          done\n          exit "$failed"\n      # A Standard',
+     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features\n          done\n          exit "$failed"\n      # A Standard',
+     'accumulate compatibility failures'),
     ('toolchain differs from contributor pin', 'publish.yml', '          toolchain: 1.100.0\n',
      '          toolchain: 1.99.1\n', 'toolchain of verify'),
     ('Pages deploy without CI', 'rust.yml', '    needs: required-ci\n', '', 'job order'),
@@ -553,6 +578,22 @@ class SdkJob(unittest.TestCase):
         for name in ('NDI_RUNTIME_DIR_V6', 'GRAFTON_NDI_EXPECTED_VERSION',
                      'GRAFTON_NDI_EXPECTED_EDITION', 'GRAFTON_NDI_EXPECTED_RUNTIME'):
             self.assertIn(f'export {name}="${{{{ steps.sdk.outputs.{name} }}}}"', steps[1]['run'])
+
+    def test_compatibility_loops_run_the_second_edition_after_a_failure(self):
+        steps = [step for step in self.job['steps'] if step.get('if') == when('matrix.compatibility')]
+        for step in steps:
+            # Keep the actual loop and failure policy; replace environment setup
+            # and the native test command with a deterministic failing first pass.
+            script = step['run']
+            start = script.index('failed=0')
+            script = script[start:]
+            script = re.sub(r'^  (?!cargo test).+$', '', script, flags=re.MULTILINE)
+            script = re.sub(r'cargo test .+?( \|\| failed=1)',
+                            r'echo "$edition"; test "$edition" = advanced\1', script)
+            with self.subTest(step=step['name']):
+                result = subprocess.run(['bash', '-eo', 'pipefail', '-c', script], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ['standard', 'advanced'])
 
     def test_each_compatibility_pass_promises_exactly_what_it_can_check(self):
         """The first step builds with the row's headers against each baseline runtime, the second with each
