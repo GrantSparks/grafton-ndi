@@ -214,7 +214,8 @@ impl<'a> KvmReceiver<'a> {
     ///
     /// # Errors
     ///
-    /// As for [`Receiver::capture_any_ref`].
+    /// As for [`Receiver::capture_any_ref`], including [`crate::Error::UnexpectedSdkResult`]
+    /// once per failed status publication, whose event remains pending.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<ReceiverItemRef<'a>>> {
         self.receiver.capture_any_ref(timeout)
@@ -224,7 +225,8 @@ impl<'a> KvmReceiver<'a> {
     ///
     /// # Errors
     ///
-    /// As for [`Receiver::capture_any`].
+    /// As for [`Receiver::capture_any`], including [`crate::Error::UnexpectedSdkResult`]
+    /// once per failed status publication, whose event remains pending.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any(&self, timeout: Duration) -> Result<Option<ReceiverItem>> {
         self.receiver.capture_any(timeout)

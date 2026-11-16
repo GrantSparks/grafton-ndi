@@ -1286,7 +1286,8 @@ impl AllocatedPacketReceiver {
     ///
     /// # Errors
     ///
-    /// As for [`PacketReceiver::capture_any`].
+    /// As for [`PacketReceiver::capture_any`], including [`crate::Error::UnexpectedSdkResult`]
+    /// once per failed status publication, whose event remains pending.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any(&self, timeout: std::time::Duration) -> Result<Option<PacketItem>> {
         PacketReceiver::capture_from(self.inner.receiver(), timeout)
@@ -1298,7 +1299,8 @@ impl AllocatedPacketReceiver {
     ///
     /// # Errors
     ///
-    /// As for [`PacketReceiver::capture_any_ref`].
+    /// As for [`PacketReceiver::capture_any_ref`], including [`crate::Error::UnexpectedSdkResult`]
+    /// once per failed status publication, whose event remains pending.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any_ref(
         &self,

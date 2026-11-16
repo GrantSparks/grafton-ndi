@@ -446,7 +446,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// # Errors
     ///
-    /// The errors of [`Receiver::capture_any`], and [`Error::SpawnFailed`]
+    /// The errors of [`Receiver::capture_any`], including [`Error::UnexpectedSdkResult`]
+    /// once per failed status publication with its event retained, and [`Error::SpawnFailed`]
     /// when no runtime context is entered or the blocking task is cancelled. Oversize timeouts
     /// are rejected before submitting work.
     ///
@@ -485,7 +486,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// # Errors
     ///
-    /// The errors of [`Receiver::capture_any_ref`], and [`Error::SpawnFailed`]
+    /// The errors of [`Receiver::capture_any_ref`], including [`Error::UnexpectedSdkResult`]
+    /// once per failed status publication with its event retained, and [`Error::SpawnFailed`]
     /// for a missing runtime context or cancelled task. Oversize timeouts are
     /// rejected before submitting work.
     ///
