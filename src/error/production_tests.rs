@@ -67,6 +67,24 @@ fn item_attrs(item: &Item) -> &[Attribute] {
     }
 }
 
+fn expression_attrs(expression: &syn::Expr) -> &[Attribute] {
+    macro_rules! attrs {
+        ($($kind:ident),+ $(,)?) => {
+            match expression {
+                $(syn::Expr::$kind(expression) => &expression.attrs,)+
+                // Verbatim tokens have no parsed attributes or constructors.
+                _ => &[],
+            }
+        };
+    }
+    attrs!(
+        Array, Assign, Async, Await, Binary, Block, Break, Call, Cast, Closure, Const, Continue,
+        Field, ForLoop, Group, If, Index, Infer, Let, Lit, Loop, Macro, Match, MethodCall, Paren,
+        Path, Range, RawAddr, Reference, Repeat, Return, Struct, Try, TryBlock, Tuple, Unary,
+        Unsafe, While, Yield,
+    )
+}
+
 #[derive(Default)]
 struct Producers {
     found: BTreeSet<(String, String)>,
@@ -118,9 +136,35 @@ impl<'ast> Visit<'ast> for Producers {
         }
     }
 
-    fn visit_impl_item_fn(&mut self, method: &'ast syn::ImplItemFn) {
-        if production(&method.attrs) {
-            visit::visit_impl_item_fn(self, method);
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        let attrs = match item {
+            syn::ImplItem::Const(item) => &item.attrs,
+            syn::ImplItem::Fn(item) => &item.attrs,
+            syn::ImplItem::Type(item) => &item.attrs,
+            syn::ImplItem::Macro(item) => &item.attrs,
+            _ => return,
+        };
+        if production(attrs) {
+            visit::visit_impl_item(self, item);
+        }
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        let attrs = match item {
+            syn::TraitItem::Const(item) => &item.attrs,
+            syn::TraitItem::Fn(item) => &item.attrs,
+            syn::TraitItem::Type(item) => &item.attrs,
+            syn::TraitItem::Macro(item) => &item.attrs,
+            _ => return,
+        };
+        if production(attrs) {
+            visit::visit_trait_item(self, item);
+        }
+    }
+
+    fn visit_expr(&mut self, expression: &'ast syn::Expr) {
+        if production(expression_attrs(expression)) {
+            visit::visit_expr(self, expression);
         }
     }
 
@@ -217,6 +261,16 @@ fn test_only_items_and_match_patterns_do_not_count_as_producers() {
         #[cfg(test)] fn test_only() { let _ = FrameDefect::NullAudioData; }
         #[cfg(all(test, feature = "advanced"))]
         mod more_tests { fn helper() { let _ = FrameDefect::NullAudioData; } }
+        struct Owner;
+        impl Owner {
+            #[cfg(test)] const ONLY_IN_TESTS: () = { let _ = FrameDefect::NullAudioData; };
+        }
+        trait Contract {
+            #[cfg(test)] const ONLY_IN_TESTS: () = { let _ = FrameDefect::NullAudioData; };
+        }
+        fn expression_only() {
+            #[cfg(test)] { let _ = FrameDefect::NullAudioData; }
+        }
         fn match_only(value: FrameDefect) { match value { FrameDefect::NullAudioData => {}, _ => {} } }
     "#).unwrap();
     let mut producers = Producers::default();
