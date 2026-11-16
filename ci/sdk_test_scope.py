@@ -236,7 +236,7 @@ def main(argv=None):
         args.output.write_bytes(''.join(argument + '\n' for argument in arguments).encode('utf-8'))
     except (OSError, ValueError) as error:
         parser.error(str(error))
-    print(f'SDK {args.scope} scope: skipping {len(arguments) // 2} audited build-only tests '
+    print(f'CI {args.scope} scope: skipping {len(arguments) // 2} audited fixed-graph tests '
           f'of {sum(line.endswith(": test") for line in inventory.splitlines())} listed; '
           'all unclassified tests and doctests remain included.', file=sys.stderr)
 
