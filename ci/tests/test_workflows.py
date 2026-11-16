@@ -54,7 +54,7 @@ TRIGGERS = {
 ACTIONS = {
     'rust.yml': {
         'lint': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache', 'actions/upload-pages-artifact'],
-        'test': ['actions/checkout', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
+        'test': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
         'cross': ['actions/checkout', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
         'miri': ['actions/checkout'],
         'sdk': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain'],
@@ -116,7 +116,8 @@ def violations(texts):
             if 'runs-on' in body and not re.fullmatch(r'\d+', body.get('timeout-minutes', '')):
                 found.append(f'{name}: {job} has no timeout')
     return (found + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
-            + docs_violations(parsed['rust.yml']) + memory_checker_violations(parsed['rust.yml']))
+            + docs_violations(parsed['rust.yml']) + memory_checker_violations(parsed['rust.yml'])
+            + repeated_feature_violations(parsed['rust.yml']))
 
 
 def docs_violations(docs):
@@ -153,6 +154,47 @@ def rustdoc_feature_violations(steps):
     return found
 
 
+REPEATED_FEATURE_TESTS = (
+    ('Tests, default features', 'cargo test --locked', 'default'),
+    ('Tests, File API without Advanced wrappers',
+     'cargo test --locked --no-default-features --features file-io', 'file'),
+)
+
+
+def scoped_commands(command, stem):
+    return (
+        f'{command} -- --list > "$scope_dir/{stem}-tests.txt"',
+        f'python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/{stem}-tests.txt" --output "$scope_dir/{stem}-skips.txt"',
+        f'{command} -- "${{scope_args[@]}}"',
+    )
+
+
+def repeated_feature_violations(rust):
+    """Fixed nested compiler graphs retain one earlier owner on each host."""
+    steps = rust['jobs']['test']['steps']
+    names = [step.get('name') for step in steps]
+    owner = next((step for step in steps if step.get('name') == 'Tests, all features'), {})
+    found = differs('rust.yml: fixed compiler owner', owner.get('run'), 'cargo test --locked --all-features')
+    if owner.get('if'):
+        found.append('rust.yml: fixed compiler owner must run on every test host')
+    for name, command, stem in REPEATED_FEATURE_TESTS:
+        step = next((step for step in steps if step.get('name') == name), {})
+        for setting in ('env', 'working-directory'):
+            if step.get(setting) != owner.get(setting):
+                found.append(f'rust.yml: repeated feature step {name} changes fixed compiler inputs: {setting}')
+        lines = [line.strip() for line in step.get('run', '').splitlines()]
+        required = (*scoped_commands(command, stem),
+                    'scope_dir="${RUNNER_TEMP:-target/ci}"', 'mkdir -p "$scope_dir"',
+                    'scope_args=()',
+                    f'while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/{stem}-skips.txt"')
+        for line in required:
+            if lines.count(line) != 1:
+                found.append(f'rust.yml: repeated feature step {name} lacks one guarded scope operation: {line}')
+        if name not in names or 'Tests, all features' not in names or names.index(name) <= names.index('Tests, all features'):
+            found.append(f'rust.yml: repeated feature step {name} has no earlier fixed compiler owner')
+    return found
+
+
 def local_recipe_violations(rust, readme):
     """The local recipe runs each documented lint/test step on the same features."""
     section = readme.split('## Running the checks locally', 1)[-1]
@@ -170,9 +212,9 @@ def local_recipe_violations(rust, readme):
         ('lint', 'Rustdoc', 'cargo doc --locked --no-deps --all-features'),
         ('lint', 'Documentation links and examples', 'python ci/docs.py --compile --rustdoc target/doc'),
         ('test', 'Tests, all features', 'cargo test --locked --all-features'),
-        ('test', 'Tests, default features', 'cargo test --locked'),
-        ('test', 'Tests, File API without Advanced wrappers', 'cargo test --locked --no-default-features --features file-io'),
-    )
+    ) + tuple(('test', name, scoped)
+              for name, command, stem in REPEATED_FEATURE_TESTS
+              for scoped in scoped_commands(command, stem))
     positions = []
     for job, name, command in checks:
         step = next((step for step in rust['jobs'][job]['steps'] if step.get('name') == name), {})
@@ -1149,6 +1191,92 @@ class Repository(unittest.TestCase):
         self.assertEqual(set(owned), {'/.github/', '/ci/', '/scripts/', '/.cargo/', '/rust-toolchain.toml',
                                       '/Cargo.toml', '/Cargo.lock', '/xtask/'})
         self.assertEqual({owner for owners in owned.values() for owner in owners}, {'@GrantSparks'})
+
+
+class RepeatedFeatureScopes(unittest.TestCase):
+    def test_fixed_compiler_owner_and_selection_cannot_be_removed(self):
+        rust = workflows.load(read_workflows()['rust.yml'])
+        self.assertEqual(repeated_feature_violations(rust), [])
+        for name, command, stem in REPEATED_FEATURE_TESTS:
+            for operation in (*scoped_commands(command, stem), 'scope_args=()',
+                              f'while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/{stem}-skips.txt"'):
+                with self.subTest(step=name, missing=operation):
+                    broken = copy.deepcopy(rust)
+                    step = next(step for step in broken['jobs']['test']['steps'] if step.get('name') == name)
+                    step['run'] = step['run'].replace(operation, '')
+                    self.assertTrue(repeated_feature_violations(broken))
+            for setting, value in (('env', {'NDI_SDK_DIR': 'a-different-header-build'}),
+                                   ('working-directory', 'another-workspace')):
+                with self.subTest(step=name, changed=setting):
+                    broken = copy.deepcopy(rust)
+                    step = next(step for step in broken['jobs']['test']['steps'] if step.get('name') == name)
+                    step[setting] = value
+                    self.assertTrue(repeated_feature_violations(broken))
+        for condition in (None, 'false'):
+            broken = copy.deepcopy(rust)
+            steps = broken['jobs']['test']['steps']
+            owner = next(step for step in steps if step.get('name') == 'Tests, all features')
+            if condition is None:
+                owner['run'] += ' -- --skip native_loans_and_slot_keys_require_their_owner'
+            else:
+                owner['if'] = condition
+            self.assertTrue(repeated_feature_violations(broken))
+        broken = copy.deepcopy(rust)
+        steps = broken['jobs']['test']['steps']
+        owner = next(step for step in steps if step.get('name') == 'Tests, all features')
+        steps.remove(owner)
+        steps.append(owner)
+        self.assertTrue(repeated_feature_violations(broken))
+
+    def test_scope_validation_precedes_execution_and_preserves_unknown_tests(self):
+        rust = workflows.load(read_workflows()['rust.yml'])
+        fixed = ('attached_modes_fail_the_internal_capture_entry_points',
+                 'frame_parts_require_the_matching_descriptor_validator',
+                 'native_loans_and_slot_keys_require_their_owner')
+        inventory = '\n'.join(f'{name}: test' for name in (
+            'handles_keep_runtime_alive_until_last_drop_and_allow_reinitialization',
+            *fixed, 'unknown_native_case', 'absent_feature_error_variants_are_unavailable',
+            'src/lib.rs - a_doctest (line 1)',
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            cargo = directory / 'cargo'
+            cargo.write_bytes(b'''#!/bin/bash
+printf '%s\n' "$*" >> "$CARGO_CALLS"
+case " $* " in
+  *" --list "*)
+    while IFS= read -r line; do
+      if [ -z "$MISSING_TEST" ] || [[ "$line" != *"$MISSING_TEST"* ]]; then printf '%s\n' "$line"; fi
+    done <<< "$SCOPE_INVENTORY"
+    ;;
+esac
+''')
+            cargo.chmod(0o755)
+            for name, command, stem in REPEATED_FEATURE_TESTS:
+                step = next(step for step in rust['jobs']['test']['steps'] if step.get('name') == name)
+                for missing in ('', fixed[0]):
+                    with self.subTest(step=name, missing=missing):
+                        calls_file = directory / 'calls'
+                        calls_file.write_text('')
+                        result = subprocess.run(['bash', '-eo', 'pipefail', '-c', step['run']], cwd=ROOT,
+                                                env={**os.environ, 'PATH': str(directory) + os.pathsep + os.environ['PATH'],
+                                                     'RUNNER_TEMP': str(directory), 'CARGO_CALLS': str(calls_file),
+                                                     'SCOPE_INVENTORY': inventory, 'MISSING_TEST': missing},
+                                                text=True, capture_output=True)
+                        calls = calls_file.read_text().splitlines()
+                        if missing:
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertIn(missing, result.stderr)
+                            self.assertEqual(len(calls), 1, 'a rejected scope must not execute tests')
+                        else:
+                            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                            self.assertEqual(len(calls), 2)
+                            expected = shlex.split(command)[1:] + ['--']
+                            for test in sorted(fixed):
+                                expected += ['--skip', test]
+                            self.assertEqual(shlex.split(calls[-1]), expected)
+                            self.assertNotIn('unknown_native_case', calls[-1])
+                            self.assertNotIn('absent_feature_error_variants_are_unavailable', calls[-1])
 
 
 if __name__ == '__main__':

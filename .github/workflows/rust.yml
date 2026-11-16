@@ -132,6 +132,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.13'
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.100.0
@@ -140,9 +143,23 @@ jobs:
       - name: Tests, all features
         run: cargo test --locked --all-features
       - name: Tests, default features
-        run: cargo test --locked
+        run: |
+          scope_dir="${RUNNER_TEMP:-target/ci}"
+          mkdir -p "$scope_dir"
+          cargo test --locked -- --list > "$scope_dir/default-tests.txt"
+          python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/default-tests.txt" --output "$scope_dir/default-skips.txt"
+          scope_args=()
+          while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/default-skips.txt"
+          cargo test --locked -- "${scope_args[@]}"
       - name: Tests, File API without Advanced wrappers
-        run: cargo test --locked --no-default-features --features file-io
+        run: |
+          scope_dir="${RUNNER_TEMP:-target/ci}"
+          mkdir -p "$scope_dir"
+          cargo test --locked --no-default-features --features file-io -- --list > "$scope_dir/file-tests.txt"
+          python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/file-tests.txt" --output "$scope_dir/file-skips.txt"
+          scope_args=()
+          while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/file-skips.txt"
+          cargo test --locked --no-default-features --features file-io -- "${scope_args[@]}"
       - name: Manual measurement fixtures
         if: runner.os == 'Linux'
         timeout-minutes: 5

@@ -31,8 +31,20 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 python ci/docs.py --compile --rustdoc target/doc
 cargo build --locked --examples --all-features
 cargo test --locked --all-features
-cargo test --locked
-cargo test --locked --no-default-features --features file-io
+scope_dir="${RUNNER_TEMP:-target/ci}"
+mkdir -p "$scope_dir"
+cargo test --locked -- --list > "$scope_dir/default-tests.txt"
+python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/default-tests.txt" --output "$scope_dir/default-skips.txt"
+scope_args=()
+while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/default-skips.txt"
+cargo test --locked -- "${scope_args[@]}"
+scope_dir="${RUNNER_TEMP:-target/ci}"
+mkdir -p "$scope_dir"
+cargo test --locked --no-default-features --features file-io -- --list > "$scope_dir/file-tests.txt"
+python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/file-tests.txt" --output "$scope_dir/file-skips.txt"
+scope_args=()
+while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/file-skips.txt"
+cargo test --locked --no-default-features --features file-io -- "${scope_args[@]}"
 ```
 
 Tests that require an unavailable NDI runtime report a skip. Runtime
@@ -40,6 +52,29 @@ initialization errors still fail. A successful SDK-free run therefore does
 not establish native transport coverage. The configured platform/runtime
 matrix is in [the CI workflow](../.github/workflows/rust.yml); execution results
 are available in [GitHub Actions](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml).
+
+The all-feature pass owns three internal compiler fixtures whose nested Cargo
+commands explicitly select the default or Advanced-only graph. The later default
+and File-only passes still compile their full configurations and run their
+feature-specific tests and doctests. Their inventories omit only those three
+repeated fixture executions, with exact-name guards in `sdk_test_scope.py`.
+Unknown tests remain included.
+
+Native SDK CI has 17 primary configurations and six compatibility roles. Each
+compatibility direction runs independently of the primary SDK checks, retaining
+both baseline editions, runtime identity checks, peer settings and isolation.
+Each header/feature/target build has a primary owner for its compiler and pure
+value checks. Compatibility roles use the helper's `runtime` scope to omit those
+audited repeated cases while retaining native tests, doctests and unknown tests.
+The synthetic-header matrix has one current Advanced compiler-host owner per
+platform; older Advanced and Windows x86 rows do not repeat that same host build.
+SDK files, generated bindings and SDK-derived binaries stay on their runner.
+
+When adding or changing a test, leave it included unless its inputs prove that
+an existing owner covers it. Add exact names and the source rationale to
+`sdk_test_scope.py` only after that audit. The helper rejects missing, duplicate,
+colliding or mismatched inventory entries; workflow guards require the owner.
+SDK-private caches and artifacts are not part of this design.
 
 The Linux test job also runs the manual measurement fixtures with `--ignored`
 in release mode. Its configurable image sweep uses one 64×64 BGRA input and
