@@ -34,6 +34,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Lossy WebP encoder storage failures remain `InvalidFrame(EncodingFailed)`
   because its supported dependency API cannot classify allocation failures;
   conversion scratch continues to report `AllocationFailed(ImageScratch)`.
+- Load refusals distinguish a missing identification anchor from a missing
+  required API entry point. Unreadable version text carries `VersionTextDefect`;
+  `InvalidCString` reports its cause once in error chains.
 
 - Custom allocator receivers use `advanced::AllocatedReceiver<M = RawCapture>`.
   Replace `AllocatedPacketReceiver` with `AllocatedReceiver<PacketAttached>`;

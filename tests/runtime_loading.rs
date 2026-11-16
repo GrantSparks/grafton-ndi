@@ -557,8 +557,6 @@ fn child(name: &str, fixtures: &Fixtures) {
                 attempt.refusal(),
                 &LoadRefusal::MissingEntryPoint {
                     symbol: c"NDIlib_send_set_failover",
-                    required: true,
-                    detail: None
                 }
             );
             assert!(!Ndi::is_running());
@@ -659,7 +657,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert!(reason.loaded_any());
             assert!(matches!(
                 reason.attempts()[0].refusal(),
-                LoadRefusal::UnreadableVersion { .. }
+                LoadRefusal::UnreadableVersion(grafton_ndi::VersionTextDefect::Unterminated)
             ));
             // A refused module selects nothing.
             drop(Ndi::with_options(&options).unwrap());

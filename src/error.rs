@@ -13,7 +13,7 @@ pub use defects::*;
 mod loading;
 pub use loading::{
     LibraryKind, LoadAttempt, LoadFailure, LoadOrigin, LoadRefusal, SelectionConflict,
-    SelectionFailure,
+    SelectionFailure, VersionTextDefect,
 };
 
 use thiserror::Error;
@@ -254,7 +254,7 @@ pub enum Error {
     /// Text passed to the SDK contains a NUL byte, which a C string cannot
     /// hold.
     #[error("Invalid CString: {0}")]
-    InvalidCString(#[from] NulError),
+    InvalidCString(NulError),
 
     /// A receiver reported the SDK error frame: its connection was lost.
     #[error("Failed to capture frame: the SDK returned an error frame: the connection was lost")]
@@ -420,6 +420,12 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
+impl From<NulError> for Error {
+    fn from(error: NulError) -> Self {
+        Self::InvalidCString(error)
+    }
+}
+
 // The existing largest payload is NulError. Selection diagnostics must not
 // enlarge the error returned by hot capture/send paths (40 bytes on x86-64).
 const _: () = assert!(
@@ -518,6 +524,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn invalid_c_string_reports_its_cause_once() {
+        let error = Error::from(std::ffi::CString::new("a\0b").unwrap_err());
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(
+            error.to_string(),
+            "Invalid CString: nul byte found in provided data at position: 1"
+        );
+    }
+
+    #[test]
     fn diagnostic_payloads_have_the_common_error_traits() {
         fn error<T: std::error::Error + std::fmt::Debug + Clone + PartialEq>() {}
         fn value<T: Copy + Eq + std::hash::Hash>() {}
@@ -525,6 +541,8 @@ mod tests {
         error::<SelectionFailure>();
         error::<LoadFailure>();
         error::<LoadRefusal>();
+        error::<VersionTextDefect>();
+        value::<VersionTextDefect>();
         error::<DiscoveryAddressFailure>();
         error::<NativeFunction>();
         error::<DiscoveryDefect>();

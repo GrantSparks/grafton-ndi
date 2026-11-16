@@ -15,7 +15,7 @@ use crate::{
     capabilities::{RuntimeInfo, SdkEdition, SdkVersion},
     runtime::RuntimeOptions,
     sdk_copy::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
-    Error, LoadRefusal, Result, SelectionFailure,
+    Error, LoadRefusal, Result, SelectionFailure, VersionTextDefect,
 };
 
 static SELECTED: Selection<Runtime> = Selection::new(crate::LibraryKind::Runtime);
@@ -113,28 +113,21 @@ impl Runtime {
         // initialization; it returns a static NUL-terminated string or null.
         let version = unsafe { resolved.core().NDIlib_version() };
         if version.is_null() {
-            return Err(LoadRefusal::UnreadableVersion {
-                detail: "NDIlib_version returned no version text".into(),
-            });
+            return Err(LoadRefusal::UnreadableVersion(VersionTextDefect::Missing));
         }
         // Read as far as the first NUL, but no further than one SDK string may
         // reach: a text without a terminator that close is not a version.
         // SAFETY: non-null was checked, and the SDK keeps the string alive for
         // as long as the implementation is loaded, which is the whole process.
         // The scan stops at its terminator or at the limit.
-        let raw_version =
-            unsafe { bounded_sdk_text(version, MAX_SDK_STRING_BYTES) }.ok_or_else(|| {
-                LoadRefusal::UnreadableVersion {
-                    detail: concat!(
-                        "its version text has no terminator within the 4 MiB ",
-                        "one SDK string may take"
-                    )
-                    .into(),
-                }
-            })?;
+        let raw_version = unsafe { bounded_sdk_text(version, MAX_SDK_STRING_BYTES) }.ok_or(
+            LoadRefusal::UnreadableVersion(VersionTextDefect::Unterminated),
+        )?;
         let raw_version = std::str::from_utf8(raw_version)
-            .map_err(|error| LoadRefusal::UnreadableVersion {
-                detail: format!("its version text is not UTF-8: {error}"),
+            .map_err(|error| {
+                LoadRefusal::UnreadableVersion(VersionTextDefect::NotUtf8 {
+                    valid_up_to: error.valid_up_to(),
+                })
             })?
             .to_owned();
         let version = SdkVersion::parse(&raw_version);
@@ -277,10 +270,9 @@ mod shared {
             let address = unsafe { library.get::<*const c_void>(anchor.to_bytes_with_nul()) }
                 .map(|symbol| *symbol)
                 .map_err(|error| {
-                    let reason = LoadRefusal::MissingEntryPoint {
+                    let reason = LoadRefusal::MissingAnchor {
                         symbol: anchor,
-                        required: false,
-                        detail: Some(error_chain(&error)),
+                        detail: error_chain(&error),
                     };
                     refused(reason, None)
                 })?;
