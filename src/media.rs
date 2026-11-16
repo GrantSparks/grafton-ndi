@@ -7,6 +7,32 @@ use std::{
 
 use crate::{Error, PixelFormat, Result};
 
+// An omitted variant makes index() non-exhaustive; a duplicate cannot define
+// its index twice. Keep decoding and iteration tied to the same checked list.
+macro_rules! decoded_variants {
+    ($name:ident: $($variant:ident),+ $(,)?) => {
+        impl $name {
+            /// Every variant, in declaration order.
+            pub(crate) const ALL: [Self; [$(stringify!($variant)),+].len()] =
+                [$(Self::$variant),+];
+
+            const fn index(self) -> usize {
+                enum Index { $($variant),+ }
+                match self { $(Self::$variant => Index::$variant as usize),+ }
+            }
+        }
+
+        const _: () = {
+            let mut index = 0;
+            while index < $name::ALL.len() {
+                assert!($name::ALL[index].index() == index);
+                index += 1;
+            }
+        };
+    };
+}
+pub(crate) use decoded_variants;
+
 /// A frame rate in frames per second, as the fraction
 /// `numerator / denominator`.
 ///
@@ -402,6 +428,14 @@ mod tests {
             PixelFormat::try_from(v210),
             Err(Error::InvalidFrame(message)) if matches!(message, crate::FrameDefect::UnknownPixelFormat {fourcc} if fourcc==v210.raw())
         ));
+    }
+
+    #[test]
+    fn every_scan_type_round_trips_through_its_sdk_code() {
+        for scan in crate::ScanType::ALL {
+            assert_eq!(crate::ScanType::from_sdk(scan.to_sdk()), Some(scan));
+        }
+        assert_eq!(crate::ScanType::from_sdk(u32::MAX), None);
     }
 
     #[test]

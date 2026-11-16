@@ -224,26 +224,12 @@ impl PixelFormatInfo {
     }
 }
 
-impl PixelFormat {
-    /// Every format, in declaration order.
-    pub(crate) const ALL: [Self; 15] = [
-        Self::Uyvy,
-        Self::Uyva,
-        Self::P216,
-        Self::Pa16,
-        Self::Yv12,
-        Self::I420,
-        Self::Nv12,
-        Self::Bgra,
-        Self::Bgrx,
-        Self::Rgba,
-        Self::Rgbx,
-        Self::Na48,
-        Self::Nb48,
-        Self::Na4g,
-        Self::Nb4g,
-    ];
+crate::media::decoded_variants!(PixelFormat:
+    Uyvy, Uyva, P216, Pa16, Yv12, I420, Nv12, Bgra, Bgrx, Rgba, Rgbx, Na48,
+    Nb48, Na4g, Nb4g,
+);
 
+impl PixelFormat {
     /// The complete readable allocation size for sending this layout.
     ///
     /// `line_stride_bytes` is `None` for tightly packed rows, or a positive
@@ -589,15 +575,9 @@ pub enum ScanType {
     Field1,
 }
 
-impl ScanType {
-    /// Every scan type, in declaration order.
-    pub(crate) const ALL: [Self; 4] = [
-        Self::Progressive,
-        Self::Interlaced,
-        Self::Field0,
-        Self::Field1,
-    ];
+crate::media::decoded_variants!(ScanType: Progressive, Interlaced, Field0, Field1);
 
+impl ScanType {
     /// The SDK's frame format type for this scan type.
     pub(crate) const fn to_sdk(self) -> NDIlib_frame_format_type_e {
         match self {
