@@ -75,7 +75,9 @@ impl<K: Eq + Hash, V> ReservedMap<K, V> {
     }
 
     fn prepare_insert(&mut self) -> bool {
-        if self.entries.len() == self.scratch.capacity() {
+        // A Vec of zero-sized pairs reports usize::MAX capacity even when no
+        // room was requested. An empty HashMap still records that zero bound.
+        if self.entries.capacity() == 0 || self.entries.len() == self.scratch.capacity() {
             return false;
         }
         if self.entries.capacity() == self.entries.len() {
@@ -238,6 +240,8 @@ mod tests {
 
     #[test]
     fn the_reserved_bound_refuses_new_items_without_allocating() {
+        let mut empty = ReservedMap::<(), ()>::try_with_capacity(0).unwrap();
+        assert_eq!(empty.insert_new((), ()), Err(((), ())));
         for capacity in [0, 1, 7] {
             let mut map = ReservedMap::try_with_capacity(capacity).unwrap();
             let ((), allocations) = crate::test_alloc::allocation_count(|| {
