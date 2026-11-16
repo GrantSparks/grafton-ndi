@@ -153,6 +153,51 @@ def rustdoc_feature_violations(steps):
     return found
 
 
+def local_recipe_violations(rust, readme):
+    """The local recipe runs each documented lint/test step on the same features."""
+    section = readme.split('## Running the checks locally', 1)[-1]
+    recipe = section.split('```sh\n', 1)[-1].split('```', 1)[0]
+    lines = [re.sub(r'^RUSTDOCFLAGS="-D warnings" ', '', line.strip())
+             for line in recipe.splitlines()]
+    found = []
+    checks = (
+        ('lint', 'CI scripts and workflows', 'python -m unittest discover -s ci/tests'),
+        ('lint', 'Format', 'cargo fmt --all -- --check'),
+        ('lint', 'Clippy', 'cargo clippy --locked --workspace --all-targets --all-features -- -D warnings'),
+        ('lint', 'Clippy', 'cargo clippy --locked --all-targets --no-default-features ${features:+--features "$features"} -- -D warnings'),
+        ('lint', 'Bindings generator tests', 'cargo test --locked --package xtask'),
+        ('lint', 'Rustdoc feature combinations', 'cargo doc --locked --no-deps --no-default-features ${features:+--features "$features"}'),
+        ('lint', 'Rustdoc', 'cargo doc --locked --no-deps --all-features'),
+        ('lint', 'Documentation links and examples', 'python ci/docs.py --compile --rustdoc target/doc'),
+        ('test', 'Tests, all features', 'cargo test --locked --all-features'),
+        ('test', 'Tests, default features', 'cargo test --locked'),
+        ('test', 'Tests, File API without Advanced wrappers', 'cargo test --locked --no-default-features --features file-io'),
+    )
+    positions = []
+    for job, name, command in checks:
+        step = next((step for step in rust['jobs'][job]['steps'] if step.get('name') == name), {})
+        if command not in [line.strip() for line in step.get('run', '').splitlines()]:
+            found.append(f'rust.yml: local recipe step {name} no longer runs {command}')
+        if command.startswith('cargo doc '):
+            if f'RUSTDOCFLAGS="-D warnings" {command}' not in [line.strip() for line in recipe.splitlines()]:
+                found.append(f'ci/README.md: local recipe rustdoc does not deny warnings: {command}')
+            if step.get('env') != {'RUSTDOCFLAGS': '-D warnings'}:
+                found.append(f'rust.yml: local recipe step {name} does not deny warnings')
+        if command not in lines:
+            found.append(f'ci/README.md: local recipe omits {command}')
+        else:
+            positions.append(lines.index(command))
+    if positions != sorted(positions):
+        found.append('ci/README.md: local recipe steps differ from lint and test order')
+    expected = []
+    for name in ('Clippy', 'Rustdoc feature combinations'):
+        step = next((step for step in rust['jobs']['lint']['steps'] if step.get('name') == name), {})
+        expected.extend(shlex.split(loop) for loop in re.findall(r'for features in ([^;]+); do', step.get('run', '')))
+    actual = [shlex.split(loop) for loop in re.findall(r'for features in ([^;]+); do', recipe)]
+    found += differs('ci/README.md: local recipe feature combinations', actual, expected)
+    return found
+
+
 def implementation_coverage_violations(rust):
     """Real Advanced code and both compatibility editions must be checked."""
     named = {step.get('name'): step for step in rust['jobs']['sdk']['steps']}
@@ -750,6 +795,53 @@ class Repository(unittest.TestCase):
             with self.subTest(message=message):
                 broken = {**texts, 'rust.yml': texts['rust.yml'].replace(block, changed)}
                 self.assertTrue(any(message in error for error in violations(broken)))
+
+    def test_local_recipe_matches_lint_and_test_steps(self):
+        rust = workflows.load(read_workflows()['rust.yml'])
+        readme = (ROOT / 'ci' / 'README.md').read_text()
+        self.assertEqual(local_recipe_violations(rust, readme), [])
+        loops = re.findall(r'for features in ([^;]+); do', readme)
+        self.assertEqual(len(loops), 2)
+        for loop in loops:
+            with self.subTest(removed_feature=loop):
+                broken = readme.replace(f'for features in {loop}; do',
+                                        f'for features in {loop.replace(" smol", "")}; do', 1)
+                self.assertTrue(any('feature combinations' in error
+                                    for error in local_recipe_violations(rust, broken)))
+        commands = [line.strip() for line in readme.split('```sh\n', 1)[1].split('```', 1)[0].splitlines()
+                    if line.strip().startswith(('cargo ', 'python ', 'RUSTDOCFLAGS='))]
+        for command in commands:
+            if command == 'cargo build --locked --examples --all-features':
+                continue
+            with self.subTest(removed_command=command):
+                self.assertTrue(local_recipe_violations(rust, readme.replace(command, '', 1)))
+        for job, body in rust['jobs'].items():
+            if job not in ('lint', 'test'):
+                continue
+            for index, step in enumerate(body['steps']):
+                if not step.get('run'):
+                    continue
+                broken = copy.deepcopy(rust)
+                broken['jobs'][job]['steps'][index]['run'] = ''
+                expected = step.get('name') in {
+                    'CI scripts and workflows', 'Format', 'Clippy', 'Bindings generator tests',
+                    'Rustdoc feature combinations', 'Rustdoc', 'Documentation links and examples',
+                    'Tests, all features', 'Tests, default features', 'Tests, File API without Advanced wrappers',
+                }
+                if expected:
+                    with self.subTest(removed_step=step['name']):
+                        self.assertTrue(local_recipe_violations(broken, readme))
+        for command in commands:
+            if command.startswith('RUSTDOCFLAGS='):
+                broken_readme = readme.replace(command, command.removeprefix('RUSTDOCFLAGS="-D warnings" '), 1)
+                self.assertTrue(any('does not deny warnings' in error
+                                    for error in local_recipe_violations(rust, broken_readme)))
+        broken = copy.deepcopy(rust)
+        for step in broken['jobs']['lint']['steps']:
+            if step.get('name') in ('Clippy', 'Rustdoc feature combinations'):
+                step['run'] = step['run'].replace(' smol', '')
+        self.assertTrue(any('feature combinations' in error
+                            for error in local_recipe_violations(broken, readme)))
 
     def test_repository_cargo_configuration_holds_only_the_xtask_alias(self):
         """Cargo obeys this file in every job that starts in the checkout; it can run programs and redirect registries."""

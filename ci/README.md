@@ -17,14 +17,22 @@ workflow validation; its tag ref keeps the Pages job disabled.
 Use the pinned Rust toolchain with Clippy and rustfmt:
 
 ```sh
-cargo build --locked --examples --all-features
-cargo test --locked --all-features
+python -m unittest discover -s ci/tests
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+for features in "" image-encoding tokio smol advanced file-io advanced,file-io; do
+    cargo clippy --locked --all-targets --no-default-features ${features:+--features "$features"} -- -D warnings
+done
+cargo test --locked --package xtask
 for features in "" image-encoding tokio smol advanced file-io advanced,file-io; do
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --no-default-features ${features:+--features "$features"}
 done
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+python ci/docs.py --compile --rustdoc target/doc
+cargo build --locked --examples --all-features
+cargo test --locked --all-features
+cargo test --locked
+cargo test --locked --no-default-features --features file-io
 ```
 
 Tests that require an unavailable NDI runtime report a skip. Runtime
