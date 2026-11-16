@@ -912,11 +912,8 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 /// # What a closed file means
 ///
 /// A report of closure repeats what the SDK said: that it finalized the file.
-/// It does not show that every frame reached the disk, and a file can be
-/// closed with nothing in it ([`RecordingReport::empty_files`]). With the NDI
-/// 6.4 File library a disk that fills while a session is recording ends the
-/// process, and one that fills while it is being stopped leaves a file that
-/// is reported closed without its data. See
+/// A closed file is not proof its data was written. Inspect the report and
+/// read back recordings whose completeness matters. See
 /// [the module's limits](super#limits-of-the-ndi-64-file-library).
 ///
 /// # Events

@@ -103,10 +103,11 @@
 //!
 //! # Limits of the NDI 6.4 File library
 //!
-//! These were observed with the NDI 6.4 File library. They lie inside the
-//! library and this crate cannot correct them.
+//! These limits apply to the versions and platforms named below. They lie
+//! inside the library and this crate cannot correct them.
 //!
-//! * **A file reported closed is not proof that its data was written.** A
+//! * **On Linux with the NDI 6.4 File library, a file reported closed is not
+//!   proof that its data was written.** A
 //!   session's report repeats what the library said: that it finalized each
 //!   file. When the disk fills while a session is being stopped, a write comes
 //!   up short, the library extends the file all the same and reports it closed
@@ -115,24 +116,28 @@
 //!   errors therefore means that the container was finalized, not that every
 //!   frame reached the disk. A recording that must be complete has to be
 //!   checked by reading it back.
-//! * **The process does not survive a full disk during recording.** When a
+//! * **On Linux with the NDI 6.4 File library, the process does not survive a
+//!   full disk during recording.** When a
 //!   write fails while a session is recording, the library queues a
 //!   write-failed and an error event and then crashes in its own writer
 //!   thread, which ends the process. Nothing this crate does can prevent it.
 //!   Record only where enough space is certain.
-//! * **A file can be closed with nothing in it.** The library opens a file as
+//! * **On Linux with the NDI 6.4 File library, a file can be closed with
+//!   nothing in it.** The library opens a file as
 //!   soon as a session or a rollover starts, and reports it closed even if no
 //!   frame arrived: after a stop before the source delivered anything, a
 //!   switch to a source that is not there, or a rollover while the source is
 //!   lost. [`RecordingReport::empty_files`] counts these files.
-//! * **A rollover the library cannot carry out ends the session.** It accepts
+//! * **On Linux with the NDI 6.4 File library, a rollover the library cannot
+//!   carry out ends the session.** It accepts
 //!   the request, fails to open the new file, closes the old one and stops.
 //!   [`FileRecorder::rollover`] checks the file its pattern names first, so a
 //!   missing directory or an exact file name that already exists is refused
 //!   and the session goes on; a file that cannot be opened for another reason
 //!   still ends it. An exact file name cannot roll over by itself at all; see
 //!   [`FileNaming::Exact`].
-//! * **Recording paths must be reportable exactly.** Start and rollover
+//! * **On every platform with the NDI 6.4 File library, recording paths must
+//!   be reportable exactly.** Start and rollover
 //!   preflight refuse absolute output paths above 4094 UTF-8 bytes with the
 //!   current SDK, reserving at least 20 digits for each index token's growth.
 //!   This keeps closure events unambiguous, so a finalized session can close
@@ -324,8 +329,8 @@ impl FileApi {
     ///   the rest of the crate keeps working.
     /// * [`Error::RuntimeConflict`] when the selected NDI runtime is not one
     ///   the File library can accompany, or `options` names a library other
-    ///   than the one already selected. [`crate::SelectionConflict`] identifies
-    ///   the cause; `detail` retains the diagnostic context.
+    ///   than the one already selected. [`crate::SelectionFailure::kind`] names
+    ///   the [`crate::SelectionConflict`]; its `Display` gives the diagnostic text.
     /// * [`Error::InvalidInput`] when `options` names a relative path.
     pub fn new(ndi: &Ndi, options: &FileApiOptions) -> Result<Self> {
         let runtime = sys::select_file(
