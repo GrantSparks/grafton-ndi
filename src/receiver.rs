@@ -197,11 +197,94 @@ impl<T> LatestReport<T> {
         self.pending = Some(report);
     }
 
-    #[cfg(any(feature = "tokio", feature = "smol"))]
+    #[cfg(any(test, feature = "tokio", feature = "smol"))]
     fn replay(&mut self, report: ReceiverReport<T>) {
         if report.sequence == self.sequence {
             self.pending = Some(report);
         }
+    }
+}
+
+#[cfg(test)]
+mod latest_report_tests {
+    use super::LatestReport;
+
+    #[test]
+    fn publishing_coalesces_and_taking_consumes_the_latest_value() {
+        let mut latest = LatestReport::default();
+        latest.publish("first");
+        latest.publish("second");
+        assert_eq!(latest.pending.take().unwrap().value, "second");
+        assert!(latest.pending.take().is_none());
+    }
+
+    #[test]
+    fn the_current_report_can_be_replayed_after_it_is_taken() {
+        let mut latest = LatestReport::default();
+        latest.publish("current");
+        let abandoned = latest.pending.take().unwrap();
+        latest.replay(abandoned);
+        assert_eq!(latest.pending.take().unwrap().value, "current");
+        assert!(latest.pending.take().is_none());
+    }
+
+    #[test]
+    fn an_older_report_cannot_follow_a_newer_report() {
+        let mut latest = LatestReport::default();
+        let older = latest.report("first");
+        let current = latest.report("second");
+        latest.replay(older);
+        assert!(latest.pending.is_none());
+        latest.replay(current);
+        assert_eq!(latest.pending.take().unwrap().value, "second");
+    }
+
+    #[test]
+    fn only_the_newest_abandoned_value_is_replayed() {
+        let mut latest = LatestReport::default();
+        let older = latest.report("first");
+        let current = latest.report("second");
+        latest.replay(current);
+        latest.replay(older);
+        assert_eq!(latest.pending.take().unwrap().value, "second");
+        assert!(latest.pending.is_none());
+    }
+
+    #[test]
+    fn taking_a_newer_publication_does_not_readmit_an_older_report() {
+        let mut latest = LatestReport::default();
+        latest.publish(1);
+        let old = latest.pending.take().unwrap();
+        latest.publish(2);
+        latest.replay(old);
+        let current = latest.pending.take().unwrap();
+        assert_eq!(current.value, 2);
+        latest.publish(3);
+        assert_eq!(latest.pending.take().unwrap().value, 3);
+        latest.replay(current);
+        assert!(latest.pending.is_none());
+    }
+
+    #[test]
+    fn replay_order_survives_sequence_wrap() {
+        let mut latest = LatestReport {
+            sequence: u64::MAX - 1,
+            pending: None,
+        };
+        let before_wrap = latest.report("before wrap");
+        assert_eq!(before_wrap.sequence, u64::MAX);
+        latest.replay(before_wrap);
+        let abandoned = latest.pending.take().unwrap();
+        let wrapped = latest.report("wrapped");
+        assert_eq!(wrapped.sequence, 0);
+        latest.replay(abandoned);
+        assert!(latest.pending.is_none());
+        latest.replay(wrapped);
+        let abandoned = latest.pending.take().unwrap();
+        assert_eq!(abandoned.value, "wrapped");
+        latest.publish("after wrap");
+        latest.replay(abandoned);
+        assert_eq!(latest.pending.take().unwrap().value, "after wrap");
     }
 }
 
@@ -3392,24 +3475,6 @@ mod tests {
         }
 
         #[test]
-        fn an_older_source_name_replay_cannot_follow_a_newer_native_report() {
-            let Some(ndi) = crate::test_support::ndi() else {
-                return;
-            };
-            let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-            let first = poll(&receiver.core, Some(c"first")).unwrap();
-            let second = poll(&receiver.core, Some(c"second")).unwrap();
-            assert_eq!(second.value, SourceNameChange::Connected("second".into()));
-            receiver.core.retain_source_name_change(first);
-            assert!(poll(&receiver.core, None).is_none());
-            receiver.core.retain_source_name_change(second);
-            assert_eq!(
-                poll(&receiver.core, None).unwrap().value,
-                SourceNameChange::Connected("second".into())
-            );
-        }
-
-        #[test]
         fn only_the_newest_abandoned_name_precedes_a_native_query() {
             let Some(ndi) = crate::test_support::ndi() else {
                 return;
@@ -3479,25 +3544,6 @@ mod tests {
                 );
                 assert!(poll(&receiver.core, None).is_none());
             });
-        }
-
-        #[test]
-        fn replayed_unknown_events_do_not_replace_newer_publications() {
-            let Some(ndi) = crate::test_support::ndi() else {
-                return;
-            };
-            let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-            receiver.core.retain(Notification::Unknown(1));
-            let old = receiver.core.take_pending_event_report().unwrap().unwrap();
-            receiver.core.retain(Notification::Unknown(2));
-            receiver.core.retain_event(old);
-            let latest = receiver.core.take_pending_event_report().unwrap().unwrap();
-            assert_eq!(latest.value, ReceiverEvent::Unknown(2));
-            // Taking the latest value does not let a still older replay back in.
-            receiver.core.retain(Notification::Unknown(3));
-            receiver.core.take_pending_event().unwrap();
-            receiver.core.retain_event(latest);
-            assert_eq!(receiver.core.take_pending_event().unwrap(), None);
         }
     }
 

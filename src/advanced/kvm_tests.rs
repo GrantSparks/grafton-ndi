@@ -1,38 +1,42 @@
 //! Input ownership at the native boundary, including failed release and drop.
 
 use super::*;
-use std::time::Duration;
-use crate::{sys::advanced::Kvm, ReceiverOptions};
-use std::{cell::RefCell, ffi::CStr};
+use std::cell::RefCell;
+#[cfg(ndi_has_advanced_kvm)]
+use std::ffi::CStr;
 
 #[derive(Default)]
-struct Calls {
-    instances: Vec<usize>,
+pub(super) struct Calls {
+    pub(super) instances: Vec<usize>,
     keys: Vec<i32>,
     releases: usize,
     touches: Vec<f32>,
     touch_updates: usize,
     touch_finishes: usize,
     mouse_releases: usize,
-    clipboard: String,
+    #[cfg(ndi_has_advanced_kvm)]
+    pub(super) clipboard: String,
     fail_key_once: bool,
     fail_buttons: usize,
     fail_touch_once: bool,
 }
-thread_local! { static CALLS: RefCell<Calls> = RefCell::default(); }
+thread_local! { pub(super) static CALLS: RefCell<Calls> = RefCell::default(); }
 
 fn record(instance: NDIlib_recv_instance_t) {
     CALLS.with_borrow_mut(|calls| calls.instances.push(instance as usize));
 }
 
+#[cfg(ndi_has_advanced_kvm)]
 unsafe extern "C" fn accept(instance: NDIlib_recv_instance_t) -> bool {
     record(instance);
     true
 }
+#[cfg(ndi_has_advanced_kvm)]
 unsafe extern "C" fn scalar(instance: NDIlib_recv_instance_t, _: f32) -> bool {
     record(instance);
     true
 }
+#[cfg(ndi_has_advanced_kvm)]
 unsafe extern "C" fn position(instance: NDIlib_recv_instance_t, _: *const f32) -> bool {
     record(instance);
     true
@@ -88,6 +92,7 @@ unsafe extern "C" fn finish_touch(instance: NDIlib_recv_instance_t) -> bool {
         !std::mem::take(&mut calls.fail_touch_once)
     })
 }
+#[cfg(ndi_has_advanced_kvm)]
 unsafe extern "C" fn clipboard(
     instance: NDIlib_recv_instance_t,
     value: *const std::ffi::c_char,
@@ -99,7 +104,8 @@ unsafe extern "C" fn clipboard(
     true
 }
 
-static TABLE: Kvm = Kvm {
+#[cfg(ndi_has_advanced_kvm)]
+pub(super) static TABLE: Kvm = Kvm {
     NDIlib_recv_kvm_is_supported: accept,
     NDIlib_recv_kvm_send_left_mouse_click: accept,
     NDIlib_recv_kvm_send_middle_mouse_click: accept,
@@ -117,23 +123,120 @@ static TABLE: Kvm = Kvm {
     NDIlib_recv_kvm_send_keyboard_release: release,
 };
 
+/// The same callbacks are usable without an Advanced SDK declaration table.
+struct TestSender;
+
+impl InputSender for TestSender {
+    fn key(&self, instance: NDIlib_recv_instance_t, value: i32, down: bool) -> Result<()> {
+        let (accepted, operation) = if down {
+            // SAFETY: these synthetic callbacks only record their arguments.
+            (
+                unsafe { key(instance, value) },
+                c"NDIlib_recv_kvm_send_keyboard_press",
+            )
+        } else {
+            (
+                unsafe { release(instance, value) },
+                c"NDIlib_recv_kvm_send_keyboard_release",
+            )
+        };
+        crate::sys::table::for_test(accepted, operation).performed()
+    }
+
+    fn mouse(
+        &self,
+        instance: NDIlib_recv_instance_t,
+        button: MouseButton,
+        down: bool,
+    ) -> Result<()> {
+        if down {
+            record(instance);
+            return Ok(());
+        }
+        let (accepted, operation) = match button {
+            // SAFETY: these synthetic callbacks only record their arguments.
+            MouseButton::Left => (
+                unsafe { left_release(instance) },
+                c"NDIlib_recv_kvm_send_left_mouse_release",
+            ),
+            MouseButton::Middle => (
+                unsafe { middle_release(instance) },
+                c"NDIlib_recv_kvm_send_middle_mouse_release",
+            ),
+            MouseButton::Right => (
+                unsafe { right_release(instance) },
+                c"NDIlib_recv_kvm_send_right_mouse_release",
+            ),
+        };
+        crate::sys::table::for_test(accepted, operation).performed()
+    }
+
+    fn touch(
+        &self,
+        instance: NDIlib_recv_instance_t,
+        count: i32,
+        points: &[[f32; 2]],
+    ) -> Result<()> {
+        // SAFETY: HeldInputs lends this validated count of initialized pairs.
+        let accepted = unsafe { touch(instance, count, points.as_ptr().cast()) };
+        crate::sys::table::for_test(accepted, c"NDIlib_recv_kvm_send_touch_positions").performed()
+    }
+
+    fn finish_touch(&self, instance: NDIlib_recv_instance_t) -> Result<()> {
+        // SAFETY: the synthetic callback only records its instance argument.
+        let accepted = unsafe { finish_touch(instance) };
+        crate::sys::table::for_test(accepted, c"NDIlib_recv_kvm_send_touch_finish").performed()
+    }
+}
+
+struct TestSession {
+    instance: NDIlib_recv_instance_t,
+    held: HeldInputs,
+}
+
+impl TestSession {
+    fn new(instance: NDIlib_recv_instance_t) -> Self {
+        Self {
+            instance,
+            held: HeldInputs::default(),
+        }
+    }
+
+    fn key_down(&mut self, keysym: u32) -> Result<()> {
+        self.held
+            .key(self.instance, &TestSender, key_symbol(keysym)?, true)
+    }
+
+    fn mouse_down(&mut self, button: MouseButton) -> Result<()> {
+        self.held.mouse(self.instance, &TestSender, button, true)
+    }
+
+    fn touch(&mut self, points: &[[f32; 2]]) -> Result<()> {
+        self.held.touch(self.instance, &TestSender, points)
+    }
+
+    fn release_all(&mut self) -> Result<()> {
+        self.held.release_all(self.instance, &TestSender)
+    }
+}
+
+impl Drop for TestSession {
+    fn drop(&mut self) {
+        // The native session retries these same held inputs before its
+        // receiver borrow ends; this session lends only synthetic storage.
+        self.held.release_on_drop(self.instance, &TestSender);
+    }
+}
+
 #[test]
 fn empty_touch_finishes_and_failed_lifts_are_retried() {
-    let Some(ndi) = crate::test_support::ndi() else {
-        return;
-    };
-    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap())).unwrap();
+    let instance_storage = 0u8;
+    let instance = std::ptr::from_ref(&instance_storage).cast_mut().cast();
     for retry_on_drop in [false, true] {
         CALLS.with_borrow_mut(|calls| *calls = Calls::default());
-        let mut session = KvmSession {
-            receiver: &receiver,
-            kvm: &TABLE,
-            keys: BTreeSet::new(),
-            buttons: BTreeSet::new(),
-            touching: false,
-        };
+        let mut session = TestSession::new(instance);
         session.touch(&[]).unwrap();
-        assert!(!session.touching);
+        assert!(!session.held.touching);
         session.touch(&[[0.25, 0.5]]).unwrap();
         CALLS.with_borrow_mut(|calls| calls.fail_touch_once = true);
         assert!(matches!(
@@ -141,10 +244,10 @@ fn empty_touch_finishes_and_failed_lifts_are_retried() {
             Err(Error::NativeOperationFailed {
                 operation}) if operation.name() == c"NDIlib_recv_kvm_send_touch_finish"
         ));
-        assert!(session.touching);
+        assert!(session.held.touching);
         if !retry_on_drop {
             session.release_all().unwrap();
-            assert!(!session.touching);
+            assert!(!session.held.touching);
         }
         drop(session);
         CALLS.with_borrow(|calls| {
@@ -157,31 +260,18 @@ fn empty_touch_finishes_and_failed_lifts_are_retried() {
 
 #[test]
 fn rejected_releases_are_retained_and_drop_retries_only_the_inputs_still_pressed() {
-    let Some(ndi) = crate::test_support::ndi() else {
-        return;
-    };
-    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap())).unwrap();
+    let instance_storage = 0u8;
+    let instance = std::ptr::from_ref(&instance_storage).cast_mut().cast();
     CALLS.with_borrow_mut(|calls| {
         *calls = Calls {
             fail_key_once: true,
             ..Default::default()
         };
     });
-    let mut session = KvmSession {
-        receiver: &receiver,
-        kvm: &TABLE,
-        keys: BTreeSet::new(),
-        buttons: BTreeSet::new(),
-        touching: false,
-    };
+    let mut session = TestSession::new(instance);
     session.key_down(0xff0d).unwrap();
     session.mouse_down(MouseButton::Left).unwrap();
     session.touch(&[[0.25, 0.5], [0.75, 1.0]]).unwrap();
-    session.set_clipboard_text("clipboard é").unwrap();
-    assert!(matches!(
-        session.set_clipboard_text("bad\0text"),
-        Err(Error::InvalidCString(_))
-    ));
     // The first key release is refused: the session says which function,
     // keeps the key, and still releases the rest.
     assert!(matches!(
@@ -189,42 +279,30 @@ fn rejected_releases_are_retained_and_drop_retries_only_the_inputs_still_pressed
         Err(Error::NativeOperationFailed {
             operation}) if operation.name() == c"NDIlib_recv_kvm_send_keyboard_release"
     ));
-    assert_eq!(session.keys.len(), 1);
-    assert!(session.buttons.is_empty());
-    assert!(!session.touching);
+    assert_eq!(session.held.keys.len(), 1);
+    assert!(session.held.buttons.is_empty());
+    assert!(!session.held.touching);
     drop(session);
     CALLS.with_borrow(|calls| {
-        assert!(calls
-            .instances
-            .iter()
-            .all(|&id| id == receiver.core.instance.0 as usize));
+        assert!(calls.instances.iter().all(|&id| id == instance as usize));
         assert_eq!(calls.keys, [0xff0d]);
         assert_eq!(calls.releases, 2);
         assert_eq!(calls.mouse_releases, 1);
         assert_eq!(calls.touch_finishes, 1);
         assert_eq!(calls.touches, [0.25, 0.5, 0.75, 1.0]);
-        assert_eq!(calls.clipboard, "clipboard é");
     });
 }
 
 #[test]
 fn every_held_input_combination_retries_only_failed_releases() {
-    let Some(ndi) = crate::test_support::ndi() else {
-        return;
-    };
-    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap())).unwrap();
+    let instance_storage = 0u8;
+    let instance = std::ptr::from_ref(&instance_storage).cast_mut().cast();
     // A key, each of the three mouse buttons, and a touch, independently held.
     for held in 0u32..32 {
         // Independently refuse each held input's first release.
         for failures in 0u32..32 {
             CALLS.with_borrow_mut(|calls| *calls = Calls::default());
-            let mut session = KvmSession {
-                receiver: &receiver,
-                kvm: &TABLE,
-                keys: BTreeSet::new(),
-                buttons: BTreeSet::new(),
-                touching: false,
-            };
+            let mut session = TestSession::new(instance);
             if held & 1 != 0 {
                 session.key_down(0xffe1).unwrap();
             }
@@ -250,15 +328,15 @@ fn every_held_input_combination_retries_only_failed_releases() {
                 session.release_all().is_err(),
                 key_failed || buttons_failed > 0 || touch_failed
             );
-            assert_eq!(session.keys.len(), usize::from(key_failed));
-            assert_eq!(session.buttons.len(), buttons_failed);
+            assert_eq!(session.held.keys.len(), usize::from(key_failed));
+            assert_eq!(session.held.buttons.len(), buttons_failed);
             for (index, button) in buttons.into_iter().enumerate() {
                 assert_eq!(
-                    session.buttons.contains(&button),
+                    session.held.buttons.contains(&button),
                     held & failures & (2 << index) != 0
                 );
             }
-            assert_eq!(session.touching, touch_failed);
+            assert_eq!(session.held.touching, touch_failed);
             // Exercise both explicit retry and Drop's retry.
             if held % 2 == 0 {
                 session.release_all().unwrap();
@@ -274,56 +352,8 @@ fn every_held_input_combination_retries_only_failed_releases() {
                     calls.touch_finishes,
                     usize::from(held & 16 != 0) + usize::from(touch_failed)
                 );
-                assert!(calls
-                    .instances
-                    .iter()
-                    .all(|&id| id == receiver.core.instance.0 as usize));
+                assert!(calls.instances.iter().all(|&id| id == instance as usize));
             });
         }
     }
-}
-
-#[test]
-fn restricted_views_and_rejected_captures_add_no_allocations_or_native_calls() {
-    let Some(ndi) = crate::test_support::ndi() else {
-        return;
-    };
-    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap())).unwrap();
-    CALLS.with_borrow_mut(|calls| *calls = Calls::default());
-    let session = KvmSession {
-        receiver: &receiver,
-        kvm: &TABLE,
-        keys: BTreeSet::new(),
-        buttons: BTreeSet::new(),
-        touching: false,
-    };
-    let invalid = crate::MAX_TIMEOUT + Duration::from_millis(1);
-    let (view, allocations) = crate::test_alloc::allocation_count(|| {
-        let view = session.receiver();
-        assert!(view.capture_video_ref(invalid).is_err());
-        assert!(view.capture_audio_ref(invalid).is_err());
-        assert!(view.capture_metadata_ref(invalid).is_err());
-        let _ = view.ptz();
-        view
-    });
-    assert_eq!(allocations, 0);
-    assert_eq!(
-        std::mem::size_of_val(&view),
-        std::mem::size_of::<&Receiver>()
-    );
-    CALLS.with_borrow(|calls| assert!(calls.instances.is_empty()));
-    // Compare delegated controls with the same operation on the owner.
-    let (_, allocations) = crate::test_alloc::allocation_count(|| {
-        assert_eq!(view.is_connected(), receiver.is_connected());
-        view.set_tally(crate::Tally::new(false, true));
-    });
-    assert_eq!(allocations, 0);
-    let invalid = crate::MAX_TIMEOUT + Duration::from_millis(1);
-    let (_, direct) = crate::test_alloc::allocation_count(|| {
-        assert!(receiver.capture_video_ref(invalid).is_err());
-    });
-    let (_, forwarded) = crate::test_alloc::allocation_count(|| {
-        assert!(view.capture_video_ref(invalid).is_err());
-    });
-    assert_eq!(forwarded, direct);
 }
