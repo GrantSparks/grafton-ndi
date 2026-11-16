@@ -18,9 +18,18 @@ is included, so enabling `file-io` alone does not generate bindings.
 
 Open it with `FileApi::new(&ndi, &FileApiOptions::default())`. On targets
 that load libraries dynamically, discovery tries the selected runtime's
-directory, the executable's directory, `NDI_RUNTIME_DIR_V6`, then the platform
-loader. A relative `NDI_RUNTIME_DIR_V6` is recorded as refused and never
-searched. `FileApiOptions::library_path` selects one absolute file without
+directory, the executable's directory and an absolute `NDI_RUNTIME_DIR_V6`.
+Windows then expands absolute `PATH` entries and tries a System32-only name
+lookup. macOS tries `@rpath/<name>` and absolute `DYLD_LIBRARY_PATH` entries.
+Linux and Android retain their native loader search (`rpath`,
+`LD_LIBRARY_PATH` and system locations). Windows and macOS never add the
+working directory to this search. Relative or empty environment directory
+entries on Windows/macOS, and a relative `NDI_RUNTIME_DIR_V6` on any platform,
+are recorded as refused and never opened. In unrestricted macOS processes,
+dyld can substitute `DYLD_LIBRARY_PATH` even for an absolute path; the crate
+refuses a substitute with `LoadRefusal::ResolvedToAnotherFile`. Native
+dependencies still follow platform loader rules.
+`FileApiOptions::library_path` selects one absolute file without
 fallback. A successful selection lasts for the process; a later conflicting
 selection returns `RuntimeConflict`. Use trusted library locations, including
 their dependencies, as described in [runtime selection](setup.md#selecting-a-runtime).

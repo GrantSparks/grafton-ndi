@@ -490,11 +490,19 @@ mod shared {
             let runtime_directory = std::env::var_os(RUNTIME_DIRECTORY)
                 .filter(|directory| !directory.is_empty())
                 .map(PathBuf::from);
+            let loader_directories = if cfg!(windows) {
+                std::env::var_os("PATH")
+            } else if cfg!(target_vendor = "apple") {
+                std::env::var_os("DYLD_LIBRARY_PATH")
+            } else {
+                None
+            };
             let plan = search_plan(
                 self.explicit,
                 self.beside.and_then(Path::parent),
                 executable.as_deref().and_then(Path::parent),
                 runtime_directory.as_deref(),
+                loader_directories.as_deref(),
                 self.names,
             );
             let mut failures = Vec::with_capacity(plan.len());
@@ -584,16 +592,32 @@ mod shared {
 
     impl Candidate {
         fn open(&self, search: &Search<'_>) -> std::result::Result<Module, Refusal> {
-            // A relative environment directory is a refused location, never
-            // a request to load code relative to the working directory.
-            if self.origin == Origin::RuntimeDirectory && !self.location.is_absolute() {
-                return Err(Refusal::unloaded(LoadRefusal::RelativeRuntimeDirectory));
+            // Environment directories name exact absolute files. Refuse
+            // relative/empty entries before opening anything: they never ask
+            // for code relative to the working directory. Only Unix's native
+            // search and Apple's @rpath, or Windows' System32-only search,
+            // may resolve a non-absolute candidate through the platform loader.
+            if !self.location.is_absolute() {
+                let refusal = match self.origin {
+                    Origin::RuntimeDirectory => Some(LoadRefusal::RelativeRuntimeDirectory),
+                    Origin::PathDirectory | Origin::DyldLibraryDirectory => {
+                        Some(LoadRefusal::RelativeSearchDirectory)
+                    }
+                    _ => None,
+                };
+                if let Some(refusal) = refusal {
+                    return Err(Refusal::unloaded(refusal));
+                }
             }
             // A directory candidate names one exact file. Skipping an absent
             // one keeps the loader from searching elsewhere for that path.
             if matches!(
                 self.origin,
-                Origin::Companion | Origin::Executable | Origin::RuntimeDirectory
+                Origin::Companion
+                    | Origin::Executable
+                    | Origin::RuntimeDirectory
+                    | Origin::PathDirectory
+                    | Origin::DyldLibraryDirectory
             ) && !self.location.is_file()
             {
                 return Err(Refusal::unloaded(LoadRefusal::Absent));
@@ -659,6 +683,7 @@ mod shared {
         companion_directory: Option<&Path>,
         executable_directory: Option<&Path>,
         runtime_directory: Option<&Path>,
+        loader_directories: Option<&OsStr>,
         names: &[&str],
     ) -> Vec<Candidate> {
         if let Some(path) = explicit {
@@ -696,8 +721,33 @@ mod shared {
                 add(Path::new("@rpath").join(name), Origin::LoaderSearch);
             }
         }
-        for name in names {
-            add(PathBuf::from(name), Origin::LoaderSearch);
+        // Expand only absolute environment directories on Windows and Apple
+        // targets; their bare-name searches would also trust the working
+        // directory. Preserve refused inputs in the plan for diagnostics.
+        if cfg!(any(windows, target_vendor = "apple")) {
+            let origin = if cfg!(windows) {
+                Origin::PathDirectory
+            } else {
+                Origin::DyldLibraryDirectory
+            };
+            if let Some(directories) = loader_directories {
+                for directory in std::env::split_paths(directories) {
+                    if !directory.is_absolute() {
+                        add(directory, origin);
+                        continue;
+                    }
+                    for name in names {
+                        add(directory.join(name), origin);
+                    }
+                }
+            }
+        }
+        if !cfg!(target_vendor = "apple") {
+            // Windows limits this final leaf to System32; non-Apple Unix
+            // retains its native rpath/environment/cache search.
+            for name in names {
+                add(PathBuf::from(name), Origin::LoaderSearch);
+            }
         }
         plan
     }
@@ -832,13 +882,16 @@ mod shared {
     fn open_library(
         location: &OsStr,
     ) -> std::result::Result<(libloading::Library, usize), libloading::Error> {
-        use libloading::os::windows::{Library, LOAD_WITH_ALTERED_SEARCH_PATH};
-        // A full path resolves the library's own dependencies beside it; a bare
-        // name uses the standard search order.
+        use libloading::os::windows::{
+            Library, LOAD_LIBRARY_SEARCH_SYSTEM32, LOAD_WITH_ALTERED_SEARCH_PATH,
+        };
+        // Exact paths resolve dependencies beside the library. A final leaf
+        // may match a loaded module or System32, never the working directory
+        // or PATH (whose absolute entries were already expanded).
         let flags = if Path::new(location).is_absolute() {
             LOAD_WITH_ALTERED_SEARCH_PATH
         } else {
-            0
+            LOAD_LIBRARY_SEARCH_SYSTEM32
         };
         // SAFETY: loading runs the library's initialization routine. Callers
         // select a trusted NDI runtime.
@@ -942,6 +995,7 @@ mod shared {
                 Some(Path::new("/core")),
                 Some(Path::new("/app")),
                 Some(runtime_directory()),
+                None,
                 &["libndi.so.6"],
             );
             assert_eq!(
@@ -957,6 +1011,7 @@ mod shared {
                 None,
                 Some(Path::new("/app")),
                 Some(runtime_directory()),
+                None,
                 &["libndi.so.6"],
             );
             let mut expected = vec![
@@ -969,13 +1024,15 @@ mod shared {
             if cfg!(target_vendor = "apple") {
                 expected.push((PathBuf::from("@rpath/libndi.so.6"), Origin::LoaderSearch));
             }
-            expected.push((PathBuf::from("libndi.so.6"), Origin::LoaderSearch));
+            if !cfg!(target_vendor = "apple") {
+                expected.push((PathBuf::from("libndi.so.6"), Origin::LoaderSearch));
+            }
             assert_eq!(locations(&plan), expected);
         }
 
         #[test]
         fn the_loader_search_remains_when_no_directory_is_known() {
-            let plan = search_plan(None, None, None, None, &["libndi.so.6"]);
+            let plan = search_plan(None, None, None, None, None, &["libndi.so.6"]);
             assert_eq!(
                 plan.last().map(|candidate| candidate.origin),
                 Some(Origin::LoaderSearch)
@@ -985,6 +1042,74 @@ mod shared {
                 .all(|candidate| candidate.origin == Origin::LoaderSearch));
         }
 
+        #[cfg(target_vendor = "apple")]
+        #[test]
+        fn apple_search_contains_only_absolute_files_and_rpaths() {
+            let directories = OsStr::new("/opt/ndi:/Library/NDI");
+            let plan = search_plan(
+                None,
+                None,
+                None,
+                None,
+                Some(directories),
+                &["libndi.dylib", "libndi_advanced.dylib"],
+            );
+            assert!(plan.iter().all(|candidate| {
+                candidate.location.is_absolute() || candidate.location.starts_with("@rpath")
+            }));
+            assert_eq!(plan[2].location, Path::new("/opt/ndi/libndi.dylib"));
+            assert_eq!(plan[2].origin, Origin::DyldLibraryDirectory);
+        }
+
+        #[cfg(any(windows, target_vendor = "apple"))]
+        #[test]
+        fn loader_environment_directories_are_expanded_or_refused_before_opening() {
+            let absolute = runtime_directory();
+            let directories =
+                std::env::join_paths([absolute, Path::new("relative"), Path::new("")]).unwrap();
+            let plan = search_plan(
+                None,
+                None,
+                None,
+                None,
+                Some(&directories),
+                &["first", "second"],
+            );
+            let origin = if cfg!(windows) {
+                Origin::PathDirectory
+            } else {
+                Origin::DyldLibraryDirectory
+            };
+            let entries: Vec<_> = plan
+                .iter()
+                .filter(|candidate| candidate.origin == origin)
+                .collect();
+            assert_eq!(entries.len(), 4);
+            assert_eq!(entries[0].location, absolute.join("first"));
+            assert_eq!(entries[1].location, absolute.join("second"));
+            assert_eq!(entries[2].location, Path::new("relative"));
+            assert!(entries[3].location.as_os_str().is_empty());
+            let search = Search {
+                kind: LibraryKind::Runtime,
+                explicit: None,
+                beside: None,
+                names: &["first", "second"],
+                anchor: CORE_ANCHOR,
+                description: "NDI runtime",
+            };
+            for candidate in &entries[2..] {
+                let refusal = match candidate.open(&search) {
+                    Ok(_) => panic!("relative search directory was opened"),
+                    Err(refusal) => refusal,
+                };
+                assert!(refusal.loaded.is_none());
+                assert_eq!(refusal.reason, LoadRefusal::RelativeSearchDirectory);
+                let diagnostic = candidate.describe(refusal).to_string();
+                assert!(diagnostic.contains(&origin.to_string()), "{diagnostic}");
+                assert!(diagnostic.contains("absolute and nonempty"), "{diagnostic}");
+            }
+        }
+
         #[test]
         fn a_relative_runtime_directory_is_recorded_but_never_opened() {
             let plan = search_plan(
@@ -992,6 +1117,7 @@ mod shared {
                 None,
                 None,
                 Some(Path::new("relative")),
+                None,
                 &["libndi.so.6", "libndi_advanced.so.6"],
             );
             let refused = &plan[0];
@@ -1029,6 +1155,7 @@ mod shared {
                 None,
                 Some(directory.as_path()),
                 Some(directory.as_path()),
+                None,
                 &["libndi.so.6"],
             );
             let bundled = plan
@@ -1045,6 +1172,7 @@ mod shared {
                 Some(Path::new("/core")),
                 Some(Path::new("/app")),
                 Some(runtime_directory()),
+                None,
                 &["libndifile.so.6"],
             );
             assert_eq!(
@@ -1071,6 +1199,7 @@ mod shared {
                 None,
                 Some(Path::new("/app")),
                 Some(runtime_directory()),
+                None,
                 &["libndi.so.6", "libndi_advanced.so.6"],
             );
             let mut expected = vec![
@@ -1095,8 +1224,10 @@ mod shared {
                     Origin::LoaderSearch,
                 ));
             }
-            expected.push((PathBuf::from("libndi.so.6"), Origin::LoaderSearch));
-            expected.push((PathBuf::from("libndi_advanced.so.6"), Origin::LoaderSearch));
+            if !cfg!(target_vendor = "apple") {
+                expected.push((PathBuf::from("libndi.so.6"), Origin::LoaderSearch));
+                expected.push((PathBuf::from("libndi_advanced.so.6"), Origin::LoaderSearch));
+            }
             assert_eq!(locations(&plan), expected);
         }
 

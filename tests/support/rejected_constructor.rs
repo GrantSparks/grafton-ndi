@@ -5,5 +5,7 @@ extern "C" fn mark_load() {
     }
 }
 #[used]
-#[link_section = ".init_array"]
+#[cfg_attr(windows, link_section = ".CRT$XCU")]
+#[cfg_attr(target_vendor = "apple", link_section = "__DATA,__mod_init_func")]
+#[cfg_attr(all(unix, not(target_vendor = "apple")), link_section = ".init_array")]
 static INITIALIZE: extern "C" fn() = mark_load;

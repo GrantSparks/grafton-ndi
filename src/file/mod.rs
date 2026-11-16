@@ -28,7 +28,17 @@
 //! 2. the directory containing the running executable;
 //! 3. the absolute directory named by `NDI_RUNTIME_DIR_V6`; relative values
 //!    are recorded as refused locations and never searched;
-//! 4. the platform loader's own search for the library name.
+//! 4. platform-specific locations: Windows expands absolute `PATH` directories,
+//!    then performs a System32-only name lookup; macOS tries `@rpath/<name>`
+//!    and absolute `DYLD_LIBRARY_PATH` directories; Linux and Android retain
+//!    the native loader search (`rpath`, `LD_LIBRARY_PATH` and system locations).
+//!
+//! Windows and macOS never add the working directory to this search. Relative
+//! or empty `PATH`/`DYLD_LIBRARY_PATH` entries are recorded as refused locations.
+//! In unrestricted macOS processes dyld can substitute `DYLD_LIBRARY_PATH`
+//! even for an absolute path; the crate refuses a substitute with
+//! [`crate::LoadRefusal::ResolvedToAnotherFile`]. Native dependencies still
+//! follow platform loader rules.
 //!
 //! When nothing is usable, [`Error::RuntimeLoadFailed`] carries a
 //! [`crate::LoadFailure`] for [`crate::LibraryKind::File`], with each attempted
