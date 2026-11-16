@@ -366,7 +366,7 @@ struct HeldOwner {
 
 impl Owner for HeldOwner {
     type Finish = std::convert::Infallible;
-    fn finish(&mut self, finish: Self::Finish) {
+    fn finish_request(&mut self, finish: Self::Finish) {
         match finish {}
     }
     type Event = ();
