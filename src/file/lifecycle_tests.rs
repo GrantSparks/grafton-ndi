@@ -1381,6 +1381,138 @@ fn acl_denied_windows_recording_directories_never_reach_the_sdk() {
     unwritable_directory_is_refused_before_native_calls(&directory);
 }
 
+#[cfg(windows)]
+#[test]
+fn low_integrity_recording_honours_the_directory_label() {
+    use std::{
+        mem::size_of,
+        os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        ptr,
+    };
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::ConvertStringSidToSidA, DuplicateTokenEx, GetLengthSid,
+            ImpersonateLoggedOnUser, RevertToSelf, SecurityImpersonation, SetTokenInformation,
+            TokenImpersonation, TokenIntegrityLevel, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT,
+            TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    // winnt.h's integrity-group attribute; windows-sys exposes it only with
+    // SystemServices, which the production library does not otherwise need.
+    const SE_GROUP_INTEGRITY: u32 = 0x20;
+
+    struct Revert;
+    impl Drop for Revert {
+        fn drop(&mut self) {
+            // SAFETY: this guard is confined to the thread impersonated below.
+            assert_ne!(unsafe { RevertToSelf() }, 0);
+        }
+    }
+    struct Sid(windows_sys::Win32::Security::PSID);
+    impl Drop for Sid {
+        fn drop(&mut self) {
+            // SAFETY: ConvertStringSidToSidA returned this allocation once.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+    fn succeeded(value: i32) {
+        assert_ne!(value, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    let directory = Directory::new("integrity-windows");
+    for (name, label) in [("low", "(OI)(CI)L"), ("medium", "(OI)(CI)M")] {
+        let child = directory.0.join(name);
+        std::fs::create_dir(&child).unwrap();
+        let output = std::process::Command::new("icacls")
+            .arg(&child)
+            .args(["/setintegritylevel", label, "/q"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "icacls: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let device = mock::Recorder::new(Closing::AtStop);
+    device.install();
+    let mut recorder = FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
+    let low = directory.target("low/take.mkv");
+    let medium = directory.target("medium/take.mkv");
+
+    let mut process_token = ptr::null_mut();
+    // SAFETY: the process pseudo-handle is live and the out handle is writable.
+    succeeded(unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY,
+            &mut process_token,
+        )
+    });
+    // SAFETY: the successful open returned one owned token handle.
+    let process_token = unsafe { OwnedHandle::from_raw_handle(process_token) };
+    let mut token = ptr::null_mut();
+    // SAFETY: duplicate only this process's identity; every input stays live.
+    succeeded(unsafe {
+        DuplicateTokenEx(
+            process_token.as_raw_handle(),
+            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_ADJUST_DEFAULT,
+            ptr::null(),
+            SecurityImpersonation,
+            TokenImpersonation,
+            &mut token,
+        )
+    });
+    // SAFETY: DuplicateTokenEx returned one distinct owned handle.
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut sid = ptr::null_mut();
+    // SAFETY: the constant SID is terminated and the output is writable.
+    succeeded(unsafe { ConvertStringSidToSidA(c"S-1-16-4096".as_ptr().cast(), &mut sid) });
+    let sid = Sid(sid);
+    let label = TOKEN_MANDATORY_LABEL {
+        Label: SID_AND_ATTRIBUTES {
+            Sid: sid.0,
+            Attributes: SE_GROUP_INTEGRITY,
+        },
+    };
+    // SAFETY: the SID came from a successful conversion and stays live.
+    let label_bytes = size_of::<TOKEN_MANDATORY_LABEL>() as u32 + unsafe { GetLengthSid(sid.0) };
+    // SAFETY: this writable duplicate has TOKEN_ADJUST_DEFAULT; label and its
+    // referenced SID remain live for the call, and its integrity is only lowered.
+    succeeded(unsafe {
+        SetTokenInformation(
+            token.as_raw_handle(),
+            TokenIntegrityLevel,
+            (&label as *const TOKEN_MANDATORY_LABEL).cast(),
+            label_bytes,
+        )
+    });
+    // SAFETY: the duplicate is an impersonation token for this process's user.
+    succeeded(unsafe { ImpersonateLoggedOnUser(token.as_raw_handle()) });
+    let revert = Revert;
+
+    // The real kernel evaluates the same DACL with two different labels.
+    // Only the low-labelled directory permits creation by the lowered token.
+    assert_eq!(
+        io_kind(recorder.start(&medium, RecordingTimecode::Preserve)),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(device.starts.load(Ordering::Acquire), 0);
+    recorder.start(&low, RecordingTimecode::Preserve).unwrap();
+    assert_eq!(device.starts.load(Ordering::Acquire), 1);
+    assert_eq!(
+        io_kind(recorder.rollover(&medium)),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
+    assert_eq!(recorder.state(), RecorderState::Recording);
+    drop(revert);
+}
+
 #[test]
 fn values_a_refused_call_was_given_stay_with_the_caller_to_pass_again() {
     let directory = Directory::new("borrowed");
