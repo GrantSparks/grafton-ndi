@@ -202,7 +202,7 @@ mod tests {
         assert!(!longest.is_expired());
         assert_eq!(longest.end(), start + MAX_TIMEOUT);
         // Rounded up, the time left is still the full budget, never u32::MAX.
-        assert_eq!(longest.remaining_ms(), u32::MAX - 1);
+        assert_eq!(sdk_millis(longest.remaining_at(start)), Some(u32::MAX - 1));
 
         // A sub-millisecond remainder waits a whole millisecond.
         let short = Deadline::after(Duration::from_nanos(1)).unwrap();

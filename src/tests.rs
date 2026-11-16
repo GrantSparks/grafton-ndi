@@ -99,15 +99,6 @@ fn test_video_frame_standard_format_size_calculation() {
 }
 
 #[test]
-fn test_video_frame_size_calculation_logic() {
-    // CORRECTNESS: Verify size calculation uses line_stride * height for standard formats
-    // and data_size_in_bytes directly for compressed formats, preventing over-allocation
-
-    let correct_size = 1920 * 4 * 1080;
-    assert!(correct_size < 10_000_000);
-}
-
-#[test]
 fn test_video_frame_null_data_returns_error() {
     let mut c_frame: NDIlib_video_frame_v2_t = unsafe { std::mem::zeroed() };
     c_frame.p_data = ptr::null_mut();
@@ -127,7 +118,7 @@ fn test_video_frame_null_data_returns_error() {
 }
 
 #[test]
-fn test_video_frame_zero_size_returns_error() {
+fn test_video_frame_negative_stride_returns_error() {
     let mut c_frame: NDIlib_video_frame_v2_t = unsafe { std::mem::zeroed() };
     let mut data = vec![0u8; 100];
     c_frame.p_data = data.as_mut_ptr();
@@ -322,56 +313,6 @@ fn test_tally_round_trips_through_the_sdk_descriptor() {
         assert_eq!((raw.on_program, raw.on_preview), (on_program, on_preview));
     }
     assert_eq!(Tally::default(), Tally::new(false, false));
-}
-
-#[test]
-fn test_async_completion_handler() {
-    use std::sync::{mpsc, Arc, Mutex};
-
-    let (tx, rx) = mpsc::channel();
-    let tx = Arc::new(Mutex::new(tx));
-
-    let handler = Box::new(move |slice: &mut [u8]| {
-        assert!(!slice.is_empty());
-        let _ = tx.lock().unwrap().send(slice.len());
-    });
-
-    let mut buffer = vec![0u8; 1024];
-    let buffer_ptr = buffer.as_mut_ptr();
-    let buffer_len = buffer.len();
-
-    unsafe {
-        let slice = std::slice::from_raw_parts_mut(buffer_ptr, buffer_len);
-        handler(slice);
-    }
-
-    assert_eq!(rx.recv().unwrap(), 1024);
-}
-
-#[test]
-fn test_retry_logic_constants() {
-    // PERF: Validate retry timeout and sleep values for non-blocking behavior
-
-    let per_attempt_timeout_ms = 100;
-    assert!((10..=1000).contains(&per_attempt_timeout_ms));
-
-    let sleep_between_retries_ms = 10;
-    assert!((1..=100).contains(&sleep_between_retries_ms));
-}
-
-#[test]
-fn test_timeout_duration_calculation() {
-    let timeout_ms: u32 = 5000;
-    let timeout_duration = std::time::Duration::from_millis(timeout_ms.into());
-    assert_eq!(timeout_duration.as_millis(), 5000);
-
-    let short_timeout_ms: u32 = 100;
-    let short_duration = std::time::Duration::from_millis(short_timeout_ms.into());
-    assert_eq!(short_duration.as_millis(), 100);
-
-    let long_timeout_ms: u32 = 60_000;
-    let long_duration = std::time::Duration::from_millis(long_timeout_ms.into());
-    assert_eq!(long_duration.as_millis(), 60_000);
 }
 
 #[test]
@@ -634,7 +575,7 @@ fn test_tokio_async_receiver_methods_exist() {
                 .capture_metadata(std::time::Duration::from_secs(5))
                 .await;
 
-            // Liveness / recovery primitives (Issue #997).
+            // Liveness and recovery primitives.
             let _: bool = async_receiver.receiver().is_connected();
             let _stats = async_receiver.receiver().connection_stats().unwrap();
             let _: u64 = async_receiver
@@ -711,7 +652,7 @@ fn test_smol_async_receiver_methods_exist() {
                 .capture_metadata(std::time::Duration::from_secs(5))
                 .await;
 
-            // Liveness / recovery primitives (Issue #997).
+            // Liveness and recovery primitives.
             let _: bool = async_receiver.receiver().is_connected();
             let _stats = async_receiver.receiver().connection_stats().unwrap();
             let _: u64 = async_receiver
