@@ -149,19 +149,22 @@ pub(crate) fn native_count<T: Into<i64>>(count: sys::table::Called<T>) -> Result
     })
 }
 
-/// A coalesced status invalidation and its publication generation.
-/// Validation completes before a compare/exchange consumes that generation;
-/// failed validation or a newer publication therefore leaves status pending.
+/// A coalesced status invalidation, its failure-report bit and publication
+/// generation. Validation completes before a compare/exchange consumes that
+/// generation; a failed snapshot stays pending and reports at most once.
 #[derive(Default)]
 struct PendingStatus(AtomicUsize);
 
 impl PendingStatus {
+    const PENDING: usize = 1;
+    const REPORTED: usize = 2;
+
     fn publish(&self) {
         let mut observed = self.0.load(Ordering::Acquire);
         loop {
             match self.0.compare_exchange_weak(
                 observed,
-                observed.wrapping_add(2) | 1,
+                (observed.wrapping_add(4) & !(Self::PENDING | Self::REPORTED)) | Self::PENDING,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -173,20 +176,55 @@ impl PendingStatus {
 
     #[cfg(test)]
     fn is_pending(&self) -> bool {
-        self.0.load(Ordering::Acquire) & 1 != 0
+        self.0.load(Ordering::Acquire) & Self::PENDING != 0
     }
 
+    #[cfg(test)]
     fn take_with<T>(&self, snapshot: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+        self.take_or_else_with(snapshot, || None)
+    }
+
+    fn take_or_else_with<T>(
+        &self,
+        snapshot: impl FnOnce() -> Result<T>,
+        other: impl FnOnce() -> Option<T>,
+    ) -> Result<Option<T>> {
         let observed = self.0.load(Ordering::Acquire);
-        if observed & 1 == 0 {
+        if observed & Self::PENDING == 0 {
             return Ok(None);
         }
-        let status = snapshot()?;
+        let status = match snapshot() {
+            Ok(status) => status,
+            Err(error) => {
+                // A bad status must not hide an independent notification. Do
+                // not mark its breach reported until a caller receives it.
+                if let Some(other) = other() {
+                    return Ok(Some(other));
+                }
+                if observed & Self::REPORTED != 0 {
+                    return Ok(None);
+                }
+                return match self.0.compare_exchange(
+                    observed,
+                    observed | Self::REPORTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => Err(error),
+                    Err(_) => Ok(None),
+                };
+            }
+        };
         // A failed CAS means another consumer took it or a new generation was
         // published while validating. Neither case may consume that newer event.
         Ok(self
             .0
-            .compare_exchange(observed, observed & !1, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                observed,
+                observed & !(Self::PENDING | Self::REPORTED),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .ok()
             .map(|_| status))
     }
@@ -1147,6 +1185,9 @@ impl Receiver {
     /// [`Error::ConnectionLost`] when the SDK reports a lost connection, and
     /// the same frame-validation errors as typed borrowed capture. Rejected
     /// frames are freed through their matching native free operation.
+    /// [`Error::UnexpectedSdkResult`] reports a negative status connection
+    /// count once per publication. That status stays pending for recovery;
+    /// other events and subsequent media capture remain available.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<ReceiverItemRef<'_>>> {
         self.capture_any_ref_until(Deadline::after(timeout)?, NeverStop)
@@ -1831,7 +1872,9 @@ impl<M: EventMode> Receiver<M> {
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
     /// (~49.7 days), and [`Error::ConnectionLost`] when the SDK reports a lost
     /// connection, or [`Error::UnexpectedSdkResult`] when a status snapshot
-    /// contains a negative native connection count. Its invalidation stays pending.
+    /// contains a negative native connection count, once per publication.
+    /// Its invalidation stays pending for recovery, without hiding other events
+    /// or preventing subsequent native captures.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn next_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
         self.next_event_until(Deadline::after(timeout)?, NeverStop)
@@ -1981,6 +2024,7 @@ impl ReceiverCore {
         self.take_pending_event()
     }
 
+    #[cfg(test)]
     fn take_pending_status(&self) -> Result<Option<ReceiverStatus>> {
         self.pending_status.take_with(|| self.current_status())
     }
@@ -2008,17 +2052,23 @@ impl ReceiverCore {
     }
 
     fn take_pending_event(&self) -> Result<Option<ReceiverEvent>> {
-        if let Some(status) = self.take_pending_status()? {
-            return Ok(Some(ReceiverEvent::StatusChanged(status)));
+        if let Some(event) = self.pending_status.take_or_else_with(
+            || self.current_status().map(ReceiverEvent::StatusChanged),
+            || self.take_pending_non_status_event(),
+        )? {
+            return Ok(Some(event));
         }
+        Ok(self.take_pending_non_status_event())
+    }
+
+    fn take_pending_non_status_event(&self) -> Option<ReceiverEvent> {
         if self.pending_source.swap(false, Ordering::AcqRel) {
-            return Ok(Some(ReceiverEvent::SourceChanged));
+            return Some(ReceiverEvent::SourceChanged);
         }
-        Ok(self
-            .pending_unknown
+        self.pending_unknown
             .lock()
             .take()
-            .map(ReceiverEvent::Unknown))
+            .map(ReceiverEvent::Unknown)
     }
 
     /// The one implementation of [`Receiver::wait_for_source_name_change`], also
@@ -3371,9 +3421,75 @@ mod tests {
                 pending.publish();
                 Err(Error::ConnectionLost)
             })
-            .is_err());
+            .unwrap()
+            .is_none());
         assert!(pending.is_pending());
         assert_eq!(pending.take_with(|| Ok(3)).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn pending_status_reports_each_publication_once_and_retries_validation() {
+        let pending = PendingStatus::default();
+        for _ in 0..2 {
+            pending.publish();
+            assert!(matches!(
+                pending.take_with::<()>(|| Err(Error::ConnectionLost)),
+                Err(Error::ConnectionLost)
+            ));
+            assert!(pending
+                .take_with::<()>(|| Err(Error::ConnectionLost))
+                .unwrap()
+                .is_none());
+            assert!(pending.is_pending());
+        }
+        assert_eq!(pending.take_with(|| Ok(7)).unwrap(), Some(7));
+        assert!(!pending.is_pending());
+    }
+
+    #[test]
+    fn pending_status_defers_failure_reporting_when_another_event_is_ready() {
+        let pending = PendingStatus::default();
+        pending.publish();
+        assert_eq!(
+            pending
+                .take_or_else_with(|| Err(Error::ConnectionLost), || Some(7))
+                .unwrap(),
+            Some(7)
+        );
+        assert!(matches!(
+            pending.take_with::<()>(|| Err(Error::ConnectionLost)),
+            Err(Error::ConnectionLost)
+        ));
+    }
+
+    #[test]
+    fn pending_status_failure_has_one_competing_reporter() {
+        let pending = PendingStatus::default();
+        pending.publish();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        pending
+                            .take_with::<()>(|| {
+                                barrier.wait();
+                                Err(Error::ConnectionLost)
+                            })
+                            .is_err()
+                    })
+                })
+                .collect();
+            assert_eq!(
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .filter(|reported| *reported)
+                    .count(),
+                1
+            );
+        });
+        assert!(pending.is_pending());
     }
 
     #[test]

@@ -317,7 +317,9 @@ impl PacketReceiver {
     /// [`Error::InvalidInput`] when `timeout` exceeds
     /// [`crate::MAX_TIMEOUT`], [`Error::ConnectionLost`] when the SDK reports a
     /// lost connection, and [`Error::InvalidFrame`] when a delivered frame
-    /// fails validation.
+    /// fails validation. [`crate::Error::UnexpectedSdkResult`] reports a
+    /// negative status connection count once per publication. Its event stays
+    /// pending for recovery while other events and media remain available.
     ///
     /// [`Error::InvalidInput`]: crate::Error::InvalidInput
     /// [`Error::ConnectionLost`]: crate::Error::ConnectionLost
@@ -336,7 +338,8 @@ impl PacketReceiver {
     ///
     /// # Errors
     ///
-    /// As for [`Self::capture_any`].
+    /// As for [`Self::capture_any`], including [`crate::Error::UnexpectedSdkResult`]
+    /// once per failed status publication, whose event remains pending.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<PacketItemRef<'_>>> {
         Self::capture_ref_from(&self.receiver, timeout)

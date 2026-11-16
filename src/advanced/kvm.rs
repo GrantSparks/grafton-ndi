@@ -393,7 +393,8 @@ impl<'a> KvmSession<'a, PacketAttached> {
     ///
     /// # Errors
     ///
-    /// As for [`PacketReceiver::capture_any`].
+    /// As for [`PacketReceiver::capture_any`], including [`crate::Error::UnexpectedSdkResult`]
+    /// once per failed status publication, whose event remains pending.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any(&self, timeout: Duration) -> Result<Option<PacketItem>> {
         PacketReceiver::capture_from(self.receiver, timeout)
@@ -404,7 +405,8 @@ impl<'a> KvmSession<'a, PacketAttached> {
     ///
     /// # Errors
     ///
-    /// As for [`PacketReceiver::capture_any_ref`].
+    /// As for [`PacketReceiver::capture_any_ref`], including [`crate::Error::UnexpectedSdkResult`]
+    /// once per failed status publication, whose event remains pending.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<PacketItemRef<'a>>> {
         PacketReceiver::capture_ref_from(self.receiver, timeout)
