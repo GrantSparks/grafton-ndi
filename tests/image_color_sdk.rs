@@ -390,6 +390,72 @@ fn the_sdk_converts_with_bt709_at_every_size_whatever_the_tag_says() {
     }
 }
 
+#[test]
+fn alpha_sources_keep_their_tagged_matrix_with_best_and_fastest() {
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    let (width, height) = (128, 32);
+    // Constant color and alpha keep codec ringing out of this format test.
+    let mut data = [72, 112, 176, 112].repeat(width * height / 2);
+    data.extend(std::iter::repeat_n(192, width * height));
+    let sent = frame(
+        PixelFormat::Uyva,
+        width,
+        height,
+        data,
+        "<ndi_color_info matrix=\"bt_601\" primaries=\"bt_601\" transfer=\"bt_601\"/>",
+    );
+    let received = round_trip(
+        &ndi,
+        "image color alpha",
+        std::slice::from_ref(&sent),
+        &[
+            ReceiverColorFormat::UyvyBgra,
+            ReceiverColorFormat::UyvyRgba,
+            ReceiverColorFormat::Best,
+            ReceiverColorFormat::Fastest,
+        ],
+    );
+    let formats: [PixelFormat; 4] = std::array::from_fn(|i| received[i][0].pixel_format());
+    assert_eq!(formats[0], PixelFormat::Bgra, "{formats:?}");
+    // Windows Standard runtimes can deliver BGRA for UyvyRgba. Either RGB
+    // layout already contains the SDK's conversion for an alpha source.
+    assert!(
+        matches!(formats[1], PixelFormat::Bgra | PixelFormat::Rgba),
+        "{formats:?}"
+    );
+    assert!(
+        matches!(formats[2], PixelFormat::Uyva | PixelFormat::Pa16),
+        "{formats:?}"
+    );
+    assert_eq!(formats[3], PixelFormat::Uyva, "{formats:?}");
+    for frames in &received {
+        assert_eq!(frames[0].color_info().unwrap(), sent.color_info().unwrap());
+    }
+    let tagged = ImageOptions::new(ImageFormat::Png);
+    let bt709 = tagged.clone().color(ColorPolicy::Override {
+        matrix: YuvMatrix::Bt709,
+        range: YuvRange::Limited,
+    });
+    for frames in &received[..2] {
+        let frame = &frames[0];
+        assert_eq!(
+            png_rgb(&frame.encode_image(&tagged).unwrap()),
+            png_rgb(&frame.encode_image(&bt709).unwrap()),
+            "the encoder keeps RGB-received pixels regardless of the tag's matrix"
+        );
+    }
+    for frames in &received[2..] {
+        let frame = &frames[0];
+        let (largest, _) = difference(
+            &png_rgb(&frame.encode_image(&tagged).unwrap()),
+            &png_rgb(&frame.encode_image(&bt709).unwrap()),
+        );
+        assert!(largest > 0, "the tagged matrix must affect YUV pixels");
+    }
+}
+
 /// Chroma that changes only between SpeedHQ's macroblocks, 16 pixels by 8
 /// rows, reaches receivers exactly, so the edges between blocks show how the
 /// SDK sites chroma: repeated chroma keeps them sharp, where interpolation

@@ -129,8 +129,8 @@ pub use {
     },
     runtime::{Ndi, ProcessLifetimeRuntime, Runtime, RuntimeOptions},
     sender::{
-        AudioSendMode, BorrowedVideoFrame, BorrowedVideoFrameBuilder, RawSend, Sender, SenderMode,
-        SenderOptions,
+        AudioSendMode, BorrowedVideoFrame, BorrowedVideoFrameBuilder, RawSend, RawVideo, Sender,
+        SenderMode, SenderOptions,
     },
 };
 

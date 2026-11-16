@@ -105,9 +105,12 @@ already carry that conversion. Encoding keeps those RGB pixels; it cannot
 apply the tag's matrix afterward. The tag still controls HDR refusal and a
 PNG's `cICP` chunk.
 
-When a source's tagged matrix matters, receive YUV with
-`ReceiverColorFormat::UyvyBgra` or `ReceiverColorFormat::UyvyRgba`. Use
-`ReceiverColorFormat::Best` to retain high bit depth and HDR code values.
+`ReceiverColorFormat::UyvyBgra` and `ReceiverColorFormat::UyvyRgba` keep
+opaque sources in YUV, but deliver BGRA or RGBA for sources with alpha.
+When a tagged source may carry alpha, use `ReceiverColorFormat::Fastest`
+for UYVA or `ReceiverColorFormat::Best` for UYVA or PA16. `Best` also retains
+high bit depth and HDR code values. Both deliver individual fields even with
+`allow_video_fields(false)`, so interlaced snapshots may need field assembly.
 
 ### `ndi_color_info`
 

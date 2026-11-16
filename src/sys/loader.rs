@@ -23,6 +23,44 @@ mod file_policy;
 #[cfg(any(not(ndi_link_static), test))]
 pub(crate) use file_policy::FILE_LIBRARY_NEEDS_ADVANCED_RUNTIME;
 
+/// Which dynamically loaded library's native file name is needed.
+#[cfg(not(ndi_link_static))]
+pub(in crate::sys) enum LibraryFile {
+    Runtime(SdkEdition),
+    #[cfg(feature = "file-io")]
+    File,
+}
+
+/// The vendor's native file names, with one row for each platform naming rule.
+#[cfg(not(ndi_link_static))]
+pub(in crate::sys) const fn library_file(kind: LibraryFile) -> &'static str {
+    let names = if cfg!(all(windows, target_pointer_width = "64")) {
+        [
+            "Processing.NDI.Lib.x64.dll",
+            "Processing.NDI.Lib.Advanced.x64.dll",
+            "Processing.NDI.Lib.File.x64.dll",
+        ]
+    } else if cfg!(windows) {
+        [
+            "Processing.NDI.Lib.x86.dll",
+            "Processing.NDI.Lib.Advanced.x86.dll",
+            "Processing.NDI.Lib.File.x86.dll",
+        ]
+    } else if cfg!(target_vendor = "apple") {
+        ["libndi.dylib", "libndi_advanced.dylib", "libndifile.dylib"]
+    } else if cfg!(target_os = "android") {
+        ["libndi.so", "libndi_advanced.so", "libndifile.so"]
+    } else {
+        ["libndi.so.6", "libndi_advanced.so.6", "libndifile.so.6"]
+    };
+    match kind {
+        LibraryFile::Runtime(SdkEdition::Standard) => names[0],
+        LibraryFile::Runtime(SdkEdition::Advanced) => names[1],
+        #[cfg(feature = "file-io")]
+        LibraryFile::File => names[2],
+    }
+}
+
 /// An absolute caller-selected library path, validated before selection.
 #[derive(Clone, Copy)]
 pub(in crate::sys) struct ExplicitLibrary<'a>(&'a Path);
@@ -151,7 +189,7 @@ impl Runtime {
         let info = RuntimeInfo {
             edition,
             linkage: Provider::LINKAGE,
-            library_path: provider.path(),
+            library_path: provider.library_path(),
             raw_version,
             version,
         };
@@ -315,8 +353,12 @@ mod shared {
         }
 
         /// The file the module was loaded from.
-        pub(crate) fn path(&self) -> Option<PathBuf> {
-            Some(self.path.clone())
+        pub(crate) fn path(&self) -> &Path {
+            &self.path
+        }
+
+        pub(super) fn library_path(&self) -> Option<PathBuf> {
+            Some(self.path().to_owned())
         }
 
         /// Where a lookup through this module's handle finds `name`, and the
@@ -602,19 +644,16 @@ mod shared {
             // for code relative to the working directory. Only Unix's native
             // search and Apple's @rpath, or Windows' System32-only search,
             // may resolve a non-absolute candidate through the platform loader.
-            if !self.location.is_absolute() {
-                let refusal = match self.origin {
-                    Origin::RuntimeDirectory => Some(LoadRefusal::RelativeRuntimeDirectory),
-                    Origin::PathDirectory
-                    | Origin::DyldLibraryDirectory
-                    | Origin::DyldFallbackLibraryDirectory => {
-                        Some(LoadRefusal::RelativeSearchDirectory)
-                    }
-                    _ => None,
-                };
-                if let Some(refusal) = refusal {
-                    return Err(Refusal::unloaded(refusal));
-                }
+            if !self.location.is_absolute()
+                && matches!(
+                    self.origin,
+                    Origin::RuntimeDirectory
+                        | Origin::PathDirectory
+                        | Origin::DyldLibraryDirectory
+                        | Origin::DyldFallbackLibraryDirectory
+                )
+            {
+                return Err(Refusal::unloaded(LoadRefusal::RelativeSearchDirectory));
             }
             // A directory candidate names one exact file. Skipping an absent
             // one keeps the loader from searching elsewhere for that path.
@@ -790,34 +829,7 @@ mod shared {
 
     /// The runtime library's file name for this target.
     pub(super) const fn library_name(edition: SdkEdition) -> &'static str {
-        match edition {
-            SdkEdition::Standard => {
-                if cfg!(all(windows, target_pointer_width = "64")) {
-                    "Processing.NDI.Lib.x64.dll"
-                } else if cfg!(windows) {
-                    "Processing.NDI.Lib.x86.dll"
-                } else if cfg!(target_vendor = "apple") {
-                    "libndi.dylib"
-                } else if cfg!(target_os = "android") {
-                    "libndi.so"
-                } else {
-                    "libndi.so.6"
-                }
-            }
-            SdkEdition::Advanced => {
-                if cfg!(all(windows, target_pointer_width = "64")) {
-                    "Processing.NDI.Lib.Advanced.x64.dll"
-                } else if cfg!(windows) {
-                    "Processing.NDI.Lib.Advanced.x86.dll"
-                } else if cfg!(target_vendor = "apple") {
-                    "libndi_advanced.dylib"
-                } else if cfg!(target_os = "android") {
-                    "libndi_advanced.so"
-                } else {
-                    "libndi_advanced.so.6"
-                }
-            }
-        }
+        super::library_file(super::LibraryFile::Runtime(edition))
     }
 
     /// Present a canonical Windows file in ordinary form when Win32 parsing
@@ -1326,7 +1338,10 @@ mod shared {
                 Err(refusal) => refusal,
             };
             assert!(refusal.loaded.is_none());
-            let diagnostic = refused.describe(refusal).to_string();
+            assert_eq!(refusal.reason, LoadRefusal::RelativeSearchDirectory);
+            let attempt = refused.describe(refusal);
+            assert_eq!(attempt.origin(), Origin::RuntimeDirectory);
+            let diagnostic = attempt.to_string();
             assert!(diagnostic.contains("NDI_RUNTIME_DIR_V6"), "{diagnostic}");
             assert!(diagnostic.contains("must be absolute"), "{diagnostic}");
             assert_eq!(plan.last().unwrap().origin, Origin::LoaderSearch);
@@ -1503,7 +1518,7 @@ mod linked {
     impl Linked {
         pub(super) const LINKAGE: SdkLinkage = SdkLinkage::Static;
 
-        pub(super) fn path(&self) -> Option<PathBuf> {
+        pub(super) fn library_path(&self) -> Option<PathBuf> {
             None
         }
 
@@ -1562,6 +1577,39 @@ mod linked {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(ndi_link_static))]
+    #[test]
+    fn native_library_file_names_match_the_vendor_files() {
+        #[cfg(all(windows, target_pointer_width = "64"))]
+        let expected = [
+            "Processing.NDI.Lib.x64.dll",
+            "Processing.NDI.Lib.Advanced.x64.dll",
+            "Processing.NDI.Lib.File.x64.dll",
+        ];
+        #[cfg(all(windows, target_pointer_width = "32"))]
+        let expected = [
+            "Processing.NDI.Lib.x86.dll",
+            "Processing.NDI.Lib.Advanced.x86.dll",
+            "Processing.NDI.Lib.File.x86.dll",
+        ];
+        #[cfg(target_vendor = "apple")]
+        let expected = ["libndi.dylib", "libndi_advanced.dylib", "libndifile.dylib"];
+        #[cfg(target_os = "android")]
+        let expected = ["libndi.so", "libndi_advanced.so", "libndifile.so"];
+        #[cfg(not(any(windows, target_vendor = "apple", target_os = "android")))]
+        let expected = ["libndi.so.6", "libndi_advanced.so.6", "libndifile.so.6"];
+        assert_eq!(
+            library_file(LibraryFile::Runtime(SdkEdition::Standard)),
+            expected[0]
+        );
+        assert_eq!(
+            library_file(LibraryFile::Runtime(SdkEdition::Advanced)),
+            expected[1]
+        );
+        #[cfg(feature = "file-io")]
+        assert_eq!(library_file(LibraryFile::File), expected[2]);
+    }
 
     #[test]
     fn only_a_request_for_the_advanced_sdk_can_go_unmet() {

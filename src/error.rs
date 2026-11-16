@@ -35,7 +35,8 @@ pub enum SpawnFailure {
     /// The Tokio operation was polled outside a Tokio runtime.
     #[error("no Tokio runtime is entered")]
     NoRuntime,
-    /// The runtime cancelled the blocking task, or its abandoned closure never started.
+    /// The runtime cancelled the blocking task, its abandoned closure never started,
+    /// or a started worker observed that its future was dropped.
     #[error("the blocking task was cancelled")]
     TaskCancelled,
 }
@@ -280,14 +281,14 @@ pub enum Error {
     /// capture; [`crate::FrameMetadataStatus`] reports its condition. Withheld
     /// metadata can still fail a later colour-description read.
     ///
-    /// A value that describes no one frame, such as a compressed video format
+    /// A value that describes no one frame, such as a compressed audio or video format
     /// or an allocation, AV sync, clock or remote-control value of the
     /// `advanced` module, is [`Error::InvalidInput`] when it is out of range.
     #[error("Invalid frame data: {0}")]
     InvalidFrame(FrameDefect),
 
     /// A value passed to the crate cannot be used; [`InputDefect`] identifies the cause.
-    /// Standalone aspect ratios, frame rates, compressed video formats and
+    /// Standalone aspect ratios, frame rates, compressed audio or video formats and
     /// allocation strides use [`InputDefect::Layout`] with a [`LayoutDefect`].
     ///
     /// It is out of range, malformed, or conflicts with another setting: for
@@ -296,7 +297,7 @@ pub enum Error {
     /// its range, malformed Advanced configuration JSON, more than one
     /// Discovery Server for a listener, allocator limits that cannot all be
     /// reached, a registration handed to an advertiser that did not issue it,
-    /// a compressed video format, an allocation stride or buffer, an AV sync
+    /// a compressed audio or video format, an allocation stride or buffer, an AV sync
     /// or clock quantity or a remote control value out of the range the SDK
     /// accepts, or a File API name, path or option the File library cannot
     /// take. The message says which value and why, and nothing reaches the
@@ -569,7 +570,6 @@ mod tests {
         error::<FrameRateDefect>();
         error::<VideoDimensionsDefect>();
         error::<AudioLengthDefect>();
-        error::<CompressedAudioDefect>();
         error::<PtzDefect>();
         #[cfg(any(feature = "tokio", feature = "smol"))]
         error::<SpawnFailure>();
@@ -595,7 +595,6 @@ mod tests {
         value::<FrameRateDefect>();
         value::<VideoDimensionsDefect>();
         value::<AudioLengthDefect>();
-        value::<CompressedAudioDefect>();
         #[cfg(any(feature = "tokio", feature = "smol"))]
         value::<SpawnFailure>();
         value::<InitializationFailure>();

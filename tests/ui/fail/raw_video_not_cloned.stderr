@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `RawVideo<'a>` in the current scope
+ --> tests/ui/fail/raw_video_not_cloned.rs:2:51
+  |
+2 | fn duplicate(video: RawVideo<'_>) { let _ = video.clone(); }
+  |                                                   ^^^^^ method not found in `RawVideo<'_>`

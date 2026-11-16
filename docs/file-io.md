@@ -142,7 +142,10 @@ submission, so the budget includes time queued behind other commands and the
 native stop; events already queued when it expires are still taken. Lost events can
 prevent confirmation. If recovery is needed, `reset` replaces the native
 recorder and returns the old session's report; `abandon` destroys it without
-waiting. Either can leave an unfinished file.
+waiting. Async callers await `AsyncFileRecorder::abandon()` for the same
+immediate teardown and last session report. It bypasses a full command queue
+and ends an existing close's cleanup wait. Either recovery can leave an
+unfinished file.
 
 Drop requests a stop and waits for closure events within one `drop_wait`
 budget (five seconds by default), including known pending files after an
@@ -187,7 +190,7 @@ Clones share that object; no Tokio or smol feature is required for these handles
 
 Operations are lazy until first polled or explicitly `submit()`ted. Dropping an
 unpolled operation does nothing. Ordinary queued work can be cancelled before
-it starts; submitted stop, finish and close requests continue after their futures
+it starts; submitted stop, finish, close and abandon requests continue after their futures
 are dropped. Native work already started runs to completion. Timeout budgets
 include command queue time after submission.
 
@@ -217,6 +220,9 @@ Await `finish`, inspect its report, then await `close` to shut down all clones
 without blocking the executor. **Dropping the last clone blocks** until its
 worker exits. Its `drop_wait` budget includes the native stop, which can
 itself outlast that budget; native destruction can also take longer.
+While a submitted close or abandon has a live future, dropping the last clone does not
+wait because that future reports completion. Dropping the close future restores
+the blocking last-drop guarantee.
 When an executor callback drops the last clone on a File owner, timer or probe
 thread, it requests shutdown without waiting. This lets those threads keep
 delivering notifications; await `close` when cleanup must have completed.

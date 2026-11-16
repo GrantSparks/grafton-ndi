@@ -162,7 +162,6 @@ fn frame_defect_diagnostics_preserve_their_text() {
         ("V210BufferTooSmall", FrameDefect::V210BufferTooSmall { actual: 5, minimum: 12 }, "V210 buffer has 5 words, requires 12"),
         ("InterleavedAudioLength", FrameDefect::InterleavedAudioLength { actual: 5, channels: 2 }, "interleaved audio has 5 samples, which is not a multiple of 2 channels"),
         ("AudioDestinationLength", FrameDefect::AudioDestinationLength { actual: 5, minimum: 12 }, "audio destination has 5 samples, requires 12"),
-        ("CompressedAudioQuantities", FrameDefect::CompressedAudioQuantities { detail: CompactDiagnostic::new(CompressedAudioDefect { sample_rate: 48000, channels: 2, samples: 16 }) }, "Compressed audio of 48000 Hz, 2 channels and 16 samples per channel: each must be in 1..=2147483647"),
         ("ColorMetadataWithheld", FrameDefect::ColorMetadataWithheld { status: FrameMetadataStatus::NotUtf8 }, "The frame's color description cannot be read because its metadata was withheld (NotUtf8); ColorPolicy::Override explicitly supplies its color conversion"),
         ("ConflictingColorMetadata", FrameDefect::ConflictingColorMetadata { first: color("<ndi_color_info transfer='bt_709'/>"), second: color("<ndi_color_info transfer='bt_2100_hlg'/>") }, "The frame's metadata holds ndi_color_info elements that differ: ColorInfo { primaries: None, transfer: Some(Bt709), matrix: None } and ColorInfo { primaries: None, transfer: Some(Hlg), matrix: None }"),
         ("HdrRefused", FrameDefect::HdrRefused { transfer: TransferFunction::Pq }, "The frame's ndi_color_info gives the PQ transfer function; HdrPolicy::CodeValues encodes its code values to a tagged PNG"),
@@ -219,15 +218,12 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("PathNotUtf8", InputDefect::PathNotUtf8 { what: "file path" }, "file path is not lossless UTF-8"),
         ("FilenamePatternToken", InputDefect::FilenamePatternToken { token: "unknown".into() }, "unsupported filename-pattern token {unknown}"),
         ("FileQueueCapacity", InputDefect::FileQueueCapacity { queue: "command", capacity: 2 }, "async command queue capacity must be between 1 and 4096, not 2"),
-        ("AllocatorShortStride", InputDefect::AllocatorShortStride { stride: 7, minimum: 12 }, "Allocator stride 7 is smaller than the requested stride 12"),
         ("AllocationTooLarge", InputDefect::AllocationTooLarge { bytes: 268435457, limit: 268435456 }, "An allocation of 268435457 bytes exceeds the capacity limit of 268435456 bytes"),
-        ("AllocationLayout", InputDefect::AllocationLayout { bytes: 268435457 }, "No allocation can hold 268435457 bytes"),
         ("KvmKeySymbol", InputDefect::KvmKeySymbol { keysym: 2147483648 }, "KVM key symbol 0x80000000 exceeds the SDK's range, 0..=0x7fffffff"),
         ("KvmPosition", InputDefect::KvmPosition { x: 1.25, y: -0.5 }, "KVM position (1.25, -0.5) is not within 0..=1 on each axis"),
         ("KvmWheel", InputDefect::KvmWheel { units: 2.5 }, "KVM wheel units 2.5 are not finite"),
         ("KvmTouchCount", InputDefect::KvmTouchCount { count: 3 }, "3 KVM touch points are more than the SDK can count"),
         ("QueueFrameTooLarge", InputDefect::QueueFrameTooLarge { bytes: 268435457, limit: 268435456 }, "frame retains 268435457 bytes of allocation capacity, exceeding the queue's 268435456 byte limit"),
-        ("SdkQuantity", InputDefect::SdkQuantity { name: "quantity", value: 3 }, "quantity 3 is not in 1..=2147483647"),
         ("ImageQuality", InputDefect::ImageQuality { codec: ImageCodecKind::Jpeg, quality: 101, minimum: 1, maximum: 100 }, "JPEG quality must be in 1..=100, got 101"),
         ("WebpEffort", InputDefect::WebpEffort { effort: 7 }, "WebP effort must be in 0..=6, got 7"),
         ("SixteenBitNeedsPng", InputDefect::SixteenBitNeedsPng { codec: ImageCodecKind::Jpeg }, "JPEG images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png"),
@@ -378,20 +374,30 @@ fn compact_scalar_evidence_roundtrips_without_changing_its_diagnostic() {
 }
 
 #[test]
+fn diagnostic_sizes_keep_unsigned_evidence_and_word_alignment() {
+    assert_eq!(std::mem::size_of::<DiagnosticSize>(), 8);
+    assert_eq!(std::mem::align_of::<DiagnosticSize>(), 4);
+    for value in [0, u32::MAX as u64, 1u64 << 63, u64::MAX] {
+        let evidence = DiagnosticSize::new(value);
+        assert_eq!(evidence.get(), value);
+        assert_eq!(format!("{evidence}"), value.to_string());
+        assert_eq!(format!("{evidence:?}"), value.to_string());
+    }
+}
+
+#[test]
 fn layout_defect_diagnostics_preserve_their_text() {
     let cases = [
         ("FrameRate", LayoutDefect::FrameRate { detail: CompactDiagnostic::new(FrameRateDefect { numerator: 30, denominator: 0 }) }, "Invalid frame rate 30/0: both parts must be in 1..=2147483647"),
         ("CompressedVideoDimensions", LayoutDefect::CompressedVideoDimensions { detail: CompactDiagnostic::new(VideoDimensionsDefect { width: 8, height: 4 }) }, "Compressed video dimensions 8x4 must each be in 1..=2147483647"),
         ("VideoZeroStride", LayoutDefect::VideoZeroStride, "Video line stride must be positive, got 0"),
-        ("VideoBufferOverflow", LayoutDefect::VideoBufferOverflow, "Video buffer size overflow"),
         ("AudioStrideRange", LayoutDefect::AudioStrideRange, "Audio channel stride exceeds i32 range"),
         ("VideoWidth", LayoutDefect::VideoWidth((-3).into()), "Video frame has invalid width: -3"),
         ("VideoOddWidth", LayoutDefect::VideoOddWidth((-3).into()), "NDI video frames require even width, got -3"),
         ("VideoHeight", LayoutDefect::VideoHeight((-3).into()), "Video frame has invalid height: -3"),
         ("VideoSdkStride", LayoutDefect::VideoSdkStride(-3), "Uncompressed video frame has invalid line_stride_in_bytes: -3"),
         ("VideoShortStride", LayoutDefect::VideoShortStride { stride: 7, minimum: 12, format: PixelFormat::Bgra, width: 8 }, "Video line_stride_in_bytes 7 is smaller than minimum row size 12 for Bgra width 8"),
-        ("VideoStrideOverflow", LayoutDefect::VideoStrideOverflow { format: PixelFormat::Bgra, width: 8 }, "Video line stride overflow for Bgra width 8"),
-        ("VideoBytes", LayoutDefect::VideoBytes(7), "Video frame exceeds maximum size: 7 bytes > 268435456 bytes"),
+        ("VideoBytes", LayoutDefect::VideoBytes(7u64.into()), "Video frame exceeds maximum size: 7 bytes > 268435456 bytes"),
         ("VideoPlanar420", LayoutDefect::VideoPlanar420 { height: 4, stride: 7 }, "Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height 4 and stride 7"),
         ("VideoSemiPlanar420", LayoutDefect::VideoSemiPlanar420(7), "Semi-planar 4:2:0 (NV12) video frames require even height, got 7"),
         ("VideoUyvaStride", LayoutDefect::VideoUyvaStride(7), "UYVA video frames require even line stride, got 7"),
@@ -401,12 +407,7 @@ fn layout_defect_diagnostics_preserve_their_text() {
         ("AudioStride", LayoutDefect::AudioStride((-3).into()), "Invalid channel_stride_in_bytes: -3"),
         ("AudioStrideAlignment", LayoutDefect::AudioStrideAlignment(7), "channel_stride_in_bytes must be a multiple of 4, got 7"),
         ("AudioShortStride", LayoutDefect::AudioShortStride { stride: 7, minimum: 12 }, "channel_stride_in_bytes 7 is smaller than one channel of audio samples 12"),
-        ("AudioStrideOverflow", LayoutDefect::AudioStrideOverflow(7), "Audio channel stride overflow: 7 samples × 4 bytes"),
-        ("AudioChannelOffset", LayoutDefect::AudioChannelOffset { channels: 2, stride: 7 }, "Audio channel offset overflow: 2 channels × 7 stride samples"),
-        ("AudioSampleCount", LayoutDefect::AudioSampleCount { offset: 17, samples: 16 }, "Audio backing sample count overflow: channel offset 17 + 16 samples"),
-        ("AudioByteSize", LayoutDefect::AudioByteSize(7), "Audio byte size overflow: 7 samples × 4 bytes"),
-        ("AudioBytes", LayoutDefect::AudioBytes(7), "Audio frame exceeds maximum size: 7 bytes > 67108864 bytes"),
-        ("VideoStrideRange", LayoutDefect::VideoStrideRange { stride: 7 }, "Video line stride 7 exceeds i32 range"),
+        ("AudioBytes", LayoutDefect::AudioBytes(7u64.into()), "Audio frame exceeds maximum size: 7 bytes > 67108864 bytes"),
     ];
     check_cases("LayoutDefect", &cases);
 }

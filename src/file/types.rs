@@ -821,8 +821,21 @@ fn check_directory(directory: &Path) -> Result<()> {
     {
         use std::os::unix::ffi::OsStrExt;
         let path = CString::new(directory.as_os_str().as_bytes())?;
-        // SAFETY: `path` is a NUL-terminated string that outlives the call.
-        if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+        // Check as the effective identity the SDK uses to open the file.
+        // Android has no AT_EACCESS; application real and effective IDs agree.
+        // SAFETY: `path` is a NUL-terminated string that outlives either call.
+        #[cfg(not(target_os = "android"))]
+        let access = unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                libc::W_OK | libc::X_OK,
+                libc::AT_EACCESS,
+            )
+        };
+        #[cfg(target_os = "android")]
+        let access = unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) };
+        if access != 0 {
             return Err(refuse(
                 std::io::ErrorKind::PermissionDenied,
                 "cannot be written to",

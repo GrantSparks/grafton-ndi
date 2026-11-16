@@ -153,6 +153,51 @@ def rustdoc_feature_violations(steps):
     return found
 
 
+def local_recipe_violations(rust, readme):
+    """The local recipe runs each documented lint/test step on the same features."""
+    section = readme.split('## Running the checks locally', 1)[-1]
+    recipe = section.split('```sh\n', 1)[-1].split('```', 1)[0]
+    lines = [re.sub(r'^RUSTDOCFLAGS="-D warnings" ', '', line.strip())
+             for line in recipe.splitlines()]
+    found = []
+    checks = (
+        ('lint', 'CI scripts and workflows', 'python -m unittest discover -s ci/tests'),
+        ('lint', 'Format', 'cargo fmt --all -- --check'),
+        ('lint', 'Clippy', 'cargo clippy --locked --workspace --all-targets --all-features -- -D warnings'),
+        ('lint', 'Clippy', 'cargo clippy --locked --all-targets --no-default-features ${features:+--features "$features"} -- -D warnings'),
+        ('lint', 'Bindings generator tests', 'cargo test --locked --package xtask'),
+        ('lint', 'Rustdoc feature combinations', 'cargo doc --locked --no-deps --no-default-features ${features:+--features "$features"}'),
+        ('lint', 'Rustdoc', 'cargo doc --locked --no-deps --all-features'),
+        ('lint', 'Documentation links and examples', 'python ci/docs.py --compile --rustdoc target/doc'),
+        ('test', 'Tests, all features', 'cargo test --locked --all-features'),
+        ('test', 'Tests, default features', 'cargo test --locked'),
+        ('test', 'Tests, File API without Advanced wrappers', 'cargo test --locked --no-default-features --features file-io'),
+    )
+    positions = []
+    for job, name, command in checks:
+        step = next((step for step in rust['jobs'][job]['steps'] if step.get('name') == name), {})
+        if command not in [line.strip() for line in step.get('run', '').splitlines()]:
+            found.append(f'rust.yml: local recipe step {name} no longer runs {command}')
+        if command.startswith('cargo doc '):
+            if f'RUSTDOCFLAGS="-D warnings" {command}' not in [line.strip() for line in recipe.splitlines()]:
+                found.append(f'ci/README.md: local recipe rustdoc does not deny warnings: {command}')
+            if step.get('env') != {'RUSTDOCFLAGS': '-D warnings'}:
+                found.append(f'rust.yml: local recipe step {name} does not deny warnings')
+        if command not in lines:
+            found.append(f'ci/README.md: local recipe omits {command}')
+        else:
+            positions.append(lines.index(command))
+    if positions != sorted(positions):
+        found.append('ci/README.md: local recipe steps differ from lint and test order')
+    expected = []
+    for name in ('Clippy', 'Rustdoc feature combinations'):
+        step = next((step for step in rust['jobs']['lint']['steps'] if step.get('name') == name), {})
+        expected.extend(shlex.split(loop) for loop in re.findall(r'for features in ([^;]+); do', step.get('run', '')))
+    actual = [shlex.split(loop) for loop in re.findall(r'for features in ([^;]+); do', recipe)]
+    found += differs('ci/README.md: local recipe feature combinations', actual, expected)
+    return found
+
+
 def implementation_coverage_violations(rust):
     """Real Advanced code and both compatibility editions must be checked."""
     named = {step.get('name'): step for step in rust['jobs']['sdk']['steps']}
@@ -186,14 +231,24 @@ def memory_checker_violations(rust):
                     'cargo +nightly-2026-11-10 miri setup'):
         if command not in setup:
             found.append('rust.yml: Miri setup does not pin the checked nightly and components')
-    if 'cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio "$filter"' not in run:
-        found.append('rust.yml: Miri does not execute the selected synthetic fixtures')
-    for fixture in ('frames::tests::video_padding_all_formats', 'frames::tests::video_padding_encoders',
-                    'receiver::mixed_tests', 'asynchronous::scoped_tests', 'advanced::send_slots::tests::',
+    command = 'cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio'
+    for selection in ('"$filter"', '-- --list'):
+        if f'{command} {selection}' not in run:
+            found.append('rust.yml: Miri does not build and execute the selected synthetic fixtures with file-io')
+    if run.count('-- --list') != 1 or f'inventory=$({command} -- --list)' not in run:
+        found.append('rust.yml: Miri must read one interpreted test inventory')
+    selection = re.search(r'for filter in (.*?); do', run, re.DOTALL)
+    filters = set(shlex.split(selection.group(1).replace('\\\n', ' '))) if selection else set()
+    for fixture in ('sdk_copy::tests::', 'source_retention::tests::', 'finder::budget::tests::',
+                    'file::out_param::tests::',
+                    'frames::tests::video_padding_all_formats', 'frames::tests::video_padding_encoders',
+                    'receiver::mixed_tests', 'receiver::latest_report_tests::',
+                    'advanced::kvm::ownership_tests::', 'advanced::reserved_map::tests::',
+                    'asynchronous::scoped_tests', 'advanced::send_slots::tests::',
                     'advanced::aliasable::tests::', 'advanced::packets::received::tests::',
                     'advanced::queued::boundary_tests::', 'sender::in_flight::tests::',
                     'advanced::send::tests::', 'advanced::queued::tests::', 'sender::tests::'):
-        if fixture not in run:
+        if fixture not in filters:
             found.append(f'rust.yml: Miri omits {fixture}')
 
     test = next((step for step in jobs['test']['steps']
@@ -214,11 +269,13 @@ def memory_checker_violations(rust):
                      '--test frame_metadata_boundary', 'filters=(frames::tests::video_padding_encoders)'):
         if required not in test.get('run', ''):
             found.append('rust.yml: scripted Memcheck omits active SDK-free fixtures or their child processes')
-    for owner, command in (('Miri', run), ('scripted Memcheck', test.get('run', ''))):
-        for required in ('-- --list "$filter"', "if ! grep -q ': test$'", 'No tests selected for filter: $filter', 'exit 1'):
-            if required not in command:
-                found.append(f'rust.yml: {owner} lacks the empty-selection guard')
-    for required in ('-- --list "$skip"', 'No tests selected for skip: $skip', 'skip_args+=(--skip "$skip")'):
+    for required in ('-- --list "$filter"', "if ! grep -q ': test$'", 'No tests selected for filter: $filter', 'exit 1'):
+        if required not in test.get('run', ''):
+            found.append('rust.yml: scripted Memcheck lacks the empty-selection guard')
+    for required in ('if ! has_tests "$filter" true', 'No tests selected for filter: $filter', 'exit 1'):
+        if required not in run:
+            found.append('rust.yml: Miri lacks the empty-selection guard')
+    for required in ('if ! has_tests "$skip" false', 'No tests selected for skip: $skip', 'skip_args+=(--skip "$skip")'):
         if required not in run:
             found.append('rust.yml: Miri lacks the skip-selection guard')
     for required in ('ci/offline/linux.sh', '--test video_padding_sdk', '--features image-encoding'):
@@ -637,8 +694,14 @@ class MemoryCheckers(unittest.TestCase):
             ('miri', 'Initialized rows, metadata and synthetic native guards', 'frames::tests::video_padding_all_formats'),
             ('miri', 'Initialized rows, metadata and synthetic native guards',
              'descriptor_admission_and_collection_stay_allocation_free_under_churn'),
+            ('miri', 'Initialized rows, metadata and synthetic native guards', 'sdk_copy::tests::fixture'),
             ('test', 'Memcheck over scripted capture and encoder padding', 'frames::tests::video_padding_encoders'),
+            ('test', 'Manual measurement fixtures', '--ignored'),
         ]
+        miri_script = rust['jobs']['miri']['steps'][2]['run']
+        skips = shlex.split(re.search(r'skips=\((.*?)\)', miri_script, re.DOTALL).group(1))
+        filters = shlex.split(re.search(r'for filter in (.*?); do', miri_script, re.DOTALL).group(1).replace('\\\n', ' '))
+        inventory = '\n'.join(f'{name}: test' for name in [*skips, *(name + 'fixture' for name in filters)])
         with tempfile.TemporaryDirectory() as directory:
             cargo = Path(directory) / 'cargo'
             cargo.write_text('''#!/bin/bash
@@ -646,8 +709,18 @@ empty=0
 for argument in "$@"; do
   if [ "$argument" = "$EMPTY_SELECTION" ]; then empty=1; fi
 done
+printf '%s\n' "$*" >> "$CARGO_CALLS"
 case " $* " in
-  *" --list "*) if [ "$empty" = 0 ]; then echo 'fixture: test'; fi ;;
+  *" --list "*)
+    if [ -n "$MIRI_INVENTORY" ]; then
+      while IFS= read -r line; do
+        if [ -z "$EMPTY_SELECTION" ] || [[ "$line" != *"$EMPTY_SELECTION"* ]]; then
+          printf '%s\n' "$line"
+        fi
+      done <<< "$MIRI_INVENTORY"
+    elif [ "$empty" = 0 ]; then
+      echo 'fixture: test'
+    fi ;;
 esac
 ''')
             cargo.chmod(0o755)
@@ -656,13 +729,21 @@ esac
                 script = '\n'.join(line for line in script.splitlines() if not line.startswith('sudo '))
                 for selection, expected in (('', 0), (missing, 1)):
                     with self.subTest(job=job, missing=selection):
+                        calls_file = Path(directory) / 'calls'
+                        calls_file.write_text('')
                         result = subprocess.run(['bash', '-eo', 'pipefail', '-c', script],
                                                 env={**os.environ, 'PATH': directory + os.pathsep + os.environ['PATH'],
-                                                     'EMPTY_SELECTION': selection}, text=True, capture_output=True)
+                                                     'EMPTY_SELECTION': selection, 'CARGO_CALLS': str(calls_file),
+                                                     'MIRI_INVENTORY': inventory if job == 'miri' else ''}, text=True, capture_output=True)
                         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                         if selection:
-                            self.assertIn(selection, result.stdout)
+                            self.assertIn(selection.removesuffix('fixture'), result.stdout)
                             self.assertIn('No tests selected', result.stdout)
+                        if job == 'miri':
+                            calls = calls_file.read_text().splitlines()
+                            self.assertEqual(sum(' --list' in call for call in calls), 1)
+                            if not selection:
+                                self.assertEqual(sum(' --list' not in call for call in calls), len(filters))
 
     def test_missing_detector_configuration_is_reported(self):
         rust = workflows.load(read_workflows()['rust.yml'])
@@ -684,14 +765,36 @@ esac
                           ('test', 'Memcheck over scripted capture and encoder padding')):
             missing_guard = copy.deepcopy(rust)
             step = next(step for step in missing_guard['jobs'][job]['steps'] if step.get('name') == name)
-            step['run'] = step['run'].replace('-- --list "$filter"', '')
+            guard = 'if ! has_tests "$filter" true' if job == 'miri' else '-- --list "$filter"'
+            step['run'] = step['run'].replace(guard, '')
             variants.append((missing_guard, 'empty-selection guard'))
         missing_skip_guard = copy.deepcopy(rust)
-        missing_skip_guard['jobs']['miri']['steps'][2]['run'] = rust['jobs']['miri']['steps'][2]['run'].replace('-- --list "$skip"', '')
+        missing_skip_guard['jobs']['miri']['steps'][2]['run'] = rust['jobs']['miri']['steps'][2]['run'].replace('if ! has_tests "$skip" false', '')
         variants.append((missing_skip_guard, 'skip-selection guard'))
+        for change in ('remove', 'repeat'):
+            broken_inventory = copy.deepcopy(rust)
+            step = broken_inventory['jobs']['miri']['steps'][2]
+            inventory = next(line for line in step['run'].splitlines() if line.startswith('inventory='))
+            step['run'] = step['run'].replace(inventory, '' if change == 'remove' else inventory + '\n' + inventory)
+            variants.append((broken_inventory, 'one interpreted test inventory'))
         missing_send_module = copy.deepcopy(rust)
         missing_send_module['jobs']['miri']['steps'][2]['run'] = rust['jobs']['miri']['steps'][2]['run'].replace('advanced::aliasable::tests::', '')
         variants.append((missing_send_module, 'Miri omits advanced::aliasable'))
+        for fixture in ('sdk_copy::tests::', 'source_retention::tests::',
+                        'finder::budget::tests::', 'file::out_param::tests::',
+                        'receiver::latest_report_tests::', 'advanced::kvm::ownership_tests::',
+                        'advanced::reserved_map::tests::'):
+            missing_reads = copy.deepcopy(rust)
+            step = missing_reads['jobs']['miri']['steps'][2]
+            step['run'] = step['run'].replace(fixture + ' \\\n', '')
+            variants.append((missing_reads, f'Miri omits {fixture}'))
+        for selection in ('"$filter"', '-- --list'):
+            missing_file = copy.deepcopy(rust)
+            step = missing_file['jobs']['miri']['steps'][2]
+            step['run'] = step['run'].replace(
+                f'--features advanced,file-io,image-encoding,tokio {selection}',
+                f'--features advanced,image-encoding,tokio {selection}')
+            variants.append((missing_file, 'synthetic fixtures with file-io'))
         ungated = copy.deepcopy(rust)
         ungated['jobs']['required-ci']['needs'].remove('miri')
         variants.append((ungated, 'Miri is not required'))
@@ -701,6 +804,21 @@ esac
 
 
 class Repository(unittest.TestCase):
+    def test_manual_measurements_have_a_bounded_ci_invocation(self):
+        rust = workflows.load(read_workflows()['rust.yml'])
+        step = next(step for step in rust['jobs']['test']['steps']
+                    if step.get('name') == 'Manual measurement fixtures')
+        self.assertEqual(step.get('if'), "runner.os == 'Linux'")
+        self.assertEqual(step.get('timeout-minutes'), '5')
+        self.assertEqual(step.get('env'), {
+            'GRAFTON_NDI_SIZES': '64x64', 'GRAFTON_NDI_FORMATS': 'Bgra',
+            'GRAFTON_NDI_CONTENTS': 'photographic', 'GRAFTON_NDI_OUTPUTS': 'jpeg85',
+        })
+        self.assertIn('cargo test --locked --release --all-features --lib -- --ignored --list', step['run'])
+        self.assertIn("if ! grep -q ': test$'", step['run'])
+        self.assertIn('exit 1', step['run'])
+        self.assertIn('cargo test --locked --release --all-features --lib -- --ignored --test-threads=1', step['run'])
+
     def test_vendored_bindings_cover_exactly_the_supported_platform_targets(self):
         setup = (ROOT / 'docs/setup.md').read_text(encoding='utf-8')
         table = setup.split('| Platform | Rust targets | Configured coverage |', 1)[1].split('\n\n', 1)[0]
@@ -750,6 +868,53 @@ class Repository(unittest.TestCase):
             with self.subTest(message=message):
                 broken = {**texts, 'rust.yml': texts['rust.yml'].replace(block, changed)}
                 self.assertTrue(any(message in error for error in violations(broken)))
+
+    def test_local_recipe_matches_lint_and_test_steps(self):
+        rust = workflows.load(read_workflows()['rust.yml'])
+        readme = (ROOT / 'ci' / 'README.md').read_text()
+        self.assertEqual(local_recipe_violations(rust, readme), [])
+        loops = re.findall(r'for features in ([^;]+); do', readme)
+        self.assertEqual(len(loops), 2)
+        for loop in loops:
+            with self.subTest(removed_feature=loop):
+                broken = readme.replace(f'for features in {loop}; do',
+                                        f'for features in {loop.replace(" smol", "")}; do', 1)
+                self.assertTrue(any('feature combinations' in error
+                                    for error in local_recipe_violations(rust, broken)))
+        commands = [line.strip() for line in readme.split('```sh\n', 1)[1].split('```', 1)[0].splitlines()
+                    if line.strip().startswith(('cargo ', 'python ', 'RUSTDOCFLAGS='))]
+        for command in commands:
+            if command == 'cargo build --locked --examples --all-features':
+                continue
+            with self.subTest(removed_command=command):
+                self.assertTrue(local_recipe_violations(rust, readme.replace(command, '', 1)))
+        for job, body in rust['jobs'].items():
+            if job not in ('lint', 'test'):
+                continue
+            for index, step in enumerate(body['steps']):
+                if not step.get('run'):
+                    continue
+                broken = copy.deepcopy(rust)
+                broken['jobs'][job]['steps'][index]['run'] = ''
+                expected = step.get('name') in {
+                    'CI scripts and workflows', 'Format', 'Clippy', 'Bindings generator tests',
+                    'Rustdoc feature combinations', 'Rustdoc', 'Documentation links and examples',
+                    'Tests, all features', 'Tests, default features', 'Tests, File API without Advanced wrappers',
+                }
+                if expected:
+                    with self.subTest(removed_step=step['name']):
+                        self.assertTrue(local_recipe_violations(broken, readme))
+        for command in commands:
+            if command.startswith('RUSTDOCFLAGS='):
+                broken_readme = readme.replace(command, command.removeprefix('RUSTDOCFLAGS="-D warnings" '), 1)
+                self.assertTrue(any('does not deny warnings' in error
+                                    for error in local_recipe_violations(rust, broken_readme)))
+        broken = copy.deepcopy(rust)
+        for step in broken['jobs']['lint']['steps']:
+            if step.get('name') in ('Clippy', 'Rustdoc feature combinations'):
+                step['run'] = step['run'].replace(' smol', '')
+        self.assertTrue(any('feature combinations' in error
+                            for error in local_recipe_violations(broken, readme)))
 
     def test_repository_cargo_configuration_holds_only_the_xtask_alias(self):
         """Cargo obeys this file in every job that starts in the checkout; it can run programs and redirect registries."""

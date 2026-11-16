@@ -221,8 +221,7 @@ impl FrameSyncAudioRequest {
     /// # Errors
     ///
     /// Returns [`Error::InvalidFrame`] for a sample rate outside
-    /// `1..=i32::MAX`, a zero dimension, an unrepresentable signed byte
-    /// stride, arithmetic overflow, or a sample payload exceeding 64 MiB.
+    /// `1..=i32::MAX`, a zero dimension, or a sample payload exceeding 64 MiB.
     /// Validation does not allocate sample storage.
     pub fn capture_at(sample_rate: u32, num_channels: u32, num_samples: u32) -> Result<Self> {
         Ok(Self {
@@ -536,7 +535,7 @@ impl<'a> FrameSyncCapture<'a> {
                 .named()
                 .NDIlib_framesync_audio_queue_depth(self.resource.instance.0)
         };
-        crate::receiver::native_count(depth).map(|depth| depth as u32)
+        depth.count()
     }
 }
 

@@ -29,7 +29,11 @@ mod stop_sealed {
 pub(crate) trait Stop: stop_sealed::Sealed + Copy {
     /// Whether the caller can request cancellation while a wait is running.
     const CAN_STOP: bool;
-    fn is_stopped(&self) -> bool;
+    type Stopped;
+    fn check(&self) -> std::result::Result<(), Self::Stopped>;
+    fn is_stopped(&self) -> bool {
+        self.check().is_err()
+    }
 }
 
 /// Synchronous waits have no cancellation state or atomic loads.
@@ -37,16 +41,29 @@ pub(crate) trait Stop: stop_sealed::Sealed + Copy {
 pub(crate) struct NeverStop;
 impl Stop for NeverStop {
     const CAN_STOP: bool = false;
-    fn is_stopped(&self) -> bool {
-        false
+    type Stopped = std::convert::Infallible;
+    fn check(&self) -> std::result::Result<(), Self::Stopped> {
+        Ok(())
     }
 }
 impl Stop for &AtomicBool {
     const CAN_STOP: bool = true;
-    fn is_stopped(&self) -> bool {
-        self.load(Ordering::Acquire)
+    type Stopped = Stopped;
+    fn check(&self) -> std::result::Result<(), Self::Stopped> {
+        if self.load(Ordering::Acquire) {
+            Err(Stopped)
+        } else {
+            Ok(())
+        }
     }
 }
+
+/// A started wait observed its caller's cancellation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Stopped;
+
+/// Native failure and cancellation remain separate until the async adapter.
+pub(crate) type StopResult<T, S> = Result<std::result::Result<T, <S as Stop>::Stopped>>;
 
 /// [`MAX_TIMEOUT`] in the SDK's milliseconds.
 const MAX_MILLIS: u32 = u32::MAX - 1;
@@ -197,6 +214,18 @@ pub(crate) fn rounding_table() -> [(Duration, Option<u32>); 9] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synchronous_stops_are_uninhabited_and_cancellable_stops_are_values() {
+        fn _never(s: <NeverStop as Stop>::Stopped) -> ! {
+            match s {}
+        }
+        let Ok(()) = NeverStop.check();
+        let cancelled = AtomicBool::new(false);
+        assert_eq!((&cancelled).check(), Ok(()));
+        cancelled.store(true, Ordering::Release);
+        assert_eq!((&cancelled).check(), Err(Stopped));
+    }
 
     #[test]
     fn checked_waits_keep_sub_millisecond_precision_and_the_sdk_bound() {

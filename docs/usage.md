@@ -141,6 +141,14 @@ block while synchronizing. Reuse two owned frames and recover the final one
 with `reclaim_video()`; see [`submit_video`](../examples/submit_video.rs).
 [`submit_video_copy`](../examples/submit_video_copy.rs) shows the copying variant.
 
+With video clocking enabled (the default), submissions can wait for the next
+frame time. Use `let (mut video, shared) = sender.split()` to move the video
+view to a scoped thread while another sends audio or metadata through `shared`.
+The video view supports `submit_video`, `submit_video_copy` and `reclaim_video`;
+it borrows the owner and keeps exactly one asynchronous video submitter. Shared
+synchronous video and flushes serialize with its submissions, while audio and
+metadata proceed independently.
+
 `VideoSource`, `AudioSource` and `MetadataSource` let synchronous operations
 accept owned frames and validated borrowed captures directly. Native audio
 conversion also accepts borrowed audio and writes into caller-provided output;

@@ -247,17 +247,8 @@ impl FileRuntime {
     const CORE_ENTRY: &'static CStr = c"NDIlib_initialize";
 
     /// The File library's file name on this target, as the vendor ships it.
-    const LIBRARY_NAME: &'static str = if cfg!(all(windows, target_pointer_width = "64")) {
-        "Processing.NDI.Lib.File.x64.dll"
-    } else if cfg!(windows) {
-        "Processing.NDI.Lib.File.x86.dll"
-    } else if cfg!(target_vendor = "apple") {
-        "libndifile.dylib"
-    } else if cfg!(target_os = "android") {
-        "libndifile.so"
-    } else {
-        "libndifile.so.6"
-    };
+    const LIBRARY_NAME: &'static str =
+        super::loader::library_file(super::loader::LibraryFile::File);
 
     /// The file the library was loaded from.
     pub(crate) fn path(&self) -> Option<&Path> {
@@ -304,9 +295,7 @@ impl FileRuntime {
             }
         }
         let families = Families::load(&module)?;
-        let path = module.path().ok_or_else(|| LoadRefusal::NotIdentifiable {
-            detail: "the loader did not report where it was loaded from".into(),
-        })?;
+        let path = module.path().to_owned();
         Ok(Self { families, path })
     }
 
@@ -358,14 +347,23 @@ impl FileRuntime {
         playback: Resolved<FilePlayback>,
         recording: Resolved<FileRecording>,
     ) -> &'static Self {
-        Box::leak(Box::new(Self {
+        let runtime = Box::leak(Box::new(Self {
             families: Families {
                 playback,
                 recording,
             },
             #[cfg(not(ndi_link_static))]
             path: "test double".into(),
-        }))
+        }));
+        // Selected native modules have process lifetime. Keep the test doubles
+        // reachable too, so Miri distinguishes this ownership from a leak.
+        #[cfg(miri)]
+        {
+            static SELECTED: std::sync::Mutex<Vec<&'static FileRuntime>> =
+                std::sync::Mutex::new(Vec::new());
+            SELECTED.lock().unwrap().push(runtime);
+        }
+        runtime
     }
 }
 

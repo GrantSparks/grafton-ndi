@@ -15,13 +15,42 @@ mixed-media capture, Advanced SDK operations, recording, playback and image
 encoding. Upgrading from 2.x requires API and deployment changes; follow the
 [2.x to 3.0 migration guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/migration/2.0-to-3.0.md).
 
+### Added
+
+- `AsyncFileRecorder::abandon` destroys the recorder without spending its
+  finalization wait and returns the last session report after destruction.
+  It bypasses command queue limits, as `close` does.
+- `Sender::split` lends asynchronous video to a scoped thread alongside shared
+  audio, metadata and controls, without an application mutex. Video submission
+  docs describe the SDK's default clock pacing.
+
 ### Fixed
 
+- Async File handles wait for native cleanup on last drop after a submitted
+  close future is discarded; live closes still report cleanup without blocking
+  handle drops.
 - Abandoned async source-name and unknown-event reports are redelivered only
   while no newer report has superseded them. Replaying a source-name result
   never waits for another poller's native query.
 
 ### Breaking changes
+
+- All relative environment library directories use `LoadRefusal::RelativeSearchDirectory`;
+  `LoadAttempt::origin()` identifies the variable that supplied the directory.
+- Allocator strides use the frame layout's causes for every uncompressed
+  format; compressed strides must equal the packet size. Replacing a padded
+  stride may narrow it to any valid layout. Remove the allocator-only short
+  stride and unreachable allocation-layout error leaves.
+
+- Advanced audio formats, AV sync and clock requests share frame audio rate
+  and count causes. API formats now report `InvalidInput(Layout)`. Construct
+  `AudioClockRequest` once and pass it to `AudioClock::wait`, which returns
+  `ClockSource` directly.
+
+- Oversized video and audio layouts report `VideoBytes` or `AudioBytes` on
+  every target. Their payload is `DiagnosticSize`, an unsigned 64-bit count;
+  arithmetic overflow leaves are removed. Packed line strides share the
+  video byte cap.
 
 - `AudioFormat` converts through `FourCc`; audio descriptors use their validated
   format. `PictureAspectRatio` normalizes negative zero and implements `Eq` and

@@ -71,11 +71,9 @@ impl AudioShape {
         let num_samples = u32::try_from(samples).map_err(|_| {
             // Any count beyond u32 also exceeds the FLTP payload ceiling.
             // Keep that size refusal distinct from a non-multiple length.
-            let bytes = len.checked_mul(size_of::<f32>());
-            match bytes {
-                Some(bytes) => crate::LayoutDefect::AudioBytes(bytes),
-                None => crate::LayoutDefect::AudioByteSize(len),
-            }
+            crate::LayoutDefect::AudioBytes(
+                (len as u64).saturating_mul(size_of::<f32>() as u64).into(),
+            )
         })?;
         Self::new(sample_rate, num_channels, num_samples)
     }
@@ -660,12 +658,20 @@ mod tests {
             (48000, 2, 0, count(AudioCountKind::Samples)),
             (48000, 2, 3, length(3, 2)),
             (48000, 3, 2, length(2, 3)),
-            (48000, u32::MAX, 2, length(2, u32::MAX)),
+            (
+                48000,
+                u32::MAX,
+                2,
+                layout(LayoutDefect::AudioCount {
+                    value: u32::MAX.into(),
+                    kind: AudioCountKind::Channels,
+                }),
+            ),
             (
                 48000,
                 1,
                 16_777_217,
-                layout(LayoutDefect::AudioBytes(67_108_868)),
+                layout(LayoutDefect::AudioBytes(67_108_868u64.into())),
             ),
         ] {
             assert_eq!(
@@ -695,7 +701,7 @@ mod tests {
         #[cfg(target_pointer_width = "64")]
         assert_eq!(
             defect(AudioShape::interleaved(48_000, 1, u32::MAX as usize + 1)),
-            layout(LayoutDefect::AudioBytes((u32::MAX as usize + 1) * 4))
+            layout(LayoutDefect::AudioBytes(((u32::MAX as u64 + 1) * 4).into()))
         );
         let samples = [0.0f32; 6];
         let frame = InterleavedAudioF32::new(48000, 2, &samples).unwrap();

@@ -195,13 +195,18 @@ where
     let guard = CancelOnDrop(Arc::clone(&cancelled));
     let work = move || {
         if cancelled.load(Ordering::Acquire) {
-            return Err(Error::SpawnFailed(SpawnFailure::TaskCancelled));
+            return discovery_result(Ok(Err(crate::timeout::Stopped)));
         }
         Ok(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             || operation(&cancelled),
         )))
     };
     (guard, work)
+}
+
+// Discovery reports cancellation as control flow; this adapter owns its public error.
+fn discovery_result<T>(outcome: crate::timeout::StopResult<T, &AtomicBool>) -> Result<T> {
+    outcome?.map_err(|crate::timeout::Stopped| Error::SpawnFailed(SpawnFailure::TaskCancelled))
 }
 
 fn resume_work<T>(outcome: std::thread::Result<T>) -> T {

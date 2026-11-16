@@ -3447,6 +3447,7 @@ fn decoded_hx_frame<'rx>(
 
 #[test]
 fn genlock_clocks_wait_on_the_system_clock_without_a_reference() {
+    let audio_request = AudioClockRequest::new(48_000, 800).unwrap();
     let Some(ndi) = common::advanced_ndi() else {
         return;
     };
@@ -3468,7 +3469,7 @@ fn genlock_clocks_wait_on_the_system_clock_without_a_reference() {
             let audio = scope.spawn(move || {
                 let began = Instant::now();
                 for _ in 0..4 {
-                    assert_eq!(audio.wait(48_000, 800).unwrap(), ClockSource::SystemClock);
+                    assert_eq!(audio.wait(audio_request), ClockSource::SystemClock);
                 }
                 began.elapsed()
             });
@@ -3594,6 +3595,7 @@ fn avsync_follows_source_format_changes_and_preserves_audio_samples() {
 
 #[test]
 fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
+    let audio_request = AudioClockRequest::new(48_000, 1600).unwrap();
     let Some(ndi) = common::advanced_ndi() else {
         return;
     };
@@ -3632,7 +3634,7 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
         let deadline = Instant::now() + PATIENCE;
         loop {
             let video = video.wait(thirty, ScanType::Progressive);
-            let audio = audio.wait(48_000, 1600).unwrap();
+            let audio = audio.wait(audio_request);
             if video == ClockSource::ReferenceSignal && audio == ClockSource::ReferenceSignal {
                 break;
             }
@@ -3647,7 +3649,7 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
     let (mut video, mut audio) = genlock.clocks();
     loop {
         let video = video.wait(thirty, ScanType::Progressive);
-        let audio = audio.wait(48_000, 1600).unwrap();
+        let audio = audio.wait(audio_request);
         if video == ClockSource::SystemClock && audio == ClockSource::SystemClock {
             break;
         }
@@ -3712,6 +3714,7 @@ fn until_paced_by(wanted: ClockSource, mut wait: impl FnMut() -> ClockSource, wh
 /// destroyed on a fifth.
 #[test]
 fn a_genlock_moves_between_threads() {
+    let audio_request = AudioClockRequest::new(48_000, 1600).unwrap();
     let Some(ndi) = common::advanced_ndi() else {
         return;
     };
@@ -3759,7 +3762,7 @@ fn a_genlock_moves_between_threads() {
                         until_paced_by(ClockSource::ReferenceSignal, wait, "video");
                     });
                     clocks.spawn(move || {
-                        let wait = || audio.wait(48_000, 1600).unwrap();
+                        let wait = || audio.wait(audio_request);
                         until_paced_by(ClockSource::ReferenceSignal, wait, "audio");
                     });
                 });

@@ -17,14 +17,22 @@ workflow validation; its tag ref keeps the Pages job disabled.
 Use the pinned Rust toolchain with Clippy and rustfmt:
 
 ```sh
-cargo build --locked --examples --all-features
-cargo test --locked --all-features
+python -m unittest discover -s ci/tests
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+for features in "" image-encoding tokio smol advanced file-io advanced,file-io; do
+    cargo clippy --locked --all-targets --no-default-features ${features:+--features "$features"} -- -D warnings
+done
+cargo test --locked --package xtask
 for features in "" image-encoding tokio smol advanced file-io advanced,file-io; do
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --no-default-features ${features:+--features "$features"}
 done
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+python ci/docs.py --compile --rustdoc target/doc
+cargo build --locked --examples --all-features
+cargo test --locked --all-features
+cargo test --locked
+cargo test --locked --no-default-features --features file-io
 ```
 
 Tests that require an unavailable NDI runtime report a skip. Runtime
@@ -32,6 +40,16 @@ initialization errors still fail. A successful SDK-free run therefore does
 not establish native transport coverage. The configured platform/runtime
 matrix is in [the CI workflow](../.github/workflows/rust.yml); execution results
 are available in [GitHub Actions](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml).
+
+The Linux test job also runs the manual measurement fixtures with `--ignored`
+in release mode. Its configurable image sweep uses one 64×64 BGRA input and
+JPEG output; the fixed workspace and allocator measurements keep their full
+inputs. Their printed measurements describe that runner, not a performance
+threshold. This SDK-free measurement step is optional locally:
+
+```sh
+GRAFTON_NDI_SIZES=64x64 GRAFTON_NDI_FORMATS=Bgra GRAFTON_NDI_CONTENTS=photographic GRAFTON_NDI_OUTPUTS=jpeg85 cargo test --locked --release --all-features --lib -- --ignored --test-threads=1
+```
 
 ### Updating the Rust toolchain
 
@@ -51,13 +69,18 @@ mobile nightlies have their own pins.
 
 ### Memory checkers
 
-The required `miri` job runs synthetic frame, metadata, guard and send-path
-aliasing tests with `nightly-2026-11-10`, using both Stacked Borrows and Tree
-Borrows. Native tests report visible skips under Miri; source-parsing and
-subprocess tests are outside its filters. The long descriptor churn test is
-explicitly skipped. Both memory-checker steps list each filter before running
-it and fail if it selects no tests; Miri also checks every skip name. This keeps
-fixture renames from silently removing coverage. The pinned nightly detects a
+The required `miri` job checks synthetic frames, metadata, bounded SDK reads,
+descriptor retention, guards and send-path aliasing with `nightly-2026-11-10`,
+using both Stacked Borrows and Tree Borrows. Native tests report visible skips
+under Miri; source-parsing and subprocess tests are outside its filters. The
+long descriptor churn, exhaustive UTF-8 pairs and multi-megabyte copy-budget
+fixtures are explicitly skipped; smaller synthetic tests retain their exact
+charges, malformed-entry handling and scan bounds. Both memory-checker steps
+check each filter before running it and fail if it selects no tests. Miri reads
+one interpreted test inventory per model, checks every skip name against it,
+and checks each filter after applying all skips. Matching uses libtest's literal
+substring rules. This keeps fixture renames from silently removing coverage
+without interpreting the inventory again for every guard. The pinned nightly detects a
 `Box`-owned `AliasableBox` regression; it does not yet support the Miri option
 needed to enforce `AliasableVec`'s unique-pointer contract. Miri uses one padded
 layout and one PNG encoding per format; native tests retain their full matrices.

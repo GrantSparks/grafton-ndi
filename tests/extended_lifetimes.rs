@@ -118,6 +118,9 @@ fn native_resource_ownership() {
         "retained_registered_receiver_name",
         "sender_unregistered",
         "sender_copy_reuse",
+        "sender_split_copy_reuse",
+        "sender_split_overlap",
+        "sender_split_drop",
         "sender_registration",
         "dropped_sender_advertiser",
         "receiver_registration",
@@ -546,7 +549,7 @@ fn child(case: &str) {
             }
             assert_eq!(events.matches("sender-destroy\n").count(), 1);
         }
-        "sender_copy_reuse" => {
+        "sender_copy_reuse" | "sender_split_copy_reuse" => {
             use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
             std::env::set_var("GRAFTON_FAKE_VALIDATE_VIDEO_COPY", "1");
             let mut sender = sender(&ndi);
@@ -559,7 +562,11 @@ fn child(case: &str) {
                 let source = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
                     .build()
                     .unwrap();
-                sender.submit_video_copy(&source).unwrap();
+                if case == "sender_split_copy_reuse" {
+                    sender.split().0.submit_video_copy(&source).unwrap();
+                } else {
+                    sender.submit_video_copy(&source).unwrap();
+                }
             }
             pixels.fill(9);
             drop(pixels);
@@ -581,6 +588,75 @@ fn child(case: &str) {
                 position(&events, "sender-copy-released=6")
                     < position(&events, "sender-destroy-begin")
             );
+        }
+        "sender_split_overlap" => {
+            use std::time::Instant;
+            let gate = std::env::temp_dir().join(format!("raw-video-gate-{}", std::process::id()));
+            fs::create_dir_all(&gate).unwrap();
+            std::env::set_var("GRAFTON_FAKE_VIDEO_GATE", &gate);
+            struct Release<'a>(&'a Path);
+            impl Drop for Release<'_> {
+                fn drop(&mut self) {
+                    fs::write(self.0.join("release"), b"").unwrap();
+                }
+            }
+            let mut sender = sender(&ndi);
+            let (mut video, shared) = sender.split();
+            std::thread::scope(|scope| {
+                let submission = scope.spawn(move || video.submit_video(frame()).unwrap());
+                let _release = Release(&gate);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !gate.join("entered").exists() {
+                    assert!(Instant::now() < deadline, "video never entered the SDK");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let audio = grafton_ndi::AudioFrame::builder()
+                    .num_samples(480)
+                    .build()
+                    .unwrap();
+                let (audio_done, completed) = std::sync::mpsc::sync_channel(1);
+                scope.spawn(move || {
+                    shared.send_audio(&audio);
+                    let _ = audio_done.send(());
+                });
+                // On failure this thread unwinds through Release before the
+                // scope joins, so a video-lock regression releases both workers.
+                assert!(
+                    completed.recv_timeout(Duration::from_secs(2)).is_ok(),
+                    "audio waited for the blocked video submission"
+                );
+                assert!(
+                    !submission.is_finished(),
+                    "video must still be blocked in the SDK"
+                );
+                let events = log();
+                assert!(events.contains("sender-audio\n"));
+                assert!(!events.contains("sender-video-released\n"));
+            });
+            std::env::remove_var("GRAFTON_FAKE_VIDEO_GATE");
+            drop(sender);
+            let events = log();
+            assert!(position(&events, "sender-audio") < position(&events, "sender-video-released"));
+            assert_eq!(events.matches("sender-flush\n").count(), 1);
+            assert_eq!(events.matches("sender-destroy\n").count(), 1);
+            fs::remove_dir_all(gate).unwrap();
+        }
+        "sender_split_drop" => {
+            let mut sender = sender(&ndi);
+            {
+                let (mut video, shared) = sender.split();
+                video.submit_video(frame()).unwrap();
+                shared.flush_video();
+                assert!(video.reclaim_video().is_some());
+                assert!(video.reclaim_video().is_none());
+                video.submit_video(frame()).unwrap();
+            }
+            // Dropping the borrowed view leaves this final loan with its owner.
+            assert_eq!(log().matches("sender-flush\n").count(), 1);
+            drop(sender);
+            let events = log();
+            assert_eq!(events.matches("sender-flush\n").count(), 2);
+            assert_eq!(events.matches("sender-destroy\n").count(), 1);
         }
         "sender_unregistered" => {
             let mut sender = sender(&ndi);

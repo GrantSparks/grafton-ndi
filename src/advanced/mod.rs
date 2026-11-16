@@ -60,6 +60,7 @@ mod kvm_receiver;
 mod packets;
 mod queued;
 mod receive;
+mod reserved_map;
 mod routing;
 mod send;
 mod send_slots;

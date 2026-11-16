@@ -1149,7 +1149,7 @@ impl AudioPacketFormat {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidFrame`] unless each quantity is in `1..=i32::MAX`.
+    /// [`Error::InvalidInput`] unless each quantity is in `1..=i32::MAX`.
     pub fn new(
         codec: AudioCodec,
         sample_rate: u32,
@@ -1163,6 +1163,7 @@ impl AudioPacketFormat {
             num_channels.into(),
             num_samples.into(),
         )
+        .map_err(|cause| Error::InvalidInput(crate::InputDefect::Layout(cause)))
     }
 
     /// The same format with the requested stream protection.
@@ -1207,6 +1208,7 @@ impl AudioPacketFormat {
             raw.no_channels.into(),
             raw.no_samples.into(),
         )
+        .map_err(|cause| invalid_frame(crate::FrameDefect::Layout(cause)))
     }
 
     /// The one quantity check, for values from the API and from the SDK.
@@ -1216,29 +1218,17 @@ impl AudioPacketFormat {
         sample_rate: i64,
         num_channels: i64,
         num_samples: i64,
-    ) -> Result<Self> {
-        match (
-            sdk_quantity(sample_rate),
-            sdk_quantity(num_channels),
-            sdk_quantity(num_samples),
-        ) {
-            (Some(sample_rate), Some(num_channels), Some(num_samples)) => Ok(Self {
-                codec,
-                protected,
-                sample_rate,
-                num_channels,
-                num_samples,
-            }),
-            _ => Err(invalid_frame(
-                crate::FrameDefect::CompressedAudioQuantities {
-                    detail: crate::CompactDiagnostic::new(crate::CompressedAudioDefect {
-                        sample_rate,
-                        channels: num_channels,
-                        samples: num_samples,
-                    }),
-                },
-            )),
-        }
+    ) -> crate::frames::LayoutResult<Self> {
+        let sample_rate = crate::frames::validate_audio_sample_rate(sample_rate)?;
+        let (num_channels, num_samples) =
+            crate::frames::validate_positive_audio_counts(num_channels, num_samples)?;
+        Ok(Self {
+            codec,
+            protected,
+            sample_rate,
+            num_channels: num_channels as u32,
+            num_samples: num_samples as u32,
+        })
     }
 
     /// A native descriptor without data, carrying this format and `extras`.
@@ -2270,9 +2260,7 @@ mod tests {
         ] {
             assert!(matches!(
                 AudioPacketFormat::new(AudioCodec::Opus, sample_rate, channels, samples),
-                Err(Error::InvalidFrame(
-                    crate::FrameDefect::CompressedAudioQuantities { .. }
-                ))
+                Err(Error::InvalidInput(crate::InputDefect::Layout(_)))
             ));
         }
         let format = AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap();
@@ -2284,6 +2272,31 @@ mod tests {
             AudioPacketFormat::from_sdk(&protected.descriptor(&FrameExtras::default())).unwrap(),
             protected
         );
+    }
+
+    #[test]
+    fn audio_packet_quantities_share_causes_for_api_and_sdk_input() {
+        for (rate, channels, samples) in [(0, 2, 960), (48_000, 0, 960), (48_000, 2, 0)] {
+            let api = AudioPacketFormat::new(AudioCodec::Opus, rate, channels, samples);
+            let raw = NDIlib_audio_frame_v3_t {
+                sample_rate: rate as i32,
+                no_channels: channels as i32,
+                no_samples: samples as i32,
+                FourCC: AudioCodec::Opus.outer(false),
+                ..Default::default()
+            };
+            let (
+                Err(Error::InvalidInput(crate::InputDefect::Layout(api))),
+                Err(Error::InvalidFrame(crate::FrameDefect::Layout(sdk))),
+            ) = (api, AudioPacketFormat::from_sdk(&raw))
+            else {
+                panic!("expected paired layout causes")
+            };
+            assert_eq!(api, sdk);
+            if rate == 0 {
+                assert_eq!(api, crate::LayoutDefect::AudioRate(0.into()));
+            }
+        }
     }
 
     /// The dimensions of a format the caller describes are input; those of a
@@ -2744,8 +2757,13 @@ mod tests {
             opus(48_000, channels, 960).unwrap();
         }
         assert!(matches!(
-            reason(opus(48_000, 0, 960)),
-            crate::FrameDefect::CompressedAudioQuantities { .. }
+            opus(48_000, 0, 960),
+            Err(Error::InvalidInput(crate::InputDefect::Layout(
+                crate::LayoutDefect::AudioCount {
+                    kind: crate::AudioCountKind::Channels,
+                    ..
+                }
+            )))
         ));
     }
 

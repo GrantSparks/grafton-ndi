@@ -1,0 +1,35 @@
+error[E0277]: `Cell<()>` cannot be shared between threads safely
+ --> tests/ui/fail/raw_video_not_shared.rs:4:21
+  |
+4 |         scope.spawn(move || { let _ = format!("{video:?}"); });
+  |               ----- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Cell<()>` cannot be shared between threads safely
+  |               |
+  |               required by a bound introduced by this call
+  |
+  = help: within `RawVideo<'_>`, the trait `Sync` is not implemented for `Cell<()>`
+  = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
+note: required because it appears within the type `PhantomData<Cell<()>>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `RawVideo<'_>`
+ --> src/sender.rs
+  |
+  | pub struct RawVideo<'a> {
+  |            ^^^^^^^^
+  = note: required for `&RawVideo<'_>` to implement `Send`
+note: required because `video` is used within this closure
+ --> tests/ui/fail/raw_video_not_shared.rs:4:49
+  |
+4 |         scope.spawn(move || { let _ = format!("{video:?}"); });
+  |                                                 ^^^^^
+note: required by a bound in `Scope::<'scope, 'env>::spawn`
+ --> $RUST/std/src/thread/scoped.rs
+  |
+  | impl<'scope, 'env> Scope<'scope, 'env> {
+...
+  |     pub fn spawn<F, T>(&'scope self, f: F) -> ScopedJoinHandle<'scope, T>
+  |     where
+  |         F: FnOnce() -> T + Send + 'scope,
+  |                            ^^^^ required by this bound in `Scope::<'scope, 'env>::spawn`

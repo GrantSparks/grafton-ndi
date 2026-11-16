@@ -137,19 +137,6 @@ fn receiver_delay(millis: i32) -> Result<Duration> {
         })
 }
 
-/// Reject a signed native count while keeping its exact producing entry point.
-/// The returned u64 covers both the SDK's i32 counts and i64 performance totals.
-pub(crate) fn native_count<T: Into<i64>>(count: sys::table::Called<T>) -> Result<u64> {
-    let (value, operation) = count.into_parts();
-    let value = value.into();
-    u64::try_from(value).map_err(|_| {
-        Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount {
-            operation,
-            value: value.into(),
-        })
-    })
-}
-
 /// A consumable report carries its publication order across an async worker.
 /// The sequence is private: only the state that published it can admit a replay.
 #[derive(Debug)]
@@ -210,11 +197,94 @@ impl<T> LatestReport<T> {
         self.pending = Some(report);
     }
 
-    #[cfg(any(feature = "tokio", feature = "smol"))]
+    #[cfg(any(test, feature = "tokio", feature = "smol"))]
     fn replay(&mut self, report: ReceiverReport<T>) {
         if report.sequence == self.sequence {
             self.pending = Some(report);
         }
+    }
+}
+
+#[cfg(test)]
+mod latest_report_tests {
+    use super::LatestReport;
+
+    #[test]
+    fn publishing_coalesces_and_taking_consumes_the_latest_value() {
+        let mut latest = LatestReport::default();
+        latest.publish("first");
+        latest.publish("second");
+        assert_eq!(latest.pending.take().unwrap().value, "second");
+        assert!(latest.pending.take().is_none());
+    }
+
+    #[test]
+    fn the_current_report_can_be_replayed_after_it_is_taken() {
+        let mut latest = LatestReport::default();
+        latest.publish("current");
+        let abandoned = latest.pending.take().unwrap();
+        latest.replay(abandoned);
+        assert_eq!(latest.pending.take().unwrap().value, "current");
+        assert!(latest.pending.take().is_none());
+    }
+
+    #[test]
+    fn an_older_report_cannot_follow_a_newer_report() {
+        let mut latest = LatestReport::default();
+        let older = latest.report("first");
+        let current = latest.report("second");
+        latest.replay(older);
+        assert!(latest.pending.is_none());
+        latest.replay(current);
+        assert_eq!(latest.pending.take().unwrap().value, "second");
+    }
+
+    #[test]
+    fn only_the_newest_abandoned_value_is_replayed() {
+        let mut latest = LatestReport::default();
+        let older = latest.report("first");
+        let current = latest.report("second");
+        latest.replay(current);
+        latest.replay(older);
+        assert_eq!(latest.pending.take().unwrap().value, "second");
+        assert!(latest.pending.is_none());
+    }
+
+    #[test]
+    fn taking_a_newer_publication_does_not_readmit_an_older_report() {
+        let mut latest = LatestReport::default();
+        latest.publish(1);
+        let old = latest.pending.take().unwrap();
+        latest.publish(2);
+        latest.replay(old);
+        let current = latest.pending.take().unwrap();
+        assert_eq!(current.value, 2);
+        latest.publish(3);
+        assert_eq!(latest.pending.take().unwrap().value, 3);
+        latest.replay(current);
+        assert!(latest.pending.is_none());
+    }
+
+    #[test]
+    fn replay_order_survives_sequence_wrap() {
+        let mut latest = LatestReport {
+            sequence: u64::MAX - 1,
+            pending: None,
+        };
+        let before_wrap = latest.report("before wrap");
+        assert_eq!(before_wrap.sequence, u64::MAX);
+        latest.replay(before_wrap);
+        let abandoned = latest.pending.take().unwrap();
+        let wrapped = latest.report("wrapped");
+        assert_eq!(wrapped.sequence, 0);
+        latest.replay(abandoned);
+        assert!(latest.pending.is_none());
+        latest.replay(wrapped);
+        let abandoned = latest.pending.take().unwrap();
+        assert_eq!(abandoned.value, "wrapped");
+        latest.publish("after wrap");
+        latest.replay(abandoned);
+        assert_eq!(latest.pending.take().unwrap().value, "after wrap");
     }
 }
 
@@ -692,10 +762,10 @@ impl ReceiverOptions {
     ///
     /// The SDK converts YUV to RGB with BT.709 limited range even when
     /// `ndi_color_info` names another matrix. This preset's RGB frames already
-    /// carry that conversion. Receive YUV with [`ReceiverColorFormat::UyvyBgra`]
-    /// or [`ReceiverColorFormat::UyvyRgba`] to let image encoding apply the
-    /// tag's matrix; [`ReceiverColorFormat::Best`] also retains high bit depth
-    /// and HDR code values. Tags still control HDR refusal and PNG tagging.
+    /// carry that conversion. See the
+    /// [image encoding color guidance](https://grantsparks.github.io/grafton-ndi/grafton_ndi/image_encoding/struct.ImageOptions.html#color)
+    /// for receiving YUV when the tag's matrix matters, including alpha and
+    /// high bit depth sources. Tags still control HDR refusal and PNG tagging.
     ///
     /// # Example
     ///
@@ -739,9 +809,10 @@ impl ReceiverOptions {
     /// RGB is convenient for untagged sources. For tagged YUV, the SDK has
     /// already converted to BT.709 limited range, ignoring `ndi_color_info`;
     /// image encoding cannot apply the tagged matrix to these RGB frames.
-    /// Use [`ReceiverColorFormat::UyvyBgra`] or [`ReceiverColorFormat::UyvyRgba`]
-    /// for that matrix, or [`ReceiverColorFormat::Best`] to retain high bit
-    /// depth and HDR code values. Tags still control HDR refusal and PNG tagging.
+    /// See the
+    /// [image encoding color guidance](https://grantsparks.github.io/grafton-ndi/grafton_ndi/image_encoding/struct.ImageOptions.html#color)
+    /// for receiving YUV when the tag's matrix matters, including alpha and
+    /// high bit depth sources. Tags still control HDR refusal and PNG tagging.
     ///
     /// # Example
     ///
@@ -1740,14 +1811,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// [`Self::connection_stats`] to inspect that SDK contract error.
     #[doc(alias = "NDIlib_recv_get_no_connections")]
     pub fn is_connected(&self) -> bool {
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
-        unsafe {
-            self.core
-                .sdk()
-                .NDIlib_recv_get_no_connections(self.core.instance.0)
-                > 0
-        }
+        self.core.connections().is_ok_and(|count| count > 0)
     }
 
     /// Re-establish this receiver's connection to its latest requested target,
@@ -1852,14 +1916,7 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_get_performance")]
     #[doc(alias = "NDIlib_recv_get_queue")]
     pub fn connection_stats(&self) -> Result<ConnectionStats> {
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
-        let connections = unsafe {
-            self.core
-                .sdk()
-                .named()
-                .NDIlib_recv_get_no_connections(self.core.instance.0)
-        };
+        let connections = self.core.connections()?;
 
         let mut total = NDIlib_recv_performance_t::default();
         let mut dropped = NDIlib_recv_performance_t::default();
@@ -1884,16 +1941,16 @@ impl<M: ReceiverMode> Receiver<M> {
         };
 
         Ok(ConnectionStats {
-            connections: native_count(connections)? as u32,
-            video_frames_received: native_count(performance.map(|()| total.video_frames))?,
-            audio_frames_received: native_count(performance.map(|()| total.audio_frames))?,
-            metadata_frames_received: native_count(performance.map(|()| total.metadata_frames))?,
-            video_frames_dropped: native_count(performance.map(|()| dropped.video_frames))?,
-            audio_frames_dropped: native_count(performance.map(|()| dropped.audio_frames))?,
-            metadata_frames_dropped: native_count(performance.map(|()| dropped.metadata_frames))?,
-            video_frames_queued: native_count(queued.map(|()| queue.video_frames))? as u32,
-            audio_frames_queued: native_count(queued.map(|()| queue.audio_frames))? as u32,
-            metadata_frames_queued: native_count(queued.map(|()| queue.metadata_frames))? as u32,
+            connections,
+            video_frames_received: performance.map(|()| total.video_frames).count()?,
+            audio_frames_received: performance.map(|()| total.audio_frames).count()?,
+            metadata_frames_received: performance.map(|()| total.metadata_frames).count()?,
+            video_frames_dropped: performance.map(|()| dropped.video_frames).count()?,
+            audio_frames_dropped: performance.map(|()| dropped.audio_frames).count()?,
+            metadata_frames_dropped: performance.map(|()| dropped.metadata_frames).count()?,
+            video_frames_queued: queued.map(|()| queue.video_frames).count()?,
+            audio_frames_queued: queued.map(|()| queue.audio_frames).count()?,
+            metadata_frames_queued: queued.map(|()| queue.metadata_frames).count()?,
         })
     }
 }
@@ -2082,15 +2139,19 @@ impl ReceiverCore {
         self.pending_status.take_with(|| self.current_status())
     }
 
-    fn current_status(&self) -> Result<ReceiverStatus> {
+    fn connections(&self) -> Result<u32> {
         // SAFETY: the receiver is live for this nonblocking native query.
-        let count = unsafe {
+        unsafe {
             self.sdk()
                 .named()
                 .NDIlib_recv_get_no_connections(self.instance.0)
-        };
+        }
+        .count()
+    }
+
+    fn current_status(&self) -> Result<ReceiverStatus> {
         Ok(ReceiverStatus {
-            connections: native_count(count)? as u32,
+            connections: self.connections()?,
         })
     }
 
@@ -3414,24 +3475,6 @@ mod tests {
         }
 
         #[test]
-        fn an_older_source_name_replay_cannot_follow_a_newer_native_report() {
-            let Some(ndi) = crate::test_support::ndi() else {
-                return;
-            };
-            let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-            let first = poll(&receiver.core, Some(c"first")).unwrap();
-            let second = poll(&receiver.core, Some(c"second")).unwrap();
-            assert_eq!(second.value, SourceNameChange::Connected("second".into()));
-            receiver.core.retain_source_name_change(first);
-            assert!(poll(&receiver.core, None).is_none());
-            receiver.core.retain_source_name_change(second);
-            assert_eq!(
-                poll(&receiver.core, None).unwrap().value,
-                SourceNameChange::Connected("second".into())
-            );
-        }
-
-        #[test]
         fn only_the_newest_abandoned_name_precedes_a_native_query() {
             let Some(ndi) = crate::test_support::ndi() else {
                 return;
@@ -3501,25 +3544,6 @@ mod tests {
                 );
                 assert!(poll(&receiver.core, None).is_none());
             });
-        }
-
-        #[test]
-        fn replayed_unknown_events_do_not_replace_newer_publications() {
-            let Some(ndi) = crate::test_support::ndi() else {
-                return;
-            };
-            let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-            receiver.core.retain(Notification::Unknown(1));
-            let old = receiver.core.take_pending_event_report().unwrap().unwrap();
-            receiver.core.retain(Notification::Unknown(2));
-            receiver.core.retain_event(old);
-            let latest = receiver.core.take_pending_event_report().unwrap().unwrap();
-            assert_eq!(latest.value, ReceiverEvent::Unknown(2));
-            // Taking the latest value does not let a still older replay back in.
-            receiver.core.retain(Notification::Unknown(3));
-            receiver.core.take_pending_event().unwrap();
-            receiver.core.retain_event(latest);
-            assert_eq!(receiver.core.take_pending_event().unwrap(), None);
         }
     }
 
@@ -3622,24 +3646,6 @@ mod tests {
         check::<VideoKind>(&receiver);
         check::<AudioKind>(&receiver);
         check::<MetadataKind>(&receiver);
-    }
-
-    #[test]
-    fn native_counts_preserve_signed_evidence_without_allocating() {
-        for value in [0, 7, -1, i64::MIN] {
-            let (result, allocations) = crate::test_alloc::allocation_count(|| {
-                native_count(sys::table::for_test(value, c"native count"))
-            });
-            assert_eq!(allocations, 0);
-            if value < 0 {
-                assert!(
-                    matches!(result, Err(Error::UnexpectedSdkResult(crate::SdkResultDefect::NegativeCount { operation, value: evidence }))
-                    if operation == c"native count" && evidence.get() == value)
-                );
-            } else {
-                assert_eq!(result.unwrap(), value as u64);
-            }
-        }
     }
 
     #[test]

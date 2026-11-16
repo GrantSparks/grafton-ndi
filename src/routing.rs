@@ -316,8 +316,7 @@ impl Router {
                 .named()
                 .NDIlib_routing_get_no_connections(self.instance.0, timeout_ms)
         };
-        // The SDK count is i32, so every nonnegative value fits u32.
-        crate::receiver::native_count(count).map(|count| count as u32)
+        count.count()
     }
     /// The source descriptor this router is advertised under, which receivers
     /// connect to.

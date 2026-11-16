@@ -3,6 +3,7 @@
 //! This example demonstrates:
 //! - Locking a [`Genlock`] to a reference source
 //! - Waiting on its video clock before each frame
+//! - Constructing a reusable audio clock request for audio pacing
 //! - Seeing when the system clock stands in for a missing reference
 //!
 //! Needs the NDI Advanced SDK at build time and an Advanced runtime.
@@ -15,7 +16,7 @@
 use std::{env, time::Duration};
 
 use grafton_ndi::{
-    advanced::{ClockSource, Genlock, GenlockOptions},
+    advanced::{AudioClockRequest, ClockSource, Genlock, GenlockOptions},
     Error, FrameRate, Ndi, RuntimeOptions, ScanType, SdkEdition, Sender, SenderOptions, VideoFrame,
 };
 
@@ -55,6 +56,10 @@ fn main() -> Result<(), Error> {
         .frame_rate(frame_rate)
         .build()?;
 
+    // An audio producer can reuse this request with audio_clock.wait(request)
+    // on its own scoped thread while this thread waits for video.
+    let audio_request = AudioClockRequest::new(48_000, 800)?;
+    println!("Audio pacing request: {audio_request:?}");
     let (mut video_clock, _audio_clock) = genlock.clocks();
     let mut paced_by = None;
     for _ in 0..600 {

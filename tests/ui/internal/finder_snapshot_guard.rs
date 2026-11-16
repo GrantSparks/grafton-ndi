@@ -9,6 +9,7 @@ fn a_finder_issued_guard_is_accepted(finder: &Finder) -> Result<Vec<Source>> {
     finder
         .lock_snapshots(None, crate::timeout::NeverStop)
         .unwrap()
+        .unwrap()
         .snapshot(&finder._ndi.api().core)
 }
 

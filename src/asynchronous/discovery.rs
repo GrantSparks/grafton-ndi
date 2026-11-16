@@ -1,5 +1,5 @@
 //! Owned discovery adapters sharing the receivers' blocking-pool stop rule.
-use super::{private, with_deadline_budget, with_timeout_budget, AsyncRuntime};
+use super::{discovery_result, private, with_deadline_budget, with_timeout_budget, AsyncRuntime};
 use crate::{
     finder::{validate_source_name, HostQuery, SourceCursor},
     timeout::Deadline,
@@ -8,7 +8,7 @@ use crate::{
 use std::{marker::PhantomData, sync::Arc, time::Duration};
 
 mod sealed {
-    pub trait SourceDiscovery {
+    pub trait SourceDiscovery: std::fmt::Debug {
         fn finder(&self) -> &crate::Finder;
     }
     impl SourceDiscovery for crate::Finder {
@@ -69,7 +69,7 @@ pub struct AsyncFinder<R: AsyncRuntime, D: SourceDiscovery = Finder> {
 impl<R: AsyncRuntime, D: SourceDiscovery> std::fmt::Debug for AsyncFinder<R, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncFinder")
-            .field("owner", &std::any::type_name::<D>())
+            .field("owner", &*self.inner)
             .field("runtime", &std::any::type_name::<R>())
             .finish_non_exhaustive()
     }
@@ -131,7 +131,11 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncFinder<R, D> {
     ) -> Result<Option<Source>> {
         let inner = Arc::clone(&self.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-            sealed::SourceDiscovery::finder(&*inner).find_source_until(deadline, stop, &mut select)
+            discovery_result(sealed::SourceDiscovery::finder(&*inner).find_source_until(
+                deadline,
+                stop,
+                &mut select,
+            ))
         })
         .await
     }
@@ -154,8 +158,11 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncFinder<R, D> {
         let name = name.to_owned();
         let inner = Arc::clone(&self.inner);
         with_deadline_budget::<R, _, _>(deadline, move |deadline, stop| {
-            sealed::SourceDiscovery::finder(&*inner)
-                .find_source_until(deadline, stop, |source| source.name() == name)
+            discovery_result(sealed::SourceDiscovery::finder(&*inner).find_source_until(
+                deadline,
+                stop,
+                |source| source.name() == name,
+            ))
         })
         .await
     }
@@ -171,7 +178,9 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncFinder<R, D> {
     pub async fn find_sources(&self, timeout: Duration) -> Result<Vec<Source>> {
         let inner = Arc::clone(&self.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-            sealed::SourceDiscovery::finder(&*inner).find_sources_until(deadline, stop)
+            discovery_result(
+                sealed::SourceDiscovery::finder(&*inner).find_sources_until(deadline, stop),
+            )
         })
         .await
     }
@@ -207,7 +216,7 @@ impl<R: AsyncRuntime> AsyncFinder<R, SourceCache> {
         let query = query.into_owned();
         let inner = Arc::clone(&self.inner);
         with_deadline_budget::<R, _, _>(deadline, move |deadline, stop| {
-            inner.find_sources_by_host_until(query.as_query(), deadline, stop)
+            discovery_result(inner.find_sources_by_host_until(query.as_query(), deadline, stop))
         })
         .await
     }
@@ -230,7 +239,7 @@ pub struct AsyncSourceWatch<R: AsyncRuntime, D: SourceDiscovery = Finder> {
 impl<R: AsyncRuntime, D: SourceDiscovery> std::fmt::Debug for AsyncSourceWatch<R, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncSourceWatch")
-            .field("owner", &std::any::type_name::<D>())
+            .field("owner", &*self.inner)
             .field("runtime", &std::any::type_name::<R>())
             .finish_non_exhaustive()
     }
@@ -253,7 +262,7 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncSourceWatch<R, D> {
         let (sources, observation) = R::spawn_stoppable(private::Token, move |stop| {
             SourceCursor::snapshot(
                 sealed::SourceDiscovery::finder(&*inner),
-                |finder| finder.current_sources_stoppable(stop),
+                |finder| discovery_result(finder.current_sources_stoppable(stop)),
                 |_| true,
             )
         })
@@ -333,6 +342,40 @@ mod tests {
         let _ = futures_are_send::<super::super::Tokio>;
         #[cfg(feature = "smol")]
         let _ = futures_are_send::<super::super::Smol>;
+    }
+
+    fn owners_keep_their_discovery_scope<R: AsyncRuntime>() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        fn assert_owner<R: AsyncRuntime, D: SourceDiscovery>(
+            adapter: AsyncFinder<R, D>,
+            kind: &str,
+        ) {
+            for output in [format!("{adapter:?}"), format!("{:?}", adapter.watch())] {
+                assert!(output.contains(&format!("owner: {kind} {{")), "{output}");
+                assert!(output.contains("\"g\""), "{output}");
+                assert!(output.ends_with(", .. }"), "{output}");
+            }
+        }
+        let configured = || Finder::new(&ndi, &FinderOptions::new().groups(["g"])).unwrap();
+        assert_owner(AsyncFinder::<R>::new(configured()), "Finder");
+        assert_owner(
+            AsyncFinder::<R, SourceCache>::new(SourceCache::new(configured())),
+            "SourceCache",
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_debug_names_the_shared_owner_and_its_scope() {
+        owners_keep_their_discovery_scope::<super::super::Tokio>();
+    }
+
+    #[cfg(feature = "smol")]
+    #[test]
+    fn smol_debug_names_the_shared_owner_and_its_scope() {
+        owners_keep_their_discovery_scope::<super::super::Smol>();
     }
 
     fn assert_invalid_discovery_inputs<R: AsyncRuntime>() {

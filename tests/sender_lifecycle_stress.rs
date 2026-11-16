@@ -7,7 +7,6 @@ common_helpers!(runtime, name);
 use grafton_ndi::{Sender, SenderOptions, VideoFrame};
 
 #[test]
-#[ignore = "slow stress test; run explicitly"]
 fn rapid_owned_sender_lifecycle() -> Result<(), grafton_ndi::Error> {
     let Some(ndi) = common::ndi() else {
         return Ok(());

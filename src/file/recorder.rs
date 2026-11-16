@@ -270,6 +270,15 @@ impl CleanupBudget {
     }
 }
 
+/// What initiated the owner's cleanup. Abandon can replace an earlier close
+/// while that close is draining; synchronous drop never requests that change.
+#[derive(Clone, Copy)]
+pub(super) enum CleanupRequest {
+    Drop,
+    Close,
+    Abandon,
+}
+
 /// A wait's deadline and its one bounded drain after expiry.
 /// Reading expiry once per step keeps the native poll and settlement in agreement.
 pub(super) enum DrainBudget {
@@ -1415,6 +1424,11 @@ impl FileRecorder {
         self.ledger.settle(expired, drained)
     }
 
+    /// Share abandon's cleanup policy with the async owner's shutdown driver.
+    pub(super) fn skip_cleanup(&mut self) {
+        self.cleanup = CleanupBudget::Skip;
+    }
+
     /// Start cleanup once, retaining an async close's original submission time.
     pub(super) fn begin_cleanup(&mut self, requested: Instant) -> DrainBudget {
         self.cleanup.begin(requested)
@@ -1450,8 +1464,11 @@ impl FileRecorder {
         queued: impl IntoIterator<Item = (Deadline, R)>,
         tick: Duration,
         sink: &mut impl FnMut(Result<RecorderEvent>),
-        closing: impl Fn() -> bool,
+        closing: impl Fn() -> CleanupRequest,
     ) {
+        if matches!(closing(), CleanupRequest::Abandon) {
+            self.skip_cleanup();
+        }
         let mut budget = self.begin_cleanup(requested);
         self.request_stop();
         for (deadline, reply) in queued {
@@ -1459,6 +1476,12 @@ impl FileRecorder {
         }
         waiters.retain();
         while self.cleanup_pending() || !waiters.is_empty() {
+            if matches!(closing(), CleanupRequest::Abandon) {
+                // A close may already be draining when abandon is submitted.
+                // Stop spending its remaining budget before the next native
+                // poll. An in-progress native call itself is not interruptible.
+                budget = DrainBudget::Spent;
+            }
             let polled = self.pump(&mut budget, waiters.wait_timeout(tick), sink);
             let drained = waiters.settle_at(
                 self,
@@ -1468,7 +1491,7 @@ impl FileRecorder {
                     at: Instant::now(),
                 },
                 sink,
-                &closing,
+                || !matches!(closing(), CleanupRequest::Drop),
                 Some(&mut budget),
             );
             if polled.expired() && drained {
@@ -1484,7 +1507,7 @@ impl FileRecorder {
     /// The file of a session that had not ended may be left truncated.
     #[doc(alias = "NDIlib_file_recorder_destroy")]
     pub fn abandon(mut self) -> RecordingReport {
-        self.cleanup = CleanupBudget::Skip;
+        self.skip_cleanup();
         self.report()
     }
 
@@ -1764,7 +1787,7 @@ impl Drop for FileRecorder {
                 std::iter::empty(),
                 FINISH_POLL,
                 &mut |_| {},
-                || false,
+                || CleanupRequest::Drop,
             );
         }
         // SAFETY: the recorder is live and is destroyed exactly once, on the

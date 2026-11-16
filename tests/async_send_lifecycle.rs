@@ -1,7 +1,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name);
+common_helpers!(runtime, name, loopback);
 
 use std::{
     sync::{mpsc, Arc, Barrier},
@@ -185,5 +185,125 @@ fn copied_send_retains_metadata_after_source_drop() -> Result<(), grafton_ndi::E
     let recovered = sender.reclaim_video().unwrap();
     assert_eq!(recovered.data()[0], 8);
     assert_eq!(recovered.metadata(), Some("<frame value=\"8\"/>"));
+    Ok(())
+}
+
+/// Clocked video remains on its submitting thread while independently paced
+/// audio reaches the same receiver through the shared half.
+#[test]
+fn split_clocked_video_keeps_audio_flowing_on_another_thread() -> grafton_ndi::Result<()> {
+    use grafton_ndi::{AudioFrame, FrameRate, Receiver, ReceiverOptions};
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::Instant,
+    };
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
+    let mut sender = Sender::new(
+        &ndi,
+        &SenderOptions::new(common::unique_name("raw split audio"))
+            .clock_video(true)
+            .clock_audio(false),
+    )?;
+    let source = common::loopback_source(&ndi, &sender)?;
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
+    let warm = AudioFrame::builder()
+        .num_channels(1)
+        .num_samples(480)
+        .build()?;
+    let ready = AtomicBool::new(false);
+    struct Ready<'a>(&'a AtomicBool);
+    impl Drop for Ready<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            while !ready.load(Ordering::Acquire) {
+                sender.send_audio(&warm);
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let _ready = Ready(&ready);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while receiver
+            .capture_audio(Duration::from_millis(100))
+            .unwrap()
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "audio receiver did not connect");
+        }
+    });
+    let video_frame = VideoFrame::builder()
+        .resolution(16, 16)
+        .frame_rate(FrameRate::new(30, 1)?)
+        .build()?;
+    // Binary-fraction markers are exactly representable. Some SDK sample
+    // conversions change their amplitude slightly (Windows 6.3.2 returned
+    // 0.08999726 for 0.09). Allow one normalized 16-bit PCM step; adjacent
+    // markers are 512 such steps apart, and their sample counts remain exact.
+    const MARKER_SCALE: f32 = 64.0;
+    const SAMPLE_TOLERANCE: f32 = 1.0 / 32_768.0;
+    let audio: Vec<_> = (1..=32)
+        .map(|index| {
+            AudioFrame::builder()
+                .num_channels(1)
+                .num_samples(480)
+                .data(vec![index as f32 / MARKER_SCALE; 480])
+                .build()
+                .unwrap()
+        })
+        .collect();
+    let (mut video, shared) = sender.split();
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            for _ in 0..12 {
+                video.submit_video_copy(&video_frame).unwrap();
+            }
+            video.reclaim_video();
+        });
+        scope.spawn(move || {
+            for frame in &audio {
+                shared.send_audio(frame);
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let mut received = [0usize; 32];
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while received.iter().any(|samples| *samples < 480) {
+            assert!(
+                Instant::now() < deadline,
+                "audio frames missing during clocked video: {received:?}"
+            );
+            if let Some(frame) = receiver.capture_audio(Duration::from_millis(100)).unwrap() {
+                for &sample in frame.data() {
+                    let index = (sample * MARKER_SCALE).round() as usize;
+                    if index == 0 {
+                        assert!(
+                            sample.abs() <= SAMPLE_TOLERANCE,
+                            "unexpected warm-up sample: {sample}"
+                        );
+                    } else {
+                        assert!(
+                            (1..=32).contains(&index),
+                            "unexpected audio marker: {sample}"
+                        );
+                        let expected = index as f32 / MARKER_SCALE;
+                        assert!(
+                            (sample - expected).abs() <= SAMPLE_TOLERANCE,
+                            "audio marker changed: {sample}, expected {expected}"
+                        );
+                        received[index - 1] += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            received, [480; 32],
+            "each marked audio block must arrive exactly once"
+        );
+    });
     Ok(())
 }

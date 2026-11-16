@@ -143,6 +143,21 @@ jobs:
         run: cargo test --locked
       - name: Tests, File API without Advanced wrappers
         run: cargo test --locked --no-default-features --features file-io
+      - name: Manual measurement fixtures
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        env:
+          GRAFTON_NDI_SIZES: 64x64
+          GRAFTON_NDI_FORMATS: Bgra
+          GRAFTON_NDI_CONTENTS: photographic
+          GRAFTON_NDI_OUTPUTS: jpeg85
+        run: |
+          selected=$(cargo test --locked --release --all-features --lib -- --ignored --list)
+          if ! grep -q ': test$' <<< "$selected"; then
+            echo '::error::No tests selected for --ignored measurement fixtures'
+            exit 1
+          fi
+          cargo test --locked --release --all-features --lib -- --ignored --test-threads=1
       - name: Memcheck over scripted capture and encoder padding
         if: runner.os == 'Linux'
         timeout-minutes: 10
@@ -179,17 +194,54 @@ jobs:
           cargo +nightly-2026-11-10 miri setup
       - name: Initialized rows, metadata and synthetic native guards
         run: |
-          skips=(descriptor_admission_and_collection_stay_allocation_free_under_churn)
+          inventory=$(cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio -- --list)
+          tests=()
+          while IFS= read -r line; do
+            case "$line" in
+              *': test') tests+=("${line%: test}") ;;
+            esac
+          done <<< "$inventory"
+          has_tests() {
+            local filter=$1 apply_skips=$2 test skip excluded
+            for test in "${tests[@]}"; do
+              [[ "$test" == *"$filter"* ]] || continue
+              excluded=false
+              if [ "$apply_skips" = true ]; then
+                for skip in "${skips[@]}"; do
+                  if [[ "$test" == *"$skip"* ]]; then
+                    excluded=true
+                    break
+                  fi
+                done
+              fi
+              if [ "$excluded" = false ]; then return 0; fi
+            done
+            return 1
+          }
+          skips=(
+            descriptor_admission_and_collection_stay_allocation_free_under_churn
+            exact_copies_match_standard_utf8_replacement
+            sdk_copy::tests::expanded_text_cannot_allocate_past_the_snapshot_limit
+            sdk_copy::tests::omitting_malformed_entries_keeps_their_scan_cost_and_fatal_errors
+            sdk_copy::tests::rejected_scans_stay_charged_and_short_budgets_are_fatal
+            finder::budget::tests::aggregate_bytes_are_checked_before_string_allocation
+            finder::budget::tests::count_and_span_are_checked_before_dereferencing_or_reserving
+            finder::budget::tests::lossy_expansion_is_charged_before_allocating_the_output
+            finder::budget::tests::rejected_entries_still_consume_the_scan_budget
+          )
           skip_args=()
           for skip in "${skips[@]}"; do
-            selected=$(cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio -- --list "$skip")
-            if ! grep -q ': test$' <<< "$selected"; then
+            if ! has_tests "$skip" false; then
               echo "::error::No tests selected for skip: $skip"
               exit 1
             fi
             skip_args+=(--skip "$skip")
           done
           for filter in \
+            sdk_copy::tests:: \
+            source_retention::tests:: \
+            finder::budget::tests:: \
+            file::out_param::tests:: \
             frames::tests::video_padding_all_formats \
             frames::tests::video_padding_single_rows \
             frames::tests::video_padding_encoders \
@@ -197,6 +249,9 @@ jobs:
             frames::metadata_tests::owned_metadata_states \
             frames::metadata_tests::audio_timestamp \
             receiver::mixed_tests \
+            receiver::latest_report_tests:: \
+            advanced::kvm::ownership_tests:: \
+            advanced::reserved_map::tests:: \
             asynchronous::scoped_tests \
             framesync::tests::test_framesync_video_ref_uses \
             framesync::tests::test_framesync_audio_ref_supports \
@@ -210,12 +265,11 @@ jobs:
             advanced::send::tests:: \
             advanced::queued::tests:: \
             sender::tests::; do
-            selected=$(cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio -- --list "$filter" "${skip_args[@]}")
-            if ! grep -q ': test$' <<< "$selected"; then
+            if ! has_tests "$filter" true; then
               echo "::error::No tests selected for filter: $filter"
               exit 1
             fi
-            cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio "$filter" -- "${skip_args[@]}"
+            cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio "$filter" -- "${skip_args[@]}"
           done
 
   cross:

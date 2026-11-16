@@ -1,0 +1,9 @@
+error[E0502]: cannot borrow `*sender` as immutable because it is also borrowed as mutable
+ --> tests/ui/fail/raw_video_owner_while_split.rs:4:5
+  |
+3 |     let (mut video, _) = sender.split();
+  |                          ------ mutable borrow occurs here
+4 |     sender.flush_video();
+  |     ^^^^^^ immutable borrow occurs here
+5 |     video.reclaim_video();
+  |     ----- mutable borrow later used here

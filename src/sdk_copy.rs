@@ -53,7 +53,7 @@ pub(crate) unsafe fn copy_sdk_string(
     // SAFETY: forwarded to the caller's obligation.
     let bytes = unsafe { sdk_text(text) }?;
     // SAFETY: sdk_text stops at the first NUL and excludes it.
-    unsafe { crate::finder::SourceText::from_sdk(bytes) }
+    unsafe { crate::finder::SourceText::from_sdk(LossyText::new(bytes)) }
 }
 
 /// Read one bounded SDK C string, retaining its producing entry point.
@@ -183,7 +183,7 @@ impl CopyBudget {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "advanced"))]
+    #[cfg(test)]
     pub(crate) fn remaining(&self) -> usize {
         self.remaining
     }
@@ -298,13 +298,10 @@ impl CopyBudget {
         // SAFETY: forwarded to the caller's obligations.
         let text = unsafe { self.c_str(value)? };
         text.map(|text| {
-            let bytes = text.to_bytes();
-            let len = std::str::from_utf8(bytes)
-                .map(str::len)
-                .unwrap_or_else(|_| LossyText::new(bytes).len());
-            self.take(len + crate::finder::SourceText::STORAGE_OVERHEAD)?;
+            let text = LossyText::new(text.to_bytes());
+            self.take(text.len() + crate::finder::SourceText::STORAGE_OVERHEAD)?;
             // SAFETY: the bounded C string scan excludes its first NUL.
-            unsafe { crate::finder::SourceText::from_sdk(bytes) }.map_err(Into::into)
+            unsafe { crate::finder::SourceText::from_sdk(text) }.map_err(Into::into)
         })
         .transpose()
     }
@@ -360,37 +357,52 @@ impl CopyBudget {
 
 /// Borrowed SDK text with the exact size of its lossy UTF-8 representation.
 /// Callers charge `len()` to their snapshot budget before asking for a copy.
-pub(crate) struct LossyText<'a> {
-    bytes: &'a [u8],
-    len: usize,
+pub(crate) struct LossyText<'a>(ClassifiedText<'a>);
+
+enum ClassifiedText<'a> {
+    Valid(&'a str),
+    Invalid { bytes: &'a [u8], len: usize },
 }
 
 impl<'a> LossyText<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        let len = bytes
-            .utf8_chunks()
-            .map(|chunk| chunk.valid().len() + usize::from(!chunk.invalid().is_empty()) * 3)
-            .sum();
-        Self { bytes, len }
+        Self(match std::str::from_utf8(bytes) {
+            Ok(text) => ClassifiedText::Valid(text),
+            Err(_) => {
+                let len = bytes
+                    .utf8_chunks()
+                    .map(|chunk| chunk.valid().len() + usize::from(!chunk.invalid().is_empty()) * 3)
+                    .sum();
+                ClassifiedText::Invalid { bytes, len }
+            }
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.len
+        match &self.0 {
+            ClassifiedText::Valid(text) => text.len(),
+            ClassifiedText::Invalid { len, .. } => *len,
+        }
     }
 
     pub(crate) fn copy(&self) -> std::result::Result<String, TryReserveError> {
         let mut text = String::new();
-        text.try_reserve_exact(self.len)?;
+        text.try_reserve_exact(self.len())?;
         self.push_to(&mut text);
         Ok(text)
     }
 
-    /// Append into storage whose capacity the caller has already reserved.
+    /// Append the classified text into storage already reserved by the caller.
     pub(crate) fn push_to(&self, text: &mut String) {
-        for chunk in self.bytes.utf8_chunks() {
-            text.push_str(chunk.valid());
-            if !chunk.invalid().is_empty() {
-                text.push('\u{fffd}');
+        match &self.0 {
+            ClassifiedText::Valid(valid) => text.push_str(valid),
+            ClassifiedText::Invalid { bytes, .. } => {
+                for chunk in bytes.utf8_chunks() {
+                    text.push_str(chunk.valid());
+                    if !chunk.invalid().is_empty() {
+                        text.push('\u{fffd}');
+                    }
+                }
             }
         }
     }
@@ -682,12 +694,77 @@ mod tests {
     }
 
     #[test]
+    fn small_omitted_entries_keep_their_charge_and_propagate_exhaustion() {
+        for remaining in [18, 17] {
+            let mut budget = budget(remaining);
+            let result = budget.collect_entries(&[false, true], |keep, budget| {
+                // Eight consumed input bytes stay charged even if this entry
+                // is malformed; a later budget failure must remain fatal.
+                budget.take(8)?;
+                if *keep {
+                    Ok(9u8)
+                } else {
+                    Err(CopyError::Malformed)
+                }
+            });
+            if remaining == 18 {
+                assert_eq!(result.unwrap(), [9]);
+                assert_eq!(budget.remaining(), 0);
+            } else {
+                limit_error(result);
+            }
+        }
+    }
+
+    #[test]
+    fn small_rejected_scans_exhaust_the_remaining_budget() {
+        let mut exact = budget(4);
+        // SAFETY: the literal remains live through its NUL terminator.
+        assert_eq!(
+            unsafe { exact.c_str(c"abc".as_ptr()) }.unwrap(),
+            Some(c"abc")
+        );
+        assert_eq!(exact.remaining(), 0);
+        let unterminated = [b'x'; 4];
+        let mut short = budget(unterminated.len());
+        // SAFETY: each byte within the remaining scan bound is readable.
+        limit_error(unsafe { short.c_str(unterminated.as_ptr().cast()) });
+        assert_eq!(short.remaining(), 0);
+    }
+
+    #[test]
+    fn representative_copies_share_the_exact_lossy_length() {
+        for bytes in [
+            &b""[..],
+            &b"ASCII"[..],
+            &b"caf\xc3\xa9"[..],
+            &b"\xe2\x82\xac\xf0\x9f\xa6\x80"[..],
+            &b"\xe2\x82"[..],
+            &b"\xed\xa0\x80"[..],
+            &b"\xf4\x90\x80\x80"[..],
+            &b"\xe2\x82A\xff\xf0\x9f\xa6\x80"[..],
+        ] {
+            let expected = String::from_utf8_lossy(bytes);
+            let text = LossyText::new(bytes);
+            assert_eq!(text.len(), expected.len());
+            assert_eq!(text.copy().unwrap(), expected);
+            let mut copied = String::new();
+            text.push_to(&mut copied);
+            assert_eq!(copied, expected);
+        }
+    }
+
+    #[test]
     fn exact_copies_match_standard_utf8_replacement() {
         let check = |bytes: &[u8]| {
             let expected = String::from_utf8_lossy(bytes);
             let text = LossyText::new(bytes);
             assert_eq!(text.len(), expected.len());
             assert_eq!(text.copy().unwrap(), expected);
+            let mut appended = String::with_capacity(text.len());
+            text.push_to(&mut appended);
+            assert_eq!(appended.len(), text.len());
+            assert_eq!(appended, expected);
         };
         check(b"");
         // Exhaust every two-byte prefix, including continuation bytes,

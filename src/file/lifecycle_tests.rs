@@ -1336,12 +1336,85 @@ fn unwritable_unix_recording_directories_never_reach_the_sdk() {
     let _restore = Restore(denied.clone());
     std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o555)).unwrap();
     let path = std::ffi::CString::new(denied.as_os_str().as_bytes()).unwrap();
-    // SAFETY: `path` retains a NUL-terminated directory path for this query.
-    if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } == 0 {
+    // Match the SDK's effective identity, including when it can override mode
+    // bits. Android applications have equal real and effective IDs.
+    // SAFETY: `path` retains a NUL-terminated directory path for either query.
+    #[cfg(not(target_os = "android"))]
+    let access = unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    };
+    #[cfg(target_os = "android")]
+    let access = unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) };
+    if access == 0 {
         crate::test_support::unsupported("this process can override directory write permissions");
         return;
     }
     unwritable_directory_is_refused_before_native_calls(&directory);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_effective_identity_without_write_access_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    const CHILD_DIRECTORY: &str = "GRAFTON_NDI_PERMISSION_CHILD_DIRECTORY";
+    const IDENTITY_UNAVAILABLE: i32 = 77;
+    if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+        // This isolated subprocess alone changes identity. The parent retains
+        // ownership of the fixture and removes it after this process exits.
+        let directory = std::mem::ManuallyDrop::new(Directory(directory.into()));
+        // SAFETY: geteuid/getuid take no arguments and inspect this process.
+        assert_eq!(unsafe { libc::getuid() }, 0);
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        // SAFETY: only this test's subprocess is affected. Its real UID stays
+        // root, so access(2) would incorrectly allow the denied directory.
+        if unsafe { libc::seteuid(65534) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EINVAL)) {
+                // User namespaces may map root alone, or forbid changing
+                // identity. Let the parent report that limitation visibly.
+                std::process::exit(IDENTITY_UNAVAILABLE);
+            }
+            panic!("cannot set the subprocess's effective identity: {error}");
+        }
+        unwritable_directory_is_refused_before_native_calls(&directory);
+        return;
+    }
+    // SAFETY: geteuid/getuid take no arguments and inspect this process.
+    if unsafe { libc::getuid() } != 0 || unsafe { libc::geteuid() } != 0 {
+        crate::test_support::unsupported("this identity-switching regression requires root");
+        return;
+    }
+    let directory = Directory::new("effective-identity");
+    std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let denied = directory.0.join("denied");
+    std::fs::create_dir(&denied).unwrap();
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "file::lifecycle_tests::an_effective_identity_without_write_access_is_refused",
+            "--nocapture",
+        ])
+        .env(CHILD_DIRECTORY, &directory.0)
+        .output()
+        .unwrap();
+    if result.status.code() == Some(IDENTITY_UNAVAILABLE) {
+        crate::test_support::unsupported(
+            "this process cannot switch to an unprivileged effective identity",
+        );
+        return;
+    }
+    assert!(
+        result.status.success(),
+        "effective-identity child failed:\n{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
 }
 
 #[cfg(windows)]

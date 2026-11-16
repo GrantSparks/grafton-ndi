@@ -2,7 +2,7 @@
 //! notification.
 
 use std::{
-    collections::{hash_map::Entry as IndexEntry, HashMap, VecDeque},
+    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, Ordering},
         Condvar, Mutex,
@@ -15,6 +15,7 @@ use std::ffi::c_void;
 
 use super::send::ScatterSendable;
 use super::{
+    reserved_map::ReservedMap,
     send::PendingVideo,
     send_slots::{DescriptorLease, Released, SlotKey},
     CompressedVideoFrame, QueueAttached, ScatterVideoFrame, SubmittedVideo,
@@ -339,7 +340,7 @@ pub(crate) struct Admitted {
 /// the SDK reports it complete, then ready until it is collected.
 struct State {
     // The frames the SDK may still read, by the address of their data.
-    in_flight: HashMap<usize, Entry>,
+    in_flight: ReservedMap<usize, Entry>,
     // The frames the SDK has finished with, in the order it reported them.
     ready: VecDeque<ReadyEntry>,
     bytes: usize,
@@ -348,9 +349,6 @@ struct State {
     // Free keys are the frame capacity. A lease dropped while unwinding
     // retires its key, so the queue may have fewer usable slots than requested.
     free: Vec<SlotKey>,
-    // A fallibly reserved submission-thread workspace for rebuilding a map
-    // whose deletion tombstones have consumed its insertion capacity.
-    rehash: Vec<(usize, Entry)>,
 }
 
 impl State {
@@ -405,55 +403,33 @@ impl State {
         let mut frame = frame;
         let lent = lend(&mut frame);
         let key = lent.descriptor().p_data as usize;
-        if self.in_flight.capacity() == self.in_flight.len() {
-            self.rebuild_index();
-        }
-        let entry = match self.in_flight.entry(key) {
-            IndexEntry::Vacant(entry) => entry,
-            IndexEntry::Occupied(_) => {
-                self.free.push(slot_key);
-                protocol_error.store(true, Ordering::Release);
-                return Err(Rejected::new(
-                    Error::UnexpectedSdkResult(crate::SdkResultDefect::UnknownCompletion),
-                    frame.into_frame(),
-                ));
-            }
-        };
-        // All rejection checks and lending precede slot initialization. The
-        // move-only key can initialize this header only once.
-        let slot = slot_key.claim(*lent.descriptor());
-        let pointer = slot.as_ptr();
         let id = SubmissionId(self.next);
+        let mut pointer = std::ptr::null();
+        let result = self
+            .in_flight
+            .insert_new_with(key, (slot_key, frame), |(slot_key, frame)| {
+                // All rejection checks and lending precede slot initialization.
+                // The move-only key can initialize this header only once.
+                let slot = slot_key.claim(*lent.descriptor());
+                pointer = slot.as_ptr();
+                Entry {
+                    id,
+                    slot,
+                    frame,
+                    bytes,
+                }
+            });
+        if let Err((slot_key, frame)) = result {
+            self.free.push(slot_key);
+            protocol_error.store(true, Ordering::Release);
+            return Err(Rejected::new(
+                Error::UnexpectedSdkResult(crate::SdkResultDefect::UnknownCompletion),
+                frame.into_frame(),
+            ));
+        }
         self.next = next;
         self.bytes = total;
-        entry.insert(Entry {
-            id,
-            slot,
-            frame,
-            bytes,
-        });
         Ok(Admitted { id, lent, pointer })
-    }
-
-    /// HashMap removal can consume insertion capacity without shrinking its
-    /// allocation. Draining resets the existing table, and both transfer
-    /// buffers were reserved for the maximum retained count at construction.
-    /// Entries move without moving any native pointee; the state lock excludes
-    /// completion callbacks throughout the rebuild.
-    fn rebuild_index(&mut self) {
-        debug_assert!(self.rehash.is_empty());
-        debug_assert!(self.rehash.capacity() >= self.in_flight.len());
-        for pair in self.in_flight.drain() {
-            self.rehash.push(pair);
-        }
-        debug_assert!(self.in_flight.capacity() > self.rehash.len());
-        for (key, entry) in self.rehash.drain(..) {
-            let IndexEntry::Vacant(slot) = self.in_flight.entry(key) else {
-                unreachable!("rebuilding preserves the unique retained keys");
-            };
-            slot.insert(entry);
-        }
-        debug_assert!(self.in_flight.capacity() > self.in_flight.len());
     }
 
     /// Release every retained entry only after native destruction. Both
@@ -522,14 +498,9 @@ impl CallbackState {
     fn new(options: QueueLimits) -> Result<Box<Self>> {
         let options = options.validate()?;
         use super::send_slots::unavailable;
-        let mut in_flight = HashMap::new();
-        in_flight.try_reserve(options.frames).map_err(unavailable)?;
+        let in_flight = ReservedMap::try_with_capacity(options.frames).map_err(unavailable)?;
         let mut ready = VecDeque::new();
         ready
-            .try_reserve_exact(options.frames)
-            .map_err(unavailable)?;
-        let mut rehash = Vec::new();
-        rehash
             .try_reserve_exact(options.frames)
             .map_err(unavailable)?;
         let free = DescriptorSlots::allocate_keys(options.frames)?;
@@ -542,7 +513,6 @@ impl CallbackState {
                 next: 1,
                 options,
                 free,
-                rehash,
             }),
             changed: Condvar::new(),
             protocol_error: AtomicBool::new(false),
@@ -1187,7 +1157,7 @@ mod tests {
             before,
             (state.free.len(), state.retained(), state.bytes, state.next)
         );
-        let retained = &state.in_flight[&key];
+        let retained = state.in_flight.get(&key).unwrap();
         assert_eq!(retained.id, admitted.id);
         let QueuedStorage::Pixels(frame) = &retained.frame else {
             panic!("the retained entry is untouched");
@@ -1353,58 +1323,6 @@ mod tests {
                 assert_eq!(allocations, 0, "accepted retry variant {variant}");
                 assert_eq!(queue.close().len(), 1);
             }
-        }
-    }
-
-    #[test]
-    fn rebuilding_the_completion_index_reuses_reserved_storage_and_preserves_loans() {
-        let callback = CallbackState::new(QueueLimits::default().max_frames(4)).unwrap();
-        let admitted = (0..3)
-            .map(|_| {
-                let frame = VideoFrame::builder().resolution(2, 2).build().unwrap();
-                let bytes = frame.retained_bytes();
-                callback
-                    .state
-                    .lock()
-                    .unwrap()
-                    .admit(
-                        QueuedVideoFrame::from(frame).authorize_for_test(None),
-                        bytes,
-                        &callback.protocol_error,
-                    )
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let mut state = callback.state.lock().unwrap();
-        let before = (
-            state.bytes,
-            state.next,
-            state.free.len(),
-            state.in_flight.capacity(),
-            state.rehash.capacity(),
-        );
-        let ((), allocations) = crate::test_alloc::allocation_count(|| state.rebuild_index());
-        assert_eq!(allocations, 0);
-        assert_eq!(
-            (
-                state.bytes,
-                state.next,
-                state.free.len(),
-                state.in_flight.capacity(),
-                state.rehash.capacity()
-            ),
-            before
-        );
-        assert!(state.rehash.is_empty());
-        for loan in admitted {
-            let entry = state
-                .in_flight
-                .get(&(loan.lent.descriptor().p_data as usize))
-                .unwrap();
-            assert_eq!(entry.id, loan.id);
-            // SAFETY: the synthetic header remains owned and initialized in
-            // the same leased slot; no native sender accesses this test state.
-            assert_eq!(unsafe { (*loan.pointer).xres }, 2);
         }
     }
 
