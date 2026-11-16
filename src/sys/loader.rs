@@ -479,12 +479,18 @@ mod shared {
             } else {
                 None
             };
+            let fallback_directories = if cfg!(target_vendor = "apple") {
+                std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH")
+            } else {
+                None
+            };
             let plan = search_plan(
                 self.explicit,
                 self.beside.and_then(Path::parent),
                 executable.as_deref().and_then(Path::parent),
                 runtime_directory.as_deref(),
                 loader_directories.as_deref(),
+                fallback_directories.as_deref(),
                 self.names,
             );
             let mut failures = Vec::with_capacity(plan.len());
@@ -582,7 +588,9 @@ mod shared {
             if !self.location.is_absolute() {
                 let refusal = match self.origin {
                     Origin::RuntimeDirectory => Some(LoadRefusal::RelativeRuntimeDirectory),
-                    Origin::PathDirectory | Origin::DyldLibraryDirectory => {
+                    Origin::PathDirectory
+                    | Origin::DyldLibraryDirectory
+                    | Origin::DyldFallbackLibraryDirectory => {
                         Some(LoadRefusal::RelativeSearchDirectory)
                     }
                     _ => None,
@@ -661,14 +669,15 @@ mod shared {
     /// order, before the next location: where a library is installed matters
     /// more than which of the names it has.
     /// Apple default searches refuse all locations before opening any when
-    /// `DYLD_LIBRARY_PATH` contains a relative or empty entry: dyld would apply
-    /// that override even to an otherwise exact path.
+    /// either dyld library directory list contains a relative or empty entry.
+    /// The current environment is checked; callers must configure dyld before launch.
     pub(super) fn search_plan(
         explicit: Option<&Path>,
         companion_directory: Option<&Path>,
         executable_directory: Option<&Path>,
         runtime_directory: Option<&Path>,
         loader_directories: Option<&OsStr>,
+        fallback_directories: Option<&OsStr>,
         names: &[&str],
     ) -> Vec<Candidate> {
         if let Some(path) = explicit {
@@ -677,24 +686,31 @@ mod shared {
                 origin: Origin::Explicit,
             }];
         }
-        // dyld applies DYLD_LIBRARY_PATH leaf overrides even to absolute
-        // paths and @rpath before resolving the requested location. Recording
-        // a bad entry later in the plan cannot prevent its initializer from
-        // running through an earlier companion/executable/@rpath candidate.
-        // Refuse the whole default search before any native open instead.
+        // Both dyld lists can substitute a leaf name, including for @rpath.
+        // Refuse unsafe entries before any open can run an initializer. The
+        // fallback list is preflighted only: its absolute entries are not
+        // ordinary exact candidates.
         #[cfg(target_vendor = "apple")]
-        if let Some(directories) = loader_directories {
-            let refused: Vec<_> = std::env::split_paths(directories)
-                .filter(|directory| !directory.is_absolute())
-                .map(|location| Candidate {
-                    location,
-                    origin: Origin::DyldLibraryDirectory,
+        {
+            let refused: Vec<_> = [
+                (loader_directories, Origin::DyldLibraryDirectory),
+                (fallback_directories, Origin::DyldFallbackLibraryDirectory),
+            ]
+            .into_iter()
+            .flat_map(|(directories, origin)| {
+                directories.into_iter().flat_map(move |directories| {
+                    std::env::split_paths(directories)
+                        .filter(|directory| !directory.is_absolute())
+                        .map(move |location| Candidate { location, origin })
                 })
-                .collect();
+            })
+            .collect();
             if !refused.is_empty() {
                 return refused;
             }
         }
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = fallback_directories;
         let mut plan: Vec<Candidate> = Vec::new();
         let mut add = |location: PathBuf, origin| {
             if !plan.iter().any(|earlier| earlier.location == location) {
@@ -999,6 +1015,7 @@ mod shared {
                 Some(Path::new("/app")),
                 Some(runtime_directory()),
                 None,
+                None,
                 &["libndi.so.6"],
             );
             assert_eq!(
@@ -1014,6 +1031,7 @@ mod shared {
                 None,
                 Some(Path::new("/app")),
                 Some(runtime_directory()),
+                None,
                 None,
                 &["libndi.so.6"],
             );
@@ -1035,7 +1053,7 @@ mod shared {
 
         #[test]
         fn the_loader_search_remains_when_no_directory_is_known() {
-            let plan = search_plan(None, None, None, None, None, &["libndi.so.6"]);
+            let plan = search_plan(None, None, None, None, None, None, &["libndi.so.6"]);
             assert_eq!(
                 plan.last().map(|candidate| candidate.origin),
                 Some(Origin::LoaderSearch)
@@ -1055,6 +1073,7 @@ mod shared {
                 None,
                 None,
                 Some(directories),
+                None,
                 &["libndi.dylib", "libndi_advanced.dylib"],
             );
             assert!(plan.iter().all(|candidate| {
@@ -1076,6 +1095,7 @@ mod shared {
                 None,
                 None,
                 Some(&directories),
+                None,
                 &["first", "second"],
             );
             let origin = if cfg!(windows) {
@@ -1131,12 +1151,45 @@ mod shared {
                     Some(Path::new("/app")),
                     Some(runtime_directory()),
                     Some(OsStr::new(directories)),
+                    None,
                     &["libndi.dylib", "libndi_advanced.dylib"],
                 );
                 assert_eq!(plan.len(), 1, "{directories:?}: {plan:?}");
                 assert_eq!(plan[0].origin, Origin::DyldLibraryDirectory);
                 assert!(!plan[0].location.is_absolute());
             }
+        }
+
+        #[cfg(target_vendor = "apple")]
+        #[test]
+        fn unsafe_dyld_fallback_entries_block_every_default_location_before_opening() {
+            for primary in [None, Some(OsStr::new("/trusted"))] {
+                for directories in ["relative", "", "/trusted:relative", "/trusted:"] {
+                    let plan = search_plan(
+                        None,
+                        Some(Path::new("/core")),
+                        Some(Path::new("/app")),
+                        Some(runtime_directory()),
+                        primary,
+                        Some(OsStr::new(directories)),
+                        &["libndi.dylib", "libndi_advanced.dylib"],
+                    );
+                    assert_eq!(plan.len(), 1, "{directories:?}: {plan:?}");
+                    assert_eq!(plan[0].origin, Origin::DyldFallbackLibraryDirectory);
+                    assert!(!plan[0].location.is_absolute());
+                }
+            }
+            let baseline = search_plan(None, None, None, None, None, None, &["libndi.dylib"]);
+            let safe_fallback = search_plan(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(OsStr::new("/trusted")),
+                &["libndi.dylib"],
+            );
+            assert_eq!(locations(&baseline), locations(&safe_fallback));
         }
 
         #[test]
@@ -1146,6 +1199,7 @@ mod shared {
                 None,
                 None,
                 Some(Path::new("relative")),
+                None,
                 None,
                 &["libndi.so.6", "libndi_advanced.so.6"],
             );
@@ -1185,6 +1239,7 @@ mod shared {
                 Some(directory.as_path()),
                 Some(directory.as_path()),
                 None,
+                None,
                 &["libndi.so.6"],
             );
             let bundled = plan
@@ -1201,6 +1256,7 @@ mod shared {
                 Some(Path::new("/core")),
                 Some(Path::new("/app")),
                 Some(runtime_directory()),
+                None,
                 None,
                 &["libndifile.so.6"],
             );
@@ -1228,6 +1284,7 @@ mod shared {
                 None,
                 Some(Path::new("/app")),
                 Some(runtime_directory()),
+                None,
                 None,
                 &["libndi.so.6", "libndi_advanced.so.6"],
             );

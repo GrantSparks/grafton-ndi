@@ -26,8 +26,10 @@ Linux and Android retain their native loader search (`rpath`,
 working directory to this search. Relative or empty environment directory
 entries on Windows/macOS, and a relative `NDI_RUNTIME_DIR_V6` on any platform,
 are recorded as refused and never opened. On macOS, any relative or empty
-`DYLD_LIBRARY_PATH` entry refuses the whole default search before opening a
-library: dyld applies these overrides even to companion and `@rpath` requests.
+entry in either `DYLD_LIBRARY_PATH` or `DYLD_FALLBACK_LIBRARY_PATH` refuses
+the entire default search before opening a library. The check reads the process
+environment at search time; dyld uses its launch-time values, so changing
+`DYLD_*` after launch is unsupported.
 Explicit paths retain dyld's own policy. In unrestricted macOS processes,
 dyld can substitute `DYLD_LIBRARY_PATH` even for an absolute path; the crate
 refuses a substitute with `LoadRefusal::ResolvedToAnotherFile`. Native

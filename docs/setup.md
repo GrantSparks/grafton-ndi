@@ -38,16 +38,16 @@ or run `cargo clean -p grafton-ndi` to trigger a rebuild.
 
 On Windows and macOS, the working directory is never added to this search.
 Relative or empty `PATH`/`DYLD_LIBRARY_PATH` entries are recorded as refused
-locations and never opened. On macOS, any such `DYLD_LIBRARY_PATH` entry refuses
-the whole default search before opening a library, including an executable or
-companion candidate: dyld applies these overrides even to absolute and
-`@rpath` requests. Explicit paths retain dyld's own policy. In unrestricted
+locations and never opened. On macOS, a relative or empty entry in either
+`DYLD_LIBRARY_PATH` or `DYLD_FALLBACK_LIBRARY_PATH` refuses the entire default
+search before opening a library, including executable and companion candidates. Explicit paths retain dyld's own policy. In unrestricted
 macOS processes dyld consults `DYLD_LIBRARY_PATH` even for an absolute path;
 the crate refuses a substitute
 with `LoadRefusal::ResolvedToAnotherFile`. This identity check follows the native
 load and cannot undo a substitute's initializers. Configure trusted absolute
-`DYLD_LIBRARY_PATH` entries before launching: dyld retains its launch-time
-overrides even if the process later changes the environment. Native dependencies
+`DYLD_LIBRARY_PATH` and `DYLD_FALLBACK_LIBRARY_PATH` entries before launching.
+The crate checks the current process environment at search time, while dyld
+retains its launch-time values; changing `DYLD_*` after launch is unsupported. Native dependencies
 still follow platform loader rules. On Linux and Android, explicitly configured relative
 or empty `LD_LIBRARY_PATH` entries can still name the working directory.
 

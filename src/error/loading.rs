@@ -248,6 +248,8 @@ pub enum LoadOrigin {
     PathDirectory,
     /// An absolute `DYLD_LIBRARY_PATH` directory on Apple targets (or a refused relative entry).
     DyldLibraryDirectory,
+    /// A refused relative or empty `DYLD_FALLBACK_LIBRARY_PATH` entry on Apple targets.
+    DyldFallbackLibraryDirectory,
     /// Unix's native search, Apple `@rpath`, or Windows' System32-only search.
     LoaderSearch,
     /// The SDK archive linked into the program at build time.
@@ -263,6 +265,7 @@ impl fmt::Display for LoadOrigin {
             Self::RuntimeDirectory => "NDI_RUNTIME_DIR_V6",
             Self::PathDirectory => "PATH",
             Self::DyldLibraryDirectory => "DYLD_LIBRARY_PATH",
+            Self::DyldFallbackLibraryDirectory => "DYLD_FALLBACK_LIBRARY_PATH",
             Self::LoaderSearch => "system library search",
             Self::LinkedArchive => "linked SDK archive",
         })
@@ -343,7 +346,8 @@ pub enum LoadRefusal {
     },
     /// `NDI_RUNTIME_DIR_V6` names a relative directory, which is never searched.
     RelativeRuntimeDirectory,
-    /// A `PATH` or `DYLD_LIBRARY_PATH` entry is relative or empty and was not opened.
+    /// A `PATH`, `DYLD_LIBRARY_PATH` or `DYLD_FALLBACK_LIBRARY_PATH` entry is
+    /// relative or empty and was not opened.
     RelativeSearchDirectory,
 }
 

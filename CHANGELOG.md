@@ -50,7 +50,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   load a library from the working directory. Windows expands absolute `PATH`
   entries; macOS retains `@rpath` and expands absolute `DYLD_LIBRARY_PATH`
   entries. Relative and empty directory entries are recorded as refused;
-  unsafe dyld entries refuse the entire default search before any native open.
+  unsafe entries in either `DYLD_LIBRARY_PATH` or `DYLD_FALLBACK_LIBRARY_PATH`
+  refuse the entire default search before any native open.
 
 - Public APIs follow one [set of conventions](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/api-conventions.md)
   for construction, options, capture, events, waits and paths. Receiver and async

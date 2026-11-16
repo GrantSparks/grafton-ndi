@@ -90,7 +90,12 @@ fn working_directory_libraries_never_run_constructors() {
                 assert!(!failure.attempts().is_empty(), "{failure}");
                 assert!(
                     failure.attempts().iter().all(|attempt| {
-                        attempt.origin() == grafton_ndi::LoadOrigin::DyldLibraryDirectory
+                        attempt.origin()
+                            == if scenario.starts_with("dyld-fallback-") {
+                                grafton_ndi::LoadOrigin::DyldFallbackLibraryDirectory
+                            } else {
+                                grafton_ndi::LoadOrigin::DyldLibraryDirectory
+                            }
                             && attempt.refusal()
                                 == &grafton_ndi::LoadRefusal::RelativeSearchDirectory
                     }),
@@ -199,6 +204,9 @@ fn working_directory_libraries_never_run_constructors() {
         "dyld-relative-file",
         "dyld-empty-file",
         "dyld-absolute",
+        "dyld-fallback-relative-runtime",
+        "dyld-fallback-empty-runtime",
+        "dyld-fallback-relative-file",
     ] {
         if (scenario.ends_with("file") && !cfg!(feature = "file-io"))
             || (scenario == "path" && !cfg!(windows))
@@ -248,7 +256,14 @@ fn working_directory_libraries_never_run_constructors() {
             } else {
                 "".into()
             };
-            command.env("DYLD_LIBRARY_PATH", value);
+            command.env(
+                if scenario.starts_with("dyld-fallback-") {
+                    "DYLD_FALLBACK_LIBRARY_PATH"
+                } else {
+                    "DYLD_LIBRARY_PATH"
+                },
+                value,
+            );
         }
         let output = command.output().unwrap();
         assert!(
