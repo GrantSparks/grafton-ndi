@@ -26,8 +26,10 @@ Linux and Android retain their native loader search (`rpath`,
 working directory to this search. Relative or empty environment directory
 entries on Windows/macOS, and a relative `NDI_RUNTIME_DIR_V6` on any platform,
 are recorded as refused and never opened. On macOS, any relative or empty
-`DYLD_LIBRARY_PATH` entry refuses the whole default search before opening a
-library: dyld applies these overrides even to companion and `@rpath` requests.
+entry in either `DYLD_LIBRARY_PATH` or `DYLD_FALLBACK_LIBRARY_PATH` refuses
+the entire default search before opening a library. The check reads the process
+environment at search time; dyld uses its launch-time values, so changing
+`DYLD_*` after launch is unsupported.
 Explicit paths retain dyld's own policy. In unrestricted macOS processes,
 dyld can substitute `DYLD_LIBRARY_PATH` even for an absolute path; the crate
 refuses a substitute with `LoadRefusal::ResolvedToAnotherFile`. Native
@@ -134,7 +136,10 @@ means its deadline expired, while `Some(Closed(report))` or
 `Some(TimedOut(...))`. After `None`, inspect `recorder.report()` for the current
 session snapshot and keep waiting or choose recovery.
 
-The timeout bounds the event wait, not the native stop call. Lost events can
+The timeout of synchronous `FileRecorder::finish` bounds the event wait, not
+the native stop call. `AsyncFileRecorder::finish` measures its timeout from
+submission, so the budget includes time queued behind other commands and the
+native stop; events already queued when it expires are still taken. Lost events can
 prevent confirmation. If recovery is needed, `reset` replaces the native
 recorder and returns the old session's report; `abandon` destroys it without
 waiting. Either can leave an unfinished file.
@@ -165,14 +170,10 @@ the finish never shortens the time available to close.
 
 ## Limits of the NDI 6.4 File library
 
-`Closed` confirms the SDK's closure events. It does not establish that every
-expected frame was captured or that bytes are durable on disk. Provision output
-space, inspect the report and read back recordings whose completeness matters.
-[Previously reported native failures](https://github.com/GrantSparks/grafton-ndi/blob/ad56e37c7306088e46e8575c604304d7b0d187b2/docs/file-io.md#limits-of-the-ndi-64-file-library)
-include process crashes on write failure and closed events for incomplete files;
-no archived run log is available here to qualify their platform or frequency.
-Plan recording as a fallible operation, and isolate it in a worker process when
-a native crash must not end the service.
+Plan recording as a fallible operation. Provision output space, inspect the
+report and read back recordings whose completeness matters. Isolate recording
+in a worker process when a native crash must not end the service. The API
+reference lists the [File library's limits and their platform scope](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/index.html#limits-of-the-ndi-64-file-library).
 Native calls can block inside the vendor library; wrapper timeouts cannot
 interrupt them. Test recording and recovery with your selected runtime,
 platform and storage.

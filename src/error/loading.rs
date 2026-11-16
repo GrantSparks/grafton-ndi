@@ -248,6 +248,8 @@ pub enum LoadOrigin {
     PathDirectory,
     /// An absolute `DYLD_LIBRARY_PATH` directory on Apple targets (or a refused relative entry).
     DyldLibraryDirectory,
+    /// A refused relative or empty `DYLD_FALLBACK_LIBRARY_PATH` entry on Apple targets.
+    DyldFallbackLibraryDirectory,
     /// Unix's native search, Apple `@rpath`, or Windows' System32-only search.
     LoaderSearch,
     /// The SDK archive linked into the program at build time.
@@ -263,10 +265,29 @@ impl fmt::Display for LoadOrigin {
             Self::RuntimeDirectory => "NDI_RUNTIME_DIR_V6",
             Self::PathDirectory => "PATH",
             Self::DyldLibraryDirectory => "DYLD_LIBRARY_PATH",
+            Self::DyldFallbackLibraryDirectory => "DYLD_FALLBACK_LIBRARY_PATH",
             Self::LoaderSearch => "system library search",
             Self::LinkedArchive => "linked SDK archive",
         })
     }
+}
+
+/// Why a runtime's version text could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[non_exhaustive]
+pub enum VersionTextDefect {
+    /// The runtime returned a null version pointer.
+    #[error("NDIlib_version returned no version text")]
+    Missing,
+    /// No terminator occurred within the SDK string bound.
+    #[error("its version text has no terminator within the 4 MiB one SDK string may take")]
+    Unterminated,
+    /// The bounded version text is not valid UTF-8.
+    #[error("its version text is not UTF-8 at byte {valid_up_to}")]
+    NotUtf8 {
+        /// The byte offset at which valid UTF-8 ends.
+        valid_up_to: usize,
+    },
 }
 
 /// Why a candidate could not provide a usable implementation.
@@ -294,14 +315,17 @@ pub enum LoadRefusal {
         /// The path the loader actually opened.
         resolved: PathBuf,
     },
-    /// A required entry point, including an identification anchor, is absent.
+    /// The identification anchor is absent: this file is not the requested library.
+    MissingAnchor {
+        /// The statically declared identification symbol's name.
+        symbol: &'static CStr,
+        /// The platform's symbol lookup diagnostic.
+        detail: String,
+    },
+    /// An identified library lacks an entry point required by the API.
     MissingEntryPoint {
         /// The statically declared native symbol's name.
         symbol: &'static CStr,
-        /// Whether it is an API-required entry rather than the identification anchor.
-        required: bool,
-        /// The platform's symbol lookup diagnostic, when one is available.
-        detail: Option<String>,
     },
     /// A lookup found the entry point in a dependency instead of the selected module.
     EntryPointOutsideModule {
@@ -313,10 +337,7 @@ pub enum LoadRefusal {
     /// The library lacks the entry points identifying the requested Advanced edition.
     EditionNotMet,
     /// The runtime did not return bounded, valid UTF-8 version text.
-    UnreadableVersion {
-        /// The invalid version condition.
-        detail: String,
-    },
+    UnreadableVersion(VersionTextDefect),
     /// A loader search returned a module already loaded and refused earlier.
     AlreadyRefused {
         /// The file first associated with that module.
@@ -343,7 +364,8 @@ pub enum LoadRefusal {
     },
     /// `NDI_RUNTIME_DIR_V6` names a relative directory, which is never searched.
     RelativeRuntimeDirectory,
-    /// A `PATH` or `DYLD_LIBRARY_PATH` entry is relative or empty and was not opened.
+    /// A `PATH`, `DYLD_LIBRARY_PATH` or `DYLD_FALLBACK_LIBRARY_PATH` entry is
+    /// relative or empty and was not opened.
     RelativeSearchDirectory,
 }
 
@@ -353,19 +375,11 @@ impl fmt::Display for LoadRefusalDiagnostic<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             LoadRefusal::Absent => f.write_str("not found"),
-            LoadRefusal::PlatformLoader { detail } | LoadRefusal::NotIdentifiable { detail }
-                | LoadRefusal::UnreadableVersion { detail } => f.write_str(detail),
+            LoadRefusal::PlatformLoader { detail } | LoadRefusal::NotIdentifiable { detail } => f.write_str(detail),
+            LoadRefusal::UnreadableVersion(defect) => fmt::Display::fmt(defect, f),
             LoadRefusal::ResolvedToAnotherFile { resolved } => write!(f, "the loader resolved it to {}", resolved.display()),
-            LoadRefusal::MissingEntryPoint { symbol, required, detail } => {
-                let symbol = symbol.to_string_lossy();
-                if *required {
-                    write!(f, "it does not export the required entry point {symbol}")?;
-                } else {
-                    write!(f, "it does not export {symbol}")?;
-                }
-                if let Some(detail) = detail { write!(f, ": {detail}")?; }
-                Ok(())
-            }
+            LoadRefusal::MissingAnchor { symbol, detail } => write!(f, "it does not export {}: {detail}", symbol.to_string_lossy()),
+            LoadRefusal::MissingEntryPoint { symbol } => write!(f, "it does not export the required entry point {}", symbol.to_string_lossy()),
             LoadRefusal::EntryPointOutsideModule { symbol, module } => write!(f, "{} resolves outside {}", symbol.to_string_lossy(), module.display()),
             LoadRefusal::EditionNotMet => f.write_str("it does not export the Advanced SDK entry points"),
             LoadRefusal::AlreadyRefused { path, refusal } => write!(f,
@@ -541,11 +555,13 @@ mod tests {
             (LoadRefusal::PlatformLoader { detail: "dlopen failed: absent".into() }, "dlopen failed: absent"),
             (LoadRefusal::NotIdentifiable { detail: "the module cannot be identified".into() }, "the module cannot be identified"),
             (LoadRefusal::ResolvedToAnotherFile { resolved: "another.so".into() }, "the loader resolved it to another.so"),
-            (LoadRefusal::MissingEntryPoint { symbol: c"NDIlib_version", required: false, detail: Some("undefined symbol".into()) }, "it does not export NDIlib_version: undefined symbol"),
-            (LoadRefusal::MissingEntryPoint { symbol: c"NDIlib_initialize", required: true, detail: None }, "it does not export the required entry point NDIlib_initialize"),
+            (LoadRefusal::MissingAnchor { symbol: c"NDIlib_version", detail: "undefined symbol".into() }, "it does not export NDIlib_version: undefined symbol"),
+            (LoadRefusal::MissingEntryPoint { symbol: c"NDIlib_initialize" }, "it does not export the required entry point NDIlib_initialize"),
             (LoadRefusal::EntryPointOutsideModule { symbol: c"NDIlib_initialize", module: "selected.so".into() }, "NDIlib_initialize resolves outside selected.so"),
             (LoadRefusal::EditionNotMet, "it does not export the Advanced SDK entry points"),
-            (LoadRefusal::UnreadableVersion { detail: "NDIlib_version returned no version text".into() }, "NDIlib_version returned no version text"),
+            (LoadRefusal::UnreadableVersion(VersionTextDefect::Missing), "NDIlib_version returned no version text"),
+            (LoadRefusal::UnreadableVersion(VersionTextDefect::Unterminated), "its version text has no terminator within the 4 MiB one SDK string may take"),
+            (LoadRefusal::UnreadableVersion(VersionTextDefect::NotUtf8 { valid_up_to: 7 }), "its version text is not UTF-8 at byte 7"),
             (LoadRefusal::AlreadyRefused { path: "rejected.so".into(), refusal: Box::new(LoadRefusal::EditionNotMet) }, "the platform loader returned rejected.so, which is already loaded and was rejected (it does not export the Advanced SDK entry points); no other library of that name can be found by name in this process, so remove or fix that file or pass an explicit library path"),
             (LoadRefusal::NoCompleteFileFamily { first_missing: c"NDIlib_file_player_create" }, "it provides no family of NDI File entry points (it does not export NDIlib_file_player_create)"),
             (LoadRefusal::BoundToAnotherRuntime, "it is bound to an NDI runtime other than the selected one"),

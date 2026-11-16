@@ -65,8 +65,9 @@ mod send;
 mod send_slots;
 mod sync;
 
-/// Receiver mode held by [`PacketReceiver`], with the common controls only.
-/// Packet capture reserves video, audio, metadata and event capture for its owner.
+/// Receiver mode held by [`PacketReceiver`], [`AllocatedReceiver<PacketAttached>`]
+/// and their [`KvmReceiver`] views. Packet capture reserves video, audio, metadata
+/// and event capture for the packet owner and its KVM view.
 #[derive(Debug)]
 pub enum PacketAttached {}
 

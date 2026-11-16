@@ -75,7 +75,9 @@ pub enum DiscoveryDefect {
 /// aspect ratios, frame rates, compressed video formats and allocation strides
 /// instead use [`InputDefect::Layout`]. Layout validators used by SDK allocator
 /// callbacks construct only allocation-free variants. The two wide diagnostic
-/// variants are constructed only by their standalone value checks.
+/// variants arise from standalone value checks and validation of delivered video
+/// headers and compressed formats, never from the `from_sdk_checked` validators
+/// that allocator callbacks use.
 #[derive(Debug, Clone, PartialEq, Error)]
 #[non_exhaustive]
 pub enum LayoutDefect {
@@ -230,12 +232,6 @@ pub enum FrameDefect {
     /// A refusal of the shared media layout or value checks.
     #[error(transparent)]
     Layout(LayoutDefect),
-    /// Scratch dimensions overflow the address space.
-    #[error("image scratch size overflow")]
-    ImageScratchOverflow,
-    /// A scaled image dimension cannot fit u32.
-    #[error("image dimension overflow")]
-    ImageDimensionOverflow,
     /// A codec cannot encode this dimension.
     #[error("{codec} {dimension} {length} exceeds maximum supported value {maximum}")]
     ImageDimension {
@@ -269,9 +265,6 @@ pub enum FrameDefect {
     /// Zero-length audio frame has non-null data pointer.
     #[error("Zero-length audio frame has non-null data pointer")]
     EmptyAudioHasData,
-    /// V210 active row size overflow.
-    #[error("V210 active row size overflow")]
-    V210RowOverflow,
     /// V210 stride must be a multiple of four and cover every complete pixel group.
     #[error("V210 stride must be a multiple of four and cover every complete pixel group")]
     V210Stride,
@@ -632,9 +625,6 @@ pub enum InputDefect {
     /// max_bytes is less than max_concurrent_calls allocations of max_allocation_bytes.
     #[error("max_bytes is less than max_concurrent_calls allocations of max_allocation_bytes")]
     AllocatorByteLimit,
-    /// Audio allocator extent overflow.
-    #[error("Audio allocator extent overflow")]
-    AllocatorAudioExtentOverflow,
     /// Compressed allocations have a byte size, not a configurable stride.
     #[error("Compressed allocations have a byte size, not a configurable stride")]
     CompressedAllocationStride,
@@ -741,12 +731,6 @@ pub enum InputDefect {
         /// The minimum.
         minimum: usize,
     },
-    /// Audio allocator stride {stride} is not a whole number of samples.
-    #[error("Audio allocator stride {stride} is not a whole number of samples")]
-    AllocatorAudioStride {
-        /// The stride.
-        stride: usize,
-    },
     /// An allocation of {bytes} bytes exceeds the capacity limit of {limit} bytes.
     #[error("An allocation of {bytes} bytes exceeds the capacity limit of {limit} bytes")]
     AllocationTooLarge {
@@ -803,11 +787,11 @@ pub enum InputDefect {
         /// The value.
         value: u32,
     },
-    /// {format} quality must be in {minimum}..={maximum}, got {quality}.
-    #[error("{format} quality must be in {minimum}..={maximum}, got {quality}")]
+    /// {codec} quality must be in {minimum}..={maximum}, got {quality}.
+    #[error("{codec} quality must be in {minimum}..={maximum}, got {quality}")]
     ImageQuality {
-        /// The format.
-        format: &'static str,
+        /// The codec.
+        codec: ImageCodecKind,
         /// The quality.
         quality: u8,
         /// The minimum.
@@ -821,17 +805,17 @@ pub enum InputDefect {
         /// The effort.
         effort: u8,
     },
-    /// {format} images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png.
-    #[error("{format} images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png")]
+    /// {codec} images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png.
+    #[error("{codec} images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png")]
     SixteenBitNeedsPng {
-        /// The format.
-        format: &'static str,
+        /// The codec.
+        codec: ImageCodecKind,
     },
-    /// {format} cannot say that its values are {transfer} code values; HdrPolicy::CodeValues needs ImageFormat::Png.
-    #[error("{format} cannot say that its values are {transfer} code values; HdrPolicy::CodeValues needs ImageFormat::Png")]
+    /// {codec} cannot say that its values are {transfer} code values; HdrPolicy::CodeValues needs ImageFormat::Png.
+    #[error("{codec} cannot say that its values are {transfer} code values; HdrPolicy::CodeValues needs ImageFormat::Png")]
     HdrNeedsPng {
-        /// The format.
-        format: &'static str,
+        /// The codec.
+        codec: ImageCodecKind,
         /// The transfer.
         transfer: TransferFunction,
     },
@@ -865,8 +849,7 @@ pub enum InputDefect {
 }
 /// Typed causes of [`crate::Error::UnexpectedSdkResult`].
 ///
-/// Ordinary causes retain their evidence inline without allocating. Boxed
-/// diagnostic fields retain caller or SDK text only for the documented exceptions.
+/// Causes retain their evidence inline without allocating.
 #[derive(Debug, Clone, PartialEq, Error, Copy, Eq, Hash)]
 #[non_exhaustive]
 pub enum SdkResultDefect {

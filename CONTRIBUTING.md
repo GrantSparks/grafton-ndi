@@ -2,12 +2,15 @@
 
 See [setup](docs/setup.md#build-requirements) for build prerequisites and
 [examples](examples/README.md) for runnable uses of the library. The minimum
-Rust version is 1.88; `rust-toolchain.toml` selects stable contributor tooling.
+Rust version is 1.88; `rust-toolchain.toml` selects the pinned contributor toolchain.
 
 ```sh
 cargo build --locked
 cargo test --locked
 ```
+
+The test suite runs from the repository. Test-only sources are not published
+in the crate package.
 
 Native tests report a skip when their runtime is unavailable. See
 [testing from source](ci/README.md) for all-feature checks, runtime selection

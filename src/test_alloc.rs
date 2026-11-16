@@ -2,6 +2,7 @@
 struct CountingAllocator;
 std::thread_local! {
     static TEST_ALLOCATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static FAIL_ALLOCATIONS_AT_LEAST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static TEST_BYTES: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
 }
 fn record_bytes(added: usize, removed: usize) {
@@ -19,18 +20,33 @@ fn record_allocation() {
         }
     });
 }
+fn refuse_allocation(size: usize) -> bool {
+    FAIL_ALLOCATIONS_AT_LEAST
+        .try_with(|minimum| minimum.get().is_some_and(|minimum| size >= minimum))
+        .unwrap_or(false)
+}
+
 unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if refuse_allocation(layout.size()) {
+            return std::ptr::null_mut();
+        }
         record_allocation();
         record_bytes(layout.size(), 0);
         unsafe { std::alloc::System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if refuse_allocation(layout.size()) {
+            return std::ptr::null_mut();
+        }
         record_allocation();
         record_bytes(layout.size(), 0);
         unsafe { std::alloc::System.alloc_zeroed(layout) }
     }
     unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        if refuse_allocation(size) {
+            return std::ptr::null_mut();
+        }
         record_allocation();
         record_bytes(size, layout.size());
         unsafe { std::alloc::System.realloc(p, layout, size) }
@@ -75,4 +91,20 @@ pub(crate) fn allocation_count<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let count = TEST_ALLOCATIONS.with(|count| count.get().unwrap());
     drop(reset);
     (value, count)
+}
+
+/// Refuse large allocations only on this test thread, restoring the previous
+/// threshold even if the closure unwinds. Source frames must be built first.
+#[cfg(feature = "image-encoding")]
+pub(crate) fn fail_allocations_at_least<T>(minimum: usize, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FAIL_ALLOCATIONS_AT_LEAST.with(|minimum| minimum.set(self.0));
+        }
+    }
+    let reset = Reset(FAIL_ALLOCATIONS_AT_LEAST.with(|value| value.replace(Some(minimum))));
+    let result = f();
+    drop(reset);
+    result
 }

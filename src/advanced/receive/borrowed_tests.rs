@@ -123,8 +123,11 @@ fn borrowed_compressed_payloads_allocate_nothing_and_release_once() {
 
 #[test]
 fn borrowed_audio_uses_receive_validation_and_reuses_owned_storage() {
-    let mut source =
-        CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1, 2, 3, 4]).unwrap();
+    let mut source = CompressedAudioFrame::new(
+        crate::advanced::AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+        vec![1, 2, 3, 4],
+    )
+    .unwrap();
     source.set_metadata("<audio/>").unwrap();
     let raw = source.raw();
     let frees = AtomicUsize::new(0);
@@ -143,9 +146,9 @@ fn borrowed_audio_uses_receive_validation_and_reuses_owned_storage() {
     assert_eq!(frame.data().as_ptr(), source.data().as_ptr());
     assert_eq!(
         (
-            frame.sample_rate(),
-            frame.num_channels(),
-            frame.num_samples()
+            frame.format().sample_rate(),
+            frame.format().num_channels(),
+            frame.format().num_samples()
         ),
         (48_000, 2, 960)
     );
@@ -248,8 +251,11 @@ fn borrowed_packets_normalize_timestamps_through_their_held_capture() {
         PacketEnvelope::encode(EnvelopeCodec::H264, 1, 0, true, &[1, 2, 3], &[4]).unwrap(),
     )
     .unwrap();
-    let mut audio =
-        CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1, 2, 3, 4]).unwrap();
+    let mut audio = CompressedAudioFrame::new(
+        crate::advanced::AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+        vec![1, 2, 3, 4],
+    )
+    .unwrap();
     for (ticks, expected) in [
         (NDIlib_recv_timestamp_undefined, None),
         (0, Some(0)),

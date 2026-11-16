@@ -1778,7 +1778,7 @@ impl VideoFrame {
 }
 
 /// Builder for a [`VideoFrame`], reached through [`VideoFrame::builder`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VideoFrameBuilder {
     width: u32,
     height: u32,
@@ -1789,6 +1789,22 @@ pub struct VideoFrameBuilder {
     timecode: Timecode,
     metadata: Option<String>,
     data: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for VideoFrameBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VideoFrameBuilder")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("pixel_format", &self.pixel_format)
+            .field("frame_rate", &self.frame_rate)
+            .field("picture_aspect_ratio", &self.picture_aspect_ratio)
+            .field("scan_type", &self.scan_type)
+            .field("timecode", &self.timecode)
+            .field("metadata", &self.metadata)
+            .field("data (bytes)", &self.data.as_ref().map(Vec::len))
+            .finish()
+    }
 }
 
 impl VideoFrameBuilder {
@@ -1816,7 +1832,7 @@ impl VideoFrameBuilder {
     }
 
     /// Set the picture aspect ratio, width over height as displayed; `0.0`
-    /// means square pixels. It must be finite and nonnegative.
+    /// means square pixels.
     #[must_use]
     pub fn picture_aspect_ratio(mut self, ratio: PictureAspectRatio) -> Self {
         self.picture_aspect_ratio = ratio;
@@ -2010,7 +2026,7 @@ pub(crate) trait AudioPartsExt: AudioParts {
             no_channels: layout.sdk_num_channels(),
             no_samples: layout.sdk_num_samples(),
             timecode: self.audio_timecode().ticks(),
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: layout.format().to_sdk(),
             p_data: self.samples().cast_mut().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: layout.sdk_channel_stride(),
@@ -2234,7 +2250,7 @@ impl<'buf> BorrowedAudioFrame<'buf> {
 }
 
 /// Builder for [`BorrowedAudioFrame`]; no sample or metadata copies are made.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct BorrowedAudioFrameBuilder<'buf> {
     data: &'buf [f32],
     sample_rate: u32,
@@ -2243,6 +2259,20 @@ pub struct BorrowedAudioFrameBuilder<'buf> {
     channel_stride_bytes: Option<usize>,
     timecode: Timecode,
     metadata: Option<&'buf CStr>,
+}
+
+impl fmt::Debug for BorrowedAudioFrameBuilder<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BorrowedAudioFrameBuilder")
+            .field("sample_rate", &self.sample_rate)
+            .field("num_channels", &self.num_channels)
+            .field("num_samples", &self.num_samples)
+            .field("channel_stride_bytes", &self.channel_stride_bytes)
+            .field("timecode", &self.timecode)
+            .field("metadata", &self.metadata.map(CStr::to_string_lossy))
+            .field("data (samples)", &self.data.len())
+            .finish()
+    }
 }
 
 impl<'buf> BorrowedAudioFrameBuilder<'buf> {
@@ -2369,7 +2399,7 @@ macro_rules! audio_accessors {
     (
         $(#[$attr:meta])*
         impl[$($generics:tt)*] $frame:ty;
-        debug($name:expr);
+        debug($name:expr, $data:literal = $data_len:ident);
         timecode { $(#[$timecode:meta])* }
         timestamp { $(#[$timestamp:meta])* }
         channel_stride_bytes { $(#[$channel_stride:meta])* }
@@ -2491,7 +2521,7 @@ macro_rules! audio_accessors {
                     .field("num_samples", &self.num_samples())
                     .field("timecode", &self.timecode())
                     .field("format", &self.format())
-                    .field("samples per channel", &AudioParts::layout(self).no_samples())
+                    .field($data, &AudioParts::layout(self).$data_len())
                     .field("channel_stride_bytes", &self.channel_stride_bytes())
                     .field("metadata", &self.metadata())
                     .field("timestamp", &self.timestamp())
@@ -2504,7 +2534,7 @@ macro_rules! audio_accessors {
 
 audio_accessors! {
     impl['buf] BorrowedAudioFrame<'buf>;
-    debug("BorrowedAudioFrame");
+    debug("BorrowedAudioFrame", "data (samples)" = sample_count);
     timecode {}
     timestamp {
         /// Application input has no SDK submission timestamp.
@@ -2577,7 +2607,7 @@ unsafe impl AudioParts for AudioFrame {
 
 audio_accessors! {
     impl[] AudioFrame;
-    debug("AudioFrame");
+    debug("AudioFrame", "data (samples)" = sample_count);
     timecode {
         /// A built frame starts with [`Timecode::SYNTHESIZE`]; a copy of a
         /// received frame keeps the timecode it arrived with.
@@ -2590,9 +2620,7 @@ audio_accessors! {
         /// It is one channel's samples, since an owned frame has no padding.
     }
     channel_data {
-        /// Data is always stored in planar format internally. If
-        /// `AudioLayout::Interleaved` was specified at build time, the data
-        /// was converted to planar during construction.
+        /// Samples for this channel are contiguous in the packed planar data.
     }
     data(self -> &[f32] => Some) {
         /// Get tightly packed planar audio as 32-bit floats.
@@ -2615,6 +2643,28 @@ audio_accessors! {
 }
 
 impl AudioFrame {
+    /// Copy validated interleaved floating-point samples into packed planar audio.
+    ///
+    /// This conversion needs no NDI runtime and allocates only the output
+    /// samples. It preserves the input's timecode; metadata is absent and the
+    /// SDK timestamp is `None`. Use [`Self::set_metadata`] to attach metadata.
+    pub fn from_interleaved(source: &crate::audio_conversion::InterleavedAudioF32<'_>) -> Self {
+        let mut frame = Self::from_validated_silence(source.layout(), source.timecode());
+        let channels = frame.layout.no_channels();
+        let samples = frame.layout.no_samples();
+        // The input's validated shape proves it contains exactly `samples`
+        // groups of `channels` initialized interleaved values.
+        for (channel, output) in frame.data.chunks_exact_mut(samples).enumerate() {
+            for (destination, &sample) in output
+                .iter_mut()
+                .zip(source.data()[channel..].iter().step_by(channels))
+            {
+                *destination = sample;
+            }
+        }
+        frame
+    }
+
     /// Allocate silent packed samples for a shape that is already validated.
     /// Metadata and receive timestamp keep the ordinary outbound defaults.
     pub(crate) fn from_validated_silence(layout: ValidatedAudioLayout, timecode: Timecode) -> Self {
@@ -2639,7 +2689,6 @@ impl AudioFrame {
             num_channels: 2,
             num_samples: 1024,
             timecode: Timecode::SYNTHESIZE,
-            layout: AudioLayout::Planar,
             data: None,
             metadata: None,
         }
@@ -2731,15 +2780,27 @@ impl AudioFrame {
 }
 
 /// Builder for an [`AudioFrame`], reached through [`AudioFrame::builder`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AudioFrameBuilder {
     sample_rate: u32,
     num_channels: u32,
     num_samples: u32,
     timecode: Timecode,
-    layout: AudioLayout,
     data: Option<Vec<f32>>,
     metadata: Option<String>,
+}
+
+impl fmt::Debug for AudioFrameBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AudioFrameBuilder")
+            .field("sample_rate", &self.sample_rate)
+            .field("num_channels", &self.num_channels)
+            .field("num_samples", &self.num_samples)
+            .field("timecode", &self.timecode)
+            .field("metadata", &self.metadata)
+            .field("data (samples)", &self.data.as_ref().map(Vec::len))
+            .finish()
+    }
 }
 
 impl AudioFrameBuilder {
@@ -2771,37 +2832,11 @@ impl AudioFrameBuilder {
         self
     }
 
-    /// Set the audio data layout (planar or interleaved)
+    /// Set packed planar 32-bit samples, with every sample of channel 0 first,
+    /// then every sample of channel 1, and so on.
     ///
-    /// - **Planar**: All samples for channel 0, then all for channel 1, etc.
-    /// - **Interleaved**: Samples from all channels are interleaved.
-    ///
-    /// Defaults to `AudioLayout::Planar` which is the native format for FLTP.
-    ///
-    /// # Example
-    /// ```
-    /// use grafton_ndi::{AudioFrame, AudioLayout};
-    ///
-    /// // Planar layout (default)
-    /// let frame = AudioFrame::builder()
-    ///     .num_channels(2)
-    ///     .num_samples(100)
-    ///     .layout(AudioLayout::Planar)
-    ///     .build()
-    ///     .unwrap();
-    /// ```
-    #[must_use]
-    pub fn layout(mut self, layout: AudioLayout) -> Self {
-        self.layout = layout;
-        self
-    }
-
-    /// Set the audio data as 32-bit floats
-    ///
-    /// The data length must equal `num_channels * num_samples`. The layout must match
-    /// the configured `AudioLayout`:
-    /// - **Planar**: `[C0S0, C0S1, ..., C1S0, C1S1, ...]`
-    /// - **Interleaved**: `[C0S0, C1S0, C0S1, C1S1, ...]` (converted to planar at build time)
+    /// The length must equal `num_channels * num_samples`. For interleaved
+    /// input, use [`AudioFrame::from_interleaved`].
     #[must_use]
     pub fn data(mut self, data: Vec<f32>) -> Self {
         self.data = Some(data);
@@ -2819,7 +2854,7 @@ impl AudioFrameBuilder {
         self
     }
 
-    /// The caller-supplied samples in their configured input layout.
+    /// The caller-supplied packed planar samples.
     pub fn supplied_data(&self) -> Option<&[f32]> {
         self.data.as_deref()
     }
@@ -2834,8 +2869,8 @@ impl AudioFrameBuilder {
 
     /// Recover the original supplied samples, retaining allocation and capacity.
     ///
-    /// A rejected builder retains the input layout and untouched samples,
-    /// including interleaved input. Returns `None` for default silent input.
+    /// A rejected builder retains untouched samples. Returns `None` for default
+    /// silent input.
     pub fn into_data(self) -> Option<Vec<f32>> {
         self.data
     }
@@ -2869,10 +2904,8 @@ impl AudioFrameBuilder {
 
     /// Build the audio frame.
     ///
-    /// Unset fields keep the defaults [`AudioFrame::builder`] lists. When
-    /// `AudioLayout::Interleaved` is set, the input data is converted to
-    /// planar format in Rust. The resulting frame always stores planar data
-    /// with channels `num_samples * 4` bytes apart.
+    /// Unset fields keep the defaults [`AudioFrame::builder`] lists. The frame
+    /// stores packed planar data with channels `num_samples * 4` bytes apart.
     ///
     /// # Errors
     ///
@@ -2893,7 +2926,7 @@ impl AudioFrameBuilder {
                 check_audio_data_len(&layout, data.len())?;
             }
             // Transfer metadata only after every rejection check, before
-            // interleaving conversion or changing sample storage.
+            // changing sample storage.
             let metadata = OwnedFrameMetadata::take_from(&mut self.metadata)?;
             Ok((layout, metadata))
         };
@@ -2903,29 +2936,7 @@ impl AudioFrameBuilder {
         };
         let sample_count = audio_layout.sample_count;
 
-        let data = if let Some(input_data) = self.data {
-            match self.layout {
-                AudioLayout::Planar => input_data,
-                AudioLayout::Interleaved => {
-                    let nc = audio_layout.no_channels;
-                    let ns = audio_layout.no_samples;
-                    // The validated layout and the length check above make
-                    // `input_data` exactly `ns` frames of `nc` interleaved
-                    // samples; channel `ch` is every `nc`th sample from `ch`.
-                    let mut planar = vec![0.0f32; sample_count];
-                    for (ch, out) in planar.chunks_exact_mut(ns).enumerate() {
-                        for (dst, &sample) in
-                            out.iter_mut().zip(input_data[ch..].iter().step_by(nc))
-                        {
-                            *dst = sample;
-                        }
-                    }
-                    planar
-                }
-            }
-        } else {
-            vec![0.0f32; sample_count]
-        };
+        let data = self.data.unwrap_or_else(|| vec![0.0; sample_count]);
 
         Ok(AudioFrame {
             layout: audio_layout,
@@ -2964,6 +2975,8 @@ pub enum AudioFormat {
     Fltp,
 }
 
+crate::media::decoded_variants!(AudioFormat: Fltp);
+
 impl AudioFormat {
     /// The SDK's FourCC for this format.
     pub(crate) const fn to_sdk(self) -> NDIlib_FourCC_audio_type_e {
@@ -2971,29 +2984,6 @@ impl AudioFormat {
             Self::Fltp => NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
         }
     }
-}
-
-/// Audio data layout format
-///
-/// Determines how multi-channel audio samples are arranged in memory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AudioLayout {
-    /// Planar format: All samples for channel 0, then all for channel 1, etc.
-    ///
-    /// Memory layout for 2 channels, 3 samples:
-    /// `[C0S0, C0S1, C0S2, C1S0, C1S1, C1S2]`
-    ///
-    /// This is the native format for FLTP and is efficient for per-channel processing.
-    Planar,
-
-    /// Interleaved format: Samples from all channels are interleaved.
-    ///
-    /// Input memory layout for 2 channels, 3 samples:
-    /// `[C0S0, C1S0, C0S1, C1S1, C0S2, C1S2]`
-    ///
-    /// Interleaved data is converted to planar format in Rust at build time,
-    /// so the resulting `AudioFrame` always stores planar data.
-    Interleaved,
 }
 
 /// Maximum allowed size for supported video frame data (256 MiB).
@@ -3023,10 +3013,20 @@ pub(crate) const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
 /// assert_eq!(frame.timecode().ticks(), 0);
 /// # Ok::<(), grafton_ndi::Error>(())
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct MetadataFrame {
     data: TerminatedText,
     timecode: Timecode,
+}
+
+impl fmt::Debug for MetadataFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MetadataFrame")
+            .field("data", &self.data())
+            .field("data (bytes)", &self.as_bytes().len())
+            .field("timecode", &self.timecode())
+            .finish()
+    }
 }
 
 impl MetadataFrame {
@@ -3266,66 +3266,6 @@ pub(crate) use metadata::{
     OwnedFrameMetadata, TerminatedText,
 };
 
-/// The bytes of an SDK string before its first NUL, or `None` when there is
-/// no NUL within the first `limit` bytes.
-///
-/// The scan reads one byte at a time and stops at the first NUL, so it never
-/// reads past the string, and it reads at most `limit` bytes.
-///
-/// # Safety
-///
-/// `text` must be non-null and readable byte-by-byte for `'a` until either
-/// its first NUL or `limit` bytes have been read.
-pub(crate) unsafe fn bounded_sdk_text<'a>(text: *const c_char, limit: usize) -> Option<&'a [u8]> {
-    let bytes = text.cast::<u8>();
-    // SAFETY: each byte read is at or before the first NUL and within the
-    // bound, which the caller guarantees readable.
-    let len = (0..limit).find(|&len| unsafe { bytes.add(len).read() } == 0)?;
-    // SAFETY: the `len` bytes before the NUL were just read, and the caller
-    // keeps them readable for `'a`.
-    Some(unsafe { slice::from_raw_parts(bytes, len) })
-}
-
-/// The most one SDK string other than frame metadata may take, terminator
-/// included: a Discovery Server string, or a source's name, address or
-/// advertised metadata.
-pub(crate) const MAX_SDK_STRING_BYTES: usize = 4 * 1024 * 1024;
-
-/// Copy an SDK string of at most [`MAX_SDK_STRING_BYTES`], terminator
-/// included, replacing bytes that are not UTF-8.
-///
-/// # Errors
-///
-/// [`Error::UnexpectedSdkResult`] naming the SDK function retained by `text`, when there is no terminator within the limit.
-///
-/// # Safety
-///
-/// `text` must be non-null and readable byte-by-byte until either its first
-/// NUL or [`MAX_SDK_STRING_BYTES`] bytes have been read.
-pub(crate) unsafe fn copy_sdk_string(
-    text: crate::sys::table::Called<*const c_char>,
-) -> Result<String> {
-    // SAFETY: forwarded to the caller's obligation.
-    let bytes = unsafe { sdk_text(text) }?;
-    Ok(String::from_utf8_lossy(bytes).into_owned())
-}
-
-/// Read one bounded SDK C string, retaining its producing entry point.
-///
-/// # Safety
-///
-/// The pointer in `text` must be non-null and readable byte-by-byte until its
-/// first NUL or [`MAX_SDK_STRING_BYTES`] bytes, and remain live for `'a`.
-pub(crate) unsafe fn sdk_text<'a>(
-    text: crate::sys::table::Called<*const c_char>,
-) -> Result<&'a [u8]> {
-    let (text, operation) = text.into_parts();
-    // SAFETY: forwarded to the caller's lifetime and readable-bound obligation.
-    unsafe { bounded_sdk_text(text, MAX_SDK_STRING_BYTES) }.ok_or(Error::UnexpectedSdkResult(
-        crate::SdkResultDefect::UnterminatedText { operation },
-    ))
-}
-
 // ============================================================================
 // Frame layout validation helpers
 // ============================================================================
@@ -3456,6 +3396,8 @@ impl Sendable<VideoFrame> {
 const _: () = {
     assert!(usize::BITS >= 32);
     assert!(MAX_VIDEO_BYTES <= i32::MAX as usize);
+    // An image row has at most eight bytes per validated source pixel.
+    assert!(MAX_VIDEO_BYTES <= usize::MAX / 8);
     // Send room is at most 64 bytes plus two strides. A validated stride is
     // at most the complete data size, even for a one-row frame.
     assert!(3 * MAX_VIDEO_BYTES + 64 < usize::MAX);
@@ -3923,7 +3865,7 @@ pub(crate) struct ValidatedAudioLayout {
 /// Inter-channel padding is never included. The iterator borrows the frame and
 /// keeps its sample storage alive; its immutable views support scoped thread
 /// transfer even when the owning capture must be freed on its original thread.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AudioChannels<'a> {
     data: *const f32,
     layout: ValidatedAudioLayout,
@@ -3938,6 +3880,19 @@ pub struct AudioChannels<'a> {
 unsafe impl Send for AudioChannels<'_> {}
 // SAFETY: Sharing exposes only immutable samples and independent iterator state.
 unsafe impl Sync for AudioChannels<'_> {}
+
+impl fmt::Debug for AudioChannels<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AudioChannels")
+            .field("remaining_channels", &self.len())
+            .field("samples_per_channel", &self.layout.no_samples())
+            .field(
+                "channel_stride_bytes",
+                &(self.layout.channel_stride_samples() * size_of::<f32>()),
+            )
+            .finish()
+    }
+}
 
 impl<'a> Iterator for AudioChannels<'a> {
     type Item = &'a [f32];
@@ -3993,6 +3948,11 @@ impl ValidatedAudioLayout {
     /// The validated `channel_stride_samples` value.
     pub(crate) const fn channel_stride_samples(&self) -> usize {
         self.channel_stride_samples
+    }
+
+    /// Initialized samples only, excluding inter-channel padding.
+    fn active_sample_count(&self) -> usize {
+        self.no_channels * self.no_samples
     }
 
     /// The validated `sample_count` value.
@@ -4051,6 +4011,18 @@ impl ValidatedAudioLayout {
             no_channels.into(),
             no_samples.into(),
             stride,
+        )
+    }
+
+    /// Replace the stride through the same rule used for delivered audio.
+    #[cfg(feature = "advanced")]
+    pub(crate) fn with_channel_stride_bytes(self, stride: usize) -> LayoutResult<Self> {
+        Self::checked(
+            self.format,
+            self.sample_rate.into(),
+            self.no_channels as i64,
+            self.no_samples as i64,
+            Some(stride),
         )
     }
 
@@ -4128,7 +4100,7 @@ impl ValidatedAudioLayout {
     }
 
     /// The SDK's `channel_stride_in_bytes`.
-    fn sdk_channel_stride(self) -> i32 {
+    pub(crate) fn sdk_channel_stride(self) -> i32 {
         self.channel_stride_bytes() as i32
     }
 
@@ -4421,14 +4393,7 @@ pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<R
 }
 
 fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioFormat> {
-    match fourcc {
-        sys::bindings::NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => {
-            Ok(AudioFormat::Fltp)
-        }
-        _ => Err(Error::InvalidFrame(
-            crate::FrameDefect::UnknownAudioFormat { fourcc },
-        )),
-    }
+    AudioFormat::try_from(FourCc::from_raw(fourcc))
 }
 
 // ============================================================================
@@ -4959,7 +4924,7 @@ unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> AudioParts
 /// });
 /// # }
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct VideoPlane<'a> {
     data: *const u8,
     layout: VideoPlaneLayout,
@@ -4979,6 +4944,25 @@ pub struct VideoPlane<'a> {
 unsafe impl Send for VideoPlane<'_> {}
 // SAFETY: Same immutable access and lifetime proof as Send above.
 unsafe impl Sync for VideoPlane<'_> {}
+
+// This formatter reads only validated extents, never the plane's allocation.
+struct PlaneExtent<'a>(&'a VideoPlaneLayout);
+
+impl fmt::Debug for PlaneExtent<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VideoPlane")
+            .field("row_stride_bytes", &self.0.row_stride)
+            .field("active_row_bytes", &self.0.active_row_bytes)
+            .field("row_count", &self.0.row_count)
+            .finish()
+    }
+}
+
+impl fmt::Debug for VideoPlane<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        PlaneExtent(&self.layout).fmt(f)
+    }
+}
 
 impl<'a> VideoPlane<'a> {
     /// Caller must retain an allocation covering the validated layout for 'a,
@@ -5044,10 +5028,20 @@ impl<'a> VideoPlane<'a> {
 
 /// Active video rows, borrowing the frame that owns the allocation.
 /// `Send + Sync` through its immutable plane; iteration never calls the SDK.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VideoRows<'a> {
     plane: VideoPlane<'a>,
     indices: std::ops::Range<usize>,
+}
+
+impl fmt::Debug for VideoRows<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VideoRows")
+            .field("remaining_rows", &self.len())
+            .field("row_stride_bytes", &self.plane.row_stride_bytes())
+            .field("active_row_bytes", &self.plane.active_row_bytes())
+            .finish()
+    }
 }
 
 impl<'a> Iterator for VideoRows<'a> {
@@ -5069,7 +5063,7 @@ impl std::iter::FusedIterator for VideoRows<'_> {}
 
 /// Video planes in SDK memory order, with no allocation or pixel copies.
 /// `Send + Sync` for scoped reads; the owning frame's thread rules still apply.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VideoPlanes<'a> {
     data: *const u8,
     layouts: slice::Iter<'a, VideoPlaneLayout>,
@@ -5082,6 +5076,17 @@ pub struct VideoPlanes<'a> {
 unsafe impl Send for VideoPlanes<'_> {}
 // SAFETY: Sharing the iterator exposes only immutable layouts and bytes.
 unsafe impl Sync for VideoPlanes<'_> {}
+impl fmt::Debug for VideoPlanes<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut summary = f.debug_struct("VideoPlanes");
+        summary.field("remaining_planes", &self.len());
+        for layout in self.layouts.as_slice() {
+            summary.field("plane", &PlaneExtent(layout));
+        }
+        summary.finish()
+    }
+}
+
 impl<'a> Iterator for VideoPlanes<'a> {
     type Item = VideoPlane<'a>;
     fn next(&mut self) -> Option<Self::Item> {
@@ -5246,7 +5251,7 @@ macro_rules! borrowed_audio_accessors {
         }
         audio_accessors! {
                 impl['a] $name<'a>;
-                debug(<$strategy as FrameFree>::REF_DEBUG_NAME);
+                debug(<$strategy as FrameFree>::REF_DEBUG_NAME, "active data (samples)" = active_sample_count);
                 timecode {
                     /// FrameSync output without a source timecode carries
                     /// [`Timecode::SYNTHESIZE`].
@@ -5656,7 +5661,7 @@ mod tests {
                 sample_rate: 48_000,
                 no_channels: channels,
                 no_samples: 5,
-                FourCC: AudioFormat::Fltp.to_sdk(),
+                FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
                 p_data: samples.as_ptr().cast_mut().cast(),
                 __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                     channel_stride_in_bytes: stride * 4,
@@ -5804,6 +5809,7 @@ mod tests {
             (3, 7),
             (3, 1),
             (5, 11),
+            (8, 3),
         ] {
             // Value encodes (channel, sample) so any misplacement is visible.
             let value = |ch: usize, s: usize| (ch * 1000 + s) as f32;
@@ -5813,14 +5819,20 @@ mod tests {
                     interleaved.push(value(ch, s));
                 }
             }
-            let frame = AudioFrame::builder()
-                .sample_rate(48_000)
-                .num_channels(channels as u32)
-                .num_samples(samples as u32)
-                .layout(AudioLayout::Interleaved)
-                .data(interleaved)
-                .build()
-                .unwrap();
+            let input = crate::audio_conversion::InterleavedAudioF32::new(
+                48_000,
+                channels as u32,
+                &interleaved,
+            )
+            .unwrap()
+            .with_timecode(Timecode::from_ticks(123));
+            let (frame, allocations) =
+                crate::test_alloc::allocation_count(|| AudioFrame::from_interleaved(&input));
+            assert_eq!(allocations, 1);
+            assert_eq!(frame.channel_stride_bytes(), samples * size_of::<f32>());
+            assert_eq!(frame.timecode(), input.timecode());
+            assert_eq!(frame.timestamp(), None);
+            assert_eq!(frame.metadata(), None);
             let expected: Vec<f32> = (0..channels)
                 .flat_map(|ch| (0..samples).map(move |s| value(ch, s)))
                 .collect();
@@ -5832,17 +5844,32 @@ mod tests {
                 assert_eq!(samples, &expected[ch * samples.len()..][..samples.len()]);
             }
         }
-        // A wrong input length is still rejected before any transposition.
-        assert!(AudioFrame::builder()
-            .num_channels(3)
-            .num_samples(4)
-            .layout(AudioLayout::Interleaved)
-            .data(vec![0.0; 11])
-            .build()
-            .is_err());
+        // The input validates divisibility before a conversion is possible.
+        assert!(crate::audio_conversion::InterleavedAudioF32::new(48_000, 3, &[0.0; 11]).is_err());
     }
 
     /// Every audio path reports a bad sample rate with the same message.
+    #[test]
+    fn audio_descriptors_use_the_validated_format() {
+        let frame = AudioFrame::builder()
+            .num_channels(2)
+            .num_samples(3)
+            .build()
+            .unwrap();
+        assert_eq!(
+            frame.audio_descriptor().FourCC,
+            FourCc::from(frame.format()).raw()
+        );
+        let samples = [0.0; 6];
+        let frame = BorrowedAudioFrame::builder(&samples, 48_000, 2, 3)
+            .build()
+            .unwrap();
+        assert_eq!(
+            frame.audio_descriptor().FourCC,
+            FourCc::from(frame.format()).raw()
+        );
+    }
+
     #[test]
     fn audio_sample_rate_check_is_shared_with_one_message() {
         let message = |result: Result<()>| match result {
@@ -5884,7 +5911,7 @@ mod tests {
                 sample_rate: rate,
                 no_channels: 1,
                 no_samples: 1,
-                FourCC: AudioFormat::Fltp.to_sdk(),
+                FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
                 p_data: (&mut sample as *mut f32).cast(),
                 __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                     channel_stride_in_bytes: 4,
@@ -7477,7 +7504,7 @@ mod tests {
             no_channels: num_channels,
             no_samples: num_samples,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: num_samples * 4,
@@ -8058,7 +8085,6 @@ mod tests {
             let builder = AudioFrame::builder()
                 .num_channels(2)
                 .num_samples(2)
-                .layout(AudioLayout::Interleaved)
                 .data(samples)
                 .metadata(audio_text)
                 .build()
@@ -8339,27 +8365,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bounded_sdk_text_stops_at_its_limit() {
-        let data = b"abc\0\xFF";
-        let text = data.as_ptr().cast::<c_char>();
-
-        // SAFETY: each scan stays within the live array: it ends at the NUL
-        // at index 3, or at a smaller limit.
-        unsafe {
-            assert_eq!(
-                bounded_sdk_text(text, MAX_METADATA_BYTES),
-                Some(&b"abc"[..])
-            );
-            // A terminator at the last index within the limit is found.
-            assert_eq!(bounded_sdk_text(text, 4), Some(&b"abc"[..]));
-            // A terminator at the limit itself is not.
-            assert_eq!(bounded_sdk_text(text, 3), None);
-            assert_eq!(bounded_sdk_text(text, 0), None);
-            assert_eq!(bounded_sdk_text(c"".as_ptr(), 1), Some(&b""[..]));
-        }
-    }
-
-    #[test]
     fn test_validate_frame_metadata_accepts_null_without_allocation_state() {
         let layout = unsafe { validate_frame_metadata(ptr::null()) }.expect("null is valid");
 
@@ -8482,7 +8487,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 123,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: no_samples * 4,
@@ -8653,7 +8658,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: dummy_data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: no_samples * 4,
@@ -8668,32 +8673,18 @@ mod tests {
             "Should reject audio frame with sample count overflow or exceeding size limit"
         );
 
-        if let Err(Error::InvalidFrame(msg)) = result {
-            // Accept either overflow or size limit error - both are correct guards
-            assert!(
-                matches!(
-                    msg,
-                    crate::FrameDefect::Layout(crate::LayoutDefect::AudioChannelOffset { .. })
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioSampleCount { .. })
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioByteSize(_))
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
-                        | crate::FrameDefect::Layout(
-                            crate::LayoutDefect::VideoStrideOverflow { .. }
-                        )
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
-                        | crate::FrameDefect::ImageScratchOverflow
-                        | crate::FrameDefect::ImageDimensionOverflow
-                ) || matches!(
-                    msg,
-                    crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
-                ),
-                "Error message should mention overflow or size limit, got: {msg}"
-            );
+        let expected = if usize::BITS == 32 {
+            crate::LayoutDefect::AudioChannelOffset {
+                channels: i32::MAX as usize,
+                stride: 1024,
+            }
         } else {
-            panic!("Expected InvalidFrame error");
-        }
+            crate::LayoutDefect::AudioBytes((i32::MAX as u64 * 1024 * 4) as usize)
+        };
+        assert!(matches!(
+            result,
+            Err(Error::InvalidFrame(crate::FrameDefect::Layout(cause))) if cause == expected
+        ));
     }
 
     /// Test that normal audio frames within bounds succeed
@@ -8711,7 +8702,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 12345,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: no_samples * 4,
@@ -8734,6 +8725,122 @@ mod tests {
     }
 
     #[test]
+    fn builder_and_view_debug_summarizes_storage_and_remaining_extents() {
+        fn summaries(width: u32, height: u32, samples: u32) -> Vec<String> {
+            let pixels = vec![7; width as usize * height as usize * 4];
+            let audio = vec![0.25; samples as usize * 2];
+            let frame = VideoFrame::builder()
+                .resolution(width, height)
+                .pixel_format(PixelFormat::Nv12)
+                .build()
+                .unwrap();
+            let plane = frame.planes().next().unwrap();
+            let audio_frame = AudioFrame::builder()
+                .num_channels(2)
+                .num_samples(samples)
+                .build()
+                .unwrap();
+            vec![
+                format!(
+                    "{:?}",
+                    VideoFrame::builder()
+                        .resolution(width, height)
+                        .data(pixels.clone())
+                        .metadata("<x/>")
+                ),
+                format!(
+                    "{:?}",
+                    crate::BorrowedVideoFrame::builder(&pixels, width, height, PixelFormat::Bgra)
+                        .metadata(c"<x/>")
+                ),
+                format!(
+                    "{:?}",
+                    AudioFrame::builder()
+                        .num_channels(2)
+                        .num_samples(samples)
+                        .data(audio.clone())
+                        .metadata("<x/>")
+                ),
+                format!(
+                    "{:?}",
+                    BorrowedAudioFrame::builder(&audio, 48_000, 2, samples).metadata(c"<x/>")
+                ),
+                format!("{plane:?}"),
+                format!("{:?}", plane.rows()),
+                format!("{:?}", frame.planes()),
+                format!("{:?}", audio_frame.channels()),
+                format!("{audio_frame:?}"),
+                format!(
+                    "{:?}",
+                    BorrowedAudioFrame::builder(&audio, 48_000, 2, samples)
+                        .build()
+                        .unwrap()
+                ),
+            ]
+        }
+        crate::test_support::assert_bounded_debug(
+            &summaries(4, 2, 3),
+            &summaries(1920, 1080, 48_000),
+        );
+        assert!(format!("{:?}", VideoFrame::builder()).contains("data (bytes): None"));
+        assert!(format!("{:?}", AudioFrame::builder()).contains("data (samples): None"));
+        let frame = VideoFrame::builder()
+            .resolution(4, 2)
+            .pixel_format(PixelFormat::Nv12)
+            .build()
+            .unwrap();
+        let mut planes = frame.planes();
+        let plane = planes.next().unwrap();
+        assert!(format!("{planes:?}").contains("remaining_planes: 1"));
+        let mut rows = plane.rows();
+        rows.next();
+        assert!(format!("{rows:?}").contains("remaining_rows: 1"));
+        let audio = AudioFrame::builder()
+            .num_channels(2)
+            .num_samples(3)
+            .build()
+            .unwrap();
+        let mut channels = audio.channels();
+        channels.next();
+        assert!(format!("{channels:?}").contains("remaining_channels: 1"));
+    }
+
+    #[test]
+    fn owned_metadata_debug_uses_the_borrowed_frame_fields() {
+        let frame = MetadataFrame::new("<x/>")
+            .unwrap()
+            .with_timecode(Timecode::from_ticks(42));
+        assert_eq!(
+            format!("{frame:?}"),
+            "MetadataFrame { data: \"<x/>\", data (bytes): 4, timecode: Timecode(42) }"
+        );
+    }
+
+    #[test]
+    fn captured_audio_debug_reports_active_samples_without_padding() {
+        let samples = [0.0f32; 11];
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48_000,
+            no_channels: 2,
+            no_samples: 3,
+            FourCC: FourCc::from(AudioFormat::Fltp).raw(),
+            p_data: samples.as_ptr().cast_mut().cast(),
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 32,
+            },
+            ..Default::default()
+        };
+        // SAFETY: the synthetic guard retains the initialized sample array;
+        // the test free callback does not own or release it.
+        let guard = unsafe { Guard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
+        let frame = AudioFrameRef::new(guard).unwrap();
+        let debug = format!("{frame:?}");
+        assert!(debug.contains("num_samples: 3"));
+        assert!(debug.contains("active data (samples): 6"));
+        assert!(!debug.contains("samples per channel"));
+    }
+
+    #[test]
     fn audio_frame_debug_lists_the_borrowed_frame_fields_not_samples() {
         let frame = AudioFrame::builder()
             .num_channels(2)
@@ -8745,7 +8852,7 @@ mod tests {
         assert_eq!(
             format!("{frame:?}"),
             "AudioFrame { sample_rate: 48000, num_channels: 2, num_samples: 3, \
-             timecode: Timecode(5), format: Fltp, samples per channel: 3, \
+             timecode: Timecode(5), format: Fltp, data (samples): 6, \
              channel_stride_bytes: 12, metadata: Some(\"<audio/>\"), timestamp: None }"
         );
     }
@@ -9301,7 +9408,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: no_samples * 4,
@@ -9331,7 +9438,7 @@ mod tests {
             sample_rate: 48000,
             no_channels: 2,
             no_samples: 3,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: storage.as_mut_ptr().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 24,
@@ -9380,7 +9487,7 @@ mod tests {
             sample_rate: 48000,
             no_channels: 1,
             no_samples: 1,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: unsafe { storage.as_mut_ptr().cast::<u8>().add(1) },
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 4,
@@ -9409,7 +9516,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: stride_samples * 4,
@@ -9430,7 +9537,7 @@ mod tests {
     fn returned_audio_accepts_the_no_source_state() {
         let unset = NDIlib_audio_frame_v3_t::default();
         let set = NDIlib_audio_frame_v3_t {
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             ..unset
         };
         for raw in [unset, set] {
@@ -9448,7 +9555,7 @@ mod tests {
         let raw = NDIlib_audio_frame_v3_t {
             sample_rate: 48000,
             no_channels: 2,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             ..Default::default()
         };
         match validate_returned_audio(&raw) {
@@ -9468,7 +9575,7 @@ mod tests {
             sample_rate: 48000,
             no_channels: 2,
             no_samples: 4,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 16,
@@ -9496,7 +9603,7 @@ mod tests {
         let format_only = NDIlib_audio_frame_v3_t {
             sample_rate: 48000,
             no_channels: 2,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             ..Default::default()
         };
         for raw in [NDIlib_audio_frame_v3_t::default(), format_only] {
@@ -9521,7 +9628,7 @@ mod tests {
         let format = NDIlib_audio_frame_v3_t {
             sample_rate: 48000,
             no_channels: 2,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             ..Default::default()
         };
         let mut sample = 0.0f32;
@@ -9589,7 +9696,7 @@ mod tests {
             no_channels: 2,
             no_samples: 1024,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 1024 * 4 - 4,
@@ -9610,7 +9717,7 @@ mod tests {
             no_channels: 2,
             no_samples: 1024,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: ptr::null_mut(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 1024 * 4,
@@ -9642,7 +9749,7 @@ mod tests {
             no_channels: 2,
             no_samples: -1, // Negative
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 1024 * 4,
@@ -9680,7 +9787,7 @@ mod tests {
             no_channels: i32::MAX,
             no_samples: 1024,
             timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 1024 * 4,
@@ -9695,31 +9802,18 @@ mod tests {
             "Should reject audio frame with overflow potential"
         );
 
-        if let Err(Error::InvalidFrame(msg)) = result {
-            assert!(
-                matches!(
-                    msg,
-                    crate::FrameDefect::Layout(crate::LayoutDefect::AudioChannelOffset { .. })
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioSampleCount { .. })
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioByteSize(_))
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
-                        | crate::FrameDefect::Layout(
-                            crate::LayoutDefect::VideoStrideOverflow { .. }
-                        )
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
-                        | crate::FrameDefect::ImageScratchOverflow
-                        | crate::FrameDefect::ImageDimensionOverflow
-                ) || matches!(
-                    msg,
-                    crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
-                ),
-                "Error should mention overflow or size limit, got: {msg}"
-            );
+        let expected = if usize::BITS == 32 {
+            crate::LayoutDefect::AudioChannelOffset {
+                channels: i32::MAX as usize,
+                stride: 1024,
+            }
         } else {
-            panic!("Expected InvalidFrame error");
-        }
+            crate::LayoutDefect::AudioBytes((i32::MAX as u64 * 1024 * 4) as usize)
+        };
+        assert!(matches!(
+            result,
+            Err(Error::InvalidFrame(crate::FrameDefect::Layout(cause))) if cause == expected
+        ));
     }
 
     /// Test the raw plane-size kernel matches the public validated layout sizing
@@ -9818,7 +9912,7 @@ mod tests {
             no_channels,
             no_samples,
             timecode: 12345,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: data.as_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: no_samples * 4,
@@ -10289,7 +10383,7 @@ mod tests {
             sample_rate: 48_000,
             no_channels: channels as i32,
             no_samples: samples as i32,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: storage.as_mut_ptr().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: (stride * 4) as i32,

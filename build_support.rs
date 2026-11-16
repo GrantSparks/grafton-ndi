@@ -202,6 +202,7 @@ pub fn links_statically(os: &str) -> bool {
 /// One supported Rust target and the Apple SDK slice it must link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StaticTarget {
+    pub triple: &'static str,
     pub os: &'static str,
     pub arch: &'static str,
     pub abi: &'static str,
@@ -215,6 +216,7 @@ pub struct StaticTarget {
 /// layout; matching their CPU alone would incorrectly accept a device slice.
 pub const STATIC_TARGETS: &[StaticTarget] = &[
     StaticTarget {
+        triple: "aarch64-apple-ios",
         os: "ios",
         arch: "aarch64",
         abi: "",
@@ -223,6 +225,7 @@ pub const STATIC_TARGETS: &[StaticTarget] = &[
         deployment_variable: "IPHONEOS_DEPLOYMENT_TARGET",
     },
     StaticTarget {
+        triple: "x86_64-apple-ios",
         os: "ios",
         arch: "x86_64",
         abi: "sim",
@@ -231,6 +234,7 @@ pub const STATIC_TARGETS: &[StaticTarget] = &[
         deployment_variable: "IPHONEOS_DEPLOYMENT_TARGET",
     },
     StaticTarget {
+        triple: "aarch64-apple-tvos",
         os: "tvos",
         arch: "aarch64",
         abi: "",
@@ -239,6 +243,7 @@ pub const STATIC_TARGETS: &[StaticTarget] = &[
         deployment_variable: "TVOS_DEPLOYMENT_TARGET",
     },
     StaticTarget {
+        triple: "x86_64-apple-tvos",
         os: "tvos",
         arch: "x86_64",
         abi: "sim",
@@ -247,6 +252,7 @@ pub const STATIC_TARGETS: &[StaticTarget] = &[
         deployment_variable: "TVOS_DEPLOYMENT_TARGET",
     },
     StaticTarget {
+        triple: "aarch64-apple-visionos",
         os: "visionos",
         arch: "aarch64",
         abi: "",
@@ -263,14 +269,21 @@ pub fn static_target(
     arch: &str,
     abi: &str,
 ) -> Result<&'static StaticTarget, String> {
-    STATIC_TARGETS
+    let entry = STATIC_TARGETS
         .iter()
-        .find(|entry| (entry.os, entry.arch, entry.abi) == (os, arch, abi))
+        .find(|entry| entry.triple == target)
         .ok_or_else(|| {
             format!(
                 "Unsupported Apple static target {target}; see docs/setup.md#apple-mobile-targets (ARM64 Apple simulators and Mac Catalyst are not supported)"
             )
-        })
+        })?;
+    if (entry.os, entry.arch, entry.abi) != (os, arch, abi) {
+        return Err(format!(
+            "Apple static target {target} has cfg ({os}, {arch}, {abi:?}), but its table row requires ({}, {}, {:?})",
+            entry.os, entry.arch, entry.abi
+        ));
+    }
+    Ok(entry)
 }
 
 /// Environment inputs used by any supported static target, without duplicates.

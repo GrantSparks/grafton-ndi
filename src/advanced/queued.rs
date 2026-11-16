@@ -632,8 +632,10 @@ impl CallbackState {
                 let completion = Completion { _private: () };
                 ready.push_back(ReadyEntry { entry, completion });
             }
-            // No frame in flight has this data: the SDK named a frame twice,
-            // or one it was never given.
+            // No retained submission has this data: the SDK named an unknown
+            // frame, or completed it twice before resubmission. Address matching
+            // relies on exactly one completion per submission after the SDK's
+            // last access; a duplicate after resubmission cannot be distinguished.
             None => {
                 drop(state);
                 self.publish_protocol_failure();
@@ -665,6 +667,8 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
         // The SDK may pass its own copy of the descriptor, so a submission is
         // recognized by its data allocation, which is unique while retained.
         // SAFETY: non-null was checked, and the SDK passes a readable descriptor.
+        // Releasing the matched loan relies on exactly one completion per
+        // submission, delivered after the SDK's last access to that frame.
         state.complete(unsafe { (*frame).p_data } as usize);
     }));
     if result.is_err() {
@@ -949,8 +953,15 @@ impl QueuedSender {
         self.lending.loans().retained_frames()
     }
 
-    /// Whether the SDK has reported a completion that matches no queued frame,
-    /// or the same one twice.
+    /// Whether the SDK has reported a completion that matches no retained
+    /// submission, such as a frame it was never given, or one completed twice
+    /// before it was submitted again.
+    ///
+    /// The queue identifies a completion by the frame's data allocation and
+    /// relies on the SDK reporting exactly one completion per submission,
+    /// after its last access to the frame. A repeated completion after that
+    /// allocation is submitted again cannot be distinguished from its new
+    /// submission's completion.
     ///
     /// The queue then no longer knows which frames the SDK still reads, so it
     /// accepts no more submissions; frames already completed can still be
@@ -1049,10 +1060,7 @@ mod tests {
 
     #[test]
     fn completed_packet_debug_is_bounded_by_fields_not_payload() {
-        use crate::advanced::{
-            packets::testing::assert_bounded_debug, EnvelopeCodec, PacketEnvelope, VideoCodec,
-            VideoPacketFormat,
-        };
+        use crate::advanced::{EnvelopeCodec, PacketEnvelope, VideoCodec, VideoPacketFormat};
         let summaries = |size| {
             let bytes =
                 PacketEnvelope::encode(EnvelopeCodec::H264, 17, 13, true, &vec![7; size], &[1, 2])
@@ -1080,7 +1088,7 @@ mod tests {
                 )
             })
         };
-        assert_bounded_debug(&summaries(1024), &summaries(1024 * 1024));
+        crate::test_support::assert_bounded_debug(&summaries(1024), &summaries(1024 * 1024));
     }
 
     #[test]

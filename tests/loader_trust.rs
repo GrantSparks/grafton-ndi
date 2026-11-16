@@ -1,6 +1,9 @@
 //! Library constructors run before validation; explicit selection avoids
 //! untrusted search candidates. All search directories here are test-owned.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
+#[path = "../src/sys/loader/file_policy.rs"]
+mod file_policy;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -12,7 +15,9 @@ use std::{fs, path::PathBuf, process::Command};
 
 #[test]
 fn relative_environment_directories_never_run_constructors() {
-    let trusted_name = if cfg!(any(feature = "advanced", feature = "file-io")) {
+    let trusted_name = if cfg!(feature = "advanced")
+        || (cfg!(feature = "file-io") && file_policy::FILE_LIBRARY_NEEDS_ADVANCED_RUNTIME)
+    {
         "libndi_advanced.so.6"
     } else {
         "libndi.so.6"
@@ -49,7 +54,9 @@ fn relative_environment_directories_never_run_constructors() {
         }
         let trusted = root.join("trusted").join(trusted_name);
         FakeRuntime {
-            cfgs: if cfg!(any(feature = "advanced", feature = "file-io")) {
+            cfgs: if cfg!(feature = "advanced")
+                || (cfg!(feature = "file-io") && file_policy::FILE_LIBRARY_NEEDS_ADVANCED_RUNTIME)
+            {
                 vec!["fake_advanced"]
             } else {
                 Vec::new()

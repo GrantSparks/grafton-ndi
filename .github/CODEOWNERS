@@ -18,3 +18,6 @@
 # manifest lists the files a release publishes.
 /Cargo.toml @GrantSparks
 /Cargo.lock @GrantSparks
+
+# The bindings generator decides the vendored-bindings gate.
+/xtask/ @GrantSparks

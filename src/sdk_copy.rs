@@ -1,15 +1,81 @@
-//! Bounded, exact and fallible copies shared by native discovery snapshots.
+//! Bounded SDK string reads and exact, fallible copies of native snapshots.
 
 use std::{
     collections::TryReserveError,
     ffi::{c_char, CStr, CString},
     mem::size_of,
+    slice,
 };
 
-use crate::{
-    frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
-    Error, ResourceKind, Result,
-};
+use crate::{Error, ResourceKind, Result};
+
+/// The bytes of an SDK string before its first NUL, or `None` when there is
+/// no NUL within the first `limit` bytes.
+///
+/// The scan reads one byte at a time and stops at the first NUL, so it never
+/// reads past the string, and it reads at most `limit` bytes.
+///
+/// # Safety
+///
+/// `text` must be non-null and readable byte-by-byte for `'a` until either
+/// its first NUL or `limit` bytes have been read.
+pub(crate) unsafe fn bounded_sdk_text<'a>(text: *const c_char, limit: usize) -> Option<&'a [u8]> {
+    let bytes = text.cast::<u8>();
+    // SAFETY: each byte read is at or before the first NUL and within the
+    // bound, which the caller guarantees readable.
+    let len = (0..limit).find(|&len| unsafe { bytes.add(len).read() } == 0)?;
+    // SAFETY: the `len` bytes before the NUL were just read, and the caller
+    // keeps them readable for `'a`.
+    Some(unsafe { slice::from_raw_parts(bytes, len) })
+}
+
+/// The most one SDK string other than frame metadata may take, terminator
+/// included: a Discovery Server string, or a source's name, address or
+/// advertised metadata.
+pub(crate) const MAX_SDK_STRING_BYTES: usize = 4 * 1024 * 1024;
+
+/// Copy SDK source text of at most [`MAX_SDK_STRING_BYTES`], terminator
+/// included, into shared native storage, replacing bytes that are not UTF-8.
+///
+/// # Errors
+///
+/// [`Error::UnexpectedSdkResult`] naming the SDK function retained by `text`,
+/// when there is no terminator within the limit, and [`Error::AllocationFailed`]
+/// when the final source string storage cannot be reserved.
+///
+/// # Safety
+///
+/// `text` must be non-null and readable byte-by-byte until either its first
+/// NUL or [`MAX_SDK_STRING_BYTES`] bytes have been read.
+pub(crate) unsafe fn copy_sdk_string(
+    text: crate::sys::table::Called<*const c_char>,
+) -> Result<crate::finder::SourceText> {
+    // SAFETY: forwarded to the caller's obligation.
+    let bytes = unsafe { sdk_text(text) }?;
+    // SAFETY: sdk_text stops at the first NUL and excludes it.
+    unsafe { crate::finder::SourceText::from_sdk(bytes) }
+}
+
+/// Read one bounded SDK C string, retaining its producing entry point.
+///
+/// # Safety
+///
+/// The pointer in `text` must be non-null and readable byte-by-byte until its
+/// first NUL or [`MAX_SDK_STRING_BYTES`] bytes, and remain live for `'a`.
+pub(crate) unsafe fn sdk_text<'a>(
+    text: crate::sys::table::Called<*const c_char>,
+) -> Result<&'a [u8]> {
+    let (text, operation) = text.into_parts();
+    // SAFETY: forwarded to the caller's lifetime and readable-bound obligation.
+    unsafe { bounded_sdk_text(text, MAX_SDK_STRING_BYTES) }.ok_or(Error::UnexpectedSdkResult(
+        crate::SdkResultDefect::UnterminatedText { operation },
+    ))
+}
+
+/// Copy scanned SDK text, replacing invalid UTF-8 with U+FFFD.
+pub(crate) fn copy_lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
 
 pub(crate) const COPY_LIMIT: usize = 16 * 1024 * 1024;
 
@@ -221,6 +287,28 @@ impl CopyBudget {
         .transpose()
     }
 
+    /// Charge and build shared source storage without another NUL scan or copy.
+    ///
+    /// # Safety
+    /// As for [`Self::c_str`].
+    pub(crate) unsafe fn source_text(
+        &mut self,
+        value: *const c_char,
+    ) -> TextResult<Option<crate::finder::SourceText>> {
+        // SAFETY: forwarded to the caller's obligations.
+        let text = unsafe { self.c_str(value)? };
+        text.map(|text| {
+            let bytes = text.to_bytes();
+            let len = std::str::from_utf8(bytes)
+                .map(str::len)
+                .unwrap_or_else(|_| LossyText::new(bytes).len());
+            self.take(len + crate::finder::SourceText::STORAGE_OVERHEAD)?;
+            // SAFETY: the bounded C string scan excludes its first NUL.
+            unsafe { crate::finder::SourceText::from_sdk(bytes) }.map_err(Into::into)
+        })
+        .transpose()
+    }
+
     /// Copy exact identifier bytes, including their sole trailing NUL.
     ///
     /// # Safety
@@ -293,13 +381,18 @@ impl<'a> LossyText<'a> {
     pub(crate) fn copy(&self) -> std::result::Result<String, TryReserveError> {
         let mut text = String::new();
         text.try_reserve_exact(self.len)?;
+        self.push_to(&mut text);
+        Ok(text)
+    }
+
+    /// Append into storage whose capacity the caller has already reserved.
+    pub(crate) fn push_to(&self, text: &mut String) {
         for chunk in self.bytes.utf8_chunks() {
             text.push_str(chunk.valid());
             if !chunk.invalid().is_empty() {
                 text.push('\u{fffd}');
             }
         }
-        Ok(text)
     }
 }
 
@@ -307,6 +400,27 @@ impl<'a> LossyText<'a> {
 mod tests {
     use super::*;
     use std::ptr;
+
+    #[test]
+    fn test_bounded_sdk_text_stops_at_its_limit() {
+        let data = b"abc\0\xFF";
+        let text = data.as_ptr().cast::<c_char>();
+
+        // SAFETY: each scan stays within the live array: it ends at the NUL
+        // at index 3, or at a smaller limit.
+        unsafe {
+            assert_eq!(
+                bounded_sdk_text(text, MAX_SDK_STRING_BYTES),
+                Some(&b"abc"[..])
+            );
+            // A terminator at the last index within the limit is found.
+            assert_eq!(bounded_sdk_text(text, 4), Some(&b"abc"[..]));
+            // A terminator at the limit itself is not.
+            assert_eq!(bounded_sdk_text(text, 3), None);
+            assert_eq!(bounded_sdk_text(text, 0), None);
+            assert_eq!(bounded_sdk_text(c"".as_ptr(), 1), Some(&b""[..]));
+        }
+    }
 
     fn budget(remaining: usize) -> CopyBudget {
         let mut budget = CopyBudget::new(COPY_LIMIT, ResourceKind::DiscoveryServerCopyBytes);

@@ -85,8 +85,9 @@ padded rows, YUV and downscaling retain incremental conversion. Encoded JPEG
 bytes and reconstructed pixels can differ between accelerated and scalar
 execution. Compare decoded quality rather than relying on byte identity.
 
-`SampleDepth::Sixteen` is PNG-only: high-bit-depth sources retain precision,
-while 8-bit inputs scale by 257. JPEG and WebP reject that setting. Codec
+`SampleDepth::Sixteen` is PNG-only: P216, PA16, NA4G and NB4G sources retain
+precision. Eight-bit RGB and alpha samples scale by 257; YUV sources are
+converted at 16-bit precision. JPEG and WebP reject that setting. Codec
 dimension limits apply after downscaling; invalid options return `InvalidInput`
 and unsupported output dimensions return `InvalidFrame`.
 
@@ -167,9 +168,13 @@ for application planning.
 
 ## Errors
 
-Inspect the method's `Result`: invalid quality, effort or depth settings return
-`InvalidInput`; malformed color descriptions, HDR refusal, excessive dimensions
-or codec failures return `InvalidFrame`; write and flush failures retain their
+Inspect the method's `Result`: invalid quality, effort or depth settings, and
+`HdrPolicy::CodeValues` with JPEG or WebP for an HDR frame, return `InvalidInput`.
+Malformed color descriptions, HDR refusal, excessive dimensions
+or codec failures return `InvalidFrame`. Conversion scratch allocation failures
+return `AllocationFailed`. The lossy WebP encoder's own allocation failures are
+the exception: they remain `InvalidFrame(FrameDefect::EncodingFailed)` until its
+supported error API can classify them. Write and flush failures retain their
 original `Io` error. A successful writer encode has written every byte and
 flushed the writer. The [API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/image_encoding/struct.ImageOptions.html#errors)
 lists the complete option rules.

@@ -57,7 +57,9 @@
 //! most 100 ms in the SDK, can still consume media and run its scoped callback
 //! after the future was dropped. Undelivered receiver events and source-name
 //! changes are retained for a later wait, including when a completed worker
-//! was never polled again. Callback time and side effects are not cancelled
+//! was never polled again. Source names and unknown events are redelivered only
+//! if no newer report superseded them. Replay takes a short bookkeeping lock,
+//! never a native-query permit. Callback time and side effects are not cancelled
 //! by the wait timeout either. A panic is caught on the worker, where SDK guards
 //! are released, then resumed on the awaiting task with its original payload.
 //! It unwinds through `select!` or `join!` as any other task panic does. If the
@@ -110,7 +112,8 @@ use std::{
 };
 
 use crate::{
-    capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
+    capture::{AllSlots, AudioKind, CaptureKind, MetadataKind, NoSlots, VideoKind},
+    receiver::{ReceiverCore, ReceiverReport},
     source_retention::RetainedSource,
     timeout::Deadline,
     Error, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef, Result, Source,
@@ -321,6 +324,8 @@ impl private::Spawn for Smol {
 /// task with its original payload, after SDK guards are released on the worker.
 /// An abandoned operation discards media and any caught panic payload;
 /// undelivered events and source-name changes are retained for later waits.
+/// A source-name or unknown-event report is redelivered only while no newer
+/// report has superseded it; replay never waits for a native query.
 ///
 /// # Example
 ///
@@ -407,8 +412,11 @@ impl<T: ReplayReceiverValue> ReceiverDelivery<T> {
         }
     }
 
-    fn take(mut self) -> T {
-        self.value.take().expect("delivery is consumed once")
+    fn take(mut self) -> T::Value {
+        self.value
+            .take()
+            .expect("delivery is consumed once")
+            .into_value()
     }
 }
 
@@ -421,25 +429,40 @@ impl<T: ReplayReceiverValue> Drop for ReceiverDelivery<T> {
 }
 
 trait ReplayReceiverValue {
+    type Value;
+    fn into_value(self) -> Self::Value;
     fn replay(self, receiver: &Receiver);
 }
 
-impl ReplayReceiverValue for ReceiverEvent {
+impl ReplayReceiverValue for ReceiverReport<ReceiverEvent> {
+    type Value = ReceiverEvent;
+    fn into_value(self) -> Self::Value {
+        self.value
+    }
     fn replay(self, receiver: &Receiver) {
         receiver.core.retain_event(self);
     }
 }
 
-impl ReplayReceiverValue for SourceNameChange {
+impl ReplayReceiverValue for ReceiverReport<SourceNameChange> {
+    type Value = SourceNameChange;
+    fn into_value(self) -> Self::Value {
+        self.value
+    }
     fn replay(self, receiver: &Receiver) {
         receiver.core.retain_source_name_change(self);
     }
 }
 
-impl ReplayReceiverValue for ReceiverItem {
+impl ReplayReceiverValue for ReceiverReport<ReceiverItem> {
+    type Value = ReceiverItem;
+    fn into_value(self) -> Self::Value {
+        self.value
+    }
     fn replay(self, receiver: &Receiver) {
-        if let Self::Event(event) = self {
-            event.replay(receiver);
+        if let ReceiverItem::Event(event) = &self.value {
+            let event = *event;
+            receiver.core.retain_event(self.map(|_| event));
         }
     }
 }
@@ -522,15 +545,21 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// whose result is discarded; each native wait lasts at most 100 ms.
     /// An undelivered event is retained for the next event or combined capture,
     /// including when the worker completed before the future was dropped.
+    /// An unknown event is redelivered only if no newer unknown event was reported.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub async fn capture_any(&self, timeout: Duration) -> Result<Option<ReceiverItem>> {
         let receiver = Arc::clone(&self.inner);
         Ok(
             with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-                let value = receiver
-                    .capture_any_ref_until(deadline, stop)?
-                    .as_ref()
-                    .map(ReceiverItemRef::to_owned);
+                let value = receiver.capture_any_report_until::<AllSlots, _>(
+                    deadline,
+                    stop,
+                    |report| report.map(ReceiverItem::Event),
+                    |media| {
+                        ReceiverCore::combined_result(media)
+                            .map(|item| ReceiverReport::unsequenced(item.to_owned()))
+                    },
+                )?;
                 Ok(value.map(|value| ReceiverDelivery::new(receiver, value)))
             })
             .await?
@@ -620,13 +649,19 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// Dropping the future skips queued work and stops a started wait before
     /// its next attempt. An event taken by an in-flight or completed worker
     /// is retained for the next event or combined capture if this future never
-    /// receives it. Each native wait lasts at most 100 ms.
+    /// receives it. An unknown event is redelivered only if no newer unknown
+    /// event was reported. Each native wait lasts at most 100 ms.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub async fn next_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
         let receiver = Arc::clone(&self.inner);
         Ok(
             with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-                let value = receiver.next_event_until(deadline, stop)?;
+                let value = receiver.capture_any_report_until::<NoSlots, _>(
+                    deadline,
+                    stop,
+                    |report| report,
+                    |media| match media {},
+                )?;
                 Ok(value.map(|value| ReceiverDelivery::new(receiver, value)))
             })
             .await?
@@ -663,8 +698,9 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// Dropping the future skips queued work and stops a started wait before
     /// its next attempt. A one-shot change taken by an in-flight or completed
     /// worker is retained for the next name-change wait if this future never
-    /// receives it. Retained changes are taken before another native query;
-    /// each native wait lasts at most 100 ms.
+    /// receives it, unless a newer source-name change has been reported.
+    /// Replay never waits for a native query. The newest retained change is
+    /// taken before another native query; each native wait lasts at most 100 ms.
     #[doc(alias = "NDIlib_recv_get_source_name")]
     pub async fn wait_for_source_name_change(
         &self,
@@ -747,8 +783,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// Reconnect serializes with other local connection changes and runs the
     /// native request on the blocking pool. Captures may continue meanwhile.
-    /// Confirm recovery via [`Receiver::connection_stats`]. A remote SourceDiscovery
-    /// Server source change does not update the local target this requests.
+    /// Confirm recovery via [`Receiver::connection_stats`]. A Discovery Server
+    /// source change does not update the local target this requests.
     ///
     /// # Errors
     ///
@@ -1276,11 +1312,14 @@ mod receiver_tests {
         };
         let receiver =
             Arc::new(Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap());
-        let event = ReceiverEvent::Unknown(4321);
-        drop(ReceiverDelivery::new(Arc::clone(&receiver), event));
+        let event = ReceiverEvent::SourceChanged;
+        drop(ReceiverDelivery::new(
+            Arc::clone(&receiver),
+            ReceiverReport::unsequenced(event),
+        ));
         assert_eq!(receiver.next_event(Duration::ZERO).unwrap(), Some(event));
         assert_eq!(
-            ReceiverDelivery::new(Arc::clone(&receiver), event).take(),
+            ReceiverDelivery::new(Arc::clone(&receiver), ReceiverReport::unsequenced(event)).take(),
             event
         );
         assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());

@@ -81,8 +81,10 @@ disconnected. Packet receivers cannot feed `FrameSync`.
 
 Both capture methods take `&self`; controls remain available through
 `receiver()` while a packet is borrowed. `controls()` reaches exclusive stream
-selection and KVM, and a packet KVM session also provides `capture_any_ref()`. Its
-result borrows the receiver, so inputs can be released while a packet is held.
+selection and KVM. Packet sessions capture through `session.receiver()` using
+`capture_any` or `capture_any_ref`, so capture can run on a worker while the
+session sends input. Borrowed results retain the receiver, so inputs can be
+released while a packet is held.
 Neither route exposes raw receiver capture. See
 [`advanced_passthrough`](../examples/advanced_passthrough.rs) for receiving and
 relaying a source's compressed packets.
@@ -115,8 +117,10 @@ specify exact limits and send validation.
 
 Owned compressed/scatter frames edit timecode and metadata with `set_timecode`,
 `set_metadata` and `clear_metadata`. Invalid replacement metadata preserves the
-old value. Audio uses `set_protected`; reusable `VideoPacketFormat` uses fluent
-`with_*` settings. Scatter frames retain separate owned blocks rather than
+old value. Reusable `VideoPacketFormat` and `AudioPacketFormat` describe codec
+and stream settings; their fluent `with_*` methods include `with_protected`.
+Build each format once and pass it with the payload to contiguous or scatter
+frame constructors. Scatter frames retain separate owned blocks rather than
 joining payloads; `into_contiguous_copy` explicitly joins them.
 
 ### Sending packets
@@ -365,8 +369,8 @@ owners expose these controls through `controls()`; see the
 returns a restricted `KvmReceiver<'_, M>` for mode-permitted capture, event polling,
 diagnostics, tally, PTZ, metadata and other shared controls while input stays
 held. Borrowed frames can coexist with mutable input calls. Use `split()`
-for simultaneous FrameSync/AVSync output and a session; packet sessions provide
-`capture_any()` directly. FrameSync and AvSync views retain metadata capture but
+for simultaneous FrameSync/AVSync output and a session; packet sessions capture
+through `session.receiver()`. FrameSync and AvSync views retain metadata capture but
 have no event polling; use capability getters, source-name polling and connection
 queries.
 

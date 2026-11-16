@@ -17,6 +17,10 @@ class Documentation(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+        self.internal_entry_points = dict(docs.INTERNAL_SDK_ENTRY_POINTS)
+        exemptions = mock.patch.dict(docs.INTERNAL_SDK_ENTRY_POINTS, {}, clear=True)
+        exemptions.start()
+        self.addCleanup(exemptions.stop)
         self.write('Cargo.toml', '[package]\nname = "example"\nversion = "3.0.0"\n')
         self.write('README.md', '# Example\n')
         self.write('examples/README.md', '# Examples\n')
@@ -358,12 +362,29 @@ class Documentation(unittest.TestCase):
         self.assertEqual(docs.sdk_alias_violations(self.root), [])
 
     def test_internal_native_entry_points_have_explicit_reasons(self):
-        self.assertTrue(all(reason.strip() for reason in docs.INTERNAL_SDK_ENTRY_POINTS.values()))
+        self.assertTrue(self.internal_entry_points)
+        self.assertTrue(all(reason.strip() for reason in self.internal_entry_points.values()))
+        docs.INTERNAL_SDK_ENTRY_POINTS['NDIlib_recv_free_video_v2'] = self.internal_entry_points['NDIlib_recv_free_video_v2']
         self.write('src/sys/api.rs', 'native_table! { fn NDIlib_recv_free_video_v2(); '
                    'fn NDIlib_recv_free_new_resource(); }')
         errors = docs.sdk_alias_violations(self.root)
         self.assertEqual(len(errors), 1)
         self.assertIn('NDIlib_recv_free_new_resource', errors[0])
+
+    def test_public_alias_must_remove_its_internal_exemption(self):
+        docs.INTERNAL_SDK_ENTRY_POINTS['NDIlib_example'] = 'fixture internal call'
+        self.write('src/sys/api.rs', 'native_table! { fn NDIlib_example(); }')
+        self.write('src/public.rs', '\n#[doc(alias = "NDIlib_example")]\npub fn example() {}')
+        errors = docs.sdk_alias_violations(self.root)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('src/public.rs:2:', errors[0])
+        self.assertIn('is aliased publicly; remove its internal exemption', errors[0])
+
+    def test_unregistered_internal_exemption_is_reported(self):
+        docs.INTERNAL_SDK_ENTRY_POINTS['NDIlib_removed'] = 'fixture removed call'
+        errors = docs.sdk_alias_violations(self.root)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('NDIlib_removed names no registered SDK entry point', errors[0])
 
     def test_generated_signatures_reject_underscored_parameters_only(self):
         self.write('target/doc/grafton_ndi/struct.Example.html',

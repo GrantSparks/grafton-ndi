@@ -13,7 +13,7 @@ pub use defects::*;
 mod loading;
 pub use loading::{
     LibraryKind, LoadAttempt, LoadFailure, LoadOrigin, LoadRefusal, SelectionConflict,
-    SelectionFailure,
+    SelectionFailure, VersionTextDefect,
 };
 
 use thiserror::Error;
@@ -216,7 +216,10 @@ pub enum Error {
     /// [`AllocationFailure`] identifies the storage and its requested size
     /// when known. Discovery copies, image encoding scratch, queued sender
     /// bookkeeping, allocator leases and crate-owned receive buffers all
-    /// report this condition here. A configured budget refusal is instead
+    /// report this condition here. The lossy WebP encoder's own storage is
+    /// the exception: its supported error API cannot classify allocation
+    /// failures, so they remain [`FrameDefect::EncodingFailed`] inside
+    /// [`Error::InvalidFrame`]. A configured budget refusal is instead
     /// [`Error::ResourceLimit`].
     #[error("Allocation failed: {0}")]
     AllocationFailed(AllocationFailure),
@@ -251,7 +254,7 @@ pub enum Error {
     /// Text passed to the SDK contains a NUL byte, which a C string cannot
     /// hold.
     #[error("Invalid CString: {0}")]
-    InvalidCString(#[from] NulError),
+    InvalidCString(NulError),
 
     /// A receiver reported the SDK error frame: its connection was lost.
     #[error("Failed to capture frame: the SDK returned an error frame: the connection was lost")]
@@ -269,9 +272,13 @@ pub enum Error {
     ///   is out of range, or a format cannot be used for the operation. This
     ///   includes a compressed frame the SDK would discard instead of
     ///   delivering it.
+    /// * A frame's colour description is malformed, conflicting or withheld
+    ///   with its metadata; its HDR transfer is refused; its image dimensions
+    ///   exceed the codec's limits; or an image encoder fails.
     ///
     /// Unreadable optional video/audio metadata is withheld instead of failing
-    /// capture; [`crate::FrameMetadataStatus`] reports its condition.
+    /// capture; [`crate::FrameMetadataStatus`] reports its condition. Withheld
+    /// metadata can still fail a later colour-description read.
     ///
     /// A value that describes no one frame, such as a compressed video format
     /// or an allocation, AV sync, clock or remote-control value of the
@@ -417,6 +424,12 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
+impl From<NulError> for Error {
+    fn from(error: NulError) -> Self {
+        Self::InvalidCString(error)
+    }
+}
+
 // The existing largest payload is NulError. Selection diagnostics must not
 // enlarge the error returned by hot capture/send paths (40 bytes on x86-64).
 const _: () = assert!(
@@ -515,6 +528,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn invalid_c_string_reports_its_cause_once() {
+        let error = Error::from(std::ffi::CString::new("a\0b").unwrap_err());
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(
+            error.to_string(),
+            "Invalid CString: nul byte found in provided data at position: 1"
+        );
+    }
+
+    #[test]
     fn diagnostic_payloads_have_the_common_error_traits() {
         fn error<T: std::error::Error + std::fmt::Debug + Clone + PartialEq>() {}
         fn value<T: Copy + Eq + std::hash::Hash>() {}
@@ -522,6 +545,8 @@ mod tests {
         error::<SelectionFailure>();
         error::<LoadFailure>();
         error::<LoadRefusal>();
+        error::<VersionTextDefect>();
+        value::<VersionTextDefect>();
         error::<DiscoveryAddressFailure>();
         error::<NativeFunction>();
         error::<DiscoveryDefect>();

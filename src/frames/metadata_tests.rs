@@ -181,7 +181,7 @@ where
         sample_rate: 48_000,
         no_channels: 2,
         no_samples: 2,
-        FourCC: AudioFormat::Fltp.to_sdk(),
+        FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
         p_data: samples.as_mut_ptr().cast(),
         p_metadata: metadata,
         __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
@@ -557,7 +557,7 @@ fn audio_timestamp_normalization_depends_on_the_capture_family() {
             sample_rate: 48_000,
             no_channels: 2,
             no_samples: 2,
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: samples.as_mut_ptr().cast(),
             timestamp: ticks,
             timecode: Timecode::SYNTHESIZE.ticks(),

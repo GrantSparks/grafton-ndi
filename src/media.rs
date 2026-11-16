@@ -5,7 +5,7 @@ use std::{
     ops::{BitOr, BitOrAssign},
 };
 
-use crate::{Error, PixelFormat, Result};
+use crate::{AudioFormat, Error, PixelFormat, Result};
 
 // An omitted variant makes index() non-exhaustive; a duplicate cannot define
 // its index twice. Keep decoding and iteration tied to the same checked list.
@@ -156,6 +156,14 @@ impl FrameRate {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PictureAspectRatio(f32);
 
+impl Eq for PictureAspectRatio {}
+
+impl Hash for PictureAspectRatio {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
+
 impl PictureAspectRatio {
     /// Derive the displayed aspect ratio from the pixel dimensions.
     pub const SQUARE_PIXELS: Self = Self(0.0);
@@ -188,14 +196,16 @@ impl PictureAspectRatio {
         if !ratio.is_finite() || ratio < 0.0 {
             return Err(crate::LayoutDefect::PictureAspectRatio(ratio));
         }
-        Ok(Self(ratio))
+        // Equality treats both zeros alike; store one bit pattern for hashing.
+        Ok(Self(if ratio == 0.0 { 0.0 } else { ratio }))
     }
 }
 
-/// A four-character code: the SDK's identifier for a pixel format or codec.
+/// A four-character code: the SDK's identifier for a pixel or audio format or codec.
 ///
 /// It holds any value, including one this crate does not know, so a value
-/// read from the SDK is never lost. [`PixelFormat`] converts to and from it.
+/// read from the SDK is never lost. [`PixelFormat`] and [`AudioFormat`] convert
+/// to and from it.
 ///
 /// # Examples
 ///
@@ -255,6 +265,33 @@ impl TryFrom<FourCc> for PixelFormat {
         Self::from_fourcc(fourcc).ok_or({
             Error::InvalidFrame(crate::FrameDefect::UnknownPixelFormat { fourcc: fourcc.0 })
         })
+    }
+}
+
+impl From<AudioFormat> for FourCc {
+    fn from(format: AudioFormat) -> Self {
+        Self(format.to_sdk())
+    }
+}
+
+impl TryFrom<FourCc> for AudioFormat {
+    type Error = Error;
+
+    /// The audio format `fourcc` names.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`] when it names no uncompressed audio format
+    /// this crate supports.
+    fn try_from(fourcc: FourCc) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|&format| FourCc::from(format) == fourcc)
+            .ok_or(Error::InvalidFrame(
+                crate::FrameDefect::UnknownAudioFormat {
+                    fourcc: fourcc.raw(),
+                },
+            ))
     }
 }
 
@@ -338,7 +375,14 @@ mod tests {
         assert_eq!(PictureAspectRatio::SQUARE_PIXELS.get(), 0.0);
         for value in [0.0, -0.0, 1.0, 16.0 / 9.0, f32::MAX] {
             let ratio = PictureAspectRatio::new(value).unwrap();
-            assert_eq!(ratio.get().to_bits(), value.to_bits());
+            assert_eq!(
+                ratio.get().to_bits(),
+                if value == 0.0 {
+                    0.0f32.to_bits()
+                } else {
+                    value.to_bits()
+                }
+            );
             assert_eq!(PictureAspectRatio::from_sdk(ratio.to_sdk()).unwrap(), ratio);
         }
         for value in [-1.0, f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
@@ -351,6 +395,38 @@ mod tests {
                 Err(Error::InvalidFrame(_))
             ));
         }
+    }
+
+    #[test]
+    fn picture_aspect_ratio_equality_and_hashing_share_canonical_zero() {
+        let zero = PictureAspectRatio::new(0.0).unwrap();
+        let negative_zero = PictureAspectRatio::new(-0.0).unwrap();
+        assert_eq!(negative_zero.get().to_bits(), 0.0f32.to_bits());
+        let values = std::collections::HashSet::from([zero, negative_zero]);
+        assert_eq!(values.len(), 1);
+        for value in [0.0, 1.0, 16.0 / 9.0, f32::MAX] {
+            assert_eq!(
+                PictureAspectRatio::new(value).unwrap(),
+                PictureAspectRatio::new(value).unwrap()
+            );
+        }
+        assert_ne!(zero, PictureAspectRatio::new(1.0).unwrap());
+    }
+
+    #[test]
+    fn every_audio_format_round_trips_through_its_fourcc() {
+        for format in AudioFormat::ALL {
+            let fourcc = FourCc::from(format);
+            assert_eq!(AudioFormat::try_from(fourcc).unwrap(), format);
+        }
+        assert_eq!(
+            FourCc::from(AudioFormat::Fltp).raw().to_le_bytes(),
+            *b"FLTp"
+        );
+        let unknown = FourCc::from_raw(u32::MAX);
+        assert!(
+            matches!(AudioFormat::try_from(unknown), Err(Error::InvalidFrame(crate::FrameDefect::UnknownAudioFormat { fourcc })) if fourcc == unknown.raw())
+        );
     }
 
     #[test]

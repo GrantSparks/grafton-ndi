@@ -79,7 +79,6 @@ fn crate_root_types_keep_their_auto_traits() {
         AudioFrameBuilder: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioFrameRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioInputFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
-        AudioLayout: Send, Sync, UnwindSafe, RefUnwindSafe;
         BorrowedAudioFrame<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         BorrowedAudioFrameBuilder<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         BorrowedVideoFrame<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -299,6 +298,7 @@ fn advanced_types_keep_their_auto_traits() {
         AllocatorUsage: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioClock<'static>: Send, UnwindSafe, RefUnwindSafe;
         AudioCodec: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AudioPacketFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSync: Send, UnwindSafe, RefUnwindSafe;
         AvSyncCapture<'static>: UnwindSafe, RefUnwindSafe;
         ReceiverControls<'static, RawCapture>: RefUnwindSafe;
@@ -404,5 +404,22 @@ fn file_types_keep_their_auto_traits() {
         FilePlayer: Sync;
         FileRecorder: Send;
         FileRecorder: Sync;
+    }
+}
+
+#[test]
+fn media_descriptions_are_hashable_values() {
+    fn value<T: Eq + std::hash::Hash>() {}
+    value::<grafton_ndi::PictureAspectRatio>();
+    #[cfg(feature = "advanced")]
+    value::<grafton_ndi::advanced::VideoPacketFormat>();
+    #[cfg(feature = "file-io")]
+    {
+        use grafton_ndi::file::{FileInfo, PlayerEvent, RecorderEvent, SourceFormat, VideoTrack};
+        value::<VideoTrack>();
+        value::<SourceFormat>();
+        value::<FileInfo>();
+        value::<PlayerEvent>();
+        value::<RecorderEvent>();
     }
 }

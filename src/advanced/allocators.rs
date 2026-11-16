@@ -27,11 +27,13 @@ use super::{AudioCodec, VideoCodec};
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use crate::sys::bindings::*;
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-use crate::{frames::ValidatedAudioLayout, AudioFormat};
+use crate::AudioFormat;
 use crate::{
-    frames::ValidatedVideoLayout, receiver::ReceiverCore, runtime::ProcessLifetimeRuntime,
-    sys::advanced::ReceiveAllocators, FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode,
-    Rejected, Result,
+    frames::{ValidatedAudioLayout, ValidatedVideoLayout},
+    receiver::ReceiverCore,
+    runtime::ProcessLifetimeRuntime,
+    sys::advanced::ReceiveAllocators,
+    FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode, Rejected, Result,
 };
 #[cfg(ndi_has_advanced_receive_allocators)]
 use std::ffi::c_void;
@@ -199,6 +201,7 @@ pub struct AllocationRequest {
     width: u32,
     height: u32,
     capacity_limit: usize,
+    audio_layout: Option<ValidatedAudioLayout>,
 }
 
 /// The kind of frame an [`AllocationRequest`] is for.
@@ -261,6 +264,11 @@ impl AllocationRequest {
     /// a compressed frame is given a stride other than its size, or the buffer would exceed
     /// the [`capacity_limit`](Self::capacity_limit).
     pub fn with_stride_bytes(self, stride: usize) -> Result<Self> {
+        let audio_layout = self
+            .audio_layout
+            .map(|layout| layout.with_channel_stride_bytes(stride))
+            .transpose()
+            .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?;
         if stride < self.stride {
             return Err(invalid_input(crate::InputDefect::AllocatorShortStride {
                 stride,
@@ -280,14 +288,10 @@ impl AllocationRequest {
                 .data_len_bytes()
             }
             AllocationFormat::AudioPlanarF32 => {
-                if !stride.is_multiple_of(size_of::<f32>()) {
-                    return Err(invalid_input(crate::InputDefect::AllocatorAudioStride {
-                        stride,
-                    }));
-                }
-                stride.checked_mul(self.height as usize).ok_or_else(|| {
-                    invalid_input(crate::InputDefect::AllocatorAudioExtentOverflow)
-                })?
+                let layout = audio_layout.expect("audio requests retain their validated layout");
+                // The layout caps its active extent at 64 MiB and its stride at
+                // i32::MAX. Including the final channel's padding still fits usize.
+                layout.channel_stride_bytes() * layout.no_channels()
             }
             _ if stride == self.stride => self.bytes,
             _ => {
@@ -305,6 +309,7 @@ impl AllocationRequest {
         Ok(Self {
             bytes,
             stride,
+            audio_layout,
             ..self
         })
     }
@@ -953,9 +958,14 @@ impl Registry {
             return None;
         }
         // At most the capacity, which is at most MAX_ALLOCATION.
-        let Ok(stride) = i32::try_from(actual.stride) else {
-            self.decline(AllocationDecline::BufferRefused);
-            return None;
+        let stride = if let Some(layout) = actual.audio_layout {
+            layout.sdk_channel_stride()
+        } else {
+            let Ok(stride) = i32::try_from(actual.stride) else {
+                self.decline(AllocationDecline::BufferRefused);
+                return None;
+            };
+            stride
         };
         // Membership serializes publication against closing. An admitted policy
         // may have blocked while replacement began; it must not publish late.
@@ -1552,6 +1562,7 @@ fn video_request(
             width: compressed_dimension(frame.xres)?,
             height: compressed_dimension(frame.yres)?,
             capacity_limit: MAX_ALLOCATION,
+            audio_layout: None,
         });
     }
     let pixel =
@@ -1565,6 +1576,7 @@ fn video_request(
         width: layout.width(),
         height: layout.height(),
         capacity_limit: MAX_ALLOCATION,
+        audio_layout: None,
     })
 }
 
@@ -1573,7 +1585,7 @@ fn video_request(
 fn audio_request(
     frame: &NDIlib_audio_frame_v3_t,
 ) -> std::result::Result<AllocationRequest, AllocationDecline> {
-    if frame.FourCC != NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP {
+    if frame.FourCC != crate::FourCc::from(crate::AudioFormat::Fltp).raw() {
         if AudioCodec::from_outer(frame.FourCC).is_none() {
             return Err(AllocationDecline::RequestNotRepresentable);
         }
@@ -1588,6 +1600,7 @@ fn audio_request(
             width: compressed_dimension(frame.no_samples)?,
             height: compressed_dimension(frame.no_channels)?,
             capacity_limit: MAX_ALLOCATION,
+            audio_layout: None,
         });
     }
     // The callback chooses a packed stride. The incoming data pointer and
@@ -1607,6 +1620,7 @@ fn audio_request(
         width: layout.num_samples(),
         height: layout.num_channels(),
         capacity_limit: MAX_ALLOCATION,
+        audio_layout: Some(layout),
     })
 }
 /// The SDK's request for video memory. `opaque` is the generation token.
@@ -2032,6 +2046,16 @@ mod tests {
             width: (bytes / 8) as u32,
             height: 2,
             capacity_limit: MAX_ALLOCATION,
+            audio_layout: Some(
+                ValidatedAudioLayout::new_uncompressed(
+                    AudioFormat::Fltp,
+                    48_000,
+                    2,
+                    (bytes / 8) as u32,
+                    None,
+                )
+                .unwrap(),
+            ),
         }
     }
 
@@ -2121,7 +2145,7 @@ mod tests {
         // FLTP extents are multiples of four: the first representable excess
         // over the 64 MiB capture cap is four bytes, not one byte.
         let audio = NDIlib_audio_frame_v3_t {
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             sample_rate: 48_000,
             no_channels: 1,
             no_samples: (crate::frames::MAX_AUDIO_BYTES / size_of::<f32>()) as i32 + 1,
@@ -2184,7 +2208,7 @@ mod tests {
     #[test]
     fn audio_request_at_capture_limit_uses_the_shared_packed_layout() {
         let frame = NDIlib_audio_frame_v3_t {
-            FourCC: AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             sample_rate: 48_000,
             no_channels: 1,
             no_samples: (crate::frames::MAX_AUDIO_BYTES / size_of::<f32>()) as i32,
@@ -3042,6 +3066,51 @@ mod tests {
     }
 
     #[test]
+    fn padded_audio_cannot_publish_a_layout_capture_would_refuse() {
+        const MIB: usize = 1024 * 1024;
+        let registry = Registry::new(
+            AllocatorLimits::default()
+                .max_allocation_bytes(256 * MIB)
+                .max_concurrent_calls(4)
+                .max_bytes(1024 * MIB)
+                .validate()
+                .unwrap(),
+        )
+        .unwrap();
+        let format = AudioFormat::Fltp;
+        let request = audio_request(&NDIlib_audio_frame_v3_t {
+            FourCC: format.to_sdk(),
+            sample_rate: 48_000,
+            no_channels: 2,
+            no_samples: 1024,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            request.with_stride_bytes(4098),
+            Err(Error::InvalidInput(crate::InputDefect::Layout(
+                crate::LayoutDefect::AudioStrideAlignment(4098)
+            )))
+        ));
+        assert!(matches!(
+            request.with_stride_bytes(65 * MIB),
+            Err(Error::InvalidInput(crate::InputDefect::Layout(
+                crate::LayoutDefect::AudioBytes(bytes)
+            ))) if bytes == 65 * MIB + 4096
+        ));
+        let token = registry
+            .register(|request: AllocationRequest| {
+                AllocationBuffer::zeroed(request.with_stride_bytes(65 * MIB)?)
+            })
+            .unwrap();
+        assert!(registry.allocate(token, request).is_none());
+        assert_eq!(registry.usage().declined(AllocationDecline::PolicyError), 1);
+        let state = lock(&registry.state);
+        assert_eq!((state.calls, state.reserved_bytes, state.bytes), (0, 0, 0));
+        assert!(state.leases.is_empty());
+    }
+
+    #[test]
     fn strides_a_request_cannot_use_are_refused_as_input() {
         let input = |result: Result<AllocationRequest>| match result {
             Err(Error::InvalidInput(reason)) => reason,
@@ -3075,10 +3144,24 @@ mod tests {
         assert_eq!(input_cause, frame_cause);
 
         let audio = request();
-        assert!(matches!(
-            input(audio.with_stride_bytes(34)),
-            crate::InputDefect::AllocatorAudioStride { .. }
-        ));
+        for stride in [0, 30, 34, i32::MAX as usize + 1] {
+            let crate::InputDefect::Layout(input_cause) = input(audio.with_stride_bytes(stride))
+            else {
+                panic!("expected the shared audio layout cause");
+            };
+            let Err(Error::InvalidFrame(crate::FrameDefect::Layout(frame_cause))) =
+                ValidatedAudioLayout::new_uncompressed(
+                    AudioFormat::Fltp,
+                    48_000,
+                    2,
+                    8,
+                    Some(stride),
+                )
+            else {
+                panic!("expected the same frame layout refusal");
+            };
+            assert_eq!(input_cause, frame_cause);
+        }
         let limited = AllocationRequest {
             capacity_limit: 64,
             ..audio
@@ -3092,6 +3175,7 @@ mod tests {
             format: AllocationFormat::CompressedAudio(FourCc::from_raw(
                 AudioCodec::Opus.outer(false),
             )),
+            audio_layout: None,
             ..audio
         };
         assert_eq!(compressed.with_stride_bytes(32).unwrap(), compressed);

@@ -105,6 +105,75 @@ fn named(receivers: &[AdvertisedReceiver], label: &str) -> Option<AdvertisedRece
         .cloned()
 }
 
+/// Create all four owners on this thread, then register, query and destroy
+/// them on a different thread against the vendor's server. This exercises the
+/// native thread-affinity assumption behind their Send implementations.
+#[test]
+fn owners_move_between_threads() {
+    let Some((ndi, binary)) = discovery_server() else {
+        return;
+    };
+    let server = Server::start(&binary);
+    let sender = sender(&ndi, "cross-thread advertised sender");
+    let sender_name = sender.source().unwrap().name().to_owned();
+    let receiver = receiver(&ndi, "cross-thread advertised receiver");
+    let mut send_advertiser = SendAdvertiser::new(
+        &ndi,
+        &AdvertiserOptions::default().servers([server.endpoint()]),
+    )
+    .unwrap();
+    let mut recv_advertiser = RecvAdvertiser::new(
+        &ndi,
+        &AdvertiserOptions::default().servers([server.endpoint()]),
+    )
+    .unwrap();
+    let mut send_listener =
+        SendListener::new(&ndi, &ListenerOptions::default().server(server.endpoint())).unwrap();
+    let mut recv_listener =
+        RecvListener::new(&ndi, &ListenerOptions::default().server(server.endpoint())).unwrap();
+
+    std::thread::spawn(move || {
+        send_advertiser
+            .register(&sender, &SendAdvertisement::default())
+            .unwrap();
+        recv_advertiser
+            .register(&receiver, &RecvAdvertisement::default())
+            .unwrap();
+        eventually("the sender registered after moving its advertiser", || {
+            send_listener
+                .wait_for_change(Duration::from_millis(100))
+                .unwrap();
+            send_listener
+                .current_senders()
+                .unwrap()
+                .into_iter()
+                .find(|advertised| advertised.name() == Some(sender_name.as_str()))
+        });
+        eventually(
+            "the receiver registered after moving its advertiser",
+            || {
+                recv_listener
+                    .wait_for_change(Duration::from_millis(100))
+                    .unwrap();
+                named(
+                    &recv_listener.current_receivers().unwrap(),
+                    "cross-thread advertised receiver",
+                )
+            },
+        );
+        // These native owners and their retained registrations are destroyed
+        // here, on the thread that used them rather than the thread that created them.
+        drop((
+            send_listener,
+            recv_listener,
+            send_advertiser,
+            recv_advertiser,
+        ));
+    })
+    .join()
+    .unwrap();
+}
+
 #[test]
 fn advertised_senders_and_receivers_reach_listeners() {
     let Some((ndi, binary)) = discovery_server() else {

@@ -987,22 +987,20 @@ pub(crate) mod in_flight {
 
         #[test]
         fn an_unproven_drop_leaks_the_native_loan() {
-            use std::sync::{
-                atomic::{AtomicUsize, Ordering},
-                Arc,
-            };
-            struct Counted(Arc<AtomicUsize>);
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static DROPS: AtomicUsize = AtomicUsize::new(0);
+            struct Counted;
             impl Drop for Counted {
                 fn drop(&mut self) {
-                    self.0.fetch_add(1, Ordering::Relaxed);
+                    DROPS.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            let drops = Arc::new(AtomicUsize::new(0));
-            let slot = InFlight(State::InFlight(Counted(Arc::clone(&drops))));
+            DROPS.store(0, Ordering::Relaxed);
+            let slot = InFlight(State::InFlight(Counted));
             let result = std::panic::catch_unwind(|| drop(slot));
             assert_eq!(result.is_err(), cfg!(debug_assertions));
             assert_eq!(
-                drops.load(Ordering::Relaxed),
+                DROPS.load(Ordering::Relaxed),
                 0,
                 "native pointees must remain allocated"
             );
@@ -1389,7 +1387,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
 
 /// Builder for a [`BorrowedVideoFrame`], reached through
 /// [`BorrowedVideoFrame::builder`]. No pixels or metadata are copied.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct BorrowedVideoFrameBuilder<'buf> {
     data: &'buf [u8],
     width: u32,
@@ -1404,6 +1402,28 @@ pub struct BorrowedVideoFrameBuilder<'buf> {
     /// Readable bytes the caller vouches for after `data`.
     readable_after: usize,
     allow_padding_and_tail: bool,
+}
+
+impl std::fmt::Debug for BorrowedVideoFrameBuilder<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BorrowedVideoFrameBuilder")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("pixel_format", &self.pixel_format)
+            .field("line_stride_bytes", &self.line_stride)
+            .field("frame_rate", &self.frame_rate)
+            .field("picture_aspect_ratio", &self.aspect_ratio_input)
+            .field("scan_type", &self.scan_type)
+            .field("timecode", &self.timecode)
+            .field("metadata", &self.metadata.map(CStr::to_string_lossy))
+            .field("readable_after", &self.readable_after)
+            .field(
+                "allow_send_from_padding_and_tail",
+                &self.allow_padding_and_tail,
+            )
+            .field("data (bytes)", &self.data.len())
+            .finish()
+    }
 }
 
 impl<'buf> BorrowedVideoFrameBuilder<'buf> {

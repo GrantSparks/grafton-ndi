@@ -14,7 +14,7 @@ Pages write permissions are confined to the deployment job, which runs no
 repository scripts. The release caller forwards those permissions for reusable
 workflow validation; its tag ref keeps the Pages job disabled.
 
-Use the selected stable Rust toolchain with Clippy and rustfmt:
+Use the pinned Rust toolchain with Clippy and rustfmt:
 
 ```sh
 cargo build --locked --examples --all-features
@@ -33,11 +33,33 @@ not establish native transport coverage. The configured platform/runtime
 matrix is in [the CI workflow](../.github/workflows/rust.yml); execution results
 are available in [GitHub Actions](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml).
 
+### Updating the Rust toolchain
+
+`rust-toolchain.toml` pins the release used by contributors and every stable CI
+job. Change the toolchain file and every workflow toolchain step together in one
+PR. Install that release, then re-bless the compile-contract snapshots:
+
+```sh
+TRYBUILD=overwrite cargo test --locked --all-features --test compile_contracts
+# With Advanced SDK headers installed:
+TRYBUILD=overwrite cargo test --locked --all-features --test advanced_contracts
+```
+
+Review every `.stderr` change and fix new Clippy findings under `-D warnings`
+before merging the bump. The minimum supported version and the Miri and Apple
+mobile nightlies have their own pins.
+
 ### Memory checkers
 
-The required `miri` job runs synthetic frame, metadata and guard tests with
-`nightly-2026-11-10`, using both Stacked Borrows and Tree Borrows. Its filters
-exclude native calls and source-parsing/subprocess tests. Miri uses one padded
+The required `miri` job runs synthetic frame, metadata, guard and send-path
+aliasing tests with `nightly-2026-11-10`, using both Stacked Borrows and Tree
+Borrows. Native tests report visible skips under Miri; source-parsing and
+subprocess tests are outside its filters. The long descriptor churn test is
+explicitly skipped. Both memory-checker steps list each filter before running
+it and fail if it selects no tests; Miri also checks every skip name. This keeps
+fixture renames from silently removing coverage. The pinned nightly detects a
+`Box`-owned `AliasableBox` regression; it does not yet support the Miri option
+needed to enforce `AliasableVec`'s unique-pointer contract. Miri uses one padded
 layout and one PNG encoding per format; native tests retain their full matrices.
 Run a focused case locally with:
 

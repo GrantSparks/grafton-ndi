@@ -1,6 +1,13 @@
 //! One-shot native reports must wake every concurrent observer in Rust.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
+#[cfg(feature = "advanced")]
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+#[cfg(feature = "advanced")]
+common_helpers!(feature_policy);
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -159,9 +166,8 @@ fn run_child(directory: &Path, library: &Path, case: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
     // A build without Advanced declarations still exercises Finder changes.
-    if !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    }
+    // Forward child skips directly: eprint! would let libtest hide them again.
+    let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &output.stderr);
 }
 
 // Exercise the real Rust Finder constructor even without an installed SDK,
@@ -570,8 +576,7 @@ fn keyframe(ndi: &Ndi, clear_after_query: bool) {
         capabilities::RuntimeFeature,
         Receiver, ReceiverOptions, Sender, SenderOptions, Source,
     };
-    if let Err(error) = ndi.require_feature(RuntimeFeature::KeyframeDemand) {
-        eprintln!("skipped: keyframe change fixture needs Advanced declarations: {error}");
+    if !common::require_feature(ndi.require_feature(RuntimeFeature::KeyframeDemand)) {
         return;
     }
     let sender = Sender::new(ndi, &SenderOptions::new("keyframe fixture")).unwrap();

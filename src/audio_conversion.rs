@@ -136,12 +136,24 @@ macro_rules! interleaved_input {
         /// count, which must divide it exactly; the equivalent FLTP
         /// allocation must fit the library's 64 MiB audio limit. Metadata is
         /// not represented.
-        #[derive(Debug, Clone, Copy)]
+        #[derive(Clone, Copy)]
         pub struct $name<'a> {
             shape: AudioShape,
             data: &'a [$sample],
             timecode: Timecode,
             $($reference: AudioReferenceLevel,)?
+        }
+
+        impl std::fmt::Debug for $name<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let mut summary = f.debug_struct(stringify!($name));
+                summary.field("sample_rate", &self.sample_rate())
+                    .field("num_channels", &self.num_channels())
+                    .field("num_samples", &self.num_samples())
+                    .field("timecode", &self.timecode());
+                $(summary.field(stringify!($reference), &self.$reference);)?
+                summary.field("data (samples)", &self.data.len()).finish()
+            }
         }
 
         impl<'a> $name<'a> {
@@ -206,11 +218,17 @@ interleaved_input!(
     NDIlib_audio_frame_interleaved_32f_t
 );
 
+impl InterleavedAudioF32<'_> {
+    pub(crate) fn layout(&self) -> ValidatedAudioLayout {
+        self.shape.0
+    }
+}
+
 /// Native audio conversion operations, resolved together from one live runtime.
 ///
-/// Construction fails if any current v3 conversion helper is missing. It does
-/// not silently substitute old v2 operations or Rust's existing f32 builder
-/// conversion. Methods take caller-owned output storage for reuse.
+/// Construction fails if any current v3 conversion helper is missing. Methods
+/// take caller-owned output storage for reuse. For a runtime-free floating-point
+/// conversion, use [`AudioFrame::from_interleaved`].
 pub struct AudioConverter {
     _ndi: Ndi,
     audio: &'static sys::InterleavedAudio,
@@ -390,6 +408,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn interleaved_debug_summarizes_every_sample_type() {
+        fn summaries(samples: usize) -> Vec<String> {
+            let i16s = vec![1i16; 2 * samples];
+            let i32s = vec![2i32; 2 * samples];
+            let floats = vec![0.25; 2 * samples];
+            vec![
+                format!(
+                    "{:?}",
+                    InterleavedAudioI16::new(48_000, 2, &i16s, AudioReferenceLevel::SEND).unwrap()
+                ),
+                format!(
+                    "{:?}",
+                    InterleavedAudioI32::new(
+                        48_000,
+                        2,
+                        &i32s,
+                        AudioReferenceLevel::RECEIVE_HEADROOM
+                    )
+                    .unwrap()
+                ),
+                format!(
+                    "{:?}",
+                    InterleavedAudioF32::new(48_000, 2, &floats).unwrap()
+                ),
+            ]
+        }
+        let small = summaries(3);
+        assert!(small[0].contains("reference_level: AudioReferenceLevel(0)"));
+        assert!(small[1].contains("reference_level: AudioReferenceLevel(20)"));
+        crate::test_support::assert_bounded_debug(&small, &summaries(48_000));
+    }
+
+    #[test]
     fn captured_audio_sources_lend_the_original_strided_descriptor() {
         use crate::capture::Guard;
         use crate::{AudioFrameRef, FrameSyncAudioRef};
@@ -408,7 +459,7 @@ mod tests {
             no_channels: 2,
             no_samples: 3,
             timecode: 1234,
-            FourCC: crate::AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: samples.as_mut_ptr().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 32,
@@ -488,7 +539,7 @@ mod tests {
             no_channels: 2,
             no_samples: 3,
             timecode: 1234,
-            FourCC: crate::AudioFormat::Fltp.to_sdk(),
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             p_data: samples.as_ptr().cast_mut().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: 32,
@@ -771,6 +822,9 @@ mod tests {
         let (frame, allocations) =
             crate::test_alloc::allocation_count(|| converter.from_interleaved_f32(&input).unwrap());
         assert_eq!(allocations, 1);
+        let rust_frame = AudioFrame::from_interleaved(&input);
+        assert_eq!(rust_frame.data(), frame.data());
+        assert_eq!(rust_frame.timecode(), frame.timecode());
         assert_eq!(frame.data(), &[0.125, 0.25, 0.5, -0.5, -0.25, -0.125]);
         assert_eq!(frame.timecode(), Timecode::from_ticks(1234));
         assert_eq!(frame.metadata(), None);

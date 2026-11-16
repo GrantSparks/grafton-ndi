@@ -1371,7 +1371,7 @@ mod tests {
         let empty = NDIlib_audio_frame_v3_t {
             p_data: ptr::null_mut(),
             no_samples: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
             ..audio
         };
         // SAFETY: an empty frame has no buffers to read.
@@ -1421,7 +1421,7 @@ mod tests {
     /// descriptor the SDK itself would construct, with what it asks for set.
     #[test]
     fn a_request_is_the_sdk_default_descriptor_with_what_it_asks_for() {
-        let planar_float = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP;
+        let planar_float = crate::FourCc::from(crate::AudioFormat::Fltp).raw();
         let automatic = AvSyncRequest::automatic().raw();
         assert_eq!(automatic.FourCC, planar_float);
         assert_eq!(automatic.no_channels, 2);

@@ -1,22 +1,12 @@
 //! Verify crate-internal adapters cannot capture slots reserved by FrameSync.
 
+#[path = "support/nested_cargo.rs"]
+mod nested_cargo;
+
 #[test]
 fn attached_modes_fail_the_internal_capture_entry_points() {
-    use std::{path::PathBuf, process::Command};
-
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
-        .join("internal-capture-permissions");
-    let output = Command::new(env!("CARGO"))
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .env("CARGO_TARGET_DIR", target)
-        .env("CARGO_BUILD_JOBS", "1")
-        .env("CARGO_TERM_COLOR", "never")
+    let output = nested_cargo::command("no-default-features", "rustc", None, None)
         .args([
-            "rustc",
-            "--offline",
-            "--locked",
             "--lib",
             "--no-default-features",
             "--",

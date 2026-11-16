@@ -86,8 +86,8 @@ pub(crate) unsafe trait FrameFree: sealed::Sealed + 'static {
     type RawFrame: Default + Copy;
 
     /// The `Debug` struct name of the borrowed reference that wraps this guard
-    /// (e.g. `"VideoFrameRef"` or `"FrameSyncVideoRef"`), so the shared generic
-    /// `Debug` impls render the historically-correct type name.
+    /// (e.g. `"VideoFrameRef"` or `"FrameSyncVideoRef"`), used by the shared
+    /// generic `Debug` implementations.
     const REF_DEBUG_NAME: &'static str;
 
     /// Additional unknown-timestamp marker for audio from this capture family.
@@ -846,23 +846,6 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_sizes() {
-        use std::mem::size_of;
-
-        // Guards should be compact - instance pointer + frame struct + zero-sized PhantomData
-        assert!(size_of::<RecvAudioGuard>() > 0);
-        assert!(size_of::<RecvMetadataGuard>() > 0);
-
-        // Generic guard with different kinds should have same overhead per kind
-        // (sizes differ only due to RawFrame size differences)
-        assert!(size_of::<Guard<VideoKind>>() > 0);
-        assert!(size_of::<Guard<AudioKind>>() > 0);
-        assert!(size_of::<Guard<MetadataKind>>() > 0);
-        assert!(size_of::<Guard<FrameSyncVideoFree>>() > 0);
-        assert!(size_of::<Guard<FrameSyncAudioFree>>() > 0);
-    }
-
-    #[test]
     fn frame_types_without_a_frame_are_classified_once() {
         for (frame_type, expected) in [
             (
@@ -911,7 +894,6 @@ mod tests {
         assert_eq!(given(&Slots::only::<VideoKind>()), [true, false, false]);
         assert_eq!(given(&Slots::only::<AudioKind>()), [false, true, false]);
         assert_eq!(given(&Slots::only::<MetadataKind>()), [false, false, true]);
-        #[cfg(feature = "advanced")]
         assert_eq!(given(&Slots::all()), [true, true, true]);
     }
 

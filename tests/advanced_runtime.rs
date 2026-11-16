@@ -20,6 +20,7 @@ common_helpers!(
     advanced,
     hx,
     unsupported,
+    feature,
     loopback,
     endpoint,
     socket,
@@ -424,8 +425,7 @@ fn an_advertised_packet_receiver_outlives_its_allocators() {
     let Some(ndi) = common::advanced_ndi() else {
         return;
     };
-    if let Err(unavailable) = ndi.require_feature(RuntimeFeature::ReceiverAdvertising) {
-        eprintln!("skipped: receiver advertising: {unavailable}");
+    if !common::require_feature(ndi.require_feature(RuntimeFeature::ReceiverAdvertising)) {
         return;
     }
     let _turn = sockets();
@@ -1253,24 +1253,29 @@ fn queued_compressed_sources_deliver_aac_and_opus() {
                 } else {
                     vec![1]
                 };
-                let mut frame =
-                    ScatterAudioFrame::new(codec, 48_000, 2, samples, split(&bytes, &cuts))
-                        .unwrap();
+                let mut frame = ScatterAudioFrame::new(
+                    AudioPacketFormat::new(codec, 48_000, 2, samples).unwrap(),
+                    split(&bytes, &cuts),
+                )
+                .unwrap();
                 frame.set_timecode(Timecode::from_ticks(timecode));
                 audio.send_scatter_audio(&mut frame).unwrap();
             } else {
-                let mut frame =
-                    CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes.clone()).unwrap();
+                let mut frame = CompressedAudioFrame::new(
+                    AudioPacketFormat::new(codec, 48_000, 2, samples).unwrap(),
+                    bytes.clone(),
+                )
+                .unwrap();
                 frame.set_timecode(Timecode::from_ticks(timecode));
                 audio.send_compressed_audio(&mut frame);
             }
             let received = await_audio(&mut receiver, timecode);
             assert_eq!(
                 (
-                    received.codec(),
-                    received.sample_rate(),
-                    received.num_channels(),
-                    received.num_samples()
+                    received.format().codec(),
+                    received.format().sample_rate(),
+                    received.format().num_channels(),
+                    received.format().num_samples()
                 ),
                 (codec, 48_000, 2, samples)
             );
@@ -1301,8 +1306,11 @@ fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
         ReceiverBandwidth::Highest,
     );
     connect(&mut receiver, "the receiver", |timecode| {
-        let mut probe =
-            CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64]).unwrap();
+        let mut probe = CompressedAudioFrame::new(
+            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+            vec![1; 64],
+        )
+        .unwrap();
         probe.set_timecode(Timecode::from_ticks(timecode));
         sender.sender().send_compressed_audio(&mut probe);
     });
@@ -1370,13 +1378,13 @@ fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
             _ => vec![1, 60],
         };
         let probe = candidate.bytes(0);
-        let admitted =
-            CompressedAudioFrame::new(codec, sample_rate, channels, samples, probe.clone()).is_ok();
+        let admitted = CompressedAudioFrame::new(
+            AudioPacketFormat::new(codec, sample_rate, channels, samples).unwrap(),
+            probe.clone(),
+        )
+        .is_ok();
         let admitted_in_blocks = ScatterAudioFrame::new(
-            codec,
-            sample_rate,
-            channels,
-            samples,
+            AudioPacketFormat::new(codec, sample_rate, channels, samples).unwrap(),
             split(&probe, &cuts(&probe)),
         )
         .is_ok();
@@ -1397,29 +1405,36 @@ fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
             let metadata = format!("<frame number=\"{timecode}\"/>");
             if scatter {
                 let blocks = split(&bytes, &cuts(&bytes));
-                let mut frame =
-                    ScatterAudioFrame::new(codec, sample_rate, channels, samples, blocks).unwrap();
+                let mut frame = ScatterAudioFrame::new(
+                    AudioPacketFormat::new(codec, sample_rate, channels, samples)
+                        .unwrap()
+                        .with_protected(protected),
+                    blocks,
+                )
+                .unwrap();
                 frame.set_timecode(Timecode::from_ticks(timecode));
-                frame.set_protected(protected);
                 frame.set_metadata(metadata.as_str()).unwrap();
                 sender.sender().send_scatter_audio(&mut frame).unwrap();
             } else {
-                let mut frame =
-                    CompressedAudioFrame::new(codec, sample_rate, channels, samples, bytes.clone())
-                        .unwrap();
+                let mut frame = CompressedAudioFrame::new(
+                    AudioPacketFormat::new(codec, sample_rate, channels, samples)
+                        .unwrap()
+                        .with_protected(protected),
+                    bytes.clone(),
+                )
+                .unwrap();
                 frame.set_timecode(Timecode::from_ticks(timecode));
-                frame.set_protected(protected);
                 frame.set_metadata(metadata.as_str()).unwrap();
                 sender.sender().send_compressed_audio(&mut frame);
             }
             let received = await_audio(&mut receiver, timecode);
             assert_eq!(
                 (
-                    received.codec(),
-                    received.is_protected(),
-                    received.sample_rate(),
-                    received.num_channels(),
-                    received.num_samples()
+                    received.format().codec(),
+                    received.format().is_protected(),
+                    received.format().sample_rate(),
+                    received.format().num_channels(),
+                    received.format().num_samples()
                 ),
                 (codec, protected, sample_rate, channels, samples),
                 "scatter={scatter}"
@@ -1633,9 +1648,11 @@ fn a_relay_delivers_every_packet_it_receives() {
         for _ in 0..2 {
             timecode += 1;
             let bytes = audio_bytes(codec, sample_rate, channels, timecode);
-            let mut frame =
-                CompressedAudioFrame::new(codec, sample_rate, channels, samples, bytes.clone())
-                    .unwrap();
+            let mut frame = CompressedAudioFrame::new(
+                AudioPacketFormat::new(codec, sample_rate, channels, samples).unwrap(),
+                bytes.clone(),
+            )
+            .unwrap();
             frame.set_timecode(Timecode::from_ticks(timecode));
             origin.sender().send_compressed_audio(&mut frame);
 
@@ -1645,10 +1662,10 @@ fn a_relay_delivers_every_packet_it_receives() {
             let relayed = await_audio(&mut downstream, timecode);
             assert_eq!(
                 (
-                    relayed.codec(),
-                    relayed.sample_rate(),
-                    relayed.num_channels(),
-                    relayed.num_samples()
+                    relayed.format().codec(),
+                    relayed.format().sample_rate(),
+                    relayed.format().num_channels(),
+                    relayed.format().num_samples()
                 ),
                 (codec, sample_rate, channels, samples)
             );
@@ -1745,8 +1762,11 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
         timecode += 1;
         let bytes = audio_bytes(codec, 48_000, 2, timecode);
         let envelope = (codec == AudioCodec::Aac).then_some(EnvelopeCodec::Aac);
-        let mut frame =
-            CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes.clone()).unwrap();
+        let mut frame = CompressedAudioFrame::new(
+            AudioPacketFormat::new(codec, 48_000, 2, samples).unwrap(),
+            bytes.clone(),
+        )
+        .unwrap();
         frame.set_timecode(Timecode::from_ticks(timecode));
         for _ in 0..3 {
             sender.sender().send_compressed_audio(&mut frame);
@@ -2003,9 +2023,11 @@ fn advanced_senders_lend_audio_and_video_to_separate_threads() {
             });
             scope.spawn(move || {
                 for _ in 0..6 {
-                    let mut frame =
-                        CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64])
-                            .unwrap();
+                    let mut frame = CompressedAudioFrame::new(
+                        AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+                        vec![1; 64],
+                    )
+                    .unwrap();
                     audio.send_compressed_audio(&mut frame);
                 }
             });
@@ -3939,7 +3961,11 @@ fn compressed_audio_packets_use_exact_custom_allocator_grants() {
     {
         let timecode = FIRST_TIMECODE + index as i64;
         let bytes = audio_bytes(codec, 48_000, 2, timecode);
-        let mut audio = CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes).unwrap();
+        let mut audio = CompressedAudioFrame::new(
+            AudioPacketFormat::new(codec, 48_000, 2, samples).unwrap(),
+            bytes,
+        )
+        .unwrap();
         audio.set_timecode(Timecode::from_ticks(timecode));
         let mut video = keyframe(VideoCodec::H264, StreamTier::Program, timecode);
         let deadline = Instant::now() + PATIENCE;
@@ -3957,12 +3983,12 @@ fn compressed_audio_packets_use_exact_custom_allocator_grants() {
                 if packet.timecode().ticks() != timecode {
                     continue;
                 }
-                assert_eq!(packet.codec(), codec);
+                assert_eq!(packet.format().codec(), codec);
                 assert_eq!(
                     (
-                        packet.sample_rate(),
-                        packet.num_channels(),
-                        packet.num_samples()
+                        packet.format().sample_rate(),
+                        packet.format().num_channels(),
+                        packet.format().num_samples()
                     ),
                     (48_000, 2, samples),
                 );

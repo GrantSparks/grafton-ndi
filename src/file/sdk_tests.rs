@@ -501,6 +501,8 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
     };
     let scratch = Scratch::new("rollovers");
     let source = LiveSource::start(&ndi, "rollovers");
+    let replacement = LiveSource::start(&ndi, "rollovers-replacement");
+    assert_ne!(source.spec, replacement.spec);
     let options = FileRecorderOptions::new(source.spec.clone())
         .proxy(false)
         .tracks(MediaTypes::VIDEO);
@@ -527,7 +529,7 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
         .unwrap();
     let second = timeline.await_change(&mut recorder, since, &first);
     let since = timeline.mark();
-    recorder.set_source(&source.spec).unwrap();
+    recorder.set_source(&replacement.spec).unwrap();
     let third = timeline.await_change(&mut recorder, since, &second);
     let switched = second.clone();
     let files = [first, second, third];

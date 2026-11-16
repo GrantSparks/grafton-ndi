@@ -23,8 +23,8 @@ use windows_sys::Win32::{
         Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
         DuplicateToken, LookupPrivilegeValueA, PrivilegeCheck, SecurityIdentification,
         DACL_SECURITY_INFORMATION, GENERIC_MAPPING, GROUP_SECURITY_INFORMATION,
-        LUID_AND_ATTRIBUTES, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, SE_PRIVILEGE_ENABLED,
-        TOKEN_DUPLICATE, TOKEN_QUERY,
+        LABEL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET,
+        SE_PRIVILEGE_ENABLED, TOKEN_DUPLICATE, TOKEN_QUERY,
     },
     Storage::FileSystem::{
         GetVolumeInformationByHandleW, FILE_ADD_FILE, FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS,
@@ -45,7 +45,10 @@ impl SecurityDescriptor {
             GetSecurityInfo(
                 directory.as_raw_handle(),
                 SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                OWNER_SECURITY_INFORMATION
+                    | GROUP_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | LABEL_SECURITY_INFORMATION,
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -171,6 +174,7 @@ fn volume_has_persistent_acls(directory: &File) -> io::Result<bool> {
 
 fn directory_allows_new_file(directory: &Path) -> io::Result<bool> {
     let token = effective_token()?;
+    let privileged = backup_privileges_enabled(&token)?;
     // The same held handle identifies the reparse target and its descriptor.
     // BACKUP_SEMANTICS is required to open directories, but enabled restore
     // privileges can make that open succeed despite a FILE_ADD_FILE denial.
@@ -189,7 +193,7 @@ fn directory_allows_new_file(directory: &Path) -> io::Result<bool> {
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
                 .open(directory)
             {
-                Ok(_) if !backup_privileges_enabled(&token)? => Ok(true),
+                Ok(_) if !privileged => Ok(true),
                 Ok(_) => Err(error),
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(false),
                 Err(error) => Err(error),
@@ -197,6 +201,13 @@ fn directory_allows_new_file(directory: &Path) -> io::Result<bool> {
         }
         Err(error) => return Err(error),
     };
+    // Without enabled backup/restore privileges the kernel's successful open
+    // proves both the DACL and mandatory integrity label permit child creation.
+    if !privileged {
+        return Ok(true);
+    }
+    // Backup intent can bypass the DACL. Evaluate the complete descriptor,
+    // including its mandatory label, independently of those privileges.
     let descriptor = match SecurityDescriptor::from_directory(&directory) {
         Ok(descriptor) => descriptor,
         Err(error)
@@ -226,7 +237,7 @@ fn directory_allows_new_file(directory: &Path) -> io::Result<bool> {
         let mut allowed = 0;
         // SAFETY: descriptor/token stay live; every output points to writable
         // storage of the stated size. FILE_ADD_FILE contains no generic bits.
-        // This checks the DACL independently of the handle's backup intent.
+        // This checks the DACL and mandatory label without the handle's backup intent.
         if unsafe {
             AccessCheck(
                 descriptor.0.as_ptr(),

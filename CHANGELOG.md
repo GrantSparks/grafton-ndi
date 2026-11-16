@@ -15,7 +15,50 @@ mixed-media capture, Advanced SDK operations, recording, playback and image
 encoding. Upgrading from 2.x requires API and deployment changes; follow the
 [2.x to 3.0 migration guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/migration/2.0-to-3.0.md).
 
+### Fixed
+
+- Abandoned async source-name and unknown-event reports are redelivered only
+  while no newer report has superseded them. Replaying a source-name result
+  never waits for another poller's native query.
+
 ### Breaking changes
+
+- `AudioFormat` converts through `FourCc`; audio descriptors use their validated
+  format. `PictureAspectRatio` normalizes negative zero and implements `Eq` and
+  `Hash`, as do video packet formats and File track, format and event values.
+
+- Interleaved floating-point input uses `AudioFrame::from_interleaved` with
+  validated `InterleavedAudioF32`; `AudioLayout` and the audio builder's `layout`
+  setter are removed. Audio builders accept packed planar samples.
+- Compressed audio frames and packets share `advanced::AudioPacketFormat`.
+  Contiguous and scatter constructors take this validated format, and packet
+  accessors read it through `format()`; stream protection uses `with_protected`.
+
+- Packet KVM sessions capture through `session.receiver()`, allowing capture on
+  a worker thread alongside input. Their direct capture methods are removed.
+
+- Audio allocator padding uses the same validated layout and error causes as
+  captured audio, including the 64 MiB active extent limit. Allocator-only audio
+  stride and extent error leaves are removed.
+- Remove unreachable image dimension, image scratch and V210 row overflow
+  error leaves. V210 constructors validate their shared P216 geometry first.
+
+- Image option refusals carry `codec: ImageCodecKind` in `ImageQuality`,
+  `SixteenBitNeedsPng` and `HdrNeedsPng`, replacing their string `format` field.
+  Encoding validates each codec quality, effort and dimension setting once.
+
+- Lossy WebP encoder storage failures remain `InvalidFrame(EncodingFailed)`
+  because its supported dependency API cannot classify allocation failures;
+  conversion scratch continues to report `AllocationFailed(ImageScratch)`.
+- Load refusals distinguish a missing identification anchor from a missing
+  required API entry point. Unreadable version text carries `VersionTextDefect`;
+  `InvalidCString` reports its cause once in error chains.
+- Async source-cache hits return on the awaiting task without a blocking-pool
+  handoff; misses retain their timeout, cancellation and publication behavior.
+
+- Discovery snapshots build source strings once from bounded SDK bytes.
+  Discovery windows charge shared name and address storage once while counting
+  both descriptor containers against their retained byte budget.
 
 - Custom allocator receivers use `advanced::AllocatedReceiver<M = RawCapture>`.
   Replace `AllocatedPacketReceiver` with `AllocatedReceiver<PacketAttached>`;
@@ -32,7 +75,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   load a library from the working directory. Windows expands absolute `PATH`
   entries; macOS retains `@rpath` and expands absolute `DYLD_LIBRARY_PATH`
   entries. Relative and empty directory entries are recorded as refused;
-  unsafe dyld entries refuse the entire default search before any native open.
+  unsafe entries in either `DYLD_LIBRARY_PATH` or `DYLD_FALLBACK_LIBRARY_PATH`
+  refuse the entire default search before any native open.
 
 - Public APIs follow one [set of conventions](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/api-conventions.md)
   for construction, options, capture, events, waits and paths. Receiver and async
@@ -359,7 +403,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   divisions; JPEG reuses its final converted row for codec padding. Encoded
   output is unchanged. Measured gains and the JPEG scratch-memory tradeoff are
   recorded in the [performance guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/image-encoding-performance.md).
-- Queued sending reserves stable frame and scatter descriptors at construction.
+- Queued sending reserves stable frame descriptors at construction; scatter
+  frames own their scatter lists.
   Accepted submissions allocate nothing; `QueueFull` refusals allocate only
   their returned `Rejected` value. Completion and collection remain allocation
   free.

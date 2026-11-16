@@ -252,6 +252,7 @@ fn static_targets_keep_each_supported_slice_and_deployment_variable() {
     assert_eq!(build_support::STATIC_TARGETS.len(), supported.len());
     for (triple, os, arch, abi, subdirectory, platform, variable) in supported {
         let target = build_support::static_target(triple, os, arch, abi).unwrap();
+        assert_eq!(target.triple, triple);
         assert_eq!(
             (
                 target.sdk_subdirectory,
@@ -289,6 +290,22 @@ fn static_targets_keep_each_supported_slice_and_deployment_variable() {
 }
 
 #[test]
+fn static_target_cfg_must_agree_with_its_exact_triple() {
+    for (os, arch, abi) in [
+        ("tvos", "aarch64", ""),
+        ("ios", "x86_64", ""),
+        ("ios", "aarch64", "sim"),
+    ] {
+        let error = build_support::static_target("aarch64-apple-ios", os, arch, abi).unwrap_err();
+        assert!(error.contains("aarch64-apple-ios has cfg"), "{error}");
+        assert!(
+            error.contains("table row requires (ios, aarch64"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn unsupported_apple_abis_fail_before_the_build_script_opens_an_sdk() {
     let fixture = Sdk::new("unsupported-apple-build");
     let executable = fixture
@@ -305,6 +322,8 @@ fn unsupported_apple_abis_fail_before_the_build_script_opens_an_sdk() {
         String::from_utf8_lossy(&compiled.stderr)
     );
     for (triple, os, arch, abi) in [
+        ("arm64e-apple-ios", "ios", "aarch64", ""),
+        ("arm64e-apple-tvos", "tvos", "aarch64", ""),
         ("aarch64-apple-ios-sim", "ios", "aarch64", "sim"),
         ("aarch64-apple-tvos-sim", "tvos", "aarch64", "sim"),
         ("aarch64-apple-visionos-sim", "visionos", "aarch64", "sim"),

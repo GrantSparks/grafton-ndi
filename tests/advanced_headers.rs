@@ -5,6 +5,8 @@
 
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/nested_cargo.rs"]
+mod nested_cargo;
 
 #[test]
 fn partial_advanced_headers_disable_only_the_missing_declarations() {
@@ -35,18 +37,10 @@ fn partial_advanced_headers_disable_only_the_missing_declarations() {
             format!("#include <Processing.NDI.Lib.h>\n{functions}\n"),
         )
         .unwrap();
-        let output = std::process::Command::new(env!("CARGO"))
-            .args([
-                "test",
-                "--locked",
-                "--offline",
-                "--lib",
-                "--all-features",
-                "capabilities::tests",
-            ])
+        let output = nested_cargo::command("partial-advanced", "test", None, None)
+            .args(["--lib", "--all-features", "capabilities::tests"])
             .env("NDI_SDK_DIR", fixture.path())
             .env("RUSTFLAGS", "-D warnings")
-            .env("CARGO_TARGET_DIR", fixture.path().join("target"))
             .output()
             .unwrap();
         assert!(

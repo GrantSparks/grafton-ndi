@@ -48,6 +48,7 @@ jobs:
           python-version: '3.13'
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: 1.100.0
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: CI scripts and workflows
@@ -105,7 +106,13 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal
           cargo +1.88.0 check --locked --workspace --all-targets --all-features
       - name: Packaged crate builds
-        run: cargo package --locked --package grafton-ndi
+        run: |
+          files=$(cargo package --list --locked --package grafton-ndi)
+          if grep -E '_tests\.rs$|/tests\.rs$|test_support|test_alloc|/mock\.rs$|/sdk_tests/' <<< "$files"; then
+            echo '::error::The package contains test-only sources'
+            exit 1
+          fi
+          cargo package --locked --package grafton-ndi
       # Skipped while the crate's major version is ahead of every published
       # release: nothing constrains a new major version.
       - name: Semver check against the last release
@@ -126,6 +133,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.100.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # No NDI runtime is installed here: tests that need one report a skip.
       - name: Tests, all features
@@ -142,7 +151,15 @@ jobs:
           sudo apt-get install --yes --no-install-recommends valgrind
           runner='target.x86_64-unknown-linux-gnu.runner=["valgrind","--tool=memcheck","--error-exitcode=99","--trace-children=yes","--trace-children-skip=*/rustc,*/rustc-*"]'
           cargo test --locked --all-features --config "$runner" --test mixed_capture_boundary --test frame_metadata_boundary -- --test-threads=1
-          cargo test --locked --all-features --config "$runner" --lib frames::tests::video_padding_encoders -- --test-threads=1
+          filters=(frames::tests::video_padding_encoders)
+          for filter in "${filters[@]}"; do
+            selected=$(cargo test --locked --all-features --lib -- --list "$filter")
+            if ! grep -q ': test$' <<< "$selected"; then
+              echo "::error::No tests selected for filter: $filter"
+              exit 1
+            fi
+            cargo test --locked --all-features --config "$runner" --lib "$filter" -- --test-threads=1
+          done
 
   miri:
     name: miri (${{ matrix.model }})
@@ -162,6 +179,16 @@ jobs:
           cargo +nightly-2026-11-10 miri setup
       - name: Initialized rows, metadata and synthetic native guards
         run: |
+          skips=(descriptor_admission_and_collection_stay_allocation_free_under_churn)
+          skip_args=()
+          for skip in "${skips[@]}"; do
+            selected=$(cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio -- --list "$skip")
+            if ! grep -q ': test$' <<< "$selected"; then
+              echo "::error::No tests selected for skip: $skip"
+              exit 1
+            fi
+            skip_args+=(--skip "$skip")
+          done
           for filter in \
             frames::tests::video_padding_all_formats \
             frames::tests::video_padding_single_rows \
@@ -175,8 +202,20 @@ jobs:
             framesync::tests::test_framesync_audio_ref_supports \
             advanced::sync::tests::returned_audio_is_released \
             advanced::sync::tests::borrowed_avsync_audio \
-            advanced::send_slots::tests::; do
-            cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio "$filter" -- --skip slot_keys_cannot_be_reused_or_cloned
+            advanced::send_slots::tests:: \
+            advanced::aliasable::tests:: \
+            advanced::packets::received::tests:: \
+            advanced::queued::boundary_tests:: \
+            sender::in_flight::tests:: \
+            advanced::send::tests:: \
+            advanced::queued::tests:: \
+            sender::tests::; do
+            selected=$(cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio -- --list "$filter" "${skip_args[@]}")
+            if ! grep -q ': test$' <<< "$selected"; then
+              echo "::error::No tests selected for filter: $filter"
+              exit 1
+            fi
+            cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio "$filter" -- "${skip_args[@]}"
           done
 
   cross:
@@ -193,6 +232,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: 1.100.0
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Clippy for every dynamically loaded target
@@ -359,6 +399,7 @@ jobs:
           python-version: '3.13'
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: 1.100.0
           targets: ${{ matrix.target }}
           components: clippy, rustfmt
       - name: Linux prerequisites
@@ -462,6 +503,8 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
+          rustup toolchain install 1.88.0 --profile minimal --target "$TARGET"
+          cargo +1.88.0 check --locked --all-targets --target "$TARGET" --all-features
           cargo clippy --locked --all-targets --target "$TARGET" --all-features -- -D warnings
           cargo clippy --locked --all-targets --target "$TARGET" --no-default-features --features advanced -- -D warnings
           cargo clippy --locked --all-targets --target "$TARGET" --no-default-features --features advanced,file-io -- -D warnings
@@ -480,12 +523,14 @@ jobs:
           export GRAFTON_NDI_PEER_RUNTIME="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_RUNTIME }}"
           export GRAFTON_NDI_PEER_VERSION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_VERSION }}"
           export GRAFTON_NDI_PEER_EDITION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_EDITION }}"
+          failed=0
           for edition in standard advanced; do
             while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
             export NDI_SDK_DIR="${{ steps.sdk.outputs.NDI_SDK_DIR }}"
             if [ "$edition" = advanced ]; then export GRAFTON_NDI_REQUIRE_RUNTIME=advanced; else export GRAFTON_NDI_REQUIRE_RUNTIME=1; fi
-            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features || failed=1
           done
+          exit "$failed"
       # A Standard baseline SDK has no headers a build reads, so its pass is a
       # build without Advanced declarations, which cannot check `advanced`. No
       # compatibility pass promises an NDI|HX decoder; the row's own runs do.
@@ -493,6 +538,7 @@ jobs:
         if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.compatibility }}
         timeout-minutes: 25
         run: |
+          failed=0
           for edition in standard advanced; do
             while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
             export GRAFTON_NDI_PEER_RUNTIME="$GRAFTON_NDI_EXPECTED_RUNTIME"
@@ -506,8 +552,9 @@ jobs:
             require="${require/,h264-decoder/}"; require="${require/,hevc-444-decoder/}"
             if [ "$edition" = standard ]; then require="${require/advanced/1}"; fi
             export GRAFTON_NDI_REQUIRE_RUNTIME="$require"
-            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features || failed=1
           done
+          exit "$failed"
 
   required-ci:
     name: required-ci

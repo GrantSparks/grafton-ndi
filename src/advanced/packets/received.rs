@@ -93,9 +93,7 @@ impl From<CompressedVideoFrame> for ReceivedVideoPacket {
 /// send admission refuses the packet.
 #[derive(Clone)]
 pub struct ReceivedAudioPacket {
-    pub(crate) codec: AudioCodec,
-    pub(crate) protected: bool,
-    pub(crate) parameters: AudioParameters,
+    pub(crate) format: AudioPacketFormat,
     pub(crate) bytes: Vec<u8>,
     pub(crate) extras: FrameExtras,
 }
@@ -112,34 +110,9 @@ impl ReceivedAudioPacket {
         &self.bytes
     }
 
-    /// The codec delivered by the receiver.
-    pub fn codec(&self) -> AudioCodec {
-        self.codec
-    }
-
-    /// Whether the packet belongs to a protected stream.
-    pub fn is_protected(&self) -> bool {
-        self.protected
-    }
-
-    /// Set whether this packet belongs to a protected stream.
-    pub fn set_protected(&mut self, protected: bool) {
-        self.protected = protected;
-    }
-
-    /// Sample rate in hertz.
-    pub fn sample_rate(&self) -> u32 {
-        self.parameters.sample_rate
-    }
-
-    /// Number of channels.
-    pub fn num_channels(&self) -> u32 {
-        self.parameters.num_channels
-    }
-
-    /// Samples per channel the packet decodes to.
-    pub fn num_samples(&self) -> u32 {
-        self.parameters.num_samples
+    /// The codec and audio format delivered by the receiver.
+    pub fn format(&self) -> AudioPacketFormat {
+        self.format
     }
 
     /// The sender's submission time, when supplied by the SDK.
@@ -159,7 +132,7 @@ impl ReceivedAudioPacket {
     /// [`Error::InvalidFrame`] for unsupported delivery parameters or envelope
     /// details. The packet remains unchanged.
     pub fn validate_for_send(&self) -> Result<()> {
-        validate_audio_for_send(self.codec, self.parameters, &self.bytes)
+        validate_audio_for_send(self.format, &self.bytes)
     }
 }
 
@@ -171,16 +144,12 @@ impl TryFrom<ReceivedAudioPacket> for CompressedAudioFrame {
             return Err(Rejected::new(error, packet));
         }
         let ReceivedAudioPacket {
-            codec,
-            protected,
-            parameters,
+            format,
             bytes,
             extras,
         } = packet;
         Ok(Self {
-            codec,
-            protected,
-            parameters,
+            format,
             bytes: AliasableVec::new(bytes),
             extras,
         })
@@ -190,16 +159,12 @@ impl TryFrom<ReceivedAudioPacket> for CompressedAudioFrame {
 impl From<CompressedAudioFrame> for ReceivedAudioPacket {
     fn from(frame: CompressedAudioFrame) -> Self {
         let CompressedAudioFrame {
-            codec,
-            protected,
-            parameters,
+            format,
             bytes,
             extras,
         } = frame;
         Self {
-            codec,
-            protected,
-            parameters,
+            format,
             bytes: bytes.into_vec(),
             extras,
         }
@@ -221,10 +186,7 @@ mod tests {
 
     fn audio() -> CompressedAudioFrame {
         CompressedAudioFrame::new(
-            AudioCodec::Aac,
-            48_000,
-            2,
-            1024,
+            AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
             testing::aac_packet(48_000, 2, &[1; 8]),
         )
         .unwrap()
@@ -249,7 +211,7 @@ mod tests {
 
         let mut sent = audio();
         sent.set_metadata("<audio/>").unwrap();
-        sent.set_protected(true);
+        sent.format = sent.format.with_protected(true);
         let pointer = sent.data().as_ptr();
         let metadata = sent.metadata().unwrap().as_ptr();
         let (received, allocations) = allocation_count(|| ReceivedAudioPacket::from(sent));
@@ -257,7 +219,7 @@ mod tests {
         let (sent, allocations) =
             allocation_count(|| CompressedAudioFrame::try_from(received).unwrap());
         assert_eq!(allocations, 0);
-        assert!(sent.is_protected());
+        assert!(sent.format().is_protected());
         assert_eq!(sent.metadata().unwrap().as_ptr(), metadata);
         let (received, allocations) = allocation_count(|| ReceivedAudioPacket::from(sent));
         assert_eq!(allocations, 0);
@@ -374,7 +336,10 @@ mod tests {
         assert!(CompressedAudioFrame::try_from(&borrowed).is_err());
         assert_eq!(destination.data(), original.data());
         assert_eq!(destination.data().as_ptr(), pointer);
-        assert_eq!(destination.num_channels(), original.num_channels());
+        assert_eq!(
+            destination.format().num_channels(),
+            original.format().num_channels()
+        );
         assert_eq!(destination.metadata(), original.metadata());
         assert_eq!(destination.timestamp(), original.timestamp());
     }
@@ -402,9 +367,12 @@ mod tests {
         assert_eq!(destination.metadata(), borrowed.metadata());
         assert_eq!(destination.metadata_status(), borrowed.metadata_status());
 
-        let mut source =
-            CompressedAudioFrame::new(AudioCodec::Opus, 24_000, 6, 480, vec![1; 8]).unwrap();
-        source.set_protected(true);
+        let mut source = CompressedAudioFrame::new(
+            AudioPacketFormat::new(AudioCodec::Opus, 24_000, 6, 480).unwrap(),
+            vec![1; 8],
+        )
+        .unwrap();
+        source.format = source.format.with_protected(true);
         source.set_timecode(Timecode::from_ticks(789));
         let mut raw = source.raw();
         raw.timestamp = 987;
@@ -418,11 +386,7 @@ mod tests {
         result.unwrap();
         assert_eq!(allocations, 0);
         assert_eq!(destination.data().as_ptr(), pointer);
-        assert_eq!(destination.codec(), borrowed.codec());
-        assert_eq!(destination.is_protected(), borrowed.is_protected());
-        assert_eq!(destination.sample_rate(), borrowed.sample_rate());
-        assert_eq!(destination.num_channels(), borrowed.num_channels());
-        assert_eq!(destination.num_samples(), borrowed.num_samples());
+        assert_eq!(destination.format(), borrowed.format());
         assert_eq!(destination.timecode(), borrowed.timecode());
         assert_eq!(destination.timestamp(), borrowed.timestamp());
         assert_eq!(destination.metadata(), borrowed.metadata());

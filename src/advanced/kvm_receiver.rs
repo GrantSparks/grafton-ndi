@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use super::{PacketAttached, PacketItem, PacketItemRef, PacketReceiver};
+
 use crate::{
     AudioMode, ConnectionStats, EventMode, MetadataMode, MetadataSource, Ptz, RawCapture, Receiver,
     ReceiverEvent, ReceiverItem, ReceiverItemRef, ReceiverMode, Result, SettingChange, Source,
@@ -20,7 +22,9 @@ use crate::{
 /// This reference-sized view allocates nothing and makes no SDK calls or lock
 /// acquisitions when constructed. Capture handles, borrowed frames and PTZ
 /// controls retain the original receiver borrow, so they can coexist with
-/// mutable session input calls. Like the receiver, the view is `Send` and `Sync`.
+/// mutable session input calls. Packet sessions also capture through
+/// `session.receiver()`, so a worker can capture while its session sends input.
+/// Like the receiver, the view is `Send` and `Sync`.
 pub struct KvmReceiver<'a, M: ReceiverMode = RawCapture> {
     receiver: &'a Receiver<M>,
 }
@@ -230,5 +234,36 @@ impl<'a> KvmReceiver<'a> {
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any(&self, timeout: Duration) -> Result<Option<ReceiverItem>> {
         self.receiver.capture_any(timeout)
+    }
+}
+
+impl<'a> KvmReceiver<'a, PacketAttached> {
+    /// Wait up to `timeout` for the next frame or event of a
+    /// [`PacketReceiver`], exactly as [`PacketReceiver::capture_any`] does, while
+    /// the session holds its inputs.
+    ///
+    /// Every result owns its data, so nothing it returns keeps the session
+    /// borrowed. Both packet capture methods use a shared borrow of the
+    /// receiver, as the packet receiver's own capture methods do.
+    ///
+    /// # Errors
+    ///
+    /// As for [`PacketReceiver::capture_any`], including [`crate::Error::UnexpectedSdkResult`]
+    /// once per failed status publication, whose event remains pending.
+    #[doc(alias = "NDIlib_recv_capture_v3")]
+    pub fn capture_any(&self, timeout: Duration) -> Result<Option<PacketItem>> {
+        PacketReceiver::capture_from(self.receiver, timeout)
+    }
+
+    /// Borrow a packet for the underlying receiver's lifetime, so inputs can
+    /// still be released while the packet is held. See [`PacketReceiver::capture_any_ref`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`PacketReceiver::capture_any_ref`], including [`crate::Error::UnexpectedSdkResult`]
+    /// once per failed status publication, whose event remains pending.
+    #[doc(alias = "NDIlib_recv_capture_v3")]
+    pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<PacketItemRef<'a>>> {
+        PacketReceiver::capture_ref_from(self.receiver, timeout)
     }
 }

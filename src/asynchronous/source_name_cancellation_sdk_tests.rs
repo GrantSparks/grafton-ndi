@@ -62,11 +62,9 @@ async fn cancelled_query_releases_before_connecting<R: AsyncRuntime>(runtime: &s
     let Some(ndi) = crate::test_support::ndi() else {
         return;
     };
-    if ndi
-        .require_feature(crate::RuntimeFeature::ConnectedSourceName)
-        .is_err()
-    {
-        eprintln!("skipped: this runtime has no connected-source-name query");
+    if !crate::test_support::require_feature(
+        ndi.require_feature(crate::RuntimeFeature::ConnectedSourceName),
+    ) {
         return;
     }
     let sender = Sender::new(

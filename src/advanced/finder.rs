@@ -65,7 +65,7 @@ unsafe fn extended_source(
         None
     } else {
         // SAFETY: non-null was checked; the caller guarantees the terminator.
-        let Some(text) = (unsafe { budget.text(metadata)? }) else {
+        let Some(text) = (unsafe { budget.metadata_text(metadata)? }) else {
             return Ok(None);
         };
         // The SDK gives a source that advertises nothing an empty string.
@@ -137,7 +137,7 @@ mod tests {
     use std::ffi::CStr;
 
     use super::*;
-    use crate::frames::MAX_SDK_STRING_BYTES;
+    use crate::sdk_copy::MAX_SDK_STRING_BYTES;
 
     #[test]
     fn plain_and_metadata_snapshots_charge_the_same_source_text() {

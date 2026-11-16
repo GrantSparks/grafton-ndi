@@ -83,7 +83,7 @@ fn borrowed_audio_item_allocates_nothing_and_owned_copy_skips_uninitialized_chan
         no_channels: 2,
         no_samples: 2,
         timecode: 2345,
-        FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+        FourCC: crate::FourCc::from(crate::AudioFormat::Fltp).raw(),
         p_data: samples.as_mut_ptr().cast(),
         __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
             channel_stride_in_bytes: 16,

@@ -314,10 +314,10 @@ macro_rules! optional_tables {
             /// resolves outside the selected implementation.
             pub(in crate::sys) fn load(resolver: &dyn Resolver) -> std::result::Result<ResolvedApi, LoadRefusal> {
                 let lifecycle = Lifecycle::load(resolver)?.map_err(|symbol| {
-                    LoadRefusal::MissingEntryPoint { symbol, required: true, detail: None }
+                    LoadRefusal::MissingEntryPoint { symbol }
                 })?;
                 let core = Core::load(resolver)?.map_err(|symbol| {
-                    LoadRefusal::MissingEntryPoint { symbol, required: true, detail: None }
+                    LoadRefusal::MissingEntryPoint { symbol }
                 })?;
                 Ok(ResolvedApi {
                     lifecycle,
@@ -553,8 +553,6 @@ mod tests {
             refusal,
             LoadRefusal::MissingEntryPoint {
                 symbol: c"NDIlib_initialize",
-                required: true,
-                detail: None,
             }
         );
     }

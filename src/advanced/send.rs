@@ -3,11 +3,14 @@
 #[cfg(any(test, ndi_has_advanced_scatter_send))]
 use std::ptr;
 
+#[cfg(doc)]
+use super::AudioCodec;
+
 use super::{
     aliasable::AliasableVec,
     invalid_frame,
-    packets::{frame_extras_accessors, packet_debug, AudioParameters, FrameExtras},
-    AdvancedConfig, AudioCodec, CompressedAttached, CompressedAudioFrame, CompressedAudioSendMode,
+    packets::{frame_extras_accessors, packet_debug, AudioPacketFormat, FrameExtras},
+    AdvancedConfig, CompressedAttached, CompressedAudioFrame, CompressedAudioSendMode,
     CompressedVideoFrame, VideoPacketFormat, MAX_PACKET_BYTES,
 };
 use crate::{
@@ -320,10 +323,8 @@ impl ScatterVideoFrame {
 /// header; Opus has no envelope.
 #[derive(Clone)]
 pub struct ScatterAudioFrame {
-    codec: AudioCodec,
+    format: AudioPacketFormat,
     storage: ScatterStorage,
-    parameters: AudioParameters,
-    protected: bool,
     extras: FrameExtras,
 }
 
@@ -333,67 +334,40 @@ packet_debug!(ScatterAudioFrame, "ScatterAudioFrame", frame, audio, frame.extras
 impl ScatterAudioFrame {
     frame_extras_accessors!();
 
-    /// Take ownership of one frame's blocks, in order. `num_samples` is the
-    /// number of samples per channel the frame decodes to.
+    /// Take ownership of one frame's blocks, in order, with the given format.
     ///
     /// # Errors
     ///
     /// Returns the blocks with [`Error::InvalidFrame`](crate::Error::InvalidFrame)
-    /// when a parameter is not in `1..=i32::MAX`, the parameters are not ones
-    /// the codec is delivered with (see [`AudioCodec`]), the block list is
-    /// invalid (as for [`ScatterVideoFrame::new`]), or the blocks do not hold
+    /// when the format parameters are not ones the codec is delivered with
+    /// (see [`AudioCodec`]), the block list is invalid (as for
+    /// [`ScatterVideoFrame::new`]), or the blocks do not hold
     /// a sendable AAC packet that agrees with the parameters.
     pub fn new(
-        codec: AudioCodec,
-        sample_rate: u32,
-        num_channels: u32,
-        num_samples: u32,
+        format: AudioPacketFormat,
         blocks: Vec<Vec<u8>>,
     ) -> std::result::Result<Self, Rejected<Vec<Vec<u8>>>> {
         let check = || {
-            let parameters = AudioParameters::new(sample_rate, num_channels, num_samples)?;
             let total = ScatterStorage::total(&blocks)?;
-            let header = first_block(&blocks, codec.header_bytes())?;
-            codec.validate_for_send(parameters, header, total, |offset| {
-                bytes_at(&blocks, offset)
-            })?;
-            Ok((parameters, total))
+            let header = first_block(&blocks, format.codec().header_bytes())?;
+            format
+                .codec()
+                .validate_for_send(format, header, total, |offset| bytes_at(&blocks, offset))?;
+            Ok(total)
         };
         match check() {
-            Ok((parameters, total)) => Ok(Self {
-                codec,
+            Ok(total) => Ok(Self {
+                format,
                 storage: ScatterStorage::new(blocks, total),
-                parameters,
-                protected: false,
                 extras: FrameExtras::default(),
             }),
             Err(error) => Err(Rejected::new(error, blocks)),
         }
     }
 
-    /// The codec.
-    pub fn codec(&self) -> AudioCodec {
-        self.codec
-    }
-
-    /// Whether the stream is protected.
-    pub fn is_protected(&self) -> bool {
-        self.protected
-    }
-
-    /// Sample rate in hertz.
-    pub fn sample_rate(&self) -> u32 {
-        self.parameters.sample_rate
-    }
-
-    /// Number of channels.
-    pub fn num_channels(&self) -> u32 {
-        self.parameters.num_channels
-    }
-
-    /// Samples per channel the frame decodes to.
-    pub fn num_samples(&self) -> u32 {
-        self.parameters.num_samples
+    /// The codec and audio format.
+    pub fn format(&self) -> AudioPacketFormat {
+        self.format
     }
 
     /// The blocks, in order.
@@ -414,18 +388,11 @@ impl ScatterAudioFrame {
         self.storage.total
     }
 
-    /// Set whether the frame belongs to a protected stream.
-    pub fn set_protected(&mut self, protected: bool) {
-        self.protected = protected;
-    }
-
     /// Join the blocks into one newly allocated contiguous frame.
     pub fn into_contiguous_copy(self) -> CompressedAudioFrame {
         CompressedAudioFrame {
-            codec: self.codec,
-            protected: self.protected,
+            format: self.format,
             bytes: AliasableVec::new(self.storage.copy_contiguous()),
-            parameters: self.parameters,
             extras: self.extras,
         }
     }
@@ -433,8 +400,7 @@ impl ScatterAudioFrame {
     /// A native descriptor without data; see [`ScatterVideoFrame::descriptor`].
     #[cfg(ndi_has_advanced_scatter_send)]
     fn descriptor(&self) -> NDIlib_audio_frame_v3_t {
-        self.parameters
-            .descriptor(self.codec, self.protected, &self.extras)
+        self.format.descriptor(&self.extras)
     }
 }
 
@@ -1055,6 +1021,7 @@ impl std::fmt::Debug for CompressedVideo<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::advanced::AudioCodec;
     use crate::advanced::{
         packets::testing::{aac_config, aac_packet},
         EnvelopeCodec, PacketEnvelope, VideoCodec,
@@ -1072,8 +1039,11 @@ mod tests {
                 .clock_audio(false),
         )
         .unwrap();
-        let mut frame =
-            CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64]).unwrap();
+        let mut frame = CompressedAudioFrame::new(
+            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+            vec![1; 64],
+        )
+        .unwrap();
         let ((_video, audio), allocations) = crate::test_alloc::allocation_count(|| sender.split());
         assert_eq!(allocations, 0);
         let ((), allocations) =
@@ -1093,8 +1063,11 @@ mod tests {
             &super::super::QueueLimits::default(),
         )
         .unwrap();
-        let mut frame =
-            CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64]).unwrap();
+        let mut frame = CompressedAudioFrame::new(
+            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+            vec![1; 64],
+        )
+        .unwrap();
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
             queue.sender().send_compressed_audio(&mut frame)
         });
@@ -1126,8 +1099,11 @@ mod tests {
         samples: u32,
         blocks: Vec<Vec<u8>>,
     ) -> Result<ScatterAudioFrame> {
-        ScatterAudioFrame::new(codec, sample_rate, channels, samples, blocks)
-            .map_err(Rejected::into_error)
+        ScatterAudioFrame::new(
+            AudioPacketFormat::new(codec, sample_rate, channels, samples)?,
+            blocks,
+        )
+        .map_err(Rejected::into_error)
     }
 
     #[test]
@@ -1221,9 +1197,11 @@ mod tests {
         let rejected = ScatterVideoFrame::new(format, blocks.clone()).unwrap_err();
         assert_eq!(rejected.into_inner(), blocks);
 
-        let rejected =
-            ScatterAudioFrame::new(AudioCodec::Opus, 48_000, 0, 960, vec![vec![1], vec![2]])
-                .unwrap_err();
+        let rejected = ScatterAudioFrame::new(
+            AudioPacketFormat::new(AudioCodec::Opus, 44_100, 2, 960).unwrap(),
+            vec![vec![1], vec![2]],
+        )
+        .unwrap_err();
         assert_eq!(rejected.into_inner(), [[1], [2]]);
     }
 
@@ -1270,11 +1248,15 @@ mod tests {
 
         let mut audio =
             scatter_audio(AudioCodec::Opus, 48_000, 2, 960, vec![vec![1], vec![2]]).unwrap();
-        audio.set_protected(true);
+        audio.format = audio.format.with_protected(true);
         let copy = audio.clone();
-        assert!(copy.is_protected());
+        assert!(copy.format().is_protected());
         assert_eq!(
-            (copy.sample_rate(), copy.num_channels(), copy.num_samples()),
+            (
+                copy.format().sample_rate(),
+                copy.format().num_channels(),
+                copy.format().num_samples()
+            ),
             (48_000, 2, 960)
         );
         assert_eq!(copy.into_contiguous_copy().data(), &[1, 2]);
@@ -1430,10 +1412,7 @@ mod tests {
         );
 
         let audio = ScatterAudioFrame::new(
-            AudioCodec::Opus,
-            48_000,
-            2,
-            960,
+            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![vec![1, 2], vec![3, 4]],
         )
         .unwrap();
@@ -1484,10 +1463,7 @@ mod tests {
         );
 
         let mut audio = ScatterAudioFrame::new(
-            AudioCodec::Opus,
-            48_000,
-            2,
-            960,
+            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![vec![1, 2], vec![3, 4]],
         )
         .unwrap();

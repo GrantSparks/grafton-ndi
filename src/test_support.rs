@@ -8,6 +8,7 @@ use crate as api;
 
 #[cfg(feature = "advanced")]
 mod advanced_runtime;
+mod feature;
 #[cfg(feature = "file-io")]
 mod file_api;
 mod hx_placeholder;
@@ -15,18 +16,17 @@ mod identity;
 mod policy;
 mod runtime;
 mod unique_name;
-#[cfg(feature = "file-io")]
 mod unsupported;
 
 #[cfg(feature = "advanced")]
 pub use advanced_runtime::advanced_ndi;
+pub use feature::require_feature;
 #[cfg(feature = "file-io")]
 pub use file_api::file_api;
 pub use hx_placeholder::is_hx_placeholder;
 use policy::Requirement;
 pub use runtime::ndi;
 pub use unique_name::unique_name;
-#[cfg(feature = "file-io")]
 pub use unsupported::unsupported;
 
 /// The entries of `GRAFTON_NDI_REQUIRE_RUNTIME` that no test compiled into
@@ -68,9 +68,42 @@ fn missing_requirement(requirement: Requirement) -> Option<&'static str> {
     }
 }
 
+/// Payload size may change only the numeric extents of bounded summaries.
+pub(crate) fn assert_bounded_debug(small: &[String], large: &[String]) {
+    fn without_counts(text: &str) -> String {
+        let mut previous_digit = false;
+        text.chars()
+            .filter_map(|character| {
+                let digit = character.is_ascii_digit();
+                let emit = !digit || !previous_digit;
+                previous_digit = digit;
+                emit.then_some(if digit { '#' } else { character })
+            })
+            .collect()
+    }
+    assert_eq!(small.len(), large.len());
+    for (small, large) in small.iter().zip(large) {
+        for text in [small, large] {
+            assert!(
+                text.len() < 1024,
+                "unbounded media Debug: {} bytes",
+                text.len()
+            );
+            assert!(
+                !text.contains("0x"),
+                "media Debug contains an address: {text}"
+            );
+        }
+        assert_ne!(small, large, "media Debug omitted its payload extent");
+        assert_eq!(without_counts(small), without_counts(large));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Capability, CapabilityRefusal, Error, RuntimeFeature, SdkVersion};
+    use std::sync::LazyLock;
 
     const REQUIREMENTS: [Requirement; 6] = [
         Requirement::Runtime,
@@ -150,6 +183,64 @@ mod tests {
                 "{tokens}: {}{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn feature_refusals_distinguish_prerequisites_from_runtime_limits() {
+        const CHILD: &str = "GRAFTON_FEATURE_REFUSAL_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(require_feature(Ok(())));
+            for refusal in [
+                CapabilityRefusal::BuildAbiUnavailable(c"NDIlib_test"),
+                CapabilityRefusal::WrongEdition(None),
+            ] {
+                let result = std::panic::catch_unwind(|| {
+                    require_feature(Err(Error::UnsupportedCapability {
+                        capability: Capability::Runtime(RuntimeFeature::ConnectedSourceName),
+                        refusal,
+                    }))
+                });
+                if Requirement::Advanced.is_promised() {
+                    assert!(result.is_err());
+                } else {
+                    assert!(!result.unwrap());
+                }
+            }
+            static REQUIRED: LazyLock<SdkVersion> =
+                LazyLock::new(|| SdkVersion::parse("6.4.0").unwrap());
+            assert!(!require_feature(Err(Error::UnsupportedCapability {
+                capability: Capability::Runtime(RuntimeFeature::ReceiveVideoOnly),
+                refusal: CapabilityRefusal::RuntimeTooOld {
+                    required: &REQUIRED,
+                },
+            })));
+            return;
+        }
+        for promise in [None, Some("advanced")] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "test_support::tests::feature_refusals_distinguish_prerequisites_from_runtime_limits",
+                "--nocapture",
+            ]).env(CHILD, "1");
+            if let Some(promise) = promise {
+                command.env("GRAFTON_NDI_REQUIRE_RUNTIME", promise);
+            } else {
+                command.env_remove("GRAFTON_NDI_REQUIRE_RUNTIME");
+            }
+            let output = command.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stderr}");
+            assert!(
+                stderr.contains("skipped:") && stderr.contains("video-only receiver bandwidth"),
+                "{stderr}"
+            );
+            assert_eq!(
+                stderr.contains("promises advanced"),
+                promise.is_some(),
+                "{stderr}"
             );
         }
     }

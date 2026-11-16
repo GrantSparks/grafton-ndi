@@ -300,7 +300,7 @@ impl EnvelopeHeader {
     pub(crate) fn validate_aac(
         &self,
         config: Option<[u8; 2]>,
-        parameters: AudioParameters,
+        parameters: AudioPacketFormat,
     ) -> Result<()> {
         if !self.is_keyframe() {
             return Err(invalid_frame(crate::FrameDefect::AacKeyframeMissing));
@@ -546,7 +546,7 @@ impl<'a> PacketEnvelope<'a> {
 /// assert!(VideoPacketFormat::new(VideoCodec::Hevc, 0, 1080).is_err());
 /// # Ok::<(), grafton_ndi::Error>(())
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VideoPacketFormat {
     codec: VideoCodec,
     tier: StreamTier,
@@ -930,11 +930,11 @@ macro_rules! packet_debug {
     };
     (@audio $summary:ident, $this:ident) => {
         $summary
-            .field("codec", &$this.codec())
-            .field("protected", &$this.is_protected())
-            .field("sample_rate", &$this.sample_rate())
-            .field("num_channels", &$this.num_channels())
-            .field("num_samples", &$this.num_samples());
+            .field("codec", &$this.format().codec())
+            .field("protected", &$this.format().is_protected())
+            .field("sample_rate", &$this.format().sample_rate())
+            .field("num_channels", &$this.format().num_channels())
+            .field("num_samples", &$this.format().num_samples());
     };
 }
 pub(crate) use packet_debug;
@@ -957,7 +957,7 @@ macro_rules! audio_envelope_accessor {
         /// The validated AAC envelope. Opus packets have no envelope and
         /// return `None`.
         pub fn envelope(&self) -> Option<PacketEnvelope<'_>> {
-            match self.codec() {
+            match self.format().codec() {
                 AudioCodec::Aac => Some(PacketEnvelope::from_validated(self.data())),
                 AudioCodec::Opus => None,
             }
@@ -1130,42 +1130,101 @@ pub enum AudioCodec {
 
 crate::media::decoded_variants!(AudioCodec: Aac, Opus);
 
-/// The sample rate, channel count and samples per channel of one compressed
-/// audio frame, each in `1..=i32::MAX`, the range of the SDK's signed fields.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct AudioParameters {
-    pub(crate) sample_rate: u32,
-    pub(crate) num_channels: u32,
-    pub(crate) num_samples: u32,
+/// The codec, protection and decoded dimensions of one compressed audio frame.
+///
+/// Quantities are in `1..=i32::MAX`, the range of the SDK's signed fields.
+/// Codec delivery rules are checked when a frame is admitted for sending,
+/// preserving lossless inspection of received packets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AudioPacketFormat {
+    codec: AudioCodec,
+    protected: bool,
+    sample_rate: u32,
+    num_channels: u32,
+    num_samples: u32,
 }
 
-impl AudioParameters {
-    /// The parameters of a frame being built.
+impl AudioPacketFormat {
+    /// Describe a compressed audio frame of `codec` with the given quantities.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidFrame`] unless each is in `1..=i32::MAX`.
-    pub(crate) fn new(sample_rate: u32, num_channels: u32, num_samples: u32) -> Result<Self> {
-        Self::checked(sample_rate.into(), num_channels.into(), num_samples.into())
+    /// [`Error::InvalidFrame`] unless each quantity is in `1..=i32::MAX`.
+    pub fn new(
+        codec: AudioCodec,
+        sample_rate: u32,
+        num_channels: u32,
+        num_samples: u32,
+    ) -> Result<Self> {
+        Self::checked(
+            codec,
+            false,
+            sample_rate.into(),
+            num_channels.into(),
+            num_samples.into(),
+        )
     }
 
-    /// The parameters of a frame the SDK delivered.
+    /// The same format with the requested stream protection.
+    #[must_use]
+    pub fn with_protected(self, protected: bool) -> Self {
+        Self { protected, ..self }
+    }
+
+    /// The compressed audio codec.
+    pub fn codec(self) -> AudioCodec {
+        self.codec
+    }
+
+    /// Whether the stream is protected.
+    pub fn is_protected(self) -> bool {
+        self.protected
+    }
+
+    /// Sample rate in hertz.
+    pub fn sample_rate(self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Number of channels.
+    pub fn num_channels(self) -> u32 {
+        self.num_channels
+    }
+
+    /// Samples per channel the frame decodes to.
+    pub fn num_samples(self) -> u32 {
+        self.num_samples
+    }
+
+    /// The format of a frame the SDK delivered.
     fn from_sdk(raw: &NDIlib_audio_frame_v3_t) -> Result<Self> {
+        let (codec, protected) = AudioCodec::from_outer(raw.FourCC)
+            .ok_or_else(|| invalid_frame(crate::FrameDefect::UnknownCompressedAudio))?;
         Self::checked(
+            codec,
+            protected,
             raw.sample_rate.into(),
             raw.no_channels.into(),
             raw.no_samples.into(),
         )
     }
 
-    /// The one check, for values from the API and from the SDK.
-    fn checked(sample_rate: i64, num_channels: i64, num_samples: i64) -> Result<Self> {
+    /// The one quantity check, for values from the API and from the SDK.
+    fn checked(
+        codec: AudioCodec,
+        protected: bool,
+        sample_rate: i64,
+        num_channels: i64,
+        num_samples: i64,
+    ) -> Result<Self> {
         match (
             sdk_quantity(sample_rate),
             sdk_quantity(num_channels),
             sdk_quantity(num_samples),
         ) {
             (Some(sample_rate), Some(num_channels), Some(num_samples)) => Ok(Self {
+                codec,
+                protected,
                 sample_rate,
                 num_channels,
                 num_samples,
@@ -1182,21 +1241,15 @@ impl AudioParameters {
         }
     }
 
-    /// A native descriptor of a compressed audio frame of `codec` with these
-    /// parameters and `extras`, without data.
-    pub(crate) fn descriptor(
-        self,
-        codec: AudioCodec,
-        protected: bool,
-        extras: &FrameExtras,
-    ) -> NDIlib_audio_frame_v3_t {
+    /// A native descriptor without data, carrying this format and `extras`.
+    pub(crate) fn descriptor(self, extras: &FrameExtras) -> NDIlib_audio_frame_v3_t {
         let (timecode, timestamp, p_metadata) = extras.to_sdk();
         NDIlib_audio_frame_v3_t {
-            // Lossless: each is at most i32::MAX.
+            // Lossless: each quantity is at most i32::MAX.
             sample_rate: self.sample_rate as i32,
             no_channels: self.num_channels as i32,
             no_samples: self.num_samples as i32,
-            FourCC: codec.outer(protected),
+            FourCC: self.codec.outer(self.protected),
             timecode,
             timestamp,
             p_metadata,
@@ -1226,7 +1279,7 @@ impl AudioCodec {
     /// [`VideoPacketFormat::validate_for_send`] is for video.
     pub(crate) fn validate_for_send(
         self,
-        parameters: AudioParameters,
+        parameters: AudioPacketFormat,
         header: &[u8],
         total: usize,
         bytes_at: impl FnOnce(usize) -> Option<[u8; 2]>,
@@ -1245,11 +1298,12 @@ impl AudioCodec {
     /// Check the parameters a frame of this codec is delivered with; see
     /// [`AudioCodec`]. An AAC frame's configuration is checked separately,
     /// against its envelope.
-    fn validate_delivery(self, parameters: AudioParameters) -> Result<()> {
-        let AudioParameters {
+    fn validate_delivery(self, parameters: AudioPacketFormat) -> Result<()> {
+        let AudioPacketFormat {
             sample_rate,
             num_channels,
             num_samples,
+            ..
         } = parameters;
         match self {
             Self::Opus => {
@@ -1306,10 +1360,8 @@ impl AudioCodec {
 /// the frame exclusively; see [`CompressedVideoFrame`].
 #[derive(Clone)]
 pub struct CompressedAudioFrame {
-    pub(crate) codec: AudioCodec,
-    pub(crate) protected: bool,
+    pub(crate) format: AudioPacketFormat,
     pub(crate) bytes: AliasableVec<u8>,
-    pub(crate) parameters: AudioParameters,
     pub(crate) extras: FrameExtras,
 }
 
@@ -1322,42 +1374,26 @@ impl CompressedAudioFrame {
 
     /// Take ownership of one audio frame's bytes: a packet envelope for AAC
     /// (see [`PacketEnvelope::encode`]), one bare packet for Opus.
-    /// `num_samples` is the number of samples per channel the frame decodes
-    /// to.
     ///
     /// # Errors
     ///
-    /// Returns the bytes with [`Error::InvalidFrame`] when a parameter is not
-    /// in `1..=i32::MAX`, the bytes are empty or too large, the parameters are
+    /// Returns the bytes with [`Error::InvalidFrame`] when the bytes are empty
+    /// or too large, the format parameters are
     /// not ones the codec is delivered with (see [`AudioCodec`]), or an AAC
     /// envelope is malformed or disagrees with them.
     pub fn new(
-        codec: AudioCodec,
-        sample_rate: u32,
-        num_channels: u32,
-        num_samples: u32,
+        format: AudioPacketFormat,
         bytes: Vec<u8>,
     ) -> std::result::Result<Self, Rejected<Vec<u8>>> {
-        let parameters = match AudioParameters::new(sample_rate, num_channels, num_samples) {
-            Ok(parameters) => parameters,
-            Err(error) => return Err(Rejected::new(error, bytes)),
-        };
         let frame = Self {
-            codec,
-            protected: false,
+            format,
             bytes: AliasableVec::new(bytes),
-            parameters,
             extras: FrameExtras::default(),
         };
-        match validate_audio_for_send(frame.codec, frame.parameters, &frame.bytes) {
+        match validate_audio_for_send(frame.format, &frame.bytes) {
             Ok(()) => Ok(frame),
             Err(error) => Err(Rejected::new(error, frame.into_data())),
         }
-    }
-
-    /// Set whether the frame belongs to a protected stream.
-    pub fn set_protected(&mut self, protected: bool) {
-        self.protected = protected;
     }
 
     /// The codec bytes.
@@ -1365,29 +1401,9 @@ impl CompressedAudioFrame {
         &self.bytes
     }
 
-    /// The codec.
-    pub fn codec(&self) -> AudioCodec {
-        self.codec
-    }
-
-    /// Whether the stream is protected.
-    pub fn is_protected(&self) -> bool {
-        self.protected
-    }
-
-    /// Sample rate in hertz.
-    pub fn sample_rate(&self) -> u32 {
-        self.parameters.sample_rate
-    }
-
-    /// Number of channels.
-    pub fn num_channels(&self) -> u32 {
-        self.parameters.num_channels
-    }
-
-    /// Samples per channel the frame decodes to.
-    pub fn num_samples(&self) -> u32 {
-        self.parameters.num_samples
+    /// The codec and audio format.
+    pub fn format(&self) -> AudioPacketFormat {
+        self.format
     }
 
     /// When the sender submitted a received frame, as the SDK recorded it;
@@ -1404,9 +1420,7 @@ impl CompressedAudioFrame {
     /// A native descriptor that lends this frame's bytes and metadata to the
     /// SDK; see [`CompressedVideoFrame::raw`].
     pub(crate) fn raw(&mut self) -> NDIlib_audio_frame_v3_t {
-        let mut raw = self
-            .parameters
-            .descriptor(self.codec, self.protected, &self.extras);
+        let mut raw = self.format.descriptor(&self.extras);
         raw.p_data = self.bytes.as_mut_ptr().cast();
         // Validation bounds the length by MAX_PACKET_BYTES, below i32::MAX.
         raw.__bindgen_anon_1.data_size_in_bytes = self.bytes.len() as i32;
@@ -1414,15 +1428,13 @@ impl CompressedAudioFrame {
     }
 }
 
-fn validate_audio_for_send(
-    codec: AudioCodec,
-    parameters: AudioParameters,
-    bytes: &[u8],
-) -> Result<()> {
+fn validate_audio_for_send(format: AudioPacketFormat, bytes: &[u8]) -> Result<()> {
     validate_audio_size(bytes)?;
-    codec.validate_for_send(parameters, bytes, bytes.len(), |offset| {
-        bytes.get(offset..)?.first_chunk().copied()
-    })
+    format
+        .codec
+        .validate_for_send(format, bytes, bytes.len(), |offset| {
+            bytes.get(offset..)?.first_chunk().copied()
+        })
 }
 
 fn validate_audio_size(bytes: &[u8]) -> Result<()> {
@@ -1683,37 +1695,6 @@ const _: () = {
 pub(crate) mod testing {
     use super::*;
 
-    /// Payload size may change only the numeric extents of bounded summaries.
-    pub(crate) fn assert_bounded_debug(small: &[String], large: &[String]) {
-        fn without_counts(text: &str) -> String {
-            let mut previous_digit = false;
-            text.chars()
-                .filter_map(|character| {
-                    let digit = character.is_ascii_digit();
-                    let emit = !digit || !previous_digit;
-                    previous_digit = digit;
-                    emit.then_some(if digit { '#' } else { character })
-                })
-                .collect()
-        }
-        assert_eq!(small.len(), large.len());
-        for (small, large) in small.iter().zip(large) {
-            for text in [small, large] {
-                assert!(
-                    text.len() < 1024,
-                    "unbounded packet Debug: {} bytes",
-                    text.len()
-                );
-                assert!(
-                    !text.contains("0x"),
-                    "packet Debug contains an address: {text}"
-                );
-            }
-            assert_ne!(small, large, "packet Debug omitted its payload extent");
-            assert_eq!(without_counts(small), without_counts(large));
-        }
-    }
-
     /// A two-byte AAC-LC AudioSpecificConfig for an indexed sample rate and a
     /// channel count the configuration can name.
     pub(crate) fn aac_config(sample_rate: u32, channels: u32) -> [u8; 2] {
@@ -1813,8 +1794,11 @@ mod tests {
                     AudioCodec::Aac => (1024, aac_packet(48_000, 2, &vec![7; size])),
                     AudioCodec::Opus => (960, vec![7; size]),
                 };
-                let mut audio =
-                    CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes.clone()).unwrap();
+                let mut audio = CompressedAudioFrame::new(
+                    AudioPacketFormat::new(codec, 48_000, 2, samples).unwrap(),
+                    bytes.clone(),
+                )
+                .unwrap();
                 let raw = audio.raw();
                 // SAFETY: audio owns the readable descriptor storage until
                 // the synthetic non-owning receive guard is dropped.
@@ -1829,10 +1813,7 @@ mod tests {
                     );
                 }
                 let scatter = ScatterAudioFrame::new(
-                    codec,
-                    48_000,
-                    2,
-                    samples,
+                    AudioPacketFormat::new(codec, 48_000, 2, samples).unwrap(),
                     vec![bytes[..44].to_vec(), bytes[44..].to_vec()],
                 )
                 .unwrap();
@@ -1851,17 +1832,19 @@ mod tests {
             result
         }
 
-        assert_bounded_debug(&summaries(1024), &summaries(1024 * 1024));
+        crate::test_support::assert_bounded_debug(&summaries(1024), &summaries(1024 * 1024));
     }
 
     fn aac(sample_rate: u32, channels: u32, samples: u32, packet: Vec<u8>) -> Result<()> {
-        CompressedAudioFrame::new(AudioCodec::Aac, sample_rate, channels, samples, packet)
+        let format = AudioPacketFormat::new(AudioCodec::Aac, sample_rate, channels, samples)?;
+        CompressedAudioFrame::new(format, packet)
             .map(drop)
             .map_err(Rejected::into_error)
     }
 
     fn opus(sample_rate: u32, channels: u32, samples: u32) -> Result<()> {
-        CompressedAudioFrame::new(AudioCodec::Opus, sample_rate, channels, samples, vec![1; 8])
+        let format = AudioPacketFormat::new(AudioCodec::Opus, sample_rate, channels, samples)?;
+        CompressedAudioFrame::new(format, vec![1; 8])
             .map(drop)
             .map_err(Rejected::into_error)
     }
@@ -1949,9 +1932,12 @@ mod tests {
                     bytes[*offset..*offset + 4].copy_from_slice(&value.to_ne_bytes());
                 }
                 let send = if audio {
-                    CompressedAudioFrame::new(AudioCodec::Aac, 48_000, 2, 1024, bytes.clone())
-                        .map(drop)
-                        .map_err(Rejected::into_error)
+                    CompressedAudioFrame::new(
+                        AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
+                        bytes.clone(),
+                    )
+                    .map(drop)
+                    .map_err(Rejected::into_error)
                 } else {
                     CompressedVideoFrame::new(h264_format(), bytes.clone())
                         .map(drop)
@@ -1964,9 +1950,12 @@ mod tests {
                         bytes[ENVELOPE_HEADER_BYTES..].to_vec(),
                     ];
                     let scatter = if audio {
-                        ScatterAudioFrame::new(AudioCodec::Aac, 48_000, 2, 1024, blocks)
-                            .map(drop)
-                            .map_err(Rejected::into_error)
+                        ScatterAudioFrame::new(
+                            AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
+                            blocks,
+                        )
+                        .map(drop)
+                        .map_err(Rejected::into_error)
                     } else {
                         ScatterVideoFrame::new(h264_format(), blocks)
                             .map(drop)
@@ -1979,22 +1968,21 @@ mod tests {
                     );
                 }
                 // SAFETY: both descriptors refer to this live bytes allocation.
-                let received =
-                    unsafe {
-                        if audio {
-                            let mut raw = AudioParameters::new(48_000, 2, 1024)
-                                .unwrap()
-                                .descriptor(AudioCodec::Aac, false, &FrameExtras::default());
-                            raw.p_data = bytes.as_ptr().cast_mut();
-                            raw.__bindgen_anon_1.data_size_in_bytes = bytes.len() as i32;
-                            copy_audio_packet(&raw).map(drop)
-                        } else {
-                            let mut raw = h264_format().raw();
-                            raw.p_data = bytes.as_ptr().cast_mut();
-                            raw.__bindgen_anon_1.data_size_in_bytes = bytes.len() as i32;
-                            copy_video_packet(&raw).map(drop)
-                        }
-                    };
+                let received = unsafe {
+                    if audio {
+                        let mut raw = AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024)
+                            .unwrap()
+                            .descriptor(&FrameExtras::default());
+                        raw.p_data = bytes.as_ptr().cast_mut();
+                        raw.__bindgen_anon_1.data_size_in_bytes = bytes.len() as i32;
+                        copy_audio_packet(&raw).map(drop)
+                    } else {
+                        let mut raw = h264_format().raw();
+                        raw.p_data = bytes.as_ptr().cast_mut();
+                        raw.__bindgen_anon_1.data_size_in_bytes = bytes.len() as i32;
+                        copy_video_packet(&raw).map(drop)
+                    }
+                };
                 if *receive_accepts {
                     assert!(
                         received.is_ok(),
@@ -2233,15 +2221,22 @@ mod tests {
                     AudioCodec::Aac => (1024, testing::aac_packet(48_000, 2, &[1, 2])),
                     AudioCodec::Opus => (960, vec![1, 2]),
                 };
-                let mut frame =
-                    CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes).unwrap();
-                frame.set_protected(protected);
+                let mut frame = CompressedAudioFrame::new(
+                    AudioPacketFormat::new(codec, 48_000, 2, samples).unwrap(),
+                    bytes,
+                )
+                .unwrap();
+                frame.format = frame.format.with_protected(protected);
                 let raw = frame.raw();
                 // SAFETY: frame retains all descriptor storage until the
                 // synthetic non-owning guard is dropped.
                 let guard = unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
                 let borrowed = CompressedAudioRef::new(guard).unwrap();
                 let received = borrowed.to_owned();
+                assert_eq!(borrowed.format(), frame.format());
+                assert_eq!(received.format(), borrowed.format());
+                let sendable = CompressedAudioFrame::try_from(received.clone()).unwrap();
+                assert_eq!(sendable.format(), borrowed.format());
                 let expected = (codec == AudioCodec::Aac)
                     .then(|| PacketEnvelope::parse(frame.data()).unwrap());
                 assert_eq!(frame.envelope(), expected);
@@ -2249,6 +2244,46 @@ mod tests {
                 assert_eq!(received.envelope(), expected);
             }
         }
+    }
+
+    #[test]
+    fn audio_packet_formats_validate_quantities_and_preserve_protection() {
+        fn value_traits<T: Copy + Eq + std::hash::Hash + Send + Sync>() {}
+        value_traits::<AudioPacketFormat>();
+        let max = i32::MAX as u32;
+        let format = AudioPacketFormat::new(AudioCodec::Opus, max, max, max).unwrap();
+        assert_eq!(
+            (
+                format.sample_rate(),
+                format.num_channels(),
+                format.num_samples()
+            ),
+            (max, max, max)
+        );
+        for (sample_rate, channels, samples) in [
+            (0, 2, 960),
+            (48_000, 0, 960),
+            (48_000, 2, 0),
+            (max + 1, 2, 960),
+            (48_000, max + 1, 960),
+            (48_000, 2, max + 1),
+        ] {
+            assert!(matches!(
+                AudioPacketFormat::new(AudioCodec::Opus, sample_rate, channels, samples),
+                Err(Error::InvalidFrame(
+                    crate::FrameDefect::CompressedAudioQuantities { .. }
+                ))
+            ));
+        }
+        let format = AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap();
+        assert!(!format.is_protected());
+        assert!(format.with_protected(true).is_protected());
+        assert_eq!(format.with_protected(true).with_protected(false), format);
+        let protected = format.with_protected(true);
+        assert_eq!(
+            AudioPacketFormat::from_sdk(&protected.descriptor(&FrameExtras::default())).unwrap(),
+            protected
+        );
     }
 
     /// The dimensions of a format the caller describes are input; those of a
@@ -2349,15 +2384,13 @@ mod tests {
         let rejected = CompressedVideoFrame::new(h264_format(), vec![7; 20]).unwrap_err();
         assert_eq!(rejected.into_inner(), vec![7; 20]);
 
-        for (sample_rate, channels) in [(0, 2), (48_000, i32::MAX.unsigned_abs() + 1)] {
-            let rejected =
-                CompressedAudioFrame::new(AudioCodec::Opus, sample_rate, channels, 960, vec![1, 2])
-                    .unwrap_err();
-            assert!(
-                matches!(rejected.error(), Error::InvalidFrame(reason) if matches!(reason, crate::FrameDefect::CompressedAudioQuantities {..}))
-            );
-            assert_eq!(rejected.into_inner(), [1, 2]);
-        }
+        let format = AudioPacketFormat::new(AudioCodec::Opus, 44_100, 2, 960).unwrap();
+        let rejected = CompressedAudioFrame::new(format, vec![1, 2]).unwrap_err();
+        assert!(matches!(
+            rejected.error(),
+            Error::InvalidFrame(crate::FrameDefect::OpusSampleRate)
+        ));
+        assert_eq!(rejected.into_inner(), [1, 2]);
 
         let mut frame = CompressedVideoFrame::new(
             h264_format().with_tier(StreamTier::Preview),
@@ -2441,17 +2474,21 @@ mod tests {
     #[test]
     fn protected_aac_preserves_codec_high_bit() {
         let bytes = aac_packet(48_000, 2, &[1]);
-        let mut frame = CompressedAudioFrame::new(AudioCodec::Aac, 48_000, 2, 1024, bytes).unwrap();
-        frame.set_protected(true);
+        let mut frame = CompressedAudioFrame::new(
+            AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
+            bytes,
+        )
+        .unwrap();
+        frame.format = frame.format.with_protected(true);
         let raw = frame.raw();
         let copied = unsafe { copy_audio_packet(&raw) }.unwrap();
-        assert_eq!(copied.codec(), AudioCodec::Aac);
-        assert!(copied.is_protected());
+        assert_eq!(copied.format().codec(), AudioCodec::Aac);
+        assert!(copied.format().is_protected());
         assert_eq!(
             (
-                copied.sample_rate(),
-                copied.num_channels(),
-                copied.num_samples()
+                copied.format().sample_rate(),
+                copied.format().num_channels(),
+                copied.format().num_samples()
             ),
             (48_000, 2, 1024)
         );
@@ -2481,8 +2518,11 @@ mod tests {
     /// whatever its bytes.
     #[test]
     fn delivered_audio_parameters_are_validated_before_they_become_unsigned() {
-        let mut frame =
-            CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8]).unwrap();
+        let mut frame = CompressedAudioFrame::new(
+            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+            vec![1; 8],
+        )
+        .unwrap();
         let raw = frame.raw();
         for (sample_rate, no_channels, no_samples) in
             [(0, 2, 960), (48_000, -2, 960), (48_000, 2, 0)]
@@ -2533,7 +2573,11 @@ mod tests {
 
             let mut audio = aac_packet(48_000, 2, &[1]);
             stamp(&mut audio, value);
-            let frame = CompressedAudioFrame::new(AudioCodec::Aac, 48_000, 2, 1024, audio).unwrap();
+            let frame = CompressedAudioFrame::new(
+                AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
+                audio,
+            )
+            .unwrap();
             ReceivedAudioPacket::from(frame.clone())
                 .validate_for_send()
                 .unwrap();
@@ -2656,13 +2700,11 @@ mod tests {
         let mut packet = aac_packet(48_000, 2, &[1]);
         packet[FLAGS_OFFSET..FLAGS_OFFSET + 4].copy_from_slice(&0u32.to_ne_bytes());
         let received = ReceivedAudioPacket {
-            codec: AudioCodec::Aac,
-            protected: false,
+            format: AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
             bytes: packet.clone(),
-            parameters: AudioParameters::new(48_000, 2, 1024).unwrap(),
             extras: FrameExtras::default(),
         };
-        assert!(validate_received_audio(received.codec(), received.data()).is_ok());
+        assert!(validate_received_audio(received.format().codec(), received.data()).is_ok());
         assert!(matches!(
             reason(received.validate_for_send()),
             crate::FrameDefect::AacKeyframeMissing
@@ -2807,8 +2849,11 @@ mod tests {
         let received = unsafe { copy_video_packet(&raw) }.unwrap();
         assert_eq!(received.timestamp(), None);
 
-        let mut audio =
-            CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8]).unwrap();
+        let mut audio = CompressedAudioFrame::new(
+            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+            vec![1; 8],
+        )
+        .unwrap();
         audio.set_timecode(Timecode::from_ticks(-5));
         assert_eq!(audio.timecode(), Timecode::from_ticks(-5));
         let delivered = NDIlib_audio_frame_v3_t {
@@ -2837,12 +2882,19 @@ mod tests {
         assert_eq!(copy.data()[RESERVED_OFFSET], 7);
         assert_eq!(frame.data()[RESERVED_OFFSET], 0);
 
-        let mut audio =
-            CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8]).unwrap();
-        audio.set_protected(true);
+        let mut audio = CompressedAudioFrame::new(
+            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+            vec![1; 8],
+        )
+        .unwrap();
+        audio.format = audio.format.with_protected(true);
         let copy = audio.clone();
         assert_eq!(
-            (copy.data(), copy.is_protected(), copy.num_samples()),
+            (
+                copy.data(),
+                copy.format().is_protected(),
+                copy.format().num_samples()
+            ),
             (audio.data(), true, 960)
         );
     }
@@ -2854,8 +2906,11 @@ mod tests {
         assert!(video.p_data.is_null() && video.p_metadata.is_null());
         assert_eq!(video.timestamp, 0);
 
-        let mut frame =
-            CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8]).unwrap();
+        let mut frame = CompressedAudioFrame::new(
+            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+            vec![1; 8],
+        )
+        .unwrap();
         let audio = frame.raw();
         assert_eq!(audio.timecode, NDIlib_send_timecode_synthesize);
         assert_eq!(audio.FourCC, AudioCodec::Opus.outer(false));
@@ -2893,17 +2948,18 @@ mod tests {
             }};
         }
         check!(CompressedVideoFrame::new(h264_format(), h264_packet(false, &[])).unwrap());
-        check!(CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1, 2]).unwrap());
+        check!(CompressedAudioFrame::new(
+            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+            vec![1, 2]
+        )
+        .unwrap());
         check!(super::super::send::ScatterVideoFrame::new(
             h264_format(),
             vec![h264_packet(false, &[])]
         )
         .unwrap());
         check!(super::super::send::ScatterAudioFrame::new(
-            AudioCodec::Opus,
-            48_000,
-            2,
-            960,
+            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![vec![1, 2]]
         )
         .unwrap());

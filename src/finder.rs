@@ -21,7 +21,7 @@ use std::{
 
 use crate::{
     change_feed::ChangeFeed,
-    frames::copy_sdk_string,
+    sdk_copy::copy_sdk_string,
     sys::{self, bindings::*},
     timeout::{Deadline, NeverStop, Stop, POLL_INTERVAL},
     Error, Ndi, ResourceKind, Result,
@@ -181,10 +181,14 @@ pub(crate) fn list_cstring(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FindInstance(NDIlib_find_instance_t);
 
-// SAFETY: the SDK gives finders no thread affinity and allows source-change
-// waits beside snapshot queries. Finder's snapshot lock covers every fetch and
-// copy before another query can invalidate its buffers; its change feed permits
-// only one native waiter. The surrounding Rust fields determine Finder's traits.
+// SAFETY: Processing.NDI.Find.h forbids overlapping current-source snapshots
+// on one instance. Finder's snapshot lock covers every fetch and copy before
+// another snapshot can invalidate its buffers; its change feed permits only one
+// native waiter. Beyond that header contract, we rely on no thread affinity for
+// creation, use and destruction, and on a native wait beside snapshots. Real
+// runtime tests in tests/change_notifications.rs exercise cross-thread use and
+// concurrent waits/snapshots; tests/finder_deadlines.rs pins snapshot contention.
+// The surrounding Rust fields determine Finder's remaining traits.
 unsafe impl Send for FindInstance {}
 // SAFETY: the same snapshot and waiter serialization applies to shared uses.
 unsafe impl Sync for FindInstance {}
@@ -324,6 +328,82 @@ impl SnapshotGuard<'_> {
     }
 }
 
+/// The shared two-step cursor protocol. Workers observe; only the owner commits.
+/// A Cell keeps each cursor Send but not Sync, matching its single consumer.
+pub(crate) struct SourceCursor {
+    observed: Cell<u64>,
+}
+
+/// Evidence that one worker completed an observation. Only the protocol below
+/// can construct it; dropping it leaves the owner's cursor unchanged.
+pub(crate) struct SourceObservation(u64);
+
+impl SourceCursor {
+    pub(crate) fn new(generation: u64) -> Self {
+        Self {
+            observed: Cell::new(generation),
+        }
+    }
+
+    pub(crate) fn observed(&self) -> u64 {
+        self.observed.get()
+    }
+
+    pub(crate) fn commit(&self, observation: Option<SourceObservation>) {
+        if let Some(SourceObservation(generation)) = observation {
+            self.observed.set(generation);
+        }
+    }
+
+    pub(crate) fn snapshot<T>(
+        finder: &Finder,
+        snapshot: impl FnOnce(&Finder) -> Result<T>,
+        completed: impl FnOnce(&T) -> bool,
+    ) -> Result<(T, Option<SourceObservation>)> {
+        Self::observe_snapshot(
+            || finder.changes.generation(),
+            || snapshot(finder),
+            completed,
+        )
+    }
+
+    // Read before copying, but acknowledge only after the owner receives the
+    // result. Reports during copying remain outstanding; failure or an
+    // incomplete internal snapshot creates no observation to commit.
+    fn observe_snapshot<T>(
+        generation: impl FnOnce() -> u64,
+        snapshot: impl FnOnce() -> Result<T>,
+        completed: impl FnOnce(&T) -> bool,
+    ) -> Result<(T, Option<SourceObservation>)> {
+        let observed = generation();
+        let value = snapshot()?;
+        let observation = completed(&value).then_some(SourceObservation(observed));
+        Ok((value, observation))
+    }
+
+    pub(crate) fn wait(
+        finder: &Finder,
+        observed: u64,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> (bool, Option<SourceObservation>) {
+        Self::observe_wait(
+            || finder.changes.generation(),
+            || finder.wait_for_sources_since(observed, deadline, stop),
+        )
+    }
+
+    // A successful wait acknowledges the generation read after its report.
+    fn observe_wait(
+        generation: impl FnOnce() -> u64,
+        wait: impl FnOnce() -> bool,
+    ) -> (bool, Option<SourceObservation>) {
+        let changed = wait();
+        let observation = changed.then(|| SourceObservation(generation()));
+        (changed, observation)
+    }
+}
+
 /// One consumer's cursor over a finder's source-list changes.
 ///
 /// Take snapshots and wait through the same watch, so reports published by
@@ -347,8 +427,7 @@ impl SnapshotGuard<'_> {
 /// ```
 pub struct SourceWatch<'finder> {
     finder: &'finder Finder,
-    // Cell makes a cursor Send but not Sync: one consumer advances it.
-    observed: Cell<u64>,
+    cursor: SourceCursor,
 }
 
 impl fmt::Debug for SourceWatch<'_> {
@@ -393,31 +472,21 @@ impl SourceWatch<'_> {
         )
     }
 
-    // Capture the generation before copying, but acknowledge it only when the
-    // caller receives a snapshot. Reports during copying remain outstanding.
     fn snapshot<T>(
         &mut self,
         snapshot: impl FnOnce(&Finder) -> Result<T>,
         completed: impl FnOnce(&T) -> bool,
     ) -> Result<T> {
-        let observed = self.finder.changes.generation();
-        let value = snapshot(self.finder)?;
-        if completed(&value) {
-            self.observed.set(observed);
-        }
+        let (value, observation) = SourceCursor::snapshot(self.finder, snapshot, completed)?;
+        self.cursor.commit(observation);
         Ok(value)
     }
 
     fn wait_until(&mut self, deadline: Deadline, stop: impl Stop) -> bool {
-        if self
-            .finder
-            .wait_for_sources_since(self.observed.get(), deadline, stop)
-        {
-            self.observed.set(self.finder.changes.generation());
-            true
-        } else {
-            false
-        }
+        let (changed, observation) =
+            SourceCursor::wait(self.finder, self.cursor.observed(), deadline, stop);
+        self.cursor.commit(observation);
+        changed
     }
 }
 
@@ -470,18 +539,19 @@ fn source_pointers(source: &NDIlib_source_t) -> (*const c_char, *const c_char) {
 /// # Safety
 ///
 /// Each non-null pointer must stay readable through its first NUL or
-/// [`crate::frames::MAX_SDK_STRING_BYTES`] bytes, whichever comes first,
+/// [`crate::sdk_copy::MAX_SDK_STRING_BYTES`] bytes, whichever comes first,
 /// until its copy finishes. The copy policy must preserve those lifetimes.
 pub(crate) unsafe fn decode_source(
     name: *const c_char,
     address: *const c_char,
-    mut copy: impl FnMut(*const c_char) -> Result<Option<String>>,
+    mut copy: impl FnMut(*const c_char) -> Result<Option<SourceText>>,
 ) -> Result<Option<Source>> {
     if name.is_null() && address.is_null() {
         return Ok(None);
     }
     let name = if name.is_null() {
-        String::new()
+        // SAFETY: empty bytes are NUL-free.
+        unsafe { SourceText::from_sdk(b"") }?
     } else {
         let Some(name) = copy(name)? else {
             return Ok(None);
@@ -494,9 +564,9 @@ pub(crate) unsafe fn decode_source(
         let Some(address) = copy(address)? else {
             return Ok(None);
         };
-        Some(SourceAddress::new(address)?)
+        Some(SourceAddress(address))
     };
-    Ok(Some(Source::new(name)?.with_optional_address(address)))
+    Ok(Some(Source::from_text(name, address)))
 }
 
 impl Finder {
@@ -663,7 +733,7 @@ impl Finder {
     pub fn watch(&self) -> SourceWatch<'_> {
         SourceWatch {
             finder: self,
-            observed: Cell::new(self.changes.generation()),
+            cursor: SourceCursor::new(self.changes.generation()),
         }
     }
 
@@ -691,7 +761,6 @@ impl Finder {
     /// Concurrent snapshots on this finder are serialized until all source names
     /// and addresses have been copied into owned Rust values.
     ///
-    /// Available since NDI SDK 6.0.
     ///
     /// Each snapshot permits at most 16,384 descriptors and 16 MiB total
     /// native descriptors, result storage, scanned string bytes (including
@@ -867,8 +936,8 @@ impl Finder {
     /// Returns [`Error::ResourceLimit`] if a snapshot exceeds the limits of
     /// [`Self::current_sources`], or distinct results retained across the
     /// whole window exceed 16,384 entries or 16 MiB. The retained byte budget
-    /// counts both copies of each source in the result vector and the
-    /// deduplication set, including their strings and container capacity.
+    /// counts shared source strings once, plus the storage of both the result
+    /// vector and the deduplication set, including container capacity.
     ///
     /// # Examples
     ///
@@ -950,7 +1019,7 @@ fn accumulate_sources(
                 .as_ref()
                 .map_or(0, |address| address.0.storage_bytes());
         let bytes = retained_bytes
-            .checked_add(text_bytes * 2)
+            .checked_add(text_bytes)
             .ok_or_else(|| budget::limit(ResourceKind::FinderDiscoveryBytes, budget::MAX_BYTES))?;
         // Check before growing either container or copying strings. Round
         // up for vector growth, hash buckets and control bytes; the actual
@@ -1179,14 +1248,52 @@ pub struct SourceAddress(SourceText);
 /// Validated UTF-8 with exactly one trailing NUL, shared by descriptors and
 /// their native borrowers. All SDK pointers lead into this immutable storage.
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct SourceText(Arc<CString>);
+pub(crate) struct SourceText(Arc<CString>);
 
 impl SourceText {
-    fn new(text: String) -> Result<Self> {
+    // Shared CString storage adds its Arc header, the CString and one NUL.
+    pub(crate) const STORAGE_OVERHEAD: usize =
+        2 * std::mem::size_of::<usize>() + std::mem::size_of::<CString>() + 1;
+
+    /// Copy bounded SDK bytes directly into their final shared native storage.
+    ///
+    /// # Safety
+    /// `bytes` must contain no NUL, as guaranteed by a bounded SDK string scan.
+    pub(crate) unsafe fn from_sdk(bytes: &[u8]) -> Result<Self> {
+        let mut text = String::new();
+        if let Ok(valid) = std::str::from_utf8(bytes) {
+            text.try_reserve_exact(valid.len() + 1)
+                .map_err(|_| budget::allocation_failed())?;
+            text.push_str(valid);
+        } else {
+            let lossy = crate::sdk_copy::LossyText::new(bytes);
+            text.try_reserve_exact(lossy.len() + 1)
+                .map_err(|_| budget::allocation_failed())?;
+            lossy.push_to(&mut text);
+        }
+        // SAFETY: the caller's bounded scan excluded NUL; UTF-8 replacement
+        // introduces none. The only terminator is appended below.
+        Ok(unsafe { Self::from_nul_free_string(text) })
+    }
+
+    /// Keep generated text whose NUL-free invariant is already established.
+    ///
+    /// # Safety
+    /// `text` must contain no NUL.
+    pub(crate) unsafe fn from_nul_free_string(text: String) -> Self {
+        let mut bytes = text.into_bytes();
+        bytes.push(0);
+        // SAFETY: the caller excludes interior NUL and we appended the sole NUL.
+        Self(Arc::new(unsafe {
+            CString::from_vec_with_nul_unchecked(bytes)
+        }))
+    }
+
+    pub(crate) fn new(text: String) -> Result<Self> {
         Ok(Self(Arc::new(CString::new(text)?)))
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         // SAFETY: the CString was constructed from a String, and its immutable
         // shared backing cannot change after construction.
         unsafe { std::str::from_utf8_unchecked(self.0.as_bytes()) }
@@ -1197,9 +1304,7 @@ impl SourceText {
     }
 
     fn storage_bytes(&self) -> usize {
-        self.0.as_bytes_with_nul().len()
-            + 2 * std::mem::size_of::<usize>()
-            + std::mem::size_of::<CString>()
+        self.0.as_bytes().len() + Self::STORAGE_OVERHEAD
     }
 }
 
@@ -1210,6 +1315,10 @@ impl fmt::Debug for SourceText {
 }
 
 impl SourceAddress {
+    pub(crate) fn from_text(text: SourceText) -> Self {
+        Self(text)
+    }
+
     /// Keep the opaque address text unchanged after checking its native form.
     ///
     /// # Errors
@@ -1348,6 +1457,10 @@ impl RawSource {
 }
 
 impl Source {
+    pub(crate) fn from_text(name: SourceText, address: Option<SourceAddress>) -> Self {
+        Self { name, address }
+    }
+
     /// The source named `name`, without an address.
     ///
     /// # Errors
@@ -1358,11 +1471,6 @@ impl Source {
             name: SourceText::new(name.into())?,
             address: None,
         })
-    }
-
-    fn with_optional_address(mut self, address: Option<SourceAddress>) -> Self {
-        self.address = address;
-        self
     }
 
     /// This source, at `address`.
@@ -1482,7 +1590,8 @@ impl Source {
     /// Returns [`Error::NativeOperationFailed`] naming the call's function when the
     /// descriptor is null, or names neither a source nor an address, and
     /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
-    /// the 4 MiB one SDK string may be.
+    /// the 4 MiB one SDK string may be. [`Error::AllocationFailed`] when the
+    /// source text storage cannot be reserved.
     ///
     /// # Safety
     ///
@@ -1625,6 +1734,21 @@ impl CacheState {
 }
 
 impl SourceCache {
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn cached_sources(&self, query: HostQuery<'_>) -> Result<Option<Vec<Source>>> {
+        self.entries
+            .probe(query, copy_sources)
+            .map(|(_, sources, _)| sources)
+    }
+
+    #[cfg(all(test, any(feature = "tokio", feature = "smol")))]
+    pub(crate) fn seed_for_test(&self, host: &str, sources: Vec<Source>) {
+        let key = HostKeyBuffer::new(HostQuery::checked(host).unwrap())
+            .into_owned()
+            .unwrap();
+        self.entries.publish(Some(0), key, Arc::new(sources));
+    }
+
     /// Create an empty cache owning `finder` and its discovery configuration.
     ///
     /// This moves the finder without allocating, cloning or making an SDK call.
@@ -1668,8 +1792,9 @@ impl SourceCache {
     ///
     /// A cache hit returns owned descriptor copies without an SDK call. On a
     /// miss, observes the full window using the configured finder; zero makes
-    /// one non-waiting snapshot attempt. Results retain first-observed order and distinguish names,
-    /// full address text. Select the desired feed explicitly.
+    /// one non-waiting snapshot attempt. Results keep first-observed order, and
+    /// sources that differ in name or full address text are distinct. Select the
+    /// desired feed explicitly.
     /// Empty results return an empty vector and are not retained.
     ///
     /// Discovery runs outside the cache lock; its window includes snapshot-lock
@@ -1752,7 +1877,7 @@ impl SourceCache {
         self.entries.clear();
     }
 
-    /// Number of cached host identities, including every feed in each identity.
+    /// Number of cached host result sets; each holds every feed observed for its host.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -1782,6 +1907,25 @@ fn copy_sources(sources: &[Source]) -> Result<Vec<Source>> {
 }
 
 impl CachedSources {
+    /// Clone the map entry under the short lock, then copy descriptors outside it.
+    /// The miss generation belongs to the same lookup used for publication.
+    fn probe(
+        &self,
+        query: HostQuery<'_>,
+        copy: impl FnOnce(&[Source]) -> Result<Vec<Source>>,
+    ) -> Result<(HostKeyBuffer, Option<Vec<Source>>, Option<u64>)> {
+        let key = HostKeyBuffer::new(query);
+        let (snapshot, generation) = {
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (cache.entries.get(key.as_str()).cloned(), cache.generation)
+        };
+        let sources = snapshot.map(|snapshot| copy(&snapshot)).transpose()?;
+        Ok((key, sources, generation))
+    }
+
     fn find_sources_by_host_with(
         &self,
         query: HostQuery<'_>,
@@ -1798,16 +1942,9 @@ impl CachedSources {
         discover: impl FnOnce(HostQuery<'_>, Deadline) -> Result<Vec<Source>>,
         mut copy: impl FnMut(&[Source]) -> Result<Vec<Source>>,
     ) -> Result<Vec<Source>> {
-        let key = HostKeyBuffer::new(query);
-        let (snapshot, generation) = {
-            let cache = self
-                .cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (cache.entries.get(key.as_str()).cloned(), cache.generation)
-        };
-        if let Some(snapshot) = snapshot {
-            return copy(&snapshot);
+        let (key, sources, generation) = self.probe(query, &mut copy)?;
+        if let Some(sources) = sources {
+            return Ok(sources);
         }
         // SDK waits and user discovery run outside the cache mutex. Invalidation
         // changes the generation, so an old result cannot repopulate the cache.
@@ -1924,6 +2061,93 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn source_cursor_commits_only_completed_observations_in_protocol_order() {
+        let cursor = SourceCursor::new(1);
+        let generation = Cell::new(10);
+        let (_, observation) = SourceCursor::observe_snapshot(
+            || generation.get(),
+            || {
+                generation.set(11);
+                Ok(())
+            },
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(cursor.observed(), 1, "a worker cannot commit its result");
+        cursor.commit(observation);
+        assert_eq!(cursor.observed(), 10, "snapshot observes before copying");
+
+        let failed = SourceCursor::observe_snapshot(
+            || generation.get(),
+            || Err::<(), _>(Error::InvalidInput(crate::InputDefect::InvalidHostQuery)),
+            |_| true,
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            cursor.observed(),
+            10,
+            "failure does not acknowledge a report"
+        );
+        let (_, incomplete) =
+            SourceCursor::observe_snapshot(|| generation.get(), || Ok(None::<()>), Option::is_some)
+                .unwrap();
+        cursor.commit(incomplete);
+        assert_eq!(
+            cursor.observed(),
+            10,
+            "an incomplete internal copy is not success"
+        );
+
+        let (changed, observation) = SourceCursor::observe_wait(
+            || generation.get(),
+            || {
+                generation.set(12);
+                true
+            },
+        );
+        assert!(changed);
+        assert_eq!(cursor.observed(), 10);
+        cursor.commit(observation);
+        assert_eq!(cursor.observed(), 12, "wait observes after its report");
+        let (changed, observation) = SourceCursor::observe_wait(
+            || panic!("an unchanged wait has no generation to acknowledge"),
+            || false,
+        );
+        assert!(!changed);
+        cursor.commit(observation);
+        assert_eq!(cursor.observed(), 12);
+        let (_, abandoned) = SourceCursor::observe_snapshot(|| 13, || Ok(()), |_| true).unwrap();
+        let _ = abandoned; // A dropped async future never calls commit.
+        assert_eq!(cursor.observed(), 12);
+    }
+
+    #[test]
+    fn discovery_window_charges_shared_source_strings_once() {
+        let source = Source::new("HOST (Camera)")
+            .unwrap()
+            .with_address(SourceAddress::new("192.0.2.7:5961").unwrap());
+        let expected =
+            source.name.storage_bytes() + source.address.as_ref().unwrap().0.storage_bytes();
+        let mut discovered = Vec::new();
+        let mut seen = HashSet::new();
+        let mut retained = 0;
+        accumulate_sources(
+            &mut discovered,
+            &mut seen,
+            &mut retained,
+            vec![source.clone()],
+        )
+        .unwrap();
+        assert_eq!(retained, expected);
+        assert!(Arc::ptr_eq(
+            &discovered[0].name.0,
+            &seen.get(&source).unwrap().name.0
+        ));
+        accumulate_sources(&mut discovered, &mut seen, &mut retained, vec![source]).unwrap();
+        assert_eq!(retained, expected, "duplicates add no storage");
+    }
 
     #[test]
     fn cache_discovery_retains_the_deadline_that_precedes_the_lookup() {
@@ -2257,7 +2481,7 @@ mod tests {
         let (watch, allocations) = crate::test_alloc::allocation_count(|| finder.watch());
         assert_eq!(allocations, 0);
         assert!(std::ptr::eq(watch.finder, &finder));
-        assert_eq!(watch.observed.get(), 0);
+        assert_eq!(watch.cursor.observed(), 0);
     }
 
     #[test]
@@ -2931,7 +3155,7 @@ mod tests {
         let ip = c"192.0.2.1:5960".as_ptr();
         let url = c"ndi://camera.local:5960".as_ptr();
         let empty = c"".as_ptr();
-        let unterminated = vec![b'x'; crate::frames::MAX_SDK_STRING_BYTES];
+        let unterminated = vec![b'x'; crate::sdk_copy::MAX_SDK_STRING_BYTES];
         let malformed = unterminated.as_ptr().cast();
         let cases = [
             (
@@ -3057,7 +3281,7 @@ mod tests {
 
     #[test]
     fn source_strings_are_bounded_by_the_sdk_string_limit() {
-        use crate::frames::MAX_SDK_STRING_BYTES;
+        use crate::sdk_copy::MAX_SDK_STRING_BYTES;
         // The longest name that fits: its terminator is the last byte the
         // scan may read. One byte longer, the terminator lies past the limit.
         let mut longest = vec![b'x'; MAX_SDK_STRING_BYTES];
@@ -3102,7 +3326,7 @@ mod tests {
             return;
         };
         let finder = Finder::new(&ndi, &FinderOptions::default()).unwrap();
-        let mut too_long = vec![b'x'; crate::frames::MAX_SDK_STRING_BYTES + 1];
+        let mut too_long = vec![b'x'; crate::sdk_copy::MAX_SDK_STRING_BYTES + 1];
         *too_long.last_mut().unwrap() = 0;
         let named = |name: *const std::ffi::c_char| NDIlib_source_t {
             p_ndi_name: name,

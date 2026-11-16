@@ -35,9 +35,11 @@
 //!
 //! Windows and macOS never add the working directory to this search. Relative
 //! or empty `PATH`/`DYLD_LIBRARY_PATH` entries are recorded as refused locations.
-//! On macOS, any relative or empty `DYLD_LIBRARY_PATH` entry refuses the whole
-//! default search before opening a library: dyld applies these overrides even
-//! to absolute and `@rpath` requests. Explicit paths retain dyld's own policy.
+//! On macOS, a relative or empty entry in either `DYLD_LIBRARY_PATH` or
+//! `DYLD_FALLBACK_LIBRARY_PATH` refuses the entire default search before opening
+//! a library. The check reads the process environment at search time; dyld uses
+//! its launch-time values, so changing `DYLD_*` after launch is unsupported.
+//! Explicit paths retain dyld's own policy.
 //! In unrestricted macOS processes dyld can substitute `DYLD_LIBRARY_PATH`
 //! even for an absolute path; the crate refuses a substitute with
 //! [`crate::LoadRefusal::ResolvedToAnotherFile`]. Native dependencies still
@@ -101,10 +103,11 @@
 //!
 //! # Limits of the NDI 6.4 File library
 //!
-//! These were observed with the NDI 6.4 File library. They lie inside the
-//! library and this crate cannot correct them.
+//! These limits apply to the versions and platforms named below. They lie
+//! inside the library and this crate cannot correct them.
 //!
-//! * **A file reported closed is not proof that its data was written.** A
+//! * **On Linux with the NDI 6.4 File library, a file reported closed is not
+//!   proof that its data was written.** A
 //!   session's report repeats what the library said: that it finalized each
 //!   file. When the disk fills while a session is being stopped, a write comes
 //!   up short, the library extends the file all the same and reports it closed
@@ -113,24 +116,28 @@
 //!   errors therefore means that the container was finalized, not that every
 //!   frame reached the disk. A recording that must be complete has to be
 //!   checked by reading it back.
-//! * **The process does not survive a full disk during recording.** When a
+//! * **On Linux with the NDI 6.4 File library, the process does not survive a
+//!   full disk during recording.** When a
 //!   write fails while a session is recording, the library queues a
 //!   write-failed and an error event and then crashes in its own writer
 //!   thread, which ends the process. Nothing this crate does can prevent it.
 //!   Record only where enough space is certain.
-//! * **A file can be closed with nothing in it.** The library opens a file as
+//! * **On Linux with the NDI 6.4 File library, a file can be closed with
+//!   nothing in it.** The library opens a file as
 //!   soon as a session or a rollover starts, and reports it closed even if no
 //!   frame arrived: after a stop before the source delivered anything, a
 //!   switch to a source that is not there, or a rollover while the source is
 //!   lost. [`RecordingReport::empty_files`] counts these files.
-//! * **A rollover the library cannot carry out ends the session.** It accepts
+//! * **On Linux with the NDI 6.4 File library, a rollover the library cannot
+//!   carry out ends the session.** It accepts
 //!   the request, fails to open the new file, closes the old one and stops.
 //!   [`FileRecorder::rollover`] checks the file its pattern names first, so a
 //!   missing directory or an exact file name that already exists is refused
 //!   and the session goes on; a file that cannot be opened for another reason
 //!   still ends it. An exact file name cannot roll over by itself at all; see
 //!   [`FileNaming::Exact`].
-//! * **Recording paths must be reportable exactly.** Start and rollover
+//! * **On every platform with the NDI 6.4 File library, recording paths must
+//!   be reportable exactly.** Start and rollover
 //!   preflight refuse absolute output paths above 4094 UTF-8 bytes with the
 //!   current SDK, reserving at least 20 digits for each index token's growth.
 //!   This keeps closure events unambiguous, so a finalized session can close
@@ -322,8 +329,8 @@ impl FileApi {
     ///   the rest of the crate keeps working.
     /// * [`Error::RuntimeConflict`] when the selected NDI runtime is not one
     ///   the File library can accompany, or `options` names a library other
-    ///   than the one already selected. [`crate::SelectionConflict`] identifies
-    ///   the cause; `detail` retains the diagnostic context.
+    ///   than the one already selected. [`crate::SelectionFailure::kind`] names
+    ///   the [`crate::SelectionConflict`]; its `Display` gives the diagnostic text.
     /// * [`Error::InvalidInput`] when `options` names a relative path.
     pub fn new(ndi: &Ndi, options: &FileApiOptions) -> Result<Self> {
         let runtime = sys::select_file(
@@ -339,8 +346,9 @@ impl FileApi {
         })
     }
 
-    /// The file the library was loaded from, or `None` when the SDK is linked
-    /// statically.
+    /// Canonical loaded file, with links resolved, or `None` for a linked SDK.
+    /// Uses the platform's ordinary path form; Windows extended syntax is kept
+    /// only when needed to express the same file.
     pub fn library_path(&self) -> Option<&Path> {
         self.runtime.path()
     }

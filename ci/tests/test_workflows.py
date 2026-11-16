@@ -5,11 +5,13 @@ comply, and on a list of plausible wrong edits, each of which it must report.
 actionlint, in the same job, checks that the files are valid workflows at all.
 """
 import copy
+import os
 from pathlib import Path
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import tomllib
 import unittest
 
@@ -105,6 +107,12 @@ def violations(texts):
             pinned = [used] if isinstance(used, str) else [re.sub(r'@[0-9a-f]{40}$', '', action) for action in used]
             found += differs(f'{name}: actions of {job}, each pinned to a commit',
                              pinned[0] if isinstance(used, str) else pinned, ACTIONS[name].get(job))
+            for step in body.get('steps', []):
+                if step.get('uses', '').startswith('dtolnay/rust-toolchain@'):
+                    pinned_release = tomllib.loads((ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel']
+                    if not re.fullmatch(r'\d+\.\d+\.\d+', pinned_release):
+                        found.append('rust-toolchain.toml: contributor toolchain is not an exact release')
+                    found += differs(f'{name}: toolchain of {job}', step.get('with', {}).get('toolchain'), pinned_release)
             if 'runs-on' in body and not re.fullmatch(r'\d+', body.get('timeout-minutes', '')):
                 found.append(f'{name}: {job} has no timeout')
     return (found + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
@@ -122,7 +130,7 @@ def docs_violations(docs):
             + differs('rust.yml: deployment environment', deploy.get('environment'),
                       {'name': 'github-pages', 'url': '${{ steps.deployment.outputs.page_url }}'})
             + differs('rust.yml: deployment scripts', [step for step in deploy['steps'] if 'run' in step], [])
-            + rustdoc_feature_violations(jobs['lint']['steps']))
+            + rustdoc_feature_violations(jobs['lint']['steps']) + implementation_coverage_violations(docs))
 
 
 def rustdoc_feature_violations(steps):
@@ -145,6 +153,24 @@ def rustdoc_feature_violations(steps):
     return found
 
 
+def implementation_coverage_violations(rust):
+    """Real Advanced code and both compatibility editions must be checked."""
+    named = {step.get('name'): step for step in rust['jobs']['sdk']['steps']}
+    advanced = named.get('Lint and document the Advanced implementation', {}).get('run', '')
+    found = []
+    for command in ('rustup toolchain install 1.88.0 --profile minimal --target "$TARGET"',
+                    'cargo +1.88.0 check --locked --all-targets --target "$TARGET" --all-features'):
+        if command not in advanced:
+            found.append('rust.yml: Advanced implementation has no MSRV check with installed headers')
+    for name in ('Current Advanced headers with baseline runtimes',
+                 'Baseline SDK builds with the current Advanced runtime'):
+        script = named.get(name, {}).get('run', '')
+        for required in ('failed=0', '--all-features || failed=1', 'exit "$failed"'):
+            if required not in script:
+                found.append(f'rust.yml: {name} does not accumulate compatibility failures')
+    return found
+
+
 def memory_checker_violations(rust):
     """Both interpreters and live padding checks must fail required jobs."""
     jobs = rust['jobs']
@@ -163,7 +189,10 @@ def memory_checker_violations(rust):
     if 'cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,image-encoding,tokio "$filter"' not in run:
         found.append('rust.yml: Miri does not execute the selected synthetic fixtures')
     for fixture in ('frames::tests::video_padding_all_formats', 'frames::tests::video_padding_encoders',
-                    'receiver::mixed_tests', 'asynchronous::scoped_tests', 'advanced::send_slots::tests::'):
+                    'receiver::mixed_tests', 'asynchronous::scoped_tests', 'advanced::send_slots::tests::',
+                    'advanced::aliasable::tests::', 'advanced::packets::received::tests::',
+                    'advanced::queued::boundary_tests::', 'sender::in_flight::tests::',
+                    'advanced::send::tests::', 'advanced::queued::tests::', 'sender::tests::'):
         if fixture not in run:
             found.append(f'rust.yml: Miri omits {fixture}')
 
@@ -182,9 +211,16 @@ def memory_checker_violations(rust):
         if owner not in jobs['required-ci'].get('needs', []):
             found.append(f'rust.yml: {owner} Memcheck is not required')
     for required in ('--trace-children=yes', '--trace-children-skip=', '--test mixed_capture_boundary',
-                     '--test frame_metadata_boundary', '--lib frames::tests::video_padding_encoders'):
+                     '--test frame_metadata_boundary', 'filters=(frames::tests::video_padding_encoders)'):
         if required not in test.get('run', ''):
             found.append('rust.yml: scripted Memcheck omits active SDK-free fixtures or their child processes')
+    for owner, command in (('Miri', run), ('scripted Memcheck', test.get('run', ''))):
+        for required in ('-- --list "$filter"', "if ! grep -q ': test$'", 'No tests selected for filter: $filter', 'exit 1'):
+            if required not in command:
+                found.append(f'rust.yml: {owner} lacks the empty-selection guard')
+    for required in ('-- --list "$skip"', 'No tests selected for skip: $skip', 'skip_args+=(--skip "$skip")'):
+        if required not in run:
+            found.append('rust.yml: Miri lacks the skip-selection guard')
     for required in ('ci/offline/linux.sh', '--test video_padding_sdk', '--features image-encoding'):
         if required not in sdk.get('run', ''):
             found.append('rust.yml: live Memcheck omits SDK padding or loopback isolation')
@@ -242,6 +278,15 @@ def publish_violations(publish):
 
 # Plausible wrong edits: (name, workflow, text to replace, replacement, words the report must contain).
 WRONG_EDITS = (
+    ('Advanced MSRV check removed', 'rust.yml',
+     '          cargo +1.88.0 check --locked --all-targets --target "$TARGET" --all-features\n', '',
+     'MSRV check with installed headers'),
+    ('compatibility failure stops later editions', 'rust.yml',
+     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features || failed=1\n          done\n          exit "$failed"\n      # A Standard',
+     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features\n          done\n          exit "$failed"\n      # A Standard',
+     'accumulate compatibility failures'),
+    ('toolchain differs from contributor pin', 'publish.yml', '          toolchain: 1.100.0\n',
+     '          toolchain: 1.99.1\n', 'toolchain of verify'),
     ('Pages deploy without CI', 'rust.yml', '    needs: required-ci\n', '', 'job order'),
     ('Pages deploy runs a repository script', 'rust.yml', '      - name: Deploy to GitHub Pages\n',
      '      - run: python ci/docs.py\n      - name: Deploy to GitHub Pages\n', 'deployment scripts'),
@@ -534,6 +579,22 @@ class SdkJob(unittest.TestCase):
                      'GRAFTON_NDI_EXPECTED_EDITION', 'GRAFTON_NDI_EXPECTED_RUNTIME'):
             self.assertIn(f'export {name}="${{{{ steps.sdk.outputs.{name} }}}}"', steps[1]['run'])
 
+    def test_compatibility_loops_run_the_second_edition_after_a_failure(self):
+        steps = [step for step in self.job['steps'] if step.get('if') == when('matrix.compatibility')]
+        for step in steps:
+            # Keep the actual loop and failure policy; replace environment setup
+            # and the native test command with a deterministic failing first pass.
+            script = step['run']
+            start = script.index('failed=0')
+            script = script[start:]
+            script = re.sub(r'^  (?!cargo test).+$', '', script, flags=re.MULTILINE)
+            script = re.sub(r'cargo test .+?( \|\| failed=1)',
+                            r'echo "$edition"; test "$edition" = advanced\1', script)
+            with self.subTest(step=step['name']):
+                result = subprocess.run(['bash', '-eo', 'pipefail', '-c', script], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ['standard', 'advanced'])
+
     def test_each_compatibility_pass_promises_exactly_what_it_can_check(self):
         """The first step builds with the row's headers against each baseline runtime, the second with each
         baseline's headers against the row's runtime; a Standard baseline has no headers a build reads. Only
@@ -570,6 +631,39 @@ class MemoryCheckers(unittest.TestCase):
             self.assertNotIn('obj:', block)
             self.assertIn('Memcheck:Addr8', block)
 
+    def test_empty_filter_and_skip_names_fail_the_checker_scripts(self):
+        rust = workflows.load(read_workflows()['rust.yml'])
+        cases = [
+            ('miri', 'Initialized rows, metadata and synthetic native guards', 'frames::tests::video_padding_all_formats'),
+            ('miri', 'Initialized rows, metadata and synthetic native guards',
+             'descriptor_admission_and_collection_stay_allocation_free_under_churn'),
+            ('test', 'Memcheck over scripted capture and encoder padding', 'frames::tests::video_padding_encoders'),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            cargo = Path(directory) / 'cargo'
+            cargo.write_text('''#!/bin/bash
+empty=0
+for argument in "$@"; do
+  if [ "$argument" = "$EMPTY_SELECTION" ]; then empty=1; fi
+done
+case " $* " in
+  *" --list "*) if [ "$empty" = 0 ]; then echo 'fixture: test'; fi ;;
+esac
+''')
+            cargo.chmod(0o755)
+            for job, name, missing in cases:
+                script = next(step['run'] for step in rust['jobs'][job]['steps'] if step.get('name') == name)
+                script = '\n'.join(line for line in script.splitlines() if not line.startswith('sudo '))
+                for selection, expected in (('', 0), (missing, 1)):
+                    with self.subTest(job=job, missing=selection):
+                        result = subprocess.run(['bash', '-eo', 'pipefail', '-c', script],
+                                                env={**os.environ, 'PATH': directory + os.pathsep + os.environ['PATH'],
+                                                     'EMPTY_SELECTION': selection}, text=True, capture_output=True)
+                        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                        if selection:
+                            self.assertIn(selection, result.stdout)
+                            self.assertIn('No tests selected', result.stdout)
+
     def test_missing_detector_configuration_is_reported(self):
         rust = workflows.load(read_workflows()['rust.yml'])
         self.assertEqual(memory_checker_violations(rust), [])
@@ -586,6 +680,18 @@ class MemoryCheckers(unittest.TestCase):
                         if step.get('name', '').startswith('Memcheck over '))
             step['run'] = step['run'].replace('--error-exitcode=99', '')
             variants.append((ineffective, 'fail on detector errors'))
+        for job, name in (('miri', 'Initialized rows, metadata and synthetic native guards'),
+                          ('test', 'Memcheck over scripted capture and encoder padding')):
+            missing_guard = copy.deepcopy(rust)
+            step = next(step for step in missing_guard['jobs'][job]['steps'] if step.get('name') == name)
+            step['run'] = step['run'].replace('-- --list "$filter"', '')
+            variants.append((missing_guard, 'empty-selection guard'))
+        missing_skip_guard = copy.deepcopy(rust)
+        missing_skip_guard['jobs']['miri']['steps'][2]['run'] = rust['jobs']['miri']['steps'][2]['run'].replace('-- --list "$skip"', '')
+        variants.append((missing_skip_guard, 'skip-selection guard'))
+        missing_send_module = copy.deepcopy(rust)
+        missing_send_module['jobs']['miri']['steps'][2]['run'] = rust['jobs']['miri']['steps'][2]['run'].replace('advanced::aliasable::tests::', '')
+        variants.append((missing_send_module, 'Miri omits advanced::aliasable'))
         ungated = copy.deepcopy(rust)
         ungated['jobs']['required-ci']['needs'].remove('miri')
         variants.append((ungated, 'Miri is not required'))
@@ -656,7 +762,7 @@ class Repository(unittest.TestCase):
         lines = (ROOT / '.github' / 'CODEOWNERS').read_text(encoding='utf-8').splitlines()
         owned = {line.split()[0]: line.split()[1:] for line in lines if line.strip() and not line.startswith('#')}
         self.assertEqual(set(owned), {'/.github/', '/ci/', '/scripts/', '/.cargo/', '/rust-toolchain.toml',
-                                      '/Cargo.toml', '/Cargo.lock'})
+                                      '/Cargo.toml', '/Cargo.lock', '/xtask/'})
         self.assertEqual({owner for owners in owned.values() for owner in owners}, {'@GrantSparks'})
 
 

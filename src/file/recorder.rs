@@ -912,11 +912,8 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 /// # What a closed file means
 ///
 /// A report of closure repeats what the SDK said: that it finalized the file.
-/// It does not show that every frame reached the disk, and a file can be
-/// closed with nothing in it ([`RecordingReport::empty_files`]). With the NDI
-/// 6.4 File library a disk that fills while a session is recording ends the
-/// process, and one that fills while it is being stopped leaves a file that
-/// is reported closed without its data. See
+/// A closed file is not proof its data was written. Inspect the report and
+/// read back recordings whose completeness matters. See
 /// [the module's limits](super#limits-of-the-ndi-64-file-library).
 ///
 /// # Events
@@ -1782,6 +1779,24 @@ impl Drop for FileRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_report_debug_names_its_closed_path() {
+        let path = b"take.mkv\0\0".map(|byte| byte as std::ffi::c_char);
+        let report = RecordingReport {
+            session: 1,
+            phase: SessionPhase::Closed { requested: true },
+            closed_files: 1,
+            empty_files: 0,
+            error_events: 0,
+            write_failures: 0,
+            dropped_events: 0,
+            last_closed_path: Some(EventText::from_buffer(&path)),
+        };
+        let debug = format!("{report:?}");
+        assert!(debug.contains("\"take.mkv\""));
+        assert!(!debug.contains("116, 97"));
+    }
 
     #[test]
     fn checked_cleanup_waits_keep_their_budget_until_it_is_spent() {

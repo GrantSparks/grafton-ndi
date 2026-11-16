@@ -1584,7 +1584,7 @@ fn hdr_frames_are_refused_by_default_in_every_format() {
             ] {
                 let message = invalid_input(frame.encode_image(&hdr(refused)));
                 assert!(
-                    matches!(message, crate::InputDefect::HdrNeedsPng {transfer,..} if transfer == if name=="PQ" {crate::TransferFunction::Pq} else {crate::TransferFunction::Hlg}),
+                    matches!(message, crate::InputDefect::HdrNeedsPng {codec, transfer} if codec == refused.codec() && transfer == if name=="PQ" {crate::TransferFunction::Pq} else {crate::TransferFunction::Hlg}),
                     "{message}"
                 );
             }
@@ -1968,10 +1968,10 @@ fn conflicting_options_are_refused_before_anything_is_written() {
         assert!(
             match needle {
                 "quality" | "WebP quality" =>
-                    matches!(message, crate::InputDefect::ImageQuality { .. }),
+                    matches!(message, crate::InputDefect::ImageQuality { codec, .. } if codec == options.format.codec()),
                 "WebP effort" => matches!(message, crate::InputDefect::WebpEffort { .. }),
                 "SampleDepth::Sixteen" =>
-                    matches!(message, crate::InputDefect::SixteenBitNeedsPng { .. }),
+                    matches!(message, crate::InputDefect::SixteenBitNeedsPng { codec } if codec == options.format.codec()),
                 other => panic!("unexpected case {other}"),
             },
             "{message}"
@@ -1985,7 +1985,7 @@ fn conflicting_options_are_refused_before_anything_is_written() {
                     crate::image_encoding::ImageFormat::Jpeg(quality)
                 ))
             ),
-            crate::InputDefect::ImageQuality { .. }
+            crate::InputDefect::ImageQuality { codec: crate::ImageCodecKind::Jpeg, quality: actual, .. } if actual == quality
         ));
         assert!(matches!(
             invalid_input(
@@ -1993,7 +1993,7 @@ fn conflicting_options_are_refused_before_anything_is_written() {
                     ImageFormat::Jpeg(quality)
                 ))
             ),
-            crate::InputDefect::ImageQuality { .. }
+            crate::InputDefect::ImageQuality { codec: crate::ImageCodecKind::Jpeg, quality: actual, .. } if actual == quality
         ));
     }
     // Quality is checked before the frame: even an HDR frame reports it.
@@ -2237,34 +2237,42 @@ fn reduced_images_are_the_block_averages_of_the_full_image() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn conversion_geometry_overflow_is_refused_before_output_or_row_access() {
-    let frame = VideoFrame::builder()
-        .resolution(2, 2)
-        .data(vec![0; 16])
-        .build()
-        .unwrap();
-    let mut source = Source::new(&frame);
-    // A private preflight fixture: no rows of this synthetic geometry may be
-    // accessed. Actual public sources obtain geometry from a validated layout.
-    source.width = usize::MAX / 8 + 1;
-    let options = options(ImageFormat::Png).depth(SampleDepth::Sixteen);
-    let mut output = Recorder {
-        written: 0,
-        fail_after: None,
-    };
-    assert!(matches!(
-        invalid_frame(super::encode_to(source, &options, &mut output)),
-        crate::FrameDefect::Layout(crate::LayoutDefect::AudioChannelOffset { .. })
-            | crate::FrameDefect::Layout(crate::LayoutDefect::AudioSampleCount { .. })
-            | crate::FrameDefect::Layout(crate::LayoutDefect::AudioByteSize(_))
-            | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
-            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoStrideOverflow { .. })
-            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
-            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
-            | crate::FrameDefect::ImageScratchOverflow
-            | crate::FrameDefect::ImageDimensionOverflow
-    ));
-    assert_eq!(output.written, 0);
+fn downscale_sums_allocation_failure_precedes_output_and_row_access() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::FAIL_SCRATCH_RESERVATION.with(|fail| fail.set(false));
+        }
+    }
+    for depth in [SampleDepth::Eight, SampleDepth::Sixteen] {
+        let frame = VideoFrame::builder()
+            .resolution(4, 2)
+            .pixel_format(PixelFormat::Rgba)
+            .data(vec![0; 32])
+            .build()
+            .unwrap();
+        let options = options(ImageFormat::Png)
+            .depth(depth)
+            .downscale(Downscale::Half);
+        let mut output = Recorder {
+            written: 0,
+            fail_after: None,
+        };
+        let _reset = Reset;
+        super::FAIL_SCRATCH_RESERVATION.with(|fail| fail.set(true));
+        let (result, rows) = super::read::count_rows(|| {
+            super::encode_to(Source::new(&frame), &options, &mut output)
+        });
+        assert!(matches!(
+            result,
+            Err(Error::AllocationFailed(crate::AllocationFailure {
+                kind: crate::AllocationKind::ImageScratch,
+                bytes: Some(bytes),
+            })) if bytes == if depth == SampleDepth::Eight { 32 } else { 64 }
+        ));
+        assert_eq!(output.written, 0);
+        assert_eq!(rows, 0);
+    }
 }
 
 /// Compare these fingerprints between a reference revision and an encoder
@@ -2414,7 +2422,7 @@ fn warm_workspace_conversion_does_not_allocate() {
                     for codec in [ImageFormat::WebpLossless, ImageFormat::WebpLossy(75)] {
                         let options = options(codec).alpha(alpha).downscale(reduction);
                         let plan = Plan::new(&source, &options).unwrap();
-                        let shape = plan.shape().buffered().unwrap();
+                        let shape = plan.shape().buffered();
                         let mut convert = || {
                             plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
                                 webp::image_with(pixels, shape, &mut workspace.image)?;
@@ -2548,9 +2556,7 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                         let plan = Plan::new(&source, &options).unwrap();
                         let mut pixels = plan.pixels::<u8>();
                         let ((image, allocations), peak) = peak_bytes(|| {
-                            allocation_count(|| {
-                                webp::image(&mut pixels, plan.shape().buffered().unwrap())
-                            })
+                            allocation_count(|| webp::image(&mut pixels, plan.shape().buffered()))
                         });
                         let len = reduced.0 * reduced.1 * channels;
                         let borrowed = matches!(image, std::borrow::Cow::Borrowed(_));
@@ -3218,4 +3224,90 @@ fn generic_video_sources_encode_and_workspaces_reuse_data_url_conversion() {
         assert_eq!(source.encode_image(&options).unwrap(), image);
         assert_eq!(source.encode_image_data_url(&options).unwrap(), url);
     }
+}
+
+#[test]
+fn lossy_webp_encoder_storage_failure_keeps_its_documented_exception() {
+    for sharp_yuv in [true, false] {
+        let frame = VideoFrame::builder()
+            .resolution(512, 512)
+            .pixel_format(PixelFormat::Rgba)
+            .data([64, 96, 128, 255].repeat(512 * 512))
+            .build()
+            .unwrap();
+        let options = options(ImageFormat::WebpLossy(75)).webp_sharp_yuv(sharp_yuv);
+        let error =
+            crate::test_alloc::fail_allocations_at_least(200_000, || frame.encode_image(&options))
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::InvalidFrame(crate::FrameDefect::EncodingFailed {
+                    codec: crate::ImageCodecKind::Webp,
+                    ..
+                })
+            ),
+            "SharpYUV={sharp_yuv}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn lossy_webp_conversion_storage_failure_reports_image_scratch() {
+    let frame = VideoFrame::builder()
+        .resolution(512, 512)
+        .pixel_format(PixelFormat::Bgra)
+        .data([128, 96, 64, 255].repeat(512 * 512))
+        .build()
+        .unwrap();
+    let error = crate::test_alloc::fail_allocations_at_least(200_000, || {
+        frame.encode_image(&options(ImageFormat::WebpLossy(75)))
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::AllocationFailed(crate::AllocationFailure {
+            kind: crate::AllocationKind::ImageScratch,
+            bytes: Some(1_048_576),
+        })
+    ));
+}
+
+#[test]
+fn eight_bit_yuv_png_conversion_preserves_sixteen_bit_precision() {
+    let frame = VideoFrame::builder()
+        .resolution(2, 2)
+        .pixel_format(PixelFormat::Uyvy)
+        .data([128, 17, 128, 17].repeat(2))
+        .build()
+        .unwrap();
+    for (depth, expected) in [(SampleDepth::Eight, 1), (SampleDepth::Sixteen, 299)] {
+        let encoded = frame
+            .encode_image(&options(ImageFormat::Png).depth(depth))
+            .unwrap();
+        let decoded = decode_png(&encoded);
+        assert_eq!((decoded.width, decoded.height), (2, 2));
+        for pixel in decoded.samples.chunks_exact(decoded.channels) {
+            assert_eq!(&pixel[..3], &[expected; 3]);
+        }
+    }
+}
+
+#[test]
+fn workspace_debug_summarizes_retained_conversion_storage() {
+    fn summary(width: u32, height: u32) -> String {
+        let frame = VideoFrame::builder()
+            .resolution(width, height)
+            .pixel_format(PixelFormat::Uyvy)
+            .build()
+            .unwrap();
+        let mut workspace = crate::image_encoding::ImageWorkspace::new();
+        let options = ImageOptions::new(ImageFormat::WebpLossy(75))
+            .webp_effort(0)
+            .webp_sharp_yuv(false);
+        workspace.encode(&frame, &options).unwrap();
+        assert!(workspace.retained_bytes() >= width as usize * height as usize * 4);
+        format!("{workspace:?}")
+    }
+    crate::test_support::assert_bounded_debug(&[summary(4, 2)], &[summary(1920, 1080)]);
 }

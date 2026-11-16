@@ -9,6 +9,10 @@ use super::{
 /// An initialized Advanced SDK runtime, or `None` when the selected runtime is
 /// not one or this build lacks the Advanced SDK declarations.
 pub fn advanced_ndi() -> Option<Ndi> {
+    if cfg!(miri) {
+        skip(Requirement::Runtime, "Miri cannot load native libraries");
+        return None;
+    }
     let ndi = ndi()?;
     match ndi.require_feature(RuntimeFeature::AdvancedSenderConfiguration) {
         Ok(()) => Some(ndi),

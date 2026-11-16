@@ -1,13 +1,10 @@
 //! Compile the private finder guard contract in its real module context.
 
+#[path = "support/nested_cargo.rs"]
+mod nested_cargo;
+
 #[test]
 fn a_foreign_mutex_cannot_supply_the_finder_snapshot_guard() {
-    use std::{path::PathBuf, process::Command};
-
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
-        .join("internal-finder-snapshot-guard");
     let features = [
         ("advanced", cfg!(feature = "advanced")),
         ("file-io", cfg!(feature = "file-io")),
@@ -20,20 +17,14 @@ fn a_foreign_mutex_cannot_supply_the_finder_snapshot_guard() {
     .collect::<Vec<_>>()
     .join(",");
 
+    let graph = if features.is_empty() {
+        "no-default-features".to_owned()
+    } else {
+        format!("features-{features}")
+    };
     let compile = |foreign: bool| {
-        let mut command = Command::new(env!("CARGO"));
-        command
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .env("CARGO_TARGET_DIR", &target)
-            .env("CARGO_BUILD_JOBS", "3")
-            .env("CARGO_TERM_COLOR", "never")
-            .args([
-                "rustc",
-                "--offline",
-                "--locked",
-                "--lib",
-                "--no-default-features",
-            ]);
+        let mut command = nested_cargo::command(&graph, "rustc", None, None);
+        command.args(["--lib", "--no-default-features"]);
         if !features.is_empty() {
             command.args(["--features", &features]);
         }

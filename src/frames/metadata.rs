@@ -1,5 +1,6 @@
 //! Metadata's bounded UTF-8 and sole trailing NUL are established here.
-use super::{bounded_sdk_text, FrameMetadataStatus, MAX_METADATA_BYTES};
+use super::{FrameMetadataStatus, MAX_METADATA_BYTES};
+use crate::sdk_copy::bounded_sdk_text;
 use crate::{sys::bindings::NDIlib_metadata_frame_t, Error, Rejected, Result};
 use std::{
     ffi::{CStr, CString},
