@@ -1062,6 +1062,7 @@ impl Control {
 /// its native cleanup.
 trait Owner: 'static {
     type Event: Send + 'static;
+    type Finish: Send + 'static;
 
     /// Take the next native event without waiting.
     fn poll_native(&mut self) -> Result<Option<Self::Event>>;
@@ -1082,8 +1083,8 @@ trait Owner: 'static {
     /// Fail registered work before the native cleanup of a panicked owner.
     fn fail_pending(&mut self) {}
 
-    /// Run a recorder finish command. Only recorder workers construct these jobs.
-    fn finish(&mut self, _deadline: Deadline, _stop: bool, _reply: FinishResponse) {}
+    /// Run the finish protocol specific to this owner.
+    fn finish(&mut self, finish: Self::Finish);
 
     /// Finish registered work and cleanup within the original close budget.
     fn shutdown(
@@ -1099,6 +1100,10 @@ trait Owner: 'static {
 }
 
 impl Owner for FilePlayer {
+    type Finish = std::convert::Infallible;
+    fn finish(&mut self, finish: Self::Finish) {
+        match finish {}
+    }
     type Event = PlayerEvent;
     fn poll_native(&mut self) -> Result<Option<Self::Event>> {
         self.next_event(Duration::ZERO)
@@ -1110,6 +1115,13 @@ impl Owner for FilePlayer {
 struct RecorderOwner {
     recorder: FileRecorder,
     waiters: FinishWaiters<FinishResponse>,
+}
+
+/// A recorder finish command retains its submission budget and response.
+struct RecorderFinish {
+    deadline: Deadline,
+    stop: bool,
+    reply: FinishResponse,
 }
 
 /// Preserve the finish driver's single registry while condition waits expose
@@ -1224,6 +1236,7 @@ impl RecorderOwner {
 
 impl Owner for RecorderOwner {
     type Event = RecorderEvent;
+    type Finish = RecorderFinish;
 
     fn poll_native(&mut self) -> Result<Option<Self::Event>> {
         self.recorder.next_event(Duration::ZERO)
@@ -1241,8 +1254,8 @@ impl Owner for RecorderOwner {
         self.waiters.fail(StateConflict::OwnerFailed);
     }
 
-    fn finish(&mut self, deadline: Deadline, stop: bool, reply: FinishResponse) {
-        RecorderOwner::finish(self, deadline, stop, reply);
+    fn finish(&mut self, finish: RecorderFinish) {
+        RecorderOwner::finish(self, finish.deadline, finish.stop, finish.reply);
     }
 
     fn shutdown(
@@ -1253,15 +1266,21 @@ impl Owner for RecorderOwner {
         queued: &mut [Job<Self>],
     ) {
         self.waiters.retain();
-        let notify = self.waiters.notifies_cleanup()
-            || queued.iter().any(|job| matches!(job, Job::Finish { .. }));
+        let notify =
+            self.waiters.notifies_cleanup() || queued.iter().any(|job| job.finish().is_some());
         if !notify {
             events.close(EventEnd::Stopped);
         }
         self.recorder.drain_cleanup(
             requested,
             &mut self.waiters,
-            queued.iter_mut().filter_map(Job::take_finish),
+            queued
+                .iter_mut()
+                .filter_map(Job::take_finish)
+                .map(|(place, finish)| {
+                    drop(place);
+                    (finish.deadline, finish.reply)
+                }),
             TICK,
             &mut |event| {
                 if notify {
@@ -1336,14 +1355,9 @@ impl HandleOwner for RecorderOwner {
 
 /// Finish requests retain their deadline and reply even if shutdown preempts
 /// ordinary command execution. Wake messages carry no admission place.
-enum Job<H> {
+enum Job<H: Owner> {
     Run(Box<dyn FnOnce(&mut H) + Send + 'static>),
-    Finish {
-        deadline: Deadline,
-        stop: bool,
-        reply: FinishResponse,
-        place: Place,
-    },
+    Finish { finish: H::Finish, place: Place },
     Wake,
 }
 
@@ -1351,36 +1365,31 @@ impl<H: Owner> Job<H> {
     fn run(self, owner: &mut H) {
         match self {
             Self::Run(work) => work(owner),
-            Self::Finish {
-                deadline,
-                stop,
-                reply,
-                place,
-            } => {
+            Self::Finish { finish, place } => {
                 drop(place);
-                owner.finish(deadline, stop, reply);
+                owner.finish(finish);
             }
             Self::Wake => {}
         }
     }
 
+    fn finish(&self) -> Option<&H::Finish> {
+        match self {
+            Self::Finish { finish, .. } => Some(finish),
+            Self::Run(_) | Self::Wake => None,
+        }
+    }
+
     /// Called by cleanup only after it has requested the native stop. Ordinary
     /// commands remain held until destruction publishes the owner's outcome.
-    fn take_finish(&mut self) -> Option<(Deadline, FinishResponse)> {
-        if !matches!(self, Self::Finish { .. }) {
-            return None;
+    fn take_finish(&mut self) -> Option<(Place, H::Finish)> {
+        match std::mem::replace(self, Self::Wake) {
+            Self::Finish { finish, place } => Some((place, finish)),
+            other => {
+                *self = other;
+                None
+            }
         }
-        let Self::Finish {
-            deadline,
-            reply,
-            place,
-            ..
-        } = std::mem::replace(self, Self::Wake)
-        else {
-            unreachable!()
-        };
-        drop(place);
-        Some((deadline, reply))
     }
 }
 
@@ -2348,9 +2357,11 @@ impl AsyncFileRecorder {
                 let (mut reply, future) = operation();
                 reply.owner = Some(Arc::clone(&control));
                 let job = Job::Finish {
-                    deadline,
-                    stop,
-                    reply: finish_response(reply),
+                    finish: RecorderFinish {
+                        deadline,
+                        stop,
+                        reply: finish_response(reply),
+                    },
                     place,
                 };
                 if sender.send(job).is_err() {
@@ -2548,6 +2559,10 @@ mod tests {
     }
 
     impl Owner for BurstOwner {
+        type Finish = std::convert::Infallible;
+        fn finish(&mut self, finish: Self::Finish) {
+            match finish {}
+        }
         type Event = usize;
         fn poll_native(&mut self) -> Result<Option<usize>> {
             self.polls += 1;
@@ -2562,6 +2577,16 @@ mod tests {
             self.remaining -= 1;
             Ok(Some(self.polls))
         }
+    }
+
+    #[test]
+    fn player_finish_is_uninhabited() {
+        fn require_uninhabited(job: Job<FilePlayer>) {
+            if let Job::Finish { finish, .. } = job {
+                match finish {}
+            }
+        }
+        let _: fn(Job<FilePlayer>) = require_uninhabited;
     }
 
     #[test]
@@ -2680,6 +2705,10 @@ mod tests {
         _not_send: Rc<()>,
     }
     impl Owner for LocalOwner {
+        type Finish = std::convert::Infallible;
+        fn finish(&mut self, finish: Self::Finish) {
+            match finish {}
+        }
         type Event = usize;
         fn poll_native(&mut self) -> Result<Option<usize>> {
             Ok(None)
@@ -3280,6 +3309,10 @@ mod tests {
             finished: Sender<()>,
         }
         impl Owner for HeldDrop {
+            type Finish = std::convert::Infallible;
+            fn finish(&mut self, finish: Self::Finish) {
+                match finish {}
+            }
             type Event = ();
             fn poll_native(&mut self) -> Result<Option<()>> {
                 Ok(None)
@@ -3666,9 +3699,11 @@ mod tests {
         let events = EventQueue::new(16);
         let (reply, future) = operation();
         let mut finish = Some(Job::Finish {
-            deadline: Deadline::after(Duration::from_secs(5)).unwrap(),
-            stop: true,
-            reply: FinishResponse::Finish(reply),
+            finish: RecorderFinish {
+                deadline: Deadline::after(Duration::from_secs(5)).unwrap(),
+                stop: true,
+                reply: FinishResponse::Finish(reply),
+            },
             place: Arc::new(Admission::new(1)).admit(true).unwrap(),
         });
         let dequeued = run_owner_wait(&mut owner, &control, &events, |_, _| {
@@ -3789,9 +3824,11 @@ mod tests {
                     proceed.recv_timeout(Duration::from_secs(5)).unwrap();
                     sender
                         .send(Job::Finish {
-                            deadline: Deadline::after(Duration::from_secs(5)).unwrap(),
-                            stop: true,
-                            reply: FinishResponse::Finish(reply),
+                            finish: RecorderFinish {
+                                deadline: Deadline::after(Duration::from_secs(5)).unwrap(),
+                                stop: true,
+                                reply: FinishResponse::Finish(reply),
+                            },
                             place,
                         })
                         .unwrap_or_else(|_| panic!("owner queue closed"));
@@ -5974,6 +6011,10 @@ mod tests {
     fn refused_creation_options_and_families_complete_at_submission() {
         struct NeverCreated;
         impl Owner for NeverCreated {
+            type Finish = std::convert::Infallible;
+            fn finish(&mut self, finish: Self::Finish) {
+                match finish {}
+            }
             type Event = ();
             fn poll_native(&mut self) -> Result<Option<()>> {
                 unreachable!()
