@@ -53,7 +53,7 @@ pub(crate) unsafe fn copy_sdk_string(
     // SAFETY: forwarded to the caller's obligation.
     let bytes = unsafe { sdk_text(text) }?;
     // SAFETY: sdk_text stops at the first NUL and excludes it.
-    unsafe { crate::finder::SourceText::from_sdk(bytes) }
+    unsafe { crate::finder::SourceText::from_sdk(LossyText::new(bytes)) }
 }
 
 /// Read one bounded SDK C string, retaining its producing entry point.
@@ -298,13 +298,10 @@ impl CopyBudget {
         // SAFETY: forwarded to the caller's obligations.
         let text = unsafe { self.c_str(value)? };
         text.map(|text| {
-            let bytes = text.to_bytes();
-            let len = std::str::from_utf8(bytes)
-                .map(str::len)
-                .unwrap_or_else(|_| LossyText::new(bytes).len());
-            self.take(len + crate::finder::SourceText::STORAGE_OVERHEAD)?;
+            let text = LossyText::new(text.to_bytes());
+            self.take(text.len() + crate::finder::SourceText::STORAGE_OVERHEAD)?;
             // SAFETY: the bounded C string scan excludes its first NUL.
-            unsafe { crate::finder::SourceText::from_sdk(bytes) }.map_err(Into::into)
+            unsafe { crate::finder::SourceText::from_sdk(text) }.map_err(Into::into)
         })
         .transpose()
     }
@@ -360,37 +357,50 @@ impl CopyBudget {
 
 /// Borrowed SDK text with the exact size of its lossy UTF-8 representation.
 /// Callers charge `len()` to their snapshot budget before asking for a copy.
-pub(crate) struct LossyText<'a> {
-    bytes: &'a [u8],
-    len: usize,
+pub(crate) enum LossyText<'a> {
+    Valid(&'a str),
+    Invalid { bytes: &'a [u8], len: usize },
 }
 
 impl<'a> LossyText<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        let len = bytes
-            .utf8_chunks()
-            .map(|chunk| chunk.valid().len() + usize::from(!chunk.invalid().is_empty()) * 3)
-            .sum();
-        Self { bytes, len }
+        match std::str::from_utf8(bytes) {
+            Ok(text) => Self::Valid(text),
+            Err(_) => {
+                let len = bytes
+                    .utf8_chunks()
+                    .map(|chunk| chunk.valid().len() + usize::from(!chunk.invalid().is_empty()) * 3)
+                    .sum();
+                Self::Invalid { bytes, len }
+            }
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.len
+        match self {
+            Self::Valid(text) => text.len(),
+            Self::Invalid { len, .. } => *len,
+        }
     }
 
     pub(crate) fn copy(&self) -> std::result::Result<String, TryReserveError> {
         let mut text = String::new();
-        text.try_reserve_exact(self.len)?;
+        text.try_reserve_exact(self.len())?;
         self.push_to(&mut text);
         Ok(text)
     }
 
-    /// Append into storage whose capacity the caller has already reserved.
+    /// Append the classified text into storage already reserved by the caller.
     pub(crate) fn push_to(&self, text: &mut String) {
-        for chunk in self.bytes.utf8_chunks() {
-            text.push_str(chunk.valid());
-            if !chunk.invalid().is_empty() {
-                text.push('\u{fffd}');
+        match self {
+            Self::Valid(valid) => text.push_str(valid),
+            Self::Invalid { bytes, .. } => {
+                for chunk in bytes.utf8_chunks() {
+                    text.push_str(chunk.valid());
+                    if !chunk.invalid().is_empty() {
+                        text.push('\u{fffd}');
+                    }
+                }
             }
         }
     }
@@ -688,6 +698,10 @@ mod tests {
             let text = LossyText::new(bytes);
             assert_eq!(text.len(), expected.len());
             assert_eq!(text.copy().unwrap(), expected);
+            let mut appended = String::with_capacity(text.len());
+            text.push_to(&mut appended);
+            assert_eq!(appended.len(), text.len());
+            assert_eq!(appended, expected);
         };
         check(b"");
         // Exhaust every two-byte prefix, including continuation bytes,

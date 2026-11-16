@@ -21,7 +21,7 @@ use std::{
 
 use crate::{
     change_feed::ChangeFeed,
-    sdk_copy::copy_sdk_string,
+    sdk_copy::{copy_sdk_string, LossyText},
     sys::{self, bindings::*},
     timeout::{Deadline, NeverStop, Stop, StopResult, POLL_INTERVAL},
     Error, Ndi, ResourceKind, Result,
@@ -551,7 +551,7 @@ pub(crate) unsafe fn decode_source(
     }
     let name = if name.is_null() {
         // SAFETY: empty bytes are NUL-free.
-        unsafe { SourceText::from_sdk(b"") }?
+        unsafe { SourceText::from_sdk(LossyText::new(b"")) }?
     } else {
         let Some(name) = copy(name)? else {
             return Ok(None);
@@ -1273,22 +1273,16 @@ impl SourceText {
     pub(crate) const STORAGE_OVERHEAD: usize =
         2 * std::mem::size_of::<usize>() + std::mem::size_of::<CString>() + 1;
 
-    /// Copy bounded SDK bytes directly into their final shared native storage.
+    /// Copy classified SDK text directly into its final shared native storage.
     ///
     /// # Safety
-    /// `bytes` must contain no NUL, as guaranteed by a bounded SDK string scan.
-    pub(crate) unsafe fn from_sdk(bytes: &[u8]) -> Result<Self> {
+    /// `source` must have been classified from bytes containing no NUL, as
+    /// guaranteed by a bounded SDK string scan.
+    pub(crate) unsafe fn from_sdk(source: LossyText<'_>) -> Result<Self> {
         let mut text = String::new();
-        if let Ok(valid) = std::str::from_utf8(bytes) {
-            text.try_reserve_exact(valid.len() + 1)
-                .map_err(|_| budget::allocation_failed())?;
-            text.push_str(valid);
-        } else {
-            let lossy = crate::sdk_copy::LossyText::new(bytes);
-            text.try_reserve_exact(lossy.len() + 1)
-                .map_err(|_| budget::allocation_failed())?;
-            lossy.push_to(&mut text);
-        }
+        text.try_reserve_exact(source.len() + 1)
+            .map_err(|_| budget::allocation_failed())?;
+        source.push_to(&mut text);
         // SAFETY: the caller's bounded scan excluded NUL; UTF-8 replacement
         // introduces none. The only terminator is appended below.
         Ok(unsafe { Self::from_nul_free_string(text) })
