@@ -7,7 +7,7 @@ fn independent_scoped_clocks(genlock: &mut Genlock, frame_rate: FrameRate) {
     let (mut video, mut audio) = genlock.clocks();
     std::thread::scope(|scope| {
         scope.spawn(move || video.wait(frame_rate, ScanType::Progressive));
-        scope.spawn(move || audio.wait(48_000, 1600));
+        scope.spawn(move || audio.wait(grafton_ndi::advanced::AudioClockRequest::new(48_000, 1600).unwrap()));
     });
 }
 fn owned_receiver(receiver: Receiver) {

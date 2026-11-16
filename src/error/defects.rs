@@ -457,12 +457,6 @@ pub enum FrameDefect {
         /// The minimum.
         minimum: usize,
     },
-    /// Compressed audio of {sample_rate} Hz, {channels} channels and {samples} samples per channel: each must be in 1..=2147483647.
-    #[error("{detail}")]
-    CompressedAudioQuantities {
-        /// Exact values, boxed only on 32-bit targets.
-        detail: CompactDiagnostic<CompressedAudioDefect>,
-    },
     /// The frame's color description cannot be read because its metadata was withheld ({status:?}); ColorPolicy::Override explicitly supplies its color conversion.
     #[error("The frame's color description cannot be read because its metadata was withheld ({status:?}); ColorPolicy::Override explicitly supplies its color conversion")]
     ColorMetadataWithheld {
@@ -740,14 +734,6 @@ pub enum InputDefect {
         /// The limit.
         limit: usize,
     },
-    /// {name} {value} is not in 1..=2147483647.
-    #[error("{name} {value} is not in 1..=2147483647")]
-    SdkQuantity {
-        /// The name.
-        name: &'static str,
-        /// The value.
-        value: u32,
-    },
     /// {codec} quality must be in {minimum}..={maximum}, got {quality}.
     #[error("{codec} quality must be in {minimum}..={maximum}, got {quality}")]
     ImageQuality {
@@ -1011,18 +997,6 @@ pub struct AudioLengthDefect {
     pub channels: u32,
     /// The samples.
     pub samples: u32,
-}
-
-/// Exact values reported by `CompressedAudioQuantities`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
-#[error("Compressed audio of {sample_rate} Hz, {channels} channels and {samples} samples per channel: each must be in 1..=2147483647")]
-pub struct CompressedAudioDefect {
-    /// The sample rate.
-    pub sample_rate: i64,
-    /// The channels.
-    pub channels: i64,
-    /// The samples.
-    pub samples: i64,
 }
 
 /// Exact values reported by `PtzValue`.

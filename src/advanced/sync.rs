@@ -4,7 +4,9 @@
 use std::ptr;
 use std::{cell::Cell, marker::PhantomData};
 
-use super::{invalid_input, sdk_quantity, AdvancedConfig, AvSyncAttached, ReceiverControls};
+#[cfg(any(test, ndi_has_advanced_av_sync))]
+use super::sdk_quantity;
+use super::{invalid_input, AdvancedConfig, AvSyncAttached, ReceiverControls};
 use crate::{
     capture::{AvSyncAudioFree, Guard},
     frames::MAX_AUDIO_BYTES,
@@ -67,11 +69,18 @@ impl AvSyncRequest {
     pub fn new(sample_rate: Option<u32>, num_samples: Option<u32>) -> Result<Self> {
         let request = Self {
             sample_rate: sample_rate
-                .map(|rate| quantity("AVSync sample rate", rate))
-                .transpose()?,
+                .map(|rate| crate::frames::validate_audio_sample_rate(rate.into()))
+                .transpose()
+                .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?,
             num_samples: num_samples
-                .map(|samples| quantity("AVSync sample count", samples))
-                .transpose()?,
+                .map(|samples| {
+                    crate::frames::validate_audio_count(
+                        samples.into(),
+                        crate::AudioCountKind::Samples,
+                    )
+                })
+                .transpose()
+                .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?,
         };
         // A frame has at least one channel.
         if request.num_samples.is_some_and(|samples| {
@@ -1175,37 +1184,89 @@ impl std::fmt::Debug for AudioClock<'_> {
     }
 }
 
-impl AudioClock<'_> {
-    /// Block until `num_samples` samples per channel at `sample_rate` hertz
-    /// are due, and report which clock timed them.
+/// A reusable, validated request for an [`AudioClock`].
+///
+/// Construct this once and pass it to each pacing call. Its timing descriptor
+/// contains no sample or metadata storage.
+#[derive(Clone, Copy)]
+pub struct AudioClockRequest {
+    timing: NDIlib_audio_frame_v3_t,
+}
+
+// SAFETY: construction fixes both pointers to null. The descriptor is private,
+// immutable, and passed only as a shared reference to a native timing query.
+unsafe impl Send for AudioClockRequest {}
+// SAFETY: as for Send; sharing this value cannot expose mutable storage.
+unsafe impl Sync for AudioClockRequest {}
+
+impl AudioClockRequest {
+    /// Ask for `num_samples` per channel at `sample_rate` hertz.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when a value is zero or exceeds `i32::MAX`.
-    #[doc(alias = "NDIlib_genlock_wait_audio")]
-    pub fn wait(&mut self, sample_rate: u32, num_samples: u32) -> Result<ClockSource> {
-        // Validate the request even in builds without the native family.
-        let _timing = audio_timing(sample_rate, num_samples)?;
-        native!(Genlock, self.resource.table => {
-            let GenResource { handle, table, .. } = *self.resource;
-            // SAFETY: the genlock outlives this clock, and only this clock waits
-            // for audio.
-            Ok(ClockSource::from_active(unsafe {
-                table.NDIlib_genlock_wait_audio(handle.0, &_timing)
-            }))
+    /// [`Error::InvalidInput`] with a shared layout cause when either quantity
+    /// is outside `1..=i32::MAX`.
+    pub fn new(sample_rate: u32, num_samples: u32) -> Result<Self> {
+        let sample_rate = crate::frames::validate_audio_sample_rate(sample_rate.into())
+            .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?;
+        let num_samples =
+            crate::frames::validate_audio_count(num_samples.into(), crate::AudioCountKind::Samples)
+                .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?;
+        Ok(Self {
+            timing: NDIlib_audio_frame_v3_t {
+                sample_rate: sample_rate as i32,
+                no_samples: num_samples as i32,
+                ..descriptors::audio_frame()
+            },
         })
+    }
+
+    /// The requested sample rate in hertz.
+    pub fn sample_rate(self) -> u32 {
+        self.timing.sample_rate as u32
+    }
+
+    /// The requested samples per channel.
+    pub fn num_samples(self) -> u32 {
+        self.timing.no_samples as u32
     }
 }
 
-/// `value`, named `name` in the error, when it is in `1..=i32::MAX`, the
-/// range of the SDK's signed fields.
-///
-/// # Errors
-///
-/// [`Error::InvalidInput`] otherwise.
-fn quantity(name: &'static str, value: u32) -> Result<u32> {
-    sdk_quantity(value)
-        .ok_or_else(|| invalid_input(crate::InputDefect::SdkQuantity { name, value }))
+impl std::fmt::Debug for AudioClockRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioClockRequest")
+            .field("sample_rate", &self.sample_rate())
+            .field("num_samples", &self.num_samples())
+            .finish()
+    }
+}
+impl PartialEq for AudioClockRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.sample_rate() == other.sample_rate() && self.num_samples() == other.num_samples()
+    }
+}
+impl Eq for AudioClockRequest {}
+impl std::hash::Hash for AudioClockRequest {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.sample_rate().hash(state);
+        self.num_samples().hash(state);
+    }
+}
+
+impl AudioClock<'_> {
+    /// Block until the validated request's samples are due and report which
+    /// clock timed them.
+    #[doc(alias = "NDIlib_genlock_wait_audio")]
+    pub fn wait(&mut self, request: AudioClockRequest) -> ClockSource {
+        native!(Genlock, self.resource.table, uses(request) => {
+            let GenResource { handle, table, .. } = *self.resource;
+            // SAFETY: the genlock outlives this clock, and only this clock waits
+            // for audio. Construction validated the immutable timing descriptor.
+            ClockSource::from_active(unsafe {
+                table.NDIlib_genlock_wait_audio(handle.0, &request.timing)
+            })
+        })
+    }
 }
 
 /// The descriptor a video clock reads its timing from.
@@ -1218,16 +1279,6 @@ fn video_timing(frame_rate: FrameRate, scan_type: ScanType) -> NDIlib_video_fram
         frame_format_type: scan_type.to_sdk(),
         ..descriptors::video_frame()
     }
-}
-
-/// The descriptor an audio clock reads its timing from.
-fn audio_timing(sample_rate: u32, num_samples: u32) -> Result<NDIlib_audio_frame_v3_t> {
-    // Lossless: each is at most i32::MAX.
-    Ok(NDIlib_audio_frame_v3_t {
-        sample_rate: quantity("Clock sample rate", sample_rate)? as i32,
-        no_samples: quantity("Clock sample count", num_samples)? as i32,
-        ..descriptors::audio_frame()
-    })
 }
 
 #[cfg(test)]
@@ -1404,7 +1455,7 @@ mod tests {
         );
         for (sample_rate, num_samples) in [(48_000, 0), (0, 1600), (u32::MAX, 1600)] {
             assert!(matches!(
-                audio_timing(sample_rate, num_samples),
+                AudioClockRequest::new(sample_rate, num_samples),
                 Err(Error::InvalidInput(_))
             ));
         }
@@ -1414,6 +1465,35 @@ mod tests {
         fn send<T: Send>() {}
         send::<VideoClock<'_>>();
         send::<AudioClock<'_>>();
+    }
+
+    #[test]
+    fn audio_clock_requests_validate_once_and_keep_native_timing() {
+        fn value_traits<T: Copy + Eq + std::hash::Hash + Send + Sync>() {}
+        value_traits::<AudioClockRequest>();
+        for rate in [1, 48_000, i32::MAX as u32] {
+            for samples in [1, 800, i32::MAX as u32] {
+                let request = AudioClockRequest::new(rate, samples).unwrap();
+                assert_eq!(
+                    (request.sample_rate(), request.num_samples()),
+                    (rate, samples)
+                );
+                assert_eq!(request, AudioClockRequest::new(rate, samples).unwrap());
+                assert!(request.timing.p_data.is_null());
+                assert!(request.timing.p_metadata.is_null());
+            }
+        }
+        for value in [0, i32::MAX as u32 + 1, u32::MAX] {
+            assert!(matches!(AudioClockRequest::new(value, 800),
+                Err(Error::InvalidInput(crate::InputDefect::Layout(crate::LayoutDefect::AudioRate(n))))
+                    if n.get() == i64::from(value)));
+            assert!(matches!(AudioClockRequest::new(48_000, value),
+                Err(Error::InvalidInput(crate::InputDefect::Layout(crate::LayoutDefect::AudioCount { kind: crate::AudioCountKind::Samples, value: n })))
+                    if n.get() == i64::from(value)));
+        }
+        assert!(matches!(AvSyncRequest::new(Some(0), None),
+            Err(Error::InvalidInput(crate::InputDefect::Layout(crate::LayoutDefect::AudioRate(n))))
+                if n.get() == 0));
     }
 
     /// The SDK fills in the audio it returns but not its format, and reads
@@ -1459,7 +1539,7 @@ mod tests {
             video.frame_format_type,
             NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved
         );
-        let audio = audio_timing(48_000, 1600).unwrap();
+        let audio = AudioClockRequest::new(48_000, 1600).unwrap().timing;
         assert_eq!(audio.FourCC, planar_float);
         assert_eq!((audio.sample_rate, audio.no_samples), (48_000, 1600));
     }

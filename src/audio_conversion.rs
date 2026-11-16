@@ -658,7 +658,15 @@ mod tests {
             (48000, 2, 0, count(AudioCountKind::Samples)),
             (48000, 2, 3, length(3, 2)),
             (48000, 3, 2, length(2, 3)),
-            (48000, u32::MAX, 2, length(2, u32::MAX)),
+            (
+                48000,
+                u32::MAX,
+                2,
+                layout(LayoutDefect::AudioCount {
+                    value: u32::MAX.into(),
+                    kind: AudioCountKind::Channels,
+                }),
+            ),
             (
                 48000,
                 1,

@@ -1372,8 +1372,10 @@ mod tests {
             crate::FrameDefect::OpusDuration
         ));
         assert!(matches!(
-            reason(opus(0, 960)),
-            crate::FrameDefect::CompressedAudioQuantities { .. }
+            opus(0, 960),
+            Err(crate::Error::InvalidInput(crate::InputDefect::Layout(
+                crate::LayoutDefect::AudioRate(_)
+            )))
         ));
     }
 

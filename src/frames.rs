@@ -4205,30 +4205,32 @@ fn check_audio_data_len(layout: &ValidatedAudioLayout, len: usize) -> Result<()>
 
 /// The one sample-rate check for every audio path, for values from the API
 /// and from the SDK: `1..=i32::MAX` Hz.
-fn validate_audio_sample_rate(sample_rate: i64) -> LayoutResult<u32> {
+pub(crate) fn validate_audio_sample_rate(sample_rate: i64) -> LayoutResult<u32> {
     u32::try_from(sample_rate)
         .ok()
         .filter(|rate| (1..=i32::MAX.unsigned_abs()).contains(rate))
         .ok_or(crate::LayoutDefect::AudioRate(sample_rate.into()))
 }
 
-/// Require a positive channel and sample count and widen both to `usize`.
+/// The one audio count rule for channels and samples: `1..=i32::MAX`.
+pub(crate) fn validate_audio_count(value: i64, kind: crate::AudioCountKind) -> LayoutResult<u32> {
+    u32::try_from(value)
+        .ok()
+        .filter(|&count| (1..=i32::MAX.unsigned_abs()).contains(&count))
+        .ok_or(crate::LayoutDefect::AudioCount {
+            value: value.into(),
+            kind,
+        })
+}
+
+/// Require channel and sample counts in the SDK's signed range and widen them.
 pub(crate) fn validate_positive_audio_counts(
     no_channels: i64,
     no_samples: i64,
 ) -> LayoutResult<(usize, usize)> {
-    let count = |value: i64, kind: crate::AudioCountKind| {
-        usize::try_from(value)
-            .ok()
-            .filter(|&count| count > 0)
-            .ok_or(crate::LayoutDefect::AudioCount {
-                value: value.into(),
-                kind,
-            })
-    };
     Ok((
-        count(no_channels, crate::AudioCountKind::Channels)?,
-        count(no_samples, crate::AudioCountKind::Samples)?,
+        validate_audio_count(no_channels, crate::AudioCountKind::Channels)? as usize,
+        validate_audio_count(no_samples, crate::AudioCountKind::Samples)? as usize,
     ))
 }
 

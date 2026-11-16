@@ -307,6 +307,7 @@ fn advanced_types_keep_their_auto_traits() {
         AvSyncAudioRef<'static>: UnwindSafe, RefUnwindSafe;
         AvSyncOutcomeRef<'static>: UnwindSafe, RefUnwindSafe;
         AvSyncRequest: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AudioClockRequest: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSyncVideo<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         ClockSource: Send, Sync, UnwindSafe, RefUnwindSafe;
         CompletedVideo: Send, Sync, UnwindSafe, RefUnwindSafe;
