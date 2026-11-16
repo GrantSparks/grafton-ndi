@@ -14,6 +14,8 @@
 //! or null.
 //!
 //! `--cfg fake_omit_recording_entry` omits one function of the recording family.
+//! `GRAFTON_FAKE_FILE_PROBE_GATE` names a test-owned directory: probes publish
+//! `<filename>.entered` and wait for `<filename>.release` there.
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
@@ -69,7 +71,22 @@ fn bound_runtime_build() -> u32 {
 }
 
 export! {
-    fn NDIlib_file_player_probe_file(_p_file_path: *const c_char, p_out_info: *mut NDIlib_file_player_file_info_t) -> bool {
+    fn NDIlib_file_player_probe_file(p_file_path: *const c_char, p_out_info: *mut NDIlib_file_player_file_info_t) -> bool {
+        if let Some(directory) = std::env::var_os("GRAFTON_FAKE_FILE_PROBE_GATE") {
+            // SAFETY: the probe caller retains its validated path for the call.
+            let path = unsafe { CStr::from_ptr(p_file_path) }.to_str().unwrap();
+            let name = std::path::Path::new(path).file_name().unwrap().to_str().unwrap();
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::write(directory.join(format!("{name}.entered")), b"").unwrap();
+            let release = directory.join(format!("{name}.release"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !release.exists() {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         // SAFETY: the caller passes storage for one structure.
         unsafe { (*p_out_info).track_count = bound_runtime_build() };
         true

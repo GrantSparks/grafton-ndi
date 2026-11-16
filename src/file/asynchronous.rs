@@ -1876,8 +1876,12 @@ impl ProbeQueue {
             Ok(path) => path,
             Err(error) => return Live::failed(error),
         };
+        let api = api.clone();
         let (reply, future) = operation();
         let job: ProbeJob = Box::new(move || {
+            // The static table keeps the module mapped; this lease separately
+            // keeps NDI initialized while the probe is queued and running.
+            let _api = api;
             if !reply.shared.cancelled.load(Ordering::Acquire) {
                 reply.complete(FilePlayer::probe_checked(playback, &path));
             }
