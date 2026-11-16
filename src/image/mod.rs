@@ -538,10 +538,31 @@ enum Codec {
     /// Quality in 0 to 100, dimensions within lossy WebP's limit.
     WebpLossy {
         shape: BufferedImageShape,
-        quality: u8,
-        effort: u8,
+        quality: webp::WebpQuality,
+        effort: webp::WebpEffort,
         sharp_yuv: bool,
     },
+}
+
+/// Codec settings that are validated before examining the source frame.
+enum CodecSettings {
+    Png,
+    Jpeg(jpeg::JpegQuality),
+    WebpLossless,
+    WebpLossy(webp::WebpQuality, webp::WebpEffort),
+}
+impl CodecSettings {
+    fn new(options: &ImageOptions) -> Result<Self> {
+        Ok(match options.format {
+            ImageFormat::Png => Self::Png,
+            ImageFormat::Jpeg(quality) => Self::Jpeg(jpeg::JpegQuality::new(quality)?),
+            ImageFormat::WebpLossless => Self::WebpLossless,
+            ImageFormat::WebpLossy(quality) => Self::WebpLossy(
+                webp::WebpQuality::new(quality)?,
+                webp::WebpEffort::new(options.webp_effort)?,
+            ),
+        })
+    }
 }
 
 impl<'a> Plan<'a> {
@@ -549,17 +570,12 @@ impl<'a> Plan<'a> {
     /// the frame's color description, its HDR transfer, and the image's size.
     fn new(source: &'a Source<'a>, options: &ImageOptions) -> Result<Self> {
         let format = options.format;
-        format.validate_quality()?;
+        let settings = CodecSettings::new(options)?;
         let depth = options.depth;
-        if matches!(format, ImageFormat::WebpLossy(_)) && options.webp_effort > 6 {
-            return Err(Error::InvalidInput(crate::InputDefect::WebpEffort {
-                effort: options.webp_effort,
-            }));
-        }
         if depth == SampleDepth::Sixteen && format != ImageFormat::Png {
             return Err(Error::InvalidInput(
                 crate::InputDefect::SixteenBitNeedsPng {
-                    format: format.name(),
+                    codec: format.codec(),
                 },
             ));
         }
@@ -579,7 +595,7 @@ impl<'a> Plan<'a> {
                 }
                 HdrPolicy::CodeValues if format != ImageFormat::Png => {
                     return Err(Error::InvalidInput(crate::InputDefect::HdrNeedsPng {
-                        format: format.name(),
+                        codec: format.codec(),
                         transfer,
                     }))
                 }
@@ -611,51 +627,46 @@ impl<'a> Plan<'a> {
                 SampleDepth::Eight
             }
         };
-        // Preserve codec dimension diagnostics before checking conversion storage.
-        match format {
-            ImageFormat::Png => {}
-            ImageFormat::Jpeg(_) => check_size(
-                crate::ImageCodecKind::Jpeg,
-                width,
-                height,
-                jpeg::MAX_DIMENSION,
-            )?,
-            ImageFormat::WebpLossless => check_size(
-                crate::ImageCodecKind::Webp,
-                width,
-                height,
-                webp::MAX_LOSSLESS_DIMENSION,
-            )?,
-            ImageFormat::WebpLossy(_) => check_size(
-                crate::ImageCodecKind::Webp,
-                width,
-                height,
-                webp::MAX_LOSSY_DIMENSION,
-            )?,
-        }
-        let shape = ImageShape::new(width, height, channels, depth)?;
         let density = PixelDensity::for_source(source, width, height);
-        let codec = match format {
-            ImageFormat::Png => Codec::Png {
-                shape,
+        // Build each checked dimension value at the size stage, after the
+        // options, colour metadata and HDR policy have been validated.
+        let codec = match settings {
+            CodecSettings::Png => Codec::Png {
+                shape: ImageShape::new(width, height, channels, depth)?,
                 compression: options.png_compression,
                 cicp: color.and_then(|color| cicp(&color)),
                 density,
             },
-            ImageFormat::Jpeg(quality) => Codec::Jpeg {
-                quality: jpeg::JpegQuality::new(quality)?,
+            CodecSettings::Jpeg(quality) => Codec::Jpeg {
+                quality,
                 dimensions: jpeg::JpegDimensions::new(width, height)?,
                 density,
             },
-            ImageFormat::WebpLossless => Codec::WebpLossless {
-                shape: shape.buffered()?,
-            },
-            ImageFormat::WebpLossy(quality) => Codec::WebpLossy {
-                shape: shape.buffered()?,
-                quality,
-                effort: options.webp_effort,
-                sharp_yuv: options.webp_sharp_yuv,
-            },
+            CodecSettings::WebpLossless => {
+                check_size(
+                    crate::ImageCodecKind::Webp,
+                    width,
+                    height,
+                    webp::MAX_LOSSLESS_DIMENSION,
+                )?;
+                Codec::WebpLossless {
+                    shape: ImageShape::new(width, height, channels, depth)?.buffered()?,
+                }
+            }
+            CodecSettings::WebpLossy(quality, effort) => {
+                check_size(
+                    crate::ImageCodecKind::Webp,
+                    width,
+                    height,
+                    webp::MAX_LOSSY_DIMENSION,
+                )?;
+                Codec::WebpLossy {
+                    shape: ImageShape::new(width, height, channels, depth)?.buffered()?,
+                    quality,
+                    effort,
+                    sharp_yuv: options.webp_sharp_yuv,
+                }
+            }
         };
         if shift > 0 {
             packed_len(

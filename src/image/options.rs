@@ -45,12 +45,12 @@ pub enum ImageFormat {
 }
 
 impl ImageFormat {
-    /// The format's name in messages.
-    pub(super) const fn name(self) -> &'static str {
+    /// The codec used by this format.
+    pub(super) const fn codec(self) -> crate::ImageCodecKind {
         match self {
-            Self::Png => "PNG",
-            Self::Jpeg(_) => "JPEG",
-            Self::WebpLossless | Self::WebpLossy(_) => "WebP",
+            Self::Png => crate::ImageCodecKind::Png,
+            Self::Jpeg(_) => crate::ImageCodecKind::Jpeg,
+            Self::WebpLossless | Self::WebpLossy(_) => crate::ImageCodecKind::Webp,
         }
     }
 
@@ -67,7 +67,7 @@ impl ImageFormat {
             if !bounds.contains(&quality) {
                 return Err(crate::Error::InvalidInput(
                     crate::InputDefect::ImageQuality {
-                        format: self.name(),
+                        codec: self.codec(),
                         quality,
                         minimum: *bounds.start(),
                         maximum: *bounds.end(),

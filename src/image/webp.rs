@@ -12,6 +12,30 @@ pub(super) const MAX_LOSSLESS_DIMENSION: usize = 16_384;
 /// VP8 spends 14 bits on a dimension, with zero reserved.
 pub(super) const MAX_LOSSY_DIMENSION: usize = 16_383;
 
+/// Quality is checked once before examining frame metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WebpQuality(u8);
+impl WebpQuality {
+    pub(super) fn new(value: u8) -> Result<Self> {
+        super::ImageFormat::WebpLossy(value).validate_quality()?;
+        Ok(Self(value))
+    }
+}
+
+/// Effort is checked once with the format's options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WebpEffort(u8);
+impl WebpEffort {
+    pub(super) fn new(value: u8) -> Result<Self> {
+        if value > 6 {
+            return Err(Error::InvalidInput(crate::InputDefect::WebpEffort {
+                effort: value,
+            }));
+        }
+        Ok(Self(value))
+    }
+}
+
 /// Encode `pixels` as a lossless WebP of `channels` channels into `out`.
 ///
 /// An RGBA frame with contiguous rows is read in place; anything else
@@ -46,8 +70,8 @@ pub(super) fn encode_lossless(
 pub(super) fn encode_lossy(
     pixels: &mut Pixels<'_, u8>,
     shape: BufferedImageShape,
-    quality: u8,
-    effort: u8,
+    quality: WebpQuality,
+    effort: WebpEffort,
     sharp_yuv: bool,
     scratch: &mut Vec<u8>,
 ) -> Result<Vec<u8>> {
@@ -56,11 +80,11 @@ pub(super) fn encode_lossy(
     let (width, height) = (shape.rows.width, shape.rows.height);
     let image = image_with(pixels, shape, scratch)?;
     let mut config = OpConfig::new(OpQuality::Lossy {
-        quality: f32::from(quality),
+        quality: f32::from(quality.0),
         alpha_quality: 100,
         sharp_yuv,
     });
-    config.method = effort;
+    config.method = effort.0;
     libwebpop::encode(
         OpImage::Rgba {
             pixels: image,

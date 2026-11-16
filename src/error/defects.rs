@@ -794,11 +794,11 @@ pub enum InputDefect {
         /// The value.
         value: u32,
     },
-    /// {format} quality must be in {minimum}..={maximum}, got {quality}.
-    #[error("{format} quality must be in {minimum}..={maximum}, got {quality}")]
+    /// {codec} quality must be in {minimum}..={maximum}, got {quality}.
+    #[error("{codec} quality must be in {minimum}..={maximum}, got {quality}")]
     ImageQuality {
-        /// The format.
-        format: &'static str,
+        /// The codec.
+        codec: ImageCodecKind,
         /// The quality.
         quality: u8,
         /// The minimum.
@@ -812,17 +812,17 @@ pub enum InputDefect {
         /// The effort.
         effort: u8,
     },
-    /// {format} images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png.
-    #[error("{format} images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png")]
+    /// {codec} images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png.
+    #[error("{codec} images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png")]
     SixteenBitNeedsPng {
-        /// The format.
-        format: &'static str,
+        /// The codec.
+        codec: ImageCodecKind,
     },
-    /// {format} cannot say that its values are {transfer} code values; HdrPolicy::CodeValues needs ImageFormat::Png.
-    #[error("{format} cannot say that its values are {transfer} code values; HdrPolicy::CodeValues needs ImageFormat::Png")]
+    /// {codec} cannot say that its values are {transfer} code values; HdrPolicy::CodeValues needs ImageFormat::Png.
+    #[error("{codec} cannot say that its values are {transfer} code values; HdrPolicy::CodeValues needs ImageFormat::Png")]
     HdrNeedsPng {
-        /// The format.
-        format: &'static str,
+        /// The codec.
+        codec: ImageCodecKind,
         /// The transfer.
         transfer: TransferFunction,
     },

@@ -27,6 +27,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Audio allocator padding uses the same validated layout and error causes as
   captured audio, including the 64 MiB active extent limit. Allocator-only audio
   stride and extent error leaves are removed.
+- Image option refusals carry `codec: ImageCodecKind` in `ImageQuality`,
+  `SixteenBitNeedsPng` and `HdrNeedsPng`, replacing their string `format` field.
+  Encoding validates each codec quality, effort and dimension setting once.
+
 - Lossy WebP encoder storage failures remain `InvalidFrame(EncodingFailed)`
   because its supported dependency API cannot classify allocation failures;
   conversion scratch continues to report `AllocationFailed(ImageScratch)`.

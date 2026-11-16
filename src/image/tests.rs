@@ -1584,7 +1584,7 @@ fn hdr_frames_are_refused_by_default_in_every_format() {
             ] {
                 let message = invalid_input(frame.encode_image(&hdr(refused)));
                 assert!(
-                    matches!(message, crate::InputDefect::HdrNeedsPng {transfer,..} if transfer == if name=="PQ" {crate::TransferFunction::Pq} else {crate::TransferFunction::Hlg}),
+                    matches!(message, crate::InputDefect::HdrNeedsPng {codec, transfer} if codec == refused.codec() && transfer == if name=="PQ" {crate::TransferFunction::Pq} else {crate::TransferFunction::Hlg}),
                     "{message}"
                 );
             }
@@ -1968,10 +1968,10 @@ fn conflicting_options_are_refused_before_anything_is_written() {
         assert!(
             match needle {
                 "quality" | "WebP quality" =>
-                    matches!(message, crate::InputDefect::ImageQuality { .. }),
+                    matches!(message, crate::InputDefect::ImageQuality { codec, .. } if codec == options.format.codec()),
                 "WebP effort" => matches!(message, crate::InputDefect::WebpEffort { .. }),
                 "SampleDepth::Sixteen" =>
-                    matches!(message, crate::InputDefect::SixteenBitNeedsPng { .. }),
+                    matches!(message, crate::InputDefect::SixteenBitNeedsPng { codec } if codec == options.format.codec()),
                 other => panic!("unexpected case {other}"),
             },
             "{message}"
@@ -1985,7 +1985,7 @@ fn conflicting_options_are_refused_before_anything_is_written() {
                     crate::image_encoding::ImageFormat::Jpeg(quality)
                 ))
             ),
-            crate::InputDefect::ImageQuality { .. }
+            crate::InputDefect::ImageQuality { codec: crate::ImageCodecKind::Jpeg, quality: actual, .. } if actual == quality
         ));
         assert!(matches!(
             invalid_input(
@@ -1993,7 +1993,7 @@ fn conflicting_options_are_refused_before_anything_is_written() {
                     ImageFormat::Jpeg(quality)
                 ))
             ),
-            crate::InputDefect::ImageQuality { .. }
+            crate::InputDefect::ImageQuality { codec: crate::ImageCodecKind::Jpeg, quality: actual, .. } if actual == quality
         ));
     }
     // Quality is checked before the frame: even an HDR frame reports it.
