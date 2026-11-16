@@ -77,7 +77,9 @@ impl<K: Eq + Hash, V> ReservedMap<K, V> {
     fn prepare_insert(&mut self) -> bool {
         // A Vec of zero-sized pairs reports usize::MAX capacity even when no
         // room was requested. An empty HashMap still records that zero bound.
-        if self.entries.capacity() == 0 || self.entries.len() == self.scratch.capacity() {
+        if self.entries.len() == self.scratch.capacity()
+            || (std::mem::size_of::<(K, V)>() == 0 && self.entries.capacity() == 0)
+        {
             return false;
         }
         if self.entries.capacity() == self.entries.len() {
