@@ -253,10 +253,15 @@ macro_rules! server_api {
      $Configured:ident::$configured:ident) => {
         #[derive(Clone, Copy)]
         struct $Handle($Raw);
-        // SAFETY: Discovery Server objects have no thread affinity. Their
-        // ServerObject has one owner and this raw handle withholds Sync, so
-        // membership calls and destruction cannot overlap. Ownership of Rust
-        // state remains checked separately by the compiler.
+        // SAFETY: the listener headers forbid overlapping membership snapshots
+        // on one instance. ServerObject has one owner and this raw handle
+        // withholds Sync; listeners require &mut self for membership calls, so
+        // these calls and destruction cannot overlap. Beyond the headers, we
+        // rely on no thread affinity for creation, use and destruction. The real
+        // vendor-server test discovery_server::owners_move_between_threads
+        // exercises all four owners across those threads; discovery.rs pins
+        // their lifecycle against a scripted runtime. Rust ownership of the
+        // surrounding state is checked separately by the compiler.
         unsafe impl Send for $Handle {}
         impl Handle for $Handle {
             fn is_null(self) -> bool { self.0.is_null() }

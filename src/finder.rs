@@ -181,10 +181,14 @@ pub(crate) fn list_cstring(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FindInstance(NDIlib_find_instance_t);
 
-// SAFETY: the SDK gives finders no thread affinity and allows source-change
-// waits beside snapshot queries. Finder's snapshot lock covers every fetch and
-// copy before another query can invalidate its buffers; its change feed permits
-// only one native waiter. The surrounding Rust fields determine Finder's traits.
+// SAFETY: Processing.NDI.Find.h forbids overlapping current-source snapshots
+// on one instance. Finder's snapshot lock covers every fetch and copy before
+// another snapshot can invalidate its buffers; its change feed permits only one
+// native waiter. Beyond that header contract, we rely on no thread affinity for
+// creation, use and destruction, and on a native wait beside snapshots. Real
+// runtime tests in tests/change_notifications.rs exercise cross-thread use and
+// concurrent waits/snapshots; tests/finder_deadlines.rs pins snapshot contention.
+// The surrounding Rust fields determine Finder's remaining traits.
 unsafe impl Send for FindInstance {}
 // SAFETY: the same snapshot and waiter serialization applies to shared uses.
 unsafe impl Sync for FindInstance {}
@@ -757,7 +761,6 @@ impl Finder {
     /// Concurrent snapshots on this finder are serialized until all source names
     /// and addresses have been copied into owned Rust values.
     ///
-    /// Available since NDI SDK 6.0.
     ///
     /// Each snapshot permits at most 16,384 descriptors and 16 MiB total
     /// native descriptors, result storage, scanned string bytes (including
@@ -1788,8 +1791,9 @@ impl SourceCache {
     ///
     /// A cache hit returns owned descriptor copies without an SDK call. On a
     /// miss, observes the full window using the configured finder; zero makes
-    /// one non-waiting snapshot attempt. Results retain first-observed order and distinguish names,
-    /// full address text. Select the desired feed explicitly.
+    /// one non-waiting snapshot attempt. Results keep first-observed order, and
+    /// sources that differ in name or full address text are distinct. Select the
+    /// desired feed explicitly.
     /// Empty results return an empty vector and are not retained.
     ///
     /// Discovery runs outside the cache lock; its window includes snapshot-lock
@@ -1872,7 +1876,7 @@ impl SourceCache {
         self.entries.clear();
     }
 
-    /// Number of cached host identities, including every feed in each identity.
+    /// Number of cached host result sets; each holds every feed observed for its host.
     pub fn len(&self) -> usize {
         self.entries.len()
     }

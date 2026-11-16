@@ -783,8 +783,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// Reconnect serializes with other local connection changes and runs the
     /// native request on the blocking pool. Captures may continue meanwhile.
-    /// Confirm recovery via [`Receiver::connection_stats`]. A remote SourceDiscovery
-    /// Server source change does not update the local target this requests.
+    /// Confirm recovery via [`Receiver::connection_stats`]. A Discovery Server
+    /// source change does not update the local target this requests.
     ///
     /// # Errors
     ///
