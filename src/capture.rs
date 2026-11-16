@@ -523,9 +523,9 @@ unsafe impl Sync for Guard<'_, MetadataKind> {}
 // model, and NDI-RECV permits received metadata to be freed on another thread:
 // https://docs.ndi.video/all/developing-with-ndi/sdk/ndi-send
 // https://docs.ndi.video/all/developing-with-ndi/sdk/ndi-recv
-// The metadata lease serializes capture through the matching sender free,
-// shared access exposes only immutable held text, and the owner's borrow
-// retains the sender and runtime through release.
+// SenderMetadataGuard::drop retains the capture lease through matching
+// sender free. Shared access exposes only immutable held text, and the
+// owner's borrow retains the sender and runtime through release.
 unsafe impl Send for Guard<'_, SenderMetadataFree> {}
 unsafe impl Sync for Guard<'_, SenderMetadataFree> {}
 

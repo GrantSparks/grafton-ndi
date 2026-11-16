@@ -119,8 +119,8 @@ struct SenderMetadataGate {
 }
 
 // Only the private acquisition/release paths change the occupancy bit, with
-// no application code under its lock. A live lease clears the bit on unwind,
-// after its metadata guard has freed the native frame, so a panic cannot leave
+// no application code under its lock. SenderMetadataGuard::drop sequences the
+// native free and lease release, including on unwind, so a panic cannot leave
 // capture state half-mutated. This preserves the captured frame's unwind traits.
 impl std::panic::RefUnwindSafe for SenderMetadataGate {}
 
@@ -2659,6 +2659,96 @@ mod tests {
         });
         assert!(panic.is_err());
         assert!(gate.acquire_until(Instant::now()).is_some());
+    }
+
+    fn check_metadata_free_before_capture_release(path: &str) {
+        use crate::capture::{Guard, SenderMetadataFree, SenderMetadataInstance};
+        use std::sync::{atomic::AtomicUsize, OnceLock};
+
+        struct Observation {
+            gate: SenderMetadataGate,
+            frees: AtomicUsize,
+            released_early: AtomicBool,
+        }
+
+        unsafe fn observe_free(instance: SenderMetadataInstance, _: &mut NDIlib_metadata_frame_t) {
+            // SAFETY: the synthetic instance borrows this observation until
+            // the metadata guard has invoked its sole release callback.
+            let observation = unsafe { &*instance.instance.cast::<Observation>() };
+            observation.frees.fetch_add(1, Ordering::Relaxed);
+            observation.released_early.store(
+                observation.gate.acquire_until(Instant::now()).is_some(),
+                Ordering::Relaxed,
+            );
+        }
+
+        static TABLE: OnceLock<sys::SenderMetadata> = OnceLock::new();
+        let table = TABLE.get_or_init(|| {
+            // Synthetic release uses observe_free, never these placeholder
+            // entry points. The table only completes the instance's type.
+            sys::SenderMetadata::load(&sys::table::ExportsWhere(|_| true))
+                .unwrap()
+                .unwrap()
+        });
+        let observation = Observation {
+            gate: SenderMetadataGate::default(),
+            frees: AtomicUsize::new(0),
+            released_early: AtomicBool::new(false),
+        };
+        let text = if path == "validation" {
+            c"\xff"
+        } else {
+            c"<held/>"
+        };
+        let raw = NDIlib_metadata_frame_t {
+            length: text.to_bytes().len() as i32,
+            p_data: text.as_ptr().cast_mut(),
+            timecode: 0,
+        };
+        let lease = observation.gate.acquire_until(Instant::now()).unwrap();
+        // SAFETY: the observation and terminated text outlive the guard; the
+        // synthetic callback observes release and does not free either one.
+        let guard = unsafe {
+            Guard::<SenderMetadataFree>::with_test_free(
+                SenderMetadataInstance {
+                    instance: (&observation as *const Observation).cast_mut().cast(),
+                    metadata: table,
+                },
+                raw,
+                observe_free,
+            )
+        };
+        let frame = MetadataFrameRef::from_sender(guard, lease);
+        match path {
+            "validation" => assert!(matches!(frame, Err(Error::InvalidUtf8(_)))),
+            "unwind" => {
+                let panic = std::panic::catch_unwind(|| {
+                    let _frame = frame.unwrap();
+                    panic!("unwind while upstream metadata is borrowed");
+                });
+                assert!(panic.is_err());
+            }
+            "normal" => drop(frame.unwrap()),
+            _ => unreachable!(),
+        }
+        assert_eq!(observation.frees.load(Ordering::Relaxed), 1);
+        assert!(!observation.released_early.load(Ordering::Relaxed));
+        assert!(observation.gate.acquire_until(Instant::now()).is_some());
+    }
+
+    #[test]
+    fn sender_metadata_guard_frees_before_releasing_capture() {
+        check_metadata_free_before_capture_release("normal");
+    }
+
+    #[test]
+    fn sender_metadata_validation_failure_frees_before_releasing_capture() {
+        check_metadata_free_before_capture_release("validation");
+    }
+
+    #[test]
+    fn sender_metadata_unwind_frees_before_releasing_capture() {
+        check_metadata_free_before_capture_release("unwind");
     }
 
     #[test]

@@ -1,7 +1,13 @@
 //! Frame types for video, audio, and metadata.
 
 use std::{
-    ffi::CStr, fmt, marker::PhantomData, mem::size_of, num::NonZeroU32, os::raw::c_char, slice,
+    ffi::CStr,
+    fmt,
+    marker::PhantomData,
+    mem::{size_of, ManuallyDrop},
+    num::NonZeroU32,
+    os::raw::c_char,
+    slice,
 };
 
 #[cfg(test)]
@@ -5424,10 +5430,21 @@ pub struct MetadataFrameRef<'rx> {
 }
 
 struct SenderMetadataGuard<'a> {
-    guard: Guard<'a, SenderMetadataFree>,
-    // Fields drop in declaration order on every exit, including validation
-    // errors and unwinding: native free always precedes capture-gate release.
-    _lease: crate::sender::SenderMetadataLease<'a>,
+    guard: ManuallyDrop<Guard<'a, SenderMetadataFree>>,
+    lease: ManuallyDrop<crate::sender::SenderMetadataLease<'a>>,
+}
+
+impl Drop for SenderMetadataGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: both fields are initialized once and taken only here. The
+        // native guard is freed while the capture lease still excludes other
+        // captures; only then may releasing the lease wake another capture.
+        // This order also holds on validation failure and during unwinding.
+        unsafe {
+            drop(ManuallyDrop::take(&mut self.guard));
+            drop(ManuallyDrop::take(&mut self.lease));
+        }
+    }
 }
 
 impl HoldsDescriptor for SenderMetadataGuard<'_> {
@@ -5472,8 +5489,8 @@ impl<'rx> MetadataFrameRef<'rx> {
         lease: crate::sender::SenderMetadataLease<'rx>,
     ) -> Result<Self> {
         let guard = SenderMetadataGuard {
-            guard,
-            _lease: lease,
+            guard: ManuallyDrop::new(guard),
+            lease: ManuallyDrop::new(lease),
         };
         // SAFETY: the sender guard retains its delivered descriptor and the
         // SDK's NUL-terminated UTF-8 storage through matching native release.
