@@ -151,7 +151,8 @@ jobs:
           sudo apt-get install --yes --no-install-recommends valgrind
           runner='target.x86_64-unknown-linux-gnu.runner=["valgrind","--tool=memcheck","--error-exitcode=99","--trace-children=yes","--trace-children-skip=*/rustc,*/rustc-*"]'
           cargo test --locked --all-features --config "$runner" --test mixed_capture_boundary --test frame_metadata_boundary -- --test-threads=1
-          for filter in frames::tests::video_padding_encoders; do
+          filters=(frames::tests::video_padding_encoders)
+          for filter in "${filters[@]}"; do
             selected=$(cargo test --locked --all-features --lib -- --list "$filter")
             if ! grep -q ': test$' <<< "$selected"; then
               echo "::error::No tests selected for filter: $filter"

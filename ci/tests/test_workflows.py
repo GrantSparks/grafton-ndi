@@ -211,7 +211,7 @@ def memory_checker_violations(rust):
         if owner not in jobs['required-ci'].get('needs', []):
             found.append(f'rust.yml: {owner} Memcheck is not required')
     for required in ('--trace-children=yes', '--trace-children-skip=', '--test mixed_capture_boundary',
-                     '--test frame_metadata_boundary', 'for filter in frames::tests::video_padding_encoders'):
+                     '--test frame_metadata_boundary', 'filters=(frames::tests::video_padding_encoders)'):
         if required not in test.get('run', ''):
             found.append('rust.yml: scripted Memcheck omits active SDK-free fixtures or their child processes')
     for owner, command in (('Miri', run), ('scripted Memcheck', test.get('run', ''))):
