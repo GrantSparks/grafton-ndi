@@ -76,9 +76,11 @@ under Miri; source-parsing and subprocess tests are outside its filters. The
 long descriptor churn, exhaustive UTF-8 pairs and multi-megabyte copy-budget
 fixtures are explicitly skipped; smaller synthetic tests retain their exact
 charges, malformed-entry handling and scan bounds. Both memory-checker steps
-list each filter before running it and fail if it selects no tests; Miri also
-checks every skip name. This keeps
-fixture renames from silently removing coverage. The pinned nightly detects a
+check each filter before running it and fail if it selects no tests. Miri reads
+one interpreted test inventory per model, checks every skip name against it,
+and checks each filter after applying all skips. Matching uses libtest's literal
+substring rules. This keeps fixture renames from silently removing coverage
+without interpreting the inventory again for every guard. The pinned nightly detects a
 `Box`-owned `AliasableBox` regression; it does not yet support the Miri option
 needed to enforce `AliasableVec`'s unique-pointer contract. Miri uses one padded
 layout and one PNG encoding per format; native tests retain their full matrices.

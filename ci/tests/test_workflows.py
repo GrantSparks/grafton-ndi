@@ -232,9 +232,11 @@ def memory_checker_violations(rust):
         if command not in setup:
             found.append('rust.yml: Miri setup does not pin the checked nightly and components')
     command = 'cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio'
-    for selection in ('"$filter"', '-- --list "$filter"', '-- --list "$skip"'):
+    for selection in ('"$filter"', '-- --list'):
         if f'{command} {selection}' not in run:
             found.append('rust.yml: Miri does not build and execute the selected synthetic fixtures with file-io')
+    if run.count('-- --list') != 1 or f'inventory=$({command} -- --list)' not in run:
+        found.append('rust.yml: Miri must read one interpreted test inventory')
     selection = re.search(r'for filter in (.*?); do', run, re.DOTALL)
     filters = set(shlex.split(selection.group(1).replace('\\\n', ' '))) if selection else set()
     for fixture in ('sdk_copy::tests::', 'source_retention::tests::', 'finder::budget::tests::',
@@ -267,11 +269,13 @@ def memory_checker_violations(rust):
                      '--test frame_metadata_boundary', 'filters=(frames::tests::video_padding_encoders)'):
         if required not in test.get('run', ''):
             found.append('rust.yml: scripted Memcheck omits active SDK-free fixtures or their child processes')
-    for owner, command in (('Miri', run), ('scripted Memcheck', test.get('run', ''))):
-        for required in ('-- --list "$filter"', "if ! grep -q ': test$'", 'No tests selected for filter: $filter', 'exit 1'):
-            if required not in command:
-                found.append(f'rust.yml: {owner} lacks the empty-selection guard')
-    for required in ('-- --list "$skip"', 'No tests selected for skip: $skip', 'skip_args+=(--skip "$skip")'):
+    for required in ('-- --list "$filter"', "if ! grep -q ': test$'", 'No tests selected for filter: $filter', 'exit 1'):
+        if required not in test.get('run', ''):
+            found.append('rust.yml: scripted Memcheck lacks the empty-selection guard')
+    for required in ('if ! has_tests "$filter" true', 'No tests selected for filter: $filter', 'exit 1'):
+        if required not in run:
+            found.append('rust.yml: Miri lacks the empty-selection guard')
+    for required in ('if ! has_tests "$skip" false', 'No tests selected for skip: $skip', 'skip_args+=(--skip "$skip")'):
         if required not in run:
             found.append('rust.yml: Miri lacks the skip-selection guard')
     for required in ('ci/offline/linux.sh', '--test video_padding_sdk', '--features image-encoding'):
@@ -690,9 +694,14 @@ class MemoryCheckers(unittest.TestCase):
             ('miri', 'Initialized rows, metadata and synthetic native guards', 'frames::tests::video_padding_all_formats'),
             ('miri', 'Initialized rows, metadata and synthetic native guards',
              'descriptor_admission_and_collection_stay_allocation_free_under_churn'),
+            ('miri', 'Initialized rows, metadata and synthetic native guards', 'sdk_copy::tests::fixture'),
             ('test', 'Memcheck over scripted capture and encoder padding', 'frames::tests::video_padding_encoders'),
             ('test', 'Manual measurement fixtures', '--ignored'),
         ]
+        miri_script = rust['jobs']['miri']['steps'][2]['run']
+        skips = shlex.split(re.search(r'skips=\((.*?)\)', miri_script, re.DOTALL).group(1))
+        filters = shlex.split(re.search(r'for filter in (.*?); do', miri_script, re.DOTALL).group(1).replace('\\\n', ' '))
+        inventory = '\n'.join(f'{name}: test' for name in [*skips, *(name + 'fixture' for name in filters)])
         with tempfile.TemporaryDirectory() as directory:
             cargo = Path(directory) / 'cargo'
             cargo.write_text('''#!/bin/bash
@@ -700,8 +709,18 @@ empty=0
 for argument in "$@"; do
   if [ "$argument" = "$EMPTY_SELECTION" ]; then empty=1; fi
 done
+printf '%s\n' "$*" >> "$CARGO_CALLS"
 case " $* " in
-  *" --list "*) if [ "$empty" = 0 ]; then echo 'fixture: test'; fi ;;
+  *" --list "*)
+    if [ -n "$MIRI_INVENTORY" ]; then
+      while IFS= read -r line; do
+        if [ -z "$EMPTY_SELECTION" ] || [[ "$line" != *"$EMPTY_SELECTION"* ]]; then
+          printf '%s\n' "$line"
+        fi
+      done <<< "$MIRI_INVENTORY"
+    elif [ "$empty" = 0 ]; then
+      echo 'fixture: test'
+    fi ;;
 esac
 ''')
             cargo.chmod(0o755)
@@ -710,13 +729,21 @@ esac
                 script = '\n'.join(line for line in script.splitlines() if not line.startswith('sudo '))
                 for selection, expected in (('', 0), (missing, 1)):
                     with self.subTest(job=job, missing=selection):
+                        calls_file = Path(directory) / 'calls'
+                        calls_file.write_text('')
                         result = subprocess.run(['bash', '-eo', 'pipefail', '-c', script],
                                                 env={**os.environ, 'PATH': directory + os.pathsep + os.environ['PATH'],
-                                                     'EMPTY_SELECTION': selection}, text=True, capture_output=True)
+                                                     'EMPTY_SELECTION': selection, 'CARGO_CALLS': str(calls_file),
+                                                     'MIRI_INVENTORY': inventory if job == 'miri' else ''}, text=True, capture_output=True)
                         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                         if selection:
-                            self.assertIn(selection, result.stdout)
+                            self.assertIn(selection.removesuffix('fixture'), result.stdout)
                             self.assertIn('No tests selected', result.stdout)
+                        if job == 'miri':
+                            calls = calls_file.read_text().splitlines()
+                            self.assertEqual(sum(' --list' in call for call in calls), 1)
+                            if not selection:
+                                self.assertEqual(sum(' --list' not in call for call in calls), len(filters))
 
     def test_missing_detector_configuration_is_reported(self):
         rust = workflows.load(read_workflows()['rust.yml'])
@@ -738,11 +765,18 @@ esac
                           ('test', 'Memcheck over scripted capture and encoder padding')):
             missing_guard = copy.deepcopy(rust)
             step = next(step for step in missing_guard['jobs'][job]['steps'] if step.get('name') == name)
-            step['run'] = step['run'].replace('-- --list "$filter"', '')
+            guard = 'if ! has_tests "$filter" true' if job == 'miri' else '-- --list "$filter"'
+            step['run'] = step['run'].replace(guard, '')
             variants.append((missing_guard, 'empty-selection guard'))
         missing_skip_guard = copy.deepcopy(rust)
-        missing_skip_guard['jobs']['miri']['steps'][2]['run'] = rust['jobs']['miri']['steps'][2]['run'].replace('-- --list "$skip"', '')
+        missing_skip_guard['jobs']['miri']['steps'][2]['run'] = rust['jobs']['miri']['steps'][2]['run'].replace('if ! has_tests "$skip" false', '')
         variants.append((missing_skip_guard, 'skip-selection guard'))
+        for change in ('remove', 'repeat'):
+            broken_inventory = copy.deepcopy(rust)
+            step = broken_inventory['jobs']['miri']['steps'][2]
+            inventory = next(line for line in step['run'].splitlines() if line.startswith('inventory='))
+            step['run'] = step['run'].replace(inventory, '' if change == 'remove' else inventory + '\n' + inventory)
+            variants.append((broken_inventory, 'one interpreted test inventory'))
         missing_send_module = copy.deepcopy(rust)
         missing_send_module['jobs']['miri']['steps'][2]['run'] = rust['jobs']['miri']['steps'][2]['run'].replace('advanced::aliasable::tests::', '')
         variants.append((missing_send_module, 'Miri omits advanced::aliasable'))
@@ -754,7 +788,7 @@ esac
             step = missing_reads['jobs']['miri']['steps'][2]
             step['run'] = step['run'].replace(fixture + ' \\\n', '')
             variants.append((missing_reads, f'Miri omits {fixture}'))
-        for selection in ('"$filter"', '-- --list "$filter"', '-- --list "$skip"'):
+        for selection in ('"$filter"', '-- --list'):
             missing_file = copy.deepcopy(rust)
             step = missing_file['jobs']['miri']['steps'][2]
             step['run'] = step['run'].replace(
