@@ -136,12 +136,24 @@ macro_rules! interleaved_input {
         /// count, which must divide it exactly; the equivalent FLTP
         /// allocation must fit the library's 64 MiB audio limit. Metadata is
         /// not represented.
-        #[derive(Debug, Clone, Copy)]
+        #[derive(Clone, Copy)]
         pub struct $name<'a> {
             shape: AudioShape,
             data: &'a [$sample],
             timecode: Timecode,
             $($reference: AudioReferenceLevel,)?
+        }
+
+        impl std::fmt::Debug for $name<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let mut summary = f.debug_struct(stringify!($name));
+                summary.field("sample_rate", &self.sample_rate())
+                    .field("num_channels", &self.num_channels())
+                    .field("num_samples", &self.num_samples())
+                    .field("timecode", &self.timecode());
+                $(summary.field(stringify!($reference), &self.$reference);)?
+                summary.field("data (samples)", &self.data.len()).finish()
+            }
         }
 
         impl<'a> $name<'a> {
@@ -394,6 +406,39 @@ impl<M: AudioSendMode> Sender<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interleaved_debug_summarizes_every_sample_type() {
+        fn summaries(samples: usize) -> Vec<String> {
+            let i16s = vec![1i16; 2 * samples];
+            let i32s = vec![2i32; 2 * samples];
+            let floats = vec![0.25; 2 * samples];
+            vec![
+                format!(
+                    "{:?}",
+                    InterleavedAudioI16::new(48_000, 2, &i16s, AudioReferenceLevel::SEND).unwrap()
+                ),
+                format!(
+                    "{:?}",
+                    InterleavedAudioI32::new(
+                        48_000,
+                        2,
+                        &i32s,
+                        AudioReferenceLevel::RECEIVE_HEADROOM
+                    )
+                    .unwrap()
+                ),
+                format!(
+                    "{:?}",
+                    InterleavedAudioF32::new(48_000, 2, &floats).unwrap()
+                ),
+            ]
+        }
+        let small = summaries(3);
+        assert!(small[0].contains("reference_level: AudioReferenceLevel(0)"));
+        assert!(small[1].contains("reference_level: AudioReferenceLevel(20)"));
+        crate::test_support::assert_bounded_debug(&small, &summaries(48_000));
+    }
 
     #[test]
     fn captured_audio_sources_lend_the_original_strided_descriptor() {

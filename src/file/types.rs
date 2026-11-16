@@ -915,11 +915,25 @@ pub(super) fn path_string(path: &Path) -> Result<FileText> {
 }
 
 /// Original SDK event bytes, retaining invalid UTF-8 and truncation evidence.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct EventText {
     bytes: Vec<u8>,
     terminated: bool,
     possibly_truncated: bool,
+}
+
+impl std::fmt::Debug for EventText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut summary = f.debug_struct("EventText");
+        summary.field("text", &self.to_string_lossy());
+        if !self.terminated {
+            summary.field("terminated", &false);
+        }
+        if self.possibly_truncated {
+            summary.field("possibly_truncated", &true);
+        }
+        summary.finish()
+    }
 }
 
 impl Default for EventText {
@@ -1779,6 +1793,29 @@ impl RecorderStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_text_debug_prints_text_and_only_nondefault_evidence() {
+        let text = |bytes: &[u8]| {
+            EventText::from_buffer(&bytes.iter().map(|&byte| byte as c_char).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            format!("{:?}", text(b"take.mkv\0\0")),
+            "EventText { text: \"take.mkv\" }"
+        );
+        assert_eq!(
+            format!("{:?}", text(b"take")),
+            "EventText { text: \"take\", terminated: false, possibly_truncated: true }"
+        );
+        assert_eq!(
+            format!("{:?}", text(b"\xff\0\0")),
+            "EventText { text: \"�\" }"
+        );
+        assert_eq!(
+            format!("{:?}", text(b"x\0")),
+            "EventText { text: \"x\", possibly_truncated: true }"
+        );
+    }
 
     #[test]
     fn session_timecodes_refuse_only_the_send_sentinel() {

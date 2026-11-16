@@ -1683,37 +1683,6 @@ const _: () = {
 pub(crate) mod testing {
     use super::*;
 
-    /// Payload size may change only the numeric extents of bounded summaries.
-    pub(crate) fn assert_bounded_debug(small: &[String], large: &[String]) {
-        fn without_counts(text: &str) -> String {
-            let mut previous_digit = false;
-            text.chars()
-                .filter_map(|character| {
-                    let digit = character.is_ascii_digit();
-                    let emit = !digit || !previous_digit;
-                    previous_digit = digit;
-                    emit.then_some(if digit { '#' } else { character })
-                })
-                .collect()
-        }
-        assert_eq!(small.len(), large.len());
-        for (small, large) in small.iter().zip(large) {
-            for text in [small, large] {
-                assert!(
-                    text.len() < 1024,
-                    "unbounded packet Debug: {} bytes",
-                    text.len()
-                );
-                assert!(
-                    !text.contains("0x"),
-                    "packet Debug contains an address: {text}"
-                );
-            }
-            assert_ne!(small, large, "packet Debug omitted its payload extent");
-            assert_eq!(without_counts(small), without_counts(large));
-        }
-    }
-
     /// A two-byte AAC-LC AudioSpecificConfig for an indexed sample rate and a
     /// channel count the configuration can name.
     pub(crate) fn aac_config(sample_rate: u32, channels: u32) -> [u8; 2] {
@@ -1851,7 +1820,7 @@ mod tests {
             result
         }
 
-        assert_bounded_debug(&summaries(1024), &summaries(1024 * 1024));
+        crate::test_support::assert_bounded_debug(&summaries(1024), &summaries(1024 * 1024));
     }
 
     fn aac(sample_rate: u32, channels: u32, samples: u32, packet: Vec<u8>) -> Result<()> {

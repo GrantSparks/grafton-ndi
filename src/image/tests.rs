@@ -3292,3 +3292,22 @@ fn eight_bit_yuv_png_conversion_preserves_sixteen_bit_precision() {
         }
     }
 }
+
+#[test]
+fn workspace_debug_summarizes_retained_conversion_storage() {
+    fn summary(width: u32, height: u32) -> String {
+        let frame = VideoFrame::builder()
+            .resolution(width, height)
+            .pixel_format(PixelFormat::Uyvy)
+            .build()
+            .unwrap();
+        let mut workspace = crate::image_encoding::ImageWorkspace::new();
+        let options = ImageOptions::new(ImageFormat::WebpLossy(75))
+            .webp_effort(0)
+            .webp_sharp_yuv(false);
+        workspace.encode(&frame, &options).unwrap();
+        assert!(workspace.retained_bytes() >= width as usize * height as usize * 4);
+        format!("{workspace:?}")
+    }
+    crate::test_support::assert_bounded_debug(&[summary(4, 2)], &[summary(1920, 1080)]);
+}

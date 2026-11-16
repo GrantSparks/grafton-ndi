@@ -1781,6 +1781,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recording_report_debug_names_its_closed_path() {
+        let path = b"take.mkv\0\0".map(|byte| byte as std::ffi::c_char);
+        let report = RecordingReport {
+            session: 1,
+            phase: SessionPhase::Closed { requested: true },
+            closed_files: 1,
+            empty_files: 0,
+            error_events: 0,
+            write_failures: 0,
+            dropped_events: 0,
+            last_closed_path: Some(EventText::from_buffer(&path)),
+        };
+        let debug = format!("{report:?}");
+        assert!(debug.contains("\"take.mkv\""));
+        assert!(!debug.contains("116, 97"));
+    }
+
+    #[test]
     fn checked_cleanup_waits_keep_their_budget_until_it_is_spent() {
         let start = Instant::now();
         for wait in [Duration::from_nanos(1), FINISH_POLL, crate::MAX_TIMEOUT] {

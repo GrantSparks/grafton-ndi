@@ -1387,7 +1387,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
 
 /// Builder for a [`BorrowedVideoFrame`], reached through
 /// [`BorrowedVideoFrame::builder`]. No pixels or metadata are copied.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct BorrowedVideoFrameBuilder<'buf> {
     data: &'buf [u8],
     width: u32,
@@ -1402,6 +1402,28 @@ pub struct BorrowedVideoFrameBuilder<'buf> {
     /// Readable bytes the caller vouches for after `data`.
     readable_after: usize,
     allow_padding_and_tail: bool,
+}
+
+impl std::fmt::Debug for BorrowedVideoFrameBuilder<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BorrowedVideoFrameBuilder")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("pixel_format", &self.pixel_format)
+            .field("line_stride_bytes", &self.line_stride)
+            .field("frame_rate", &self.frame_rate)
+            .field("picture_aspect_ratio", &self.aspect_ratio_input)
+            .field("scan_type", &self.scan_type)
+            .field("timecode", &self.timecode)
+            .field("metadata", &self.metadata.map(CStr::to_string_lossy))
+            .field("readable_after", &self.readable_after)
+            .field(
+                "allow_send_from_padding_and_tail",
+                &self.allow_padding_and_tail,
+            )
+            .field("data (bytes)", &self.data.len())
+            .finish()
+    }
 }
 
 impl<'buf> BorrowedVideoFrameBuilder<'buf> {

@@ -1060,10 +1060,7 @@ mod tests {
 
     #[test]
     fn completed_packet_debug_is_bounded_by_fields_not_payload() {
-        use crate::advanced::{
-            packets::testing::assert_bounded_debug, EnvelopeCodec, PacketEnvelope, VideoCodec,
-            VideoPacketFormat,
-        };
+        use crate::advanced::{EnvelopeCodec, PacketEnvelope, VideoCodec, VideoPacketFormat};
         let summaries = |size| {
             let bytes =
                 PacketEnvelope::encode(EnvelopeCodec::H264, 17, 13, true, &vec![7; size], &[1, 2])
@@ -1091,7 +1088,7 @@ mod tests {
                 )
             })
         };
-        assert_bounded_debug(&summaries(1024), &summaries(1024 * 1024));
+        crate::test_support::assert_bounded_debug(&summaries(1024), &summaries(1024 * 1024));
     }
 
     #[test]

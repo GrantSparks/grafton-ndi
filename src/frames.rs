@@ -1778,7 +1778,7 @@ impl VideoFrame {
 }
 
 /// Builder for a [`VideoFrame`], reached through [`VideoFrame::builder`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VideoFrameBuilder {
     width: u32,
     height: u32,
@@ -1789,6 +1789,22 @@ pub struct VideoFrameBuilder {
     timecode: Timecode,
     metadata: Option<String>,
     data: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for VideoFrameBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VideoFrameBuilder")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("pixel_format", &self.pixel_format)
+            .field("frame_rate", &self.frame_rate)
+            .field("picture_aspect_ratio", &self.picture_aspect_ratio)
+            .field("scan_type", &self.scan_type)
+            .field("timecode", &self.timecode)
+            .field("metadata", &self.metadata)
+            .field("data (bytes)", &self.data.as_ref().map(Vec::len))
+            .finish()
+    }
 }
 
 impl VideoFrameBuilder {
@@ -2234,7 +2250,7 @@ impl<'buf> BorrowedAudioFrame<'buf> {
 }
 
 /// Builder for [`BorrowedAudioFrame`]; no sample or metadata copies are made.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct BorrowedAudioFrameBuilder<'buf> {
     data: &'buf [f32],
     sample_rate: u32,
@@ -2243,6 +2259,20 @@ pub struct BorrowedAudioFrameBuilder<'buf> {
     channel_stride_bytes: Option<usize>,
     timecode: Timecode,
     metadata: Option<&'buf CStr>,
+}
+
+impl fmt::Debug for BorrowedAudioFrameBuilder<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BorrowedAudioFrameBuilder")
+            .field("sample_rate", &self.sample_rate)
+            .field("num_channels", &self.num_channels)
+            .field("num_samples", &self.num_samples)
+            .field("channel_stride_bytes", &self.channel_stride_bytes)
+            .field("timecode", &self.timecode)
+            .field("metadata", &self.metadata.map(CStr::to_string_lossy))
+            .field("data (samples)", &self.data.len())
+            .finish()
+    }
 }
 
 impl<'buf> BorrowedAudioFrameBuilder<'buf> {
@@ -2369,7 +2399,7 @@ macro_rules! audio_accessors {
     (
         $(#[$attr:meta])*
         impl[$($generics:tt)*] $frame:ty;
-        debug($name:expr);
+        debug($name:expr, $data:literal = $data_len:ident);
         timecode { $(#[$timecode:meta])* }
         timestamp { $(#[$timestamp:meta])* }
         channel_stride_bytes { $(#[$channel_stride:meta])* }
@@ -2491,7 +2521,7 @@ macro_rules! audio_accessors {
                     .field("num_samples", &self.num_samples())
                     .field("timecode", &self.timecode())
                     .field("format", &self.format())
-                    .field("samples per channel", &AudioParts::layout(self).no_samples())
+                    .field($data, &AudioParts::layout(self).$data_len())
                     .field("channel_stride_bytes", &self.channel_stride_bytes())
                     .field("metadata", &self.metadata())
                     .field("timestamp", &self.timestamp())
@@ -2504,7 +2534,7 @@ macro_rules! audio_accessors {
 
 audio_accessors! {
     impl['buf] BorrowedAudioFrame<'buf>;
-    debug("BorrowedAudioFrame");
+    debug("BorrowedAudioFrame", "data (samples)" = sample_count);
     timecode {}
     timestamp {
         /// Application input has no SDK submission timestamp.
@@ -2577,7 +2607,7 @@ unsafe impl AudioParts for AudioFrame {
 
 audio_accessors! {
     impl[] AudioFrame;
-    debug("AudioFrame");
+    debug("AudioFrame", "data (samples)" = sample_count);
     timecode {
         /// A built frame starts with [`Timecode::SYNTHESIZE`]; a copy of a
         /// received frame keeps the timecode it arrived with.
@@ -2750,7 +2780,7 @@ impl AudioFrame {
 }
 
 /// Builder for an [`AudioFrame`], reached through [`AudioFrame::builder`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AudioFrameBuilder {
     sample_rate: u32,
     num_channels: u32,
@@ -2758,6 +2788,19 @@ pub struct AudioFrameBuilder {
     timecode: Timecode,
     data: Option<Vec<f32>>,
     metadata: Option<String>,
+}
+
+impl fmt::Debug for AudioFrameBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AudioFrameBuilder")
+            .field("sample_rate", &self.sample_rate)
+            .field("num_channels", &self.num_channels)
+            .field("num_samples", &self.num_samples)
+            .field("timecode", &self.timecode)
+            .field("metadata", &self.metadata)
+            .field("data (samples)", &self.data.as_ref().map(Vec::len))
+            .finish()
+    }
 }
 
 impl AudioFrameBuilder {
@@ -2970,10 +3013,20 @@ pub(crate) const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
 /// assert_eq!(frame.timecode().ticks(), 0);
 /// # Ok::<(), grafton_ndi::Error>(())
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct MetadataFrame {
     data: TerminatedText,
     timecode: Timecode,
+}
+
+impl fmt::Debug for MetadataFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MetadataFrame")
+            .field("data", &self.data())
+            .field("data (bytes)", &self.as_bytes().len())
+            .field("timecode", &self.timecode())
+            .finish()
+    }
 }
 
 impl MetadataFrame {
@@ -3812,7 +3865,7 @@ pub(crate) struct ValidatedAudioLayout {
 /// Inter-channel padding is never included. The iterator borrows the frame and
 /// keeps its sample storage alive; its immutable views support scoped thread
 /// transfer even when the owning capture must be freed on its original thread.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AudioChannels<'a> {
     data: *const f32,
     layout: ValidatedAudioLayout,
@@ -3827,6 +3880,19 @@ pub struct AudioChannels<'a> {
 unsafe impl Send for AudioChannels<'_> {}
 // SAFETY: Sharing exposes only immutable samples and independent iterator state.
 unsafe impl Sync for AudioChannels<'_> {}
+
+impl fmt::Debug for AudioChannels<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AudioChannels")
+            .field("remaining_channels", &self.len())
+            .field("samples_per_channel", &self.layout.no_samples())
+            .field(
+                "channel_stride_bytes",
+                &(self.layout.channel_stride_samples() * size_of::<f32>()),
+            )
+            .finish()
+    }
+}
 
 impl<'a> Iterator for AudioChannels<'a> {
     type Item = &'a [f32];
@@ -3882,6 +3948,11 @@ impl ValidatedAudioLayout {
     /// The validated `channel_stride_samples` value.
     pub(crate) const fn channel_stride_samples(&self) -> usize {
         self.channel_stride_samples
+    }
+
+    /// Initialized samples only, excluding inter-channel padding.
+    fn active_sample_count(&self) -> usize {
+        self.no_channels * self.no_samples
     }
 
     /// The validated `sample_count` value.
@@ -4853,7 +4924,7 @@ unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> AudioParts
 /// });
 /// # }
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct VideoPlane<'a> {
     data: *const u8,
     layout: VideoPlaneLayout,
@@ -4873,6 +4944,25 @@ pub struct VideoPlane<'a> {
 unsafe impl Send for VideoPlane<'_> {}
 // SAFETY: Same immutable access and lifetime proof as Send above.
 unsafe impl Sync for VideoPlane<'_> {}
+
+// This formatter reads only validated extents, never the plane's allocation.
+struct PlaneExtent<'a>(&'a VideoPlaneLayout);
+
+impl fmt::Debug for PlaneExtent<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VideoPlane")
+            .field("row_stride_bytes", &self.0.row_stride)
+            .field("active_row_bytes", &self.0.active_row_bytes)
+            .field("row_count", &self.0.row_count)
+            .finish()
+    }
+}
+
+impl fmt::Debug for VideoPlane<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        PlaneExtent(&self.layout).fmt(f)
+    }
+}
 
 impl<'a> VideoPlane<'a> {
     /// Caller must retain an allocation covering the validated layout for 'a,
@@ -4938,10 +5028,20 @@ impl<'a> VideoPlane<'a> {
 
 /// Active video rows, borrowing the frame that owns the allocation.
 /// `Send + Sync` through its immutable plane; iteration never calls the SDK.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VideoRows<'a> {
     plane: VideoPlane<'a>,
     indices: std::ops::Range<usize>,
+}
+
+impl fmt::Debug for VideoRows<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VideoRows")
+            .field("remaining_rows", &self.len())
+            .field("row_stride_bytes", &self.plane.row_stride_bytes())
+            .field("active_row_bytes", &self.plane.active_row_bytes())
+            .finish()
+    }
 }
 
 impl<'a> Iterator for VideoRows<'a> {
@@ -4963,7 +5063,7 @@ impl std::iter::FusedIterator for VideoRows<'_> {}
 
 /// Video planes in SDK memory order, with no allocation or pixel copies.
 /// `Send + Sync` for scoped reads; the owning frame's thread rules still apply.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VideoPlanes<'a> {
     data: *const u8,
     layouts: slice::Iter<'a, VideoPlaneLayout>,
@@ -4976,6 +5076,17 @@ pub struct VideoPlanes<'a> {
 unsafe impl Send for VideoPlanes<'_> {}
 // SAFETY: Sharing the iterator exposes only immutable layouts and bytes.
 unsafe impl Sync for VideoPlanes<'_> {}
+impl fmt::Debug for VideoPlanes<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut summary = f.debug_struct("VideoPlanes");
+        summary.field("remaining_planes", &self.len());
+        for layout in self.layouts.as_slice() {
+            summary.field("plane", &PlaneExtent(layout));
+        }
+        summary.finish()
+    }
+}
+
 impl<'a> Iterator for VideoPlanes<'a> {
     type Item = VideoPlane<'a>;
     fn next(&mut self) -> Option<Self::Item> {
@@ -5140,7 +5251,7 @@ macro_rules! borrowed_audio_accessors {
         }
         audio_accessors! {
                 impl['a] $name<'a>;
-                debug(<$strategy as FrameFree>::REF_DEBUG_NAME);
+                debug(<$strategy as FrameFree>::REF_DEBUG_NAME, "active data (samples)" = active_sample_count);
                 timecode {
                     /// FrameSync output without a source timecode carries
                     /// [`Timecode::SYNTHESIZE`].
@@ -8614,6 +8725,122 @@ mod tests {
     }
 
     #[test]
+    fn builder_and_view_debug_summarizes_storage_and_remaining_extents() {
+        fn summaries(width: u32, height: u32, samples: u32) -> Vec<String> {
+            let pixels = vec![7; width as usize * height as usize * 4];
+            let audio = vec![0.25; samples as usize * 2];
+            let frame = VideoFrame::builder()
+                .resolution(width, height)
+                .pixel_format(PixelFormat::Nv12)
+                .build()
+                .unwrap();
+            let plane = frame.planes().next().unwrap();
+            let audio_frame = AudioFrame::builder()
+                .num_channels(2)
+                .num_samples(samples)
+                .build()
+                .unwrap();
+            vec![
+                format!(
+                    "{:?}",
+                    VideoFrame::builder()
+                        .resolution(width, height)
+                        .data(pixels.clone())
+                        .metadata("<x/>")
+                ),
+                format!(
+                    "{:?}",
+                    crate::BorrowedVideoFrame::builder(&pixels, width, height, PixelFormat::Bgra)
+                        .metadata(c"<x/>")
+                ),
+                format!(
+                    "{:?}",
+                    AudioFrame::builder()
+                        .num_channels(2)
+                        .num_samples(samples)
+                        .data(audio.clone())
+                        .metadata("<x/>")
+                ),
+                format!(
+                    "{:?}",
+                    BorrowedAudioFrame::builder(&audio, 48_000, 2, samples).metadata(c"<x/>")
+                ),
+                format!("{plane:?}"),
+                format!("{:?}", plane.rows()),
+                format!("{:?}", frame.planes()),
+                format!("{:?}", audio_frame.channels()),
+                format!("{audio_frame:?}"),
+                format!(
+                    "{:?}",
+                    BorrowedAudioFrame::builder(&audio, 48_000, 2, samples)
+                        .build()
+                        .unwrap()
+                ),
+            ]
+        }
+        crate::test_support::assert_bounded_debug(
+            &summaries(4, 2, 3),
+            &summaries(1920, 1080, 48_000),
+        );
+        assert!(format!("{:?}", VideoFrame::builder()).contains("data (bytes): None"));
+        assert!(format!("{:?}", AudioFrame::builder()).contains("data (samples): None"));
+        let frame = VideoFrame::builder()
+            .resolution(4, 2)
+            .pixel_format(PixelFormat::Nv12)
+            .build()
+            .unwrap();
+        let mut planes = frame.planes();
+        let plane = planes.next().unwrap();
+        assert!(format!("{planes:?}").contains("remaining_planes: 1"));
+        let mut rows = plane.rows();
+        rows.next();
+        assert!(format!("{rows:?}").contains("remaining_rows: 1"));
+        let audio = AudioFrame::builder()
+            .num_channels(2)
+            .num_samples(3)
+            .build()
+            .unwrap();
+        let mut channels = audio.channels();
+        channels.next();
+        assert!(format!("{channels:?}").contains("remaining_channels: 1"));
+    }
+
+    #[test]
+    fn owned_metadata_debug_uses_the_borrowed_frame_fields() {
+        let frame = MetadataFrame::new("<x/>")
+            .unwrap()
+            .with_timecode(Timecode::from_ticks(42));
+        assert_eq!(
+            format!("{frame:?}"),
+            "MetadataFrame { data: \"<x/>\", data (bytes): 4, timecode: Timecode(42) }"
+        );
+    }
+
+    #[test]
+    fn captured_audio_debug_reports_active_samples_without_padding() {
+        let samples = [0.0f32; 11];
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48_000,
+            no_channels: 2,
+            no_samples: 3,
+            FourCC: FourCc::from(AudioFormat::Fltp).raw(),
+            p_data: samples.as_ptr().cast_mut().cast(),
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 32,
+            },
+            ..Default::default()
+        };
+        // SAFETY: the synthetic guard retains the initialized sample array;
+        // the test free callback does not own or release it.
+        let guard = unsafe { Guard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
+        let frame = AudioFrameRef::new(guard).unwrap();
+        let debug = format!("{frame:?}");
+        assert!(debug.contains("num_samples: 3"));
+        assert!(debug.contains("active data (samples): 6"));
+        assert!(!debug.contains("samples per channel"));
+    }
+
+    #[test]
     fn audio_frame_debug_lists_the_borrowed_frame_fields_not_samples() {
         let frame = AudioFrame::builder()
             .num_channels(2)
@@ -8625,7 +8852,7 @@ mod tests {
         assert_eq!(
             format!("{frame:?}"),
             "AudioFrame { sample_rate: 48000, num_channels: 2, num_samples: 3, \
-             timecode: Timecode(5), format: Fltp, samples per channel: 3, \
+             timecode: Timecode(5), format: Fltp, data (samples): 6, \
              channel_stride_bytes: 12, metadata: Some(\"<audio/>\"), timestamp: None }"
         );
     }

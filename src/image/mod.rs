@@ -79,7 +79,7 @@ impl<'a> Source<'a> {
 /// Eligible RGBA input is borrowed without populating conversion scratch.
 /// Remembers the last successful output size for matching format settings,
 /// retaining no output memory; [`release`](Self::release) resets that hint.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ImageWorkspace {
     row: Vec<u8>,
     image: Vec<u8>,
@@ -92,6 +92,15 @@ pub struct ImageWorkspace {
 struct OutputHint {
     format: ImageFormat,
     length: usize,
+}
+
+impl std::fmt::Debug for ImageWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageWorkspace")
+            .field("retained_bytes", &self.retained_bytes())
+            .field("output_hint", &self.output_hint)
+            .finish()
+    }
 }
 
 impl ImageWorkspace {

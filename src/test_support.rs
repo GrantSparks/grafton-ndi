@@ -68,6 +68,37 @@ fn missing_requirement(requirement: Requirement) -> Option<&'static str> {
     }
 }
 
+/// Payload size may change only the numeric extents of bounded summaries.
+pub(crate) fn assert_bounded_debug(small: &[String], large: &[String]) {
+    fn without_counts(text: &str) -> String {
+        let mut previous_digit = false;
+        text.chars()
+            .filter_map(|character| {
+                let digit = character.is_ascii_digit();
+                let emit = !digit || !previous_digit;
+                previous_digit = digit;
+                emit.then_some(if digit { '#' } else { character })
+            })
+            .collect()
+    }
+    assert_eq!(small.len(), large.len());
+    for (small, large) in small.iter().zip(large) {
+        for text in [small, large] {
+            assert!(
+                text.len() < 1024,
+                "unbounded media Debug: {} bytes",
+                text.len()
+            );
+            assert!(
+                !text.contains("0x"),
+                "media Debug contains an address: {text}"
+            );
+        }
+        assert_ne!(small, large, "media Debug omitted its payload extent");
+        assert_eq!(without_counts(small), without_counts(large));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
