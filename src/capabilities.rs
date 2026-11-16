@@ -136,7 +136,9 @@ impl RuntimeInfo {
     pub fn linkage(&self) -> SdkLinkage {
         self.linkage
     }
-    /// Actual loaded module path, when using a shared implementation.
+    /// Canonical loaded file, with links resolved, for a shared implementation.
+    /// Uses the platform's ordinary path form; Windows extended syntax is kept
+    /// only when needed to express the same file.
     pub fn library_path(&self) -> Option<&Path> {
         self.library_path.as_deref()
     }

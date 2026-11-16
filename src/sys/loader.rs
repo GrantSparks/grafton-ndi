@@ -298,6 +298,8 @@ mod shared {
             let (base, path) = containing_module(address)
                 .map_err(|detail| refused(LoadRefusal::NotIdentifiable { detail }, None))?;
             let path = path.canonicalize().unwrap_or(path);
+            #[cfg(windows)]
+            let path = ordinary_module_path(path);
             if Path::new(location).is_absolute() && !same_path(Path::new(location), &path) {
                 let reason = LoadRefusal::ResolvedToAnotherFile {
                     resolved: path.clone(),
@@ -816,6 +818,93 @@ mod shared {
                 }
             }
         }
+    }
+
+    /// Present a canonical Windows file in ordinary form when Win32 parsing
+    /// preserves its name. Keep extended syntax for names that need it.
+    #[cfg(windows)]
+    fn ordinary_module_path(path: PathBuf) -> PathBuf {
+        use std::{
+            ffi::{OsStr, OsString},
+            os::windows::ffi::{OsStrExt, OsStringExt},
+            path::{Component, Prefix},
+        };
+
+        fn needs_verbatim(component: &OsStr) -> bool {
+            let units: Vec<_> = component.encode_wide().collect();
+            if units.last().is_some_and(|&unit| unit == 32 || unit == 46)
+                || units
+                    .iter()
+                    .any(|&unit| unit < 32 || [34, 42, 47, 58, 60, 62, 63, 92, 124].contains(&unit))
+            {
+                return true;
+            }
+            // DOS device names remain reserved with an extension, including
+            // COM/LPT names using superscript 1, 2 or 3. Spaces before an
+            // extension do not make a device name ordinary.
+            let end = units
+                .iter()
+                .position(|&unit| unit == 46)
+                .unwrap_or(units.len());
+            let mut stem = &units[..end];
+            while stem.last() == Some(&32) {
+                stem = &stem[..stem.len() - 1];
+            }
+            let upper: Vec<_> = stem
+                .iter()
+                .map(|&unit| {
+                    if (97..=122).contains(&unit) {
+                        unit - 32
+                    } else {
+                        unit
+                    }
+                })
+                .collect();
+            let named_device = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+                .iter()
+                .any(|name| upper.iter().copied().eq(name.encode_utf16()));
+            named_device
+                || (upper.len() == 4
+                    && (upper[..3] == [67, 79, 77] || upper[..3] == [76, 80, 84])
+                    && ((49..=57).contains(&upper[3]) || [0xb9, 0xb2, 0xb3].contains(&upper[3])))
+        }
+
+        let Some(Component::Prefix(prefix)) = path.components().next() else {
+            return path;
+        };
+        let units: Vec<_> = path.as_os_str().encode_wide().collect();
+        let plain = match prefix.kind() {
+            Prefix::VerbatimDisk(_) => OsString::from_wide(&units[4..]),
+            Prefix::VerbatimUNC(server, share) => {
+                if needs_verbatim(server) || needs_verbatim(share) {
+                    return path;
+                }
+                let mut plain = OsString::from(r"\\");
+                plain.push(OsString::from_wide(&units[8..]));
+                plain
+            }
+            _ => return path,
+        };
+        if path
+            .components()
+            .any(|component| matches!(component, Component::Normal(name) if needs_verbatim(name)))
+        {
+            return path;
+        }
+        // MAX_PATH includes the terminator. Longer ordinary paths depend on
+        // process/OS opt-ins; ask Win32 directly rather than assume them.
+        let mut plain_units: Vec<_> = plain.encode_wide().collect();
+        plain_units.push(0);
+        if plain_units.len() > 260 {
+            use windows_sys::Win32::Storage::FileSystem::{
+                GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+            };
+            // SAFETY: the buffer is a live, NUL-terminated UTF-16 path.
+            if unsafe { GetFileAttributesW(plain_units.as_ptr()) } == INVALID_FILE_ATTRIBUTES {
+                return path;
+            }
+        }
+        PathBuf::from(plain)
     }
 
     fn same_path(a: &Path, b: &Path) -> bool {
@@ -1352,6 +1441,39 @@ mod shared {
             assert!(text.len() > summary.len(), "{text}");
             #[cfg(unix)]
             assert!(text.contains("/nonexistent/libndi-missing.so"), "{text}");
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn reported_windows_paths_use_ordinary_disk_and_unc_forms() {
+            for (verbatim, ordinary) in [
+                (r"\\?\C:\a\b.dll", r"C:\a\b.dll"),
+                (r"\\?\UNC\s\x\b.dll", r"\\s\x\b.dll"),
+            ] {
+                assert_eq!(ordinary_module_path(verbatim.into()), Path::new(ordinary));
+            }
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn reported_windows_paths_keep_syntax_needed_to_preserve_the_file_name() {
+            for path in [
+                r"\\?\C:\a.\b.dll",
+                r"\\?\C:\a \b.dll",
+                r"\\?\C:\nul\b.dll",
+                r"\\?\C:\NuL.dll",
+                r"\\?\C:\NUL .dll",
+                r"\\?\C:\COM1\b.dll",
+                r"\\?\C:\LPT³\b.dll",
+                r"\\?\UNC\s\share.\b.dll",
+                r"\\?\Volume{1234}\b.dll",
+            ] {
+                assert_eq!(ordinary_module_path(path.into()), Path::new(path));
+            }
+            // A component longer than NTFS permits also proves that the
+            // unprefixed long path cannot be opened, regardless of opt-ins.
+            let long = PathBuf::from(format!(r"\\?\C:\{}\b.dll", "a".repeat(300)));
+            assert_eq!(ordinary_module_path(long.clone()), long);
         }
     }
 }

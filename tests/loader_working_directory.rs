@@ -10,7 +10,37 @@ mod runtime_fixture;
 use fixture::FixtureDir;
 use grafton_ndi::{Error, LoadFailure, Runtime, RuntimeOptions};
 use runtime_fixture::FakeRuntime;
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+fn canonical_fixture_path(path: &Path) -> PathBuf {
+    let path = path.canonicalize().unwrap();
+    #[cfg(windows)]
+    {
+        // Fixture names are ordinary, short paths. Strip the known prefix on
+        // the expected side so the reported side must itself be ordinary.
+        let text = path.to_str().unwrap();
+        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text))
+    }
+    #[cfg(not(windows))]
+    path
+}
+
+fn assert_ordinary_path(path: &Path) {
+    #[cfg(windows)]
+    assert!(
+        !matches!(path.components().next(), Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim()),
+        "{path:?}"
+    );
+    #[cfg(not(windows))]
+    let _ = path;
+}
 
 const STANDARD: &str = if cfg!(all(windows, target_pointer_width = "64")) {
     "Processing.NDI.Lib.x64.dll"
@@ -38,11 +68,19 @@ fn failed(error: Error, working: &Path) -> LoadFailure {
     let Error::RuntimeLoadFailed(failure) = error else {
         panic!("expected a search failure, got {error:?}");
     };
+    let working = canonical_fixture_path(working);
+    for path in failure
+        .attempts()
+        .iter()
+        .filter_map(|attempt| attempt.resolved_path())
+    {
+        assert_ordinary_path(path);
+    }
     assert!(
         failure.attempts().iter().all(|attempt| {
             !attempt
                 .resolved_path()
-                .is_some_and(|path| path.starts_with(working))
+                .is_some_and(|path| path.starts_with(&working))
         }),
         "{failure}"
     );
@@ -117,14 +155,11 @@ fn working_directory_libraries_never_run_constructors() {
             }
             "path" | "dyld-absolute" => {
                 let runtime = Runtime::select(&RuntimeOptions::new()).unwrap();
+                let reported = runtime.info().library_path().unwrap();
+                assert_ordinary_path(reported);
                 assert_eq!(
-                    runtime
-                        .info()
-                        .library_path()
-                        .unwrap()
-                        .canonicalize()
-                        .unwrap(),
-                    root.join("loader").join(STANDARD).canonicalize().unwrap(),
+                    reported,
+                    canonical_fixture_path(&root.join("loader").join(STANDARD)),
                 );
             }
             "detector" => {

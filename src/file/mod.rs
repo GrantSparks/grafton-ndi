@@ -346,8 +346,9 @@ impl FileApi {
         })
     }
 
-    /// The file the library was loaded from, or `None` when the SDK is linked
-    /// statically.
+    /// Canonical loaded file, with links resolved, or `None` for a linked SDK.
+    /// Uses the platform's ordinary path form; Windows extended syntax is kept
+    /// only when needed to express the same file.
     pub fn library_path(&self) -> Option<&Path> {
         self.runtime.path()
     }
