@@ -12,10 +12,11 @@ use std::{fmt, mem::ManuallyDrop, ops::Deref, ptr::NonNull};
 /// all derive from the one pointer the allocation was created with, so moving
 /// the owner changes nothing about what the SDK's copy of that pointer may do.
 ///
-/// A shared reference only reads. Deriving a writable pointer requires an
-/// exclusive borrow, so whoever lets the SDK write holds the allocation
-/// exclusively, or by value, for as long as the SDK keeps the pointer; no
-/// reference from [`Deref`] can then be alive to observe the write.
+/// Shared mutation goes through interior mutability: callback state uses its
+/// locks and atomics, and descriptor keys initialize their disjoint slot cells
+/// through raw pointers. Other writes, including SDK writes to lent storage,
+/// require the allocation to be held exclusively or by value with no live
+/// reference into the written contents. Moving this owner preserves pointers.
 pub(crate) struct AliasableBox<T: ?Sized> {
     pointer: NonNull<T>,
 }
@@ -28,24 +29,10 @@ impl<T: ?Sized> AliasableBox<T> {
         }
     }
 
-    /// The allocation's address, for the SDK to read.
+    /// The allocation's address. Writes must obey the type's shared-mutation
+    /// or exclusive-ownership contract.
     pub(crate) fn as_ptr(&self) -> *const T {
         self.pointer.as_ptr()
-    }
-
-    /// The allocation's address, for the SDK to read and write.
-    #[cfg(test)]
-    pub(crate) fn as_mut_ptr(&mut self) -> *mut T {
-        self.pointer.as_ptr()
-    }
-
-    /// Give the allocation back to an ordinary box.
-    #[cfg(test)]
-    pub(crate) fn into_box(self) -> Box<T> {
-        let this = ManuallyDrop::new(self);
-        // SAFETY: the pointer came from a box in `new`, and skipping this
-        // value's destructor makes the returned box the only owner.
-        unsafe { Box::from_raw(this.pointer.as_ptr()) }
     }
 }
 
@@ -53,9 +40,10 @@ impl<T: ?Sized> Deref for AliasableBox<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        // SAFETY: the allocation lives until this value is dropped, and it is
-        // written only through `as_mut_ptr`, whose exclusive borrow cannot
-        // overlap the shared one this reference is tied to.
+        // SAFETY: the allocation lives until this value is dropped. Writes
+        // that coexist with this shared reference touch only UnsafeCell
+        // contents; all other writes require exclusive ownership and exclude
+        // references into their contents for the duration of the write.
         unsafe { self.pointer.as_ref() }
     }
 }
@@ -175,15 +163,14 @@ mod tests {
     /// result once it has the allocation to itself again.
     #[test]
     fn writes_through_a_lent_pointer_survive_moving_the_owner() {
-        let mut bytes = AliasableBox::new(vec![1u8, 2, 3].into_boxed_slice());
-        let lent = bytes.as_mut_ptr().cast::<u8>();
+        let bytes = AliasableBox::new(vec![1u8, 2, 3].into_boxed_slice());
+        let lent = bytes.as_ptr().cast::<u8>().cast_mut();
         let moved = Box::new(bytes);
         // SAFETY: the allocation is alive, three bytes long, and no reference
         // into it exists.
         unsafe { lent.add(1).write(9) };
         assert_eq!(**moved, [1, 9, 3]);
         assert_eq!(moved.as_ptr().cast::<u8>(), lent.cast_const());
-        assert_eq!(*moved.into_box(), [1, 9, 3]);
     }
 
     /// Capacity remains available after an SDK write and a move of its owner.
@@ -266,7 +253,7 @@ mod tests {
         }
         drop(AliasableBox::new(Box::new(Counted)));
         assert_eq!(DROPS.load(Ordering::Relaxed), 1);
-        drop(AliasableBox::new(Box::new(Counted)).into_box());
+        drop(Box::new(AliasableBox::new(Box::new(Counted))));
         assert_eq!(DROPS.load(Ordering::Relaxed), 2);
     }
 }
