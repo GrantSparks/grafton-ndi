@@ -4,7 +4,7 @@
 //! first usable module for the life of the process. Statically linked targets
 //! resolve the same tables from the archive selected at build time.
 
-use std::{ffi::CStr, path::Path};
+use std::path::Path;
 
 use super::{
     api::{Gates, Resolved},
@@ -20,10 +20,6 @@ use crate::{
 
 static SELECTED: Selection<Runtime> = Selection::new(crate::LibraryKind::Runtime);
 
-/// Entry points only the Advanced SDK exports; together they identify its edition.
-const ADVANCED_SENDER: &CStr = c"NDIlib_send_create_v2";
-const ADVANCED_RECEIVER: &CStr = c"NDIlib_recv_create_v4";
-
 /// The implementation selected for this process.
 pub(crate) struct Runtime {
     pub(crate) lifecycle: crate::runtime::RuntimeManager,
@@ -35,23 +31,6 @@ pub(crate) struct Runtime {
 /// Observe the selected runtime without selecting or loading one.
 pub(crate) fn selected() -> Option<&'static Runtime> {
     SELECTED.get()
-}
-
-/// Which of the entry points that identify the Advanced SDK an
-/// implementation exports.
-#[derive(Clone, Copy, Debug)]
-struct AdvancedEntryPoints {
-    sender_configuration: bool,
-    receiver_configuration: bool,
-}
-
-impl AdvancedEntryPoints {
-    fn detect(resolver: &dyn Resolver) -> std::result::Result<Self, LoadRefusal> {
-        Ok(Self {
-            sender_configuration: resolver.resolve(ADVANCED_SENDER)?.is_some(),
-            receiver_configuration: resolver.resolve(ADVANCED_RECEIVER)?.is_some(),
-        })
-    }
 }
 
 /// Select the implementation `options` describe, or confirm that the one
@@ -126,8 +105,7 @@ impl Runtime {
         requested: SdkEdition,
     ) -> std::result::Result<Self, LoadRefusal> {
         let resolved = Resolved::load(&provider)?;
-        let advanced = AdvancedEntryPoints::detect(&provider)?;
-        let edition = provider.edition(advanced);
+        let edition = provider.edition()?;
         if !meets(requested, edition) {
             return Err(LoadRefusal::EditionNotMet);
         }
@@ -222,7 +200,7 @@ mod shared {
         sync::{Mutex, PoisonError},
     };
 
-    use super::{AdvancedEntryPoints, Resolver, Runtime};
+    use super::{Resolver, Runtime};
     use crate::{
         capabilities::{SdkEdition, SdkLinkage},
         runtime::RuntimeOptions,
@@ -369,12 +347,16 @@ mod shared {
 
         /// A module is an Advanced runtime when it exports both Advanced entry
         /// points; its file name and the caller's request are not evidence.
-        pub(super) fn edition(&self, advanced: AdvancedEntryPoints) -> SdkEdition {
-            if advanced.sender_configuration && advanced.receiver_configuration {
+        pub(super) fn edition(&self) -> std::result::Result<SdkEdition, LoadRefusal> {
+            // Only shared libraries need symbol-based edition detection. A
+            // linked provider already knows the archive the build selected.
+            let sender_configuration = self.resolve(c"NDIlib_send_create_v2")?.is_some();
+            let receiver_configuration = self.resolve(c"NDIlib_recv_create_v4")?.is_some();
+            Ok(if sender_configuration && receiver_configuration {
                 SdkEdition::Advanced
             } else {
                 SdkEdition::Standard
-            }
+            })
         }
     }
 
@@ -1266,7 +1248,7 @@ mod linked {
         ptr::NonNull,
     };
 
-    use super::{AdvancedEntryPoints, Resolver, Runtime};
+    use super::{Resolver, Runtime};
     use crate::{
         capabilities::{SdkEdition, SdkLinkage},
         runtime::RuntimeOptions,
@@ -1300,8 +1282,8 @@ mod linked {
         }
 
         /// The build selected exactly one edition-specific archive.
-        pub(super) fn edition(&self, _advanced: AdvancedEntryPoints) -> SdkEdition {
-            super::linked_edition()
+        pub(super) fn edition(&self) -> std::result::Result<SdkEdition, LoadRefusal> {
+            Ok(super::linked_edition())
         }
     }
 
