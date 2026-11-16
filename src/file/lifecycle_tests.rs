@@ -1362,6 +1362,7 @@ fn unwritable_unix_recording_directories_never_reach_the_sdk() {
 fn an_effective_identity_without_write_access_is_refused() {
     use std::os::unix::fs::PermissionsExt;
     const CHILD_DIRECTORY: &str = "GRAFTON_NDI_PERMISSION_CHILD_DIRECTORY";
+    const IDENTITY_UNAVAILABLE: i32 = 77;
     if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
         // This isolated subprocess alone changes identity. The parent retains
         // ownership of the fixture and removes it after this process exits.
@@ -1371,7 +1372,15 @@ fn an_effective_identity_without_write_access_is_refused() {
         assert_eq!(unsafe { libc::geteuid() }, 0);
         // SAFETY: only this test's subprocess is affected. Its real UID stays
         // root, so access(2) would incorrectly allow the denied directory.
-        assert_eq!(unsafe { libc::seteuid(65534) }, 0);
+        if unsafe { libc::seteuid(65534) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EINVAL)) {
+                // User namespaces may map root alone, or forbid changing
+                // identity. Let the parent report that limitation visibly.
+                std::process::exit(IDENTITY_UNAVAILABLE);
+            }
+            panic!("cannot set the subprocess's effective identity: {error}");
+        }
         unwritable_directory_is_refused_before_native_calls(&directory);
         return;
     }
@@ -1394,6 +1403,12 @@ fn an_effective_identity_without_write_access_is_refused() {
         .env(CHILD_DIRECTORY, &directory.0)
         .output()
         .unwrap();
+    if result.status.code() == Some(IDENTITY_UNAVAILABLE) {
+        crate::test_support::unsupported(
+            "this process cannot switch to an unprivileged effective identity",
+        );
+        return;
+    }
     assert!(
         result.status.success(),
         "effective-identity child failed:\n{}\n{}",
