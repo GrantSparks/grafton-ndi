@@ -65,7 +65,7 @@ unsafe fn extended_source(
         None
     } else {
         // SAFETY: non-null was checked; the caller guarantees the terminator.
-        let Some(text) = (unsafe { budget.text(metadata)? }) else {
+        let Some(text) = (unsafe { budget.metadata_text(metadata)? }) else {
             return Ok(None);
         };
         // The SDK gives a source that advertises nothing an empty string.

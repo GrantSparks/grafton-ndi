@@ -47,10 +47,11 @@ pub(crate) const MAX_SDK_STRING_BYTES: usize = 4 * 1024 * 1024;
 /// NUL or [`MAX_SDK_STRING_BYTES`] bytes have been read.
 pub(crate) unsafe fn copy_sdk_string(
     text: crate::sys::table::Called<*const c_char>,
-) -> Result<String> {
+) -> Result<crate::finder::SourceText> {
     // SAFETY: forwarded to the caller's obligation.
     let bytes = unsafe { sdk_text(text) }?;
-    Ok(copy_lossy(bytes))
+    // SAFETY: sdk_text stops at the first NUL and excludes it.
+    unsafe { crate::finder::SourceText::from_sdk(bytes) }
 }
 
 /// Read one bounded SDK C string, retaining its producing entry point.
@@ -284,6 +285,28 @@ impl CopyBudget {
         .transpose()
     }
 
+    /// Charge and build shared source storage without another NUL scan or copy.
+    ///
+    /// # Safety
+    /// As for [`Self::c_str`].
+    pub(crate) unsafe fn source_text(
+        &mut self,
+        value: *const c_char,
+    ) -> TextResult<Option<crate::finder::SourceText>> {
+        // SAFETY: forwarded to the caller's obligations.
+        let text = unsafe { self.c_str(value)? };
+        text.map(|text| {
+            let bytes = text.to_bytes();
+            let len = std::str::from_utf8(bytes)
+                .map(str::len)
+                .unwrap_or_else(|_| LossyText::new(bytes).len());
+            self.take(len + crate::finder::SourceText::STORAGE_OVERHEAD)?;
+            // SAFETY: the bounded C string scan excludes its first NUL.
+            unsafe { crate::finder::SourceText::from_sdk(bytes) }.map_err(Into::into)
+        })
+        .transpose()
+    }
+
     /// Copy exact identifier bytes, including their sole trailing NUL.
     ///
     /// # Safety
@@ -356,13 +379,18 @@ impl<'a> LossyText<'a> {
     pub(crate) fn copy(&self) -> std::result::Result<String, TryReserveError> {
         let mut text = String::new();
         text.try_reserve_exact(self.len)?;
+        self.push_to(&mut text);
+        Ok(text)
+    }
+
+    /// Append into storage whose capacity the caller has already reserved.
+    pub(crate) fn push_to(&self, text: &mut String) {
         for chunk in self.bytes.utf8_chunks() {
             text.push_str(chunk.valid());
             if !chunk.invalid().is_empty() {
                 text.push('\u{fffd}');
             }
         }
-        Ok(text)
     }
 }
 

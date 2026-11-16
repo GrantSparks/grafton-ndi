@@ -37,6 +37,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Load refusals distinguish a missing identification anchor from a missing
   required API entry point. Unreadable version text carries `VersionTextDefect`;
   `InvalidCString` reports its cause once in error chains.
+- Discovery snapshots build source strings once from bounded SDK bytes.
+  Discovery windows charge shared name and address storage once while counting
+  both descriptor containers against their retained byte budget.
 
 - Custom allocator receivers use `advanced::AllocatedReceiver<M = RawCapture>`.
   Replace `AllocatedPacketReceiver` with `AllocatedReceiver<PacketAttached>`;

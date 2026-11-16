@@ -3,15 +3,13 @@
 use std::{ffi::c_char, mem::size_of};
 
 use crate::{
+    finder::SourceText,
     sdk_copy::{CopyBudget, TextError},
     Error, ResourceKind, Result,
 };
 
 pub(super) use crate::sdk_copy::{allocation_failed, COPY_LIMIT as MAX_BYTES};
 pub(super) const MAX_SOURCES: usize = 16_384;
-// Shared CString storage adds its Arc header, the CString itself and one NUL.
-pub(super) const SOURCE_TEXT_OVERHEAD: usize =
-    2 * size_of::<usize>() + size_of::<std::ffi::CString>() + 1;
 
 pub(super) fn limit(resource: ResourceKind, limit: usize) -> Error {
     Error::ResourceLimit { resource, limit }
@@ -44,21 +42,33 @@ impl SnapshotBudget {
 
     /// Charge the shared empty name used for an address-only source.
     pub(super) fn empty_source_name(&mut self) -> Result<()> {
-        self.0.take(SOURCE_TEXT_OVERHEAD)
+        self.0.take(SourceText::STORAGE_OVERHEAD)
+    }
+
+    /// Copy advertised metadata without building native source storage.
+    ///
+    /// # Safety
+    /// As for [`Self::text`].
+    #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_source_metadata)))]
+    pub(crate) unsafe fn metadata_text(
+        &mut self,
+        pointer: *const c_char,
+    ) -> Result<Option<String>> {
+        // SAFETY: forwarded to the caller's obligations.
+        match unsafe { self.0.text(pointer) } {
+            Ok(text) => Ok(text),
+            Err(TextError::Unterminated) => Ok(None),
+            Err(TextError::Failed(error)) => Err(error),
+        }
     }
 
     /// # Safety
     /// A non-null pointer remains readable through its first NUL or the SDK
     /// string bound, whichever comes first.
-    pub(crate) unsafe fn text(&mut self, pointer: *const c_char) -> Result<Option<String>> {
+    pub(crate) unsafe fn text(&mut self, pointer: *const c_char) -> Result<Option<SourceText>> {
         // SAFETY: forwarded to the caller's obligations.
-        match unsafe { self.0.text(pointer) } {
-            Ok(text) => {
-                if text.is_some() {
-                    self.0.take(SOURCE_TEXT_OVERHEAD)?;
-                }
-                Ok(text)
-            }
+        match unsafe { self.0.source_text(pointer) } {
+            Ok(text) => Ok(text),
             Err(TextError::Unterminated) => Ok(None),
             Err(TextError::Failed(error)) => Err(error),
         }
@@ -124,6 +134,16 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_builds_each_source_string_in_two_allocations() {
+        let mut entry = named(c"HOST (Camera)".as_ptr());
+        entry.__bindgen_anon_1.p_url_address = c"192.0.2.7:5961".as_ptr();
+        let entries = [entry; 100];
+        let (sources, allocations) = crate::test_alloc::allocation_count(|| snapshot(&entries));
+        assert_eq!(sources.unwrap().len(), 100);
+        assert_eq!(allocations, 401, "two per source string, plus the vector");
+    }
+
+    #[test]
     fn count_and_span_are_checked_before_dereferencing_or_reserving() {
         assert_eq!(descriptor_bytes(MAX_SOURCES, 16).unwrap(), MAX_SOURCES * 16);
         for (count, size) in [(MAX_SOURCES + 1, 16), (usize::MAX, 2)] {
@@ -155,7 +175,7 @@ mod tests {
     #[test]
     fn aggregate_bytes_are_checked_before_string_allocation() {
         let overhead =
-            2 * (size_of::<NDIlib_source_t>() + size_of::<Source>() + SOURCE_TEXT_OVERHEAD);
+            2 * (size_of::<NDIlib_source_t>() + size_of::<Source>() + SourceText::STORAGE_OVERHEAD);
         let len = (MAX_BYTES - overhead - 2) / 4;
         let fits = CString::new(vec![b'x'; len]).unwrap();
         assert_eq!(snapshot(&[named(fits.as_ptr()); 2]).unwrap().len(), 2);
@@ -196,7 +216,7 @@ mod tests {
         let bytes = c"a\xff\xe2\x82\xac\xe2\x82";
         // SAFETY: live literal, including a NUL terminator.
         let copied = unsafe { budget.text(bytes.as_ptr()) }.unwrap().unwrap();
-        assert_eq!(copied, bytes.to_string_lossy());
+        assert_eq!(copied.as_str(), bytes.to_string_lossy());
     }
 
     #[test]

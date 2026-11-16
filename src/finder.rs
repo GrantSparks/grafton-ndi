@@ -475,13 +475,14 @@ fn source_pointers(source: &NDIlib_source_t) -> (*const c_char, *const c_char) {
 pub(crate) unsafe fn decode_source(
     name: *const c_char,
     address: *const c_char,
-    mut copy: impl FnMut(*const c_char) -> Result<Option<String>>,
+    mut copy: impl FnMut(*const c_char) -> Result<Option<SourceText>>,
 ) -> Result<Option<Source>> {
     if name.is_null() && address.is_null() {
         return Ok(None);
     }
     let name = if name.is_null() {
-        String::new()
+        // SAFETY: empty bytes are NUL-free.
+        unsafe { SourceText::from_sdk(b"") }?
     } else {
         let Some(name) = copy(name)? else {
             return Ok(None);
@@ -494,9 +495,9 @@ pub(crate) unsafe fn decode_source(
         let Some(address) = copy(address)? else {
             return Ok(None);
         };
-        Some(SourceAddress::new(address)?)
+        Some(SourceAddress(address))
     };
-    Ok(Some(Source::new(name)?.with_optional_address(address)))
+    Ok(Some(Source::from_text(name, address)))
 }
 
 impl Finder {
@@ -867,8 +868,8 @@ impl Finder {
     /// Returns [`Error::ResourceLimit`] if a snapshot exceeds the limits of
     /// [`Self::current_sources`], or distinct results retained across the
     /// whole window exceed 16,384 entries or 16 MiB. The retained byte budget
-    /// counts both copies of each source in the result vector and the
-    /// deduplication set, including their strings and container capacity.
+    /// counts shared source strings once, plus the storage of both the result
+    /// vector and the deduplication set, including container capacity.
     ///
     /// # Examples
     ///
@@ -950,7 +951,7 @@ fn accumulate_sources(
                 .as_ref()
                 .map_or(0, |address| address.0.storage_bytes());
         let bytes = retained_bytes
-            .checked_add(text_bytes * 2)
+            .checked_add(text_bytes)
             .ok_or_else(|| budget::limit(ResourceKind::FinderDiscoveryBytes, budget::MAX_BYTES))?;
         // Check before growing either container or copying strings. Round
         // up for vector growth, hash buckets and control bytes; the actual
@@ -1179,14 +1180,52 @@ pub struct SourceAddress(SourceText);
 /// Validated UTF-8 with exactly one trailing NUL, shared by descriptors and
 /// their native borrowers. All SDK pointers lead into this immutable storage.
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct SourceText(Arc<CString>);
+pub(crate) struct SourceText(Arc<CString>);
 
 impl SourceText {
-    fn new(text: String) -> Result<Self> {
+    // Shared CString storage adds its Arc header, the CString and one NUL.
+    pub(crate) const STORAGE_OVERHEAD: usize =
+        2 * std::mem::size_of::<usize>() + std::mem::size_of::<CString>() + 1;
+
+    /// Copy bounded SDK bytes directly into their final shared native storage.
+    ///
+    /// # Safety
+    /// `bytes` must contain no NUL, as guaranteed by a bounded SDK string scan.
+    pub(crate) unsafe fn from_sdk(bytes: &[u8]) -> Result<Self> {
+        let mut text = String::new();
+        if let Ok(valid) = std::str::from_utf8(bytes) {
+            text.try_reserve_exact(valid.len() + 1)
+                .map_err(|_| budget::allocation_failed())?;
+            text.push_str(valid);
+        } else {
+            let lossy = crate::sdk_copy::LossyText::new(bytes);
+            text.try_reserve_exact(lossy.len() + 1)
+                .map_err(|_| budget::allocation_failed())?;
+            lossy.push_to(&mut text);
+        }
+        // SAFETY: the caller's bounded scan excluded NUL; UTF-8 replacement
+        // introduces none. The only terminator is appended below.
+        Ok(unsafe { Self::from_nul_free_string(text) })
+    }
+
+    /// Keep generated text whose NUL-free invariant is already established.
+    ///
+    /// # Safety
+    /// `text` must contain no NUL.
+    pub(crate) unsafe fn from_nul_free_string(text: String) -> Self {
+        let mut bytes = text.into_bytes();
+        bytes.push(0);
+        // SAFETY: the caller excludes interior NUL and we appended the sole NUL.
+        Self(Arc::new(unsafe {
+            CString::from_vec_with_nul_unchecked(bytes)
+        }))
+    }
+
+    pub(crate) fn new(text: String) -> Result<Self> {
         Ok(Self(Arc::new(CString::new(text)?)))
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         // SAFETY: the CString was constructed from a String, and its immutable
         // shared backing cannot change after construction.
         unsafe { std::str::from_utf8_unchecked(self.0.as_bytes()) }
@@ -1197,9 +1236,7 @@ impl SourceText {
     }
 
     fn storage_bytes(&self) -> usize {
-        self.0.as_bytes_with_nul().len()
-            + 2 * std::mem::size_of::<usize>()
-            + std::mem::size_of::<CString>()
+        self.0.as_bytes().len() + Self::STORAGE_OVERHEAD
     }
 }
 
@@ -1210,6 +1247,10 @@ impl fmt::Debug for SourceText {
 }
 
 impl SourceAddress {
+    pub(crate) fn from_text(text: SourceText) -> Self {
+        Self(text)
+    }
+
     /// Keep the opaque address text unchanged after checking its native form.
     ///
     /// # Errors
@@ -1348,6 +1389,10 @@ impl RawSource {
 }
 
 impl Source {
+    pub(crate) fn from_text(name: SourceText, address: Option<SourceAddress>) -> Self {
+        Self { name, address }
+    }
+
     /// The source named `name`, without an address.
     ///
     /// # Errors
@@ -1358,11 +1403,6 @@ impl Source {
             name: SourceText::new(name.into())?,
             address: None,
         })
-    }
-
-    fn with_optional_address(mut self, address: Option<SourceAddress>) -> Self {
-        self.address = address;
-        self
     }
 
     /// This source, at `address`.
@@ -1924,6 +1964,32 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn discovery_window_charges_shared_source_strings_once() {
+        let source = Source::new("HOST (Camera)")
+            .unwrap()
+            .with_address(SourceAddress::new("192.0.2.7:5961").unwrap());
+        let expected =
+            source.name.storage_bytes() + source.address.as_ref().unwrap().0.storage_bytes();
+        let mut discovered = Vec::new();
+        let mut seen = HashSet::new();
+        let mut retained = 0;
+        accumulate_sources(
+            &mut discovered,
+            &mut seen,
+            &mut retained,
+            vec![source.clone()],
+        )
+        .unwrap();
+        assert_eq!(retained, expected);
+        assert!(Arc::ptr_eq(
+            &discovered[0].name.0,
+            &seen.get(&source).unwrap().name.0
+        ));
+        accumulate_sources(&mut discovered, &mut seen, &mut retained, vec![source]).unwrap();
+        assert_eq!(retained, expected, "duplicates add no storage");
+    }
 
     #[test]
     fn cache_discovery_retains_the_deadline_that_precedes_the_lookup() {

@@ -3,6 +3,7 @@
 
 use super::{Retained, ServerApi, ServerObject};
 use crate::{
+    finder::SourceText,
     sdk_copy::{
         bounded_sdk_text, copy_lossy, CopyBudget, SpanError, COPY_LIMIT, MAX_SDK_STRING_BYTES,
     },
@@ -360,7 +361,7 @@ impl ReceiverCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AdvertisedSender {
     id: Option<SenderId>,
-    name: Option<String>,
+    name: Option<SourceText>,
     metadata: Option<String>,
     address: Option<String>,
     port: Option<u16>,
@@ -374,7 +375,7 @@ impl AdvertisedSender {
     }
     /// The sender's source name.
     pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
+        self.name.as_ref().map(SourceText::as_str)
     }
     /// The connection metadata the sender advertises.
     pub fn metadata(&self) -> Option<&str> {
@@ -399,14 +400,17 @@ impl AdvertisedSender {
     /// included only when both the address and a valid port were advertised.
     /// IPv6 literals are enclosed in brackets before their port is appended.
     pub fn to_source(&self) -> Option<crate::Source> {
-        let mut source = crate::Source::new(self.name.as_ref()?).ok()?;
+        let mut source = crate::Source::from_text(self.name.as_ref()?.clone(), None);
         if let (Some(address), Some(port)) = (&self.address, self.port) {
             let endpoint = if address.parse::<std::net::Ipv6Addr>().is_ok() {
                 format!("[{address}]:{port}")
             } else {
                 format!("{address}:{port}")
             };
-            source = source.with_address(crate::SourceAddress::new(endpoint).ok()?);
+            // SAFETY: scanned SDK address text contains no NUL, and formatting
+            // adds only brackets, a colon and decimal port digits.
+            let endpoint = unsafe { SourceText::from_nul_free_string(endpoint) };
+            source = source.with_address(crate::SourceAddress::from_text(endpoint));
         }
         Some(source)
     }
@@ -886,7 +890,7 @@ impl SendListener {
                 let groups = budget.collect(groups, |group, budget| Ok(budget.text(*group)?))?;
                 Ok(AdvertisedSender {
                     id: budget.id(sender.p_uuid)?.map(SenderId::from_exact),
-                    name: budget.text(sender.p_name)?,
+                    name: budget.source_text(sender.p_name)?,
                     metadata: budget.text(sender.p_metadata)?,
                     address: budget.text(sender.p_address)?,
                     port: u16::try_from(sender.port).ok(),
@@ -1038,7 +1042,7 @@ mod tests {
     fn advertised_sources_use_name_and_only_complete_addresses() {
         let mut sender = AdvertisedSender {
             id: None,
-            name: Some("Studio (Camera)".into()),
+            name: Some(SourceText::new("Studio (Camera)".into()).unwrap()),
             metadata: None,
             address: Some("192.0.2.10".into()),
             port: Some(5960),
