@@ -8,7 +8,7 @@ use crate::{
 use std::{marker::PhantomData, sync::Arc, time::Duration};
 
 mod sealed {
-    pub trait SourceDiscovery {
+    pub trait SourceDiscovery: std::fmt::Debug {
         fn finder(&self) -> &crate::Finder;
     }
     impl SourceDiscovery for crate::Finder {
@@ -69,7 +69,7 @@ pub struct AsyncFinder<R: AsyncRuntime, D: SourceDiscovery = Finder> {
 impl<R: AsyncRuntime, D: SourceDiscovery> std::fmt::Debug for AsyncFinder<R, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncFinder")
-            .field("owner", &std::any::type_name::<D>())
+            .field("owner", &*self.inner)
             .field("runtime", &std::any::type_name::<R>())
             .finish_non_exhaustive()
     }
@@ -239,7 +239,7 @@ pub struct AsyncSourceWatch<R: AsyncRuntime, D: SourceDiscovery = Finder> {
 impl<R: AsyncRuntime, D: SourceDiscovery> std::fmt::Debug for AsyncSourceWatch<R, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncSourceWatch")
-            .field("owner", &std::any::type_name::<D>())
+            .field("owner", &*self.inner)
             .field("runtime", &std::any::type_name::<R>())
             .finish_non_exhaustive()
     }
@@ -342,6 +342,40 @@ mod tests {
         let _ = futures_are_send::<super::super::Tokio>;
         #[cfg(feature = "smol")]
         let _ = futures_are_send::<super::super::Smol>;
+    }
+
+    fn owners_keep_their_discovery_scope<R: AsyncRuntime>() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        fn assert_owner<R: AsyncRuntime, D: SourceDiscovery>(
+            adapter: AsyncFinder<R, D>,
+            kind: &str,
+        ) {
+            for output in [format!("{adapter:?}"), format!("{:?}", adapter.watch())] {
+                assert!(output.contains(&format!("owner: {kind} {{")), "{output}");
+                assert!(output.contains("\"g\""), "{output}");
+                assert!(output.ends_with(", .. }"), "{output}");
+            }
+        }
+        let configured = || Finder::new(&ndi, &FinderOptions::new().groups(["g"])).unwrap();
+        assert_owner(AsyncFinder::<R>::new(configured()), "Finder");
+        assert_owner(
+            AsyncFinder::<R, SourceCache>::new(SourceCache::new(configured())),
+            "SourceCache",
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_debug_names_the_shared_owner_and_its_scope() {
+        owners_keep_their_discovery_scope::<super::super::Tokio>();
+    }
+
+    #[cfg(feature = "smol")]
+    #[test]
+    fn smol_debug_names_the_shared_owner_and_its_scope() {
+        owners_keep_their_discovery_scope::<super::super::Smol>();
     }
 
     fn assert_invalid_discovery_inputs<R: AsyncRuntime>() {
