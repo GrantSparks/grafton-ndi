@@ -617,10 +617,17 @@ impl ReceiverOptions {
     ///
     /// Suited to image export, thumbnails and analysis pipelines, and to
     /// networks with little bandwidth to spare:
-    /// - color format [`ReceiverColorFormat::RgbxRgba`], which image
-    ///   encoding reads without converting color;
+    /// - color format [`ReceiverColorFormat::RgbxRgba`], convenient for
+    ///   encoding untagged sources directly;
     /// - bandwidth [`ReceiverBandwidth::Lowest`], the source's preview stream;
     /// - video fields not allowed, so interlaced video arrives as whole frames.
+    ///
+    /// The SDK converts YUV to RGB with BT.709 limited range even when
+    /// `ndi_color_info` names another matrix. This preset's RGB frames already
+    /// carry that conversion. Receive YUV with [`ReceiverColorFormat::UyvyBgra`]
+    /// or [`ReceiverColorFormat::UyvyRgba`] to let image encoding apply the
+    /// tag's matrix; [`ReceiverColorFormat::Best`] also retains high bit depth
+    /// and HDR code values. Tags still control HDR refusal and PNG tagging.
     ///
     /// # Example
     ///
@@ -660,6 +667,13 @@ impl ReceiverOptions {
     /// - color format [`ReceiverColorFormat::RgbxRgba`];
     /// - bandwidth [`ReceiverBandwidth::Highest`], the source's program stream;
     /// - video fields allowed, so interlaced video keeps its fields.
+    ///
+    /// RGB is convenient for untagged sources. For tagged YUV, the SDK has
+    /// already converted to BT.709 limited range, ignoring `ndi_color_info`;
+    /// image encoding cannot apply the tagged matrix to these RGB frames.
+    /// Use [`ReceiverColorFormat::UyvyBgra`] or [`ReceiverColorFormat::UyvyRgba`]
+    /// for that matrix, or [`ReceiverColorFormat::Best`] to retain high bit
+    /// depth and HDR code values. Tags still control HDR refusal and PNG tagging.
     ///
     /// # Example
     ///

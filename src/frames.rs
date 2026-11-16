@@ -1287,11 +1287,13 @@ macro_rules! video_accessors {
                 /// Encode the frame as an image, as `options` describe.
                 ///
                 /// Every uncompressed pixel format encodes, as PNG, JPEG or
-                /// lossless or lossy WebP. YUV is converted to RGB as the NDI SDK converts
-                /// it, with BT.709, limited range and repeated chroma, unless the
-                /// frame's `ndi_color_info` metadata names another matrix; a frame
-                /// tagged PQ or HLG is refused unless the options ask for its code
-                /// values. See
+                /// lossless or lossy WebP. By default, YUV uses limited range,
+                /// repeated chroma and the matrix in readable `ndi_color_info`,
+                /// or BT.709 when untagged. RGB-received frames already hold the
+                /// SDK's BT.709 limited-range conversion, which ignores the tag;
+                /// encoding cannot apply its matrix afterward. Tags still decide
+                /// HDR refusal and the PNG `cICP` chunk. Receive YUV when the
+                /// tagged matrix or original HDR code values matter. See
                 /// [`ImageOptions`](crate::image_encoding::ImageOptions) for formats, color, HDR,
                 /// bit depth, alpha, reduction, cost and memory.
                 ///
@@ -1303,17 +1305,11 @@ macro_rules! video_accessors {
                 ///
                 /// # Errors
                 ///
-                /// [`Error::InvalidInput`](crate::Error::InvalidInput) for options
-                /// that conflict: a JPEG quality outside 1 to 100, a WebP quality
-                /// outside 0 to 100, 16 bits or HDR
-                /// code values for JPEG or WebP.
-                /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) for a frame
-                /// the options cannot encode: a PQ or HLG frame under
-                /// [`HdrPolicy::Refuse`](crate::image_encoding::HdrPolicy::Refuse), unreadable
-                /// `ndi_color_info` or withheld received metadata under
-                /// [`ColorPolicy::Sdk`](crate::image_encoding::ColorPolicy::Sdk),
-                /// or an image larger than its codec allows; and when the codec
-                /// fails.
+                /// Returns [`Error::InvalidInput`](crate::Error::InvalidInput)
+                /// for unsuitable options, [`Error::InvalidFrame`](crate::Error::InvalidFrame)
+                /// for frame or codec refusals, or `Error::AllocationFailed` for
+                /// conversion scratch storage. The complete conditions are in the
+                /// [ImageOptions error table](crate::image_encoding::ImageOptions#errors).
                 ///
                 /// # Example
                 ///
