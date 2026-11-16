@@ -220,6 +220,7 @@ Use the SDK's required deployment target or later. The CI script sets iOS/tvOS
 archive's floor fail the build. The application linker also checks deployment
 compatibility.
 
-Rust 1.88 is the crate minimum, but tvOS and visionOS use newer toolchains in CI.
-The x86-64 tvOS simulator uses a pinned nightly with `-Zbuild-std`; see
+Rust 1.88 is the crate minimum. CI lints iOS, tvOS and visionOS with the current
+stable toolchain, except that the x86-64 tvOS simulator uses a pinned nightly
+with `-Zbuild-std`. Both default and all-feature builds deny warnings; see
 [`ci/apple-mobile.sh`](../ci/apple-mobile.sh) for exact commands.
