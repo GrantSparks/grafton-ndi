@@ -19,6 +19,7 @@ use super::loader::Linked;
 use super::loader::{confirm_selected, Module, Search};
 use super::{
     bindings::*,
+    loader::ExplicitLibrary,
     selection::Selection,
     table::{native_table, Resolver},
     Runtime,
@@ -198,7 +199,7 @@ pub(crate) fn select_file(
     runtime: &Runtime,
     library_path: Option<&Path>,
 ) -> Result<&'static FileRuntime> {
-    super::loader::validate_library_path(library_path)?;
+    let library_path = library_path.map(ExplicitLibrary::new).transpose()?;
     let file = SELECTED.get_or_try_load(|| FileRuntime::load(runtime, library_path))?;
     file.accepts(library_path)?;
     Ok(file)
@@ -263,17 +264,16 @@ impl FileRuntime {
         Some(&self.path)
     }
 
-    fn load(runtime: &Runtime, explicit: Option<&Path>) -> Result<Self> {
+    fn load(runtime: &Runtime, explicit: Option<ExplicitLibrary<'_>>) -> Result<Self> {
         let core = &runtime.info;
-        // The 6.4.0.2 POSIX File library, including Standard SDK copies,
-        // imports the core entry points from the Advanced runtime by name.
-        // Opened beside a Standard core it would make
-        // the platform loader bring a second NDI implementation into the
-        // process, so it is refused before anything is opened. The Windows
-        // File library carries its own implementation and imports none.
-        if cfg!(unix) && core.edition() != crate::capabilities::SdkEdition::Advanced {
+        if super::loader::FILE_LIBRARY_NEEDS_ADVANCED_RUNTIME
+            && core.edition() != crate::capabilities::SdkEdition::Advanced
+        {
             return Err(Error::RuntimeConflict(
-                SelectionFailure::file_needs_advanced(core.library_path(), explicit),
+                SelectionFailure::file_needs_advanced(
+                    core.library_path(),
+                    explicit.map(ExplicitLibrary::path),
+                ),
             ));
         }
         Search {
@@ -310,7 +310,7 @@ impl FileRuntime {
         Ok(Self { families, path })
     }
 
-    fn accepts(&self, requested: Option<&Path>) -> Result<()> {
+    fn accepts(&self, requested: Option<ExplicitLibrary<'_>>) -> Result<()> {
         confirm_selected(LibraryKind::File, &self.path, requested)
     }
 }
@@ -322,7 +322,7 @@ impl FileRuntime {
         None
     }
 
-    fn load(_runtime: &Runtime, explicit: Option<&Path>) -> Result<Self> {
+    fn load(_runtime: &Runtime, explicit: Option<ExplicitLibrary<'_>>) -> Result<Self> {
         Self::reject_path(explicit)?;
         let families = Families::load(&Linked).map_err(|reason| {
             Error::RuntimeLoadFailed(LoadFailure::linked(
@@ -334,15 +334,15 @@ impl FileRuntime {
         Ok(Self { families })
     }
 
-    fn accepts(&self, requested: Option<&Path>) -> Result<()> {
+    fn accepts(&self, requested: Option<ExplicitLibrary<'_>>) -> Result<()> {
         Self::reject_path(requested)
     }
 
-    fn reject_path(requested: Option<&Path>) -> Result<()> {
+    fn reject_path(requested: Option<ExplicitLibrary<'_>>) -> Result<()> {
         if let Some(requested) = requested {
             return Err(Error::RuntimeConflict(SelectionFailure::linked(
                 LibraryKind::File,
-                requested,
+                requested.path(),
             )));
         }
         Ok(())

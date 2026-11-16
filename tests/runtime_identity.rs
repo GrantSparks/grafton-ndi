@@ -5,6 +5,9 @@
 #[path = "common/mod.rs"]
 mod helpers;
 common_helpers!(runtime);
+#[path = "../src/sys/loader/file_policy.rs"]
+mod file_policy;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -18,7 +21,9 @@ fn provisioned_identity_is_checked_in_the_process_that_loads_the_runtime() {
     }
     let directory = fixture::FixtureDir::create("identity");
     // Without a request both editions are sought; this build prefers one.
-    let edition = if cfg!(any(feature = "advanced", feature = "file-io")) {
+    let edition = if cfg!(feature = "advanced")
+        || (cfg!(feature = "file-io") && file_policy::FILE_LIBRARY_NEEDS_ADVANCED_RUNTIME)
+    {
         "advanced"
     } else {
         "standard"

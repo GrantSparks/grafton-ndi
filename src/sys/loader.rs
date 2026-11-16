@@ -18,6 +18,28 @@ use crate::{
     Error, LoadRefusal, Result, SelectionFailure, VersionTextDefect,
 };
 
+#[cfg(any(not(ndi_link_static), test))]
+mod file_policy;
+#[cfg(any(not(ndi_link_static), test))]
+pub(crate) use file_policy::FILE_LIBRARY_NEEDS_ADVANCED_RUNTIME;
+
+/// An absolute caller-selected library path, validated before selection.
+#[derive(Clone, Copy)]
+pub(in crate::sys) struct ExplicitLibrary<'a>(&'a Path);
+
+impl<'a> ExplicitLibrary<'a> {
+    pub(in crate::sys) fn new(path: &'a Path) -> Result<Self> {
+        if !path.is_absolute() {
+            return Err(Error::InvalidInput(crate::InputDefect::RelativeLibraryPath));
+        }
+        Ok(Self(path))
+    }
+
+    pub(in crate::sys) fn path(self) -> &'a Path {
+        self.0
+    }
+}
+
 static SELECTED: Selection<Runtime> = Selection::new(crate::LibraryKind::Runtime);
 
 /// The implementation selected for this process.
@@ -39,21 +61,17 @@ pub(crate) fn selected() -> Option<&'static Runtime> {
 /// # Errors
 ///
 /// [`Error::RuntimeLoadFailed`] when nothing usable can be loaded (retryable),
-/// [`Error::RuntimeConflict`] when a different implementation is already pinned.
+/// [`Error::RuntimeConflict`] when a different implementation is already pinned,
+/// [`Error::InvalidInput`] when an explicit library path is relative or empty.
 pub(crate) fn select(options: &RuntimeOptions) -> Result<&'static Runtime> {
-    validate_library_path(options.library_path.as_deref())?;
-    let runtime = SELECTED.get_or_try_load(|| Runtime::load(options))?;
-    runtime.accepts(options)?;
+    let explicit = options
+        .library_path
+        .as_deref()
+        .map(ExplicitLibrary::new)
+        .transpose()?;
+    let runtime = SELECTED.get_or_try_load(|| Runtime::load(options, explicit))?;
+    runtime.accepts(options, explicit)?;
     Ok(runtime)
-}
-
-/// Validate caller-supplied paths before either a shared or linked provider
-/// can select anything. Empty paths are relative and are refused as well.
-pub(in crate::sys) fn validate_library_path(path: Option<&Path>) -> Result<()> {
-    if path.is_some_and(|path| !path.is_absolute()) {
-        return Err(Error::InvalidInput(crate::InputDefect::RelativeLibraryPath));
-    }
-    Ok(())
 }
 
 /// The editions whose libraries are searched for when [`RuntimeOptions`]
@@ -66,10 +84,9 @@ pub(in crate::sys) fn validate_library_path(path: Option<&Path>) -> Result<()> {
 /// runtime. Other builds prefer the Standard one. Nothing on the build machine
 /// affects the order.
 #[cfg(not(ndi_link_static))]
-const DEFAULT_SEARCH: [SdkEdition; 2] = if cfg!(any(
-    feature = "advanced",
-    all(feature = "file-io", not(windows))
-)) {
+const DEFAULT_SEARCH: [SdkEdition; 2] = if cfg!(feature = "advanced")
+    || (cfg!(feature = "file-io") && FILE_LIBRARY_NEEDS_ADVANCED_RUNTIME)
+{
     [SdkEdition::Advanced, SdkEdition::Standard]
 } else {
     [SdkEdition::Standard, SdkEdition::Advanced]
@@ -155,20 +172,22 @@ impl Runtime {
     /// # Errors
     ///
     /// [`Error::RuntimeConflict`] when `options` ask for an edition it is not
-    /// or name a library it was not loaded from;
-    /// [`Error::InvalidInput`] when they name a relative path.
-    fn accepts(&self, options: &RuntimeOptions) -> Result<()> {
+    /// or name a library it was not loaded from.
+    fn accepts(
+        &self,
+        options: &RuntimeOptions,
+        explicit: Option<ExplicitLibrary<'_>>,
+    ) -> Result<()> {
         if options
             .edition
             .is_some_and(|requested| !meets(requested, self.info.edition))
         {
             return Err(Error::RuntimeConflict(SelectionFailure::edition_not_met(
                 self.info.library_path(),
-                options.library_path.as_deref(),
+                explicit.map(ExplicitLibrary::path),
             )));
         }
-        self.provider
-            .confirm_location(options.library_path.as_deref())
+        self.provider.confirm_location(explicit)
     }
 }
 
@@ -193,7 +212,7 @@ mod shared {
         sync::{Mutex, PoisonError},
     };
 
-    use super::{Resolver, Runtime};
+    use super::{ExplicitLibrary, Resolver, Runtime};
     use crate::{
         capabilities::{SdkEdition, SdkLinkage},
         runtime::RuntimeOptions,
@@ -333,7 +352,10 @@ mod shared {
 
         /// Confirm that a request naming the library at `requested` is met by
         /// this module.
-        pub(super) fn confirm_location(&self, requested: Option<&Path>) -> Result<()> {
+        pub(super) fn confirm_location(
+            &self,
+            requested: Option<ExplicitLibrary<'_>>,
+        ) -> Result<()> {
             confirm_selected(LibraryKind::Runtime, &self.path, requested)
         }
 
@@ -375,7 +397,10 @@ mod shared {
         /// Search for the runtime library `options` describe: the requested
         /// edition's file name, or, without a request, the file names of both
         /// editions at each location.
-        pub(in crate::sys) fn load(options: &RuntimeOptions) -> Result<Self> {
+        pub(in crate::sys) fn load(
+            options: &RuntimeOptions,
+            explicit: Option<ExplicitLibrary<'_>>,
+        ) -> Result<Self> {
             let editions = match options.edition {
                 Some(requested) => vec![requested],
                 None => super::DEFAULT_SEARCH.to_vec(),
@@ -392,7 +417,7 @@ mod shared {
             let requested = options.edition.unwrap_or(SdkEdition::Standard);
             Search {
                 kind: LibraryKind::Runtime,
-                explicit: options.library_path.as_deref(),
+                explicit,
                 beside: None,
                 names: &names,
                 anchor: CORE_ANCHOR,
@@ -409,12 +434,12 @@ mod shared {
     pub(in crate::sys) fn confirm_selected(
         library: LibraryKind,
         selected: &Path,
-        requested: Option<&Path>,
+        requested: Option<ExplicitLibrary<'_>>,
     ) -> Result<()> {
         let Some(requested) = requested else {
             return Ok(());
         };
-        super::validate_library_path(Some(requested))?;
+        let requested = requested.path();
         if same_path(requested, selected) {
             Ok(())
         } else {
@@ -429,7 +454,7 @@ mod shared {
         /// Which library is being sought.
         pub(in crate::sys) kind: LibraryKind,
         /// The only acceptable location, when the caller named one.
-        pub(in crate::sys) explicit: Option<&'a Path>,
+        pub(in crate::sys) explicit: Option<ExplicitLibrary<'a>>,
         /// The file of an already selected library this one is installed
         /// beside; its directory is searched first.
         pub(in crate::sys) beside: Option<&'a Path>,
@@ -450,7 +475,6 @@ mod shared {
         ///
         /// # Errors
         ///
-        /// [`Error::InvalidInput`] for a relative explicit path;
         /// [`Error::RuntimeConflict`] for an explicit runtime or a File search
         /// that would bind to another globally visible runtime;
         /// otherwise [`Error::RuntimeLoadFailed`] naming every location tried
@@ -459,7 +483,6 @@ mod shared {
             &self,
             accept: impl Fn(Module) -> std::result::Result<T, LoadRefusal>,
         ) -> Result<T> {
-            super::validate_library_path(self.explicit)?;
             let executable = std::env::current_exe().ok();
             let runtime_directory = std::env::var_os(RUNTIME_DIRECTORY)
                 .filter(|directory| !directory.is_empty())
@@ -509,7 +532,7 @@ mod shared {
                         return Err(Error::RuntimeConflict(SelectionFailure::foreign(
                             self.kind,
                             self.beside,
-                            self.explicit,
+                            self.explicit.map(ExplicitLibrary::path),
                             module,
                             &candidate.location,
                             candidate.origin,
@@ -664,7 +687,7 @@ mod shared {
     /// either dyld library directory list contains a relative or empty entry.
     /// The current environment is checked; callers must configure dyld before launch.
     pub(super) fn search_plan(
-        explicit: Option<&Path>,
+        explicit: Option<ExplicitLibrary<'_>>,
         companion_directory: Option<&Path>,
         executable_directory: Option<&Path>,
         runtime_directory: Option<&Path>,
@@ -674,7 +697,7 @@ mod shared {
     ) -> Vec<Candidate> {
         if let Some(path) = explicit {
             return vec![Candidate {
-                location: path.to_owned(),
+                location: path.path().to_owned(),
                 origin: Origin::Explicit,
             }];
         }
@@ -1001,8 +1024,9 @@ mod shared {
 
         #[test]
         fn an_explicit_path_is_the_only_candidate() {
+            let path = runtime_directory().join("libndi.so.6");
             let plan = search_plan(
-                Some(Path::new("/opt/ndi/libndi.so.6")),
+                Some(ExplicitLibrary::new(&path).unwrap()),
                 Some(Path::new("/core")),
                 Some(Path::new("/app")),
                 Some(runtime_directory()),
@@ -1010,10 +1034,7 @@ mod shared {
                 None,
                 &["libndi.so.6"],
             );
-            assert_eq!(
-                locations(&plan),
-                [(PathBuf::from("/opt/ndi/libndi.so.6"), Origin::Explicit)]
-            );
+            assert_eq!(locations(&plan), [(path, Origin::Explicit)]);
         }
 
         #[test]
@@ -1312,10 +1333,9 @@ mod shared {
         #[test]
         fn without_a_request_both_editions_are_sought_with_the_features_preference_first() {
             use crate::capabilities::SdkEdition::{Advanced, Standard};
-            let expected = if cfg!(any(
-                feature = "advanced",
-                all(feature = "file-io", not(windows))
-            )) {
+            let expected = if cfg!(feature = "advanced")
+                || (cfg!(feature = "file-io") && super::super::FILE_LIBRARY_NEEDS_ADVANCED_RUNTIME)
+            {
                 [Advanced, Standard]
             } else {
                 [Standard, Advanced]
@@ -1340,11 +1360,11 @@ mod shared {
 mod linked {
     use std::{
         ffi::{c_void, CStr},
-        path::{Path, PathBuf},
+        path::PathBuf,
         ptr::NonNull,
     };
 
-    use super::{Resolver, Runtime};
+    use super::{ExplicitLibrary, Resolver, Runtime};
     use crate::{
         capabilities::{SdkEdition, SdkLinkage},
         runtime::RuntimeOptions,
@@ -1367,12 +1387,15 @@ mod linked {
 
         /// A linked archive is the only implementation there is, so no request
         /// can name a library to load in its place.
-        pub(super) fn confirm_location(&self, requested: Option<&Path>) -> Result<()> {
+        pub(super) fn confirm_location(
+            &self,
+            requested: Option<ExplicitLibrary<'_>>,
+        ) -> Result<()> {
             match requested {
                 None => Ok(()),
                 Some(requested) => Err(Error::RuntimeConflict(SelectionFailure::linked(
                     LibraryKind::Runtime,
-                    requested,
+                    requested.path(),
                 ))),
             }
         }
@@ -1399,7 +1422,10 @@ mod linked {
         /// The archive was chosen when the program was built, so the request
         /// plays no part here: it is checked against the archive exactly as
         /// against any implementation that is already selected.
-        pub(in crate::sys) fn load(_: &RuntimeOptions) -> Result<Self> {
+        pub(in crate::sys) fn load(
+            _: &RuntimeOptions,
+            _: Option<ExplicitLibrary<'_>>,
+        ) -> Result<Self> {
             Self::describe(Linked, super::linked_edition()).map_err(|reason| {
                 Error::RuntimeLoadFailed(LoadFailure::linked(
                     LibraryKind::Runtime,
@@ -1426,13 +1452,24 @@ mod tests {
     }
 
     #[test]
+    fn file_library_platform_dependency_matches_the_vendor_libraries() {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
+        const {
+            assert!(FILE_LIBRARY_NEEDS_ADVANCED_RUNTIME)
+        };
+        #[cfg(windows)]
+        const {
+            assert!(!FILE_LIBRARY_NEEDS_ADVANCED_RUNTIME)
+        };
+    }
+
+    #[test]
     fn explicit_paths_are_validated_before_any_provider_is_consulted() {
-        assert!(validate_library_path(None).is_ok());
         let absolute = std::env::current_dir().unwrap().join("library");
-        assert!(validate_library_path(Some(&absolute)).is_ok());
+        assert!(ExplicitLibrary::new(&absolute).is_ok());
         for path in [Path::new("library"), Path::new(""), Path::new("./library")] {
             assert!(matches!(
-                validate_library_path(Some(path)),
+                ExplicitLibrary::new(path),
                 Err(Error::InvalidInput(_))
             ));
         }
