@@ -998,7 +998,20 @@ impl Control {
     /// Publish the request and its budget start as one fact. Return whether
     /// shutdown had already been requested, as last-handle drops need to know.
     fn request_shutdown(&self) -> bool {
+        // A finish admitted before this publication must already be in the
+        // channel before the owner can begin its shutdown drain.
+        let _submission = lock(&self.closing);
         self.shutdown_at.set(Instant::now()).is_err()
+    }
+
+    /// Make finish acceptance and enqueue indivisible with shutdown publication,
+    /// using the same mutex that already owns close replies.
+    fn submit_finish<T>(&self, enqueue: impl FnOnce() -> Live<T>) -> Live<T> {
+        let _submission = lock(&self.closing);
+        if self.failed() || self.shutdown_requested() {
+            return Live::failed(stopped(self.failed()));
+        }
+        enqueue()
     }
 
     fn shutdown_requested(&self) -> bool {
@@ -2304,29 +2317,28 @@ impl AsyncFileRecorder {
         let admission = Arc::clone(&self.worker.admission);
         let control = Arc::clone(&self.worker.control);
         FileOperation::deferred(move || {
-            if control.failed() || control.shutdown_requested() {
-                return Live::failed(stopped(control.failed()));
-            }
-            let deadline = match Deadline::after(timeout) {
-                Ok(deadline) => deadline,
-                Err(error) => return Live::failed(error),
-            };
-            let place = match admission.admit(stop) {
-                Ok(place) => place,
-                Err(error) => return Live::failed(error),
-            };
-            let (mut reply, future) = operation();
-            reply.owner = Some(Arc::clone(&control));
-            let job = Job::Finish {
-                deadline,
-                stop,
-                reply: finish_response(reply),
-                place,
-            };
-            if sender.send(job).is_err() {
-                return Live::failed(stopped(control.failed()));
-            }
-            future
+            control.submit_finish(|| {
+                let deadline = match Deadline::after(timeout) {
+                    Ok(deadline) => deadline,
+                    Err(error) => return Live::failed(error),
+                };
+                let place = match admission.admit(stop) {
+                    Ok(place) => place,
+                    Err(error) => return Live::failed(error),
+                };
+                let (mut reply, future) = operation();
+                reply.owner = Some(Arc::clone(&control));
+                let job = Job::Finish {
+                    deadline,
+                    stop,
+                    reply: finish_response(reply),
+                    place,
+                };
+                if sender.send(job).is_err() {
+                    return Live::failed(stopped(control.failed()));
+                }
+                future
+            })
         })
     }
 
@@ -3679,6 +3691,69 @@ mod tests {
         // closure cannot subsequently turn their earlier result into success.
         assert!(!closing.is_completed());
         block_on(closing).unwrap();
+    }
+
+    #[test]
+    fn an_accepted_finish_is_enqueued_before_shutdown_can_publish() {
+        let (device, recorder) = mock_recorder(Closing::AtStop);
+        let (blocked, release_owner) = block_owner(&recorder.worker);
+        let control = Arc::clone(&recorder.worker.control);
+        let sender = recorder.worker.sender.clone();
+        let place = recorder.worker.admission.admit(true).unwrap();
+        let (mut reply, finishing) = operation();
+        reply.owner = Some(Arc::clone(&control));
+        let (entered, admitted) = mpsc::channel();
+        let (release_submission, proceed) = mpsc::channel();
+        let (closing_sent, closing_received) = mpsc::channel();
+        let (close_attempted, attempting_close) = mpsc::channel();
+        thread::scope(|scope| {
+            let submitting = Arc::clone(&control);
+            scope.spawn(move || {
+                let submitted = submitting.submit_finish(|| {
+                    entered.send(()).unwrap();
+                    proceed.recv_timeout(Duration::from_secs(5)).unwrap();
+                    sender
+                        .send(Job::Finish {
+                            deadline: Deadline::after(Duration::from_secs(5)).unwrap(),
+                            stop: true,
+                            reply: FinishResponse::Finish(reply),
+                            place,
+                        })
+                        .unwrap_or_else(|_| panic!("owner queue closed"));
+                    Live::Immediate(Ok(()))
+                });
+                block_on(FileOperation::live(submitted)).unwrap();
+            });
+            admitted.recv_timeout(Duration::from_secs(5)).unwrap();
+            let other = recorder.clone();
+            scope.spawn(move || {
+                close_attempted.send(()).unwrap();
+                closing_sent.send(other.close().submit()).unwrap();
+            });
+            attempting_close
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            assert!(matches!(
+                closing_received.recv_timeout(Duration::from_millis(30)),
+                Err(RecvTimeoutError::Timeout)
+            ));
+            assert!(
+                !control.shutdown_requested(),
+                "shutdown overtook an accepted finish"
+            );
+            release_submission.send(()).unwrap();
+            let closing = closing_received
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            release_owner.send(()).unwrap();
+            block_on(blocked).unwrap();
+            assert!(matches!(
+                block_on(FileOperation::live(finishing)).unwrap(),
+                FinishStatus::Closed(_)
+            ));
+            block_on(closing).unwrap();
+        });
+        assert!(device.closed_before_destroy.load(Ordering::Acquire));
     }
 
     #[test]
