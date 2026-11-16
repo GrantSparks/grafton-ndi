@@ -810,10 +810,46 @@ mod discovery {
     /// The events most recently handed out, which stay allocated until freed.
     type Batch = Vec<NDIlib_listener_event>;
 
+    /// Model a runtime that borrows subscription identifiers rather than
+    /// copying them. Every later listener operation checks the retained text.
+    #[derive(Default)]
+    struct Subscriptions(std::collections::BTreeMap<Vec<u8>, *const c_char>);
+
+    impl Subscriptions {
+        unsafe fn check(&self, listener: &str, operation: &str) {
+            for (expected, &pointer) in &self.0 {
+                assert_eq!(unsafe { CStr::from_ptr(pointer) }.to_bytes(), expected);
+            }
+            if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_some() {
+                log(&format!("{listener}-retained-{operation} {}", self.0.len()));
+            }
+        }
+
+        unsafe fn subscribe(&mut self, listener: &str, pointer: *const c_char) {
+            if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_none() {
+                return;
+            }
+            unsafe { self.check(listener, "subscribe") };
+            let bytes = unsafe { CStr::from_ptr(pointer) }.to_bytes().to_vec();
+            if let Some(&previous) = self.0.get(&bytes) {
+                assert_eq!(previous, pointer, "resubscribing replaced retained storage");
+            } else {
+                self.0.insert(bytes, pointer);
+            }
+            log(&format!("{listener}-retained-pointer {}", pointer as usize));
+        }
+
+        unsafe fn unsubscribe(&mut self, listener: &str, pointer: *const c_char) {
+            unsafe { self.check(listener, "unsubscribe") };
+            self.0.remove(unsafe { CStr::from_ptr(pointer) }.to_bytes());
+        }
+    }
+
     struct SendListener {
         senders: [NDIlib_sender_t; 2],
         _groups: Box<[*const c_char]>,
         batch: Batch,
+        subscriptions: Subscriptions,
     }
 
     struct RecvListener {
@@ -821,6 +857,7 @@ mod discovery {
         _streams: Box<[NDIlib_receiver_type_e]>,
         _commands: Box<[NDIlib_receiver_command_e]>,
         batch: Batch,
+        subscriptions: Subscriptions,
     }
 
     /// Fill `batch` with events and hand it out, or hand out nothing when the
@@ -927,12 +964,14 @@ mod discovery {
                 "groups-null" => senders[1].num_groups = 1,
                 _ => {}
             }
-            Box::into_raw(Box::new(SendListener { senders, _groups: groups, batch: Batch::new() })).cast()
+            Box::into_raw(Box::new(SendListener { senders, _groups: groups, batch: Batch::new(), subscriptions: Subscriptions::default() })).cast()
         }
 
         fn NDIlib_send_listener_destroy(p_instance: NDIlib_send_listener_instance_t) {
             log("send-listener-destroy");
-            drop(unsafe { Box::from_raw(p_instance.cast::<SendListener>()) });
+            let listener = unsafe { Box::from_raw(p_instance.cast::<SendListener>()) };
+            unsafe { listener.subscriptions.check("send-listener", "destroy") };
+            drop(listener);
         }
 
         fn NDIlib_send_listener_is_connected(_p_instance: NDIlib_send_listener_instance_t) -> bool {
@@ -945,6 +984,7 @@ mod discovery {
 
         fn NDIlib_send_listener_get_senders(p_instance: NDIlib_send_listener_instance_t, p_num_senders: *mut u32) -> *const NDIlib_sender_t {
             let listener = unsafe { &*p_instance.cast::<SendListener>() };
+            unsafe { listener.subscriptions.check("send-listener", "snapshot") };
             unsafe { *p_num_senders = listener.senders.len() as u32 };
             if malformed() == "senders-null" { ptr::null() } else { listener.senders.as_ptr() }
         }
@@ -953,17 +993,22 @@ mod discovery {
             false
         }
 
-        fn NDIlib_send_listener_subscribe_events(_p_instance: NDIlib_send_listener_instance_t, p_sender_uuid: *const c_char) {
+        fn NDIlib_send_listener_subscribe_events(p_instance: NDIlib_send_listener_instance_t, p_sender_uuid: *const c_char) {
             log(&format!("send-listener-subscribe {}", unsafe { bytes(p_sender_uuid) }));
+            let listener = unsafe { &mut *p_instance.cast::<SendListener>() };
+            unsafe { listener.subscriptions.subscribe("send-listener", p_sender_uuid) };
         }
 
-        fn NDIlib_send_listener_unsubscribe_events(_p_instance: NDIlib_send_listener_instance_t, p_sender_uuid: *const c_char) {
+        fn NDIlib_send_listener_unsubscribe_events(p_instance: NDIlib_send_listener_instance_t, p_sender_uuid: *const c_char) {
             log(&format!("send-listener-unsubscribe {}", unsafe { bytes(p_sender_uuid) }));
+            let listener = unsafe { &mut *p_instance.cast::<SendListener>() };
+            unsafe { listener.subscriptions.unsubscribe("send-listener", p_sender_uuid) };
         }
 
         fn NDIlib_send_listener_get_events(p_instance: NDIlib_send_listener_instance_t, p_num_events: *mut u32, timeout_in_ms: u32) -> *const NDIlib_send_listener_event {
             log(&format!("send-listener-events {timeout_in_ms}"));
             let listener = unsafe { &mut *p_instance.cast::<SendListener>() };
+            unsafe { listener.subscriptions.check("send-listener", "events") };
             unsafe { events(&mut listener.batch, SENDER_ID, p_num_events, timeout_in_ms) }
         }
 
@@ -1047,12 +1092,14 @@ mod discovery {
                 }
                 _ => {}
             }
-            Box::into_raw(Box::new(RecvListener { receivers, _streams: streams, _commands: commands, batch: Batch::new() })).cast()
+            Box::into_raw(Box::new(RecvListener { receivers, _streams: streams, _commands: commands, batch: Batch::new(), subscriptions: Subscriptions::default() })).cast()
         }
 
         fn NDIlib_recv_listener_destroy(p_instance: NDIlib_recv_listener_instance_t) {
             log("recv-listener-destroy");
-            drop(unsafe { Box::from_raw(p_instance.cast::<RecvListener>()) });
+            let listener = unsafe { Box::from_raw(p_instance.cast::<RecvListener>()) };
+            unsafe { listener.subscriptions.check("recv-listener", "destroy") };
+            drop(listener);
         }
 
         fn NDIlib_recv_listener_is_connected(_p_instance: NDIlib_recv_listener_instance_t) -> bool {
@@ -1065,6 +1112,7 @@ mod discovery {
 
         fn NDIlib_recv_listener_get_receivers(p_instance: NDIlib_recv_listener_instance_t, p_num_receivers: *mut u32) -> *const NDIlib_receiver_t {
             let listener = unsafe { &*p_instance.cast::<RecvListener>() };
+            unsafe { listener.subscriptions.check("recv-listener", "snapshot") };
             unsafe { *p_num_receivers = listener.receivers.len() as u32 };
             if malformed() == "receivers-null" { ptr::null() } else { listener.receivers.as_ptr() }
         }
@@ -1073,17 +1121,22 @@ mod discovery {
             false
         }
 
-        fn NDIlib_recv_listener_subscribe_events(_p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char) {
+        fn NDIlib_recv_listener_subscribe_events(p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char) {
             log(&format!("recv-listener-subscribe {}", unsafe { bytes(p_receiver_uuid) }));
+            let listener = unsafe { &mut *p_instance.cast::<RecvListener>() };
+            unsafe { listener.subscriptions.subscribe("recv-listener", p_receiver_uuid) };
         }
 
-        fn NDIlib_recv_listener_unsubscribe_events(_p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char) {
+        fn NDIlib_recv_listener_unsubscribe_events(p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char) {
             log(&format!("recv-listener-unsubscribe {}", unsafe { bytes(p_receiver_uuid) }));
+            let listener = unsafe { &mut *p_instance.cast::<RecvListener>() };
+            unsafe { listener.subscriptions.unsubscribe("recv-listener", p_receiver_uuid) };
         }
 
         fn NDIlib_recv_listener_get_events(p_instance: NDIlib_recv_listener_instance_t, p_num_events: *mut u32, timeout_in_ms: u32) -> *const NDIlib_recv_listener_event {
             log(&format!("recv-listener-events {timeout_in_ms}"));
             let listener = unsafe { &mut *p_instance.cast::<RecvListener>() };
+            unsafe { listener.subscriptions.check("recv-listener", "events") };
             unsafe { events(&mut listener.batch, RECEIVER_ID, p_num_events, timeout_in_ms) }
         }
 
