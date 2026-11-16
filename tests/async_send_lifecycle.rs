@@ -264,9 +264,9 @@ fn split_clocked_video_keeps_audio_flowing_on_another_thread() -> grafton_ndi::R
                 thread::sleep(Duration::from_millis(10));
             }
         });
-        let mut received = [false; 32];
+        let mut received = [0usize; 32];
         let deadline = Instant::now() + Duration::from_secs(15);
-        while received.iter().any(|seen| !seen) {
+        while received.iter().any(|samples| *samples < 480) {
             assert!(
                 Instant::now() < deadline,
                 "audio frames missing during clocked video: {received:?}"
@@ -274,12 +274,30 @@ fn split_clocked_video_keeps_audio_flowing_on_another_thread() -> grafton_ndi::R
             if let Some(frame) = receiver.capture_audio(Duration::from_millis(100)).unwrap() {
                 for &sample in frame.data() {
                     let index = (sample * 100.0).round() as usize;
-                    if (1..=32).contains(&index) {
-                        received[index - 1] = true;
+                    if index == 0 {
+                        assert!(
+                            sample.abs() < 0.000_001,
+                            "unexpected warm-up sample: {sample}"
+                        );
+                    } else {
+                        assert!(
+                            (1..=32).contains(&index),
+                            "unexpected audio marker: {sample}"
+                        );
+                        let expected = index as f32 / 100.0;
+                        assert!(
+                            (sample - expected).abs() < 0.000_001,
+                            "audio marker changed: {sample}, expected {expected}"
+                        );
+                        received[index - 1] += 1;
                     }
                 }
             }
         }
+        assert_eq!(
+            received, [480; 32],
+            "each marked audio block must arrive exactly once"
+        );
     });
     Ok(())
 }

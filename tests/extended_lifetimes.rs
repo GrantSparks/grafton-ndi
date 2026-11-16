@@ -614,7 +614,17 @@ fn child(case: &str) {
                     .num_samples(480)
                     .build()
                     .unwrap();
-                shared.send_audio(&audio);
+                let (audio_done, completed) = std::sync::mpsc::sync_channel(1);
+                scope.spawn(move || {
+                    shared.send_audio(&audio);
+                    let _ = audio_done.send(());
+                });
+                // On failure this thread unwinds through Release before the
+                // scope joins, so a video-lock regression releases both workers.
+                assert!(
+                    completed.recv_timeout(Duration::from_secs(2)).is_ok(),
+                    "audio waited for the blocked video submission"
+                );
                 assert!(
                     !submission.is_finished(),
                     "video must still be blocked in the SDK"
