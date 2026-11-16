@@ -1338,7 +1338,7 @@ fn unwritable_unix_recording_directories_never_reach_the_sdk() {
     let path = std::ffi::CString::new(denied.as_os_str().as_bytes()).unwrap();
     // SAFETY: `path` retains a NUL-terminated directory path for this query.
     if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } == 0 {
-        eprintln!("skipped: this process can override directory write permissions");
+        crate::test_support::unsupported("this process can override directory write permissions");
         return;
     }
     unwritable_directory_is_refused_before_native_calls(&directory);

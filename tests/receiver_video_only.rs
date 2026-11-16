@@ -2,7 +2,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name, loopback, socket);
+common_helpers!(runtime, name, loopback, socket, unsupported, feature);
 
 use grafton_ndi::{
     capabilities::RuntimeFeature, AudioFrame, FrameRate, Receiver, ReceiverBandwidth,
@@ -13,11 +13,7 @@ use std::time::{Duration, Instant};
 #[test]
 fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
     let Some(ndi) = common::ndi() else { return };
-    if ndi
-        .require_feature(RuntimeFeature::ReceiveVideoOnly)
-        .is_err()
-    {
-        // The constructors' rejection on older runtimes is tested separately.
+    if !common::require_feature(ndi.require_feature(RuntimeFeature::ReceiveVideoOnly)) {
         return;
     }
     // Send in real time: clocked 30 fps video, each frame paired with 1600

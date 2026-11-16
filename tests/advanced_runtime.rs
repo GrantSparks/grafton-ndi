@@ -20,6 +20,7 @@ common_helpers!(
     advanced,
     hx,
     unsupported,
+    feature,
     loopback,
     endpoint,
     socket,
@@ -424,8 +425,7 @@ fn an_advertised_packet_receiver_outlives_its_allocators() {
     let Some(ndi) = common::advanced_ndi() else {
         return;
     };
-    if let Err(unavailable) = ndi.require_feature(RuntimeFeature::ReceiverAdvertising) {
-        eprintln!("skipped: receiver advertising: {unavailable}");
+    if !common::require_feature(ndi.require_feature(RuntimeFeature::ReceiverAdvertising)) {
         return;
     }
     let _turn = sockets();

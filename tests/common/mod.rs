@@ -7,6 +7,8 @@
 //! `policy` selects prerequisite reporting without loading a runtime.
 //! `advanced`, `file`, `hx`, and `identity` extend `runtime`; `prerequisites`
 //! extends either policy selection, and `endpoint` extends `loopback`.
+//! `feature` extends `runtime` plus `unsupported` to classify capability checks;
+//! `feature_policy` supplies that classification without loading a runtime.
 
 macro_rules! common_helpers {
     ($($group:ident),+ $(,)?) => {
@@ -61,6 +63,17 @@ macro_rules! common_helpers {
         #[path = "../../src/test_support/unsupported.rs"]
         mod unsupported;
         pub use unsupported::unsupported;
+    };
+    (@ feature_policy) => {
+        use grafton_ndi as api;
+        common_helpers!(@ policy);
+        common_helpers!(@ unsupported);
+        common_helpers!(@ feature);
+    };
+    (@ feature) => {
+        #[path = "../../src/test_support/feature.rs"]
+        mod feature;
+        pub use feature::require_feature;
     };
     (@ loopback) => {
         mod loopback;

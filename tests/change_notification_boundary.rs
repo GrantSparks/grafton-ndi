@@ -1,6 +1,13 @@
 //! One-shot native reports must wake every concurrent observer in Rust.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
+#[cfg(feature = "advanced")]
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+#[cfg(feature = "advanced")]
+common_helpers!(feature_policy);
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -570,8 +577,7 @@ fn keyframe(ndi: &Ndi, clear_after_query: bool) {
         capabilities::RuntimeFeature,
         Receiver, ReceiverOptions, Sender, SenderOptions, Source,
     };
-    if let Err(error) = ndi.require_feature(RuntimeFeature::KeyframeDemand) {
-        eprintln!("skipped: keyframe change fixture needs Advanced declarations: {error}");
+    if !common::require_feature(ndi.require_feature(RuntimeFeature::KeyframeDemand)) {
         return;
     }
     let sender = Sender::new(ndi, &SenderOptions::new("keyframe fixture")).unwrap();
