@@ -1,0 +1,8 @@
+error[E0515]: cannot return value referencing function parameter `sender`
+ --> tests/ui/fail/raw_video_outlives_owner.rs:3:5
+  |
+3 |     sender.split().0
+  |     ------^^^^^^^^^^
+  |     |
+  |     returns a value referencing data owned by the current function
+  |     `sender` is borrowed here

@@ -116,6 +116,7 @@ fn crate_root_types_keep_their_auto_traits() {
         ResourceKind: Send, Sync, UnwindSafe, RefUnwindSafe;
         RawCapture: Send, Sync, UnwindSafe, RefUnwindSafe;
         RawSend: Send, Sync, UnwindSafe, RefUnwindSafe;
+        RawVideo<'static>: Send, UnwindSafe;
         Receiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         Receiver<FrameSyncAttached>: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceiverBandwidth: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -163,7 +164,7 @@ fn crate_root_types_keep_their_auto_traits() {
         video_conversion::V210Layout: Send, Sync, UnwindSafe, RefUnwindSafe;
         video_conversion::VideoConverter: Send, Sync, UnwindSafe, RefUnwindSafe;
     }
-    lacks! { routing::Router: Sync; }
+    lacks! { routing::Router: Sync; RawVideo<'static>: Sync; RawVideo<'static>: Clone; }
 }
 
 #[test]

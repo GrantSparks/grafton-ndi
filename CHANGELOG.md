@@ -20,6 +20,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - `AsyncFileRecorder::abandon` destroys the recorder without spending its
   finalization wait and returns the last session report after destruction.
   It bypasses command queue limits, as `close` does.
+- `Sender::split` lends asynchronous video to a scoped thread alongside shared
+  audio, metadata and controls, without an application mutex. Video submission
+  docs describe the SDK's default clock pacing.
 
 ### Fixed
 

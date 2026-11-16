@@ -614,6 +614,16 @@ mod objects {
                 return;
             }
             log("sender-submit");
+            if let Some(gate) = std::env::var_os("GRAFTON_FAKE_VIDEO_GATE") {
+                let gate = std::path::PathBuf::from(gate);
+                std::fs::write(gate.join("entered"), b"").unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                while !gate.join("release").exists() {
+                    assert!(std::time::Instant::now() < deadline, "video gate was not released");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                log("sender-video-released");
+            }
             if sender.completion.is_none() && std::env::var_os("GRAFTON_FAKE_VALIDATE_VIDEO_COPY").is_some() {
                 unsafe { sender.release_copy() };
                 let frame = unsafe { *p_video_data };

@@ -374,7 +374,9 @@ impl CompressedAudioSendMode for QueueAttached {}
 /// A sender is `Send` and `Sync`. Its operations take `&self` and may run on
 /// several threads at once, except the asynchronous video operations,
 /// `submit_video`, `submit_video_copy` and `reclaim_video`, which
-/// take `&mut self`. Tally polls preserve changes for a waiting thread;
+/// take `&mut self`. [`Sender::split`] lends these video operations to a
+/// scoped thread alongside a shared sender for audio, metadata and controls.
+/// Tally polls preserve changes for a waiting thread;
 /// concurrent tally waits serialize and each change is consumed once.
 pub struct Sender<M: SenderMode = RawSend> {
     inner: Inner,
@@ -464,35 +466,14 @@ pub(crate) mod in_flight {
 
         fn synchronize<R>(&self, call: impl FnOnce(VideoPair<'_>) -> R) -> R {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let VideoState {
-                in_flight,
-                staging,
-                spare,
-            } = &mut *state;
-            call(VideoPair {
-                stream: Stream {
-                    slot: in_flight,
-                    sender: self.owner.handle(),
-                },
-                staging,
-                spare,
-            })
+            call(state.paired(self.owner.handle()))
         }
 
         fn exclusive(&mut self) -> VideoPair<'_> {
-            let VideoState {
-                in_flight,
-                staging,
-                spare,
-            } = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-            VideoPair {
-                stream: Stream {
-                    slot: in_flight,
-                    sender: self.owner.handle(),
-                },
-                staging,
-                spare,
-            }
+            self.state
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .paired(self.owner.handle())
         }
 
         pub(super) fn send(&self, frame: Sendable<&(impl VideoSource + ?Sized)>) -> Result<()> {
@@ -504,16 +485,19 @@ pub(crate) mod in_flight {
         }
 
         pub(super) fn submit(&mut self, frame: Sendable<VideoFrame>) -> Option<VideoFrame> {
-            self.exclusive()
-                .stream
-                .submit(frame)
-                .map(Sendable::into_frame)
+            self.exclusive().submit(frame)
+        }
+
+        pub(super) fn submit_shared(&self, frame: Sendable<VideoFrame>) -> Option<VideoFrame> {
+            self.synchronize(|pair| pair.submit(frame))
         }
 
         pub(super) fn copy(&mut self, frame: Sendable<&(impl VideoSource + ?Sized)>) {
-            let mut pair = self.exclusive();
-            let owned = frame.copied(pair.spare.take());
-            *pair.spare = pair.stream.submit(owned).map(Sendable::into_frame);
+            self.exclusive().copy(frame);
+        }
+
+        pub(super) fn copy_shared(&self, frame: Sendable<&(impl VideoSource + ?Sized)>) {
+            self.synchronize(|pair| pair.copy(frame));
         }
 
         pub(super) fn flush(&self) {
@@ -521,10 +505,11 @@ pub(crate) mod in_flight {
         }
 
         pub(super) fn finish(&mut self) -> Option<VideoFrame> {
-            let mut pair = self.exclusive();
-            pair.stream.flush();
-            *pair.spare = None;
-            pair.stream.slot.take_retained().map(Sendable::into_frame)
+            self.exclusive().finish()
+        }
+
+        pub(super) fn finish_shared(&self) -> Option<VideoFrame> {
+            self.synchronize(|pair| pair.finish())
         }
 
         #[cfg(test)]
@@ -535,6 +520,41 @@ pub(crate) mod in_flight {
         #[cfg(all(feature = "advanced", ndi_has_advanced_send_completion))]
         pub(super) fn retire(mut self) -> Option<VideoFrame> {
             self.finish()
+        }
+    }
+
+    impl VideoState {
+        fn paired<'a>(&'a mut self, sender: SendHandle<'a>) -> VideoPair<'a> {
+            let Self {
+                in_flight,
+                staging,
+                spare,
+            } = self;
+            VideoPair {
+                stream: Stream {
+                    slot: in_flight,
+                    sender,
+                },
+                staging,
+                spare,
+            }
+        }
+    }
+
+    impl VideoPair<'_> {
+        fn submit(mut self, frame: Sendable<VideoFrame>) -> Option<VideoFrame> {
+            self.stream.submit(frame).map(Sendable::into_frame)
+        }
+
+        fn copy(mut self, frame: Sendable<&(impl VideoSource + ?Sized)>) {
+            let owned = frame.copied(self.spare.take());
+            *self.spare = self.stream.submit(owned).map(Sendable::into_frame);
+        }
+
+        fn finish(mut self) -> Option<VideoFrame> {
+            self.stream.flush();
+            *self.spare = None;
+            self.stream.slot.take_retained().map(Sendable::into_frame)
         }
     }
 
@@ -985,6 +1005,114 @@ pub(crate) mod in_flight {
     mod tests {
         use super::*;
 
+        /// The split path locks this state and runs these same kernels. Every
+        /// synthetic native call rereads the previous loan before releasing it,
+        /// so Miri observes descriptor/pixel lifetimes through submit and reclaim.
+        #[test]
+        fn split_video_kernels_retain_loans_and_reuse_warm_storage() {
+            use super::super::SendInstance;
+            use crate::{sys::table::Resolver, LoadRefusal};
+            use std::{
+                ffi::{c_void, CStr},
+                ptr::NonNull,
+                sync::LazyLock,
+            };
+
+            #[derive(Default)]
+            struct Observation {
+                pending: Option<(crate::sys::bindings::NDIlib_video_frame_v2_t, u8)>,
+                releases: usize,
+            }
+            unsafe extern "C" fn unused() {}
+            unsafe extern "C" fn submit(
+                instance: crate::sys::bindings::NDIlib_send_instance_t,
+                frame: *const crate::sys::bindings::NDIlib_video_frame_v2_t,
+            ) {
+                // SAFETY: the instance borrows this live test mutex. The
+                // previous loan must still own its bytes until this call returns.
+                let state = unsafe { &*instance.cast::<Mutex<Observation>>() };
+                let mut state = state.lock().unwrap();
+                if let Some((previous, byte)) = state.pending.take() {
+                    assert_eq!(unsafe { previous.p_data.read() }, byte);
+                    assert_eq!(unsafe { CStr::from_ptr(previous.p_metadata) }, c"<loan/>");
+                    state.releases += 1;
+                }
+                if !frame.is_null() {
+                    let frame = unsafe { *frame };
+                    state.pending = Some((frame, unsafe { frame.p_data.read() }));
+                }
+            }
+            struct Synthetic;
+            impl Resolver for Synthetic {
+                fn resolve(
+                    &self,
+                    name: &'static CStr,
+                ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
+                    // Only the video entry is called. Other entries have valid
+                    // code addresses but are intentionally outside this fixture.
+                    let address = if name == c"NDIlib_send_send_video_async_v2" {
+                        submit as *mut c_void
+                    } else {
+                        unused as *mut c_void
+                    };
+                    Ok(NonNull::new(address))
+                }
+            }
+            static CORE: LazyLock<crate::sys::Core> =
+                LazyLock::new(|| crate::sys::Core::load(&Synthetic).unwrap().ok().unwrap());
+            let observed = Mutex::new(Observation::default());
+            let sender = SendHandle {
+                instance: SendInstance(std::ptr::from_ref(&observed).cast_mut().cast()),
+                core: &CORE,
+                _owner: std::marker::PhantomData,
+            };
+            let frame = |value| {
+                crate::VideoFrame::builder()
+                    .resolution(2, 2)
+                    .metadata("<loan/>")
+                    .data(vec![value; 16])
+                    .build()
+                    .unwrap()
+            };
+            let source = frame(3);
+            let state = Mutex::new(VideoState::default());
+            let submit = |frame| {
+                state
+                    .lock()
+                    .unwrap()
+                    .paired(sender)
+                    .submit(Sendable::for_test(frame))
+            };
+            let mut spare = frame(1);
+            assert!(submit(frame(2)).is_none());
+            let (_, allocations) = crate::test_alloc::allocation_count(|| {
+                for _ in 0..4 {
+                    spare = submit(spare).unwrap();
+                }
+            });
+            assert_eq!(allocations, 0);
+            let copy = || {
+                state
+                    .lock()
+                    .unwrap()
+                    .paired(sender)
+                    .copy(Sendable::for_test(&source))
+            };
+            copy();
+            copy();
+            let (_, allocations) = crate::test_alloc::allocation_count(|| {
+                copy();
+                copy();
+            });
+            assert_eq!(allocations, 0);
+            let finish = || state.lock().unwrap().paired(sender).finish();
+            assert_eq!(finish().unwrap().data(), source.data());
+            assert!(finish().is_none());
+            let observed = observed.lock().unwrap();
+            assert!(observed.pending.is_none());
+            assert_eq!(observed.releases, 9);
+        }
+
         #[test]
         fn an_unproven_drop_leaks_the_native_loan() {
             use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1048,6 +1176,60 @@ impl<M: SenderMode> fmt::Debug for Sender<M> {
         f.debug_struct("Sender")
             .field("name", &self.native.resource()._name)
             .field("mode", &std::any::type_name::<M>())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Asynchronous video operations borrowed from a [`Sender`] through [`Sender::split`].
+///
+/// This view is `Send`, but neither `Sync` nor `Clone`. Dropping it leaves
+/// pending frames with the sender; its next submission, reclamation or drop
+/// synchronizes them.
+pub struct RawVideo<'a> {
+    sender: &'a Sender,
+    _not_sync: PhantomData<std::cell::Cell<()>>,
+}
+
+impl RawVideo<'_> {
+    /// Submit owned video; see [`Sender::submit_video`] for ownership and pacing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unsent frame with [`Error::UnsupportedCapability`] when its
+    /// pixel format is unavailable. Pending video is unchanged.
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
+    pub fn submit_video(
+        &mut self,
+        frame: VideoFrame,
+    ) -> std::result::Result<Option<VideoFrame>, Rejected<VideoFrame>> {
+        let authorized = self.sender.require_video_layout(frame)?;
+        Ok(self.sender.native.video.submit_shared(authorized))
+    }
+
+    /// Copy and submit video; see [`Sender::submit_video_copy`] for reuse and pacing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] when the pixel format is
+    /// unavailable, before copying or changing pending video.
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
+    pub fn submit_video_copy(&mut self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
+        let authorized = Sendable::borrowed(frame, &self.sender._ndi)?;
+        self.sender.native.video.copy_shared(authorized);
+        Ok(())
+    }
+
+    /// Drain and recover the final frame; see [`Sender::reclaim_video`].
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
+    pub fn reclaim_video(&mut self) -> Option<VideoFrame> {
+        self.sender.native.video.finish_shared()
+    }
+}
+
+impl fmt::Debug for RawVideo<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawVideo")
+            .field("sender", self.sender)
             .finish_non_exhaustive()
     }
 }
@@ -1737,6 +1919,28 @@ impl Sender {
         Ok((sender, retained))
     }
 
+    /// Lend asynchronous video and shared sender operations to scoped threads.
+    ///
+    /// The video view is `Send`, but neither `Sync` nor `Clone`, keeping one
+    /// asynchronous video submitter. The shared sender supports audio,
+    /// metadata and controls. Both halves borrow this sender; dropping the
+    /// view leaves pending video with the owner for its next submission,
+    /// reclamation or drop.
+    ///
+    /// Video submissions through the view synchronize with shared
+    /// [`Self::send_video`] and [`Self::flush_video`] calls. Audio and metadata
+    /// do not take that video lock, including while clocking paces a submission.
+    pub fn split(&mut self) -> (RawVideo<'_>, &Sender) {
+        let sender = &*self;
+        (
+            RawVideo {
+                sender,
+                _not_sync: PhantomData,
+            },
+            sender,
+        )
+    }
+
     /// Send a video frame synchronously.
     ///
     /// Accepts every [`VideoSource`]: owned frames, checked external buffers,
@@ -1799,6 +2003,13 @@ impl Sender {
     /// the owned frame for recovery by the next async send or [`Self::reclaim_video`].
     /// No SDK completion callback is registered, including with Advanced SDK.
     ///
+    /// The call can still block: with [`SenderOptions::clock_video`] enabled,
+    /// the default, the SDK paces video inside the call. The first can return
+    /// immediately; subsequent calls wait for the next frame time. Set
+    /// `clock_video(false)` and pace sends in the application to avoid this
+    /// frame-rate wait. SDK back-pressure can also block a call. Use
+    /// [`Self::split`] to send audio from another thread during submission.
+    ///
     /// # Errors
     ///
     /// Returns the frame, unsent, with [`Error::UnsupportedCapability`] if
@@ -1837,6 +2048,13 @@ impl Sender {
     /// Recover the final copy with [`Self::reclaim_video`], which also
     /// releases the spare. Owned submissions through [`Self::submit_video`]
     /// still return the frame they displace.
+    ///
+    /// The call can still block: with [`SenderOptions::clock_video`] enabled,
+    /// the default, the SDK paces video inside the call. The first can return
+    /// immediately; subsequent calls wait for the next frame time. Set
+    /// `clock_video(false)` and pace sends in the application to avoid this
+    /// frame-rate wait. SDK back-pressure can also block a call. Use
+    /// [`Self::split`] to send audio from another thread during submission.
     ///
     /// # Errors
     ///
@@ -2975,6 +3193,31 @@ mod tests {
             sender.send_video(&owned).unwrap();
         });
         assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn split_video_submissions_reuse_storage_without_allocating() {
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
+        let source = test_owned_frame(3);
+        let (mut video, shared) = sender.split();
+        video.submit_video_copy(&source).unwrap();
+        video.submit_video_copy(&source).unwrap();
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            for _ in 0..4 {
+                video.submit_video_copy(&source).unwrap();
+            }
+        });
+        assert_eq!(allocations, 0);
+        let spare = source.clone();
+        let (recovered, allocations) =
+            crate::test_alloc::allocation_count(|| video.submit_video(spare).unwrap());
+        assert_eq!(allocations, 0);
+        assert_eq!(recovered.unwrap().data(), source.data());
+        shared.flush_video();
+        assert_eq!(video.reclaim_video().unwrap().data(), source.data());
+        assert!(video.reclaim_video().is_none());
     }
 
     #[test]
