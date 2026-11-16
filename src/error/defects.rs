@@ -230,12 +230,6 @@ pub enum FrameDefect {
     /// A refusal of the shared media layout or value checks.
     #[error(transparent)]
     Layout(LayoutDefect),
-    /// Scratch dimensions overflow the address space.
-    #[error("image scratch size overflow")]
-    ImageScratchOverflow,
-    /// A scaled image dimension cannot fit u32.
-    #[error("image dimension overflow")]
-    ImageDimensionOverflow,
     /// A codec cannot encode this dimension.
     #[error("{codec} {dimension} {length} exceeds maximum supported value {maximum}")]
     ImageDimension {
@@ -269,9 +263,6 @@ pub enum FrameDefect {
     /// Zero-length audio frame has non-null data pointer.
     #[error("Zero-length audio frame has non-null data pointer")]
     EmptyAudioHasData,
-    /// V210 active row size overflow.
-    #[error("V210 active row size overflow")]
-    V210RowOverflow,
     /// V210 stride must be a multiple of four and cover every complete pixel group.
     #[error("V210 stride must be a multiple of four and cover every complete pixel group")]
     V210Stride,

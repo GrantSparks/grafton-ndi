@@ -3343,6 +3343,8 @@ impl Sendable<VideoFrame> {
 const _: () = {
     assert!(usize::BITS >= 32);
     assert!(MAX_VIDEO_BYTES <= i32::MAX as usize);
+    // An image row has at most eight bytes per validated source pixel.
+    assert!(MAX_VIDEO_BYTES <= usize::MAX / 8);
     // Send room is at most 64 bytes plus two strides. A validated stride is
     // at most the complete data size, even for a one-row frame.
     assert!(3 * MAX_VIDEO_BYTES + 64 < usize::MAX);
@@ -8560,32 +8562,18 @@ mod tests {
             "Should reject audio frame with sample count overflow or exceeding size limit"
         );
 
-        if let Err(Error::InvalidFrame(msg)) = result {
-            // Accept either overflow or size limit error - both are correct guards
-            assert!(
-                matches!(
-                    msg,
-                    crate::FrameDefect::Layout(crate::LayoutDefect::AudioChannelOffset { .. })
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioSampleCount { .. })
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioByteSize(_))
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
-                        | crate::FrameDefect::Layout(
-                            crate::LayoutDefect::VideoStrideOverflow { .. }
-                        )
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
-                        | crate::FrameDefect::ImageScratchOverflow
-                        | crate::FrameDefect::ImageDimensionOverflow
-                ) || matches!(
-                    msg,
-                    crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
-                ),
-                "Error message should mention overflow or size limit, got: {msg}"
-            );
+        let expected = if usize::BITS == 32 {
+            crate::LayoutDefect::AudioChannelOffset {
+                channels: i32::MAX as usize,
+                stride: 1024,
+            }
         } else {
-            panic!("Expected InvalidFrame error");
-        }
+            crate::LayoutDefect::AudioBytes((i32::MAX as u64 * 1024 * 4) as usize)
+        };
+        assert!(matches!(
+            result,
+            Err(Error::InvalidFrame(crate::FrameDefect::Layout(cause))) if cause == expected
+        ));
     }
 
     /// Test that normal audio frames within bounds succeed
@@ -9587,31 +9575,18 @@ mod tests {
             "Should reject audio frame with overflow potential"
         );
 
-        if let Err(Error::InvalidFrame(msg)) = result {
-            assert!(
-                matches!(
-                    msg,
-                    crate::FrameDefect::Layout(crate::LayoutDefect::AudioChannelOffset { .. })
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioSampleCount { .. })
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioByteSize(_))
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
-                        | crate::FrameDefect::Layout(
-                            crate::LayoutDefect::VideoStrideOverflow { .. }
-                        )
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
-                        | crate::FrameDefect::ImageScratchOverflow
-                        | crate::FrameDefect::ImageDimensionOverflow
-                ) || matches!(
-                    msg,
-                    crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
-                ),
-                "Error should mention overflow or size limit, got: {msg}"
-            );
+        let expected = if usize::BITS == 32 {
+            crate::LayoutDefect::AudioChannelOffset {
+                channels: i32::MAX as usize,
+                stride: 1024,
+            }
         } else {
-            panic!("Expected InvalidFrame error");
-        }
+            crate::LayoutDefect::AudioBytes((i32::MAX as u64 * 1024 * 4) as usize)
+        };
+        assert!(matches!(
+            result,
+            Err(Error::InvalidFrame(crate::FrameDefect::Layout(cause))) if cause == expected
+        ));
     }
 
     /// Test the raw plane-size kernel matches the public validated layout sizing

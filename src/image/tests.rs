@@ -2237,34 +2237,42 @@ fn reduced_images_are_the_block_averages_of_the_full_image() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn conversion_geometry_overflow_is_refused_before_output_or_row_access() {
-    let frame = VideoFrame::builder()
-        .resolution(2, 2)
-        .data(vec![0; 16])
-        .build()
-        .unwrap();
-    let mut source = Source::new(&frame);
-    // A private preflight fixture: no rows of this synthetic geometry may be
-    // accessed. Actual public sources obtain geometry from a validated layout.
-    source.width = usize::MAX / 8 + 1;
-    let options = options(ImageFormat::Png).depth(SampleDepth::Sixteen);
-    let mut output = Recorder {
-        written: 0,
-        fail_after: None,
-    };
-    assert!(matches!(
-        invalid_frame(super::encode_to(source, &options, &mut output)),
-        crate::FrameDefect::Layout(crate::LayoutDefect::AudioChannelOffset { .. })
-            | crate::FrameDefect::Layout(crate::LayoutDefect::AudioSampleCount { .. })
-            | crate::FrameDefect::Layout(crate::LayoutDefect::AudioByteSize(_))
-            | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
-            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoStrideOverflow { .. })
-            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBufferOverflow)
-            | crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
-            | crate::FrameDefect::ImageScratchOverflow
-            | crate::FrameDefect::ImageDimensionOverflow
-    ));
-    assert_eq!(output.written, 0);
+fn downscale_sums_allocation_failure_precedes_output_and_row_access() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::FAIL_SCRATCH_RESERVATION.with(|fail| fail.set(false));
+        }
+    }
+    for depth in [SampleDepth::Eight, SampleDepth::Sixteen] {
+        let frame = VideoFrame::builder()
+            .resolution(4, 2)
+            .pixel_format(PixelFormat::Rgba)
+            .data(vec![0; 32])
+            .build()
+            .unwrap();
+        let options = options(ImageFormat::Png)
+            .depth(depth)
+            .downscale(Downscale::Half);
+        let mut output = Recorder {
+            written: 0,
+            fail_after: None,
+        };
+        let _reset = Reset;
+        super::FAIL_SCRATCH_RESERVATION.with(|fail| fail.set(true));
+        let (result, rows) = super::read::count_rows(|| {
+            super::encode_to(Source::new(&frame), &options, &mut output)
+        });
+        assert!(matches!(
+            result,
+            Err(Error::AllocationFailed(crate::AllocationFailure {
+                kind: crate::AllocationKind::ImageScratch,
+                bytes: Some(bytes),
+            })) if bytes == if depth == SampleDepth::Eight { 32 } else { 64 }
+        ));
+        assert_eq!(output.written, 0);
+        assert_eq!(rows, 0);
+    }
 }
 
 /// Compare these fingerprints between a reference revision and an encoder
@@ -2414,7 +2422,7 @@ fn warm_workspace_conversion_does_not_allocate() {
                     for codec in [ImageFormat::WebpLossless, ImageFormat::WebpLossy(75)] {
                         let options = options(codec).alpha(alpha).downscale(reduction);
                         let plan = Plan::new(&source, &options).unwrap();
-                        let shape = plan.shape().buffered().unwrap();
+                        let shape = plan.shape().buffered();
                         let mut convert = || {
                             plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
                                 webp::image_with(pixels, shape, &mut workspace.image)?;
@@ -2548,9 +2556,7 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                         let plan = Plan::new(&source, &options).unwrap();
                         let mut pixels = plan.pixels::<u8>();
                         let ((image, allocations), peak) = peak_bytes(|| {
-                            allocation_count(|| {
-                                webp::image(&mut pixels, plan.shape().buffered().unwrap())
-                            })
+                            allocation_count(|| webp::image(&mut pixels, plan.shape().buffered()))
                         });
                         let len = reduced.0 * reduced.1 * channels;
                         let borrowed = matches!(image, std::borrow::Cow::Borrowed(_));

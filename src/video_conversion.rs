@@ -39,10 +39,7 @@ impl V210Layout {
     /// [`Error::InvalidFrame`] for a width that is zero or not a multiple of
     /// six, a zero height, or storage beyond the video limit.
     pub fn new(width: u32, height: u32) -> Result<Self> {
-        let stride = Self::active_words_checked(width)?
-            .checked_mul(4)
-            .ok_or(Error::InvalidFrame(crate::FrameDefect::V210RowOverflow))?;
-        Self::with_line_stride_bytes(width, height, stride)
+        Self::checked(width, height, None)
     }
 
     /// Create a layout with a byte stride that may include row padding.
@@ -52,10 +49,19 @@ impl V210Layout {
     /// As for [`Self::new`], and for a stride that is not a multiple of four
     /// or does not cover every complete pixel group.
     pub fn with_line_stride_bytes(width: u32, height: u32, stride_bytes: usize) -> Result<Self> {
-        let active_words = Self::active_words_checked(width)?;
-        // Reuse the established even-width/height/extent validation for the
-        // corresponding two full-height, 16-bit P216 planes.
+        Self::checked(width, height, Some(stride_bytes))
+    }
+
+    fn checked(width: u32, height: u32, stride: Option<usize>) -> Result<Self> {
+        if width == 0 || !width.is_multiple_of(6) {
+            return Err(Error::InvalidFrame(crate::FrameDefect::V210Width));
+        }
+        // Validate the corresponding two full-height, 16-bit P216 planes
+        // before arithmetic. Their extent bounds width to MAX_VIDEO_BYTES / 4.
         ValidatedVideoLayout::new_uncompressed(PixelFormat::P216, width, height, None)?;
+        const _: () = assert!(MAX_VIDEO_BYTES / 4 <= usize::MAX / 16);
+        let active_words = width as usize / 6 * 4;
+        let stride_bytes = stride.unwrap_or(active_words * 4);
         if stride_bytes == 0 || !stride_bytes.is_multiple_of(4) || stride_bytes / 4 < active_words {
             return Err(Error::InvalidFrame(crate::FrameDefect::V210Stride));
         }
@@ -69,15 +75,6 @@ impl V210Layout {
             stride: stride_bytes,
             words: bytes / 4,
         })
-    }
-
-    fn active_words_checked(width: u32) -> Result<usize> {
-        if width == 0 || !width.is_multiple_of(6) {
-            return Err(Error::InvalidFrame(crate::FrameDefect::V210Width));
-        }
-        (width as usize / 6)
-            .checked_mul(4)
-            .ok_or(Error::InvalidFrame(crate::FrameDefect::V210RowOverflow))
     }
 
     /// Pixel width, always a multiple of six.
@@ -426,6 +423,21 @@ mod tests {
 
     #[test]
     fn complete_group_geometry_and_checked_caps() {
+        let width = 4_294_967_292;
+        let Err(Error::InvalidFrame(crate::FrameDefect::Layout(expected))) =
+            ValidatedVideoLayout::new_uncompressed(PixelFormat::P216, width, 1, None)
+        else {
+            panic!("oversized P216 geometry must be refused");
+        };
+        for result in [
+            V210Layout::new(width, 1),
+            V210Layout::with_line_stride_bytes(width, 1, 4),
+        ] {
+            assert!(matches!(
+                result,
+                Err(Error::InvalidFrame(crate::FrameDefect::Layout(actual))) if actual == expected
+            ));
+        }
         for width in [0, 1, 2, 4, 8, 10, i32::MAX.unsigned_abs(), u32::MAX] {
             assert!(V210Layout::new(width, 1).is_err());
         }

@@ -36,6 +36,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Audio allocator padding uses the same validated layout and error causes as
   captured audio, including the 64 MiB active extent limit. Allocator-only audio
   stride and extent error leaves are removed.
+- Remove unreachable image dimension, image scratch and V210 row overflow
+  error leaves. V210 constructors validate their shared P216 geometry first.
+
 - Image option refusals carry `codec: ImageCodecKind` in `ImageQuality`,
   `SixteenBitNeedsPng` and `HdrNeedsPng`, replacing their string `format` field.
   Encoding validates each codec quality, effort and dimension setting once.

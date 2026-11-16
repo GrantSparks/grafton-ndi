@@ -213,8 +213,8 @@ impl<'a, P: Sample> Reader<'a, P> {
             "reader consumed every plane of the checked layout"
         );
         Self {
-            width: source.width,
-            height: source.height,
+            width: source.width as usize,
+            height: source.height as usize,
             layout,
         }
     }

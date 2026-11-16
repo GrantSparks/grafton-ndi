@@ -223,7 +223,6 @@ impl ImageFormat {
 /// | Unreadable `ndi_color_info` with [`ColorPolicy::Sdk`] | [`Error::InvalidFrame`] |
 /// | An image wider or taller than JPEG's 65,535, lossless WebP's 16,384 or lossy WebP's 16,383 pixels | [`Error::InvalidFrame`] |
 /// | Writing or flushing the writer given to `encode_image_to` fails | [`Error::Io`] |
-/// | The required conversion scratch size overflows | [`Error::InvalidFrame`] |
 /// | Conversion scratch cannot be allocated | [`Error::AllocationFailed`] |
 /// | The lossy WebP encoder cannot allocate its working storage | [`Error::InvalidFrame`] (`crate::FrameDefect::EncodingFailed`) |
 /// | The codec fails for another reason | [`Error::InvalidFrame`] |

@@ -100,8 +100,6 @@ fn frame_defect_diagnostics_preserve_their_text() {
     let cases = [
         ("UnknownEnvelopeCodec", FrameDefect::UnknownEnvelopeCodec { fourcc: 1094861636 }, "Unknown packet envelope codec FourCC: 0x41424344"),
         ("Layout", FrameDefect::Layout(LayoutDefect::VideoZeroStride), "Video line stride must be positive, got 0"),
-        ("ImageScratchOverflow", FrameDefect::ImageScratchOverflow, "image scratch size overflow"),
-        ("ImageDimensionOverflow", FrameDefect::ImageDimensionOverflow, "image dimension overflow"),
         ("ImageDimension", FrameDefect::ImageDimension { codec: ImageCodecKind::Jpeg, dimension: ImageAxisKind::Width, length: 6, maximum: 16 }, "JPEG width 6 exceeds maximum supported value 16"),
         ("MetadataMissingTerminator", FrameDefect::MetadataMissingTerminator, "Metadata frame length does not include a trailing NUL terminator"),
         ("MetadataInteriorNul", FrameDefect::MetadataInteriorNul, "Metadata frame contains an interior NUL byte"),
@@ -110,7 +108,6 @@ fn frame_defect_diagnostics_preserve_their_text() {
         ("NullAudioData", FrameDefect::NullAudioData, "Audio frame has null data pointer"),
         ("AudioMisaligned", FrameDefect::AudioMisaligned, "Audio data pointer is not aligned for f32"),
         ("EmptyAudioHasData", FrameDefect::EmptyAudioHasData, "Zero-length audio frame has non-null data pointer"),
-        ("V210RowOverflow", FrameDefect::V210RowOverflow, "V210 active row size overflow"),
         ("V210Stride", FrameDefect::V210Stride, "V210 stride must be a multiple of four and cover every complete pixel group"),
         ("V210Storage", FrameDefect::V210Storage, "V210 storage exceeds the video limit"),
         ("V210Width", FrameDefect::V210Width, "V210 conversion requires a positive width divisible by six"),

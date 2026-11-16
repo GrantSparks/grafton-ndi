@@ -12,6 +12,13 @@ pub(super) const MAX_LOSSLESS_DIMENSION: usize = 16_384;
 /// VP8 spends 14 bits on a dimension, with zero reserved.
 pub(super) const MAX_LOSSY_DIMENSION: usize = 16_383;
 
+// A complete, four-channel WebP buffer fits usize even on a 32-bit target.
+// Both codec dimension checks use these same constants before buffering.
+const _: () = {
+    assert!(MAX_LOSSY_DIMENSION <= MAX_LOSSLESS_DIMENSION);
+    assert!(MAX_LOSSLESS_DIMENSION <= usize::MAX / MAX_LOSSLESS_DIMENSION / 4);
+};
+
 /// Quality is checked once before examining frame metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct WebpQuality(u8);

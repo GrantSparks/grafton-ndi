@@ -47,8 +47,8 @@ use crate::{
 
 /// The parts of a video frame an encode reads, borrowed from any frame type.
 pub(crate) struct Source<'a> {
-    width: usize,
-    height: usize,
+    width: u32,
+    height: u32,
     format: PixelFormat,
     planes: VideoPlanes<'a>,
     aspect: crate::PictureAspectRatio,
@@ -59,8 +59,8 @@ impl<'a> Source<'a> {
     pub(crate) fn new<F: VideoParts + ?Sized>(frame: &'a F) -> Self {
         let layout = frame.layout();
         Self {
-            width: layout.width() as usize,
-            height: layout.height() as usize,
+            width: layout.width(),
+            height: layout.height(),
             format: layout.pixel_format(),
             planes: frame.plane_views(),
             aspect: frame.header().picture_aspect_ratio(),
@@ -367,15 +367,6 @@ fn resize_scratch<T: Default + Clone>(scratch: &mut Vec<T>, len: usize) -> Resul
     Ok(())
 }
 
-fn packed_len(width: usize, height: usize, channels: usize) -> Result<usize> {
-    width
-        .checked_mul(height)
-        .and_then(|n| n.checked_mul(channels))
-        .ok_or(Error::InvalidFrame(
-            crate::FrameDefect::ImageScratchOverflow,
-        ))
-}
-
 /// Encode `source` as a base64 data URL, allocated at its exact final
 /// length.
 pub(crate) fn encode_data_url(source: Source<'_>, options: &ImageOptions) -> Result<String> {
@@ -442,32 +433,29 @@ struct ImageShape {
 }
 
 impl ImageShape {
-    fn new(width: usize, height: usize, channels: Channels, depth: SampleDepth) -> Result<Self> {
-        let row_bytes = packed_len(width, 1, channels.count() * depth.bytes())?;
-        let dimension = |value| {
-            u32::try_from(value)
-                .map_err(|_| Error::InvalidFrame(crate::FrameDefect::ImageDimensionOverflow))
-        };
-        Ok(Self {
-            width: dimension(width)?,
-            height: dimension(height)?,
+    fn new(width: u32, height: u32, channels: Channels, depth: SampleDepth) -> Self {
+        // Source dimensions come from a validated layout. The frames module
+        // asserts MAX_VIDEO_BYTES * 8 fits usize, including on 32-bit targets.
+        let row_bytes = width as usize * channels.count() * depth.bytes();
+        Self {
+            width,
+            height,
             channels,
             depth,
             row_bytes,
-        })
+        }
     }
 
-    fn buffered(self) -> Result<BufferedImageShape> {
-        let image_bytes =
-            self.row_bytes
-                .checked_mul(self.height as usize)
-                .ok_or(Error::InvalidFrame(
-                    crate::FrameDefect::ImageScratchOverflow,
-                ))?;
-        Ok(BufferedImageShape {
+    /// Only used for WebP, after checking the codec's dimension limit.
+    fn buffered(self) -> BufferedImageShape {
+        debug_assert!(self.width as usize <= webp::MAX_LOSSLESS_DIMENSION);
+        debug_assert!(self.height as usize <= webp::MAX_LOSSLESS_DIMENSION);
+        debug_assert_eq!(self.depth, SampleDepth::Eight);
+        // The largest WebP dimension squared times four fits a 32-bit usize.
+        BufferedImageShape {
             rows: self,
-            image_bytes,
-        })
+            image_bytes: self.row_bytes * self.height as usize,
+        }
     }
 }
 
@@ -487,7 +475,7 @@ struct PixelDensity {
     y: u16,
 }
 impl PixelDensity {
-    fn for_source(source: &Source<'_>, width: usize, height: usize) -> Option<Self> {
+    fn for_source(source: &Source<'_>, width: u32, height: u32) -> Option<Self> {
         let aspect = f64::from(source.aspect.get());
         // Zero explicitly requests square pixels. Explicit square-pixel ratios
         // also stay untagged, including rounding from the SDK's f32 field.
@@ -613,7 +601,10 @@ impl<'a> Plan<'a> {
         };
 
         let shift = options.downscale.shift();
-        let (width, height) = (reduced(source.width, shift), reduced(source.height, shift));
+        let (width, height) = (
+            source.width.div_ceil(1 << shift),
+            source.height.div_ceil(1 << shift),
+        );
         let alpha = options.alpha.keeps_alpha() && !matches!(format, ImageFormat::Jpeg(_));
         let channels = match format {
             ImageFormat::WebpLossy(_) => Channels::Rgba,
@@ -632,53 +623,42 @@ impl<'a> Plan<'a> {
         // options, colour metadata and HDR policy have been validated.
         let codec = match settings {
             CodecSettings::Png => Codec::Png {
-                shape: ImageShape::new(width, height, channels, depth)?,
+                shape: ImageShape::new(width, height, channels, depth),
                 compression: options.png_compression,
                 cicp: color.and_then(|color| cicp(&color)),
                 density,
             },
             CodecSettings::Jpeg(quality) => Codec::Jpeg {
                 quality,
-                dimensions: jpeg::JpegDimensions::new(width, height)?,
+                dimensions: jpeg::JpegDimensions::new(width as usize, height as usize)?,
                 density,
             },
             CodecSettings::WebpLossless => {
                 check_size(
                     crate::ImageCodecKind::Webp,
-                    width,
-                    height,
+                    width as usize,
+                    height as usize,
                     webp::MAX_LOSSLESS_DIMENSION,
                 )?;
                 Codec::WebpLossless {
-                    shape: ImageShape::new(width, height, channels, depth)?.buffered()?,
+                    shape: ImageShape::new(width, height, channels, depth).buffered(),
                 }
             }
             CodecSettings::WebpLossy(quality, effort) => {
                 check_size(
                     crate::ImageCodecKind::Webp,
-                    width,
-                    height,
+                    width as usize,
+                    height as usize,
                     webp::MAX_LOSSY_DIMENSION,
                 )?;
                 Codec::WebpLossy {
-                    shape: ImageShape::new(width, height, channels, depth)?.buffered()?,
+                    shape: ImageShape::new(width, height, channels, depth).buffered(),
                     quality,
                     effort,
                     sharp_yuv: options.webp_sharp_yuv,
                 }
             }
         };
-        if shift > 0 {
-            packed_len(
-                width,
-                1,
-                if depth == SampleDepth::Sixteen {
-                    32
-                } else {
-                    16
-                },
-            )?;
-        }
         Ok(Self {
             source,
             codec,
