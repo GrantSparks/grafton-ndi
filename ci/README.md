@@ -41,6 +41,16 @@ not establish native transport coverage. The configured platform/runtime
 matrix is in [the CI workflow](../.github/workflows/rust.yml); execution results
 are available in [GitHub Actions](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml).
 
+The Linux test job also runs the manual measurement fixtures with `--ignored`
+in release mode. Its configurable image sweep uses one 64×64 BGRA input and
+JPEG output; the fixed workspace and allocator measurements keep their full
+inputs. Their printed measurements describe that runner, not a performance
+threshold. This SDK-free measurement step is optional locally:
+
+```sh
+GRAFTON_NDI_SIZES=64x64 GRAFTON_NDI_FORMATS=Bgra GRAFTON_NDI_CONTENTS=photographic GRAFTON_NDI_OUTPUTS=jpeg85 cargo test --locked --release --all-features --lib -- --ignored --test-threads=1
+```
+
 ### Updating the Rust toolchain
 
 `rust-toolchain.toml` pins the release used by contributors and every stable CI

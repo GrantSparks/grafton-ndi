@@ -683,6 +683,7 @@ class MemoryCheckers(unittest.TestCase):
             ('miri', 'Initialized rows, metadata and synthetic native guards',
              'descriptor_admission_and_collection_stay_allocation_free_under_churn'),
             ('test', 'Memcheck over scripted capture and encoder padding', 'frames::tests::video_padding_encoders'),
+            ('test', 'Manual measurement fixtures', '--ignored'),
         ]
         with tempfile.TemporaryDirectory() as directory:
             cargo = Path(directory) / 'cargo'
@@ -746,6 +747,21 @@ esac
 
 
 class Repository(unittest.TestCase):
+    def test_manual_measurements_have_a_bounded_ci_invocation(self):
+        rust = workflows.load(read_workflows()['rust.yml'])
+        step = next(step for step in rust['jobs']['test']['steps']
+                    if step.get('name') == 'Manual measurement fixtures')
+        self.assertEqual(step.get('if'), "runner.os == 'Linux'")
+        self.assertEqual(step.get('timeout-minutes'), '5')
+        self.assertEqual(step.get('env'), {
+            'GRAFTON_NDI_SIZES': '64x64', 'GRAFTON_NDI_FORMATS': 'Bgra',
+            'GRAFTON_NDI_CONTENTS': 'photographic', 'GRAFTON_NDI_OUTPUTS': 'jpeg85',
+        })
+        self.assertIn('cargo test --locked --release --all-features --lib -- --ignored --list', step['run'])
+        self.assertIn("if ! grep -q ': test$'", step['run'])
+        self.assertIn('exit 1', step['run'])
+        self.assertIn('cargo test --locked --release --all-features --lib -- --ignored --test-threads=1', step['run'])
+
     def test_vendored_bindings_cover_exactly_the_supported_platform_targets(self):
         setup = (ROOT / 'docs/setup.md').read_text(encoding='utf-8')
         table = setup.split('| Platform | Rust targets | Configured coverage |', 1)[1].split('\n\n', 1)[0]
