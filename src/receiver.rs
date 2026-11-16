@@ -35,7 +35,6 @@ use crate::RuntimeFeature;
 use crate::advanced::{AvSyncAttached, PacketAttached};
 
 use std::{
-    collections::VecDeque,
     ffi::CString,
     marker::PhantomData,
     os::raw::c_char,
@@ -149,6 +148,74 @@ pub(crate) fn native_count<T: Into<i64>>(count: sys::table::Called<T>) -> Result
             value: value.into(),
         })
     })
+}
+
+/// A consumable report carries its publication order across an async worker.
+/// The sequence is private: only the state that published it can admit a replay.
+#[derive(Debug)]
+pub(crate) struct ReceiverReport<T> {
+    sequence: u64,
+    pub(crate) value: T,
+}
+
+impl<T> ReceiverReport<T> {
+    pub(crate) fn unsequenced(value: T) -> Self {
+        Self { sequence: 0, value }
+    }
+
+    pub(crate) fn map<U>(self, convert: impl FnOnce(T) -> U) -> ReceiverReport<U> {
+        ReceiverReport {
+            sequence: self.sequence,
+            value: convert(self.value),
+        }
+    }
+
+    pub(crate) fn into_value(self) -> T {
+        self.value
+    }
+}
+
+/// Latest-value reports coalesce like the SDK's one-shot queries. This lock
+/// protects only bookkeeping; no SDK call or native-query permit is taken in it.
+struct LatestReport<T> {
+    sequence: u64,
+    pending: Option<ReceiverReport<T>>,
+}
+
+impl<T> Default for LatestReport<T> {
+    fn default() -> Self {
+        Self {
+            sequence: 0,
+            pending: None,
+        }
+    }
+}
+
+impl<T> LatestReport<T> {
+    fn advance(&mut self) -> u64 {
+        self.sequence = self.sequence.wrapping_add(1);
+        self.pending = None;
+        self.sequence
+    }
+
+    fn report(&mut self, value: T) -> ReceiverReport<T> {
+        ReceiverReport {
+            sequence: self.advance(),
+            value,
+        }
+    }
+
+    fn publish(&mut self, value: T) {
+        let report = self.report(value);
+        self.pending = Some(report);
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    fn replay(&mut self, report: ReceiverReport<T>) {
+        if report.sequence == self.sequence {
+            self.pending = Some(report);
+        }
+    }
 }
 
 /// A coalesced status invalidation, its failure-report bit and publication
@@ -1117,10 +1184,11 @@ pub(crate) struct ReceiverCore {
     target: RwLock<RetainedSource>,
     pending_status: PendingStatus,
     pending_source: AtomicBool,
-    pending_unknown: Mutex<Option<u32>>,
-    // Serialize native one-shot queries and retain any results abandoned by an
-    // async caller. The queue allocates only when a completed result is replayed.
-    source_query_guard: Mutex<VecDeque<SourceNameChange>>,
+    pending_unknown: Mutex<LatestReport<u32>>,
+    // Only native source-name queries take this permit. Replaying an abandoned
+    // result takes the separate short lock, never waiting for the SDK.
+    source_query_guard: Mutex<()>,
+    source_name: Mutex<LatestReport<SourceNameChange>>,
     connection_metadata: Mutex<ConnectionMetadata>,
     _name: Option<CString>,
     #[cfg(feature = "advanced")]
@@ -1244,8 +1312,9 @@ impl<M: CreatableMode> Receiver<M> {
                 target: RwLock::new(RetainedSource::new(&options.source)),
                 pending_status: PendingStatus::default(),
                 pending_source: AtomicBool::new(false),
-                pending_unknown: Mutex::new(None),
-                source_query_guard: Mutex::new(VecDeque::new()),
+                pending_unknown: Mutex::new(LatestReport::default()),
+                source_query_guard: Mutex::new(()),
+                source_name: Mutex::new(LatestReport::default()),
                 connection_metadata: Mutex::new(ConnectionMetadata::default()),
                 _name,
                 #[cfg(feature = "advanced")]
@@ -1330,8 +1399,27 @@ impl<M: ReceiverMode> Receiver<M> {
         &'rx self,
         deadline: Deadline,
         stop: impl Stop,
-        event: impl FnMut(ReceiverEvent) -> T,
+        mut event: impl FnMut(ReceiverEvent) -> T,
         convert: impl FnMut(S::Media<'rx>) -> Result<T>,
+    ) -> Result<Option<T>>
+    where
+        M: Permits<S>,
+    {
+        self.core.capture_any_until_with::<S, T>(
+            deadline,
+            stop,
+            |report| event(report.value),
+            convert,
+        )
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn capture_any_report_until<S: SlotSet, T>(
+        &self,
+        deadline: Deadline,
+        stop: impl Stop,
+        event: impl FnMut(ReceiverReport<ReceiverEvent>) -> T,
+        convert: impl FnMut(S::Media<'_>) -> Result<T>,
     ) -> Result<Option<T>>
     where
         M: Permits<S>,
@@ -1949,51 +2037,53 @@ impl ReceiverCore {
         &'rx self,
         deadline: Deadline,
         stop: impl Stop,
-        mut event: impl FnMut(ReceiverEvent) -> T,
+        mut event: impl FnMut(ReceiverReport<ReceiverEvent>) -> T,
         mut convert: impl FnMut(S::Media<'rx>) -> Result<T>,
     ) -> Result<Option<T>> {
         capture_within(deadline, stop, |attempt| {
-            if let Some(pending) = self.take_pending_event()? {
+            if let Some(pending) = self.take_pending_event_report()? {
                 return Ok(Some(event(pending)));
             }
             let lock = self.capture_lock(attempt);
             let delivered = capture_any::<S>(&lock)?;
-            self.capture_any_result_with(delivered, &mut event, &mut convert)
+            self.capture_any_report_result_with(delivered, &mut event, &mut convert)
         })
     }
 
     /// The kernel's delivery boundary. Notifications always coalesce through
     /// `event`, including a native miss when a typed capture retained an event
     /// during the wait. A caller can convert only media from its slot set.
+    #[cfg(test)]
     pub(crate) fn capture_any_result_with<'rx, S: SlotSet, T>(
         &'rx self,
         delivered: Delivered<'rx, S>,
         event: impl FnOnce(ReceiverEvent) -> T,
         convert: impl FnOnce(S::Media<'rx>) -> Result<T>,
     ) -> Result<Option<T>> {
+        self.capture_any_report_result_with(delivered, |report| event(report.value), convert)
+    }
+
+    fn capture_any_report_result_with<'rx, S: SlotSet, T>(
+        &'rx self,
+        delivered: Delivered<'rx, S>,
+        event: impl FnOnce(ReceiverReport<ReceiverEvent>) -> T,
+        convert: impl FnOnce(S::Media<'rx>) -> Result<T>,
+    ) -> Result<Option<T>> {
         match delivered {
             Delivered::Media(media) => convert(media).map(Some),
             Delivered::Notification(notification) => {
-                self.event(notification).map(|item| item.map(event))
+                self.retain(notification);
+                self.take_pending_event_report().map(|item| item.map(event))
             }
         }
     }
 
-    fn combined_result(media: Media<'_>) -> Result<ReceiverItemRef<'_>> {
+    pub(crate) fn combined_result(media: Media<'_>) -> Result<ReceiverItemRef<'_>> {
         Ok(match media {
             Media::Video(guard) => ReceiverItemRef::Video(VideoKind::make_ref(guard)?),
             Media::Audio(guard) => ReceiverItemRef::Audio(AudioKind::make_ref(guard)?),
             Media::Metadata(guard) => ReceiverItemRef::Metadata(MetadataKind::make_ref(guard)?),
         })
-    }
-
-    /// Coalesce the native notification with any invalidation a concurrent
-    /// typed capture retained during this wait, then consume one. A pending
-    /// event returned before the native wait never comes through this path
-    /// and is never published again.
-    fn event(&self, notification: Notification) -> Result<Option<ReceiverEvent>> {
-        self.retain(notification);
-        self.take_pending_event()
     }
 
     #[cfg(test)]
@@ -2019,30 +2109,41 @@ impl ReceiverCore {
             Notification::None => {}
             Notification::StatusChanged => self.pending_status.publish(),
             Notification::SourceChanged => self.pending_source.store(true, Ordering::Release),
-            Notification::Unknown(value) => *self.pending_unknown.lock() = Some(value),
+            Notification::Unknown(value) => self.pending_unknown.lock().publish(value),
         }
     }
 
-    /// Return an undelivered async event to the shared coalescing mechanism.
+    /// Return an undelivered async event without overwriting a newer report.
     #[cfg(any(feature = "tokio", feature = "smol"))]
-    pub(crate) fn retain_event(&self, event: ReceiverEvent) {
-        self.retain(match event {
-            ReceiverEvent::StatusChanged(_) => Notification::StatusChanged,
-            ReceiverEvent::SourceChanged => Notification::SourceChanged,
-            ReceiverEvent::Unknown(value) => Notification::Unknown(value),
-        });
+    pub(crate) fn retain_event(&self, event: ReceiverReport<ReceiverEvent>) {
+        match event.value {
+            ReceiverEvent::StatusChanged(_) => self.pending_status.publish(),
+            ReceiverEvent::SourceChanged => self.pending_source.store(true, Ordering::Release),
+            ReceiverEvent::Unknown(value) => self.pending_unknown.lock().replay(ReceiverReport {
+                sequence: event.sequence,
+                value,
+            }),
+        }
     }
 
     #[cfg(any(feature = "tokio", feature = "smol"))]
-    pub(crate) fn retain_source_name_change(&self, change: SourceNameChange) {
-        // Several workers can finish before their futures are polled. Keep all
-        // abandoned changes rather than overwriting another worker's result.
-        self.source_query_guard.lock().push_back(change);
+    pub(crate) fn retain_source_name_change(&self, change: ReceiverReport<SourceNameChange>) {
+        self.source_name.lock().replay(change);
     }
 
+    #[cfg(test)]
     fn take_pending_event(&self) -> Result<Option<ReceiverEvent>> {
+        self.take_pending_event_report()
+            .map(|event| event.map(ReceiverReport::into_value))
+    }
+
+    fn take_pending_event_report(&self) -> Result<Option<ReceiverReport<ReceiverEvent>>> {
         if let Some(event) = self.pending_status.take_or_else_with(
-            || self.current_status().map(ReceiverEvent::StatusChanged),
+            || {
+                self.current_status()
+                    .map(ReceiverEvent::StatusChanged)
+                    .map(ReceiverReport::unsequenced)
+            },
             || self.take_pending_non_status_event(),
         )? {
             return Ok(Some(event));
@@ -2050,14 +2151,15 @@ impl ReceiverCore {
         Ok(self.take_pending_non_status_event())
     }
 
-    fn take_pending_non_status_event(&self) -> Option<ReceiverEvent> {
+    fn take_pending_non_status_event(&self) -> Option<ReceiverReport<ReceiverEvent>> {
         if self.pending_source.swap(false, Ordering::AcqRel) {
-            return Some(ReceiverEvent::SourceChanged);
+            return Some(ReceiverReport::unsequenced(ReceiverEvent::SourceChanged));
         }
         self.pending_unknown
             .lock()
+            .pending
             .take()
-            .map(ReceiverEvent::Unknown)
+            .map(|report| report.map(ReceiverEvent::Unknown))
     }
 
     /// The one implementation of [`Receiver::wait_for_source_name_change`], also
@@ -2074,6 +2176,7 @@ impl ReceiverCore {
         // The query comes with the function that releases what it returns.
         let (source_name, strings) = self.source_name_tables()?;
         self.wait_for_source_name_change_with(source_name, strings, deadline, stop)
+            .map(|change| change.map(ReceiverReport::into_value))
     }
 
     pub(crate) fn source_name_tables(
@@ -2090,12 +2193,16 @@ impl ReceiverCore {
         strings: &sys::ReceiverStrings,
         deadline: Deadline,
         stop: impl Stop,
-    ) -> Result<Option<SourceNameChange>> {
+    ) -> Result<Option<ReceiverReport<SourceNameChange>>> {
         capture_within(deadline, stop, |attempt| {
-            let Some(mut query) = self.source_query_guard.try_lock_until(attempt.0.end()) else {
+            if let Some(change) = self.source_name.lock().pending.take() {
+                return Ok(Some(change));
+            }
+            let Some(_query) = self.source_query_guard.try_lock_until(attempt.0.end()) else {
                 return Ok(None);
             };
-            if let Some(change) = query.pop_front() {
+            // A worker may have replayed while this poller waited for the permit.
+            if let Some(change) = self.source_name.lock().pending.take() {
                 return Ok(Some(change));
             }
             let mut pointer = ptr::null();
@@ -2115,13 +2222,20 @@ impl ReceiverCore {
                 strings,
             };
             if !changed.into_value() {
-                return Ok(None);
+                return Ok(self.source_name.lock().pending.take());
             }
+            // Still under the query permit: even a malformed newer report
+            // supersedes older abandoned reports before its text is decoded.
+            let sequence = self.source_name.lock().advance();
             // The SDK reports a change only once, since the previous call, so a
             // strict decoding error here would lose the name for good.
-            Ok(Some(match guard.copy_lossy()? {
+            let change = match guard.copy_lossy()? {
                 Some(name) => SourceNameChange::Connected(name),
                 None => SourceNameChange::Disconnected,
+            };
+            Ok(Some(ReceiverReport {
+                sequence,
+                value: change,
             }))
         })
     }
@@ -3173,7 +3287,10 @@ mod tests {
                 Deadline::after(Duration::ZERO).unwrap(),
                 NeverStop,
             );
-            (change.unwrap(), FREES.load(Ordering::Relaxed) - before)
+            (
+                change.unwrap().map(ReceiverReport::into_value),
+                FREES.load(Ordering::Relaxed) - before,
+            )
         };
         assert_eq!(
             poll(true, Some(b"Studio \xff\xfe camera")),
@@ -3240,7 +3357,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            result,
+            result.map(ReceiverReport::into_value),
             Some(SourceNameChange::Connected("later source".into()))
         );
         CALLS.with(|calls| {
@@ -3265,53 +3382,154 @@ mod tests {
     }
 
     #[cfg(any(feature = "tokio", feature = "smol"))]
-    #[test]
-    fn retained_source_names_precede_native_queries_without_overwriting_each_other() {
-        static CALLS: AtomicUsize = AtomicUsize::new(0);
+    mod replay_tests {
+        use super::*;
+        use std::{cell::Cell, ffi::CStr};
+
+        thread_local! {
+            static NEXT: Cell<Option<&'static CStr>> = const { Cell::new(None) };
+            static CALLS: Cell<usize> = const { Cell::new(0) };
+        }
+
         unsafe extern "C" fn get_source_name(
             _instance: NDIlib_recv_instance_t,
             name: *mut *const c_char,
             _timeout_ms: u32,
         ) -> bool {
-            CALLS.fetch_add(1, Ordering::Relaxed);
-            unsafe { name.write(ptr::null()) };
-            false
+            CALLS.with(|calls| calls.set(calls.get() + 1));
+            let next = NEXT.take();
+            // SAFETY: the caller provides writable storage and the string is static.
+            unsafe { name.write(next.map_or(ptr::null(), CStr::as_ptr)) };
+            next.is_some()
         }
         unsafe extern "C" fn free(_instance: NDIlib_recv_instance_t, _name: *const c_char) {}
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        let source_name = sys::ReceiverSourceName {
-            NDIlib_recv_get_source_name: get_source_name,
-        };
-        let strings = sys::ReceiverStrings {
-            NDIlib_recv_free_string: free,
-        };
-        let changes = [
-            SourceNameChange::Connected("first".into()),
-            SourceNameChange::Disconnected,
-        ];
-        for change in &changes {
-            receiver.core.retain_source_name_change(change.clone());
+
+        fn poll(
+            core: &ReceiverCore,
+            name: Option<&'static CStr>,
+        ) -> Option<ReceiverReport<SourceNameChange>> {
+            NEXT.set(name);
+            core.wait_for_source_name_change_with(
+                &sys::ReceiverSourceName {
+                    NDIlib_recv_get_source_name: get_source_name,
+                },
+                &sys::ReceiverStrings {
+                    NDIlib_recv_free_string: free,
+                },
+                Deadline::after(Duration::ZERO).unwrap(),
+                NeverStop,
+            )
+            .unwrap()
         }
-        let poll = || {
-            receiver
-                .core
-                .wait_for_source_name_change_with(
-                    &source_name,
-                    &strings,
-                    Deadline::after(Duration::ZERO).unwrap(),
-                    NeverStop,
-                )
-                .unwrap()
-        };
-        for change in changes {
-            assert_eq!(poll(), Some(change));
-            assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+
+        #[test]
+        fn an_older_source_name_replay_cannot_follow_a_newer_native_report() {
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+            let first = poll(&receiver.core, Some(c"first")).unwrap();
+            let second = poll(&receiver.core, Some(c"second")).unwrap();
+            assert_eq!(second.value, SourceNameChange::Connected("second".into()));
+            receiver.core.retain_source_name_change(first);
+            assert!(poll(&receiver.core, None).is_none());
+            receiver.core.retain_source_name_change(second);
+            assert_eq!(
+                poll(&receiver.core, None).unwrap().value,
+                SourceNameChange::Connected("second".into())
+            );
         }
-        assert!(poll().is_none());
-        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+
+        #[test]
+        fn only_the_newest_abandoned_name_precedes_a_native_query() {
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+            let first = poll(&receiver.core, Some(c"first")).unwrap();
+            let second = poll(&receiver.core, Some(c"second")).unwrap();
+            receiver.core.retain_source_name_change(second);
+            receiver.core.retain_source_name_change(first);
+            let before = CALLS.get();
+            assert_eq!(
+                poll(&receiver.core, None).unwrap().value,
+                SourceNameChange::Connected("second".into())
+            );
+            assert_eq!(CALLS.get(), before);
+            assert!(poll(&receiver.core, None).is_none());
+            assert_eq!(CALLS.get(), before + 1);
+        }
+
+        #[test]
+        fn replay_does_not_wait_for_another_pollers_native_query() {
+            static ENTERED: AtomicBool = AtomicBool::new(false);
+            unsafe extern "C" fn slow_query(
+                _instance: NDIlib_recv_instance_t,
+                name: *mut *const c_char,
+                _timeout_ms: u32,
+            ) -> bool {
+                ENTERED.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(100));
+                // SAFETY: the caller provides writable storage for the pointer.
+                unsafe { name.write(c"second".as_ptr()) };
+                true
+            }
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+            let abandoned = poll(&receiver.core, Some(c"first")).unwrap();
+            ENTERED.store(false, Ordering::Release);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    receiver
+                        .core
+                        .wait_for_source_name_change_with(
+                            &sys::ReceiverSourceName {
+                                NDIlib_recv_get_source_name: slow_query,
+                            },
+                            &sys::ReceiverStrings {
+                                NDIlib_recv_free_string: free,
+                            },
+                            Deadline::after(Duration::from_millis(100)).unwrap(),
+                            NeverStop,
+                        )
+                        .unwrap()
+                });
+                let waiting = Instant::now();
+                while !ENTERED.load(Ordering::Acquire) {
+                    assert!(waiting.elapsed() < Duration::from_secs(2));
+                    std::thread::yield_now();
+                }
+                let started = Instant::now();
+                receiver.core.retain_source_name_change(abandoned);
+                assert!(started.elapsed() < Duration::from_millis(10));
+                assert_eq!(
+                    worker.join().unwrap().unwrap().value,
+                    SourceNameChange::Connected("second".into())
+                );
+                assert!(poll(&receiver.core, None).is_none());
+            });
+        }
+
+        #[test]
+        fn replayed_unknown_events_do_not_replace_newer_publications() {
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+            receiver.core.retain(Notification::Unknown(1));
+            let old = receiver.core.take_pending_event_report().unwrap().unwrap();
+            receiver.core.retain(Notification::Unknown(2));
+            receiver.core.retain_event(old);
+            let latest = receiver.core.take_pending_event_report().unwrap().unwrap();
+            assert_eq!(latest.value, ReceiverEvent::Unknown(2));
+            // Taking the latest value does not let a still older replay back in.
+            receiver.core.retain(Notification::Unknown(3));
+            receiver.core.take_pending_event().unwrap();
+            receiver.core.retain_event(latest);
+            assert_eq!(receiver.core.take_pending_event().unwrap(), None);
+        }
     }
 
     /// A source no receiver can connect to: no name and no address.
