@@ -2,9 +2,11 @@
 
 use std::{marker::PhantomData, path::Path, ptr::NonNull, rc::Rc, time::Duration};
 
+#[cfg(doc)]
+use super::FileFamily;
 use super::{
-    out_param, types, FileApi, FileDuration, FilePosition, PlayerEvent, PlayerOptions, PlayerStats,
-    SourceFormat,
+    out_param, types, FileApi, FileDuration, FileInfo, FilePlayerOptions, FilePosition,
+    PlayerEvent, PlayerStats, SourceFormat,
 };
 use crate::{
     sys::{self, bindings::*},
@@ -86,11 +88,26 @@ impl std::fmt::Debug for FilePlayer {
 }
 
 impl FilePlayer {
-    pub(super) fn create(api: FileApi, options: &PlayerOptions) -> Result<Self> {
-        Self::prepare(api, options)?.create()
+    /// Create a player and advertise its NDI source.
+    ///
+    /// The source is advertised from this call until the player is dropped,
+    /// whether or not a file is playing. The options are only read, so they
+    /// stay with the caller whatever the outcome.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] when the player's name is empty or a group
+    /// is empty or contains a comma or NUL. [`Error::InvalidCString`] when
+    /// the player's name contains a NUL.
+    /// [`Error::NativeOperationFailed`] when the SDK cannot create the player
+    /// and [`Error::UnsupportedCapability`] when the library does not provide
+    /// [`FileFamily::Playback`].
+    #[doc(alias = "NDIlib_file_player_create")]
+    pub fn new(api: &FileApi, options: &FilePlayerOptions) -> Result<Self> {
+        Self::prepare(api.clone(), options)?.create()
     }
 
-    pub(super) fn prepare(api: FileApi, options: &PlayerOptions) -> Result<PreparedPlayer> {
+    pub(super) fn prepare(api: FileApi, options: &FilePlayerOptions) -> Result<PreparedPlayer> {
         let playback = api.table::<sys::FilePlayback>()?;
         let resolved = options.resolve()?;
         Ok(PreparedPlayer {
@@ -99,6 +116,38 @@ impl FilePlayer {
             resolved,
             name: options.name.clone(),
         })
+    }
+
+    /// Read a recording's duration and track layout.
+    ///
+    /// Nothing is played and no NDI source is advertised.
+    /// An unreadable format payload does not discard the other information;
+    /// [`FileInfo::source_format`] reports the typed cause instead.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NativeOperationFailed`] when the SDK cannot read the file,
+    /// [`Error::InvalidInput`] when the path is empty or is not UTF-8,
+    /// [`Error::InvalidCString`] when it contains a NUL, [`Error::Io`] when a
+    /// relative path cannot be resolved because the current directory is
+    /// unavailable, and [`Error::UnsupportedCapability`] when the library
+    /// does not provide [`FileFamily::Playback`].
+    /// [`Error::UnexpectedSdkResult`] when the library's file information
+    /// does not match this crate's structure layout.
+    #[doc(alias = "NDIlib_file_player_probe_file")]
+    pub fn probe(api: &FileApi, path: impl AsRef<Path>) -> Result<FileInfo> {
+        let playback = api.table::<sys::FilePlayback>()?;
+        let path = types::path_string(path.as_ref())?;
+        let info = out_param::required_fill(|info| {
+            // SAFETY: `path` is a NUL-terminated string that outlives the
+            // call; the helper keeps guarded info storage writable through it.
+            unsafe {
+                playback
+                    .named()
+                    .NDIlib_file_player_probe_file(path.as_ptr(), info)
+            }
+        })?;
+        Ok(FileInfo::from_sdk(&info))
     }
 
     /// Play a file through the advertised source.
@@ -158,7 +207,7 @@ impl FilePlayer {
     /// and [`Error::UnexpectedSdkResult`] when the SDK's event does not match
     /// this crate's structure layout or its returned event type.
     #[doc(alias = "NDIlib_file_player_capture_event")]
-    pub fn poll_event(&mut self, timeout: Duration) -> Result<Option<PlayerEvent>> {
+    pub fn next_event(&mut self, timeout: Duration) -> Result<Option<PlayerEvent>> {
         let timeout = crate::to_ms_checked(timeout)?;
         out_param::capture_event(
             |event| {

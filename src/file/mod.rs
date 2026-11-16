@@ -8,20 +8,20 @@
 //! supports either runtime edition. Both SDK editions distribute the File API.
 //!
 //! The File library is a separate native library that accompanies the NDI
-//! runtime. [`FileApi::open`] finds it when it is first needed; nothing else in
+//! runtime. [`FileApi::new`] finds it when it is first needed; nothing else in
 //! this crate depends on it, so its absence never affects sending or receiving.
 //!
-//! * [`FileApi::probe`] reads a recording's duration and track layout without
+//! * [`FilePlayer::probe`] reads a recording's duration and track layout without
 //!   advertising anything on the network.
-//! * [`FileApi::create_player`] advertises an NDI source and plays recordings
+//! * [`FilePlayer::new`] advertises an NDI source and plays recordings
 //!   through it; see [`FilePlayer`].
-//! * [`FileApi::create_recorder`] records a source's compressed essence exactly
+//! * [`FileRecorder::new`] records a source's compressed essence exactly
 //!   as it arrives; see [`FileRecorder`]. The recorder is source-driven: it
 //!   subscribes to an NDI source and does not accept frames from Rust.
 //!
 //! # Where the File library is loaded from
 //!
-//! Unless [`FileRuntimeOptions::library_path`] names an exact file, the first
+//! Unless [`FileApiOptions::library_path`] names an exact file, the first
 //! usable library in this order is selected:
 //!
 //! 1. the directory of the selected NDI runtime library, where the SDK installs it;
@@ -49,7 +49,7 @@
 //! A library that loads but cannot be used stays loaded. If the platform
 //! loader's own search then matches the library name to that module, it returns
 //! it again instead of looking further; the error names the file, and the remedy
-//! is to remove or fix it or to pass [`FileRuntimeOptions::library_path`].
+//! is to remove or fix it or to pass [`FileApiOptions::library_path`].
 //!
 //! The native borrowed source/path getters are deliberately not called: their
 //! strings can be invalidated by the SDK's recording thread. Use
@@ -63,7 +63,7 @@
 //! probes recordings, and recording. A library is selected when it provides
 //! at least one family completely. [`FileApi::status`] reports each family,
 //! and an operation that needs a family the selected library lacks fails with
-//! [`Error::FileFamilyUnavailable`], naming the family and the first entry
+//! [`Error::UnsupportedCapability`], naming the family and the first entry
 //! point the library does not export.
 //!
 //! # Finishing a recording
@@ -75,7 +75,7 @@
 //! for errors during the session. [`RecordingReport::stopped_by_sdk`] says
 //! whether the SDK ended the session before it was asked to stop. Dropping a
 //! recorder whose session is still open performs the same stop and wait,
-//! bounded by [`RecorderOptions::drop_wait`], but cannot report the outcome.
+//! bounded by [`FileRecorderOptions::drop_wait`], but cannot report the outcome.
 //!
 //! After a finalization timeout, [`FileRecorder::reset`] explicitly abandons
 //! the uncertain session and replaces its native instance. The old report is
@@ -91,7 +91,7 @@
 //!   session's report repeats what the library said: that it finalized each
 //!   file. When the disk fills while a session is being stopped, a write comes
 //!   up short, the library extends the file all the same and reports it closed
-//!   without an error, and [`FileApi::probe`] then reports a final duration
+//!   without an error, and [`FilePlayer::probe`] then reports a final duration
 //!   for a file whose data is not there. [`FinishStatus::Closed`] with no
 //!   errors therefore means that the container was finalized, not that every
 //!   frame reached the disk. A recording that must be complete has to be
@@ -139,7 +139,7 @@
 //!
 //! use grafton_ndi::{
 //!     file::{
-//!         FileApi, FileRuntimeOptions, FinishStatus, RecorderOptions, RecordingTarget,
+//!         FileApi, FileApiOptions, FileRecorder, FinishStatus, FileRecorderOptions, RecordingTarget,
 //!         RecordingTimecode, SourceSpec,
 //!     },
 //!     Ndi,
@@ -147,10 +147,10 @@
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let ndi = Ndi::new()?;
-//! let file = FileApi::open(&ndi, &FileRuntimeOptions::default())?;
+//! let file = FileApi::new(&ndi, &FileApiOptions::default())?;
 //!
-//! let options = RecorderOptions::new(SourceSpec::new("STUDIO (Camera 1)")?);
-//! let mut recorder = file.create_recorder(&options)?;
+//! let options = FileRecorderOptions::new(SourceSpec::new("STUDIO (Camera 1)")?);
+//! let mut recorder = FileRecorder::new(&file, &options)?;
 //! recorder.start(&RecordingTarget::new("take")?, RecordingTimecode::Preserve)?;
 //! std::thread::sleep(Duration::from_secs(10));
 //!
@@ -190,12 +190,12 @@ use out_param::OutParam;
 ///
 /// [`FileApi::status`] reports whether the selected library provides one, and
 /// an operation that needs a family the library lacks fails with
-/// [`Error::FileFamilyUnavailable`], naming that family and its first missing
+/// [`Error::UnsupportedCapability`], naming that family and its first missing
 /// entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum FileFamily {
-    /// Probing recordings ([`FileApi::probe`]) and playing them back as an
+    /// Probing recordings ([`FilePlayer::probe`]) and playing them back as an
     /// NDI source ([`FilePlayer`], [`AsyncFilePlayer`]).
     Playback,
     /// Recording NDI sources to disk ([`FileRecorder`], [`AsyncFileRecorder`]).
@@ -224,11 +224,11 @@ impl std::fmt::Display for FileFamily {
 
 /// How the File library is located. Creating this value loads nothing.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct FileRuntimeOptions {
+pub struct FileApiOptions {
     library_path: Option<PathBuf>,
 }
 
-impl FileRuntimeOptions {
+impl FileApiOptions {
     /// Restore the normal File library search instead of an explicit path.
     #[must_use]
     pub fn clear_library_path(mut self) -> Self {
@@ -252,7 +252,7 @@ impl FileRuntimeOptions {
     ///
     /// No other location is tried, so a failure to load it is reported rather
     /// than hidden by a fallback. A relative path is rejected by
-    /// [`FileApi::open`] with [`Error::InvalidInput`] on every target, before
+    /// [`FileApi::new`] with [`Error::InvalidInput`] on every target, before
     /// selection. A target that links the SDK statically refuses an absolute
     /// path with [`Error::RuntimeConflict`].
     #[must_use]
@@ -306,7 +306,7 @@ impl FileApi {
     ///   than the one already selected. [`crate::SelectionConflict`] identifies
     ///   the cause; `detail` retains the diagnostic context.
     /// * [`Error::InvalidInput`] when `options` names a relative path.
-    pub fn open(ndi: &Ndi, options: &FileRuntimeOptions) -> Result<Self> {
+    pub fn new(ndi: &Ndi, options: &FileApiOptions) -> Result<Self> {
         let runtime = sys::select_file(
             ndi.runtime().selected_runtime(),
             options.library_path.as_deref(),
@@ -332,7 +332,7 @@ impl FileApi {
     /// [`SymbolUnavailable`](crate::capabilities::CapabilityRefusal::SymbolUnavailable)
     /// when it does not export one of the family's entry points. Every
     /// operation that needs the family then fails with
-    /// [`Error::FileFamilyUnavailable`], and keeps failing: the library stays
+    /// [`Error::UnsupportedCapability`], and keeps failing: the library stays
     /// selected for the life of the process.
     pub fn status(&self, family: FileFamily) -> CapabilityStatus {
         self.runtime.status(family)
@@ -344,76 +344,18 @@ impl FileApi {
         self.status(family) == CapabilityStatus::Available
     }
 
-    /// Read a recording's duration and track layout.
+    /// Require the complete native entry-point family.
     ///
-    /// Nothing is played and no NDI source is advertised.
-    /// An unreadable format payload does not discard the other information;
-    /// [`FileInfo::source_format`] reports the typed cause instead.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::NativeOperationFailed`] when the SDK cannot read the file,
-    /// [`Error::InvalidInput`] when the path is empty or is not UTF-8,
-    /// [`Error::InvalidCString`] when it contains a NUL, [`Error::Io`] when a
-    /// relative path cannot be resolved because the current directory is
-    /// unavailable, and [`Error::FileFamilyUnavailable`] when the library
-    /// does not provide [`FileFamily::Playback`].
-    /// [`Error::UnexpectedSdkResult`] when the library's file information
-    /// does not match this crate's structure layout.
-    #[doc(alias = "NDIlib_file_player_probe_file")]
-    pub fn probe(&self, path: impl AsRef<Path>) -> Result<FileInfo> {
-        let playback = self.table::<sys::FilePlayback>()?;
-        let path = types::path_string(path.as_ref())?;
-        let info = out_param::required_fill(|info| {
-            // SAFETY: `path` is a NUL-terminated string that outlives the
-            // call; the helper keeps guarded info storage writable through it.
-            unsafe {
-                playback
-                    .named()
-                    .NDIlib_file_player_probe_file(path.as_ptr(), info)
-            }
-        })?;
-        Ok(FileInfo::from_sdk(&info))
-    }
-
-    /// Create a player and advertise its NDI source.
-    ///
-    /// The source is advertised from this call until the player is dropped,
-    /// whether or not a file is playing. The options are only read, so they
-    /// stay with the caller whatever the outcome.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidInput`] when the player's name is empty, and
-    /// [`Error::InvalidCString`] when its name or groups contain a NUL.
-    /// [`Error::NativeOperationFailed`] when the SDK cannot create the player
-    /// and [`Error::FileFamilyUnavailable`] when the library does not provide
-    /// [`FileFamily::Playback`].
-    #[doc(alias = "NDIlib_file_player_create")]
-    pub fn create_player(&self, options: &PlayerOptions) -> Result<FilePlayer> {
-        FilePlayer::create(self.clone(), options)
-    }
-
-    /// Create a recorder for the source named in `options`.
-    ///
-    /// Nothing is written until [`FileRecorder::start`]. The options are only
-    /// read, so they stay with the caller whatever the outcome; the recorder
-    /// keeps its own copy of the source they name.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidInput`] when the options are malformed or conflict:
-    /// an empty track selection, a drop wait beyond [`crate::MAX_TIMEOUT`], a
-    /// malformed [`FileNaming::Pattern`], or an exact file name
-    /// ([`FileNaming::Exact`], or a pattern without `{index}`) with
-    /// format-change rollover switched on or a nonzero rollover size.
-    /// [`Error::InvalidCString`] when the filename pattern contains a NUL.
-    /// [`Error::NativeOperationFailed`] when the SDK cannot create the
-    /// recorder and [`Error::FileFamilyUnavailable`] when the library does not
-    /// provide [`FileFamily::Recording`].
-    #[doc(alias = "NDIlib_file_recorder_create")]
-    pub fn create_recorder(&self, options: &RecorderOptions) -> Result<FileRecorder> {
-        FileRecorder::create(self.clone(), options)
+    /// Returns [`Error::UnsupportedCapability`] with the missing symbol when
+    /// the selected File library does not provide `family`.
+    pub fn require_family(&self, family: FileFamily) -> Result<()> {
+        match self.status(family) {
+            CapabilityStatus::Available => Ok(()),
+            CapabilityStatus::Unavailable(refusal) => Err(crate::Error::UnsupportedCapability {
+                capability: crate::capabilities::Capability::File(family),
+                refusal,
+            }),
+        }
     }
 
     /// The table of a family, or the error for the first of its entry points

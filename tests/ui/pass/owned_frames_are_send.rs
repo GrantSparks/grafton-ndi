@@ -1,5 +1,6 @@
 use grafton_ndi::{
-    AudioFrame, FrameRate, MetadataFrame, PixelFormat, ScanType, Timecode, VideoFrame,
+    AudioFrame, FrameRate, MetadataFrame, PictureAspectRatio, PixelFormat, ScanType, Timecode,
+    VideoFrame,
 };
 
 fn assert_send<T: Send>() {}
@@ -21,7 +22,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
         .resolution(16, 16)
         .pixel_format(PixelFormat::Bgra)
         .frame_rate(FrameRate::new(30, 1)?)
-        .picture_aspect_ratio(1.0)
+        .picture_aspect_ratio(PictureAspectRatio::new(1.0)?)
         .scan_type(ScanType::Progressive)
         .build()?;
     take_send(video.clone());

@@ -46,8 +46,8 @@ fn core_owners(ndi: &Ndi, source: &Source) -> Result<()> {
         Receiver::new(ndi, &options)?,
     ));
     #[cfg(feature = "image-encoding")]
-    shared(grafton_ndi::ImageOptions::new(
-        grafton_ndi::ImageFormat::Jpeg(85),
+    shared(grafton_ndi::image_encoding::ImageOptions::new(
+        grafton_ndi::image_encoding::ImageFormat::Jpeg(85),
     ));
     Ok(())
 }
@@ -56,8 +56,8 @@ fn core_owners(ndi: &Ndi, source: &Source) -> Result<()> {
 fn advanced_owners(ndi: &Ndi, source: &Source) -> Result<()> {
     use grafton_ndi::{
         advanced::{
-            AllocatorLimits, AllocatorService, AvSync, CompressedSender, Genlock, PacketReceiver,
-            PassthroughPreset, QueueOptions, QueuedSender,
+            AllocatorLimits, AllocatorService, AvSync, CompressedSender, Genlock, GenlockOptions,
+            PacketReceiver, PassthroughPreset, QueueLimits, QueuedSender,
         },
         SenderOptions,
     };
@@ -65,10 +65,13 @@ fn advanced_owners(ndi: &Ndi, source: &Source) -> Result<()> {
     let send = SenderOptions::new("service");
     shared(PacketReceiver::new(ndi, &options, PassthroughPreset::Hevc)?);
     shared(CompressedSender::new(ndi, &send)?);
-    shared(QueuedSender::new(ndi, &send, QueueOptions::new())?);
+    shared(QueuedSender::new(ndi, &send, &QueueLimits::new())?);
     worker(AvSync::new(Receiver::new(ndi, &options)?)?);
-    worker(Genlock::new(ndi, Some(source), None)?);
-    let service = AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::new())?;
+    worker(Genlock::new(
+        ndi,
+        &GenlockOptions::new().source(source.clone()),
+    )?);
+    let service = AllocatorService::new(ndi.process_lifetime(), &AllocatorLimits::new())?;
     shared(service.attach(Receiver::new(ndi, &options)?)?);
     shared(service.attach_packets(PacketReceiver::new(ndi, &options, PassthroughPreset::Hevc)?)?);
     Ok(())
@@ -77,15 +80,15 @@ fn advanced_owners(ndi: &Ndi, source: &Source) -> Result<()> {
 #[cfg(feature = "file-io")]
 fn file_owners(ndi: &Ndi) -> Result<()> {
     use grafton_ndi::file::{
-        AsyncFilePlayer, AsyncFileRecorder, FileApi, FileRuntimeOptions, PlayerOptions,
-        RecorderOptions, SourceSpec,
+        AsyncFilePlayer, AsyncFileRecorder, FileApi, FileApiOptions, FilePlayer, FilePlayerOptions,
+        FileRecorder, FileRecorderOptions, SourceSpec,
     };
-    let api = FileApi::open(ndi, &FileRuntimeOptions::new())?;
-    let player = PlayerOptions::new("service");
-    let recorder = RecorderOptions::new(SourceSpec::new("source")?);
+    let api = FileApi::new(ndi, &FileApiOptions::new())?;
+    let player = FilePlayerOptions::new("service");
+    let recorder = FileRecorderOptions::new(SourceSpec::new("source")?);
     // Native objects stay on their thread; only their lifetime is unconstrained.
-    local(api.create_player(&player)?);
-    local(api.create_recorder(&recorder)?);
+    local(FilePlayer::new(&api, &player)?);
+    local(FileRecorder::new(&api, &recorder)?);
     // Deferred creation owns its API and options before its first poll.
     shared(AsyncFilePlayer::create(&api, &player));
     shared(AsyncFileRecorder::create(&api, &recorder));
@@ -95,7 +98,7 @@ fn file_owners(ndi: &Ndi) -> Result<()> {
 
 fn discovery_owners(ndi: &Ndi) -> Result<()> {
     use grafton_ndi::{
-        discovery::{
+        discovery_server::{
             AdvertiserOptions, ListenerOptions, RecvAdvertiser, RecvListener, SendAdvertiser,
             SendListener,
         },

@@ -12,7 +12,7 @@ fn retain(state: &CallbackState, id: u64) -> usize {
 
 #[test]
 fn completion_trampoline_accepts_copied_descriptors_on_concurrent_threads() {
-    let state = CallbackState::new(QueueOptions::default()).unwrap();
+    let state = CallbackState::new(QueueLimits::default()).unwrap();
     let keys = [retain(&state, 1), retain(&state, 2)];
     std::thread::scope(|scope| {
         for key in keys {
@@ -43,7 +43,7 @@ fn completion_trampoline_accepts_copied_descriptors_on_concurrent_threads() {
 
 #[test]
 fn malformed_callback_retains_pending_ownership_and_reports_protocol_failure() {
-    let mut state = CallbackState::new(QueueOptions::default()).unwrap();
+    let mut state = CallbackState::new(QueueLimits::default()).unwrap();
     retain(&state, 1);
     let opaque = (&mut *state as *mut CallbackState).cast();
     unsafe { completion(opaque, std::ptr::null()) };
@@ -93,7 +93,7 @@ fn scatter_keys_and_concurrent_completions_preserve_allocations() {
         return;
     };
     let table = ndi.table::<ScatterSend>().unwrap();
-    let state = CallbackState::new(QueueOptions::new().max_frames(4)).unwrap();
+    let state = CallbackState::new(QueueLimits::new().max_frames(4)).unwrap();
     let mut keys = vec![retain(&state, 1)];
     let mut original = Vec::new();
     for number in 2..=4 {

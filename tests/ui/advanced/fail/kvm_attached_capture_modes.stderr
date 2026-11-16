@@ -1,8 +1,8 @@
-error[E0599]: the method `video` exists for struct `KvmReceiver<'_, FrameSyncAttached>`, but its trait bounds were not satisfied
+error[E0599]: the method `capture_video` exists for struct `KvmReceiver<'_, FrameSyncAttached>`, but its trait bounds were not satisfied
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:10:18
    |
-10 |     let _ = view.video();
-   |                  ^^^^^ method cannot be called on `KvmReceiver<'_, FrameSyncAttached>` due to unsatisfied trait bounds
+10 |     let _ = view.capture_video(Duration::ZERO);
+   |                  ^^^^^^^^^^^^^ method cannot be called on `KvmReceiver<'_, FrameSyncAttached>` due to unsatisfied trait bounds
    |
   ::: src/receiver.rs
    |
@@ -12,27 +12,31 @@ error[E0599]: the method `video` exists for struct `KvmReceiver<'_, FrameSyncAtt
    = note: the following trait bounds were not satisfied:
            `FrameSyncAttached: VideoMode`
 
-error[E0599]: the method `audio` exists for struct `KvmReceiver<'_, FrameSyncAttached>`, but its trait bounds were not satisfied
+error[E0599]: the method `capture_audio` exists for struct `KvmReceiver<'_, FrameSyncAttached>`, but its trait bounds were not satisfied
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:11:18
    |
-11 |     let _ = view.audio();
-   |                  ^^^^^ method cannot be called on `KvmReceiver<'_, FrameSyncAttached>` due to unsatisfied trait bounds
+11 |     let _ = view.capture_audio(Duration::ZERO);
+   |                  ^^^^^^^^^^^^^ method cannot be called on `KvmReceiver<'_, FrameSyncAttached>` due to unsatisfied trait bounds
    |
   ::: src/receiver.rs
    |
    | pub enum FrameSyncAttached {}
-   | -------------------------- doesn't satisfy `FrameSyncAttached: CaptureMode`
+   | -------------------------- doesn't satisfy `FrameSyncAttached: AudioMode`
    |
    = note: the following trait bounds were not satisfied:
-           `FrameSyncAttached: CaptureMode`
+           `FrameSyncAttached: AudioMode`
 
 error[E0599]: no method named `capture_any_ref` found for struct `KvmReceiver<'_, FrameSyncAttached>` in the current scope
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:12:18
    |
 12 |     let _ = view.capture_any_ref(Duration::ZERO);
-   |                  ^^^^^^^^^^^^^^^ method not found in `KvmReceiver<'_, FrameSyncAttached>`
+   |                  ^^^^^^^^^^^^^^^
    |
-   = note: the method was found for `KvmReceiver<'a>`
+help: there is a method `capture_metadata_ref` with a similar name
+   |
+12 -     let _ = view.capture_any_ref(Duration::ZERO);
+12 +     let _ = view.capture_metadata_ref(Duration::ZERO);
+   |
 
 error[E0599]: no method named `capture_any` found for struct `KvmReceiver<'_, FrameSyncAttached>` in the current scope
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:13:18
@@ -42,27 +46,31 @@ error[E0599]: no method named `capture_any` found for struct `KvmReceiver<'_, Fr
    |
    = note: the method was found for `KvmReceiver<'a>`
 
-error[E0599]: the method `audio` exists for struct `KvmReceiver<'_, AvSyncAttached>`, but its trait bounds were not satisfied
+error[E0599]: the method `capture_audio` exists for struct `KvmReceiver<'_, AvSyncAttached>`, but its trait bounds were not satisfied
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:19:18
    |
-19 |     let _ = view.audio();
-   |                  ^^^^^ method cannot be called on `KvmReceiver<'_, AvSyncAttached>` due to unsatisfied trait bounds
+19 |     let _ = view.capture_audio(Duration::ZERO);
+   |                  ^^^^^^^^^^^^^
    |
-  ::: src/receiver.rs
+  ::: src/advanced/mod.rs
    |
    | pub enum AvSyncAttached {}
-   | ----------------------- doesn't satisfy `AvSyncAttached: CaptureMode`
+   | ----------------------- doesn't satisfy `AvSyncAttached: AudioMode`
    |
    = note: the following trait bounds were not satisfied:
-           `AvSyncAttached: CaptureMode`
+           `AvSyncAttached: AudioMode`
 
 error[E0599]: no method named `capture_any_ref` found for struct `KvmReceiver<'_, AvSyncAttached>` in the current scope
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:20:18
    |
 20 |     let _ = view.capture_any_ref(Duration::ZERO);
-   |                  ^^^^^^^^^^^^^^^ method not found in `KvmReceiver<'_, AvSyncAttached>`
+   |                  ^^^^^^^^^^^^^^^
    |
-   = note: the method was found for `KvmReceiver<'a>`
+help: there is a method `capture_video_ref` with a similar name
+   |
+20 -     let _ = view.capture_any_ref(Duration::ZERO);
+20 +     let _ = view.capture_video_ref(Duration::ZERO);
+   |
 
 error[E0599]: no method named `capture_any` found for struct `KvmReceiver<'_, AvSyncAttached>` in the current scope
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:21:18
@@ -72,13 +80,13 @@ error[E0599]: no method named `capture_any` found for struct `KvmReceiver<'_, Av
    |
    = note: the method was found for `KvmReceiver<'a>`
 
-error[E0599]: the method `video` exists for struct `KvmReceiver<'_, PacketAttached>`, but its trait bounds were not satisfied
+error[E0599]: the method `capture_video` exists for struct `KvmReceiver<'_, PacketAttached>`, but its trait bounds were not satisfied
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:27:18
    |
-27 |     let _ = view.video();
-   |                  ^^^^^ method cannot be called on `KvmReceiver<'_, PacketAttached>` due to unsatisfied trait bounds
+27 |     let _ = view.capture_video(Duration::ZERO);
+   |                  ^^^^^^^^^^^^^ method cannot be called on `KvmReceiver<'_, PacketAttached>` due to unsatisfied trait bounds
    |
-  ::: src/receiver.rs
+  ::: src/advanced/mod.rs
    |
    | pub enum PacketAttached {}
    | ----------------------- doesn't satisfy `PacketAttached: VideoMode`
@@ -86,27 +94,27 @@ error[E0599]: the method `video` exists for struct `KvmReceiver<'_, PacketAttach
    = note: the following trait bounds were not satisfied:
            `PacketAttached: VideoMode`
 
-error[E0599]: the method `audio` exists for struct `KvmReceiver<'_, PacketAttached>`, but its trait bounds were not satisfied
+error[E0599]: the method `capture_audio` exists for struct `KvmReceiver<'_, PacketAttached>`, but its trait bounds were not satisfied
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:28:18
    |
-28 |     let _ = view.audio();
-   |                  ^^^^^ method cannot be called on `KvmReceiver<'_, PacketAttached>` due to unsatisfied trait bounds
+28 |     let _ = view.capture_audio(Duration::ZERO);
+   |                  ^^^^^^^^^^^^^ method cannot be called on `KvmReceiver<'_, PacketAttached>` due to unsatisfied trait bounds
    |
-  ::: src/receiver.rs
+  ::: src/advanced/mod.rs
    |
    | pub enum PacketAttached {}
-   | ----------------------- doesn't satisfy `PacketAttached: CaptureMode`
+   | ----------------------- doesn't satisfy `PacketAttached: AudioMode`
    |
    = note: the following trait bounds were not satisfied:
-           `PacketAttached: CaptureMode`
+           `PacketAttached: AudioMode`
 
-error[E0599]: the method `metadata` exists for struct `KvmReceiver<'_, PacketAttached>`, but its trait bounds were not satisfied
+error[E0599]: the method `capture_metadata` exists for struct `KvmReceiver<'_, PacketAttached>`, but its trait bounds were not satisfied
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:29:18
    |
-29 |     let _ = view.metadata();
-   |                  ^^^^^^^^
+29 |     let _ = view.capture_metadata(Duration::ZERO);
+   |                  ^^^^^^^^^^^^^^^^ method cannot be called on `KvmReceiver<'_, PacketAttached>` due to unsatisfied trait bounds
    |
-  ::: src/receiver.rs
+  ::: src/advanced/mod.rs
    |
    | pub enum PacketAttached {}
    | ----------------------- doesn't satisfy `PacketAttached: MetadataMode`
@@ -114,13 +122,13 @@ error[E0599]: the method `metadata` exists for struct `KvmReceiver<'_, PacketAtt
    = note: the following trait bounds were not satisfied:
            `PacketAttached: MetadataMode`
 
-error[E0599]: the method `poll_event` exists for struct `KvmReceiver<'_, PacketAttached>`, but its trait bounds were not satisfied
+error[E0599]: the method `next_event` exists for struct `KvmReceiver<'_, PacketAttached>`, but its trait bounds were not satisfied
   --> tests/ui/advanced/fail/kvm_attached_capture_modes.rs:30:18
    |
-30 |     let _ = view.poll_event(Duration::ZERO);
+30 |     let _ = view.next_event(Duration::ZERO);
    |                  ^^^^^^^^^^ method cannot be called on `KvmReceiver<'_, PacketAttached>` due to unsatisfied trait bounds
    |
-  ::: src/receiver.rs
+  ::: src/advanced/mod.rs
    |
    | pub enum PacketAttached {}
    | ----------------------- doesn't satisfy `PacketAttached: EventMode`

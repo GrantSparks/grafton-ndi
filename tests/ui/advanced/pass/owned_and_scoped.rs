@@ -14,7 +14,7 @@ fn owned_receiver(receiver: Receiver) {
     let _ = AvSync::new(receiver);
 }
 fn owned_submission(sender: &mut CompressedSender, frame: ScatterVideoFrame) {
-    let _ = sender.send_scatter_video_async(frame);
+    let _ = sender.submit_scatter_video(frame);
 }
 fn main() {
     let _ = (independent_scoped_clocks, owned_receiver, owned_submission);

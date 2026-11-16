@@ -47,11 +47,11 @@ impl WaitPath {
 
 fn recording(device: &Arc<mock::Recorder>) -> FileRecorder {
     device.install();
-    let mut recorder = mock::recorder_api()
-        .create_recorder(&RecorderOptions::new(
-            SourceSpec::new("drain budget fixture").unwrap(),
-        ))
-        .unwrap();
+    let mut recorder = crate::file::FileRecorder::new(
+        &mock::recorder_api(),
+        &FileRecorderOptions::new(SourceSpec::new("drain budget fixture").unwrap()),
+    )
+    .unwrap();
     let target =
         RecordingTarget::new(std::env::temp_dir().join("mock-drain-budget-paired")).unwrap();
     recorder
@@ -82,7 +82,7 @@ fn synchronous_and_registered_waits_share_the_exact_late_poll_limit() {
             "{path:?}"
         );
         assert!(
-            recorder.poll_event(Duration::ZERO).unwrap().is_some(),
+            recorder.next_event(Duration::ZERO).unwrap().is_some(),
             "{path:?}: consumed the backlog"
         );
         recorder.abandon();
@@ -95,7 +95,7 @@ fn synchronous_and_registered_waits_redrain_a_closure_queued_after_an_earlier_em
         let device = mock::Recorder::new(Closing::WhenTold);
         let mut recorder = recording(&device);
         recorder.request_stop();
-        while recorder.poll_event(Duration::ZERO).unwrap().is_some() {}
+        while recorder.next_event(Duration::ZERO).unwrap().is_some() {}
         // The first drain was empty before the wait expired. Closure becomes
         // queued before the deadline; expiry must observe it with a fresh drain.
         device.close();

@@ -215,8 +215,7 @@ async fn scoped_loopback<R: grafton_ndi::asynchronous::AsyncRuntime>(
             } else {
                 if !observed[0] {
                     observed[0] = receiver
-                        .video()
-                        .capture_with(cadence.capture_timeout(), move |frame| {
+                        .capture_video_with(cadence.capture_timeout(), move |frame| {
                             assert_eq!((frame.width(), frame.height()), (16, 16));
                             assert_eq!(frame.metadata(), Some("<scoped-video/>"));
                             frame.timecode() == timecode
@@ -226,8 +225,7 @@ async fn scoped_loopback<R: grafton_ndi::asynchronous::AsyncRuntime>(
                 }
                 if !observed[1] {
                     observed[1] = receiver
-                        .audio()
-                        .capture_with(cadence.capture_timeout(), move |frame| {
+                        .capture_audio_with(cadence.capture_timeout(), move |frame| {
                             assert_eq!(frame.num_channels(), 2);
                             assert!(frame
                                 .channel_data(0)
@@ -241,8 +239,7 @@ async fn scoped_loopback<R: grafton_ndi::asynchronous::AsyncRuntime>(
                 }
                 if !observed[2] {
                     observed[2] = receiver
-                        .metadata()
-                        .capture_with(cadence.capture_timeout(), move |frame| {
+                        .capture_metadata_with(cadence.capture_timeout(), move |frame| {
                             frame.data() == "<scoped-metadata/>" && frame.timecode() == timecode
                         })
                         .await?

@@ -4,8 +4,7 @@ async fn contract<R: grafton_ndi::asynchronous::AsyncRuntime>(
 ) {
     use std::time::Duration;
     receiver
-        .audio()
-        .capture_with(Duration::ZERO, |frame| frame.channel_data(0).unwrap())
+        .capture_audio_with(Duration::ZERO, |frame| frame.channel_data(0).unwrap())
         .await
         .unwrap();
 }

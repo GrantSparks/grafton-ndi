@@ -93,7 +93,7 @@ syn = { version = "2", features = ["full"] }
 tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }
 
 [[example]]
-name = "NDIlib_Recv_PNG"
+name = "receive_png"
 required-features = ["image-encoding"]
 
 [[example]]

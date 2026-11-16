@@ -1,3 +1,5 @@
+//! Port of SDK sample `NDIlib_Recv_FrameSync`.
+//!
 //! Example: Receiving NDI video and audio using FrameSync for clock-corrected capture.
 //!
 //! This example demonstrates using the FrameSync API to receive video and audio
@@ -21,14 +23,14 @@
 //! request samples according to the audio device clock. Capture and resampling
 //! still take processing time, and wrapper synchronization may briefly block.
 //!
-//! Run with: `cargo run --example NDIlib_Recv_FrameSync`
+//! Run with: `cargo run --example receive_framesync`
 //!
 //! Optional arguments:
-//! - IP address to search: `cargo run --example NDIlib_Recv_FrameSync -- 192.168.0.100`
-//! - Frame count: `cargo run --example NDIlib_Recv_FrameSync -- --frames 100`
-//! - Audio sample rate: `cargo run --example NDIlib_Recv_FrameSync -- --audio-rate 44100`
-//! - Audio channels: `cargo run --example NDIlib_Recv_FrameSync -- --audio-channels 1`
-//! - Samples per audio block: `cargo run --example NDIlib_Recv_FrameSync -- --audio-samples 512`
+//! - IP address to search: `cargo run --example receive_framesync -- 192.168.0.100`
+//! - Frame count: `cargo run --example receive_framesync -- --frames 100`
+//! - Audio sample rate: `cargo run --example receive_framesync -- --audio-rate 44100`
+//! - Audio channels: `cargo run --example receive_framesync -- --audio-channels 1`
+//! - Samples per audio block: `cargo run --example receive_framesync -- --audio-samples 512`
 
 use grafton_ndi::{
     FrameSync, FrameSyncAudioRequest, Ndi, Receiver, ReceiverColorFormat, ReceiverOptions, ScanType,

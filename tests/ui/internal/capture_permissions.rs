@@ -12,9 +12,9 @@ fn attached_mixed(receiver: &Receiver<FrameSyncAttached>, deadline: Deadline) {
 }
 
 fn attached_events(receiver: &Receiver<FrameSyncAttached>, deadline: Deadline) {
-    let _ = receiver.poll_event_until(deadline, NeverStop);
+    let _ = receiver.next_event_until(deadline, NeverStop);
 }
 
 fn attached_audio_view(receiver: &Receiver<FrameSyncAttached>) {
-    let _ = Capture::<AudioKind>::new(receiver);
+    let _ = receiver.capture_audio(std::time::Duration::ZERO);
 }

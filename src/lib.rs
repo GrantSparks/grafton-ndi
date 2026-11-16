@@ -35,7 +35,7 @@
 //! - [`receiver`] and [`sender`]: capture and publish media.
 //! - [`frames`] and [`framesync`]: frame layouts and clock-driven capture.
 //! - [`capabilities`]: check optional runtime operations.
-//! - [`routing`] and [`discovery`]: redirect connections and use Discovery Servers.
+//! - [`routing`] and [`discovery_server`]: redirect connections and use Discovery Servers.
 //! - [`audio_conversion`] and [`video_conversion`]: checked media conversions.
 //!
 //! Cargo features enable `asynchronous` (`tokio` or `smol`), `advanced`,
@@ -85,7 +85,8 @@ pub mod sender;
 pub mod video_conversion;
 
 pub mod capabilities;
-pub mod discovery;
+#[path = "discovery/mod.rs"]
+pub mod discovery_server;
 pub mod routing;
 
 #[cfg(feature = "advanced")]
@@ -98,14 +99,14 @@ pub mod file;
 pub mod asynchronous;
 
 #[cfg(feature = "image-encoding")]
-mod image;
+#[path = "image/mod.rs"]
+pub mod image_encoding;
 
 pub use {
     capabilities::{
-        Capabilities, CapabilityRefusal, CapabilityStatus, CapabilityUnavailable, RuntimeFeature,
-        RuntimeInfo, SdkEdition, SdkLinkage, SdkVersion,
+        Capabilities, Capability, CapabilityRefusal, CapabilityStatus, CapabilityUnavailable,
+        RuntimeFeature, RuntimeInfo, SdkEdition, SdkLinkage, SdkVersion,
     },
-    capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
     error::*,
     finder::{Finder, FinderOptions, Source, SourceAddress, SourceCache, SourceWatch},
     frames::{
@@ -120,8 +121,8 @@ pub use {
         FrameSyncVideoRef,
     },
     receiver::{
-        Capture, CaptureMode, ConnectionStats, EventMode, FrameSyncAttached, MetadataMode, Ptz,
-        RawCapture, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverEvent, ReceiverItem,
+        AudioMode, ConnectionStats, EventMode, FrameSyncAttached, MetadataMode, Ptz, RawCapture,
+        Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverEvent, ReceiverItem,
         ReceiverItemRef, ReceiverMode, ReceiverOptions, ReceiverStatus, SettingChange,
         SourceNameChange, Tally, VideoMode,
     },
@@ -132,19 +133,10 @@ pub use {
     },
 };
 
-#[cfg(feature = "advanced")]
-pub use sender::{CompressedAttached, CompressedAudioSendMode, QueueAttached};
-
 pub use color_info::{ColorInfo, ColorPrimaries, TransferFunction, YuvMatrix};
 pub use media::{FourCc, FrameRate, MediaTypes, PictureAspectRatio, StreamTier};
 pub use rejected::Rejected;
 pub use time::{SdkTimestamp, Timecode};
-
-#[cfg(feature = "image-encoding")]
-pub use image::{
-    AlphaMode, ColorPolicy, Downscale, HdrPolicy, ImageFormat, ImageOptions, ImageWorkspace,
-    PngCompression, SampleDepth, YuvRange,
-};
 
 /// Alias for Result with our Error type
 pub type Result<T> = std::result::Result<T, crate::error::Error>;

@@ -4,7 +4,7 @@ error[E0599]: the method `send_audio` exists for reference `&grafton_ndi::Sender
 3 |     sender.sender().send_audio(frame);
   |                     ^^^^^^^^^^
   |
- ::: src/sender.rs
+ ::: src/advanced/mod.rs
   |
   | pub enum CompressedAttached {}
   | --------------------------- doesn't satisfy `CompressedAttached: AudioSendMode`

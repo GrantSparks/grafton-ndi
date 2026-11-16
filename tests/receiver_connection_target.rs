@@ -46,14 +46,14 @@ fn connection_target_tracks_native_requests() {
 fn exercise_target() {
     let path = std::path::PathBuf::from(std::env::var_os("GRAFTON_TARGET_CHILD").unwrap());
     let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(path)).unwrap();
-    let a = Source::new("A");
-    let b = Source::new("B");
+    let a = Source::new("A").unwrap();
+    let b = Source::new("B").unwrap();
     let receiver = Receiver::new(&ndi, &ReceiverOptions::new(a.clone())).unwrap();
     let initial = receiver.connection_target();
     assert_eq!(initial, a);
     let _: () = receiver.reconnect();
     assert_eq!(receiver.connection_target(), a);
-    receiver.connect_to(&b).unwrap();
+    let _: () = receiver.connect_to(&b);
     assert_eq!(receiver.connection_target(), b);
     assert_eq!(initial, a, "a snapshot does not change with the receiver");
     receiver.disconnect();
@@ -61,7 +61,7 @@ fn exercise_target() {
     receiver.reconnect();
     assert_eq!(receiver.connection_target(), b);
     assert!(matches!(
-        receiver.connect_to(&Source::new("bad\0name")),
+        Source::new("bad\0name"),
         Err(Error::InvalidCString(_))
     ));
     assert_eq!(receiver.connection_target(), b);
@@ -83,9 +83,7 @@ fn exercise_target() {
             scope.spawn(move || {
                 start.wait();
                 for request in 0..25 {
-                    receiver
-                        .connect_to(&Source::new(format!("{worker}/{request}")))
-                        .unwrap();
+                    receiver.connect_to(&Source::new(format!("{worker}/{request}")).unwrap());
                     receiver.reconnect();
                 }
             });
@@ -112,7 +110,7 @@ fn exercise_target() {
     {
         let before = requests();
         rejected_async_requests(
-            Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap(),
+            Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
         );
         assert_eq!(
             requests(),
@@ -137,13 +135,19 @@ fn rejected_async_requests(receiver: Receiver) {
     };
     let receiver = AsyncReceiver::<Tokio>::new(receiver);
     let mut context = Context::from_waker(Waker::noop());
-    let source = Source::new("bad\0async source");
+    assert!(matches!(
+        Source::new("bad\0async source"),
+        Err(Error::InvalidCString(_))
+    ));
+    let source = Source::new("valid async source").unwrap();
     let mut connect = std::pin::pin!(receiver.connect_to(&source));
     assert!(matches!(
         connect.as_mut().poll(&mut context),
-        Poll::Ready(Err(Error::InvalidCString(_)))
+        Poll::Ready(Err(Error::SpawnFailed(
+            grafton_ndi::SpawnFailure::NoRuntime
+        )))
     ));
-    let mut change = std::pin::pin!(receiver.poll_source_name_change(Duration::ZERO));
+    let mut change = std::pin::pin!(receiver.wait_for_source_name_change(Duration::ZERO));
     assert!(matches!(
         change.as_mut().poll(&mut context),
         Poll::Ready(Err(Error::UnsupportedCapability { .. }))

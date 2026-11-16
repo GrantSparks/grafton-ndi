@@ -1,25 +1,31 @@
 error[E0277]: `Rc<i32>` cannot be sent between threads safely
- --> tests/ui/async/fail/async_scoped_nonsend_capture.rs:9:39
+ --> tests/ui/async/fail/async_scoped_nonsend_capture.rs:8:45
   |
-9 |         .capture_with(Duration::ZERO, move |_| *local)
-  |          ------------                 --------^^^^^^^
-  |          |                            |
-  |          |                            `Rc<i32>` cannot be sent between threads safely
-  |          |                            within this `{closure@$DIR/tests/ui/async/fail/async_scoped_nonsend_capture.rs:9:39: 9:47}`
+8 |         .capture_video_with(Duration::ZERO, move |_| *local)
+  |          ------------------                 --------^^^^^^^
+  |          |                                  |
+  |          |                                  `Rc<i32>` cannot be sent between threads safely
+  |          |                                  within this `{closure@$DIR/tests/ui/async/fail/async_scoped_nonsend_capture.rs:8:45: 8:53}`
   |          required by a bound introduced by this call
   |
-  = help: within `{closure@$DIR/tests/ui/async/fail/async_scoped_nonsend_capture.rs:9:39: 9:47}`, the trait `Send` is not implemented for `Rc<i32>`
+  = help: within `{closure@$DIR/tests/ui/async/fail/async_scoped_nonsend_capture.rs:8:45: 8:53}`, the trait `Send` is not implemented for `Rc<i32>`
 note: required because `local` is used within this closure
- --> tests/ui/async/fail/async_scoped_nonsend_capture.rs:9:49
+ --> tests/ui/async/fail/async_scoped_nonsend_capture.rs:8:55
   |
-9 |         .capture_with(Duration::ZERO, move |_| *local)
-  |                                                 ^^^^^
-note: required by a bound in `AsyncCapture::<'rx, R, K>::capture_with`
+8 |         .capture_video_with(Duration::ZERO, move |_| *local)
+  |                                                       ^^^^^
+note: required by a bound in `AsyncReceiver::<R>::capture_video_with`
  --> src/asynchronous.rs
   |
-  | impl<'rx, R: AsyncRuntime, K: CaptureKind> AsyncCapture<'rx, R, K>
+  |             impl<R: AsyncRuntime> AsyncReceiver<R> {
 ...
-  |     pub async fn capture_with<F, T>(&self, timeout: Duration, process: F) -> Result<Option<T>>
-  |     where
-  |         F: for<'frame> FnOnce(&K::Ref<'frame>) -> T + Send + 'static,
-  |                                                       ^^^^ required by this bound in `AsyncCapture::<'rx, R, K>::capture_with`
+  |                     F: for<'frame> FnOnce(&crate::$borrowed<'frame>) -> T + Send + 'static,
+  |                                                                             ^^^^ required by this bound in `AsyncReceiver::<R>::capture_video_with`
+...
+  | crate::capture::capture_method_kinds!(async_receiver_capture_methods);
+  | --------------------------------------------------------------------- in this macro invocation
+  |
+ ::: src/capture.rs
+  |
+  |                 capture_video, capture_video_ref, capture_video_with, "video"),
+  = note: this error originates in the macro `async_receiver_capture_methods` which comes from the expansion of the macro `crate::capture::capture_method_kinds` (in Nightly builds, run with -Z macro-backtrace for more info)

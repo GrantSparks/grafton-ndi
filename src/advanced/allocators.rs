@@ -19,7 +19,9 @@ use std::{
     },
 };
 
-use super::{invalid_input, PacketItem, PacketItemRef, PacketReceiver, ReceiverControls};
+use super::{
+    invalid_input, PacketAttached, PacketItem, PacketItemRef, PacketReceiver, ReceiverControls,
+};
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use super::{AudioCodec, VideoCodec};
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
@@ -27,11 +29,9 @@ use crate::sys::bindings::*;
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use crate::{frames::ValidatedAudioLayout, AudioFormat};
 use crate::{
-    frames::ValidatedVideoLayout,
-    receiver::{PacketAttached, ReceiverCore},
-    runtime::ProcessLifetimeRuntime,
-    sys::advanced::ReceiveAllocators,
-    FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode, Rejected, Result,
+    frames::ValidatedVideoLayout, receiver::ReceiverCore, runtime::ProcessLifetimeRuntime,
+    sys::advanced::ReceiveAllocators, FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode,
+    Rejected, Result,
 };
 #[cfg(ndi_has_advanced_receive_allocators)]
 use std::ffi::c_void;
@@ -63,7 +63,7 @@ const MAX_ALLOCATION: usize = 256 * MIB;
 /// concurrent calls can each be granted a largest allocation:
 /// `max_concurrent_calls` may not exceed `max_allocations`, and
 /// `max_concurrent_calls * max_allocation_bytes` may not exceed `max_bytes`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AllocatorLimits {
     max_generations: usize,
     max_allocations: usize,
@@ -338,7 +338,7 @@ pub unsafe trait ExternalAllocation: Send + 'static {
 /// Copying this descriptor grants no permission to access or lend its memory.
 /// Each successful [`AllocationBuffer::from_pool`] call establishes one exclusive
 /// loan, and requires the caller to uphold that constructor's safety contract.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PoolBlock {
     pointer: NonNull<u8>,
     capacity: usize,
@@ -1165,8 +1165,8 @@ impl AllocatorService {
     /// [`Error::InvalidInput`](crate::Error::InvalidInput) when the limits are
     /// out of range, differ from those of an earlier service, or the bounded
     /// lease bookkeeping cannot be reserved.
-    pub fn new(runtime: ProcessLifetimeRuntime, limits: AllocatorLimits) -> Result<Self> {
-        let limits = limits.validate()?;
+    pub fn new(runtime: ProcessLifetimeRuntime, limits: &AllocatorLimits) -> Result<Self> {
+        let limits = (*limits).validate()?;
         let registry = match REGISTRY.get() {
             Some(registry) => registry,
             None => {
@@ -1282,25 +1282,28 @@ impl std::fmt::Debug for AllocatedPacketReceiver {
 
 impl AllocatedPacketReceiver {
     /// Wait up to `timeout` for the next frame or event; see
-    /// [`PacketReceiver::capture`].
+    /// [`PacketReceiver::capture_any`].
     ///
     /// # Errors
     ///
-    /// As for [`PacketReceiver::capture`].
+    /// As for [`PacketReceiver::capture_any`].
     #[doc(alias = "NDIlib_recv_capture_v3")]
-    pub fn capture(&self, timeout: std::time::Duration) -> Result<Option<PacketItem>> {
+    pub fn capture_any(&self, timeout: std::time::Duration) -> Result<Option<PacketItem>> {
         PacketReceiver::capture_from(self.inner.receiver(), timeout)
     }
 
     /// Borrow a packet directly from SDK or application-provided storage.
     /// A held item keeps its custom allocation charged until the SDK releases
-    /// it after the item is dropped. See [`PacketReceiver::capture_ref`].
+    /// it after the item is dropped. See [`PacketReceiver::capture_any_ref`].
     ///
     /// # Errors
     ///
-    /// As for [`PacketReceiver::capture_ref`].
+    /// As for [`PacketReceiver::capture_any_ref`].
     #[doc(alias = "NDIlib_recv_capture_v3")]
-    pub fn capture_ref(&self, timeout: std::time::Duration) -> Result<Option<PacketItemRef<'_>>> {
+    pub fn capture_any_ref(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<PacketItemRef<'_>>> {
         PacketReceiver::capture_ref_from(self.inner.receiver(), timeout)
     }
 
@@ -1311,7 +1314,7 @@ impl AllocatedPacketReceiver {
 
     /// Borrow exclusive stream controls or start KVM without permitting
     /// receiver replacement. This allocates nothing and makes no SDK call.
-    /// A KVM session captures packets through its own `capture` method.
+    /// A KVM session captures packets through its own `capture_any` method.
     pub fn controls(&mut self) -> ReceiverControls<'_, PacketAttached> {
         ReceiverControls::new(self.inner.receiver_mut())
     }
@@ -1388,9 +1391,9 @@ enum Stream {
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// let ndi = Ndi::new()?;
-/// # let source = Source::new("");
+/// # let source = Source::new("").unwrap();
 /// let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
-/// let service = AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default())?;
+/// let service = AllocatorService::new(ndi.process_lifetime(), &AllocatorLimits::default())?;
 /// let mut receiver = service.attach(receiver)?;
 ///
 /// // Pad every video line to a multiple of 256 bytes.
@@ -1398,7 +1401,7 @@ enum Stream {
 ///     let stride = request.stride_bytes().next_multiple_of(256);
 ///     AllocationBuffer::zeroed(request.with_stride_bytes(stride)?)
 /// })?;
-/// if let Some(frame) = receiver.receiver().video().capture(Duration::from_secs(1))? {
+/// if let Some(frame) = receiver.receiver().capture_video(Duration::from_secs(1))? {
 ///     println!("line stride: {} bytes", frame.line_stride_bytes());
 /// }
 /// # Ok(())
@@ -1480,7 +1483,7 @@ impl AllocatedReceiver {
 ///
 /// Dropping it, or taking the receiver back, returns the receiver to the
 /// SDK's own memory first. The receiver itself may live on afterwards, in a
-/// [`RecvAdvertiser`](crate::discovery::RecvAdvertiser) registration: the
+/// [`RecvAdvertiser`](crate::discovery_server::RecvAdvertiser) registration: the
 /// allocations it still holds are then freed through the token-keyed registry,
 /// which outlives every receiver.
 struct Allocation<M: ReceiverMode> {

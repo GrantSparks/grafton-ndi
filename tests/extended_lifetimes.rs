@@ -10,7 +10,7 @@ mod runtime_fixture;
 
 use grafton_ndi::{
     capabilities::{RuntimeFeature, SdkEdition},
-    discovery::{
+    discovery_server::{
         AdvertiserOptions, RecvAdvertisement, RecvAdvertiser, SendAdvertisement, SendAdvertiser,
     },
     runtime::RuntimeOptions,
@@ -57,7 +57,7 @@ fn position(events: &str, event: &str) -> usize {
 /// The Discovery Server every advertiser here names. The SDK creates an
 /// advertiser only for an address, and does not need to reach it.
 fn server() -> AdvertiserOptions {
-    AdvertiserOptions::default().servers("192.0.2.1")
+    AdvertiserOptions::default().servers(["192.0.2.1"])
 }
 fn frame() -> VideoFrame {
     VideoFrame::builder().resolution(2, 2).build().unwrap()
@@ -67,7 +67,9 @@ fn sender(ndi: &Ndi) -> Sender {
 }
 
 fn retained_source(name: &str, address: &str) -> Source {
-    Source::new(name).with_address(SourceAddress::new(address))
+    Source::new(name)
+        .unwrap()
+        .with_address(SourceAddress::new(address).unwrap())
 }
 
 fn assert_retained_reads(kind: &str, expected: &[(&str, &str)]) {
@@ -236,19 +238,13 @@ fn child(case: &str) {
     match case {
         "retained_failover" => {
             let sender = sender(&ndi);
-            sender
-                .set_failover(&retained_source("first failover", "192.0.2.1:5960"))
-                .unwrap();
-            sender
-                .set_failover(&retained_source(
-                    "second failover",
-                    "http://backup.example/ndi",
-                ))
-                .unwrap();
+            sender.set_failover(&retained_source("first failover", "192.0.2.1:5960"));
+            sender.set_failover(&retained_source(
+                "second failover",
+                "http://backup.example/ndi",
+            ));
             sender.clear_failover();
-            sender
-                .set_failover(&retained_source("last failover", "192.0.2.3:5962"))
-                .unwrap();
+            sender.set_failover(&retained_source("last failover", "192.0.2.3:5962"));
             drop(sender);
             assert_retained_reads(
                 "failover",
@@ -261,12 +257,10 @@ fn child(case: &str) {
         }
         "retained_registered_failover" => {
             let sender = sender(&ndi);
-            sender
-                .set_failover(&retained_source("registered failover", "192.0.2.5:5960"))
-                .unwrap();
+            sender.set_failover(&retained_source("registered failover", "192.0.2.5:5960"));
             let mut advertiser = SendAdvertiser::new(&ndi, &server()).unwrap();
             let _registration = advertiser
-                .register(&sender, SendAdvertisement::default())
+                .register(&sender, &SendAdvertisement::default())
                 .unwrap();
             drop(sender);
             assert!(!log().contains("sender-destroy\n"));
@@ -288,9 +282,7 @@ fn child(case: &str) {
                         for change in 0..20 {
                             let name = format!("concurrent-{worker}-{change}");
                             let address = format!("http://example.test/{name}");
-                            sender
-                                .set_failover(&retained_source(&name, &address))
-                                .unwrap();
+                            sender.set_failover(&retained_source(&name, &address));
                         }
                     });
                 }
@@ -321,22 +313,22 @@ fn child(case: &str) {
             let mut router = Router::new(&ndi, &RouterOptions::new("retained router")).unwrap();
             for name in ["route A", "route B"] {
                 router
-                    .change(&retained_source(name, "192.0.2.10:5960"))
+                    .set_route(&retained_source(name, "192.0.2.10:5960"))
                     .unwrap();
             }
             std::env::set_var("GRAFTON_FAKE_ROUTING_CHANGE", "refuse");
             for name in ["refused C", "refused D"] {
                 assert!(router
-                    .change(&retained_source(name, "http://refused.example/ndi"))
+                    .set_route(&retained_source(name, "http://refused.example/ndi"))
                     .is_err());
             }
             std::env::remove_var("GRAFTON_FAKE_ROUTING_CHANGE");
             router
-                .change(&retained_source("route E", "192.0.2.11:5960"))
+                .set_route(&retained_source("route E", "192.0.2.11:5960"))
                 .unwrap();
-            router.clear().unwrap();
+            router.clear_route().unwrap();
             router
-                .change(&retained_source("route F", "192.0.2.12:5960"))
+                .set_route(&retained_source("route F", "192.0.2.12:5960"))
                 .unwrap();
             drop(router);
             assert_retained_reads(
@@ -359,14 +351,11 @@ fn child(case: &str) {
             );
         }
         "retained_connection_targets" => {
-            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
-            receiver
-                .connect_to(&retained_source("target A", "192.0.2.20:5960"))
-                .unwrap();
+            let receiver =
+                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+            receiver.connect_to(&retained_source("target A", "192.0.2.20:5960"));
             receiver.reconnect();
-            receiver
-                .connect_to(&retained_source("target B", "http://target.example/ndi"))
-                .unwrap();
+            receiver.connect_to(&retained_source("target B", "http://target.example/ndi"));
             receiver.disconnect();
             receiver.reconnect();
             drop(receiver);
@@ -381,16 +370,15 @@ fn child(case: &str) {
             );
         }
         "retained_receiver_metadata" => {
-            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+            let receiver =
+                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
             for index in 0..16 {
                 let frame = grafton_ndi::MetadataFrame::new(format!("<entry index='{index}'/>"))
                     .unwrap()
                     .with_timecode(grafton_ndi::Timecode::from_ticks(index));
                 receiver.add_connection_metadata(&frame).unwrap();
             }
-            receiver
-                .connect_to(&Source::new("metadata target"))
-                .unwrap();
+            receiver.connect_to(&Source::new("metadata target").unwrap());
             receiver.reconnect();
             receiver.clear_connection_metadata().unwrap();
             receiver
@@ -423,7 +411,9 @@ fn child(case: &str) {
                     )
                     .unwrap();
             }
-            router.change(&Source::new("metadata target")).unwrap();
+            router
+                .set_route(&Source::new("metadata target").unwrap())
+                .unwrap();
             router.clear_connection_metadata().unwrap();
             router
                 .add_connection_metadata(&grafton_ndi::MetadataFrame::new("<last/>").unwrap())
@@ -441,15 +431,15 @@ fn child(case: &str) {
         }
         "retained_receiver_name" | "retained_registered_receiver_name" => {
             let name = "retained receiver creation name";
-            let options = ReceiverOptions::new(Source::new("")).name(name);
+            let options = ReceiverOptions::new(Source::new("").unwrap()).name(name);
             let receiver = Receiver::new(&ndi, &options).unwrap();
             drop(options);
-            receiver.connect_to(&Source::new("named target")).unwrap();
+            receiver.connect_to(&Source::new("named target").unwrap());
             receiver.reconnect();
             if case == "retained_registered_receiver_name" {
                 let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
                 let _registration = advertiser
-                    .register(&receiver, RecvAdvertisement::default())
+                    .register(&receiver, &RecvAdvertisement::default())
                     .unwrap();
                 drop(receiver);
                 assert!(!log().contains("receiver-destroy\n"));
@@ -485,9 +475,9 @@ fn child(case: &str) {
                     .unwrap()
                     .with_tier(tier);
                 let frame = CompressedVideoFrame::new(format, vec![value; 16]).unwrap();
-                assert!(sender.send_video_async(frame).is_none());
+                assert!(sender.submit_video(frame).is_none());
             }
-            let reclaimed = sender.finish_video_async();
+            let reclaimed = sender.reclaim_video();
             let events = log();
             assert_eq!(events.matches("sender-flush\n").count(), 1);
             assert!(!events.contains("sender-destroy-begin\n"));
@@ -497,9 +487,9 @@ fn child(case: &str) {
                         < position(&events, &format!("sender-loan-released={value}"))
                 );
             }
-            let empty = sender.split().0.finish_video_async();
+            let empty = sender.split().0.reclaim_video();
             assert!(empty.program.is_none() && empty.preview.is_none());
-            assert_eq!(log(), events, "an empty finish makes no native call");
+            assert_eq!(log(), events, "an empty reclaim makes no native call");
             for (frame, value) in [
                 (reclaimed.program.unwrap(), 11),
                 (reclaimed.preview.unwrap(), 22),
@@ -508,7 +498,7 @@ fn child(case: &str) {
                     panic!("contiguous frame");
                 };
                 assert_eq!(frame.data()[0], value);
-                assert!(sender.send_video_async(frame).is_none());
+                assert!(sender.submit_video(frame).is_none());
             }
             drop(sender);
             assert!(position(&log(), "sender-flush") < position(&log(), "sender-destroy-begin"));
@@ -527,7 +517,7 @@ fn child(case: &str) {
                     .unwrap()
                     .with_tier(tier);
                 let frame = CompressedVideoFrame::new(format, vec![value; 16]).unwrap();
-                assert!(sender.send_video_async(frame).is_none());
+                assert!(sender.submit_video(frame).is_none());
             }
             if case == "compressed_close" {
                 let reclaimed = sender.close();
@@ -569,7 +559,7 @@ fn child(case: &str) {
                 let source = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
                     .build()
                     .unwrap();
-                sender.send_video_async_copy(&source).unwrap();
+                sender.submit_video_copy(&source).unwrap();
             }
             pixels.fill(9);
             drop(pixels);
@@ -594,7 +584,7 @@ fn child(case: &str) {
         }
         "sender_unregistered" => {
             let mut sender = sender(&ndi);
-            sender.send_video_async(frame()).unwrap();
+            sender.submit_video(frame()).unwrap();
             drop(sender);
             let events = log();
             assert_eq!(events.matches("sender-flush\n").count(), 1);
@@ -605,12 +595,12 @@ fn child(case: &str) {
             let mut sender = sender(&ndi);
             let mut advertiser = SendAdvertiser::new(&ndi, &server()).unwrap();
             let registration = advertiser
-                .register(&sender, SendAdvertisement::default())
+                .register(&sender, &SendAdvertisement::default())
                 .unwrap();
             assert!(advertiser
-                .register(&sender, SendAdvertisement::default())
+                .register(&sender, &SendAdvertisement::default())
                 .is_err());
-            sender.send_video_async(frame()).unwrap();
+            sender.submit_video(frame()).unwrap();
             drop(sender);
             assert!(log().contains("sender-flush\n"));
             // The registration, not the dropped handle, keeps the sender alive.
@@ -638,7 +628,10 @@ fn child(case: &str) {
             let mut advertiser = SendAdvertiser::new(&ndi, &server()).unwrap();
             // Discarding the registration leaves the sender advertised.
             let _ = advertiser
-                .register(&sender, SendAdvertisement::default().allow_monitoring(true))
+                .register(
+                    &sender,
+                    &SendAdvertisement::default().allow_monitoring(true),
+                )
                 .unwrap();
             drop(sender);
             let events = log();
@@ -659,13 +652,14 @@ fn child(case: &str) {
             assert_eq!(events.matches("sender-destroy\n").count(), 1);
         }
         "receiver_registration" => {
-            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+            let receiver =
+                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
             let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let registration = advertiser
-                .register(&receiver, RecvAdvertisement::default())
+                .register(&receiver, &RecvAdvertisement::default())
                 .unwrap();
             assert!(advertiser
-                .register(&receiver, RecvAdvertisement::default())
+                .register(&receiver, &RecvAdvertisement::default())
                 .is_err());
             drop(receiver);
             assert!(!log().contains("receiver-destroy\n"));
@@ -679,12 +673,13 @@ fn child(case: &str) {
             drop(advertiser);
         }
         "dropped_receiver_advertiser" => {
-            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+            let receiver =
+                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
             let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let _ = advertiser
                 .register(
                     &receiver,
-                    RecvAdvertisement::default().input_group("Program"),
+                    &RecvAdvertisement::default().input_group("Program"),
                 )
                 .unwrap();
             drop(receiver);
@@ -706,7 +701,7 @@ fn child(case: &str) {
             let mut advertiser = SendAdvertiser::new(&ndi, &server()).unwrap();
             let mut other = SendAdvertiser::new(&ndi, &server()).unwrap();
             let registration = advertiser
-                .register(&sender, SendAdvertisement::default())
+                .register(&sender, &SendAdvertisement::default())
                 .unwrap();
             // Another advertiser neither ends the registration nor calls the
             // SDK for it: it hands the registration back with the reason.
@@ -716,7 +711,7 @@ fn child(case: &str) {
             let registration = rejected.into_inner();
             // It may advertise the same sender itself.
             let second = other
-                .register(&sender, SendAdvertisement::default())
+                .register(&sender, &SendAdvertisement::default())
                 .unwrap();
             other.unregister(second).unwrap();
             drop(other);
@@ -727,11 +722,12 @@ fn child(case: &str) {
             assert_eq!(log().matches("sender-destroy\n").count(), 1);
             drop(advertiser);
 
-            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+            let receiver =
+                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
             let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let mut other = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let registration = advertiser
-                .register(&receiver, RecvAdvertisement::default())
+                .register(&receiver, &RecvAdvertisement::default())
                 .unwrap();
             let rejected = other.unregister(registration).unwrap_err();
             assert!(!log().contains("recv-advertiser-remove"));
@@ -743,7 +739,7 @@ fn child(case: &str) {
             let sender = sender(&ndi);
             let mut advertiser = SendAdvertiser::new(&ndi, &server()).unwrap();
             let registration = advertiser
-                .register(&sender, SendAdvertisement::default())
+                .register(&sender, &SendAdvertisement::default())
                 .unwrap();
             drop(sender);
             // An SDK that removes nothing fails the call, which changes
@@ -762,10 +758,11 @@ fn child(case: &str) {
             assert_eq!(log().matches("sender-destroy\n").count(), 1);
             drop(advertiser);
 
-            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+            let receiver =
+                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
             let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let registration = advertiser
-                .register(&receiver, RecvAdvertisement::default())
+                .register(&receiver, &RecvAdvertisement::default())
                 .unwrap();
             drop(receiver);
             std::env::set_var("GRAFTON_FAKE_ADVERTISER_REMOVE", "refuse");
@@ -808,13 +805,13 @@ fn child(case: &str) {
         #[cfg(feature = "advanced")]
         "queue_immediate" => {
             use grafton_ndi::{
-                advanced::{QueueOptions, QueuedSender},
+                advanced::{QueueLimits, QueuedSender},
                 QueueLimit,
             };
             let mut queue = QueuedSender::new(
                 &ndi,
                 &SenderOptions::new("queue"),
-                QueueOptions::default().max_frames(1),
+                &QueueLimits::default().max_frames(1),
             )
             .unwrap();
             let id = queue.try_submit(frame()).unwrap();
@@ -822,7 +819,7 @@ fn child(case: &str) {
             let rejected = queue.try_submit(frame()).unwrap_err();
             let (error, rejected_frame) = rejected.into_parts();
             assert!(matches!(error, Error::QueueFull(QueueLimit::Frames)));
-            let completed = queue.wait_completed(Duration::ZERO).unwrap().unwrap();
+            let completed = queue.next_completed(Duration::ZERO).unwrap().unwrap();
             assert_eq!(completed.id(), id);
             assert_eq!(queue.retained_frames(), 0);
             let next = queue.try_submit(rejected_frame).unwrap();
@@ -836,7 +833,7 @@ fn child(case: &str) {
             let mut small = QueuedSender::new(
                 &ndi,
                 &SenderOptions::new("queue"),
-                QueueOptions::default().max_bytes(1),
+                &QueueLimits::default().max_bytes(1),
             )
             .unwrap();
             let rejected = small.try_submit(frame()).unwrap_err();
@@ -859,7 +856,7 @@ fn child(case: &str) {
             let mut bounded = QueuedSender::new(
                 &ndi,
                 &SenderOptions::new("queue metadata capacity"),
-                QueueOptions::default().max_bytes(512),
+                &QueueLimits::default().max_bytes(512),
             )
             .unwrap();
             let rejected = bounded.try_submit(packet).unwrap_err();
@@ -884,7 +881,7 @@ fn child(case: &str) {
             let mut exact = QueuedSender::new(
                 &ndi,
                 &SenderOptions::new("queue exact capacity"),
-                QueueOptions::default().max_bytes(4),
+                &QueueLimits::default().max_bytes(4),
             )
             .unwrap();
             let first = exact.try_submit(packet(4)).unwrap();
@@ -905,7 +902,7 @@ fn child(case: &str) {
             assert_eq!(exact.retained_frames(), 1);
             assert_eq!(log().matches("sender-submit-return\n").count(), 3);
             assert_eq!(
-                exact.wait_completed(Duration::ZERO).unwrap().unwrap().id(),
+                exact.next_completed(Duration::ZERO).unwrap().unwrap().id(),
                 first
             );
             exact.try_submit(rejected.into_inner()).unwrap();
@@ -917,7 +914,7 @@ fn child(case: &str) {
         | "queue_scatter_protocol"
         | "queue_scatter_unavailable" => {
             use grafton_ndi::advanced::{
-                QueueOptions, QueuedSender, QueuedVideoFrame, ScatterVideoFrame, VideoCodec,
+                QueueLimits, QueuedSender, QueuedVideoFrame, ScatterVideoFrame, VideoCodec,
                 VideoPacketFormat,
             };
             let packet = || {
@@ -930,7 +927,7 @@ fn child(case: &str) {
             let mut queue = QueuedSender::new(
                 &ndi,
                 &SenderOptions::new("scatter queue"),
-                QueueOptions::default(),
+                &QueueLimits::default(),
             )
             .unwrap();
             if case == "queue_scatter_unavailable" {
@@ -943,7 +940,7 @@ fn child(case: &str) {
                 assert!(matches!(
                     rejected.error(),
                     Error::UnsupportedCapability {
-                        feature: RuntimeFeature::ScatterSend,
+                        capability: grafton_ndi::Capability::Runtime(RuntimeFeature::ScatterSend),
                         ..
                     }
                 ));
@@ -968,13 +965,13 @@ fn child(case: &str) {
                 let id = queue.try_submit(frame).unwrap();
                 assert!(queue.completion_protocol_failed());
                 assert_eq!(queue.retained_frames(), 1);
-                assert!(queue.try_take_completed().is_none());
+                assert!(queue.try_next_completed().is_none());
                 assert!(matches!(
                     queue.try_submit(packet()).unwrap_err().error(),
                     Error::UnexpectedSdkResult(_)
                 ));
                 assert!(matches!(
-                    queue.wait_completed(Duration::ZERO),
+                    queue.next_completed(Duration::ZERO),
                     Err(Error::UnexpectedSdkResult(_))
                 ));
                 let mut reclaimed = queue.close();
@@ -1004,7 +1001,7 @@ fn child(case: &str) {
                     submitted.push((id, original));
                 }
                 if case == "queue_scatter_delayed" {
-                    assert!(queue.try_take_completed().is_none());
+                    assert!(queue.try_next_completed().is_none());
                     std::env::set_var("GRAFTON_FAKE_CALLBACK_MODE", "drain");
                     let frame = packet();
                     let original = frame
@@ -1015,7 +1012,7 @@ fn child(case: &str) {
                     submitted.push((id, original));
                 }
                 for _ in 0..submitted.len() {
-                    let done = queue.wait_completed(Duration::ZERO).unwrap().unwrap();
+                    let done = queue.next_completed(Duration::ZERO).unwrap().unwrap();
                     let original = &submitted.iter().find(|(id, _)| *id == done.id()).unwrap().1;
                     let QueuedVideoFrame::Scatter(frame) = done.into_frame() else {
                         panic!("the frame changed type")
@@ -1037,7 +1034,7 @@ fn child(case: &str) {
         #[cfg(feature = "advanced")]
         "queue_split" => {
             use grafton_ndi::{
-                advanced::{QueueOptions, QueuedSender},
+                advanced::{QueueLimits, QueuedSender},
                 AudioFrame,
             };
             use std::sync::{
@@ -1047,7 +1044,7 @@ fn child(case: &str) {
             let mut queue = QueuedSender::new(
                 &ndi,
                 &SenderOptions::new("split queue"),
-                QueueOptions::default(),
+                &QueueLimits::default(),
             )
             .unwrap();
             queue.try_submit(frame()).unwrap();
@@ -1063,7 +1060,7 @@ fn child(case: &str) {
                 scope.spawn(|| {
                     started.wait();
                     assert!(video
-                        .wait_completed(Duration::from_millis(250))
+                        .next_completed(Duration::from_millis(250))
                         .unwrap()
                         .is_none());
                     finished.store(true, Ordering::Release);
@@ -1083,7 +1080,7 @@ fn child(case: &str) {
         #[cfg(feature = "advanced")]
         "queue_backlog" => {
             use grafton_ndi::advanced::{
-                CompressedVideoFrame, QueueOptions, QueuedSender, QueuedVideoFrame, VideoCodec,
+                CompressedVideoFrame, QueueLimits, QueuedSender, QueuedVideoFrame, VideoCodec,
                 VideoPacketFormat,
             };
             let pixels = QueuedVideoFrame::from(frame());
@@ -1102,7 +1099,7 @@ fn child(case: &str) {
             let mut queue = QueuedSender::new(
                 &ndi,
                 &SenderOptions::new("queue backlog"),
-                QueueOptions::new().max_frames(64),
+                &QueueLimits::new().max_frames(64),
             )
             .unwrap();
             let mut submitted = Vec::new();
@@ -1123,7 +1120,7 @@ fn child(case: &str) {
             assert_eq!(queue.retained_frames(), 64);
             let mut resubmitted = Vec::new();
             for (id, pointer) in submitted {
-                let completed = queue.try_take_completed().unwrap();
+                let completed = queue.try_next_completed().unwrap();
                 assert_eq!(completed.id(), id);
                 assert_eq!(address(completed.frame()), pointer);
                 let next = queue.try_submit(completed.into_frame()).unwrap();
@@ -1131,7 +1128,7 @@ fn child(case: &str) {
                 resubmitted.push((next, pointer));
             }
             for (id, pointer) in resubmitted {
-                let completed = queue.try_take_completed().unwrap();
+                let completed = queue.try_next_completed().unwrap();
                 assert_eq!(completed.id(), id);
                 assert_eq!(address(completed.frame()), pointer);
             }
@@ -1143,16 +1140,16 @@ fn child(case: &str) {
         }
         #[cfg(feature = "advanced")]
         "queue_destroy" | "queue_close" => {
-            use grafton_ndi::advanced::{QueueOptions, QueuedSender, QueuedVideoFrame};
+            use grafton_ndi::advanced::{QueueLimits, QueuedSender, QueuedVideoFrame};
             let mut queue =
-                QueuedSender::new(&ndi, &SenderOptions::new("queue"), QueueOptions::default())
+                QueuedSender::new(&ndi, &SenderOptions::new("queue"), &QueueLimits::default())
                     .unwrap();
             let original = [frame(), frame()].map(|frame| {
                 let pointer = frame.data().as_ptr();
                 (queue.try_submit(frame).unwrap(), pointer)
             });
             assert!(queue
-                .wait_completed(Duration::from_millis(1))
+                .next_completed(Duration::from_millis(1))
                 .unwrap()
                 .is_none());
             assert_eq!(queue.retained_frames(), 2);
@@ -1186,14 +1183,14 @@ fn child(case: &str) {
         }
         #[cfg(feature = "advanced")]
         "queue_registered_sender" => {
-            use grafton_ndi::advanced::{QueueOptions, QueuedSender};
+            use grafton_ndi::advanced::{QueueLimits, QueuedSender};
             let sender = sender(&ndi);
             let mut advertiser = SendAdvertiser::new(&ndi, &server()).unwrap();
             let registration = advertiser
-                .register(&sender, SendAdvertisement::default())
+                .register(&sender, &SendAdvertisement::default())
                 .unwrap();
             // A registered sender cannot become a queue: it comes back as it was.
-            let sender = QueuedSender::from_sender(sender, QueueOptions::default())
+            let sender = QueuedSender::from_sender(sender, &QueueLimits::default())
                 .expect_err("a registered sender is refused")
                 .into_inner();
             sender.send_video(&frame()).unwrap();

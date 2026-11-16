@@ -16,7 +16,9 @@ const PATIENCE: Duration = Duration::from_secs(15);
 fn isolated_finder(ndi: &Ndi, group: &str) -> Finder {
     Finder::new(
         ndi,
-        &FinderOptions::new().groups(group).extra_ips("127.0.0.1"),
+        &FinderOptions::new()
+            .groups([group])
+            .extra_ips(["127.0.0.1"]),
     )
     .unwrap()
 }
@@ -67,7 +69,7 @@ fn a_report_waits_for_the_next_native_wait() {
     let mut watch = finder.watch();
     watch.current_sources().unwrap();
     let name = common::unique_name("retained-source");
-    let _sender = Sender::new(&ndi, &SenderOptions::new(&name).groups(&group)).unwrap();
+    let _sender = Sender::new(&ndi, &SenderOptions::new(&name).groups([&group])).unwrap();
     wait_visible(&observer, &name, &ndi);
     // Neither a snapshot nor a native wait touches `finder` while discovery
     // learns the change. The independent observer establishes visibility.
@@ -90,7 +92,7 @@ fn another_consumers_snapshot_leaves_the_report_for_the_next_wait() {
     let mut watch = finder.watch();
     watch.current_sources().unwrap();
     let name = common::unique_name("snapshot-source");
-    let _sender = Sender::new(&ndi, &SenderOptions::new(&name).groups(&group)).unwrap();
+    let _sender = Sender::new(&ndi, &SenderOptions::new(&name).groups([&group])).unwrap();
     wait_visible(&finder, &name, &ndi);
     assert!(
         watch.wait_for_change(Duration::ZERO).unwrap(),
@@ -112,7 +114,7 @@ fn a_native_wait_consumes_the_report_it_returns() {
         let mut watch = finder.watch();
         let wait = scope.spawn(move || watch.wait_for_change(PATIENCE).unwrap());
         thread::sleep(Duration::from_millis(200));
-        let sender = Sender::new(&ndi, &SenderOptions::new(&name).groups(&group)).unwrap();
+        let sender = Sender::new(&ndi, &SenderOptions::new(&name).groups([&group])).unwrap();
         assert!(wait.join().unwrap(), "no change report: {:?}", ndi.info());
         sender
     });
@@ -132,7 +134,7 @@ fn a_native_wait_consumes_the_report_it_returns() {
 #[test]
 fn concurrent_source_lookups_return_promptly_for_successive_announcements() {
     let Some(ndi) = common::ndi() else { return };
-    let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
+    let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips(["127.0.0.1"])).unwrap();
     for round in 0..3 {
         let names = [
             common::unique_name(&format!("broadcast-{round}-A")),

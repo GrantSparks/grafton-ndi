@@ -157,20 +157,39 @@ pub enum EnvelopeCodec {
 }
 
 impl EnvelopeCodec {
-    /// The FourCC the envelope header carries for this codec.
-    pub const fn fourcc(self) -> FourCc {
-        FourCc::from_raw(match self {
+    const fn raw_fourcc(self) -> u32 {
+        match self {
             Self::H264 => fourcc(b"H264"),
             Self::Hevc => fourcc(b"HEVC"),
             Self::Aac => 0xff,
-        })
+        }
     }
+}
 
-    /// The codec an envelope header's FourCC names, if this module knows it.
-    pub fn from_fourcc(fourcc: FourCc) -> Option<Self> {
+impl From<EnvelopeCodec> for FourCc {
+    /// The FourCC carried by the codec's envelope header.
+    fn from(codec: EnvelopeCodec) -> Self {
+        Self::from_raw(codec.raw_fourcc())
+    }
+}
+
+impl TryFrom<FourCc> for EnvelopeCodec {
+    type Error = Error;
+
+    /// Decode a packet-envelope codec from its FourCC.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`] when the FourCC names no supported envelope codec.
+    fn try_from(fourcc: FourCc) -> Result<Self> {
         [Self::H264, Self::Hevc, Self::Aac]
             .into_iter()
-            .find(|codec| codec.fourcc() == fourcc)
+            .find(|&codec| FourCc::from(codec) == fourcc)
+            .ok_or_else(|| {
+                invalid_frame(crate::FrameDefect::UnknownEnvelopeCodec {
+                    fourcc: fourcc.raw(),
+                })
+            })
     }
 }
 
@@ -240,7 +259,7 @@ impl EnvelopeHeader {
         {
             return Err(invalid_frame(crate::FrameDefect::PacketHeaderUnsupported));
         }
-        if self.codec != codec.fourcc() {
+        if self.codec != FourCc::from(codec) {
             return Err(invalid_frame(crate::FrameDefect::PacketCodecMismatch));
         }
         if self.data_len == 0 {
@@ -389,7 +408,7 @@ impl<'a> PacketEnvelope<'a> {
             VERSION_OFFSET,
             &(ENVELOPE_HEADER_BYTES as i32).to_ne_bytes(),
         );
-        put(CODEC_OFFSET, &codec.fourcc().raw().to_ne_bytes());
+        put(CODEC_OFFSET, &FourCc::from(codec).raw().to_ne_bytes());
         put(PTS_OFFSET, &presentation_time.to_ne_bytes());
         put(DTS_OFFSET, &decode_time.to_ne_bytes());
         // The SDK delivers no AAC packet without the flag.
@@ -411,7 +430,7 @@ impl<'a> PacketEnvelope<'a> {
 
     /// The codec, when the header names one this module knows.
     pub fn codec(self) -> Option<EnvelopeCodec> {
-        EnvelopeCodec::from_fourcc(self.header.codec)
+        EnvelopeCodec::try_from(self.header.codec).ok()
     }
 
     /// The codec's FourCC exactly as the header carries it.
@@ -568,19 +587,15 @@ impl VideoPacketFormat {
         Self { frame_rate, ..self }
     }
 
-    /// The same format with picture aspect ratio `ratio` (width over height
-    /// of the displayed picture). `0.0` means square pixels, as the SDK
-    /// defines it; a receiver is then given the ratio of the frame's width to
-    /// its height.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidInput`] when the value is negative or not finite.
-    pub fn with_picture_aspect_ratio(self, ratio: f32) -> Result<Self> {
-        Ok(Self {
-            picture_aspect_ratio: PictureAspectRatio::new(ratio)?,
+    /// The same format with the validated displayed picture aspect ratio.
+    /// [`PictureAspectRatio::SQUARE_PIXELS`] asks the SDK to derive it from
+    /// the pixel dimensions.
+    #[must_use]
+    pub fn with_picture_aspect_ratio(self, ratio: PictureAspectRatio) -> Self {
+        Self {
+            picture_aspect_ratio: ratio,
             ..self
-        })
+        }
     }
 
     /// The same format on the program or preview stream.
@@ -622,8 +637,8 @@ impl VideoPacketFormat {
     }
 
     /// The picture aspect ratio; `0.0` means square pixels.
-    pub fn picture_aspect_ratio(self) -> f32 {
-        self.picture_aspect_ratio.get()
+    pub fn picture_aspect_ratio(self) -> PictureAspectRatio {
+        self.picture_aspect_ratio
     }
 
     /// The stream this format belongs to.
@@ -1172,7 +1187,7 @@ impl AudioCodec {
     /// The FourCC a frame of this codec is sent with.
     pub(crate) const fn outer(self, protected: bool) -> u32 {
         (match self {
-            Self::Aac => EnvelopeCodec::Aac.fourcc().raw(),
+            Self::Aac => EnvelopeCodec::Aac.raw_fourcc(),
             Self::Opus => fourcc(b"Opus"),
         }) | if protected { PROTECTED } else { 0 }
     }
@@ -1529,15 +1544,15 @@ const _: () = {
     );
 
     same_bits!(
-        EnvelopeCodec::H264.fourcc().raw(),
+        EnvelopeCodec::H264.raw_fourcc(),
         NDIlib_compressed_FourCC_type_e_NDIlib_compressed_FourCC_type_H264
     );
     same_bits!(
-        EnvelopeCodec::Hevc.fourcc().raw(),
+        EnvelopeCodec::Hevc.raw_fourcc(),
         NDIlib_compressed_FourCC_type_e_NDIlib_compressed_FourCC_type_HEVC
     );
     same_bits!(
-        EnvelopeCodec::Aac.fourcc().raw(),
+        EnvelopeCodec::Aac.raw_fourcc(),
         NDIlib_compressed_FourCC_type_e_NDIlib_compressed_FourCC_type_AAC
     );
 
@@ -1843,23 +1858,12 @@ mod tests {
             crate::FrameDefect::UnknownScanType { code: 0xFFFFFFFF }
         ));
         for ratio in [-1.0, f32::NAN, f32::INFINITY] {
-            let Err(Error::InvalidInput(packet)) = h264_format().with_picture_aspect_ratio(ratio)
-            else {
-                panic!("packet setter must retain InvalidInput")
-            };
-            let mut frame = crate::VideoFrame::builder()
-                .resolution(2, 1)
-                .build()
-                .unwrap();
-            let Err(Error::InvalidFrame(frame)) = frame.set_picture_aspect_ratio(ratio) else {
-                panic!("frame setter must retain InvalidFrame")
-            };
-            assert!(
-                matches!(packet, crate::InputDefect::Layout(crate::LayoutDefect::PictureAspectRatio(value)) if value.to_bits()==ratio.to_bits())
-            );
-            assert!(
-                matches!(frame, crate::FrameDefect::Layout(crate::LayoutDefect::PictureAspectRatio(value)) if value.to_bits()==ratio.to_bits())
-            );
+            assert!(matches!(
+                PictureAspectRatio::new(ratio),
+                Err(Error::InvalidInput(crate::InputDefect::Layout(
+                    crate::LayoutDefect::PictureAspectRatio(value)
+                ))) if value.to_bits() == ratio.to_bits()
+            ));
         }
     }
 
@@ -1869,7 +1873,7 @@ mod tests {
             PacketEnvelope::encode(EnvelopeCodec::H264, 12, -4, true, &[1, 2], &[3]).unwrap();
         let p = PacketEnvelope::parse(&bytes).unwrap();
         assert_eq!(p.codec(), Some(EnvelopeCodec::H264));
-        assert_eq!(p.fourcc(), EnvelopeCodec::H264.fourcc());
+        assert_eq!(p.fourcc(), FourCc::from(EnvelopeCodec::H264));
         assert_eq!(p.fourcc().raw().to_le_bytes(), *b"H264");
         assert_eq!(p.presentation_time(), 12);
         assert_eq!(p.decode_time(), -4);
@@ -1894,8 +1898,13 @@ mod tests {
         assert_eq!(p.codec(), None);
         assert_eq!(p.fourcc(), FourCc::from_raw(u32::from_ne_bytes(*b"AV01")));
         for codec in [EnvelopeCodec::H264, EnvelopeCodec::Hevc, EnvelopeCodec::Aac] {
-            assert_eq!(EnvelopeCodec::from_fourcc(codec.fourcc()), Some(codec));
+            assert_eq!(EnvelopeCodec::try_from(FourCc::from(codec)).unwrap(), codec);
         }
+        assert!(matches!(
+            EnvelopeCodec::try_from(p.fourcc()),
+            Err(Error::InvalidFrame(crate::FrameDefect::UnknownEnvelopeCodec { fourcc }))
+                if fourcc == p.fourcc().raw()
+        ));
     }
 
     #[test]
@@ -1981,20 +1990,16 @@ mod tests {
     #[test]
     fn a_zero_aspect_ratio_means_square_pixels_and_is_kept_when_received() {
         let format = h264_format();
-        assert_eq!(format.picture_aspect_ratio(), 0.0);
+        assert_eq!(
+            format.picture_aspect_ratio(),
+            PictureAspectRatio::SQUARE_PIXELS
+        );
         assert_eq!(
             format
-                .with_picture_aspect_ratio(0.0)
-                .unwrap()
+                .with_picture_aspect_ratio(PictureAspectRatio::SQUARE_PIXELS)
                 .picture_aspect_ratio(),
-            0.0
+            PictureAspectRatio::SQUARE_PIXELS
         );
-        for ratio in [-1.0, f32::NAN, f32::INFINITY] {
-            assert!(matches!(
-                format.with_picture_aspect_ratio(ratio),
-                Err(Error::InvalidInput(_))
-            ));
-        }
 
         // A received frame whose descriptor leaves the ratio unset is kept
         // as it is.
@@ -2002,14 +2007,20 @@ mod tests {
         let raw = frame.raw();
         assert_eq!(raw.picture_aspect_ratio, 0.0);
         let received = unsafe { copy_video_packet(&raw) }.unwrap();
-        assert_eq!(received.format().picture_aspect_ratio(), 0.0);
+        assert_eq!(
+            received.format().picture_aspect_ratio(),
+            PictureAspectRatio::SQUARE_PIXELS
+        );
 
         let wide = NDIlib_video_frame_v2_t {
             picture_aspect_ratio: 16.0 / 9.0,
             ..raw
         };
         let received = unsafe { copy_video_packet(&wide) }.unwrap();
-        assert_eq!(received.format().picture_aspect_ratio(), 16.0 / 9.0);
+        assert_eq!(
+            received.format().picture_aspect_ratio(),
+            PictureAspectRatio::new(16.0 / 9.0).unwrap()
+        );
 
         let negative = NDIlib_video_frame_v2_t {
             picture_aspect_ratio: -1.0,

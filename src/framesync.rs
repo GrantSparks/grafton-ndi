@@ -93,7 +93,9 @@ use crate::{
 /// `NDIlib_framesync_free_video`.
 /// This owning reference is neither `Send` nor `Sync`; its immutable plane/row
 /// views support scoped worker reads while it stays borrowed on this thread.
-pub type FrameSyncVideoRef<'fs> = VideoRef<'fs, FrameSyncVideoFree>;
+pub struct FrameSyncVideoRef<'fs> {
+    pub(crate) inner: VideoRef<'fs, FrameSyncVideoFree>,
+}
 
 /// A zero-copy borrowed audio frame from a [`FrameSync`] capture.
 ///
@@ -101,7 +103,9 @@ pub type FrameSyncVideoRef<'fs> = VideoRef<'fs, FrameSyncVideoFree>;
 /// and `Debug` implementation, and both always hold samples. The frame is
 /// automatically freed when dropped via `NDIlib_framesync_free_audio_v2`.
 /// This owning reference is neither `Send` nor `Sync`.
-pub type FrameSyncAudioRef<'fs> = AudioRef<'fs, FrameSyncAudioFree>;
+pub struct FrameSyncAudioRef<'fs> {
+    pub(crate) inner: AudioRef<'fs, FrameSyncAudioFree>,
+}
 
 /// The format of the audio a [`FrameSync`] is receiving, as reported by
 /// [`FrameSync::audio_input_format`].
@@ -159,7 +163,7 @@ impl AudioInputFormat {
 /// # use std::time::Duration;
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// # let ndi = Ndi::new()?;
-/// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("Test")))?;
+/// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("Test").unwrap()))?;
 /// let framesync = FrameSync::new(receiver)?;
 ///
 /// // Wait until the source's audio format is known.
@@ -250,7 +254,7 @@ impl FrameSyncAudioRequest {
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
-    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("Test")))?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("Test").unwrap()))?;
     /// let framesync = FrameSync::new(receiver)?;
     ///
     /// // Wait until the source's audio format is known.
@@ -313,7 +317,7 @@ impl FrameSyncAudioRequest {
 /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, FrameSyncAudioRequest, Source, SourceAddress, ScanType};
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// # let ndi = Ndi::new()?;
-/// # let source = Source::new("Test");
+/// # let source = Source::new("Test").unwrap();
 /// # let options = ReceiverOptions::new(source);
 /// # let receiver = Receiver::new(&ndi, &options)?;
 /// let framesync = FrameSync::new(receiver)?;
@@ -637,7 +641,7 @@ impl FrameSync {
     /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, Source, SourceAddress};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
-    /// # let source = Source::new("Test");
+    /// # let source = Source::new("Test").unwrap();
     /// # let options = ReceiverOptions::new(source);
     /// let receiver = Receiver::new(&ndi, &options)?;
     /// let framesync = FrameSync::new(receiver)?;
@@ -682,7 +686,7 @@ impl FrameSync {
     /// synchronization can consume status notifications, so this receiver has
     /// no event polling. Query capabilities with `ptz().is_supported()`,
     /// `web_control_url()` and Advanced KVM's `is_supported()`; observe the
-    /// source with `poll_source_name_change()` and connection state with
+    /// source with `wait_for_source_name_change()` and connection state with
     /// `is_connected()` or `connection_stats()`.
     /// Tally control publishes state upstream; it does not query incoming tally.
     /// Local connection changes may run while FrameSync captures; the native
@@ -697,7 +701,7 @@ impl FrameSync {
     /// ```compile_fail,E0277
     /// use grafton_ndi::FrameSync;
     /// fn capture(framesync: &FrameSync) {
-    ///     let _ = framesync.receiver().audio();
+    ///     let _ = framesync.receiver().capture_audio(std::time::Duration::ZERO);
     /// }
     /// ```
     pub fn receiver(&self) -> &Receiver<FrameSyncAttached> {
@@ -791,7 +795,7 @@ impl FrameSync {
     /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, Source, SourceAddress, ScanType};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
-    /// # let source = Source::new("Test");
+    /// # let source = Source::new("Test").unwrap();
     /// # let options = ReceiverOptions::new(source);
     /// # let receiver = Receiver::new(&ndi, &options)?;
     /// let framesync = FrameSync::new(receiver)?;
@@ -880,7 +884,7 @@ impl FrameSync {
     /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, FrameSyncAudioRequest, Source, SourceAddress};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
-    /// # let source = Source::new("Test");
+    /// # let source = Source::new("Test").unwrap();
     /// # let options = ReceiverOptions::new(source);
     /// # let receiver = Receiver::new(&ndi, &options)?;
     /// let framesync = FrameSync::new(receiver)?;
@@ -938,7 +942,7 @@ impl FrameSync {
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
-    /// # let source = Source::new("Test");
+    /// # let source = Source::new("Test").unwrap();
     /// # let options = ReceiverOptions::new(source);
     /// # let receiver = Receiver::new(&ndi, &options)?;
     /// let framesync = FrameSync::new(receiver)?;
@@ -996,7 +1000,7 @@ impl FrameSync {
     /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, Source};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
-    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("Test")))?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("Test").unwrap()))?;
     /// let framesync = FrameSync::new(receiver)?;
     ///
     /// match framesync.audio_input_format()? {
@@ -1038,7 +1042,7 @@ impl FrameSync {
     /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, Source, SourceAddress};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
-    /// # let source = Source::new("Test");
+    /// # let source = Source::new("Test").unwrap();
     /// # let options = ReceiverOptions::new(source);
     /// # let receiver = Receiver::new(&ndi, &options)?;
     /// let framesync = FrameSync::new(receiver)?;
@@ -1147,8 +1151,11 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver =
-            Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
+        let receiver = Receiver::new(
+            &ndi,
+            &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
+        )
+        .unwrap();
         let sync = FrameSync::new(receiver).unwrap();
         audio_test_calls::take_queries();
         assert_eq!(
@@ -1172,8 +1179,11 @@ mod tests {
         let Some(ndi) = crate::test_support::advanced_ndi() else {
             return;
         };
-        let receiver =
-            Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
+        let receiver = Receiver::new(
+            &ndi,
+            &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
+        )
+        .unwrap();
         let mut sync = FrameSync::new(receiver).unwrap();
         let original = (sync.resource.instance, sync.receiver.core.instance.0);
         let (results, allocations) = crate::test_alloc::allocation_count(|| {
@@ -1203,14 +1213,16 @@ mod tests {
             return;
         };
         let events = track(|| {
-            let receiver =
-                Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
+            let receiver = Receiver::new(
+                &ndi,
+                &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
+            )
+            .unwrap();
             let sync = FrameSync::new(receiver).unwrap();
             let receiver = sync.into_receiver();
             assert_eq!(snapshot(), ["framesync"]);
             assert!(receiver
-                .video()
-                .capture(std::time::Duration::ZERO)
+                .capture_video(std::time::Duration::ZERO)
                 .unwrap()
                 .is_none());
             drop(receiver);
@@ -1227,8 +1239,11 @@ mod tests {
         let events = track(|| {
             let make = || {
                 FrameSync::new(
-                    Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new("")))
-                        .unwrap(),
+                    Receiver::new(
+                        &ndi,
+                        &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
+                    )
+                    .unwrap(),
                 )
                 .unwrap()
             };
@@ -1266,9 +1281,11 @@ mod tests {
         for recover in [false, true] {
             let events = track(|| {
                 let ndi = runtime.clone();
-                let mut receiver =
-                    Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new("")))
-                        .unwrap();
+                let mut receiver = Receiver::new(
+                    &ndi,
+                    &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
+                )
+                .unwrap();
                 let original = receiver.core.instance.0;
                 drop(ndi);
                 for _ in 0..3 {
@@ -1276,7 +1293,7 @@ mod tests {
                     assert_eq!(fs.receiver().core.instance.0, original);
                     receiver = fs.into_receiver();
                     assert_eq!(receiver.core.instance.0, original);
-                    assert!(receiver.video().capture(std::time::Duration::ZERO).is_ok());
+                    assert!(receiver.capture_video(std::time::Duration::ZERO).is_ok());
                 }
                 let fs = FrameSync::new(receiver).unwrap();
                 if recover {
@@ -1298,8 +1315,11 @@ mod tests {
         }
         let events = track(|| {
             let ndi = runtime.clone();
-            let receiver =
-                Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
+            let receiver = Receiver::new(
+                &ndi,
+                &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
+            )
+            .unwrap();
             drop(ndi);
             let rejected = match FrameSync::new_with(receiver, |_| {
                 crate::sys::table::for_test(ptr::null_mut(), c"NDIlib_framesync_create")
@@ -1314,7 +1334,7 @@ mod tests {
             ));
             // The receiver comes back usable, and is dropped exactly once.
             let receiver = rejected.into_inner();
-            assert!(receiver.video().capture(std::time::Duration::ZERO).is_ok());
+            assert!(receiver.capture_video(std::time::Duration::ZERO).is_ok());
         });
         assert_eq!(events, ["receiver"]);
     }
@@ -1360,8 +1380,11 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver =
-            Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
+        let receiver = Receiver::new(
+            &ndi,
+            &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
+        )
+        .unwrap();
         let fs = FrameSync::new(receiver).unwrap();
         audio_test_calls::take();
         for (channels, samples) in [

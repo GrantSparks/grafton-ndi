@@ -7,8 +7,8 @@ use super::{
     aliasable::AliasableVec,
     invalid_frame,
     packets::{frame_extras_accessors, AudioParameters, FrameExtras},
-    AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, VideoPacketFormat,
-    MAX_PACKET_BYTES,
+    AdvancedConfig, AudioCodec, CompressedAttached, CompressedAudioFrame, CompressedAudioSendMode,
+    CompressedVideoFrame, VideoPacketFormat, MAX_PACKET_BYTES,
 };
 use crate::{
     sender::in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans, Synchronized},
@@ -16,8 +16,7 @@ use crate::{
         advanced::{native, ScatterSend},
         bindings::*,
     },
-    CompressedAttached, CompressedAudioSendMode, Ndi, Rejected, Result, Sender, SenderOptions,
-    StreamTier,
+    Ndi, Rejected, Result, Sender, SenderOptions, StreamTier,
 };
 
 #[cfg(any(test, ndi_has_advanced_scatter_send))]
@@ -440,9 +439,9 @@ impl ScatterAudioFrame {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum SubmittedVideo {
-    /// A frame submitted with [`CompressedSender::send_video_async`].
+    /// A frame submitted with [`CompressedSender::submit_video`].
     Contiguous(CompressedVideoFrame),
-    /// A frame submitted with [`CompressedSender::send_scatter_video_async`].
+    /// A frame submitted with [`CompressedSender::submit_scatter_video`].
     Scatter(ScatterVideoFrame),
 }
 
@@ -484,9 +483,9 @@ pub struct ReclaimedVideo {
 /// The entry owns all of these, so nothing can read the frame's bytes while
 /// the SDK may still write to them.
 pub(crate) enum PendingVideo {
-    /// A frame submitted with [`CompressedSender::send_video_async`].
+    /// A frame submitted with [`CompressedSender::submit_video`].
     Contiguous(CompressedVideoFrame),
-    /// A frame submitted with [`CompressedSender::send_scatter_video_async`].
+    /// A frame submitted with [`CompressedSender::submit_scatter_video`].
     #[cfg(ndi_has_advanced_scatter_send)]
     Scatter {
         frame: ScatterVideoFrame,
@@ -646,7 +645,7 @@ impl Loans for PendingStreams {
 /// directions, tally, connections, failover, and the Advanced encoder
 /// guidance, keyframe and tally controls) but none of the uncompressed sends,
 /// and which cannot be registered with a
-/// [`SendAdvertiser`](crate::discovery::SendAdvertiser).
+/// [`SendAdvertiser`](crate::discovery_server::SendAdvertiser).
 ///
 /// # Threading
 ///
@@ -661,7 +660,7 @@ impl Loans for PendingStreams {
 /// exclusively and an asynchronous one takes it, so no reference to a frame's
 /// bytes exists while the SDK may change them, and a frame can be sent again
 /// afterwards.
-/// [`finish_video_async`](Self::finish_video_async) waits for pending video
+/// [`reclaim_video`](Self::reclaim_video) waits for pending video
 /// and returns both streams' frames while keeping the source available.
 ///
 /// ```compile_fail,E0502
@@ -741,8 +740,10 @@ impl CompressedSender {
         })
     }
 
-    /// The sender this value sends through, for the operations that do not
-    /// send video or audio: [`source`](Sender::source),
+    /// The sender this value sends through, for compressed audio and the
+    /// operations that do not send video: [`source`](Sender::source),
+    /// [`send_compressed_audio`](Sender::send_compressed_audio),
+    /// [`send_scatter_audio`](Sender::send_scatter_audio),
     /// [`send_metadata`](Sender::send_metadata) and
     /// [`capture_metadata`](Sender::capture_metadata),
     /// [`tally`](Sender::tally), [`connection_count`](Sender::connection_count),
@@ -759,9 +760,11 @@ impl CompressedSender {
 
     /// Lend video and audio operations to separate scoped threads.
     ///
-    /// Video keeps exclusive access to the pending streams. Each half is
-    /// `Send`, but neither `Sync` nor `Clone`, and neither outlives this owner.
-    pub fn split(&mut self) -> (CompressedVideo<'_>, CompressedAudio<'_>) {
+    /// Video keeps exclusive access to the pending streams and is `Send`
+    /// but neither `Sync` nor `Clone`. The shared sender supports compressed
+    /// audio, metadata and controls and is `Send + Sync`. Both halves borrow
+    /// this owner.
+    pub fn split(&mut self) -> (CompressedVideo<'_>, &Sender<CompressedAttached>) {
         let pair = self.lending.parts();
         let sender = pair.sender();
         (
@@ -769,10 +772,7 @@ impl CompressedSender {
                 pair,
                 _not_sync: std::marker::PhantomData,
             },
-            CompressedAudio {
-                sender,
-                _not_sync: std::marker::PhantomData,
-            },
+            sender,
         )
     }
 
@@ -790,8 +790,8 @@ impl CompressedSender {
     /// stream, and returns the frame that this one replaces. The call can
     /// still block while the SDK applies back-pressure.
     #[doc(alias = "NDIlib_send_send_video_async_v2")]
-    pub fn send_video_async(&mut self, frame: CompressedVideoFrame) -> Option<SubmittedVideo> {
-        self.split().0.send_video_async(frame)
+    pub fn submit_video(&mut self, frame: CompressedVideoFrame) -> Option<SubmittedVideo> {
+        self.split().0.submit_video(frame)
     }
 
     /// Drain asynchronous video and return both streams' final frames.
@@ -802,16 +802,8 @@ impl CompressedSender {
     /// returns `None`. Finishing an empty sender makes no native call.
     /// Reclamation does not report whether receivers received the frames.
     #[doc(alias = "NDIlib_send_send_video_async_v2")]
-    pub fn finish_video_async(&mut self) -> ReclaimedVideo {
-        self.split().0.finish_video_async()
-    }
-
-    /// Send an audio frame and return when the SDK has finished with it.
-    ///
-    /// The frame is borrowed exclusively because the SDK writes to its bytes.
-    #[doc(alias = "NDIlib_send_send_audio_v3")]
-    pub fn send_audio(&mut self, frame: &mut CompressedAudioFrame) {
-        self.split().1.send_audio(frame)
+    pub fn reclaim_video(&mut self) -> ReclaimedVideo {
+        self.split().0.reclaim_video()
     }
 
     /// Send a video frame held in several blocks and return when the SDK has
@@ -829,31 +821,17 @@ impl CompressedSender {
     }
 
     /// Submit a video frame held in several blocks without waiting for it to
-    /// be sent; see [`send_video_async`](Self::send_video_async).
+    /// be sent; see [`submit_video`](Self::submit_video).
     ///
     /// # Errors
     ///
     /// Returns the frame when the runtime has no scatter sending.
     #[doc(alias = "NDIlib_send_send_video_scatter_async")]
-    pub fn send_scatter_video_async(
+    pub fn submit_scatter_video(
         &mut self,
         frame: ScatterVideoFrame,
     ) -> std::result::Result<Option<SubmittedVideo>, Rejected<ScatterVideoFrame>> {
-        self.split().0.send_scatter_video_async(frame)
-    }
-
-    /// Send an audio frame held in several blocks and return when the SDK has
-    /// finished with it.
-    ///
-    /// The frame is borrowed exclusively because the SDK writes to its blocks.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
-    /// when the runtime has no scatter sending.
-    #[doc(alias = "NDIlib_send_send_audio_scatter")]
-    pub fn send_scatter_audio(&mut self, frame: &mut ScatterAudioFrame) -> Result<()> {
-        self.split().1.send_scatter_audio(frame)
+        self.split().0.submit_scatter_video(frame)
     }
 
     /// Destroy the sender and take back the frames it still held.
@@ -872,15 +850,6 @@ impl CompressedSender {
 /// owner when the view is dropped; closing or dropping the owner drains them.
 pub struct CompressedVideo<'a> {
     pair: LoanPair<'a, CompressedAttached, &'a mut PendingStreams>,
-    _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
-}
-
-/// Audio operations and shared controls borrowed from a [`CompressedSender`].
-///
-/// It is `Send`, but neither `Sync` nor `Clone`, and may run on a scoped thread
-/// separately from the video half.
-pub struct CompressedAudio<'a> {
-    sender: &'a Sender<CompressedAttached>,
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
@@ -903,15 +872,15 @@ impl CompressedVideo<'_> {
         };
     }
 
-    /// See [`CompressedSender::send_video_async`].
+    /// See [`CompressedSender::submit_video`].
     #[doc(alias = "NDIlib_send_send_video_async_v2")]
-    pub fn send_video_async(&mut self, frame: CompressedVideoFrame) -> Option<SubmittedVideo> {
+    pub fn submit_video(&mut self, frame: CompressedVideoFrame) -> Option<SubmittedVideo> {
         self.pair.submit_pending(frame)
     }
 
-    /// See [`CompressedSender::finish_video_async`].
+    /// See [`CompressedSender::reclaim_video`].
     #[doc(alias = "NDIlib_send_send_video_async_v2")]
-    pub fn finish_video_async(&mut self) -> ReclaimedVideo {
+    pub fn reclaim_video(&mut self) -> ReclaimedVideo {
         self.pair.finish()
     }
 
@@ -935,40 +904,17 @@ impl CompressedVideo<'_> {
         })
     }
 
-    /// See [`CompressedSender::send_scatter_video_async`].
+    /// See [`CompressedSender::submit_scatter_video`].
     ///
     /// # Errors
     ///
-    /// As for [`CompressedSender::send_scatter_video_async`].
+    /// As for [`CompressedSender::submit_scatter_video`].
     #[doc(alias = "NDIlib_send_send_video_scatter_async")]
-    pub fn send_scatter_video_async(
+    pub fn submit_scatter_video(
         &mut self,
         frame: ScatterVideoFrame,
     ) -> std::result::Result<Option<SubmittedVideo>, Rejected<ScatterVideoFrame>> {
         self.pair.submit_scatter(frame)
-    }
-}
-
-impl CompressedAudio<'_> {
-    /// The shared metadata, source, tally, connection and encoder controls.
-    pub fn sender(&self) -> &Sender<CompressedAttached> {
-        self.sender
-    }
-
-    /// See [`CompressedSender::send_audio`].
-    #[doc(alias = "NDIlib_send_send_audio_v3")]
-    pub fn send_audio(&mut self, frame: &mut CompressedAudioFrame) {
-        self.sender.send_compressed_audio(frame);
-    }
-
-    /// See [`CompressedSender::send_scatter_audio`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`CompressedSender::send_scatter_audio`].
-    #[doc(alias = "NDIlib_send_send_audio_scatter")]
-    pub fn send_scatter_audio(&mut self, frame: &mut ScatterAudioFrame) -> Result<()> {
-        self.sender.send_scatter_audio(frame)
     }
 }
 
@@ -1027,14 +973,6 @@ impl std::fmt::Debug for CompressedVideo<'_> {
     }
 }
 
-impl std::fmt::Debug for CompressedAudio<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompressedAudio")
-            .field("sender", self.sender)
-            .finish_non_exhaustive()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,11 +995,10 @@ mod tests {
         .unwrap();
         let mut frame =
             CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64]).unwrap();
-        let ((_video, mut audio), allocations) =
-            crate::test_alloc::allocation_count(|| sender.split());
+        let ((_video, audio), allocations) = crate::test_alloc::allocation_count(|| sender.split());
         assert_eq!(allocations, 0);
         let ((), allocations) =
-            crate::test_alloc::allocation_count(|| audio.send_audio(&mut frame));
+            crate::test_alloc::allocation_count(|| audio.send_compressed_audio(&mut frame));
         assert_eq!(allocations, 0);
     }
 
@@ -1074,7 +1011,7 @@ mod tests {
             &ndi,
             &SenderOptions::new(crate::test_support::unique_name("queued-compressed-audio"))
                 .clock_audio(false),
-            super::super::QueueOptions::default(),
+            &super::super::QueueLimits::default(),
         )
         .unwrap();
         let mut frame =
@@ -1467,17 +1404,17 @@ mod tests {
         let original_list = first.storage.descriptor();
         sender.send_scatter_video(&mut first).unwrap();
         assert_eq!(first.storage.descriptor(), original_list);
-        sender.send_scatter_video_async(first).unwrap();
+        sender.submit_scatter_video(first).unwrap();
         let program = list(&sender.lending.loans().program);
         assert_eq!(program, original_list);
         sender
-            .send_scatter_video_async(make(StreamTier::Preview))
+            .submit_scatter_video(make(StreamTier::Preview))
             .unwrap();
         let preview = list(&sender.lending.loans().preview);
         assert_ne!(program, preview);
         let replacement = make(StreamTier::Program);
         let (returned, allocations) =
-            crate::test_alloc::allocation_count(|| sender.send_scatter_video_async(replacement));
+            crate::test_alloc::allocation_count(|| sender.submit_scatter_video(replacement));
         assert_eq!(allocations, 0);
         let SubmittedVideo::Scatter(returned_program) = returned.unwrap().unwrap() else {
             panic!("scatter")
@@ -1489,7 +1426,7 @@ mod tests {
         assert_eq!(list(&sender.lending.loans().preview), preview);
         let replacement = make(StreamTier::Preview);
         let (returned, allocations) =
-            crate::test_alloc::allocation_count(|| sender.send_scatter_video_async(replacement));
+            crate::test_alloc::allocation_count(|| sender.submit_scatter_video(replacement));
         let SubmittedVideo::Scatter(returned_preview) = returned.unwrap().unwrap() else {
             panic!("scatter")
         };
@@ -1497,18 +1434,18 @@ mod tests {
         let next_preview = list(&sender.lending.loans().preview);
         assert_ne!(next_preview, preview);
         assert_ne!(next_preview, next_program);
-        sender.send_scatter_video_async(returned_program).unwrap();
+        sender.submit_scatter_video(returned_program).unwrap();
         assert_eq!(list(&sender.lending.loans().program), program);
         assert_eq!(list(&sender.lending.loans().preview), next_preview);
         // The recovered frame keeps its original list even across a
         // contiguous replacement and a later asynchronous submission.
         sender
-            .send_video_async(
+            .submit_video(
                 CompressedVideoFrame::new(format.with_tier(StreamTier::Preview), bytes.clone())
                     .unwrap(),
             )
             .unwrap();
-        sender.send_scatter_video_async(returned_preview).unwrap();
+        sender.submit_scatter_video(returned_preview).unwrap();
         assert_eq!(list(&sender.lending.loans().preview), preview);
         let reclaimed = sender.close();
         assert!(reclaimed.program.is_some());
@@ -1559,17 +1496,17 @@ mod tests {
                         let frame =
                             ScatterVideoFrame::new(format, vec![vec![1; 16], vec![2; 8]]).unwrap();
                         let pointer = frame.blocks().next().unwrap().as_ptr();
-                        assert!(sender.send_scatter_video_async(frame).unwrap().is_none());
+                        assert!(sender.submit_scatter_video(frame).unwrap().is_none());
                         pointer
                     } else {
                         let frame = CompressedVideoFrame::new(format, vec![1; 16]).unwrap();
                         let pointer = frame.data().as_ptr();
-                        assert!(sender.send_video_async(frame).is_none());
+                        assert!(sender.submit_video(frame).is_none());
                         pointer
                     });
                 }
                 let (reclaimed, allocations) =
-                    crate::test_alloc::allocation_count(|| sender.finish_video_async());
+                    crate::test_alloc::allocation_count(|| sender.reclaim_video());
                 assert_eq!(allocations, 0);
                 for (returned, expected) in [reclaimed.program, reclaimed.preview]
                     .into_iter()
@@ -1587,7 +1524,7 @@ mod tests {
                     });
                     assert_eq!(pointer, expected);
                 }
-                let empty = sender.split().0.finish_video_async();
+                let empty = sender.split().0.reclaim_video();
                 assert!(empty.program.is_none() && empty.preview.is_none());
                 let closed = sender.close();
                 assert!(closed.program.is_none() && closed.preview.is_none());
@@ -1610,12 +1547,12 @@ mod tests {
         let mut sender = CompressedSender::new(&ndi, &options).unwrap();
         let program = make(StreamTier::Program);
         let program_data = program.data().as_ptr();
-        assert!(sender.send_video_async(program).is_none());
+        assert!(sender.submit_video(program).is_none());
         // A preview submission leaves the program frame in flight.
-        let preview = sender.send_video_async(make(StreamTier::Preview));
+        let preview = sender.submit_video(make(StreamTier::Preview));
         assert!(preview.is_none());
         assert!(sender.lending.loans().program.is_in_flight());
-        let returned = sender.send_video_async(make(StreamTier::Program)).unwrap();
+        let returned = sender.submit_video(make(StreamTier::Program)).unwrap();
         let SubmittedVideo::Contiguous(returned) = returned else {
             panic!("a contiguous frame was submitted");
         };

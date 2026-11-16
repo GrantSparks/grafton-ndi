@@ -11,7 +11,7 @@ use std::{
 
 fn loopback_source(ndi: &crate::Ndi, sender: &Sender) -> Source {
     let name = sender.source().unwrap().name().to_owned();
-    let finder = Finder::new(ndi, &FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
+    let finder = Finder::new(ndi, &FinderOptions::new().extra_ips(["127.0.0.1"])).unwrap();
     let source = finder
         .find_source(Duration::from_secs(15), |source| {
             source.name() == name && source.address().is_some_and(|address| !address.is_url())
@@ -23,7 +23,7 @@ fn loopback_source(ndi: &crate::Ndi, sender: &Sender) -> Source {
         .unwrap()
         .port()
         .expect("an advertised port");
-    source.with_address(SourceAddress::new(format!("127.0.0.1:{port}")))
+    source.with_address(SourceAddress::new(format!("127.0.0.1:{port}")).unwrap())
 }
 
 struct Publishing {
@@ -81,16 +81,16 @@ async fn cancelled_query_releases_before_connecting<R: AsyncRuntime>(runtime: &s
     let source = loopback_source(&ndi, &sender);
     let _publishing = Publishing::start(sender);
     let receiver = AsyncReceiver::<R>::new(
-        Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap(),
+        Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
     );
     while receiver
-        .poll_source_name_change(Duration::ZERO)
+        .wait_for_source_name_change(Duration::ZERO)
         .await
         .unwrap()
         .is_some()
     {}
 
-    let mut abandoned = Box::pin(receiver.poll_source_name_change(Duration::from_secs(4)));
+    let mut abandoned = Box::pin(receiver.wait_for_source_name_change(Duration::from_secs(4)));
     let mut context = Context::from_waker(Waker::noop());
     assert!(matches!(
         abandoned.as_mut().poll(&mut context),
@@ -111,13 +111,12 @@ async fn cancelled_query_releases_before_connecting<R: AsyncRuntime>(runtime: &s
     }
     // A sole Arc proves the old worker fully released this SAME receiver.
     // No connection or source-name change was requested before this point.
-    receiver.receiver().connect_to(&source).unwrap();
+    receiver.receiver().connect_to(&source);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if receiver
             .receiver()
-            .video()
-            .capture_ref(Duration::from_millis(100))
+            .capture_video_ref(Duration::from_millis(100))
             .unwrap()
             .is_some()
         {
@@ -132,7 +131,7 @@ async fn cancelled_query_releases_before_connecting<R: AsyncRuntime>(runtime: &s
     // the separate source-name query's one-shot change.
     assert_eq!(
         receiver
-            .poll_source_name_change(Duration::from_secs(3))
+            .wait_for_source_name_change(Duration::from_secs(3))
             .await
             .unwrap(),
         Some(SourceNameChange::Connected(source.name().to_owned())),

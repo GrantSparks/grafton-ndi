@@ -1,7 +1,7 @@
 error[E0599]: no method named `connect_to` found for struct `KvmReceiver<'a, M>` in the current scope
  --> tests/ui/advanced/fail/kvm_attached_connection_changes.rs:8:24
   |
-8 |     session.receiver().connect_to(next).unwrap();
+8 |     session.receiver().connect_to(next);
   |                        ^^^^^^^^^^ method not found in `KvmReceiver<'_, FrameSyncAttached>`
 
 error[E0599]: no method named `disconnect` found for struct `KvmReceiver<'a, M>` in the current scope
@@ -19,13 +19,13 @@ help: there is a method `is_connected` with a similar name
 error[E0599]: no method named `reconnect` found for struct `KvmReceiver<'a, M>` in the current scope
   --> tests/ui/advanced/fail/kvm_attached_connection_changes.rs:18:24
    |
-18 |     session.receiver().reconnect().unwrap();
+18 |     session.receiver().reconnect();
    |                        ^^^^^^^^^ method not found in `KvmReceiver<'_, PacketAttached>`
 
 error[E0599]: no method named `connect_to` found for struct `KvmReceiver<'a, M>` in the current scope
   --> tests/ui/advanced/fail/kvm_attached_connection_changes.rs:23:24
    |
-23 |     session.receiver().connect_to(next).unwrap();
+23 |     session.receiver().connect_to(next);
    |                        ^^^^^^^^^^ method not found in `KvmReceiver<'_>`
 
 error[E0599]: no method named `disconnect` found for struct `KvmReceiver<'a, M>` in the current scope

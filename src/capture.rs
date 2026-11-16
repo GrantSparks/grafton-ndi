@@ -38,9 +38,7 @@
 use std::{marker::PhantomData, rc::Rc};
 
 use crate::{
-    frames::{
-        AudioFrame, AudioFrameRef, MetadataFrame, MetadataFrameRef, VideoFrame, VideoFrameRef,
-    },
+    frames::{AudioFrameRef, MetadataFrameRef, VideoFrameRef},
     receiver::CaptureLock,
     sys::{self, bindings::*},
     Error, Ndi, Result,
@@ -54,6 +52,7 @@ mod sealed {
     impl Sealed for super::VideoKind {}
     impl Sealed for super::AudioKind {}
     impl Sealed for super::MetadataKind {}
+    impl Sealed for super::SenderMetadataFree {}
     impl Sealed for super::FrameSyncVideoFree {}
     impl Sealed for super::FrameSyncAudioFree {}
     #[cfg(feature = "advanced")]
@@ -110,23 +109,19 @@ pub(crate) unsafe trait FrameFree: sealed::Sealed + 'static {
 #[cfg(test)]
 type TestFrameFree<S> = unsafe fn(<S as FrameFree>::Instance, &mut <S as FrameFree>::RawFrame);
 
-/// A sealed receiver capture kind with its borrowed and owned frame types.
+/// A sealed receiver capture kind with its borrowed frame type.
 ///
 /// Implemented for [`VideoKind`], [`AudioKind`], and [`MetadataKind`]. Raw SDK
-/// routing, freeing and copying are private implementation details. Generic
-/// callers use [`crate::Capture`] with this trait: its
-/// [`capture_ref`](crate::Capture::capture_ref) yields `K::Ref<'_>` and its
-/// [`capture`](crate::Capture::capture) `K::Owned`.
+/// routing, freeing and copying are private implementation details. The receiver kernels
+/// use this trait to select the borrowed result type.
 ///
 /// Receiver frame references implement `Send + Sync` and can move to scoped
 /// worker threads while borrowing their receiver. FrameSync references use
 /// separate private strategies and remain thread-affine.
 #[allow(private_bounds)]
-pub trait CaptureKind: CaptureStrategy + Sized {
+pub(crate) trait CaptureKind: CaptureStrategy + Sized {
     /// A zero-copy captured frame borrowing the receiver.
     type Ref<'rx>;
-    /// An owned frame that can outlive the receiver.
-    type Owned;
 }
 
 /// Private SDK routing paired with the corresponding free strategy.
@@ -146,17 +141,11 @@ pub(crate) trait CaptureStrategy:
     fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>>
     where
         Self: CaptureKind;
-
-    /// Copy a borrowed view into an owned frame. A view that `make_ref`
-    /// validated always copies.
-    fn ref_to_owned(frame: &<Self as CaptureKind>::Ref<'_>) -> <Self as CaptureKind>::Owned
-    where
-        Self: CaptureKind;
 }
 
 /// Marker type for video frame capture operations.
 #[derive(Debug)]
-pub struct VideoKind;
+pub(crate) struct VideoKind;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
 // matching NDIlib_recv_free_video_v2 release through the owning runtime.
@@ -172,7 +161,6 @@ unsafe impl FrameFree for VideoKind {
 
 impl CaptureKind for VideoKind {
     type Ref<'rx> = VideoFrameRef<'rx>;
-    type Owned = VideoFrame;
 }
 
 impl CaptureStrategy for VideoKind {
@@ -185,15 +173,11 @@ impl CaptureStrategy for VideoKind {
     fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
         VideoFrameRef::new(guard)
     }
-
-    fn ref_to_owned(frame: &VideoFrameRef<'_>) -> VideoFrame {
-        frame.to_owned()
-    }
 }
 
 /// Marker type for audio frame capture operations.
 #[derive(Debug)]
-pub struct AudioKind;
+pub(crate) struct AudioKind;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
 // matching NDIlib_recv_free_audio_v3 release through the owning runtime.
@@ -209,7 +193,6 @@ unsafe impl FrameFree for AudioKind {
 
 impl CaptureKind for AudioKind {
     type Ref<'rx> = AudioFrameRef<'rx>;
-    type Owned = AudioFrame;
 }
 
 impl CaptureStrategy for AudioKind {
@@ -222,15 +205,11 @@ impl CaptureStrategy for AudioKind {
     fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
         AudioFrameRef::new(guard)
     }
-
-    fn ref_to_owned(frame: &AudioFrameRef<'_>) -> AudioFrame {
-        frame.to_owned()
-    }
 }
 
 /// Marker type for metadata frame capture operations.
 #[derive(Debug)]
-pub struct MetadataKind;
+pub(crate) struct MetadataKind;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
 // matching NDIlib_recv_free_metadata release through the owning runtime.
@@ -246,7 +225,6 @@ unsafe impl FrameFree for MetadataKind {
 
 impl CaptureKind for MetadataKind {
     type Ref<'rx> = MetadataFrameRef<'rx>;
-    type Owned = MetadataFrame;
 }
 
 impl CaptureStrategy for MetadataKind {
@@ -259,17 +237,54 @@ impl CaptureStrategy for MetadataKind {
     fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
         MetadataFrameRef::new(guard)
     }
+}
 
-    fn ref_to_owned(frame: &MetadataFrameRef<'_>) -> MetadataFrame {
-        frame.to_owned()
+/// Free strategy for upstream metadata captured by a sender.
+#[derive(Debug)]
+pub(crate) struct SenderMetadataFree;
+
+/// The sender and authorized optional table that produced one metadata loan.
+#[derive(Clone, Copy)]
+pub(crate) struct SenderMetadataInstance {
+    pub(crate) instance: NDIlib_send_instance_t,
+    pub(crate) metadata: &'static sys::SenderMetadata,
+}
+
+// SAFETY: this strategy releases only the metadata descriptor returned by
+// NDIlib_send_capture through the same sender instance and authorized table.
+unsafe impl FrameFree for SenderMetadataFree {
+    type Instance = SenderMetadataInstance;
+    type RawFrame = NDIlib_metadata_frame_t;
+    const REF_DEBUG_NAME: &'static str = "MetadataFrameRef";
+
+    unsafe fn free(_core: &sys::Core, instance: Self::Instance, frame: &mut Self::RawFrame) {
+        instance
+            .metadata
+            .NDIlib_send_free_metadata(instance.instance, frame);
     }
 }
+
+/// The single inventory of typed receiver capture operations, consumed by the
+/// ordinary, KVM and async surfaces so their kinds and names stay in step.
+macro_rules! capture_method_kinds {
+    ($generate:ident) => {
+        $generate! {
+            (VideoMode, VideoKind, VideoFrame, VideoFrameRef,
+                capture_video, capture_video_ref, capture_video_with, "video"),
+            (AudioMode, AudioKind, AudioFrame, AudioFrameRef,
+                capture_audio, capture_audio_ref, capture_audio_with, "audio"),
+            (MetadataMode, MetadataKind, MetadataFrame, MetadataFrameRef,
+                capture_metadata, capture_metadata_ref, capture_metadata_with, "metadata"),
+        }
+    };
+}
+pub(crate) use capture_method_kinds;
 
 /// Free strategy for video frames captured through [`FrameSync`](crate::FrameSync).
 ///
 /// Frees via `NDIlib_framesync_free_video`.
 #[derive(Debug)]
-pub struct FrameSyncVideoFree;
+pub(crate) struct FrameSyncVideoFree;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
 // matching NDIlib_framesync_free_video release through the owning runtime.
@@ -287,7 +302,7 @@ unsafe impl FrameFree for FrameSyncVideoFree {
 ///
 /// Frees via `NDIlib_framesync_free_audio_v2`.
 #[derive(Debug)]
-pub struct FrameSyncAudioFree;
+pub(crate) struct FrameSyncAudioFree;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
 // matching NDIlib_framesync_free_audio_v2 release through the owning runtime.
@@ -307,7 +322,7 @@ unsafe impl FrameFree for FrameSyncAudioFree {
 /// Free strategy for audio borrowed from [`AvSync`](crate::advanced::AvSync).
 #[cfg(feature = "advanced")]
 #[derive(Debug)]
-pub struct AvSyncAudioFree;
+pub(crate) struct AvSyncAudioFree;
 
 /// The native owner and already-authorized table of one AV-sync audio loan.
 #[cfg(feature = "advanced")]
@@ -386,7 +401,7 @@ unsafe impl FrameFree for AvSyncAudioFree {
 /// described by the frame, unchanged until matching release. Empty descriptors
 /// may have null pointers. Only `new` and the test-only `with_test_free` create
 /// guards; safe borrowed views rely on this invariant.
-pub struct Guard<'owner, S: FrameFree> {
+pub(crate) struct Guard<'owner, S: FrameFree> {
     instance: S::Instance,
     frame: S::RawFrame,
     // The release names the strategy only in unit tests, whose synthetic
@@ -438,7 +453,12 @@ impl<'owner, S: FrameFree> Guard<'owner, S> {
     ///   or channel samples are initialized, and metadata is readable through
     ///   its first NUL or `MAX_METADATA_BYTES`. Standalone metadata with a
     ///   positive declared length retains that complete readable extent;
-    ///   length zero uses the same bounded NUL rule. Padding need not be initialized.
+    ///   length zero uses the same bounded NUL rule. For `SenderMetadataFree`,
+    ///   the SDK text is instead readable through its first NUL within
+    ///   `MAX_METADATA_BYTES`, independently of the descriptor's declared count
+    ///   (which can exclude that terminator). The borrowed view validates that
+    ///   count without treating it as an initialized storage extent.
+    ///   Padding need not be initialized.
     /// - the owning instance and all described storage remain valid and
     ///   unchanged for `'owner`; tie this lifetime to a borrow of that owner.
     ///   Null request descriptors and empty synchronization results are valid.
@@ -498,6 +518,16 @@ unsafe impl Send for Guard<'_, AudioKind> {}
 unsafe impl Sync for Guard<'_, AudioKind> {}
 unsafe impl Send for Guard<'_, MetadataKind> {}
 unsafe impl Sync for Guard<'_, MetadataKind> {}
+
+// SAFETY: NDI-SEND's upstream-metadata section refers to the receive-device
+// model, and NDI-RECV permits received metadata to be freed on another thread:
+// https://docs.ndi.video/all/developing-with-ndi/sdk/ndi-send
+// https://docs.ndi.video/all/developing-with-ndi/sdk/ndi-recv
+// The metadata lease serializes capture through the matching sender free,
+// shared access exposes only immutable held text, and the owner's borrow
+// retains the sender and runtime through release.
+unsafe impl Send for Guard<'_, SenderMetadataFree> {}
+unsafe impl Sync for Guard<'_, SenderMetadataFree> {}
 
 impl<'owner, S: FrameFree> Drop for Guard<'owner, S> {
     fn drop(&mut self) {

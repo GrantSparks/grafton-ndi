@@ -77,16 +77,14 @@ fn crate_root_types_keep_their_auto_traits() {
         AudioFrameBuilder: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioFrameRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioInputFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
-        AudioKind: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioLayout: Send, Sync, UnwindSafe, RefUnwindSafe;
         BorrowedAudioFrame<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         BorrowedAudioFrameBuilder<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         BorrowedVideoFrame<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         BorrowedVideoFrameBuilder<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         Capabilities: Send, Sync, UnwindSafe, RefUnwindSafe;
-        Capture<'static, AudioKind>: Send, Sync, UnwindSafe, RefUnwindSafe;
-        Capture<'static, MetadataKind>: Send, Sync, UnwindSafe, RefUnwindSafe;
-        Capture<'static, VideoKind>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        Capability: Send, Sync, UnwindSafe, RefUnwindSafe;
+        CapabilityRefusal: Send, Sync, UnwindSafe, RefUnwindSafe;
         ColorInfo: Send, Sync, UnwindSafe, RefUnwindSafe;
         ColorPrimaries: Send, Sync, UnwindSafe, RefUnwindSafe;
         ConnectionStats: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -107,9 +105,9 @@ fn crate_root_types_keep_their_auto_traits() {
         MediaTypes: Send, Sync, UnwindSafe, RefUnwindSafe;
         MetadataFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         MetadataFrameRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
-        MetadataKind: Send, Sync, UnwindSafe, RefUnwindSafe;
         Ndi: Send, Sync, UnwindSafe, RefUnwindSafe;
         NativeFunction: Send, Sync, UnwindSafe, RefUnwindSafe;
+        PictureAspectRatio: Send, Sync, UnwindSafe, RefUnwindSafe;
         PixelFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         PixelFormatInfo: Send, Sync, UnwindSafe, RefUnwindSafe;
         ProcessLifetimeRuntime: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -149,7 +147,6 @@ fn crate_root_types_keep_their_auto_traits() {
         VideoFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoFrameBuilder: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoFrameRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
-        VideoKind: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoPlane<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoPlanes<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoRows<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -173,7 +170,7 @@ fn crate_root_types_keep_their_auto_traits() {
 #[cfg(feature = "image-encoding")]
 #[test]
 fn image_encoding_types_keep_their_auto_traits() {
-    use grafton_ndi::{
+    use grafton_ndi::image_encoding::{
         AlphaMode, ColorPolicy, Downscale, HdrPolicy, ImageFormat, ImageOptions, PngCompression,
         SampleDepth, YuvRange,
     };
@@ -224,10 +221,10 @@ fn smol_types_keep_their_auto_traits() {
     lacks! { AsyncSourceWatch<Smol>: Sync; }
 }
 
-/// The public types of the `discovery` module.
+/// The public types of the `discovery_server` module.
 #[test]
 fn discovery_types_keep_their_auto_traits() {
-    use grafton_ndi::discovery::*;
+    use grafton_ndi::discovery_server::*;
     has! {
         AdvertisedReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         AdvertisedSender: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -256,8 +253,8 @@ fn discovery_types_keep_their_auto_traits() {
 #[test]
 fn advanced_modes_types_keep_their_auto_traits() {
     use grafton_ndi::{
-        advanced::{AvSyncAttached, PacketAttached},
-        CompressedAttached, QueueAttached, Receiver, Sender,
+        advanced::{AvSyncAttached, CompressedAttached, PacketAttached, QueueAttached},
+        Receiver, Sender,
     };
     has! {
         CompressedAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -309,6 +306,7 @@ fn advanced_types_keep_their_auto_traits() {
         EnvelopeCodec: Send, Sync, UnwindSafe, RefUnwindSafe;
         ExtendedSource: Send, Sync, UnwindSafe, RefUnwindSafe;
         Genlock: Send, UnwindSafe, RefUnwindSafe;
+        GenlockOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
         KvmSession<'static, RawCapture>: Send, Sync, UnwindSafe, RefUnwindSafe;
         KvmReceiver<'static, RawCapture>: Send, Sync, UnwindSafe, RefUnwindSafe;
         KvmReceiver<'static, grafton_ndi::FrameSyncAttached>: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -321,7 +319,7 @@ fn advanced_types_keep_their_auto_traits() {
         PacketReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         PassthroughPreset: Send, Sync, UnwindSafe, RefUnwindSafe;
         QualityPlan: Send, Sync, UnwindSafe, RefUnwindSafe;
-        QueueOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
+        QueueLimits: Send, Sync, UnwindSafe, RefUnwindSafe;
         QueuedSender: Send, Sync, UnwindSafe, RefUnwindSafe;
         QueuedVideoFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceivedAudio: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -359,15 +357,15 @@ fn file_types_keep_their_auto_traits() {
         FilePlayer: UnwindSafe, RefUnwindSafe;
         FilePosition: Send, Sync, UnwindSafe, RefUnwindSafe;
         FileRecorder: UnwindSafe, RefUnwindSafe;
-        FileRuntimeOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
+        FileApiOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
         FinishStatus: Send, Sync, UnwindSafe, RefUnwindSafe;
         PlayerEvent: Send, Sync, UnwindSafe, RefUnwindSafe;
         PlayerEventKind: Send, Sync, UnwindSafe, RefUnwindSafe;
-        PlayerOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
+        FilePlayerOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
         PlayerStats: Send, Sync, UnwindSafe, RefUnwindSafe;
         RecorderEvent: Send, Sync, UnwindSafe, RefUnwindSafe;
         RecorderEventKind: Send, Sync, UnwindSafe, RefUnwindSafe;
-        RecorderOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
+        FileRecorderOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
         RecorderState: Send, Sync, UnwindSafe, RefUnwindSafe;
         RecorderStats: Send, Sync, UnwindSafe, RefUnwindSafe;
         RecordingReport: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -376,7 +374,7 @@ fn file_types_keep_their_auto_traits() {
         SessionTimecode: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceSpec: Send, Sync, UnwindSafe, RefUnwindSafe;
-        StateError: Send, Sync, UnwindSafe, RefUnwindSafe;
+        StateConflict: Send, Sync, UnwindSafe, RefUnwindSafe;
         StopRequest: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoTrack: Send, Sync, UnwindSafe, RefUnwindSafe;
     }

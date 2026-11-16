@@ -2,8 +2,8 @@ use grafton_ndi::advanced::{CompressedSender, QueuedSender};
 
 fn queued(owner: &mut QueuedSender) {
     let (mut video, _) = owner.split();
-    let _ = owner.try_take_completed();
-    let _ = video.try_take_completed();
+    let _ = owner.try_next_completed();
+    let _ = video.try_next_completed();
 }
 
 fn compressed(owner: CompressedSender) {

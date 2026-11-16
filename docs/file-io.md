@@ -16,26 +16,27 @@ targets. On Linux, macOS and Android the wrapper requires an Advanced runtime
 for File operations; the `advanced` Cargo feature is not required. The File ABI
 is included, so enabling `file-io` alone does not generate bindings.
 
-Open it with `FileApi::open(&ndi, &FileRuntimeOptions::default())`. On targets
+Open it with `FileApi::new(&ndi, &FileApiOptions::default())`. On targets
 that load libraries dynamically, discovery tries the selected runtime's
 directory, the executable's directory, `NDI_RUNTIME_DIR_V6`, then the platform
 loader. A relative `NDI_RUNTIME_DIR_V6` is recorded as refused and never
-searched. `FileRuntimeOptions::library_path` selects one absolute file without
+searched. `FileApiOptions::library_path` selects one absolute file without
 fallback. A successful selection lasts for the process; a later conflicting
 selection returns `RuntimeConflict`. Use trusted library locations, including
 their dependencies, as described in [runtime selection](setup.md#selecting-a-runtime).
 
 ### What the selected library provides
 
-Check `FileApi::status` or `supports` for `FileFamily::Playback` and
-`FileFamily::Recording`. Missing family symbols produce
-`Error::FileFamilyUnavailable`; loading the core runtime does not establish
+Check `FileApi::status` or `supports`, or call `require_family`, for
+`FileFamily::Playback` and `FileFamily::Recording`. Missing family symbols produce
+`Error::UnsupportedCapability { capability: Capability::File(family), refusal }`;
+loading the core runtime does not establish
 File availability. See the [File API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/index.html)
 for loading errors and the full family contract.
 
 ## Probing a recording
 
-`FileApi::probe(path)` reads duration and track information without advertising
+`FilePlayer::probe(&api, path)` reads duration and track information without advertising
 an NDI source. The [`file_play` example](../examples/file_play.rs) demonstrates
 probing before playback.
 
@@ -46,7 +47,8 @@ cargo run --example file_play --features file-io -- take_001.mkv "Replay"
 ```
 
 The example advertises `Replay`, plays the recording once, prints events and
-reports video counters. `create_player` advertises from creation until drop,
+reports video counters. `FilePlayer::new(&api, &FilePlayerOptions::new(name))`
+advertises from creation until drop,
 including between files. Use `start` and `stop` for files, `set_paused` and
 `set_looping` for playback control, and `seek` or `seek_frame_approximate` for
 positioning. Poll events to observe progress and errors. Exact units and seek
@@ -63,6 +65,10 @@ records for ten seconds, drains events and inspects the finish report. Default
 indexed naming produces `take_001.mkv`, then successive files as needed. Use
 its `--groups` and `--ip` options to scope discovery, or `--by-name` to ask the
 File SDK to rediscover the source by name.
+
+Create the recorder with `FileRecorder::new(&api, &FileRecorderOptions::new(spec))`.
+Player and recorder options are cloneable, comparable values. Player groups
+accept a list, for example `.groups(["Studio"])`.
 
 Choose the source policy deliberately:
 
@@ -85,7 +91,7 @@ Use indexed naming for recordings that must span source or format changes.
 `FileNaming::Exact`, or a pattern without an index, limits a target to one file.
 For an exact name, the wrapper rejects format-change rollover, a nonzero
 rollover size, and source changes during a session. See
-[`RecorderOptions`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.RecorderOptions.html).
+[`FileRecorderOptions`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorderOptions.html).
 
 In custom patterns, `{index}` and `{index:N}` must be in the file name.
 Directories may use literal text and `{prefix}`, for example
@@ -105,8 +111,16 @@ Call `finish(timeout)` and inspect both its status and `RecordingReport`:
 | Status | Action |
 | --- | --- |
 | `Closed` | The SDK reported every opened file finalized. Check errors, write failures, empty files and `stopped_by_sdk` for an early end. |
-| `TimedOut` | Use `wait_finished` to continue waiting. |
+| `TimedOut` | Use `wait_for_finish` to continue waiting. |
 | `Indeterminate` | Closure could not be established from the events; waiting longer does not repair the report. |
+
+`finish(timeout)` requests the stop and reports that bounded completion attempt,
+including `FinishStatus::TimedOut(report)`. A later
+`wait_for_finish(timeout) -> Result<Option<FinishStatus>>` only waits: `None`
+means its deadline expired, while `Some(Closed(report))` or
+`Some(Indeterminate(report))` carries a final outcome. It never returns
+`Some(TimedOut(...))`. After `None`, inspect `recorder.report()` for the current
+session snapshot and keep waiting or choose recovery.
 
 The timeout bounds the event wait, not the native stop call. Lost events can
 prevent confirmation. If recovery is needed, `reset` replaces the native
@@ -121,11 +135,13 @@ Use explicit finishing when the result matters. See
 [`FileRecorder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorder.html)
 for state transitions, error conditions and recovery.
 
-If another async clone calls `close` while `finish` or `wait_finished` runs,
+If another async clone calls `close` while `finish` or `wait_for_finish` runs,
 the wait uses the earlier of its own deadline and `drop_wait` measured from
-the close's submission. It reports `Closed` or `Indeterminate` if the session
-settles, or `InvalidState(Closed)` if that budget ends first. `TimedOut` would
-suggest another wait, which a closed handle cannot perform. Destruction
+the close's submission. A settled session reports `Closed` or `Indeterminate`
+(wrapped in `Some` for `wait_for_finish`); an unsettled one returns
+`InvalidState(Closed)` if that budget ends first. Neither `TimedOut` from
+`finish` nor `None` from `wait_for_finish` would be appropriate for a handle
+that cannot be waited on again. Destruction
 uses only the remainder of the close's budget after an earlier finish deadline;
 the finish never shortens the time available to close.
 
@@ -160,13 +176,23 @@ The async recorder drains native events continuously. `next_event` supplies
 bounded application notifications; dropped notifications do not alter its
 recording report. Configure queue limits with `AsyncFileOptions` and handle
 `QueueFull` when submitting commands.
+Pass `&AsyncFileOptions` to `create_with_options`. Statistics name their units:
+player counters are `*_frames_sent`, recorder counters are `*_frames_written`,
+and the recorder reports `frames_dropped_by_writer` separately. Recorder written
+counters count muxed packets, rather than decoded audio samples or image data;
+receiver, pipeline and writer drops remain distinct.
 
-While `finish` or `wait_finished` waits for closure, the owner runs commands
+While `finish` or `wait_for_finish` waits for closure, the owner runs commands
 from every clone between event bursts. Status queries remain available, and
 several waits can observe the same session with independent deadlines. Native
 calls, including the initial stop, can still block the owner. A successful
 `reset` abandons the old native recorder and ends its pending finish waits with
 `InvalidState(Closed)`; a failed reset preserves those waits.
+
+Async `wait_for_finish` returns `FileOperation<Option<FinishStatus>>`, with the
+same `None`/`Some` distinction. After an expired wait, await
+`recorder.report()` to inspect the current report. Async `finish` retains
+`FileOperation<FinishStatus>` and its `TimedOut(report)` outcome.
 
 Await `finish`, inspect its report, then await `close` to shut down all clones
 without blocking the executor. **Dropping the last clone blocks** until its
@@ -187,7 +213,7 @@ library paths to distinguish a `FileNeedsAdvancedRuntime` conflict from a differ
 implementation or foreign runtime in the global symbol scope.
 
 File operations use the crate's `Error`. Distinguish unavailable libraries or
-families (`RuntimeLoadFailed`, `FileFamilyUnavailable`), conflicting selections
+families (`RuntimeLoadFailed`, `UnsupportedCapability`), conflicting selections
 (`RuntimeConflict`), invalid arguments or state, queue saturation (`QueueFull`),
 native failures and filesystem errors. Method rustdoc describes which errors
 leave an existing session running and which reports require recovery.

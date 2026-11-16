@@ -1,4 +1,6 @@
-use grafton_ndi::discovery::{InputGroupId, ReceiverId, RecvListener, SendListener, SenderId};
+use grafton_ndi::discovery_server::{
+    InputGroupId, ReceiverId, RecvListener, SendListener, SenderId,
+};
 fn mix(
     senders: &mut SendListener,
     receivers: &mut RecvListener,

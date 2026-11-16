@@ -35,7 +35,7 @@ impl Drop for StopOnDrop<'_> {
 fn receive_marker(receiver: &Receiver, marker: u8, deadline: Instant, mut send: impl FnMut()) {
     loop {
         send();
-        match receiver.video().capture_ref(Duration::from_millis(100)) {
+        match receiver.capture_video_ref(Duration::from_millis(100)) {
             Ok(Some(frame)) if frame.timecode() == Timecode::from_ticks(i64::from(marker)) => {
                 return
             }
@@ -66,7 +66,7 @@ fn a_receiver_follows_failover_after_its_input_source_and_primary_are_dropped() 
     .unwrap();
     {
         let target = common::loopback_source(&ndi, &backup).unwrap();
-        primary.set_failover(&target).unwrap();
+        primary.set_failover(&target);
     }
     let receiver = Receiver::new(
         &ndi,

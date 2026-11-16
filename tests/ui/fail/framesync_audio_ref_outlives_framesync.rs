@@ -1,7 +1,7 @@
 use grafton_ndi::{FrameSync, FrameSyncAudioRequest, Ndi, Receiver, ReceiverOptions, Source};
 
 fn receiver(ndi: &Ndi) -> Receiver {
-    let source = Source::new("compile-contract");
+    let source = Source::new("compile-contract").unwrap();
     let options = ReceiverOptions::new(source);
     Receiver::new(ndi, &options).unwrap()
 }

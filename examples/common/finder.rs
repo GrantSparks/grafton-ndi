@@ -16,7 +16,7 @@ pub fn finder_with_extra_ips(ndi: &Ndi, extra_ips: &[&str]) -> Result<Finder> {
         for ip in extra_ips {
             println!("  - {ip}");
         }
-        options = options.extra_ips(extra_ips.join(","));
+        options = options.extra_ips(extra_ips.iter().copied());
         println!();
     }
 

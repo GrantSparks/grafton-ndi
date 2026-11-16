@@ -1,7 +1,7 @@
 use grafton_ndi::{
-    advanced::{CompressedAudio, CompressedAudioFrame, CompressedSender, CompressedVideo,
+    advanced::{CompressedAttached, CompressedAudioFrame, CompressedSender, CompressedVideo,
                CompressedVideoFrame, QueuedSender, QueuedVideo},
-    AudioFrame, VideoFrame,
+    AudioFrame, Sender, VideoFrame,
 };
 
 trait AmbiguousIfSync<A> { fn check() {} }
@@ -20,12 +20,12 @@ fn queued(queue: &mut QueuedSender, video: VideoFrame, audio: &AudioFrame) {
 }
 
 fn compressed(sender: &mut CompressedSender, mut video: CompressedVideoFrame, mut audio: CompressedAudioFrame) {
-    let (mut videos, mut audios) = sender.split();
+    let (mut videos, audios) = sender.split();
     std::thread::scope(|scope| {
         scope.spawn(move || videos.send_video(&mut video));
         scope.spawn(move || {
-            audios.send_audio(&mut audio);
-            let _ = audios.sender().source();
+            audios.send_compressed_audio(&mut audio);
+            let _ = audios.source();
         });
     });
 }
@@ -34,11 +34,11 @@ fn send<T: Send>() {}
 fn main() {
     send::<QueuedVideo<'static>>();
     send::<CompressedVideo<'static>>();
-    send::<CompressedAudio<'static>>();
+    send::<&'static Sender<CompressedAttached>>();
+    fn shared<T: Send + Sync + Clone>() {}
+    shared::<&'static Sender<CompressedAttached>>();
     <QueuedVideo<'static> as AmbiguousIfSync<_>>::check();
     <CompressedVideo<'static> as AmbiguousIfSync<_>>::check();
-    <CompressedAudio<'static> as AmbiguousIfSync<_>>::check();
     <QueuedVideo<'static> as AmbiguousIfClone<_>>::check();
     <CompressedVideo<'static> as AmbiguousIfClone<_>>::check();
-    <CompressedAudio<'static> as AmbiguousIfClone<_>>::check();
 }

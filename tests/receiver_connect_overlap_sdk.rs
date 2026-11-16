@@ -308,9 +308,7 @@ fn storm<M: ReceiverMode>(receiver: &Receiver<M>, peers: &Peers, stopped: &Atomi
     while Instant::now() < deadline && !stopped.load(Ordering::Acquire) {
         for source in &peers.sources {
             let before = receiver.connection_stats().unwrap().video_frames_received();
-            timed("connect_to", Duration::ZERO, || {
-                receiver.connect_to(source).unwrap()
-            });
+            timed("connect_to", Duration::ZERO, || receiver.connect_to(source));
             progress_after(receiver, before);
             thread::sleep(Duration::from_millis(round % 21));
         }
@@ -322,7 +320,7 @@ fn storm<M: ReceiverMode>(receiver: &Receiver<M>, peers: &Peers, stopped: &Atomi
         round += 1;
     }
     let before = receiver.connection_stats().unwrap().video_frames_received();
-    receiver.connect_to(&peers.sources[0]).unwrap();
+    receiver.connect_to(&peers.sources[0]);
     progress_after(receiver, before);
     eprintln!("completed {round} connect/disconnect/reconnect rounds");
 }
@@ -350,14 +348,14 @@ fn native_capture_and_connect_overlap_without_torn_frames() {
                         match kind % 3 {
                             0 => {
                                 if let Some(frame) = captured(timed("video capture", SLICE, || {
-                                    receiver.video().capture_ref(SLICE)
+                                    receiver.capture_video_ref(SLICE)
                                 })) {
                                     loans.video(frame, peers);
                                 }
                             }
                             1 => {
                                 if let Some(frame) = captured(timed("audio capture", SLICE, || {
-                                    receiver.audio().capture_ref(SLICE)
+                                    receiver.capture_audio_ref(SLICE)
                                 })) {
                                     loans.audio(frame);
                                 }
@@ -450,7 +448,7 @@ fn avsync_capture_and_connect_overlap_without_invalid_audio() {
         let receiver = sync.receiver();
         let receive = || {
             let Some(video) = captured(timed("AV video capture", SLICE, || {
-                receiver.video().capture_ref(SLICE)
+                receiver.capture_video_ref(SLICE)
             })) else {
                 return;
             };
@@ -495,7 +493,7 @@ fn avsync_capture_and_connect_overlap_without_invalid_audio() {
 #[test]
 fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
     use grafton_ndi::{
-        discovery::{
+        discovery_server::{
             AdvertiserOptions, ListenerOptions, RecvAdvertisement, RecvAdvertiser, RecvListener,
             SendAdvertisement, SendAdvertiser,
         },
@@ -553,11 +551,11 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
     };
     let server = common::discovery_server::Server::start(&binary);
     let peers = Peers::new(&ndi);
-    let options = AdvertiserOptions::new().servers(server.endpoint());
+    let options = AdvertiserOptions::new().servers([server.endpoint()]);
     let mut send_advertiser = SendAdvertiser::new(&ndi, &options).unwrap();
     for sender in &peers.senders {
         send_advertiser
-            .register(sender, SendAdvertisement::new())
+            .register(sender, &SendAdvertisement::new())
             .unwrap();
     }
     let receiver_name = common::unique_name("overlap remote receiver");
@@ -570,7 +568,7 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
     let _registration = advertiser
         .register(
             &receiver,
-            RecvAdvertisement::new()
+            &RecvAdvertisement::new()
                 .allow_monitoring(true)
                 .allow_controlling(true),
         )
@@ -580,12 +578,18 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
     let deadline = Instant::now() + common::discovery_server::SETTLE;
     let suffix = format!("({receiver_name})");
     let id = loop {
-        listener.wait_for_changes(SLICE).unwrap();
-        if let Some(advertised) = listener.snapshot().unwrap().into_iter().find(|advertised| {
-            advertised
-                .name()
-                .is_some_and(|name| name.ends_with(&suffix))
-        }) {
+        listener.wait_for_change(SLICE).unwrap();
+        if let Some(advertised) =
+            listener
+                .current_receivers()
+                .unwrap()
+                .into_iter()
+                .find(|advertised| {
+                    advertised
+                        .name()
+                        .is_some_and(|name| name.ends_with(&suffix))
+                })
+        {
             break advertised.id().unwrap().clone();
         }
         assert!(
@@ -618,7 +622,7 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
                 let deadline = Instant::now() + PATIENCE;
                 loop {
                     let change = timed("source name change", SLICE, || {
-                        receiver.poll_source_name_change(SLICE)
+                        receiver.wait_for_source_name_change(SLICE)
                     })
                     .unwrap();
                     if change.as_ref() == Some(&expected) {

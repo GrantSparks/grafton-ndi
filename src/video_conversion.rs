@@ -664,11 +664,7 @@ mod tests {
 
     #[test]
     fn strided_borrowed_and_captured_p216_convert_without_pixel_copies() {
-        use crate::{
-            capture::{FrameSyncVideoFree, Guard, VideoKind},
-            frames::VideoRef,
-            BorrowedVideoFrame,
-        };
+        use crate::{capture::Guard, BorrowedVideoFrame, FrameSyncVideoRef, VideoFrameRef};
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
@@ -698,15 +694,11 @@ mod tests {
                     // SAFETY: Both synthetic guards borrow storage and static
                     // metadata for this test, and neither callback frees them.
                     let receiver = unsafe {
-                        VideoRef::<VideoKind>::new(Guard::with_test_free(
-                            ptr::null_mut(),
-                            raw,
-                            |_, _| {},
-                        ))
+                        VideoFrameRef::new(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {}))
                     }
                     .unwrap();
                     let framesync = unsafe {
-                        VideoRef::<FrameSyncVideoFree>::new(Guard::with_test_free(
+                        FrameSyncVideoRef::new(Guard::with_test_free(
                             ptr::null_mut(),
                             raw,
                             |_, _| {},

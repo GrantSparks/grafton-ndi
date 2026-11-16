@@ -892,7 +892,7 @@ fn child(name: &str, fixtures: &Fixtures) {
 fn configured_objects_are_refused_for_their_own_capability(ndi: &Ndi) {
     use grafton_ndi::{
         advanced::AdvancedConfig,
-        discovery::{
+        discovery_server::{
             AdvertiserOptions, ListenerOptions, RecvAdvertiser, RecvListener, SendAdvertiser,
             SendListener,
         },
@@ -901,7 +901,7 @@ fn configured_objects_are_refused_for_their_own_capability(ndi: &Ndi) {
     };
     let config = AdvancedConfig::parse("{}").unwrap();
     let advertisers = AdvertiserOptions::default()
-        .servers("127.0.0.1")
+        .servers(["127.0.0.1"])
         .config(config.clone());
     let listeners = ListenerOptions::default()
         .server("127.0.0.1")
@@ -959,7 +959,10 @@ fn configured_objects_are_refused_for_their_own_capability(ndi: &Ndi) {
         assert_eq!(status.reason(), Some(expected), "{feature:?}");
         for error in [error, ndi.require_feature(feature).err()] {
             let (refused, refusal) = match error {
-                Some(Error::UnsupportedCapability { feature, refusal }) => (feature, refusal),
+                Some(Error::UnsupportedCapability {
+                    capability: grafton_ndi::Capability::Runtime(feature),
+                    refusal,
+                }) => (feature, refusal),
                 other => panic!("{feature:?}: expected an unsupported capability, got {other:?}"),
             };
             assert_eq!((refused, refusal.reason()), (feature, expected));

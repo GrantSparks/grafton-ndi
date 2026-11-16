@@ -1,10 +1,12 @@
+//! Port of SDK sample `NDIlib_Send_Audio`.
+//!
 //! Example: Sending audio via NDI.
 //!
 //! This example sends 50 frames of 4-channel silence at 48kHz, 1920 samples
 //! per frame, and then exits. The audio is clocked to ensure accurate sample
 //! timing.
 //!
-//! Run with: `cargo run --example NDIlib_Send_Audio`
+//! Run with: `cargo run --example send_audio`
 
 use grafton_ndi::{AudioFrame, Error, Ndi, Sender, SenderOptions};
 

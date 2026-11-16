@@ -2,7 +2,7 @@
 //!
 //! `Sender::send_video(&frame)` sends the same borrowed frame synchronously
 //! without copying it; copy only when the asynchronous pipeline is wanted.
-//! `send_video_async_copy` retains two reusable frames. Once both have enough
+//! `submit_video_copy` retains two reusable frames. Once both have enough
 //! pixel and metadata capacity, subsequent copies allocate no frame storage.
 use grafton_ndi::{BorrowedVideoFrame, FrameRate, Ndi, PixelFormat, SenderOptions};
 
@@ -22,9 +22,9 @@ fn main() -> Result<(), grafton_ndi::Error> {
     // immediately. The sender recycles released copies between submissions.
     for shade in 0..60 {
         pixels.fill(shade);
-        sender.send_video_async_copy(&borrow(&pixels)?)?;
+        sender.submit_video_copy(&borrow(&pixels)?)?;
     }
-    let last = sender.finish_video_async().unwrap();
+    let last = sender.reclaim_video().unwrap();
     assert_eq!(last.data().len(), pixels.len());
     Ok(())
 }

@@ -78,7 +78,7 @@ fn main() -> Result<(), Error> {
                 println!("Viewer metadata not passed upstream: {error}");
             }
         }
-        match receiver.capture_ref(Duration::from_secs(1))? {
+        match receiver.capture_any_ref(Duration::from_secs(1))? {
             // A packet the sender cannot pass on is refused with the reason,
             // and stays with the caller.
             Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(packet))) => {
@@ -105,7 +105,9 @@ fn main() -> Result<(), Error> {
                 };
                 match admitted {
                     Ok(()) => {
-                        sender.send_audio(audio_storage.as_mut().unwrap());
+                        sender
+                            .sender()
+                            .send_compressed_audio(audio_storage.as_mut().unwrap());
                         audio += 1;
                     }
                     Err(error) => println!("Audio packet not relayed: {error}"),

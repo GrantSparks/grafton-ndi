@@ -10,7 +10,7 @@ macro_rules! video {
             let _ = frame.height();
             let _ = frame.pixel_format();
             let _ = frame.frame_rate();
-            let _ = frame.picture_aspect_ratio();
+            let _: grafton_ndi::PictureAspectRatio = frame.picture_aspect_ratio();
             let _ = frame.scan_type();
             let _ = frame.timecode();
             let _ = frame.timestamp();

@@ -102,7 +102,7 @@ fn stream_changes_leave_clocked_capture_and_recovery_usable() {
             let receiving = session.receiver();
             assert_eq!(receiving.connection_target(), source);
             receiving.set_tally(grafton_ndi::Tally::new(false, true));
-            let metadata = receiving.metadata().capture_ref(Duration::ZERO).unwrap();
+            let metadata = receiving.capture_metadata_ref(Duration::ZERO).unwrap();
             let video = capture
                 .capture_video_ref(ScanType::Progressive)
                 .unwrap()

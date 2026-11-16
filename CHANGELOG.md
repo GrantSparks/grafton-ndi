@@ -17,6 +17,35 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- Public APIs follow one [set of conventions](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/api-conventions.md)
+  for construction, options, capture, events, waits and paths. Receiver and async
+  typed capture use `capture_video`, `capture_audio`, `capture_metadata` and
+  `_ref`/`_with` forms; capture handles and kind types become private.
+  `CaptureMode` becomes `AudioMode`.
+- SDK video submission uses `submit_video`, `submit_video_copy`, `reclaim_video`
+  and `flush_video`. Connection counts are immediate getters; use
+  `wait_for_connection` to wait. Events use `next_event`, batch events
+  `next_events`, and queue completions `next_completed`/`try_next_completed`.
+- `Source` and `SourceAddress` validate NUL at construction; source connection,
+  route and failover updates no longer repeat text validation. List options
+  accept iterables and read back slices. `PictureAspectRatio` appears in every
+  aspect signature, and stride-aware sizing uses
+  `PixelFormat::buffer_len(width, height, Option<usize>)`.
+- Borrowed frame aliases become named structs with generated accessors. Image
+  encoding belongs to `image_encoding` and the shared `VideoSource` surface;
+  use `encode_image`/`encode_image_data_url` instead of PNG/JPEG/data URL shortcuts.
+  Discovery Server APIs move to `discovery_server`. Advanced markers have only
+  their `advanced` paths, and examples use snake_case names.
+- File constructors belong to their object types with matching options names;
+  File options and Advanced queue/allocator limits are borrowed. Genlock uses
+  `GenlockOptions`. Compressed sender splitting lends the shared sender for
+  audio instead of a separate `CompressedAudio` wrapper. All public types have
+  `Debug`, all options have `PartialEq`, and SDK entry points have search aliases.
+- Recorder `wait_for_finish` follows the wait convention: an expired wait
+  returns `None`, and final `Closed`/`Indeterminate` outcomes are `Some`.
+  Inspect `report()` after a timeout. The separate bounded `finish` operation
+  retains `FinishStatus::TimedOut(report)`.
+
 - `BorrowedVideoFrame::data()` returns contiguous active bytes as `Option<&[u8]>`.
   Use `storage()` for validated storage including row padding. Video and audio
   inherent accessors and source traits share one implementation; owned frames
@@ -66,26 +95,27 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   cause, library kind and selected, requested and foreign-module paths.
   `RuntimeLoadFailed` carries a boxed `LoadFailure` with typed candidate
   locations, origins and refusals, including whether native code was loaded.
-- Capability statuses and `Error::UnsupportedCapability { feature, refusal }`
+- Capability statuses and `Error::UnsupportedCapability { capability, refusal }`
   carry the same typed `CapabilityRefusal`. Its `reason()` returns the broad
   category; its fields retain the missing symbol, declaration or required version.
-- File-family refusals use `Error::FileFamilyUnavailable { family, missing }`,
-  with the missing entry point as a static `CStr`.
-  `RuntimeFeature::File` and `CapabilityUnavailable::SeparateLibrary` are
-  removed; use `FileApi::status` or `supports` for File availability.
+- Runtime and File-family refusals share `UnsupportedCapability`, identifying
+  `Capability::Runtime(feature)` or `Capability::File(family)` and retaining a
+  missing entry point as a static `CStr`. Use `FileApi::status`, `supports` or
+  `require_family` for File availability. The unused `NoSourcesFound` error is
+  removed; File state conflicts use `StateConflict`.
 - Runtime and File library selection require absolute explicit paths on every
   target. Relative `NDI_RUNTIME_DIR_V6` directories are refused and skipped,
   with the reason retained in load-failure diagnostics.
 - On dynamically loaded non-Apple ELF targets, a runtime already linked or
   preloaded into the global symbol scope must be the selected module. Other
   candidates are refused before loading; diagnostics name the runtime in scope.
-- `send_video_async_copy` returns `Result<()>` and reuses released video and
+- `submit_video_copy` returns `Result<()>` and reuses released video and
   metadata storage instead of returning the displaced frame. After warm-up,
-  repeated copies of one layout allocate nothing; `finish_video_async` returns
+  repeated copies of one layout allocate nothing; `reclaim_video` returns
   the final frame and releases the spare.
 - Remove `Sender::on_async_video_done` and `clear_async_video_done`. Observe
-  asynchronous video completion through frames returned by `send_video_async`
-  and `finish_video_async`. Ordinary senders now implement `UnwindSafe` and
+  asynchronous video completion through frames returned by `submit_video`
+  and `reclaim_video`. Ordinary senders now implement `UnwindSafe` and
   `RefUnwindSafe`.
 - Received video and audio survive unreadable optional per-frame metadata.
   `metadata_status()` reports why text was withheld; forwarding omits the text.
@@ -132,9 +162,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Video builders default to 60 fps and square pixels. Set explicit timing and
   picture aspect for other output. Captured timing and aspect are preserved.
 - Capture returns `Result<Option<Frame>>`; a timeout is `Ok(None)`. Remove
-  `try_capture` and rename `try_capture_ref` to `capture_ref`. Borrowed capture
-  now retries transient results within the caller's deadline.
-- `poll_event` replaces `poll_status_change` and returns `ReceiverEvent`.
+  the kind-view `try_capture` methods and use `capture_video_ref`,
+  `capture_audio_ref` or `capture_metadata_ref` to borrow. Borrowed capture
+  retries transient results within the caller's deadline.
+- `next_event` replaces `poll_status_change` and returns `ReceiverEvent`.
   Combined capture and polling consume notifications once; notifications
   coalesce rather than forming a broadcast or ordered history.
 - Receiver modes restrict media capture while attached to synchronizers or
@@ -143,7 +174,7 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - FrameSync's short `capture_video` and `capture_audio` names return owned
   copies. Use `_ref` to borrow. `audio_input_format()` replaces the empty audio
   query; audio capture requests require a positive rate and return a frame.
-- `SourceCache::new(finder)` owns a configured finder. `sources_by_host`
+- `SourceCache::new(finder)` owns a configured finder. `find_sources_by_host`
   replaces the first-feed lookup and returns all matching feeds over the full
   discovery window. Entries remain stale until invalidated.
 - `connection_target()` replaces `Receiver::source()` and reports the latest
@@ -171,7 +202,7 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - `ExternalPool`, `PoolBlock` and unsafe `AllocationBuffer::from_pool` lend
   preallocated receive buffers without boxing a handle on SDK threads.
 
-- `CompressedSender::finish_video_async` and its split video view drain both
+- `CompressedSender::reclaim_video` and its split video view drain both
   asynchronous streams and return their frames while keeping the source live.
 
 - Queued senders support AAC and Opus through shared

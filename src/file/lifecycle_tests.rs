@@ -15,13 +15,13 @@ use std::{
 fn recording_on(device: &Arc<mock::Recorder>) -> FileRecorder {
     recording_with(
         device,
-        RecorderOptions::new(SourceSpec::new("mock source").unwrap()),
+        FileRecorderOptions::new(SourceSpec::new("mock source").unwrap()),
     )
 }
 
-fn recording_with(device: &Arc<mock::Recorder>, options: RecorderOptions) -> FileRecorder {
+fn recording_with(device: &Arc<mock::Recorder>, options: FileRecorderOptions) -> FileRecorder {
     device.install();
-    let mut recorder = mock::recorder_api().create_recorder(&options).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &options).unwrap();
     recorder
         .start(&target("first"), RecordingTimecode::Preserve)
         .unwrap();
@@ -37,8 +37,8 @@ fn generated_session_timecodes_reach_the_native_start_unchanged() {
     for ticks in [0, 360_000_000_000] {
         let device = mock::Recorder::new(Closing::AtStop);
         device.install();
-        let options = RecorderOptions::new(SourceSpec::new("timecode source").unwrap());
-        let mut recorder = mock::recorder_api().create_recorder(&options).unwrap();
+        let options = FileRecorderOptions::new(SourceSpec::new("timecode source").unwrap());
+        let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &options).unwrap();
         let start = SessionTimecode::new(crate::Timecode::from_ticks(ticks)).unwrap();
         recorder
             .start(
@@ -60,7 +60,7 @@ fn every_session_exit_issues_exactly_one_native_stop() {
     for ending in 0..4 {
         let device = mock::Recorder::new(Closing::AtStop);
         let mut recorder = recording_on(&device);
-        recorder.poll_event(Duration::ZERO).unwrap();
+        recorder.next_event(Duration::ZERO).unwrap();
         match ending {
             0 => {
                 recorder.request_stop();
@@ -73,7 +73,7 @@ fn every_session_exit_issues_exactly_one_native_stop() {
             }
             _ => unreachable!(),
         }
-        while recorder.poll_event(Duration::ZERO).unwrap().is_some() {}
+        while recorder.next_event(Duration::ZERO).unwrap().is_some() {}
         assert!(matches!(
             recorder.state(),
             RecorderState::Closed | RecorderState::Indeterminate
@@ -94,15 +94,18 @@ fn a_timeout_keeps_the_recorder_and_a_later_close_completes_without_a_second_sto
         recorder.finish(Duration::ZERO).unwrap(),
         FinishStatus::TimedOut(_)
     ));
-    assert!(matches!(
-        recorder.wait_finished(Duration::from_millis(30)).unwrap(),
-        FinishStatus::TimedOut(_)
-    ));
+    let report = recorder.report();
+    assert!(recorder.wait_for_finish(Duration::ZERO).unwrap().is_none());
+    assert_eq!(recorder.report(), report);
+    assert!(recorder
+        .wait_for_finish(Duration::from_millis(30))
+        .unwrap()
+        .is_none());
     assert_eq!(device.destroys.load(Ordering::Acquire), 0);
     device.push(FILE_CLOSED, TAKE);
     assert!(matches!(
-        recorder.wait_finished(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        recorder.wait_for_finish(Duration::from_secs(1)).unwrap(),
+        Some(FinishStatus::Closed(_))
     ));
     assert_eq!(recorder.request_stop(), StopRequest::AlreadyClosed);
     drop(recorder);
@@ -160,7 +163,7 @@ fn a_completed_rollover_is_followed_in_the_order_the_sdk_reports_it() {
     // The next file is reported open before the previous one is reported closed.
     device.push(ROLLOVER, "second.mkv");
     device.push(FILE_CLOSED, TAKE);
-    while recorder.poll_event(Duration::ZERO).unwrap().is_some() {}
+    while recorder.next_event(Duration::ZERO).unwrap().is_some() {}
     assert_eq!(recorder.state(), RecorderState::Recording);
     assert_eq!(
         recorder.reported_current_file().unwrap().as_bytes(),
@@ -168,7 +171,8 @@ fn a_completed_rollover_is_followed_in_the_order_the_sdk_reports_it() {
     );
     recorder.request_stop();
     device.push(FILE_CLOSED, "second.mkv");
-    let FinishStatus::Closed(report) = recorder.wait_finished(Duration::from_secs(1)).unwrap()
+    let Some(FinishStatus::Closed(report)) =
+        recorder.wait_for_finish(Duration::from_secs(1)).unwrap()
     else {
         panic!("both files were reported closed");
     };
@@ -196,7 +200,7 @@ fn resetting_an_unconfirmed_session_preserves_its_report_and_isolates_late_event
     let replacement = mock::Recorder::new(Closing::AtStop);
     replacement.install();
     let report = recorder
-        .reset(&RecorderOptions::new(
+        .reset(&FileRecorderOptions::new(
             SourceSpec::new("replacement").unwrap(),
         ))
         .unwrap();
@@ -231,7 +235,7 @@ fn a_failed_reset_keeps_the_old_recorder_and_its_finalization_pending() {
     replacement.refuse_creation.store(true, Ordering::Release);
     replacement.install();
     assert!(matches!(
-        recorder.reset(&RecorderOptions::new(
+        recorder.reset(&FileRecorderOptions::new(
             SourceSpec::new("replacement").unwrap()
         )),
         Err(Error::NativeOperationFailed {
@@ -241,8 +245,8 @@ fn a_failed_reset_keeps_the_old_recorder_and_its_finalization_pending() {
     assert_eq!(recorder.state(), RecorderState::Stopping);
     old.push(FILE_CLOSED, TAKE);
     assert!(matches!(
-        recorder.wait_finished(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        recorder.wait_for_finish(Duration::from_secs(1)).unwrap(),
+        Some(FinishStatus::Closed(_))
     ));
 }
 
@@ -258,6 +262,12 @@ fn lost_sdk_events_end_the_session_as_indeterminate() {
     );
     assert!(!recorder.report().closure_confirmed());
     assert_eq!(recorder.report().dropped_events(), 1);
+    let Some(FinishStatus::Indeterminate(report)) =
+        recorder.wait_for_finish(Duration::ZERO).unwrap()
+    else {
+        panic!("a settled session must remain an indeterminate outcome");
+    };
+    assert_eq!(report, recorder.report());
     assert_eq!(recorder.request_stop(), StopRequest::AlreadyEnded);
     // The session is over, so another can begin.
     device.dropped_events.store(1, Ordering::Release);
@@ -275,7 +285,7 @@ fn a_malformed_close_event_still_closes_the_session() {
     event.source_format_payload.video_track_count = 3;
     device.push_event(event);
     let mut closed = None;
-    while let Some(event) = recorder.poll_event(Duration::ZERO).unwrap() {
+    while let Some(event) = recorder.next_event(Duration::ZERO).unwrap() {
         if event.kind() == RecorderEventKind::FileClosed {
             closed = Some(event);
         }
@@ -290,18 +300,17 @@ fn a_malformed_close_event_still_closes_the_session() {
         })
     );
     assert!(matches!(
-        recorder.wait_finished(Duration::from_millis(50)).unwrap(),
-        FinishStatus::Closed(_)
+        recorder.wait_for_finish(Duration::from_millis(50)).unwrap(),
+        Some(FinishStatus::Closed(_))
     ));
 }
 
 #[test]
 fn an_unreadable_player_format_preserves_its_ended_event_and_probe_information() {
     let api = FileApi::with_tables(mock::playback_with_unreadable_formats(), mock::recording());
-    let mut player = api
-        .create_player(&PlayerOptions::new("mock player"))
-        .unwrap();
-    let event = player.poll_event(Duration::ZERO).unwrap().unwrap();
+    let mut player =
+        crate::file::FilePlayer::new(&api, &FilePlayerOptions::new("mock player")).unwrap();
+    let event = player.next_event(Duration::ZERO).unwrap().unwrap();
     assert_eq!(event.kind(), PlayerEventKind::Ended);
     assert_eq!(event.path().to_str().unwrap(), "p");
     assert_eq!(event.first_pts().ticks(), 42);
@@ -312,7 +321,7 @@ fn an_unreadable_player_format_preserves_its_ended_event_and_probe_information()
             value: -1
         })
     );
-    let info = api.probe("mock.mkv").unwrap();
+    let info = crate::file::FilePlayer::probe(&api, "mock.mkv").unwrap();
     assert_eq!(info.duration().value().ticks(), 123);
     assert!(info.duration().is_final());
     assert_eq!(info.track_count(), 4);
@@ -330,7 +339,7 @@ fn an_event_larger_than_this_crate_expects_is_rejected_and_taints_the_session() 
     let device = mock::Recorder::new(Closing::AtStop);
     let mut recorder = recording_on(&device);
     device.oversize_next_event.store(true, Ordering::Release);
-    let error = recorder.poll_event(Duration::ZERO).unwrap_err();
+    let error = recorder.next_event(Duration::ZERO).unwrap_err();
     assert!(
         matches!(error,
         Error::UnexpectedSdkResult(crate::SdkResultDefect::FileStructureTooLarge { bytes, name })
@@ -429,7 +438,7 @@ fn dropping_a_recording_recorder_waits_for_its_file_to_be_closed() {
 #[test]
 fn the_drop_wait_is_bounded_when_the_close_never_comes() {
     let device = mock::Recorder::new(Closing::Never);
-    let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap())
+    let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
         .drop_wait(Duration::from_millis(60));
     let recorder = recording_with(&device, options);
     let begun = Instant::now();
@@ -457,15 +466,15 @@ fn abandoning_stops_and_destroys_without_waiting() {
 fn a_recorder_that_never_started_is_destroyed_without_a_stop() {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
-    let mut recorder = mock::recorder_api()
-        .create_recorder(&RecorderOptions::new(
-            SourceSpec::new("mock source").unwrap(),
-        ))
-        .unwrap();
+    let mut recorder = crate::file::FileRecorder::new(
+        &mock::recorder_api(),
+        &FileRecorderOptions::new(SourceSpec::new("mock source").unwrap()),
+    )
+    .unwrap();
     assert_eq!(recorder.request_stop(), StopRequest::NotStarted);
     assert!(matches!(
         recorder.finish(Duration::ZERO),
-        Err(Error::InvalidState(StateError::StopNotRequested))
+        Err(Error::InvalidState(StateConflict::StopNotRequested))
     ));
     drop(recorder);
     assert_eq!(device.stops.load(Ordering::Acquire), 0);
@@ -476,11 +485,11 @@ fn a_recorder_that_never_started_is_destroyed_without_a_stop() {
 fn a_target_in_a_directory_that_does_not_exist_is_refused_before_the_sdk_sees_it() {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
-    let mut recorder = mock::recorder_api()
-        .create_recorder(&RecorderOptions::new(
-            SourceSpec::new("mock source").unwrap(),
-        ))
-        .unwrap();
+    let mut recorder = crate::file::FileRecorder::new(
+        &mock::recorder_api(),
+        &FileRecorderOptions::new(SourceSpec::new("mock source").unwrap()),
+    )
+    .unwrap();
     let missing = || {
         RecordingTarget::new(std::env::temp_dir().join("grafton-ndi-no-such-directory/take"))
             .unwrap()
@@ -524,7 +533,8 @@ fn a_file_closed_before_its_first_frame_is_reported_as_empty() {
     assert_eq!(recorder.report().empty_files(), 0);
     recorder.request_stop();
     device.push(FILE_CLOSED, "second.mkv");
-    let FinishStatus::Closed(report) = recorder.wait_finished(Duration::from_secs(1)).unwrap()
+    let Some(FinishStatus::Closed(report)) =
+        recorder.wait_for_finish(Duration::from_secs(1)).unwrap()
     else {
         panic!("both files were reported closed");
     };
@@ -536,8 +546,8 @@ fn a_file_closed_before_its_first_frame_is_reported_as_empty() {
 fn a_metadata_only_recording_reports_no_empty_files() {
     // The SDK reports no first frame for metadata, so its absence says nothing.
     let device = mock::Recorder::new(Closing::AtStop);
-    let options =
-        RecorderOptions::new(SourceSpec::new("mock source").unwrap()).tracks(MediaTypes::METADATA);
+    let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
+        .tracks(MediaTypes::METADATA);
     let mut recorder = recording_with(&device, options);
     let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(1)).unwrap() else {
         panic!("the file was reported closed");
@@ -576,9 +586,8 @@ fn dropping_a_player_stops_then_destroys_it_once() {
         },
         mock::recording(),
     );
-    let player = api
-        .create_player(&PlayerOptions::new("mock player"))
-        .unwrap();
+    let player =
+        crate::file::FilePlayer::new(&api, &FilePlayerOptions::new("mock player")).unwrap();
     drop(player);
     assert_eq!(PLAYER_STOPS.get(), 1);
     assert_eq!(PLAYER_DESTROYS.get(), 1);
@@ -594,24 +603,22 @@ fn malformed_player_options_are_refused_before_the_sdk_creates_a_player() {
         mock::recording(),
     );
     assert!(matches!(
-        api.create_player(&PlayerOptions::new("")),
+        crate::file::FilePlayer::new(&api, &FilePlayerOptions::new("")),
         Err(Error::InvalidInput(crate::InputDefect::Empty {
             what: "player name"
         }))
     ));
-    for options in [
-        PlayerOptions::new("mock\0player"),
-        PlayerOptions::new("mock player").groups("a\0b"),
-    ] {
-        assert!(matches!(
-            api.create_player(&options),
-            Err(Error::InvalidCString(_))
-        ));
-    }
+    assert!(matches!(
+        crate::file::FilePlayer::new(&api, &FilePlayerOptions::new("mock\0player")),
+        Err(Error::InvalidCString(_))
+    ));
     assert_eq!(PLAYER_CREATES.get(), 0);
     drop(
-        api.create_player(&PlayerOptions::new("mock player").groups(""))
-            .unwrap(),
+        crate::file::FilePlayer::new(
+            &api,
+            &FilePlayerOptions::new("mock player").groups([] as [&str; 0]),
+        )
+        .unwrap(),
     );
     assert_eq!(PLAYER_CREATES.get(), 1);
 }
@@ -629,32 +636,43 @@ fn a_family_the_library_lacks_is_refused_as_that_capability_by_the_entry_point_i
     );
     assert!(!api.supports(FileFamily::Playback));
     assert!(api.supports(FileFamily::Recording));
+    assert!(api.require_family(FileFamily::Recording).is_ok());
+    assert!(matches!(
+        api.require_family(FileFamily::Playback),
+        Err(Error::UnsupportedCapability {
+            capability: crate::capabilities::Capability::File(FileFamily::Playback),
+            refusal: crate::CapabilityRefusal::SymbolUnavailable(missing),
+        }) if missing == c"NDIlib_file_player_seek_to_frame"
+    ));
     // Refused before anything is checked or called, even for a path that
     // would be refused too.
     for error in [
-        api.probe("recording.mkv").unwrap_err(),
-        api.probe("").unwrap_err(),
-        api.create_player(&PlayerOptions::new("mock player"))
-            .unwrap_err(),
-        api.create_player(&PlayerOptions::new("")).unwrap_err(),
+        crate::file::FilePlayer::probe(&api, "recording.mkv").unwrap_err(),
+        crate::file::FilePlayer::probe(&api, "").unwrap_err(),
+        crate::file::FilePlayer::new(&api, &FilePlayerOptions::new("mock player")).unwrap_err(),
+        crate::file::FilePlayer::new(&api, &FilePlayerOptions::new("")).unwrap_err(),
     ] {
-        let Error::FileFamilyUnavailable { family, missing } = error else {
+        let Error::UnsupportedCapability {
+            capability: crate::capabilities::Capability::File(family),
+            refusal: crate::CapabilityRefusal::SymbolUnavailable(missing),
+        } = error
+        else {
             panic!("expected the playback family to be unavailable: {error}");
         };
         assert_eq!(family, FileFamily::Playback);
         assert_eq!(missing, c"NDIlib_file_player_seek_to_frame");
     }
     // The family the library provides is unaffected.
-    let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap());
+    let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap());
     assert!(!matches!(
-        api.create_recorder(&options),
-        Err(Error::FileFamilyUnavailable { .. })
+        crate::file::FileRecorder::new(&api, &options),
+        Err(Error::UnsupportedCapability { .. })
     ));
 }
 
 /// Take every queued event, so the session's state follows what the device did.
 fn take_events(recorder: &mut FileRecorder) {
-    while recorder.poll_event(Duration::ZERO).unwrap().is_some() {}
+    while recorder.next_event(Duration::ZERO).unwrap().is_some() {}
 }
 
 #[test]
@@ -683,7 +701,7 @@ fn finishing_a_session_the_sdk_is_ending_itself_still_tells_it_to_stop() {
     device.end_session_itself();
     // Up to the error event: the session is stopping, by the library's choice.
     for _ in 0..3 {
-        recorder.poll_event(Duration::ZERO).unwrap().unwrap();
+        recorder.next_event(Duration::ZERO).unwrap().unwrap();
     }
     assert_eq!(recorder.state(), RecorderState::Stopping);
     assert_eq!(recorder.request_stop(), StopRequest::AlreadyStopping);
@@ -702,11 +720,11 @@ fn finishing_a_session_the_sdk_is_ending_itself_still_tells_it_to_stop() {
 fn a_malformed_stale_event_is_consumed_before_the_native_start() {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
-    let mut recorder = mock::recorder_api()
-        .create_recorder(&RecorderOptions::new(
-            SourceSpec::new("mock source").unwrap(),
-        ))
-        .unwrap();
+    let mut recorder = crate::file::FileRecorder::new(
+        &mock::recorder_api(),
+        &FileRecorderOptions::new(SourceSpec::new("mock source").unwrap()),
+    )
+    .unwrap();
     device.push(mock::OPEN_FAILED, "old.mkv");
     device.oversize_next_event.store(true, Ordering::Release);
     assert_eq!(
@@ -736,11 +754,11 @@ fn refused_starts_name_the_actual_timecode_entry_point() {
     ] {
         let device = mock::Recorder::new(Closing::AtStop);
         device.install();
-        let mut recorder = mock::recorder_api()
-            .create_recorder(&RecorderOptions::new(
-                SourceSpec::new("mock source").unwrap(),
-            ))
-            .unwrap();
+        let mut recorder = crate::file::FileRecorder::new(
+            &mock::recorder_api(),
+            &FileRecorderOptions::new(SourceSpec::new("mock source").unwrap()),
+        )
+        .unwrap();
         device.fail_next_start.store(true, Ordering::Release);
         assert!(matches!(recorder.start(&target("unopenable"), timecode),
             Err(Error::NativeOperationFailed { operation }) if operation == expected));
@@ -751,11 +769,11 @@ fn refused_starts_name_the_actual_timecode_entry_point() {
 fn a_refused_start_is_not_counted_in_any_session() {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
-    let mut recorder = mock::recorder_api()
-        .create_recorder(&RecorderOptions::new(
-            SourceSpec::new("mock source").unwrap(),
-        ))
-        .unwrap();
+    let mut recorder = crate::file::FileRecorder::new(
+        &mock::recorder_api(),
+        &FileRecorderOptions::new(SourceSpec::new("mock source").unwrap()),
+    )
+    .unwrap();
     let refuse_start = |recorder: &mut FileRecorder| {
         device.fail_next_start.store(true, Ordering::Release);
         assert!(matches!(
@@ -763,7 +781,7 @@ fn a_refused_start_is_not_counted_in_any_session() {
             Err(Error::NativeOperationFailed { .. })
         ));
         // The library's reason is still there to be read.
-        let event = recorder.poll_event(Duration::ZERO).unwrap().unwrap();
+        let event = recorder.next_event(Duration::ZERO).unwrap().unwrap();
         assert_eq!(event.kind(), RecorderEventKind::OpenFailed);
     };
 
@@ -818,12 +836,12 @@ fn waiting_on_a_final_report_preserves_queued_out_of_session_events() {
     device.push(mock::OPEN_FAILED, "later.mkv");
     let before = device.captures.load(Ordering::Acquire);
     assert!(matches!(
-        recorder.wait_finished(Duration::ZERO).unwrap(),
-        FinishStatus::Closed(_)
+        recorder.wait_for_finish(Duration::ZERO).unwrap(),
+        Some(FinishStatus::Closed(_))
     ));
     assert_eq!(device.captures.load(Ordering::Acquire), before);
     assert_eq!(
-        recorder.poll_event(Duration::ZERO).unwrap().unwrap().kind(),
+        recorder.next_event(Duration::ZERO).unwrap().unwrap().kind(),
         RecorderEventKind::OpenFailed
     );
 }
@@ -871,7 +889,10 @@ fn a_timeout_out_of_range_is_refused_before_the_stop() {
     let device = mock::Recorder::new(Closing::AtStop);
     let mut recorder = recording_on(&device);
     let too_long = crate::MAX_TIMEOUT + Duration::from_nanos(1);
-    for result in [recorder.finish(too_long), recorder.wait_finished(too_long)] {
+    for result in [
+        recorder.finish(too_long).map(|_| ()),
+        recorder.wait_for_finish(too_long).map(|_| ()),
+    ] {
         assert!(
             matches!(&result, Err(Error::InvalidInput(crate::InputDefect::TimeoutTooLong { requested })) if *requested == too_long),
             "{result:?}"
@@ -968,8 +989,8 @@ impl Drop for Directory {
     }
 }
 
-fn exact() -> RecorderOptions {
-    RecorderOptions::new(SourceSpec::new("mock source").unwrap()).naming(FileNaming::Exact)
+fn exact() -> FileRecorderOptions {
+    FileRecorderOptions::new(SourceSpec::new("mock source").unwrap()).naming(FileNaming::Exact)
 }
 
 fn io_kind<T: std::fmt::Debug>(result: Result<T>) -> std::io::ErrorKind {
@@ -984,7 +1005,7 @@ fn unreportable_recording_paths_never_reach_native_start_or_rollover() {
     let directory = Directory::new("path-limit");
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
-    let mut recorder = mock::recorder_api().create_recorder(&exact()).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
     let base = directory.0.to_str().unwrap();
     let path_bytes = sys::bindings::NDIlib_file_recorder_event_path_max_size as usize - 1;
     let too_long = RecordingTarget::new(format!(
@@ -1017,7 +1038,7 @@ fn unreportable_recording_paths_never_reach_native_start_or_rollover() {
 fn conflicting_options_are_refused_before_the_sdk_creates_anything() {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
-    let indexed = || RecorderOptions::new(SourceSpec::new("mock source").unwrap());
+    let indexed = || FileRecorderOptions::new(SourceSpec::new("mock source").unwrap());
     let requested = crate::MAX_TIMEOUT + Duration::from_millis(1);
     for (options, expected) in [
         (
@@ -1045,7 +1066,9 @@ fn conflicting_options_are_refused_before_the_sdk_creates_anything() {
             },
         ),
     ] {
-        let Err(Error::InvalidInput(cause)) = mock::recorder_api().create_recorder(&options) else {
+        let Err(Error::InvalidInput(cause)) =
+            crate::file::FileRecorder::new(&mock::recorder_api(), &options)
+        else {
             panic!("conflicting options were not refused");
         };
         assert_eq!(cause, expected);
@@ -1053,10 +1076,10 @@ fn conflicting_options_are_refused_before_the_sdk_creates_anything() {
     assert_eq!(device.creates.load(Ordering::Acquire), 0);
 
     // What creation tells the SDK.
-    let created = |options: RecorderOptions| {
+    let created = |options: FileRecorderOptions| {
         let device = mock::Recorder::new(Closing::AtStop);
         device.install();
-        drop(mock::recorder_api().create_recorder(&options).unwrap());
+        drop(crate::file::FileRecorder::new(&mock::recorder_api(), &options).unwrap());
         (
             device
                 .created_without_format_rollover
@@ -1073,17 +1096,17 @@ fn conflicting_options_are_refused_before_the_sdk_creates_anything() {
 
 #[test]
 fn the_naming_and_the_proxy_reach_the_sdk_as_its_settings() {
-    let created = |options: RecorderOptions| {
+    let created = |options: FileRecorderOptions| {
         let device = mock::Recorder::new(Closing::AtStop);
         device.install();
-        drop(mock::recorder_api().create_recorder(&options).unwrap());
+        drop(crate::file::FileRecorder::new(&mock::recorder_api(), &options).unwrap());
         let pattern = device.created_pattern.lock().unwrap().clone();
         (
             pattern,
             device.created_without_proxy.load(Ordering::Acquire),
         )
     };
-    let options = || RecorderOptions::new(SourceSpec::new("mock source").unwrap());
+    let options = || FileRecorderOptions::new(SourceSpec::new("mock source").unwrap());
     // Indexed names leave the pattern to the SDK's own default.
     assert_eq!(created(options()), (None, false));
     assert_eq!(
@@ -1122,7 +1145,7 @@ fn an_exact_recorder_changes_source_only_between_sessions() {
     let directory = Directory::new("exact-source");
     let device = mock::Recorder::new(Closing::Never);
     device.install();
-    let mut recorder = mock::recorder_api().create_recorder(&exact()).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
     let another = || SourceSpec::new("another source").unwrap();
 
     recorder.set_source(&another()).unwrap();
@@ -1133,13 +1156,13 @@ fn an_exact_recorder_changes_source_only_between_sessions() {
         .unwrap();
     assert!(matches!(
         recorder.set_source(&another()),
-        Err(Error::InvalidState(StateError::ExactFileName))
+        Err(Error::InvalidState(StateConflict::ExactFileName))
     ));
     assert_eq!(recorder.state(), RecorderState::Recording);
     recorder.request_stop();
     assert!(matches!(
         recorder.set_source(&another()),
-        Err(Error::InvalidState(StateError::ExactFileName))
+        Err(Error::InvalidState(StateConflict::ExactFileName))
     ));
     assert_eq!(device.source_changes.load(Ordering::Acquire), 1);
     assert_eq!(
@@ -1160,7 +1183,7 @@ fn an_indexed_recorder_refuses_a_change_of_source_only_while_stopping() {
     recorder.request_stop();
     assert!(matches!(
         recorder.set_source(&SourceSpec::new("a third source").unwrap()),
-        Err(Error::InvalidState(StateError::Stopping))
+        Err(Error::InvalidState(StateConflict::Stopping))
     ));
     assert_eq!(device.source_changes.load(Ordering::Acquire), 1);
     recorder.abandon();
@@ -1172,7 +1195,7 @@ fn an_exact_target_that_exists_is_refused_before_the_sdk_sees_it() {
     std::fs::write(directory.0.join("taken.mkv"), b"kept").unwrap();
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
-    let mut recorder = mock::recorder_api().create_recorder(&exact()).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
 
     assert_eq!(
         io_kind(recorder.start(&directory.target("taken.mkv"), RecordingTimecode::Preserve)),
@@ -1203,9 +1226,9 @@ fn the_directory_a_pattern_names_is_checked_before_the_sdk_sees_it() {
     let directory = Directory::new("pattern-directory");
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
-    let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap())
+    let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
         .naming(FileNaming::Pattern("{prefix}/{index:03}.mkv".into()));
-    let mut recorder = mock::recorder_api().create_recorder(&options).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &options).unwrap();
 
     // The target's own directory exists; the one the pattern names does not.
     assert_eq!(
@@ -1230,8 +1253,8 @@ fn values_a_refused_call_was_given_stay_with_the_caller_to_pass_again() {
     let directory = Directory::new("borrowed");
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
-    let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap());
-    let mut recorder = mock::recorder_api().create_recorder(&options).unwrap();
+    let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap());
+    let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &options).unwrap();
 
     // The indexed pattern puts each file in the directory the target names.
     let first = directory.target("first/take");
@@ -1286,9 +1309,9 @@ fn players_borrow_their_options() {
         },
         mock::recording(),
     );
-    let options = PlayerOptions::new("mock player");
-    let first = api.create_player(&options).unwrap();
-    let second = api.create_player(&options).unwrap();
+    let options = FilePlayerOptions::new("mock player");
+    let first = crate::file::FilePlayer::new(&api, &options).unwrap();
+    let second = crate::file::FilePlayer::new(&api, &options).unwrap();
     assert!(format!("{first:?}").contains("mock player"), "{first:?}");
     assert!(format!("{second:?}").contains("mock player"), "{second:?}");
     assert_eq!(options.name, "mock player");
@@ -1297,17 +1320,21 @@ fn players_borrow_their_options() {
 #[test]
 fn selected_endpoints_and_deliberate_names_cross_creation_and_source_change() {
     use crate::{Source, SourceAddress};
-    let selected =
-        Source::new("STUDIO (Camera 2)").with_address(SourceAddress::new("192.0.2.10:5962"));
+    let selected = Source::new("STUDIO (Camera 2)")
+        .unwrap()
+        .with_address(SourceAddress::new("192.0.2.10:5962").unwrap());
     let spec = SourceSpec::try_from(&selected).unwrap();
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
-    let mut recorder = mock::recorder_api()
-        .create_recorder(&RecorderOptions::new(spec.clone()))
-        .unwrap();
+    let mut recorder = crate::file::FileRecorder::new(
+        &mock::recorder_api(),
+        &FileRecorderOptions::new(spec.clone()),
+    )
+    .unwrap();
     assert_eq!(recorder.last_accepted_source(), Some(&spec));
     let second = Source::new("STUDIO (Program)")
-        .with_address(SourceAddress::new("ndi://camera.local:5963/path?opaque=1"));
+        .unwrap()
+        .with_address(SourceAddress::new("ndi://camera.local:5963/path?opaque=1").unwrap());
     recorder
         .set_source(&SourceSpec::try_from(&second).unwrap())
         .unwrap();
@@ -1323,10 +1350,12 @@ fn selected_endpoints_and_deliberate_names_cross_creation_and_source_change() {
         ]
     );
     let before = recorder.last_accepted_source().unwrap().clone();
-    assert!(
-        SourceSpec::try_from(&Source::new("valid name").with_address(SourceAddress::new("")))
-            .is_err()
-    );
+    assert!(SourceSpec::try_from(
+        &Source::new("valid name")
+            .unwrap()
+            .with_address(SourceAddress::new("").unwrap())
+    )
+    .is_err());
     assert_eq!(recorder.last_accepted_source(), Some(&before));
     assert_eq!(device.source_changes.load(Ordering::Acquire), 2);
 }

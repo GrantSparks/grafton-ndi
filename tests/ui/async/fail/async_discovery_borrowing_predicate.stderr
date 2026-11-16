@@ -1,17 +1,18 @@
 error[E0373]: closure may outlive the current function, but it borrows `name`, which is owned by the current function
- --> tests/ui/async/fail/async_discovery_borrowing_predicate.rs:6:51
+ --> tests/ui/async/fail/async_discovery_borrowing_predicate.rs:7:49
   |
-6 |     finder.find_source(std::time::Duration::ZERO, |source| source.name() == name).await.unwrap();
-  |                                                   ^^^^^^^^                  ---- `name` is borrowed here
-  |                                                   |
-  |                                                   may outlive borrowed value `name`
+7 |         .find_source(std::time::Duration::ZERO, |source| source.name() == name)
+  |                                                 ^^^^^^^^                  ---- `name` is borrowed here
+  |                                                 |
+  |                                                 may outlive borrowed value `name`
   |
 note: function requires argument type to outlive `'static`
  --> tests/ui/async/fail/async_discovery_borrowing_predicate.rs:6:5
   |
-6 |     finder.find_source(std::time::Duration::ZERO, |source| source.name() == name).await.unwrap();
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+6 | /     finder
+7 | |         .find_source(std::time::Duration::ZERO, |source| source.name() == name)
+  | |_______________________________________________________________________________^
 help: to force the closure to take ownership of `name` (and any other referenced variables), use the `move` keyword
   |
-6 |     finder.find_source(std::time::Duration::ZERO, move |source| source.name() == name).await.unwrap();
-  |                                                   ++++
+7 |         .find_source(std::time::Duration::ZERO, move |source| source.name() == name)
+  |                                                 ++++

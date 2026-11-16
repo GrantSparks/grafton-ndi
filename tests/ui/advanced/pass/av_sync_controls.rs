@@ -11,10 +11,10 @@ use std::time::Duration;
 
 fn common<M: ReceiverMode>(_: &Receiver<M>) {}
 fn metadata<M: MetadataMode>(receiver: &Receiver<M>) {
-    let _ = receiver.metadata().capture_ref(Duration::ZERO);
+    let _ = receiver.capture_metadata_ref(Duration::ZERO);
 }
 fn video<M: VideoMode>(receiver: &Receiver<M>) {
-    let _ = receiver.video().capture(Duration::ZERO);
+    let _ = receiver.capture_video(Duration::ZERO);
 }
 fn controls(receiver: &Receiver<AvSyncAttached>) {
     common(receiver);
@@ -26,7 +26,7 @@ fn controls(receiver: &Receiver<AvSyncAttached>) {
     let _ = receiver.request_keyframe();
     let _ = receiver.send_metadata(&MetadataFrame::new("<sync/>").unwrap());
     let _ = receiver.set_video_delay(Duration::ZERO);
-    let _ = receiver.connect_to(&Source::new("OTHER (Program)"));
+    let _ = receiver.connect_to(&Source::new("OTHER (Program)").unwrap());
     receiver.reconnect();
 }
 fn zero_copy(sync: &AvSync) -> grafton_ndi::Result<()> {
@@ -34,8 +34,7 @@ fn zero_copy(sync: &AvSync) -> grafton_ndi::Result<()> {
     // Capture in place, then synchronize that same frame.
     while let Some(video) = sync
         .receiver()
-        .video()
-        .capture_ref(Duration::from_millis(100))?
+        .capture_video_ref(Duration::from_millis(100))?
     {
         let Some(stamped) = AvSyncVideo::new(&video) else {
             continue;
@@ -48,7 +47,7 @@ fn zero_copy(sync: &AvSync) -> grafton_ndi::Result<()> {
     }
     // An owned copy of a captured frame keeps its timestamp, and the queued
     // audio is taken without a frame.
-    if let Some(owned) = sync.receiver().video().capture(Duration::ZERO)? {
+    if let Some(owned) = sync.receiver().capture_video(Duration::ZERO)? {
         if let Some(stamped) = AvSyncVideo::new(&owned) {
             let _ = sync.synchronize(stamped, AvSyncRequest::automatic())?;
         }
@@ -66,7 +65,7 @@ fn scoped(sync: &AvSync) {
     std::thread::scope(|scope| {
         let receiver = sync.receiver();
         scope.spawn(move || {
-            let _ = receiver.metadata().capture(Duration::ZERO);
+            let _ = receiver.capture_metadata(Duration::ZERO);
             receiver.reconnect();
         });
         let _ = sync.queued_audio(AvSyncRequest::automatic());

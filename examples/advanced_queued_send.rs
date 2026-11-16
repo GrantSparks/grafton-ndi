@@ -31,7 +31,7 @@ use std::{
 };
 
 use grafton_ndi::{
-    advanced::{QueueOptions, QueuedSender, QueuedVideo, QueuedVideoFrame},
+    advanced::{QueueLimits, QueuedSender, QueuedVideo, QueuedVideoFrame},
     AudioFrame, Error, Ndi, RuntimeOptions, SdkEdition, SenderOptions, VideoFrame,
 };
 
@@ -41,7 +41,7 @@ fn main() -> Result<(), Error> {
         &ndi,
         // Completion-based sends are paced by the application below.
         &SenderOptions::new("Queued Sender Example").clock_video(false),
-        QueueOptions::default().max_frames(4),
+        &QueueLimits::default().max_frames(4),
     )?;
 
     let send_result = {
@@ -82,7 +82,7 @@ fn send_video(sender: &mut QueuedVideo<'_>) -> Result<(), Error> {
     let mut next_tick = Instant::now();
     let interval = Duration::from_secs_f64(1.0 / 60.0);
     for number in 0..300 {
-        while let Some(done) = sender.try_take_completed() {
+        while let Some(done) = sender.try_next_completed() {
             spare.push(done.into_frame());
         }
         let frame = match spare.pop() {
@@ -95,7 +95,7 @@ fn send_video(sender: &mut QueuedVideo<'_>) -> Result<(), Error> {
                 // The queue is full: the frame comes back, and is kept for later.
                 println!("Frame {number} not queued: {rejected}");
                 spare.push(rejected.into_inner());
-                if let Some(done) = sender.wait_completed(Duration::from_millis(100))? {
+                if let Some(done) = sender.next_completed(Duration::from_millis(100))? {
                     spare.push(done.into_frame());
                 }
             }

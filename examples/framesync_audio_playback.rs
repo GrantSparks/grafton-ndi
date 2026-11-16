@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("provide exactly one complete source name".into());
     }
     let ndi = Ndi::new()?;
-    let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips("127.0.0.1"))?;
+    let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips(["127.0.0.1"]))?;
     let source = finder
         .find_source_by_name(&name, Duration::from_secs(10))?
         .ok_or("selected audio source was not discovered within ten seconds")?;

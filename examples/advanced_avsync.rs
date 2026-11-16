@@ -59,11 +59,7 @@ fn main() -> Result<(), Error> {
         }
         // The frame borrows the SDK's buffer, and the synchronizer reads it
         // there: no pixels are copied.
-        let Some(video) = sync
-            .receiver()
-            .video()
-            .capture_ref(Duration::from_secs(1))?
-        else {
+        let Some(video) = sync.receiver().capture_video_ref(Duration::from_secs(1))? else {
             println!("No video yet...");
             continue;
         };

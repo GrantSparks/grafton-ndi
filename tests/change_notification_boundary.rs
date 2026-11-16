@@ -439,7 +439,7 @@ async fn async_discovery<R: grafton_ndi::asynchronous::AsyncRuntime>(
         Finder::new(ndi, &FinderOptions::new()).unwrap(),
     ));
     let before = count("finder-wait-begin");
-    let mut abandoned = Box::pin(cache.sources_by_host("STUDIO", Duration::from_secs(3)));
+    let mut abandoned = Box::pin(cache.find_sources_by_host("STUDIO", Duration::from_secs(3)));
     assert!(matches!(
         abandoned.as_mut().poll(&mut context),
         Poll::Pending
@@ -457,7 +457,7 @@ async fn async_discovery<R: grafton_ndi::asynchronous::AsyncRuntime>(
     );
     assert_eq!(
         cache
-            .sources_by_host("STUDIO", Duration::ZERO)
+            .find_sources_by_host("STUDIO", Duration::ZERO)
             .await
             .unwrap()
             .len(),
@@ -467,7 +467,7 @@ async fn async_discovery<R: grafton_ndi::asynchronous::AsyncRuntime>(
     let calls = count("finder-wait-begin");
     assert_eq!(
         cache
-            .sources_by_host("STUDIO", Duration::ZERO)
+            .find_sources_by_host("STUDIO", Duration::ZERO)
             .await
             .unwrap()
             .len(),
@@ -575,7 +575,7 @@ fn keyframe(ndi: &Ndi, clear_after_query: bool) {
         return;
     }
     let sender = Sender::new(ndi, &SenderOptions::new("keyframe fixture")).unwrap();
-    let receiver = Receiver::new(ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+    let receiver = Receiver::new(ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
     let h264 = VideoPacketFormat::new(VideoCodec::H264, 64, 32).unwrap();
     let different_size = VideoPacketFormat::new(VideoCodec::H264, 128, 64).unwrap();
     if clear_after_query {
@@ -594,7 +594,7 @@ fn keyframe(ndi: &Ndi, clear_after_query: bool) {
             let (sender, ready, tx) = (&sender, &ready, tx.clone());
             scope.spawn(move || {
                 ready.wait();
-                tx.send(sender.wait_for_keyframe_change(PATIENCE, format).unwrap())
+                tx.send(sender.wait_for_keyframe_change(format, PATIENCE).unwrap())
                     .unwrap();
             });
         }

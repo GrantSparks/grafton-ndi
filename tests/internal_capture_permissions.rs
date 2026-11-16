@@ -38,7 +38,7 @@ fn attached_modes_fail_the_internal_capture_entry_points() {
         );
     }
     assert!(
-        stderr.contains("capture_ref_until") && stderr.contains("Capture::<'rx, K>::new"),
-        "typed capture and its mode-erasing view must both fail the permission gate:\n{stderr}"
+        stderr.contains("capture_ref_until") && stderr.contains("capture_audio"),
+        "internal and public typed capture must both fail their permission gates:\n{stderr}"
     );
 }

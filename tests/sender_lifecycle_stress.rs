@@ -21,7 +21,7 @@ fn rapid_owned_sender_lifecycle() -> Result<(), grafton_ndi::Error> {
         let mut next = VideoFrame::builder().resolution(16, 16).build()?;
         for value in 0..50 {
             next.data_mut().fill(value);
-            let returned = sender.send_video_async(next)?;
+            let returned = sender.submit_video(next)?;
             next = match returned {
                 Some(frame) => frame,
                 None => VideoFrame::builder().resolution(16, 16).build()?,

@@ -47,7 +47,8 @@ fn polls_preserve_changes_and_never_enter_a_waiters_native_query() {
         let ndi =
             Ndi::with_options(&RuntimeOptions::new().library_path(PathBuf::from(library))).unwrap();
         let sender = Sender::new(&ndi, &SenderOptions::new("fake tally")).unwrap();
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+        let receiver =
+            Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
         // Poll first, then wait: the report must be returned exactly once.
         receiver.set_tally(Tally::new(true, false));
         for _ in 0..3 {

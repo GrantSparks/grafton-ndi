@@ -58,15 +58,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for source in &sources {
-        router.change(source)?;
+        router.set_route(source)?;
         println!(
             "Routing to {source} ({} receiver(s) connected to the router)",
-            router.connection_count(Duration::ZERO)?
+            router.connection_count()?
         );
         thread::sleep(DWELL);
     }
 
-    router.clear()?;
+    router.clear_route()?;
     println!("Route cleared.");
     Ok(())
 }

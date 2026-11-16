@@ -11,7 +11,7 @@ mod fixture;
 use fixture::FixtureDir;
 use grafton_ndi::{
     file::{
-        FileNaming, FinishStatus, RecorderEventKind, RecorderOptions, RecordingTarget,
+        FileNaming, FileRecorderOptions, FinishStatus, RecorderEventKind, RecordingTarget,
         RecordingTimecode, SourceSpec,
     },
     MediaTypes,
@@ -65,7 +65,7 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
             std::process::id()
         ));
         if let Some(groups) = groups {
-            options = options.groups(groups);
+            options = options.groups([groups]);
         }
         let sender = grafton_ndi::Sender::new(&ndi, &options).unwrap();
         senders.push((sender, dimensions));
@@ -97,8 +97,8 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
         let finder = grafton_ndi::Finder::new(
             &ndi,
             &grafton_ndi::FinderOptions::new()
-                .groups(&group)
-                .extra_ips("127.0.0.1"),
+                .groups([&group])
+                .extra_ips(["127.0.0.1"]),
         )
         .unwrap();
         let selected = finder
@@ -130,11 +130,11 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
         // media, rather than merely checking that native creation succeeded.
         for (label, spec, expected) in policies {
             let file = fixture.path().join(format!("{label}.mkv"));
-            let options = RecorderOptions::new(spec.clone())
+            let options = FileRecorderOptions::new(spec.clone())
                 .naming(FileNaming::Exact)
                 .proxy(false)
                 .tracks(MediaTypes::VIDEO);
-            let mut recorder = api.create_recorder(&options).unwrap();
+            let mut recorder = grafton_ndi::file::FileRecorder::new(&api, &options).unwrap();
             assert_eq!(recorder.last_accepted_source(), Some(&spec));
             recorder.set_source(&spec).unwrap();
             assert_eq!(recorder.last_accepted_source(), Some(&spec));
@@ -150,7 +150,7 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
                     Instant::now() < deadline,
                     "no FirstFrame for {label} selection"
                 );
-                let Some(event) = recorder.poll_event(Duration::from_millis(50)).unwrap() else {
+                let Some(event) = recorder.next_event(Duration::from_millis(50)).unwrap() else {
                     continue;
                 };
                 match event.kind() {
@@ -164,13 +164,13 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
             let track = &first.source_format().unwrap().video_tracks()[0];
             assert_eq!((track.width(), track.height()), expected);
             thread::sleep(Duration::from_millis(150));
-            assert!(recorder.stats().unwrap().unwrap().video_frames() > 0);
+            assert!(recorder.stats().unwrap().unwrap().video_frames_written() > 0);
             let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
                 panic!("the selected recording was not finalized");
             };
             assert_eq!(report.error_events(), 0);
             assert_eq!(report.empty_files(), 0);
-            let info = api.probe(&file).unwrap();
+            let info = grafton_ndi::file::FilePlayer::probe(&api, &file).unwrap();
             let track = &info.source_format().unwrap().video_tracks()[0];
             assert_eq!((track.width(), track.height()), expected);
             assert!(info.duration().is_final());
@@ -182,18 +182,19 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
         // Pair an unavailable endpoint with the public name that just delivered
         // media, so a hidden name fallback would record the logical feed.
         let unavailable = grafton_ndi::Source::new(&logical_name)
-            .with_address(grafton_ndi::SourceAddress::new("127.0.0.1:9"));
+            .unwrap()
+            .with_address(grafton_ndi::SourceAddress::new("127.0.0.1:9").unwrap());
         let spec = SourceSpec::try_from(&unavailable).unwrap();
         assert_eq!(spec.name(), None);
         assert_eq!(spec.url(), Some("127.0.0.1:9"));
-        let mut recorder = api
-            .create_recorder(
-                &RecorderOptions::new(spec.clone())
-                    .naming(FileNaming::Exact)
-                    .proxy(false)
-                    .tracks(MediaTypes::VIDEO),
-            )
-            .unwrap();
+        let mut recorder = grafton_ndi::file::FileRecorder::new(
+            &api,
+            &FileRecorderOptions::new(spec.clone())
+                .naming(FileNaming::Exact)
+                .proxy(false)
+                .tracks(MediaTypes::VIDEO),
+        )
+        .unwrap();
         assert_eq!(recorder.last_accepted_source(), Some(&spec));
         recorder
             .start(
@@ -205,7 +206,7 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
         assert!(recorder
             .stats()
             .unwrap()
-            .is_none_or(|stats| stats.video_frames() == 0));
+            .is_none_or(|stats| stats.video_frames_written() == 0));
         let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
             panic!("the unavailable endpoint recording was not finalized");
         };

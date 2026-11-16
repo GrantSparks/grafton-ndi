@@ -381,8 +381,8 @@ mod tests {
 
     #[test]
     fn captured_audio_sources_lend_the_original_strided_descriptor() {
-        use crate::capture::{AudioKind, FrameSyncAudioFree, Guard};
-        use crate::frames::AudioRef;
+        use crate::capture::Guard;
+        use crate::{AudioFrameRef, FrameSyncAudioRef};
         use std::{
             mem::MaybeUninit,
             sync::atomic::{AtomicUsize, Ordering},
@@ -411,13 +411,13 @@ mod tests {
         // SAFETY: the initialized channels, uninitialized inter-channel padding,
         // and static metadata stay live until both non-owning guards are dropped.
         let receiver = unsafe {
-            AudioRef::<AudioKind>::new(Guard::with_test_free(instance, raw, |instance, _| {
+            AudioFrameRef::new(Guard::with_test_free(instance, raw, |instance, _| {
                 (*(instance as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
             }))
         }
         .unwrap();
         let framesync = unsafe {
-            AudioRef::<FrameSyncAudioFree>::new(Guard::with_test_free(
+            FrameSyncAudioRef::new(Guard::with_test_free(
                 instance.cast(),
                 raw,
                 |instance, _| {
@@ -464,8 +464,8 @@ mod tests {
 
     #[test]
     fn native_strided_captures_convert_all_sample_types_without_planar_copies() {
-        use crate::capture::{AudioKind, FrameSyncAudioFree, Guard};
-        use crate::frames::AudioRef;
+        use crate::capture::Guard;
+        use crate::{AudioFrameRef, FrameSyncAudioRef};
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
@@ -489,15 +489,11 @@ mod tests {
         // SAFETY: both synthetic guards borrow the initialized storage and static
         // metadata for this test; neither callback frees independently owned data.
         let receiver = unsafe {
-            AudioRef::<AudioKind>::new(Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}))
+            AudioFrameRef::new(Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}))
         }
         .unwrap();
         let framesync = unsafe {
-            AudioRef::<FrameSyncAudioFree>::new(Guard::with_test_free(
-                std::ptr::null_mut(),
-                raw,
-                |_, _| {},
-            ))
+            FrameSyncAudioRef::new(Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}))
         }
         .unwrap();
         fn verify(converter: &AudioConverter, source: &(impl AudioSource + ?Sized)) {

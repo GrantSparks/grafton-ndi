@@ -139,7 +139,11 @@ fn frames_that_end_where_memory_ends_are_sent() {
     // it; a receiver makes the test independent of that.
     let _receiver = uyvy_receiver(&ndi, &sender);
     let deadline = Instant::now() + Duration::from_secs(15);
-    while sender.connection_count(Duration::from_millis(100)).unwrap() == 0 {
+    while sender
+        .wait_for_connection(Duration::from_millis(100))
+        .unwrap()
+        .is_none()
+    {
         assert!(Instant::now() < deadline, "no receiver connected");
     }
     let sizes = [
@@ -162,7 +166,7 @@ fn frames_that_end_where_memory_ends_are_sent() {
                 ScanType::Field1,
             ] {
                 let case = format!("{format:?} {width}x{height} {scan:?}");
-                let len = format.buffer_len(width, height).unwrap();
+                let len = format.buffer_len(width, height, None).unwrap();
                 let room = room(format, width, height, scan);
 
                 // The frame and exactly its room, then nothing.
@@ -193,10 +197,10 @@ fn frames_that_end_where_memory_ends_are_sent() {
                 // room, so sending never needs to grow its allocation.
                 let owned = frame.to_owned();
                 sender.send_video(&owned).unwrap();
-                sender.send_video_async_copy(&frame).unwrap();
-                let returned = sender.send_video_async(owned).unwrap();
+                sender.submit_video_copy(&frame).unwrap();
+                let returned = sender.submit_video(owned).unwrap();
                 assert!(returned.is_some(), "{case}");
-                assert!(sender.finish_video_async().is_some(), "{case}");
+                assert!(sender.reclaim_video().is_some(), "{case}");
             }
         }
     }
@@ -241,8 +245,7 @@ fn received(
         loop {
             assert!(Instant::now() < deadline, "{label}: no frame");
             let captured = receiver
-                .video()
-                .capture_ref(Duration::from_millis(100))
+                .capture_video_ref(Duration::from_millis(100))
                 .unwrap();
             if let Some(captured) = captured {
                 if captured.width() == 642 {

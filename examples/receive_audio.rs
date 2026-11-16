@@ -1,3 +1,5 @@
+//! Port of SDK sample `NDIlib_Recv_Audio`.
+//!
 //! Example: Receiving NDI audio with 32-bit float format.
 //!
 //! This example demonstrates:
@@ -6,10 +8,10 @@
 //! - Capturing 32-bit float audio frames
 //! - Accessing audio data by channel
 //!
-//! Run with: `cargo run --example NDIlib_Recv_Audio`
+//! Run with: `cargo run --example receive_audio`
 //!
 //! Optional arguments:
-//! - IP address to search: `cargo run --example NDIlib_Recv_Audio -- 192.168.0.110`
+//! - IP address to search: `cargo run --example receive_audio -- 192.168.0.110`
 
 use std::{env, time::Duration};
 
@@ -66,7 +68,7 @@ fn main() -> Result<(), Error> {
 
     // Capture a few audio frames
     for i in 0..5 {
-        match receiver.audio().capture_ref(Duration::from_secs(5))? {
+        match receiver.capture_audio_ref(Duration::from_secs(5))? {
             Some(audio_frame) => {
                 println!("Frame {}: ", i + 1);
                 println!("  Sample rate: {} Hz", audio_frame.sample_rate());

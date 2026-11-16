@@ -18,7 +18,7 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
         let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
         let packets = PacketReceiver::new(
             &ndi,
-            &ReceiverOptions::new(Source::new("fixture")),
+            &ReceiverOptions::new(Source::new("fixture").unwrap()),
             PassthroughPreset::ProtectedWithAudio,
         )
         .unwrap();
@@ -38,7 +38,7 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
                 "audio"
             };
             let before = frees(medium);
-            let frame = packets.capture_ref(Duration::ZERO).unwrap().unwrap();
+            let frame = packets.capture_any_ref(Duration::ZERO).unwrap().unwrap();
             assert_eq!(frees(medium), before);
             let pointer = match &frame {
                 PacketItemRef::Video(ReceivedVideoRef::Compressed(frame)) => {
@@ -59,7 +59,7 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
                 "GRAFTON_FAKE_CAPTURE_SCRIPT",
                 format!("{}:{kind}", serial + 10),
             );
-            assert!(packets.capture(Duration::ZERO).unwrap().is_some());
+            assert!(packets.capture_any(Duration::ZERO).unwrap().is_some());
             assert_eq!(frees(medium), before + 2);
         }
         for (serial, kind) in [
@@ -69,19 +69,19 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
             (23, "status"),
         ] {
             std::env::set_var("GRAFTON_FAKE_CAPTURE_SCRIPT", format!("{serial}:{kind}"));
-            assert!(packets.capture_ref(Duration::ZERO).unwrap().is_some());
+            assert!(packets.capture_any_ref(Duration::ZERO).unwrap().is_some());
         }
         std::env::set_var("GRAFTON_FAKE_CAPTURE_SCRIPT", "24:bad-packet-video");
         let before = frees("video");
         assert!(matches!(
-            packets.capture_ref(Duration::ZERO),
+            packets.capture_any_ref(Duration::ZERO),
             Err(Error::InvalidFrame(_))
         ));
         assert_eq!(frees("video"), before + 1);
         std::env::set_var("GRAFTON_FAKE_CAPTURE_SCRIPT", "25:none");
-        assert!(packets.capture_ref(Duration::ZERO).unwrap().is_none());
+        assert!(packets.capture_any_ref(Duration::ZERO).unwrap().is_none());
         assert!(matches!(
-            packets.capture_ref(Duration::MAX),
+            packets.capture_any_ref(Duration::MAX),
             Err(Error::InvalidInput(_))
         ));
 
@@ -96,7 +96,7 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
         std::thread::scope(|scope| {
             let capture = scope.spawn(|| {
                 assert!(packets
-                    .capture_ref(Duration::from_millis(110))
+                    .capture_any_ref(Duration::from_millis(110))
                     .unwrap()
                     .is_none());
             });

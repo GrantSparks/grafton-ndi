@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn event_type_mismatch_is_diagnosed_for_both_native_handles() {
-        use crate::file::{mock, FileApi, PlayerOptions, RecorderOptions, SourceSpec};
+        use crate::file::{mock, FileApi, FilePlayerOptions, FileRecorderOptions, SourceSpec};
 
         unsafe extern "C" fn player_create(
             _: *const NDIlib_file_player_create_t,
@@ -311,21 +311,20 @@ mod tests {
                 ..mock::recording()
             },
         );
-        let mut player = api
-            .create_player(&PlayerOptions::new("mock player"))
-            .unwrap();
-        let mut recorder = api
-            .create_recorder(&RecorderOptions::new(
-                SourceSpec::new("mock source").unwrap(),
-            ))
-            .unwrap();
+        let mut player =
+            crate::file::FilePlayer::new(&api, &FilePlayerOptions::new("mock player")).unwrap();
+        let mut recorder = crate::file::FileRecorder::new(
+            &api,
+            &FileRecorderOptions::new(SourceSpec::new("mock source").unwrap()),
+        )
+        .unwrap();
         for (result, diagnostic) in [
             (
-                player.poll_event(std::time::Duration::ZERO).map(|_| ()),
+                player.next_event(std::time::Duration::ZERO).map(|_| ()),
                 "the player returned one event type and stored another",
             ),
             (
-                recorder.poll_event(std::time::Duration::ZERO).map(|_| ()),
+                recorder.next_event(std::time::Duration::ZERO).map(|_| ()),
                 "the recorder returned one event type and stored another",
             ),
         ] {

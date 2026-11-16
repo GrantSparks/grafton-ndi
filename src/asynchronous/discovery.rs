@@ -8,28 +8,28 @@ use crate::{
 use std::{cell::Cell, marker::PhantomData, sync::Arc, time::Duration};
 
 mod sealed {
-    pub trait Discovery {
+    pub trait SourceDiscovery {
         fn finder(&self) -> &crate::Finder;
     }
-    impl Discovery for crate::Finder {
+    impl SourceDiscovery for crate::Finder {
         fn finder(&self) -> &crate::Finder {
             self
         }
     }
-    impl Discovery for crate::SourceCache {
+    impl SourceDiscovery for crate::SourceCache {
         fn finder(&self) -> &crate::Finder {
             self.finder()
         }
     }
 }
 
-/// Discovery state an [`AsyncFinder`] can own: [`Finder`] or [`SourceCache`].
+/// Source discovery state an [`AsyncFinder`] can own: [`Finder`] or [`SourceCache`].
 ///
 /// This sealed, itemless trait selects the existing discovery owner. It adds no
 /// finder, cache or worker and cannot be implemented outside this crate.
-pub trait Discovery: sealed::Discovery + Send + Sync + 'static {}
-impl Discovery for Finder {}
-impl Discovery for SourceCache {}
+pub trait SourceDiscovery: sealed::SourceDiscovery + Send + Sync + 'static {}
+impl SourceDiscovery for Finder {}
+impl SourceDiscovery for SourceCache {}
 
 /// Async discovery through one owned [`Finder`] or [`SourceCache`].
 ///
@@ -61,12 +61,12 @@ impl Discovery for SourceCache {}
 /// # Ok(())
 /// # }
 /// ```
-pub struct AsyncFinder<R: AsyncRuntime, D: Discovery = Finder> {
+pub struct AsyncFinder<R: AsyncRuntime, D: SourceDiscovery = Finder> {
     inner: Arc<D>,
     _runtime: PhantomData<R>,
 }
 
-impl<R: AsyncRuntime, D: Discovery> std::fmt::Debug for AsyncFinder<R, D> {
+impl<R: AsyncRuntime, D: SourceDiscovery> std::fmt::Debug for AsyncFinder<R, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncFinder")
             .field("owner", &std::any::type_name::<D>())
@@ -75,7 +75,7 @@ impl<R: AsyncRuntime, D: Discovery> std::fmt::Debug for AsyncFinder<R, D> {
     }
 }
 
-impl<R: AsyncRuntime, D: Discovery> Clone for AsyncFinder<R, D> {
+impl<R: AsyncRuntime, D: SourceDiscovery> Clone for AsyncFinder<R, D> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -84,7 +84,7 @@ impl<R: AsyncRuntime, D: Discovery> Clone for AsyncFinder<R, D> {
     }
 }
 
-impl<R: AsyncRuntime, D: Discovery> AsyncFinder<R, D> {
+impl<R: AsyncRuntime, D: SourceDiscovery> AsyncFinder<R, D> {
     /// Share an existing discovery owner without recreating its native finder.
     #[must_use]
     pub fn new(discovery: D) -> Self {
@@ -97,7 +97,7 @@ impl<R: AsyncRuntime, D: Discovery> AsyncFinder<R, D> {
     /// The configured finder shared by every lookup and cursor of this adapter.
     #[must_use]
     pub fn finder(&self) -> &Finder {
-        sealed::Discovery::finder(&*self.inner)
+        sealed::SourceDiscovery::finder(&*self.inner)
     }
 
     /// Create one owned cursor that can move into a spawned async task.
@@ -131,7 +131,7 @@ impl<R: AsyncRuntime, D: Discovery> AsyncFinder<R, D> {
     ) -> Result<Option<Source>> {
         let inner = Arc::clone(&self.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-            sealed::Discovery::finder(&*inner).find_source_until(deadline, stop, &mut select)
+            sealed::SourceDiscovery::finder(&*inner).find_source_until(deadline, stop, &mut select)
         })
         .await
     }
@@ -154,7 +154,7 @@ impl<R: AsyncRuntime, D: Discovery> AsyncFinder<R, D> {
         let name = name.to_owned();
         let inner = Arc::clone(&self.inner);
         with_deadline_budget::<R, _, _>(deadline, move |deadline, stop| {
-            sealed::Discovery::finder(&*inner)
+            sealed::SourceDiscovery::finder(&*inner)
                 .find_source_until(deadline, stop, |source| source.name() == name)
         })
         .await
@@ -171,7 +171,7 @@ impl<R: AsyncRuntime, D: Discovery> AsyncFinder<R, D> {
     pub async fn find_sources(&self, timeout: Duration) -> Result<Vec<Source>> {
         let inner = Arc::clone(&self.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-            sealed::Discovery::finder(&*inner).find_sources_until(deadline, stop)
+            sealed::SourceDiscovery::finder(&*inner).find_sources_until(deadline, stop)
         })
         .await
     }
@@ -186,7 +186,7 @@ impl<R: AsyncRuntime> AsyncFinder<R, SourceCache> {
 
     /// Return cached feeds or observe a host's full discovery window.
     ///
-    /// As [`SourceCache::sources_by_host`], including best-effort publication.
+    /// As [`SourceCache::find_sources_by_host`], including best-effort publication.
     /// A cancelled miss does not publish an incomplete discovery window. Cache
     /// hits also use the blocking pool; returned descriptors are owned copies.
     ///
@@ -197,13 +197,13 @@ impl<R: AsyncRuntime> AsyncFinder<R, SourceCache> {
     /// result-copy and dispatch errors propagate.
     #[doc(alias = "NDIlib_find_get_current_sources")]
     #[doc(alias = "NDIlib_find_wait_for_sources")]
-    pub async fn sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
+    pub async fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
         let deadline = Deadline::after(timeout)?;
         validate_host_query(host)?;
         let host = host.to_owned();
         let inner = Arc::clone(&self.inner);
         with_deadline_budget::<R, _, _>(deadline, move |deadline, stop| {
-            inner.sources_by_host_until(&host, deadline, stop)
+            inner.find_sources_by_host_until(&host, deadline, stop)
         })
         .await
     }
@@ -217,13 +217,13 @@ impl<R: AsyncRuntime> AsyncFinder<R, SourceCache> {
 /// A failed or dropped operation leaves its generation unchanged. Reports
 /// published during a snapshot or an abandoned wait remain owed to the cursor.
 /// This also keeps the finder and its runtime alive until the cursor is dropped.
-pub struct AsyncSourceWatch<R: AsyncRuntime, D: Discovery = Finder> {
+pub struct AsyncSourceWatch<R: AsyncRuntime, D: SourceDiscovery = Finder> {
     inner: Arc<D>,
     observed: Cell<u64>,
     _runtime: PhantomData<R>,
 }
 
-impl<R: AsyncRuntime, D: Discovery> std::fmt::Debug for AsyncSourceWatch<R, D> {
+impl<R: AsyncRuntime, D: SourceDiscovery> std::fmt::Debug for AsyncSourceWatch<R, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncSourceWatch")
             .field("owner", &std::any::type_name::<D>())
@@ -232,7 +232,7 @@ impl<R: AsyncRuntime, D: Discovery> std::fmt::Debug for AsyncSourceWatch<R, D> {
     }
 }
 
-impl<R: AsyncRuntime, D: Discovery> AsyncSourceWatch<R, D> {
+impl<R: AsyncRuntime, D: SourceDiscovery> AsyncSourceWatch<R, D> {
     /// Copy current sources and acknowledge the generation read before copying.
     ///
     /// Snapshot-lock acquisition can be stopped when this future is dropped;
@@ -247,7 +247,7 @@ impl<R: AsyncRuntime, D: Discovery> AsyncSourceWatch<R, D> {
     pub async fn current_sources(&mut self) -> Result<Vec<Source>> {
         let inner = Arc::clone(&self.inner);
         let (generation, sources) = R::spawn_stoppable(private::Token, move |stop| {
-            let finder = sealed::Discovery::finder(&*inner);
+            let finder = sealed::SourceDiscovery::finder(&*inner);
             let generation = finder.generation();
             finder
                 .current_sources_stoppable(stop)
@@ -275,7 +275,7 @@ impl<R: AsyncRuntime, D: Discovery> AsyncSourceWatch<R, D> {
         let inner = Arc::clone(&self.inner);
         let (changed, generation) =
             with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-                let finder = sealed::Discovery::finder(&*inner);
+                let finder = sealed::SourceDiscovery::finder(&*inner);
                 let changed = finder.wait_for_sources_since(observed, deadline, stop);
                 Ok((changed, finder.generation()))
             })
@@ -302,7 +302,7 @@ mod tests {
         Finder::new(
             ndi,
             &FinderOptions::new()
-                .groups(crate::test_support::unique_name("async discovery"))
+                .groups([crate::test_support::unique_name("async discovery")])
                 .show_local_sources(false),
         )
         .unwrap()
@@ -317,7 +317,7 @@ mod tests {
         send(finder.find_source(Duration::ZERO, |_| true));
         send(finder.find_source_by_name("camera", Duration::ZERO));
         send(finder.find_sources(Duration::ZERO));
-        send(cache.sources_by_host("camera", Duration::ZERO));
+        send(cache.find_sources_by_host("camera", Duration::ZERO));
         send(watch.current_sources());
         send(watch.wait_for_change(Duration::ZERO));
     }
@@ -364,7 +364,7 @@ mod tests {
         }
         for host in ["", "http://camera", "bad\0host"] {
             assert!(matches!(
-                Box::pin(cache.sources_by_host(host, Duration::ZERO))
+                Box::pin(cache.find_sources_by_host(host, Duration::ZERO))
                     .as_mut()
                     .poll(&mut context),
                 Poll::Ready(Err(Error::InvalidInput(InputDefect::InvalidHostQuery)))
@@ -425,8 +425,8 @@ mod tests {
             1,
         );
         abandon(
-            "sources_by_host",
-            cache.sources_by_host("missing.invalid", LOOKUP),
+            "find_sources_by_host",
+            cache.find_sources_by_host("missing.invalid", LOOKUP),
             || Arc::strong_count(&cache.inner),
             1,
         );

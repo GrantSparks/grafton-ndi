@@ -456,6 +456,22 @@ runtime_features! {
     advanced Kvm as "KVM control";
 }
 
+/// A runtime capability or a family of operations from the separate File library.
+///
+/// [`crate::Error::UnsupportedCapability`] uses this value to identify the
+/// unavailable operation group while retaining its [`CapabilityRefusal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
+pub enum Capability {
+    /// An operation group provided by the selected NDI runtime.
+    #[error("{}", .0.name())]
+    Runtime(RuntimeFeature),
+    /// An operation family provided by the separate File library.
+    #[cfg(feature = "file-io")]
+    #[error("{}", .0.name())]
+    File(crate::file::FileFamily),
+}
+
 /// Why a capability cannot safely be used in this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
@@ -764,7 +780,10 @@ mod tests {
     ) -> std::result::Result<(), (RuntimeFeature, CapabilityRefusal)> {
         match result {
             Ok(_) => Ok(()),
-            Err(Error::UnsupportedCapability { feature, refusal }) => Err((feature, refusal)),
+            Err(Error::UnsupportedCapability {
+                capability: Capability::Runtime(feature),
+                refusal,
+            }) => Err((feature, refusal)),
             Err(other) => panic!("unexpected error: {other}"),
         }
     }
@@ -882,7 +901,10 @@ mod tests {
                         CapabilityStatus::from_decision(expected.map_err(|(_, refusal)| refusal))
                     );
                     if let Err((_, refusal)) = expected {
-                        let error = Error::UnsupportedCapability { feature, refusal };
+                        let error = Error::UnsupportedCapability {
+                            capability: Capability::Runtime(feature),
+                            refusal,
+                        };
                         assert_eq!(
                             error.to_string(),
                             format!(

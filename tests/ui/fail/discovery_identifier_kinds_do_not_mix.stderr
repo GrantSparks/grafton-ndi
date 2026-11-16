@@ -1,27 +1,27 @@
 error[E0308]: mismatched types
- --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:9:23
-  |
-9 |     senders.subscribe(receiver);
-  |             --------- ^^^^^^^^ expected `&SenderId`, found `&ReceiverId`
-  |             |
-  |             arguments to this method are incorrect
-  |
-  = note: expected reference `&SenderId`
-             found reference `&ReceiverId`
+  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:11:23
+   |
+11 |     senders.subscribe(receiver);
+   |             --------- ^^^^^^^^ expected `&SenderId`, found `&ReceiverId`
+   |             |
+   |             arguments to this method are incorrect
+   |
+   = note: expected reference `&SenderId`
+              found reference `&ReceiverId`
 note: method defined here
- --> src/discovery/listener.rs
-  |
-  |         pub fn subscribe(&mut self, id: &$Id) {
-  |                ^^^^^^^^^
+  --> src/discovery/listener.rs
+   |
+   |         pub fn subscribe(&mut self, id: &$Id) {
+   |                ^^^^^^^^^
 ...
-  |     listener_methods!(SenderId);
-  |     --------------------------- in this macro invocation
-  = note: this error originates in the macro `listener_methods` (in Nightly builds, run with -Z macro-backtrace for more info)
+   |     listener_methods!(SenderId);
+   |     --------------------------- in this macro invocation
+   = note: this error originates in the macro `listener_methods` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0308]: mismatched types
-  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:10:25
+  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:12:25
    |
-10 |     senders.unsubscribe(group);
+12 |     senders.unsubscribe(group);
    |             ----------- ^^^^^ expected `&SenderId`, found `&InputGroupId`
    |             |
    |             arguments to this method are incorrect
@@ -39,9 +39,9 @@ note: method defined here
    = note: this error originates in the macro `listener_methods` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0308]: mismatched types
-  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:11:25
+  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:13:25
    |
-11 |     receivers.subscribe(sender);
+13 |     receivers.subscribe(sender);
    |               --------- ^^^^^^ expected `&ReceiverId`, found `&SenderId`
    |               |
    |               arguments to this method are incorrect
@@ -59,9 +59,9 @@ note: method defined here
    = note: this error originates in the macro `listener_methods` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0308]: mismatched types
-  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:12:27
+  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:14:27
    |
-12 |     receivers.unsubscribe(group);
+14 |     receivers.unsubscribe(group);
    |               ----------- ^^^^^ expected `&ReceiverId`, found `&InputGroupId`
    |               |
    |               arguments to this method are incorrect
@@ -79,9 +79,9 @@ note: method defined here
    = note: this error originates in the macro `listener_methods` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0308]: mismatched types
-  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:13:39
+  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:15:39
    |
-13 |     let _ = receivers.request_connect(sender, "Camera 1");
+15 |     let _ = receivers.request_connect(sender, "Camera 1");
    |                       --------------- ^^^^^^ expected `&ReceiverId`, found `&SenderId`
    |                       |
    |                       arguments to this method are incorrect
@@ -91,13 +91,13 @@ error[E0308]: mismatched types
 note: method defined here
   --> src/discovery/listener.rs
    |
-   |     pub fn request_connect(&mut self, id: &ReceiverId, source: &str) -> Result<()> {
+   |     pub fn request_connect(&mut self, id: &ReceiverId, source_name: &str) -> Result<()> {
    |            ^^^^^^^^^^^^^^^
 
 error[E0308]: mismatched types
-  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:14:42
+  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:16:42
    |
-14 |     let _ = receivers.request_disconnect(group);
+16 |     let _ = receivers.request_disconnect(group);
    |                       ------------------ ^^^^^ expected `&ReceiverId`, found `&InputGroupId`
    |                       |
    |                       arguments to this method are incorrect

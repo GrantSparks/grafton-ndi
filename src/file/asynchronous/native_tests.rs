@@ -48,5 +48,8 @@ fn a_native_finish_reports_confirmed_closure_when_another_clone_closes_it() {
     let outcome = block_on(finishing).unwrap();
     assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
     block_on(closing).unwrap();
-    assert!(api.probe(&path).unwrap().duration().is_final());
+    assert!(crate::file::FilePlayer::probe(&api, &path)
+        .unwrap()
+        .duration()
+        .is_final());
 }

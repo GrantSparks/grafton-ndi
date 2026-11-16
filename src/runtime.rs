@@ -62,7 +62,7 @@
 //! environment or platform search paths. A later explicit selection cannot
 //! undo code already run by an earlier load. Native dependencies still use
 //! platform loader rules and must also come from trusted locations. With the
-//! File API, explicitly select `FileRuntimeOptions::library_path`
+//! File API, explicitly select `FileApiOptions::library_path`
 //! too, or establish that its companion and other search directories are
 //! trusted; inspect the selection through `FileApi::library_path`.
 //!

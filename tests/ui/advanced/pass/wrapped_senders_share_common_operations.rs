@@ -1,7 +1,7 @@
 use grafton_ndi::{
-    advanced::{CompressedSender, QueuedSender, VideoPacketFormat},
+    advanced::{CompressedAttached, CompressedSender, QueueAttached, QueuedSender, VideoPacketFormat},
     audio_conversion::InterleavedAudioF32,
-    AudioFrame, CompressedAttached, MetadataFrame, QueueAttached, Sender, Source, Tally,
+    AudioFrame, MetadataFrame, Sender, Source, Tally,
 };
 use std::time::Duration;
 
@@ -10,16 +10,18 @@ fn compressed(sender: &CompressedSender, metadata: &MetadataFrame, failover: &So
     let _ = sender.source();
     sender.send_metadata(metadata);
     let _ = sender.capture_metadata(Duration::ZERO);
+    let _ = sender.capture_metadata_ref(Duration::ZERO);
     let _ = sender.tally();
     let _ = sender.wait_for_tally_change(Duration::ZERO);
-    let _ = sender.connection_count(Duration::ZERO);
+    let _ = sender.connection_count();
+    let _ = sender.wait_for_connection(Duration::ZERO);
     sender.add_connection_metadata(metadata);
     sender.clear_connection_metadata();
     let _ = sender.set_failover(failover);
     sender.clear_failover();
     let _ = sender.set_external_tally(Tally::new(true, false));
     let _ = sender.keyframe_required(None);
-    let _ = sender.wait_for_keyframe_change(Duration::ZERO, None);
+    let _ = sender.wait_for_keyframe_change(None, Duration::ZERO);
 }
 fn queued(
     sender: &QueuedSender,
@@ -35,9 +37,11 @@ fn queued(
     let _ = sender.send_audio_interleaved_f32(interleaved);
     sender.send_metadata(metadata);
     let _ = sender.capture_metadata(Duration::ZERO);
+    let _ = sender.capture_metadata_ref(Duration::ZERO);
     let _ = sender.tally();
     let _ = sender.wait_for_tally_change(Duration::ZERO);
-    let _ = sender.connection_count(Duration::ZERO);
+    let _ = sender.connection_count();
+    let _ = sender.wait_for_connection(Duration::ZERO);
     sender.add_connection_metadata(metadata);
     sender.clear_connection_metadata();
     let _ = sender.set_failover(failover);

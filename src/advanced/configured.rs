@@ -191,7 +191,7 @@ mod tests {
     use super::*;
     use crate::{
         capabilities::RuntimeFeature,
-        discovery::{
+        discovery_server::{
             AdvertiserOptions, ListenerOptions, RecvAdvertiser, RecvListener, SendAdvertiser,
             SendListener,
         },
@@ -224,12 +224,12 @@ mod tests {
         refused(Finder::new(&ndi, &finder).err());
         let sender = SenderOptions::new("configured").config(config.clone());
         refused(Sender::new(&ndi, &sender).err());
-        let receiver = ReceiverOptions::new(Source::new("")).config(config.clone());
+        let receiver = ReceiverOptions::new(Source::new("").unwrap()).config(config.clone());
         refused(Receiver::new(&ndi, &receiver).err());
         let router = RouterOptions::new("configured").config(config.clone());
         refused(Router::new(&ndi, &router).err());
         let advertiser = AdvertiserOptions::default()
-            .servers("127.0.0.1")
+            .servers(["127.0.0.1"])
             .config(config.clone());
         refused(SendAdvertiser::new(&ndi, &advertiser).err());
         refused(RecvAdvertiser::new(&ndi, &advertiser).err());

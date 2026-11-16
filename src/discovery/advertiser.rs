@@ -20,9 +20,9 @@ use std::{
 ///
 /// Without explicit servers the SDK uses the Discovery Server from the NDI
 /// configuration. If that names none either, the advertiser cannot be created.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct AdvertiserOptions {
-    servers: Option<String>,
+    servers: Option<Vec<String>>,
     #[cfg(feature = "advanced")]
     config: Option<crate::advanced::AdvancedConfig>,
 }
@@ -44,7 +44,7 @@ impl AdvertiserOptions {
 
     /// Requested server endpoints, or `None` to inherit the NDI configuration.
     #[must_use]
-    pub fn configured_servers(&self) -> Option<&str> {
+    pub fn configured_servers(&self) -> Option<&[String]> {
         self.servers.as_deref()
     }
 
@@ -62,11 +62,12 @@ impl AdvertiserOptions {
     /// Use explicit endpoints instead of the SDK configuration.
     ///
     /// Each endpoint is a host name or IP address, optionally followed by a
-    /// colon and a port (5959 when omitted). Several endpoints separated by
-    /// commas register with redundant servers.
+    /// colon and a port (5959 when omitted). Several elements register with
+    /// redundant servers. Creation refuses empty elements and elements
+    /// containing a comma or NUL.
     #[must_use]
-    pub fn servers(mut self, servers: impl Into<String>) -> Self {
-        self.servers = Some(servers.into());
+    pub fn servers(mut self, servers: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.servers = Some(servers.into_iter().map(Into::into).collect());
         self
     }
     /// Create the advertiser with this per-instance Advanced SDK
@@ -89,7 +90,7 @@ pub struct SendAdvertisement {
 impl SendAdvertisement {
     /// Whether remote monitoring was requested.
     #[must_use]
-    pub fn configured_monitoring(&self) -> bool {
+    pub fn configured_allow_monitoring(&self) -> bool {
         self.monitoring
     }
 
@@ -106,7 +107,7 @@ impl SendAdvertisement {
 }
 /// How a receiver is advertised. Monitoring and remote source control are
 /// disabled unless explicitly enabled.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct RecvAdvertisement {
     monitoring: bool,
     controlling: bool,
@@ -122,13 +123,13 @@ impl RecvAdvertisement {
 
     /// Whether remote monitoring was requested.
     #[must_use]
-    pub fn configured_monitoring(&self) -> bool {
+    pub fn configured_allow_monitoring(&self) -> bool {
         self.monitoring
     }
 
     /// Whether remote source control was requested.
     #[must_use]
-    pub fn configured_controlling(&self) -> bool {
+    pub fn configured_allow_controlling(&self) -> bool {
         self.controlling
     }
 
@@ -151,7 +152,7 @@ impl RecvAdvertisement {
     }
     /// Permit Discovery Server clients to change this receiver's source.
     ///
-    /// Remote changes are observed through [`Receiver::poll_source_name_change`].
+    /// Remote changes are observed through [`Receiver::wait_for_source_name_change`].
     /// They do not update [`Receiver::connection_target`], the latest local
     /// request; [`Receiver::reconnect`] requests that local target again and
     /// replaces any remote routing.
@@ -390,7 +391,7 @@ impl<A: AdvertiserApi> Drop for Advertiser<A> {
 /// can take several seconds after the server appears. It has no way to report
 /// whether it is connected. To find out, use a [`SendListener`] on the same
 /// server: [`is_connected`](super::SendListener::is_connected) reports the
-/// connection, and a [snapshot](super::SendListener::snapshot) shows whether
+/// connection, and a [snapshot](super::SendListener::current_senders) shows whether
 /// the registration arrived.
 ///
 /// # Ownership
@@ -425,7 +426,7 @@ pub struct SendAdvertiser {
 /// can take several seconds after the server appears. It has no way to report
 /// whether it is connected. To find out, use a [`RecvListener`] on the same
 /// server: [`is_connected`](super::RecvListener::is_connected) reports the
-/// connection, and a [snapshot](super::RecvListener::snapshot) shows whether
+/// connection, and a [snapshot](super::RecvListener::current_receivers) shows whether
 /// the registration arrived.
 ///
 /// # Ownership
@@ -502,8 +503,8 @@ impl SendAdvertiser {
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
     /// cannot provide [sender advertising], which needs NDI 6.4.0 or later, or
     /// the options carry an Advanced configuration that the runtime or this
-    /// build cannot take; [`Error::InvalidCString`] when the server list
-    /// contains a NUL byte; and [`Error::InvalidInput`] when the SDK creates
+    /// build cannot take; [`Error::InvalidInput`] when a server element is
+    /// empty or contains a comma or NUL, or when the SDK creates
     /// no advertiser. It creates none for an address it cannot parse, and none
     /// when `options` name no server and the NDI configuration supplies none.
     ///
@@ -543,10 +544,10 @@ impl SendAdvertiser {
     pub fn register(
         &mut self,
         sender: &Sender,
-        options: SendAdvertisement,
+        options: &SendAdvertisement,
     ) -> Result<SendRegistration> {
         self.inner
-            .register(sender.native_owner(), &options)
+            .register(sender.native_owner(), options)
             .map(SendRegistration)
     }
     /// Stop advertising a sender and release this advertiser's hold on it.
@@ -581,8 +582,8 @@ impl RecvAdvertiser {
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
     /// cannot provide [receiver advertising], which needs NDI 6.4.0 or later,
     /// or the options carry an Advanced configuration that the runtime or this
-    /// build cannot take; [`Error::InvalidCString`] when the server list
-    /// contains a NUL byte; and [`Error::InvalidInput`] when the SDK creates
+    /// build cannot take; [`Error::InvalidInput`] when a server element is
+    /// empty or contains a comma or NUL, or when the SDK creates
     /// no advertiser. It creates none for an address it cannot parse, and none
     /// when `options` name no server and the NDI configuration supplies none.
     ///
@@ -618,7 +619,7 @@ impl RecvAdvertiser {
     pub fn register<M: ReceiverMode>(
         &mut self,
         receiver: &Receiver<M>,
-        options: RecvAdvertisement,
+        options: &RecvAdvertisement,
     ) -> Result<RecvRegistration> {
         let input_group = options
             .input_group
@@ -631,7 +632,7 @@ impl RecvAdvertiser {
                     resource: Arc::clone(&receiver.core),
                     _input_group: input_group,
                 },
-                &options,
+                options,
             )
             .map(RecvRegistration)
     }

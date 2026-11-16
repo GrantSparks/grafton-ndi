@@ -1,10 +1,13 @@
 //! Still images from video frames: the `image-encoding` feature.
 //!
-//! An encode reads the frame a row at a time through one of five readers
-//! ([`read`]), converts YUV to RGB in the color stage ([`color`]), averages
-//! blocks when asked to reduce the image ([`downscale`]), and hands the rows
-//! to PNG, JPEG or WebP. Every check of the options and the frame
-//! happens in [`Plan::new`], before anything is written.
+//! [`ImageOptions`] selects PNG, JPEG, lossless or lossy WebP, plus color,
+//! alpha, bit depth and reduction settings. Every [`VideoSource`](crate::VideoSource)
+//! exposes `encode_image`, `encode_image_to` and `encode_image_data_url`.
+//! [`ImageWorkspace`] reuses conversion storage across repeated encodes.
+//!
+//! Encoding validates the frame and options before writing output. YUV input
+//! follows the SDK color conventions by default; explicit options select other
+//! color handling and HDR code values.
 
 mod color;
 mod downscale;
@@ -126,7 +129,7 @@ impl ImageWorkspace {
     /// partial output.
     ///
     /// ```
-    /// use grafton_ndi::{ImageWorkspace, ImageOptions, ImageFormat, PixelFormat, VideoFrame};
+    /// use grafton_ndi::{PixelFormat, VideoFrame, image_encoding::{ImageWorkspace, ImageOptions, ImageFormat}};
     /// let frame = VideoFrame::builder().resolution(2, 2)
     ///     .pixel_format(PixelFormat::Bgra).data(vec![255; 16]).build()?;
     /// let mut workspace = ImageWorkspace::new();
@@ -147,6 +150,18 @@ impl ImageWorkspace {
         let source = Source::new(frame);
         let plan = Plan::new(&source, options)?;
         write_image(plan, &mut out, self)
+    }
+
+    /// Encode a frame as a base64 data URL, reusing conversion scratch.
+    ///
+    /// Validation, format and color handling match [`Self::encode`].
+    pub fn encode_data_url<F: crate::VideoSource + ?Sized>(
+        &mut self,
+        frame: &F,
+        options: &ImageOptions,
+    ) -> Result<String> {
+        let image = self.encode(frame, options)?;
+        Ok(data_url(&image, options.format))
     }
 
     fn encode_source(&mut self, source: Source<'_>, options: &ImageOptions) -> Result<Vec<u8>> {
@@ -357,18 +372,21 @@ fn packed_len(width: usize, height: usize, channels: usize) -> Result<usize> {
 /// Encode `source` as a base64 data URL, allocated at its exact final
 /// length.
 pub(crate) fn encode_data_url(source: Source<'_>, options: &ImageOptions) -> Result<String> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-
     let image = encode(source, options)?;
-    let media_type = options.format.media_type();
+    Ok(data_url(&image, options.format))
+}
+
+fn data_url(image: &[u8], format: ImageFormat) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let media_type = format.media_type();
     let encoded_len =
         base64::encoded_len(image.len(), true).expect("the base64 of a Vec's bytes fits in usize");
     let mut url = String::with_capacity("data:;base64,".len() + media_type.len() + encoded_len);
     url.push_str("data:");
     url.push_str(media_type);
     url.push_str(";base64,");
-    STANDARD.encode_string(&image, &mut url);
-    Ok(url)
+    STANDARD.encode_string(image, &mut url);
+    url
 }
 
 /// What an encode resolves its options and frame to. Building one makes

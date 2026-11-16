@@ -1,3 +1,5 @@
+//! Port of SDK sample `NDIlib_Find`.
+//!
 //! Example: Discovering NDI sources on the network.
 //!
 //! This example demonstrates how to use the Find API to discover NDI sources.
@@ -5,11 +7,11 @@
 //!
 //! This is based on the NDIlib_Find example from the NDI SDK.
 //!
-//! Run with: `cargo run --example NDIlib_Find`
+//! Run with: `cargo run --example find_sources`
 //!
 //! Optional arguments:
-//! - IP address or subnet to search: `cargo run --example NDIlib_Find -- 192.168.0.100`
-//! - Multiple IPs: `cargo run --example NDIlib_Find -- 192.168.0.100 10.0.0.0/24`
+//! - IP address or subnet to search: `cargo run --example find_sources -- 192.168.0.100`
+//! - Multiple IPs: `cargo run --example find_sources -- 192.168.0.100 10.0.0.0/24`
 //!
 //! Troubleshooting:
 //! - If no sources are found, try adding specific IP addresses with extra_ips()

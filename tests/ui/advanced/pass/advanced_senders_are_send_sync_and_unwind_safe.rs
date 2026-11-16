@@ -2,8 +2,8 @@
 //! shared across threads, and stay unwind safe, with or without the Advanced
 //! SDK headers in the build.
 use grafton_ndi::{
-    advanced::{CompressedSender, QueuedSender},
-    CompressedAttached, QueueAttached, Sender,
+    advanced::{CompressedAttached, CompressedSender, QueueAttached, QueuedSender},
+    Sender,
 };
 use std::panic::UnwindSafe;
 

@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ndi = Ndi::new()?;
     let receiver = Receiver::new(
         &ndi,
-        &ReceiverOptions::new(Source::new(arguments[0].clone())),
+        &ReceiverOptions::new(Source::new(arguments[0].clone())?),
     )?;
     let sender = Sender::new(
         &ndi,

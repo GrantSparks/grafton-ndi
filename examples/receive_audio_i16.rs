@@ -1,12 +1,14 @@
+//! Port of SDK sample `NDIlib_Recv_Audio_16bpp`.
+//!
 //! Example: Receiving NDI audio and converting to 16-bit format.
 //!
 //! This example demonstrates capturing audio from an NDI source and
 //! converting it to 16-bit signed integer format, similar to the C++ example.
 //!
-//! Run with: `cargo run --example NDIlib_Recv_Audio_16bpp`
+//! Run with: `cargo run --example receive_audio_i16`
 //!
 //! Optional arguments:
-//! - IP address to search: `cargo run --example NDIlib_Recv_Audio_16bpp -- 192.168.0.110`
+//! - IP address to search: `cargo run --example receive_audio_i16 -- 192.168.0.110`
 
 use grafton_ndi::{
     audio_conversion::{AudioConverter, AudioReferenceLevel},
@@ -64,7 +66,7 @@ fn main() -> Result<(), Error> {
     // Run for one minute
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(60) {
-        if let Some(audio_frame) = receiver.audio().capture_ref(Duration::from_millis(250))? {
+        if let Some(audio_frame) = receiver.capture_audio_ref(Duration::from_millis(250))? {
             println!(
                 "Audio data received ({num_samples} samples).",
                 num_samples = audio_frame.num_samples()

@@ -3,9 +3,9 @@
 use std::time::Duration;
 
 use crate::{
-    AudioKind, Capture, CaptureMode, ConnectionStats, EventMode, MetadataKind, MetadataMode,
-    MetadataSource, Ptz, RawCapture, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef,
-    ReceiverMode, Result, SettingChange, Source, SourceNameChange, Tally, VideoKind, VideoMode,
+    AudioMode, ConnectionStats, EventMode, MetadataMode, MetadataSource, Ptz, RawCapture, Receiver,
+    ReceiverEvent, ReceiverItem, ReceiverItemRef, ReceiverMode, Result, SettingChange, Source,
+    SourceNameChange, Tally, VideoMode,
 };
 
 /// Restricted receiver access lent by [`super::KvmSession::receiver`].
@@ -108,14 +108,17 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
         self.receiver.web_control_url()
     }
 
-    /// Query source-name changes; see [`Receiver::poll_source_name_change`].
+    /// Query source-name changes; see [`Receiver::wait_for_source_name_change`].
     ///
     /// # Errors
     ///
-    /// As for [`Receiver::poll_source_name_change`].
+    /// As for [`Receiver::wait_for_source_name_change`].
     #[doc(alias = "NDIlib_recv_get_source_name")]
-    pub fn poll_source_name_change(&self, timeout: Duration) -> Result<Option<SourceNameChange>> {
-        self.receiver.poll_source_name_change(timeout)
+    pub fn wait_for_source_name_change(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<SourceNameChange>> {
+        self.receiver.wait_for_source_name_change(timeout)
     }
 
     /// Set upstream tally; see [`Receiver::set_tally`].
@@ -163,44 +166,46 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     /// # Errors
     ///
     /// As for [`Receiver::request_keyframe`].
+    #[doc(alias = "NDIlib_recv_request_keyframe")]
     pub fn request_keyframe(&self) -> Result<()> {
         self.receiver.request_keyframe()
     }
 }
 
-impl<'a, M: VideoMode> KvmReceiver<'a, M> {
-    /// Borrow typed video capture; see [`Receiver::video`] and [`Capture`].
-    #[must_use = "the Capture view does nothing until a capture verb is called"]
-    pub fn video(&self) -> Capture<'a, VideoKind> {
-        self.receiver.video()
-    }
-}
+macro_rules! kvm_capture_methods {
+    ($(($mode:ident, $kind:ident, $owned:ident, $borrowed:ident,
+        $capture:ident, $capture_ref:ident, $capture_with:ident, $label:literal)),* $(,)?) => {
+        $(
+            impl<'a, M: $mode> KvmReceiver<'a, M> {
+                #[doc = concat!("Capture owned ", $label, "; see [`Receiver::", stringify!($capture), "`].")]
+                #[doc(alias = "NDIlib_recv_capture_v3")]
+                pub fn $capture(&self, timeout: Duration) -> Result<Option<crate::$owned>> {
+                    self.receiver.$capture(timeout)
+                }
 
-impl<'a, M: CaptureMode> KvmReceiver<'a, M> {
-    /// Borrow typed audio capture; see [`Receiver::audio`] and [`Capture`].
-    #[must_use = "the Capture view does nothing until a capture verb is called"]
-    pub fn audio(&self) -> Capture<'a, AudioKind> {
-        self.receiver.audio()
-    }
+                #[doc = concat!("Borrow ", $label, "; see [`Receiver::", stringify!($capture_ref), "`].")]
+                /// The frame retains the original receiver borrow and may coexist
+                /// with later mutable KVM session input calls.
+                #[doc(alias = "NDIlib_recv_capture_v3")]
+                pub fn $capture_ref(&self, timeout: Duration) -> Result<Option<crate::$borrowed<'a>>> {
+                    let receiver: &'a Receiver<M> = self.receiver;
+                    receiver.$capture_ref(timeout)
+                }
+            }
+        )*
+    };
 }
-
-impl<'a, M: MetadataMode> KvmReceiver<'a, M> {
-    /// Borrow typed metadata capture; see [`Receiver::metadata`] and [`Capture`].
-    #[must_use = "the Capture view does nothing until a capture verb is called"]
-    pub fn metadata(&self) -> Capture<'a, MetadataKind> {
-        self.receiver.metadata()
-    }
-}
+crate::capture::capture_method_kinds!(kvm_capture_methods);
 
 impl<'a, M: EventMode> KvmReceiver<'a, M> {
-    /// Poll receiver events; see [`Receiver::poll_event`].
+    /// Poll receiver events; see [`Receiver::next_event`].
     ///
     /// # Errors
     ///
-    /// As for [`Receiver::poll_event`].
+    /// As for [`Receiver::next_event`].
     #[doc(alias = "NDIlib_recv_capture_v3")]
-    pub fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
-        self.receiver.poll_event(timeout)
+    pub fn next_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
+        self.receiver.next_event(timeout)
     }
 }
 

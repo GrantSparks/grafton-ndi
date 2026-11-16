@@ -1,9 +1,11 @@
+//! Port of SDK sample `NDIlib_Send_Video`.
+//!
 //! Example: Sending video frames via NDI.
 //!
 //! This example sends black 1920x1080 frames at the builder's default 60 fps.
 //! The NDI SDK clocks submission, and each batch reports its measured throughput.
 //!
-//! Run with: `cargo run --example NDIlib_Send_Video`
+//! Run with: `cargo run --example send_video`
 
 use std::time::Instant;
 

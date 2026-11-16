@@ -1,0 +1,12 @@
+error[E0432]: unresolved import `grafton_ndi::advanced::CompressedAudio`
+ --> tests/ui/advanced/fail/removed_compressed_audio.rs:1:5
+  |
+1 | use grafton_ndi::advanced::CompressedAudio;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^---------------
+  |                            |
+  |                            no `CompressedAudio` in `advanced`
+  |
+help: a similar name exists in the module
+  |
+1 | use grafton_ndi::advanced::CompressedAudioRef;
+  |                                           +++

@@ -1,12 +1,14 @@
+//! Port of SDK sample `NDIlib_Recv_PTZ`.
+//!
 //! Example: Controlling PTZ (Pan-Tilt-Zoom) cameras via NDI.
 //!
 //! This example demonstrates detecting PTZ support and recalling presets
 //! when the receiver status changes.
 //!
-//! Run with: `cargo run --example NDIlib_Recv_PTZ`
+//! Run with: `cargo run --example receive_ptz`
 //!
 //! Optional arguments:
-//! - IP address to search: `cargo run --example NDIlib_Recv_PTZ -- 192.168.0.110`
+//! - IP address to search: `cargo run --example receive_ptz -- 192.168.0.110`
 
 use std::{
     env,
@@ -59,9 +61,9 @@ fn main() -> Result<(), Error> {
     // Run for 30 seconds
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(30) {
-        // Use poll_event to check for status changes
+        // Use next_event to check for status changes
         if let Some(ReceiverEvent::StatusChanged(_status)) =
-            receiver.poll_event(Duration::from_secs(1))?
+            receiver.next_event(Duration::from_secs(1))?
         {
             // Check PTZ support on status change
             if receiver.ptz().is_supported() {

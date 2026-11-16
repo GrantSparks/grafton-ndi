@@ -3,9 +3,9 @@
 use grafton_ndi::{FrameSync, FrameSyncAttached, Receiver};
 use std::time::Duration;
 fn own_audio(receiver: &Receiver<FrameSyncAttached>) {
-    let _ = receiver.audio().capture(Duration::ZERO);
+    let _ = receiver.capture_audio(Duration::ZERO);
 }
 fn lent_audio(framesync: &FrameSync) {
-    let _ = framesync.receiver().audio().capture_ref(Duration::ZERO);
+    let _ = framesync.receiver().capture_audio_ref(Duration::ZERO);
 }
 fn main() {}

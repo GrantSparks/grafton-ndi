@@ -3,7 +3,7 @@ use grafton_ndi::{
 };
 
 fn receiver(ndi: &Ndi) -> Result<Receiver, grafton_ndi::Error> {
-    let source = Source::new("compile-contract");
+    let source = Source::new("compile-contract").unwrap();
     let options = ReceiverOptions::new(source);
     Receiver::new(ndi, &options)
 }

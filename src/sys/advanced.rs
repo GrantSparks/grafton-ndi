@@ -7,7 +7,7 @@
 use super::{bindings::NDIlib_recv_color_format_e, table::Resolver, Evidence, Table};
 use crate::{
     advanced::PassthroughPreset,
-    capabilities::{Capabilities, CapabilityRefusal, RuntimeFeature},
+    capabilities::{Capabilities, Capability, CapabilityRefusal, RuntimeFeature},
     LoadRefusal, Result,
 };
 use std::ffi::CStr;
@@ -282,7 +282,7 @@ impl Evidence<'_> {
         self.capabilities
             .passthrough_format(preset)
             .map_err(|refusal| crate::Error::UnsupportedCapability {
-                feature: RuntimeFeature::Passthrough(preset),
+                capability: Capability::Runtime(RuntimeFeature::Passthrough(preset)),
                 refusal,
             })
     }

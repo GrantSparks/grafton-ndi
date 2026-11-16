@@ -45,7 +45,7 @@ pub enum WheelAxis {
 /// across them. The view offers mode-permitted capture, tally, PTZ, statistics
 /// and metadata, without allowing application connection changes. For a
 /// [`PacketReceiver`](super::PacketReceiver), which has no frame capture of its
-/// own, [`KvmSession::capture`] on a session from `packets.controls().kvm()`
+/// own, [`KvmSession::capture_any`] on a session from `packets.controls().kvm()`
 /// delivers its packets and events.
 ///
 /// To change source, successfully [`release_all`](Self::release_all), end the
@@ -254,7 +254,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     pub fn wheel(&mut self, axis: WheelAxis, units: f32) -> Result<()> {
         native!(Kvm, self.kvm, uses(axis, units) => {
             if !units.is_finite() {
-                return Err(invalid_input(crate::InputDefect::KvmWheel { units: units }));
+                return Err(invalid_input(crate::InputDefect::KvmWheel { units }));
             }
             match axis {
                 WheelAxis::Vertical => {
@@ -384,7 +384,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
 
 impl<'a> KvmSession<'a, PacketAttached> {
     /// Wait up to `timeout` for the next frame or event of a
-    /// [`PacketReceiver`], exactly as [`PacketReceiver::capture`] does, while
+    /// [`PacketReceiver`], exactly as [`PacketReceiver::capture_any`] does, while
     /// the session holds its inputs.
     ///
     /// Every result owns its data, so nothing it returns keeps the session
@@ -393,20 +393,20 @@ impl<'a> KvmSession<'a, PacketAttached> {
     ///
     /// # Errors
     ///
-    /// As for [`PacketReceiver::capture`].
+    /// As for [`PacketReceiver::capture_any`].
     #[doc(alias = "NDIlib_recv_capture_v3")]
-    pub fn capture(&self, timeout: Duration) -> Result<Option<PacketItem>> {
+    pub fn capture_any(&self, timeout: Duration) -> Result<Option<PacketItem>> {
         PacketReceiver::capture_from(self.receiver, timeout)
     }
 
     /// Borrow a packet for the underlying receiver's lifetime, so inputs can
-    /// still be released while the packet is held. See [`PacketReceiver::capture_ref`].
+    /// still be released while the packet is held. See [`PacketReceiver::capture_any_ref`].
     ///
     /// # Errors
     ///
-    /// As for [`PacketReceiver::capture_ref`].
+    /// As for [`PacketReceiver::capture_any_ref`].
     #[doc(alias = "NDIlib_recv_capture_v3")]
-    pub fn capture_ref(&self, timeout: Duration) -> Result<Option<PacketItemRef<'a>>> {
+    pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<PacketItemRef<'a>>> {
         PacketReceiver::capture_ref_from(self.receiver, timeout)
     }
 }

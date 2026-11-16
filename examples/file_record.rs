@@ -17,7 +17,7 @@
 //! such as `192.168.1.20:5961`, is taken as an address instead of a name, which
 //! records it without discovering it first.
 //!
-//! Records the program stream with `RecorderOptions::proxy(false)`. This
+//! Records the program stream with `FileRecorderOptions::proxy(false)`. This
 //! avoids waiting for an optional proxy stream at startup and produces the
 //! single-video-track input supported by the `file_thumbnails` example.
 //!
@@ -31,8 +31,8 @@ use std::{
 
 use grafton_ndi::{
     file::{
-        FileApi, FileRuntimeOptions, FinishStatus, RecorderEventKind, RecorderOptions,
-        RecordingTarget, RecordingTimecode, SourceSpec,
+        FileApi, FileApiOptions, FileRecorder, FileRecorderOptions, FinishStatus,
+        RecorderEventKind, RecordingTarget, RecordingTimecode, SourceSpec,
     },
     Finder, FinderOptions, Ndi,
 };
@@ -57,10 +57,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--groups" => {
-                discovery = discovery.groups(arguments.next().ok_or("--groups needs a value")?)
+                discovery =
+                    discovery.groups(arguments.next().ok_or("--groups needs a value")?.split(','))
             }
             "--ip" => {
-                discovery = discovery.extra_ips(arguments.next().ok_or("--ip needs a value")?)
+                discovery = discovery.extra_ips([arguments.next().ok_or("--ip needs a value")?])
             }
             "--by-name" => by_name = true,
             _ => return Err(format!("unknown option: {argument}").into()),
@@ -71,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("recording duration must be positive".into());
     }
     let ndi = Ndi::new()?;
-    let file = FileApi::open(&ndi, &FileRuntimeOptions::default())?;
+    let file = FileApi::new(&ndi, &FileApiOptions::default())?;
     println!("File library: {:?}", file.library_path());
 
     // NDI names read "MACHINE (Source)"; anything else is an address.
@@ -81,15 +82,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let finder = Finder::new(&ndi, &discovery)?;
         let selected = finder
             .find_source_by_name(&source, Duration::from_secs(10))?
-            .ok_or_else(|| grafton_ndi::Error::NoSourcesFound {
-                criteria: source.clone(),
-            })?;
+            .ok_or_else(|| format!("no NDI source named {source} was found"))?;
         println!("Selected {selected}");
         SourceSpec::try_from(&selected)?
     } else {
         SourceSpec::from_url(&source)?
     };
-    let mut recorder = file.create_recorder(&RecorderOptions::new(spec).proxy(false))?;
+    let mut recorder = FileRecorder::new(&file, &FileRecorderOptions::new(spec).proxy(false))?;
     recorder.start(&RecordingTarget::new(&prefix)?, RecordingTimecode::Preserve)?;
     println!("Recording {source} for {seconds} s...");
 
@@ -97,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // session that lost events cannot be confirmed closed.
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(seconds) {
-        let Some(event) = recorder.poll_event(Duration::from_millis(250))? else {
+        let Some(event) = recorder.next_event(Duration::from_millis(250))? else {
             continue;
         };
         match event.kind() {
@@ -113,8 +112,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(stats) = recorder.stats()? {
         println!(
             "{} video and {} audio packets, {} bytes",
-            stats.video_frames(),
-            stats.audio_frames(),
+            stats.video_frames_written(),
+            stats.audio_frames_written(),
             stats.bytes_written()
         );
     }

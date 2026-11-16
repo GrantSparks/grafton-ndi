@@ -65,6 +65,10 @@ FrameSync audio capture returns a frame because it can synthesize silence.
 
 `wait_for_<condition>(timeout)` returns `Result<bool>`, or `Result<Option<T>>`
 when it reports a value. `false` or `None` means the wait expired.
+For example, `wait_for_finish` returns `Option<FinishStatus>`: `None` on
+timeout, or `Some` with a final recorder outcome. The separate bounded
+completion operation `finish` retains `FinishStatus::TimedOut(report)`;
+`report()` supplies a current snapshot after an expired wait.
 `find_*(..., timeout)` observes a discovery window; `current_*()` returns a
 snapshot. Getters never wait for the SDK or network. Timeouts belong to these
 operations, capture, and operations bounding their own completion, such as
@@ -92,8 +96,9 @@ selection have different precedence from ordinary source connection.
 
 Each error condition has one variant. Payload names end in `Defect` for an
 invalid value, `Failure` for a failed operation, or `Refusal`, `Conflict`,
-`Limit` and `Kind` for reasons and discriminators. Payloads implement
-`thiserror::Error`, `Debug + Clone + PartialEq`, and `Copy`, `Eq` and `Hash`
+`Limit` and `Kind` for reasons and discriminators. Payloads derive
+`thiserror::Error` to implement `std::error::Error`, and implement
+`Debug + Clone + PartialEq`, plus `Copy`, `Eq` and `Hash`
 where their fields allow. The crate only defines error variants it returns.
 
 Return types reflect actual failure modes. `send_audio` and `send_metadata`

@@ -146,7 +146,9 @@ fn exercise(cache: &SourceCache, gate: &Gate) {
     .is_empty());
     let (sources, cached) = contended(finder, gate, |_| {
         (
-            cache.sources_by_host("studio", Duration::ZERO).unwrap(),
+            cache
+                .find_sources_by_host("studio", Duration::ZERO)
+                .unwrap(),
             cache.len(),
         )
     });
@@ -176,7 +178,7 @@ fn exercise(cache: &SourceCache, gate: &Gate) {
     assert_eq!(accumulated.len(), 1);
     let sources = expired_during_wait(finder, gate, |_| {
         cache
-            .sources_by_host("studio", Duration::from_millis(20))
+            .find_sources_by_host("studio", Duration::from_millis(20))
             .unwrap()
     });
     assert_eq!(sources.len(), 1);

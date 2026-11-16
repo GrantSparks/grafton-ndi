@@ -8,9 +8,11 @@ fn common<M: SenderMode>(sender: &Sender<M>, metadata: &MetadataFrame, failover:
     let _ = sender.source();
     sender.send_metadata(metadata);
     let _ = sender.capture_metadata(Duration::ZERO);
+    let _ = sender.capture_metadata_ref(Duration::ZERO);
     let _ = sender.tally();
     let _ = sender.wait_for_tally_change(Duration::ZERO);
-    let _ = sender.connection_count(Duration::ZERO);
+    let _ = sender.connection_count();
+    let _ = sender.wait_for_connection(Duration::ZERO);
     sender.add_connection_metadata(metadata);
     sender.clear_connection_metadata();
     let _ = sender.set_failover(failover);
@@ -26,9 +28,9 @@ fn ordinary(mut sender: Sender<RawSend>, frame: VideoFrame, sound: &AudioFrame) 
     common(&sender, &metadata, &source);
     audio(&sender, sound);
     let _ = sender.send_video(&frame);
-    let _ = sender.send_video_async(frame);
-    sender.flush_async_blocking();
-    let _ = sender.finish_video_async();
+    let _ = sender.submit_video(frame);
+    sender.flush_video();
+    let _ = sender.reclaim_video();
 }
 fn assert_owned<T: Send + Sync + Unpin>() {}
 fn main() {

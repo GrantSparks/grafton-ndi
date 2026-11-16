@@ -13,7 +13,7 @@ mod runtime_fixture;
 use grafton_ndi::{
     advanced::AdvancedConfig,
     capabilities::RuntimeFeature,
-    discovery::{
+    discovery_server::{
         AdvertiserOptions, ListenerOptions, RecvAdvertiser, RecvListener, SendAdvertiser,
         SendListener,
     },
@@ -41,7 +41,7 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
             }
         }
         const SERVER: &str = "127.0.0.1:5959";
-        let mut advertisers = AdvertiserOptions::new().servers(SERVER);
+        let mut advertisers = AdvertiserOptions::new().servers([SERVER]);
         let mut listeners = ListenerOptions::new().server(SERVER);
         if configured {
             let config = AdvancedConfig::parse("{}").unwrap();

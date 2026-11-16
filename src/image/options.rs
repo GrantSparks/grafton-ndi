@@ -7,7 +7,7 @@ use crate::YuvMatrix;
 /// # Examples
 ///
 /// ```
-/// use grafton_ndi::ImageFormat;
+/// use grafton_ndi::image_encoding::ImageFormat;
 ///
 /// // PNG: lossless, any bit depth, carries an HDR tag.
 /// let png = ImageFormat::Png;
@@ -100,12 +100,11 @@ impl ImageFormat {
 ///
 /// Every video frame type encodes with it, whether owned, captured or
 /// borrowed for sending, through `encode_image`, `encode_image_to` and
-/// `encode_image_data_url`, for example [`VideoFrame::encode_image`]. The
-/// shortcuts `encode_png`, `encode_jpeg` and `encode_data_url` are exactly
-/// those methods with `ImageOptions::new(format)`.
+/// `encode_image_data_url`, for example [`VideoFrame::encode_image`].
+/// Construct these settings with `ImageOptions::new(format)`.
 ///
 /// ```
-/// use grafton_ndi::{ColorPolicy, Downscale, ImageFormat, ImageOptions, PixelFormat, VideoFrame, YuvMatrix, YuvRange};
+/// use grafton_ndi::{PixelFormat, VideoFrame, YuvMatrix, image_encoding::{ColorPolicy, Downscale, ImageFormat, ImageOptions, YuvRange}};
 ///
 /// let frame = VideoFrame::builder()
 ///     .resolution(64, 36)
@@ -171,7 +170,7 @@ impl ImageFormat {
 ///
 /// ```no_run
 /// # async fn snapshot(frame: grafton_ndi::VideoFrame) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-/// use grafton_ndi::{ImageFormat, ImageOptions};
+/// use grafton_ndi::{image_encoding::{ImageFormat, ImageOptions}};
 ///
 /// let options = ImageOptions::new(ImageFormat::WebpLossless);
 /// let webp = tokio::task::spawn_blocking(move || frame.encode_image(&options)).await??;

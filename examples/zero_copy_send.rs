@@ -15,15 +15,15 @@ fn main() -> Result<(), grafton_ndi::Error> {
     };
     let first = make_frame()?;
     let mut available = make_frame()?;
-    assert!(sender.send_video_async(first)?.is_none());
+    assert!(sender.submit_video(first)?.is_none());
 
     for frame_num in 1..300 {
         generate_test_pattern(available.data_mut(), 1920, 1080, frame_num);
         // The next submission completes the previous send before returning its frame.
         // Moving VideoFrame transfers its allocation; it does not copy its pixels.
-        available = sender.send_video_async(available)?.expect("previous frame");
+        available = sender.submit_video(available)?.expect("previous frame");
     }
-    let final_frame = sender.finish_video_async().expect("final pending frame");
+    let final_frame = sender.reclaim_video().expect("final pending frame");
     println!(
         "Recovered both allocations: {} and {} bytes",
         available.data().len(),

@@ -296,8 +296,8 @@ impl<M: SenderMode> Sender<M> {
     #[doc(alias = "NDIlib_send_wait_for_keyframe_request")]
     pub fn wait_for_keyframe_change(
         &self,
-        timeout: Duration,
         format: Option<VideoPacketFormat>,
+        timeout: Duration,
     ) -> Result<bool> {
         let table = self.runtime().table::<KeyframeDemand>()?;
         native!(KeyframeDemand, table, uses(timeout, format) => {

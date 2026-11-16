@@ -15,7 +15,7 @@
 //! used, and the example fails if that names none.
 
 use grafton_ndi::{
-    discovery::{
+    discovery_server::{
         AdvertiserOptions, ListenerOptions, RecvListener, SendAdvertisement, SendAdvertiser,
         SendListener,
     },
@@ -35,7 +35,7 @@ fn main() -> Result<(), Error> {
     let mut advertiser_options = AdvertiserOptions::default();
     let mut listener_options = ListenerOptions::default();
     if let Some(server) = &server {
-        advertiser_options = advertiser_options.servers(server.as_str());
+        advertiser_options = advertiser_options.servers([server.as_str()]);
         listener_options = listener_options.server(server.as_str());
     }
 
@@ -45,8 +45,10 @@ fn main() -> Result<(), Error> {
     // the registration is removed or the advertiser is dropped.
     let sender = Sender::new(&ndi, &SenderOptions::new("Discovery Server Example"))?;
     let mut advertiser = SendAdvertiser::new(&ndi, &advertiser_options)?;
-    let registration =
-        advertiser.register(&sender, SendAdvertisement::default().allow_monitoring(true))?;
+    let registration = advertiser.register(
+        &sender,
+        &SendAdvertisement::default().allow_monitoring(true),
+    )?;
     println!("Registered {}", sender.source()?);
 
     let mut senders = SendListener::new(&ndi, &listener_options)?;
@@ -66,8 +68,8 @@ fn main() -> Result<(), Error> {
     let deadline = Instant::now() + WATCH;
     while Instant::now() < deadline {
         // Print the registry whenever either side of it changes.
-        let senders_changed = senders.wait_for_changes(Duration::from_secs(1))?;
-        let receivers_changed = receivers.wait_for_changes(Duration::ZERO)?;
+        let senders_changed = senders.wait_for_change(Duration::from_secs(1))?;
+        let receivers_changed = receivers.wait_for_change(Duration::ZERO)?;
         if senders.is_connected() != connected {
             connected = !connected;
             println!(
@@ -83,7 +85,7 @@ fn main() -> Result<(), Error> {
             continue;
         }
         println!("\nSenders:");
-        for sender in senders.snapshot()? {
+        for sender in senders.current_senders()? {
             println!(
                 "  {} at {}:{}",
                 sender.name().unwrap_or("(unnamed)"),
@@ -92,7 +94,7 @@ fn main() -> Result<(), Error> {
             );
         }
         println!("Receivers:");
-        for receiver in receivers.snapshot()? {
+        for receiver in receivers.current_receivers()? {
             println!(
                 "  {} at {}, accepting {:?}",
                 receiver.name().unwrap_or("(unnamed)"),

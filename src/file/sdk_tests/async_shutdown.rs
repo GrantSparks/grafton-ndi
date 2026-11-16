@@ -60,12 +60,12 @@ fn timer_released_recordings_finalize_while_other_file_deadlines_continue() {
     let recorder = recording(&api, &source, &path);
     let player = block_on(AsyncFilePlayer::create(
         &api,
-        &PlayerOptions::new("timer-release-wait"),
+        &FilePlayerOptions::new("timer-release-wait"),
     ))
     .unwrap();
     let other = block_on(AsyncFilePlayer::create(
         &api,
-        &PlayerOptions::new("timer-release-other"),
+        &FilePlayerOptions::new("timer-release-other"),
     ))
     .unwrap();
     let close_recorder = recorder.close(); // Lazy: keep only the shutdown control.
@@ -82,7 +82,10 @@ fn timer_released_recordings_finalize_while_other_file_deadlines_continue() {
         .is_none());
     released.recv_timeout(PATIENCE).unwrap();
     block_on(close_recorder).unwrap();
-    assert!(api.probe(&path).unwrap().duration().is_final());
+    assert!(crate::file::FilePlayer::probe(&api, &path)
+        .unwrap()
+        .duration()
+        .is_final());
     block_on(player.close()).unwrap();
     block_on(other.close()).unwrap();
 }
@@ -131,7 +134,10 @@ fn recorders_whose_callbacks_release_each_other_finalize_without_a_join_cycle() 
     // new file before its first frame, so it need not contain a duration.
     for path in [&first_path, &second_path] {
         assert!(
-            api.probe(path).unwrap().duration().is_final(),
+            crate::file::FilePlayer::probe(&api, path)
+                .unwrap()
+                .duration()
+                .is_final(),
             "{}",
             path.display()
         );

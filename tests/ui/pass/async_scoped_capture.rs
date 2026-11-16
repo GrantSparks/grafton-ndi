@@ -2,34 +2,29 @@
 async fn contract<R: grafton_ndi::asynchronous::AsyncRuntime>(
     receiver: &grafton_ndi::asynchronous::AsyncReceiver<R>,
 ) {
-    use grafton_ndi::{CaptureKind, ReceiverItem, VideoFrame};
+    use grafton_ndi::{ReceiverItem, VideoFrame};
     use std::time::Duration;
     let _: Option<(u32, u32)> = receiver
-        .video()
-        .capture_with(Duration::ZERO, |frame| (frame.width(), frame.height()))
+        .capture_video_with(Duration::ZERO, |frame| (frame.width(), frame.height()))
         .await
         .unwrap();
     let _: Option<VideoFrame> = receiver
-        .video()
-        .capture_with(Duration::ZERO, |frame| frame.to_owned())
+        .capture_video_with(Duration::ZERO, |frame| frame.to_owned())
         .await
         .unwrap();
     let _: Option<Option<f32>> = receiver
-        .audio()
-        .capture_with(Duration::ZERO, |frame| {
+        .capture_audio_with(Duration::ZERO, |frame| {
             frame.channel_data(0).map(|c| c.iter().sum::<f32>())
         })
         .await
         .unwrap();
     let _: Option<String> = receiver
-        .metadata()
-        .capture_with(Duration::ZERO, |frame| frame.data().to_owned())
+        .capture_metadata_with(Duration::ZERO, |frame| frame.data().to_owned())
         .await
         .unwrap();
     let once = String::from("consumed by an FnOnce callback");
     receiver
-        .video()
-        .capture_with(Duration::ZERO, move |frame| {
+        .capture_video_with(Duration::ZERO, move |frame| {
             drop(once);
             frame.width()
         })
@@ -39,16 +34,23 @@ async fn contract<R: grafton_ndi::asynchronous::AsyncRuntime>(
         .capture_any_with(Duration::ZERO, |item| item.to_owned())
         .await
         .unwrap();
-    async fn generic<R: grafton_ndi::asynchronous::AsyncRuntime, K: CaptureKind>(
-        capture: &grafton_ndi::asynchronous::AsyncCapture<'_, R, K>,
-    ) where
-        K::Owned: Send + 'static,
-    {
-        capture.capture_with(Duration::ZERO, |_| 42).await.unwrap();
+    async fn generic<R: grafton_ndi::asynchronous::AsyncRuntime>(
+        receiver: &grafton_ndi::asynchronous::AsyncReceiver<R>,
+    ) {
+        let _: Option<u32> = receiver
+            .capture_video_with(Duration::ZERO, |_| 42)
+            .await
+            .unwrap();
+        let _: Option<u32> = receiver
+            .capture_audio_with(Duration::ZERO, |_| 42)
+            .await
+            .unwrap();
+        let _: Option<u32> = receiver
+            .capture_metadata_with(Duration::ZERO, |_| 42)
+            .await
+            .unwrap();
     }
-    generic(&receiver.video()).await;
-    generic(&receiver.audio()).await;
-    generic(&receiver.metadata()).await;
+    generic(receiver).await;
 }
 fn main() {
     #[cfg(feature = "tokio")]

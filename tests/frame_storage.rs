@@ -150,7 +150,7 @@ fn complete_send_size_includes_scan_rows_and_stride_and_enables_direct_sending()
                     .build()
                     .unwrap();
                 assert!(frame.sends_in_place(), "{format:?} {scan:?} {height}");
-                let packed_size = format.buffer_len(16, height).unwrap();
+                let packed_size = format.buffer_len(16, height, None).unwrap();
                 assert!(allocation >= packed_size + format.send_tail_room());
                 if format.send_tail_room() > 0 && scan != ScanType::Progressive && height % 4 != 0 {
                     assert!(allocation >= packed_size + format.send_tail_room() + 2 * stride);
