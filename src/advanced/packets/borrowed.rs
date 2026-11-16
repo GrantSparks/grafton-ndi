@@ -30,9 +30,7 @@ struct VideoPacketParts {
 }
 
 struct AudioPacketParts {
-    codec: AudioCodec,
-    protected: bool,
-    parameters: AudioParameters,
+    format: AudioPacketFormat,
     len: usize,
 }
 
@@ -158,17 +156,13 @@ impl descriptor_parts_sealed::Sealed for AudioPacketParts {}
 // exact descriptor. No returned extent can exceed its declared allocation.
 unsafe impl DescriptorParts<NDIlib_audio_frame_v3_t> for AudioPacketParts {
     unsafe fn validate(raw: &NDIlib_audio_frame_v3_t) -> Result<Self> {
-        let (codec, protected) = AudioCodec::from_outer(raw.FourCC)
-            .ok_or_else(|| invalid_frame(crate::FrameDefect::UnknownCompressedAudio))?;
-        let parameters = AudioParameters::from_sdk(raw)?;
+        let format = AudioPacketFormat::from_sdk(raw)?;
         // SAFETY: this delivered union names the guard's initialized
         // readable payload; packet_bytes checks the positive extent.
         let bytes = unsafe { packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
-        validate_received_audio(codec, bytes)?;
+        validate_received_audio(format.codec(), bytes)?;
         Ok(Self {
-            codec,
-            protected,
-            parameters,
+            format,
             len: bytes.len(),
         })
     }
@@ -183,29 +177,9 @@ impl<'rx> CompressedAudioRef<'rx> {
     borrowed_extras!();
     audio_envelope_accessor!();
 
-    /// The compressed audio codec.
-    pub fn codec(&self) -> AudioCodec {
-        self.frame.parts().codec
-    }
-
-    /// Whether the source stream is protected.
-    pub fn is_protected(&self) -> bool {
-        self.frame.parts().protected
-    }
-
-    /// Samples per second.
-    pub fn sample_rate(&self) -> u32 {
-        self.frame.parts().parameters.sample_rate
-    }
-
-    /// Number of audio channels.
-    pub fn num_channels(&self) -> u32 {
-        self.frame.parts().parameters.num_channels
-    }
-
-    /// Decoded samples per channel represented by this packet.
-    pub fn num_samples(&self) -> u32 {
-        self.frame.parts().parameters.num_samples
+    /// The codec and audio format delivered by the receiver.
+    pub fn format(&self) -> AudioPacketFormat {
+        self.frame.parts().format
     }
 
     /// Copy payload and readable metadata into independently owned storage.
@@ -214,9 +188,7 @@ impl<'rx> CompressedAudioRef<'rx> {
         let mut extras = FrameExtras::default();
         extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
         ReceivedAudioPacket {
-            codec: self.codec(),
-            protected: self.is_protected(),
-            parameters: self.frame.parts().parameters,
+            format: self.format(),
             bytes: self.data().to_vec(),
             extras,
         }
@@ -226,18 +198,14 @@ impl<'rx> CompressedAudioRef<'rx> {
     /// [`Self::to_owned`]. Sufficient capacities permit allocation-free copies.
     pub fn copy_into(&self, destination: &mut ReceivedAudioPacket) {
         let ReceivedAudioPacket {
-            codec,
-            protected,
-            parameters,
+            format,
             bytes,
             extras,
         } = destination;
         bytes.clear();
         bytes.extend_from_slice(self.data());
         extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
-        *codec = self.codec();
-        *protected = self.is_protected();
-        *parameters = self.frame.parts().parameters;
+        *format = self.format();
     }
 
     /// Copy into sendable storage after checking this borrowed packet.
@@ -248,19 +216,15 @@ impl<'rx> CompressedAudioRef<'rx> {
     ///
     /// [`Error::InvalidFrame`] when this packet cannot be sent.
     pub fn try_copy_into(&self, destination: &mut CompressedAudioFrame) -> Result<()> {
-        validate_audio_for_send(self.codec(), self.frame.parts().parameters, self.data())?;
+        validate_audio_for_send(self.format(), self.data())?;
         let CompressedAudioFrame {
-            codec,
-            protected,
-            parameters,
+            format,
             bytes,
             extras,
         } = destination;
         bytes.copy_from_slice(self.data());
         extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
-        *codec = self.codec();
-        *protected = self.is_protected();
-        *parameters = self.frame.parts().parameters;
+        *format = self.format();
         Ok(())
     }
 }
@@ -295,22 +259,14 @@ impl TryFrom<&CompressedAudioRef<'_>> for CompressedAudioFrame {
 
     /// Admit the borrowed packet before allocating its owned copy.
     fn try_from(packet: &CompressedAudioRef<'_>) -> Result<Self> {
-        validate_audio_for_send(
-            packet.codec(),
-            packet.frame.parts().parameters,
-            packet.data(),
-        )?;
+        validate_audio_for_send(packet.format(), packet.data())?;
         let ReceivedAudioPacket {
-            codec,
-            protected,
-            parameters,
+            format,
             bytes,
             extras,
         } = packet.to_owned();
         Ok(Self {
-            codec,
-            protected,
-            parameters,
+            format,
             bytes: AliasableVec::new(bytes),
             extras,
         })

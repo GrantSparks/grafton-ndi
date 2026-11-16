@@ -620,15 +620,18 @@ mod tests {
         assert!(event.is_err());
         assert_eq!(releases, 1);
 
-        let mut sent =
-            CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8]).unwrap();
+        let mut sent = CompressedAudioFrame::new(
+            crate::advanced::AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+            vec![1; 8],
+        )
+        .unwrap();
         let (event, releases) = deliver::<AudioKind>(sent.raw(), audio_event);
         assert_eq!(releases, 1);
         let PacketItem::Audio(ReceivedAudio::Compressed(copied)) = event.unwrap() else {
             panic!("a codec packet is passed through");
         };
         assert_eq!(copied.data(), &[1; 8]);
-        assert_eq!(copied.codec(), AudioCodec::Opus);
+        assert_eq!(copied.format().codec(), AudioCodec::Opus);
 
         let mut truncated = sent.raw();
         truncated.__bindgen_anon_1.data_size_in_bytes = 0;

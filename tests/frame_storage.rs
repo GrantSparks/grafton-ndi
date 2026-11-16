@@ -166,8 +166,8 @@ fn complete_send_size_includes_scan_rows_and_stride_and_enables_direct_sending()
 #[test]
 fn compressed_and_scatter_round_trips_preserve_payload_pools() {
     use grafton_ndi::advanced::{
-        AudioCodec, CompressedAudioFrame, CompressedVideoFrame, ScatterAudioFrame,
-        ScatterVideoFrame, VideoCodec, VideoPacketFormat,
+        AudioCodec, AudioPacketFormat, CompressedAudioFrame, CompressedVideoFrame,
+        ScatterAudioFrame, ScatterVideoFrame, VideoCodec, VideoPacketFormat,
     };
     let format = VideoPacketFormat::new(VideoCodec::SpeedHq422, 1920, 1080).unwrap();
     let mut bytes = Vec::with_capacity(4096);
@@ -195,29 +195,41 @@ fn compressed_and_scatter_round_trips_preserve_payload_pools() {
     let mut bytes = Vec::with_capacity(1024);
     bytes.extend_from_slice(&[1, 2, 3]);
     let (pointer, capacity) = (bytes.as_ptr(), bytes.capacity());
-    let bytes = CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, bytes)
-        .unwrap()
-        .into_data();
+    let bytes = CompressedAudioFrame::new(
+        AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+        bytes,
+    )
+    .unwrap()
+    .into_data();
     assert_eq!((bytes.as_ptr(), bytes.capacity()), (pointer, capacity));
-    let blocks = ScatterAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![bytes])
-        .unwrap()
-        .into_blocks();
+    let blocks = ScatterAudioFrame::new(
+        AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+        vec![bytes],
+    )
+    .unwrap()
+    .into_blocks();
     assert_eq!(
         (blocks[0].as_ptr(), blocks[0].capacity()),
         (pointer, capacity)
     );
     let bytes = blocks.into_iter().next().unwrap();
-    let rejected = CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 0, 960, bytes)
-        .unwrap_err()
-        .into_inner();
+    let rejected = CompressedAudioFrame::new(
+        AudioPacketFormat::new(AudioCodec::Opus, 44_100, 2, 960).unwrap(),
+        bytes,
+    )
+    .unwrap_err()
+    .into_inner();
     assert_eq!(
         (rejected.as_ptr(), rejected.capacity()),
         (pointer, capacity)
     );
     // AAC metadata/envelope validation occurs after its storage owner is created.
-    let rejected = CompressedAudioFrame::new(AudioCodec::Aac, 48_000, 2, 1024, rejected)
-        .unwrap_err()
-        .into_inner();
+    let rejected = CompressedAudioFrame::new(
+        AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
+        rejected,
+    )
+    .unwrap_err()
+    .into_inner();
     assert_eq!(
         (rejected.as_ptr(), rejected.capacity()),
         (pointer, capacity)

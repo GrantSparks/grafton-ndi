@@ -117,8 +117,10 @@ specify exact limits and send validation.
 
 Owned compressed/scatter frames edit timecode and metadata with `set_timecode`,
 `set_metadata` and `clear_metadata`. Invalid replacement metadata preserves the
-old value. Audio uses `set_protected`; reusable `VideoPacketFormat` uses fluent
-`with_*` settings. Scatter frames retain separate owned blocks rather than
+old value. Reusable `VideoPacketFormat` and `AudioPacketFormat` describe codec
+and stream settings; their fluent `with_*` methods include `with_protected`.
+Build each format once and pass it with the payload to contiguous or scatter
+frame constructors. Scatter frames retain separate owned blocks rather than
 joining payloads; `into_contiguous_copy` explicitly joins them.
 
 ### Sending packets

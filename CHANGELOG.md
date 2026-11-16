@@ -30,6 +30,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Interleaved floating-point input uses `AudioFrame::from_interleaved` with
   validated `InterleavedAudioF32`; `AudioLayout` and the audio builder's `layout`
   setter are removed. Audio builders accept packed planar samples.
+- Compressed audio frames and packets share `advanced::AudioPacketFormat`.
+  Contiguous and scatter constructors take this validated format, and packet
+  accessors read it through `format()`; stream protection uses `with_protected`.
+
 - Packet KVM sessions capture through `session.receiver()`, allowing capture on
   a worker thread alongside input. Their direct capture methods are removed.
 

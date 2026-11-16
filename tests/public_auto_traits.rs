@@ -298,6 +298,7 @@ fn advanced_types_keep_their_auto_traits() {
         AllocatorUsage: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioClock<'static>: Send, UnwindSafe, RefUnwindSafe;
         AudioCodec: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AudioPacketFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSync: Send, UnwindSafe, RefUnwindSafe;
         AvSyncCapture<'static>: UnwindSafe, RefUnwindSafe;
         ReceiverControls<'static, RawCapture>: RefUnwindSafe;

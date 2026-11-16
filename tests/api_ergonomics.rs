@@ -72,16 +72,20 @@ fn raw_frames_share_metadata_and_timecode_editing() {
 #[test]
 fn compressed_and_scatter_frames_share_owned_frame_editing() {
     use grafton_ndi::advanced::{
-        AudioCodec, CompressedAudioFrame, CompressedVideoFrame, ScatterAudioFrame,
-        ScatterVideoFrame, VideoCodec, VideoPacketFormat,
+        AudioCodec, AudioPacketFormat, CompressedAudioFrame, CompressedVideoFrame,
+        ScatterAudioFrame, ScatterVideoFrame, VideoCodec, VideoPacketFormat,
     };
     let format = VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16).unwrap();
     check_frame_editing!(CompressedVideoFrame::new(format, vec![0; 4]).unwrap());
     check_frame_editing!(ScatterVideoFrame::new(format, vec![vec![0; 4]]).unwrap());
-    check_frame_editing!(
-        CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1]).unwrap()
-    );
-    check_frame_editing!(
-        ScatterAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![vec![1]]).unwrap()
-    );
+    check_frame_editing!(CompressedAudioFrame::new(
+        AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+        vec![1]
+    )
+    .unwrap());
+    check_frame_editing!(ScatterAudioFrame::new(
+        AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+        vec![vec![1]]
+    )
+    .unwrap());
 }
