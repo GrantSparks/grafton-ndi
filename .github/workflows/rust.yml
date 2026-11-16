@@ -362,6 +362,7 @@ jobs:
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             package: 6.3.2-advanced-linux
+            test-scope: synthetic-headers
             require: advanced
           - role: primary
             name: linux-x64 standard-6.4
@@ -404,6 +405,7 @@ jobs:
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             package: 6.3.2-advanced-windows
+            test-scope: synthetic-headers
             require: advanced,h264-decoder
           - role: primary
             name: windows-x64 standard-6.4
@@ -422,6 +424,7 @@ jobs:
             runner: windows-2025
             target: i686-pc-windows-msvc
             package: current-advanced-windows
+            test-scope: synthetic-headers
             require: advanced,h264-decoder
           - role: primary
             name: macos-arm64 standard-6.3.2
@@ -434,6 +437,7 @@ jobs:
             runner: macos-15
             target: aarch64-apple-darwin
             package: 6.3.2-advanced-apple
+            test-scope: synthetic-headers
             require: advanced,h264-decoder
           - role: primary
             name: macos-arm64 standard-6.4
@@ -598,7 +602,18 @@ jobs:
         timeout-minutes: 20
         env:
           GRAFTON_NDI_REQUIRE_RUNTIME: ${{ matrix.require }}
-        run: cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features
+        run: |
+          skip_args=()
+          if [ "${{ matrix.test-scope }}" = synthetic-headers ]; then
+            # These fixed synthetic headers have a full owner in the current
+            # Advanced primary row for the compiler host, independent of this SDK.
+            inventory="$RUNNER_TEMP/ndi-primary-tests.txt"
+            skip_file="$RUNNER_TEMP/ndi-primary-skips.txt"
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- --list > "$inventory"
+            python ci/sdk_test_scope.py --scope synthetic-headers --inventory "$inventory" --output "$skip_file"
+            while IFS= read -r argument; do skip_args+=("$argument"); done < "$skip_file"
+          fi
+          cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}"
       - name: Tests against the real runtime, no default features
         if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.role == 'primary' }}
         timeout-minutes: 10

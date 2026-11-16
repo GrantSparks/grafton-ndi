@@ -225,6 +225,14 @@ COMPATIBILITY_PACKAGES = {
     'aarch64-apple-darwin': ('current-advanced-apple', '6.3.2-standard-apple', '6.3.2-advanced-apple'),
 }
 COMPATIBILITY_ROLES = {'current-headers', 'baseline-headers'}
+# advanced_headers invokes nested Cargo for the compiler host, not the row's
+# runtime target. Windows x86 therefore shares the x64 host's synthetic fixture.
+SYNTHETIC_HEADER_OWNERS = {
+    'linux-x64 advanced-6.3.2': 'linux-x64 advanced-6.4',
+    'windows-x64 advanced-6.3.2': 'windows-x64 advanced-6.4',
+    'windows-x86 advanced-6.4': 'windows-x64 advanced-6.4',
+    'macos-arm64 advanced-6.3.2': 'macos-arm64 advanced-6.4',
+}
 
 
 def sdk_matrix_violations(rust):
@@ -259,6 +267,20 @@ def sdk_matrix_violations(rust):
     ):
         found += differs(f'rust.yml: {field} configuration owners',
                          {row.get('name') for row in rows if row.get(field) == 'true'}, owners)
+    found += differs('rust.yml: synthetic-header deduplication owners',
+                     {row.get('name') for row in rows if row.get('test-scope') == 'synthetic-headers'},
+                     set(SYNTHETIC_HEADER_OWNERS))
+    for row in primary:
+        if row.get('test-scope') == 'synthetic-headers':
+            owners = [owner for owner in primary
+                      if owner.get('name') == SYNTHETIC_HEADER_OWNERS.get(row['name'])
+                      and owner.get('runner') == row.get('runner')
+                      and owner.get('package', '').startswith('current-advanced-')
+                      and not owner.get('test-scope')]
+            if len(owners) != 1:
+                found.append(f'rust.yml: {row["name"]} has no unique full synthetic-header owner')
+        elif row.get('test-scope'):
+            found.append('rust.yml: a primary SDK row has an unaudited test scope')
     if any('compatibility' in row or 'compatibility-advanced' in row for row in primary):
         found.append('rust.yml: primary SDK rows still provision compatibility packages')
     return found
@@ -296,8 +318,18 @@ def implementation_coverage_violations(rust):
                  'Tests against the real runtime, no default features'):
         step = named.get(name, {})
         found += differs(f'rust.yml: {name} primary owner', step.get('if'), when("matrix.role == 'primary'"))
-        if '--skip' in step.get('run', '') or 'sdk_test_scope' in step.get('run', ''):
+        script = step.get('run', '')
+        if '--skip' in script:
             found.append(f'rust.yml: {name} omits the primary configuration checks')
+        if name.endswith('all features'):
+            required = ('if [ "${{ matrix.test-scope }}" = synthetic-headers ]; then',
+                        '--all-features -- --list > "$inventory"',
+                        'python ci/sdk_test_scope.py --scope synthetic-headers --inventory "$inventory" --output "$skip_file"',
+                        'cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}"')
+            if any(command not in script for command in required):
+                found.append('rust.yml: primary SDK synthetic-header scope lacks its validated owner selection')
+        elif 'sdk_test_scope' in script or 'skip_args' in script:
+            found.append('rust.yml: default SDK configuration omits full primary checks')
     return found
 
 
@@ -649,14 +681,16 @@ class SdkJob(unittest.TestCase):
                     # `1` is implied by every other entry, so it is spelt out only when it stands alone.
                     self.assertEqual(set(promise.split(',')) | {'1'},
                                      checkable(target, pin, all_features=all_features, driver=driver))
-        # A step that may fail without failing the job is a diagnostic, and promises nothing.
-        tests = {step['run']: step['env'] for step in self.job['steps']
-                 if step.get('run', '').startswith('cargo test') and 'continue-on-error' not in step}
         command = 'cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast '
-        self.assertEqual(tests, {
-            command + '--all-features': {'GRAFTON_NDI_REQUIRE_RUNTIME': '${{ matrix.require }}'},
-            command + '--no-default-features': {
-                'GRAFTON_NDI_REQUIRE_RUNTIME': "${{ matrix.require-no-default || '1' }}"}})
+        for name, flags, environment in (
+            ('Tests against the real runtime, all features', '--all-features',
+             {'GRAFTON_NDI_REQUIRE_RUNTIME': '${{ matrix.require }}'}),
+            ('Tests against the real runtime, no default features', '--no-default-features',
+             {'GRAFTON_NDI_REQUIRE_RUNTIME': "${{ matrix.require-no-default || '1' }}"}),
+        ):
+            step = next(step for step in self.job['steps'] if step.get('name') == name)
+            self.assertEqual(step['env'], environment)
+            self.assertIn(command + flags, step['run'])
 
     def test_a_failing_step_does_not_hide_the_steps_after_it(self):
         """Every step after the isolation check runs whenever that check passed, so one run reports everything
@@ -775,6 +809,8 @@ class SdkJob(unittest.TestCase):
             ('different baseline', 'independent SDK compatibility directions'),
             ('mobile check removed', 'apple-mobile configuration owners'),
             ('bindings check removed', 'bindings configuration owners'),
+            ('synthetic owner omitted', 'full synthetic-header owner'),
+            ('unknown primary scope', 'unaudited test scope'),
         ):
             changed = copy.deepcopy(rust)
             altered = changed['jobs']['sdk']['strategy']['matrix']['include']
@@ -791,8 +827,12 @@ class SdkJob(unittest.TestCase):
                 altered[-1]['compatibility'] = '6.1.1-standard-linux'
             elif mutation == 'mobile check removed':
                 del next(row for row in altered if row['name'] == 'macos-arm64 advanced-6.4')['apple-mobile']
-            else:
+            elif mutation == 'bindings check removed':
                 del next(row for row in altered if row['name'] == 'linux-x64 standard-6.4')['bindings']
+            elif mutation == 'synthetic owner omitted':
+                next(row for row in altered if row['name'] == 'linux-x64 advanced-6.4')['test-scope'] = 'synthetic-headers'
+            else:
+                next(row for row in altered if row['name'] == 'linux-x64 standard-6.4')['test-scope'] = 'runtime'
             with self.subTest(mutation=mutation):
                 self.assertTrue(any(expected in line for line in sdk_matrix_violations(changed)))
 
@@ -820,6 +860,16 @@ class SdkJob(unittest.TestCase):
                     if step.get('name') == 'Tests against the real runtime, all features')
         step['run'] += ' --skip compile_contracts'
         self.assertTrue(any('omits the primary' in line for line in implementation_coverage_violations(changed)))
+        for old, new in (
+            ('if [ "${{ matrix.test-scope }}" = synthetic-headers ]; then', 'if true; then'),
+            ('--scope synthetic-headers --inventory', '--scope runtime --inventory'),
+        ):
+            changed = copy.deepcopy(rust)
+            step = next(step for step in changed['jobs']['sdk']['steps']
+                        if step.get('name') == 'Tests against the real runtime, all features')
+            step['run'] = step['run'].replace(old, new)
+            self.assertTrue(any('validated owner selection' in line
+                                for line in implementation_coverage_violations(changed)))
 
     def test_each_compatibility_pass_promises_exactly_what_it_can_check(self):
         """The first step builds with the row's headers against each baseline runtime, the second with each
