@@ -26,6 +26,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- All relative environment library directories use `LoadRefusal::RelativeSearchDirectory`;
+  `LoadAttempt::origin()` identifies the variable that supplied the directory.
+
 - `AudioFormat` converts through `FourCc`; audio descriptors use their validated
   format. `PictureAspectRatio` normalizes negative zero and implements `Eq` and
   `Hash`, as do video packet formats and File track, format and event values.

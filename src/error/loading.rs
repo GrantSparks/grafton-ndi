@@ -362,10 +362,9 @@ pub enum LoadRefusal {
         /// The module defining `NDIlib_version` in the global symbol scope.
         module: PathBuf,
     },
-    /// `NDI_RUNTIME_DIR_V6` names a relative directory, which is never searched.
-    RelativeRuntimeDirectory,
-    /// A `PATH`, `DYLD_LIBRARY_PATH` or `DYLD_FALLBACK_LIBRARY_PATH` entry is
-    /// relative or empty and was not opened.
+    /// An `NDI_RUNTIME_DIR_V6`, `PATH`, `DYLD_LIBRARY_PATH` or
+    /// `DYLD_FALLBACK_LIBRARY_PATH` directory is relative or empty and was not
+    /// opened. [`LoadAttempt::origin`] identifies the environment variable.
     RelativeSearchDirectory,
 }
 
@@ -388,7 +387,6 @@ impl fmt::Display for LoadRefusalDiagnostic<'_> {
             LoadRefusal::BoundToAnotherRuntime => f.write_str("it is bound to an NDI runtime other than the selected one"),
             LoadRefusal::ForeignRuntimeInScope { module } => write!(f,
                 "the process's global symbol scope already holds another NDI runtime ({}); select that runtime or stop linking or preloading it", module.display()),
-            LoadRefusal::RelativeRuntimeDirectory => f.write_str("the runtime directory must be absolute"),
             LoadRefusal::RelativeSearchDirectory => f.write_str("the library search directory must be absolute and nonempty"),
         }
     }
@@ -566,7 +564,6 @@ mod tests {
             (LoadRefusal::NoCompleteFileFamily { first_missing: c"NDIlib_file_player_create" }, "it provides no family of NDI File entry points (it does not export NDIlib_file_player_create)"),
             (LoadRefusal::BoundToAnotherRuntime, "it is bound to an NDI runtime other than the selected one"),
             (LoadRefusal::ForeignRuntimeInScope { module: "preloaded.so".into() }, "the process's global symbol scope already holds another NDI runtime (preloaded.so); select that runtime or stop linking or preloading it"),
-            (LoadRefusal::RelativeRuntimeDirectory, "the runtime directory must be absolute"),
             (LoadRefusal::RelativeSearchDirectory, "the library search directory must be absolute and nonempty"),
         ];
         for (refusal, expected) in cases {
@@ -586,7 +583,7 @@ mod tests {
         let relative = LoadAttempt::new(
             "relative".into(),
             LoadOrigin::RuntimeDirectory,
-            LoadRefusal::RelativeRuntimeDirectory,
+            LoadRefusal::RelativeSearchDirectory,
             false,
             None,
         );
@@ -615,8 +612,8 @@ mod tests {
             failure.attempts()[2].resolved_path(),
             Some(Path::new("resolved.so"))
         );
-        assert_eq!(failure.to_string(), "no usable NDI runtime; tried bundle/ndi.so (next to the executable): not found; relative (NDI_RUNTIME_DIR_V6): the runtime directory must be absolute; ndi.so (system library search) resolved to resolved.so: it does not export the Advanced SDK entry points");
-        assert_eq!(Error::RuntimeLoadFailed(failure).to_string(), "Failed to load an NDI library: no usable NDI runtime; tried bundle/ndi.so (next to the executable): not found; relative (NDI_RUNTIME_DIR_V6): the runtime directory must be absolute; ndi.so (system library search) resolved to resolved.so: it does not export the Advanced SDK entry points");
+        assert_eq!(failure.to_string(), "no usable NDI runtime; tried bundle/ndi.so (next to the executable): not found; relative (NDI_RUNTIME_DIR_V6): the library search directory must be absolute and nonempty; ndi.so (system library search) resolved to resolved.so: it does not export the Advanced SDK entry points");
+        assert_eq!(Error::RuntimeLoadFailed(failure).to_string(), "Failed to load an NDI library: no usable NDI runtime; tried bundle/ndi.so (next to the executable): not found; relative (NDI_RUNTIME_DIR_V6): the library search directory must be absolute and nonempty; ndi.so (system library search) resolved to resolved.so: it does not export the Advanced SDK entry points");
     }
 
     #[test]
