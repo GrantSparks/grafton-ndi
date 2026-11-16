@@ -54,7 +54,7 @@ TRIGGERS = {
 ACTIONS = {
     'rust.yml': {
         'lint': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache', 'actions/upload-pages-artifact'],
-        'test': ['actions/checkout', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
+        'test': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
         'cross': ['actions/checkout', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
         'miri': ['actions/checkout'],
         'sdk': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain'],
@@ -116,7 +116,8 @@ def violations(texts):
             if 'runs-on' in body and not re.fullmatch(r'\d+', body.get('timeout-minutes', '')):
                 found.append(f'{name}: {job} has no timeout')
     return (found + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
-            + docs_violations(parsed['rust.yml']) + memory_checker_violations(parsed['rust.yml']))
+            + docs_violations(parsed['rust.yml']) + memory_checker_violations(parsed['rust.yml'])
+            + repeated_feature_violations(parsed['rust.yml']))
 
 
 def docs_violations(docs):
@@ -153,6 +154,49 @@ def rustdoc_feature_violations(steps):
     return found
 
 
+REPEATED_FEATURE_TESTS = (
+    ('Tests, default features', 'cargo test --locked', 'default'),
+    ('Tests, File API without Advanced wrappers',
+     'cargo test --locked --no-default-features --features file-io', 'file'),
+)
+
+
+def scoped_commands(command, stem):
+    return (
+        f'{command} -- --list > "$scope_dir/{stem}-tests.txt"',
+        f'python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/{stem}-tests.txt" --output "$scope_dir/{stem}-skips.txt"',
+        f'{command} -- "${{scope_args[@]}}"',
+    )
+
+
+def repeated_feature_violations(rust):
+    """Fixed nested compiler graphs retain one earlier owner on each host."""
+    steps = rust['jobs']['test']['steps']
+    names = [step.get('name') for step in steps]
+    owner = next((step for step in steps if step.get('name') == 'Tests, all features'), {})
+    found = differs('rust.yml: fixed compiler owner', owner.get('run'), 'cargo test --locked --all-features')
+    if 'if' in owner:
+        found.append('rust.yml: fixed compiler owner must run on every test host')
+    for name, command, stem in REPEATED_FEATURE_TESTS:
+        step = next((step for step in steps if step.get('name') == name), {})
+        if 'if' in step:
+            found.append(f'rust.yml: repeated feature step {name} must run on every test host')
+        for setting in ('env', 'working-directory'):
+            if step.get(setting) != owner.get(setting):
+                found.append(f'rust.yml: repeated feature step {name} changes fixed compiler inputs: {setting}')
+        lines = [line.strip() for line in step.get('run', '').splitlines()]
+        required = (*scoped_commands(command, stem),
+                    'scope_dir="${RUNNER_TEMP:-target/ci}"', 'mkdir -p "$scope_dir"',
+                    'scope_args=()',
+                    f'while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/{stem}-skips.txt"')
+        for line in required:
+            if lines.count(line) != 1:
+                found.append(f'rust.yml: repeated feature step {name} lacks one guarded scope operation: {line}')
+        if name not in names or 'Tests, all features' not in names or names.index(name) <= names.index('Tests, all features'):
+            found.append(f'rust.yml: repeated feature step {name} has no earlier fixed compiler owner')
+    return found
+
+
 def local_recipe_violations(rust, readme):
     """The local recipe runs each documented lint/test step on the same features."""
     section = readme.split('## Running the checks locally', 1)[-1]
@@ -170,9 +214,9 @@ def local_recipe_violations(rust, readme):
         ('lint', 'Rustdoc', 'cargo doc --locked --no-deps --all-features'),
         ('lint', 'Documentation links and examples', 'python ci/docs.py --compile --rustdoc target/doc'),
         ('test', 'Tests, all features', 'cargo test --locked --all-features'),
-        ('test', 'Tests, default features', 'cargo test --locked'),
-        ('test', 'Tests, File API without Advanced wrappers', 'cargo test --locked --no-default-features --features file-io'),
-    )
+    ) + tuple(('test', name, scoped)
+              for name, command, stem in REPEATED_FEATURE_TESTS
+              for scoped in scoped_commands(command, stem))
     positions = []
     for job, name, command in checks:
         step = next((step for step in rust['jobs'][job]['steps'] if step.get('name') == name), {})
@@ -198,22 +242,193 @@ def local_recipe_violations(rust, readme):
     return found
 
 
+# The native obligations are independent of their scheduling roles. Keep the
+# original configurations explicit so deleting a row cannot shrink coverage.
+PRIMARY_SDK_CONFIGURATIONS = {
+    ('linux-x64 standard-6.1.1', 'x86_64-unknown-linux-gnu', '6.1.1-standard-linux'),
+    ('linux-x64 standard-6.3.2', 'x86_64-unknown-linux-gnu', '6.3.2-standard-linux'),
+    ('linux-x64 advanced-6.3.2', 'x86_64-unknown-linux-gnu', '6.3.2-advanced-linux'),
+    ('linux-x64 standard-6.4', 'x86_64-unknown-linux-gnu', 'current-standard-linux'),
+    ('linux-x64 advanced-6.4', 'x86_64-unknown-linux-gnu', 'current-advanced-linux'),
+    ('linux-x86 standard-6.4', 'i686-unknown-linux-gnu', 'current-standard-linux'),
+    ('linux-arm64 standard-6.4', 'aarch64-unknown-linux-gnu', 'current-standard-linux'),
+    ('windows-x64 standard-6.3.2', 'x86_64-pc-windows-msvc', '6.3.2-standard-windows'),
+    ('windows-x64 advanced-6.3.2', 'x86_64-pc-windows-msvc', '6.3.2-advanced-windows'),
+    ('windows-x64 standard-6.4', 'x86_64-pc-windows-msvc', 'current-standard-windows'),
+    ('windows-x64 advanced-6.4', 'x86_64-pc-windows-msvc', 'current-advanced-windows'),
+    ('windows-x86 advanced-6.4', 'i686-pc-windows-msvc', 'current-advanced-windows'),
+    ('macos-arm64 standard-6.3.2', 'aarch64-apple-darwin', '6.3.2-standard-apple'),
+    ('macos-arm64 advanced-6.3.2', 'aarch64-apple-darwin', '6.3.2-advanced-apple'),
+    ('macos-arm64 standard-6.4', 'aarch64-apple-darwin', 'current-standard-apple'),
+    ('macos-arm64 advanced-6.4', 'aarch64-apple-darwin', 'current-advanced-apple'),
+    ('macos-x64 standard-6.4', 'x86_64-apple-darwin', 'current-standard-apple'),
+}
+COMPATIBILITY_PACKAGES = {
+    'x86_64-unknown-linux-gnu': ('current-advanced-linux', '6.1.1-standard-linux', '6.3.2-advanced-linux'),
+    'x86_64-pc-windows-msvc': ('current-advanced-windows', '6.3.2-standard-windows', '6.3.2-advanced-windows'),
+    'aarch64-apple-darwin': ('current-advanced-apple', '6.3.2-standard-apple', '6.3.2-advanced-apple'),
+}
+COMPATIBILITY_ROLES = {'current-headers', 'baseline-headers'}
+# advanced_headers invokes nested Cargo for the compiler host, not the row's
+# runtime target. Windows x86 therefore shares the x64 host's synthetic fixture.
+SYNTHETIC_HEADER_OWNERS = {
+    'linux-x64 advanced-6.3.2': 'linux-x64 advanced-6.4',
+    'windows-x64 advanced-6.3.2': 'windows-x64 advanced-6.4',
+    'windows-x86 advanced-6.4': 'windows-x64 advanced-6.4',
+    'macos-arm64 advanced-6.3.2': 'macos-arm64 advanced-6.4',
+}
+
+
+def sdk_matrix_violations(rust):
+    """Every crossed build has exactly one primary compiler/configuration owner."""
+    rows = rust['jobs']['sdk']['strategy']['matrix']['include']
+    primary = [row for row in rows if row.get('role') == 'primary']
+    actual = {(row.get('name'), row.get('target'), row.get('package')) for row in primary}
+    found = differs('rust.yml: primary SDK configurations', actual, PRIMARY_SDK_CONFIGURATIONS)
+    if len(primary) != len(actual) or len({row.get('name') for row in rows}) != len(rows):
+        found.append('rust.yml: SDK row names and primary configurations must be unique')
+    if any(row.get('role') not in {'primary', *COMPATIBILITY_ROLES} for row in rows):
+        found.append('rust.yml: an SDK row has an unknown scheduling role')
+    crossed = [row for row in rows if row.get('role') in COMPATIBILITY_ROLES]
+    actual_crossed = {(row['role'], row.get('target'), row.get('package'),
+                       row.get('compatibility'), row.get('compatibility-advanced')) for row in crossed}
+    expected_crossed = {(role, target, *packages)
+                        for target, packages in COMPATIBILITY_PACKAGES.items() for role in COMPATIBILITY_ROLES}
+    found += differs('rust.yml: independent SDK compatibility directions', actual_crossed, expected_crossed)
+    if len(crossed) != len(expected_crossed):
+        found.append('rust.yml: SDK compatibility directions must appear exactly once')
+    for row in crossed:
+        headers = ([row.get('package')] if row['role'] == 'current-headers'
+                   else [row.get('compatibility'), row.get('compatibility-advanced')])
+        for package in headers:
+            owners = [owner for owner in primary
+                      if (owner.get('target'), owner.get('package')) == (row.get('target'), package)]
+            if len(owners) != 1:
+                found.append(f'rust.yml: {row.get("name")} header package {package} has no unique primary build owner')
+    for field, owners in (
+        ('bindings', {'linux-x64 standard-6.4'}),
+        ('apple-mobile', {'macos-arm64 standard-6.4', 'macos-arm64 advanced-6.4'}),
+    ):
+        found += differs(f'rust.yml: {field} configuration owners',
+                         {row.get('name') for row in rows if row.get(field) == 'true'}, owners)
+    found += differs('rust.yml: synthetic-header deduplication owners',
+                     {row.get('name') for row in rows if row.get('test-scope') == 'synthetic-headers'},
+                     set(SYNTHETIC_HEADER_OWNERS))
+    for row in primary:
+        if row.get('test-scope') == 'synthetic-headers':
+            owners = [owner for owner in primary
+                      if owner.get('name') == SYNTHETIC_HEADER_OWNERS.get(row['name'])
+                      and owner.get('runner') == row.get('runner')
+                      and owner.get('package', '').startswith('current-advanced-')
+                      and not owner.get('test-scope')]
+            if len(owners) != 1:
+                found.append(f'rust.yml: {row["name"]} has no unique full synthetic-header owner')
+        elif row.get('test-scope'):
+            found.append('rust.yml: a primary SDK row has an unaudited test scope')
+    if any('compatibility' in row or 'compatibility-advanced' in row for row in primary):
+        found.append('rust.yml: primary SDK rows still provision compatibility packages')
+    return found
+
+
 def implementation_coverage_violations(rust):
     """Real Advanced code and both compatibility editions must be checked."""
     named = {step.get('name'): step for step in rust['jobs']['sdk']['steps']}
-    advanced = named.get('Lint and document the Advanced implementation', {}).get('run', '')
-    found = []
+    advanced = named.get('Lint and document the Advanced implementation', {})
+    found = sdk_matrix_violations(rust)
+    found += differs('rust.yml: Advanced implementation owner', advanced.get('if'),
+                     when("matrix.role == 'primary' && contains(matrix.package, 'advanced')"))
     for command in ('rustup toolchain install 1.88.0 --profile minimal --target "$TARGET"',
                     'cargo +1.88.0 check --locked --all-targets --target "$TARGET" --all-features'):
-        if command not in advanced:
+        if command not in advanced.get('run', ''):
             found.append('rust.yml: Advanced implementation has no MSRV check with installed headers')
-    for name in ('Current Advanced headers with baseline runtimes',
-                 'Baseline SDK builds with the current Advanced runtime'):
-        script = named.get(name, {}).get('run', '')
-        for required in ('failed=0', '--all-features || failed=1', 'exit "$failed"'):
+    for role, name in (
+        ('current-headers', 'Current Advanced headers with baseline runtimes'),
+        ('baseline-headers', 'Baseline SDK builds with the current Advanced runtime'),
+    ):
+        step = named.get(name, {})
+        script = step.get('run', '')
+        found += differs(f'rust.yml: {name} scheduling role', step.get('if'), when(f"matrix.role == '{role}'"))
+        for required in ('failed=0', '--all-features -- "${skip_args[@]}" || failed=1', 'exit "$failed"'):
             if required not in script:
                 found.append(f'rust.yml: {name} does not accumulate compatibility failures')
+        headers = 'advanced' if role == 'current-headers' else '"$edition"'
+        required = ('--all-features -- --list > "$inventory"',
+                    'python ci/sdk_test_scope.py --inventory "$inventory" --target "$TARGET" '
+                    f'--headers {headers} --output "$skip_file"',
+                    'while IFS= read -r argument; do skip_args+=("$argument"); done < "$skip_file"')
+        if any(command not in script for command in required):
+            found.append(f'rust.yml: {name} lacks validated runtime-independent selection')
+    for name in ('Tests against the real runtime, all features',
+                 'Tests against the real runtime, no default features'):
+        step = named.get(name, {})
+        found += differs(f'rust.yml: {name} primary owner', step.get('if'), when("matrix.role == 'primary'"))
+        script = step.get('run', '')
+        if '--skip' in script:
+            found.append(f'rust.yml: {name} omits the primary configuration checks')
+        if name.endswith('all features'):
+            required = ('if [ "${{ matrix.test-scope }}" = synthetic-headers ]; then',
+                        '--all-features -- --list > "$inventory"',
+                        'python ci/sdk_test_scope.py --scope synthetic-headers --inventory "$inventory" --output "$skip_file"',
+                        'cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}"')
+            if any(command not in script for command in required):
+                found.append('rust.yml: primary SDK synthetic-header scope lacks its validated owner selection')
+        elif 'sdk_test_scope' in script or 'skip_args' in script:
+            found.append('rust.yml: default SDK configuration omits full primary checks')
     return found
+
+
+# Keep this contract independent of the workflow parser: batching cannot drop a selector or add a skip.
+MIRI_BATCHES = {
+    'reads': [
+        'sdk_copy::tests::',
+        'source_retention::tests::',
+        'finder::budget::tests::',
+        'file::out_param::tests::',
+    ],
+    'media': [
+        'frames::tests::video_padding_all_formats',
+        'frames::tests::video_padding_single_rows',
+        'frames::tests::video_padding_encoders',
+        'frames::metadata_tests::metadata_constructors',
+        'frames::metadata_tests::owned_metadata_states',
+        'frames::metadata_tests::audio_timestamp',
+        'receiver::mixed_tests',
+        'receiver::latest_report_tests::',
+        'asynchronous::scoped_tests',
+        'framesync::tests::test_framesync_video_ref_uses',
+        'framesync::tests::test_framesync_audio_ref_supports',
+        'advanced::sync::tests::returned_audio_is_released',
+        'advanced::sync::tests::borrowed_avsync_audio',
+    ],
+    'ownership': [
+        'advanced::kvm::ownership_tests::',
+        'advanced::reserved_map::tests::',
+        'advanced::send_slots::tests::',
+        'advanced::aliasable::tests::',
+        'advanced::packets::received::tests::',
+        'advanced::queued::boundary_tests::',
+        'sender::in_flight::tests::',
+        'advanced::send::tests::',
+        'advanced::queued::tests::',
+        'sender::tests::',
+    ],
+}
+MIRI_SKIPS = [
+    'descriptor_admission_and_collection_stay_allocation_free_under_churn',
+    'exact_copies_match_standard_utf8_replacement',
+    'sdk_copy::tests::expanded_text_cannot_allocate_past_the_snapshot_limit',
+    'sdk_copy::tests::omitting_malformed_entries_keeps_their_scan_cost_and_fatal_errors',
+    'sdk_copy::tests::rejected_scans_stay_charged_and_short_budgets_are_fatal',
+    'finder::budget::tests::aggregate_bytes_are_checked_before_string_allocation',
+    'finder::budget::tests::count_and_span_are_checked_before_dereferencing_or_reserving',
+    'finder::budget::tests::lossy_expansion_is_charged_before_allocating_the_output',
+    'finder::budget::tests::rejected_entries_still_consume_the_scan_budget',
+]
+
+
+def miri_batches(script):
+    return [(name, shlex.split(body)) for name, body in
+            re.findall(r'^\s*(\w+)\) filters=\((.*?)\);;', script, re.DOTALL | re.MULTILINE)]
 
 
 def memory_checker_violations(rust):
@@ -232,24 +447,29 @@ def memory_checker_violations(rust):
         if command not in setup:
             found.append('rust.yml: Miri setup does not pin the checked nightly and components')
     command = 'cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio'
-    for selection in ('"$filter"', '-- --list'):
+    for selection in ('-- --exact "${batch_tests[@]}"', '-- --list'):
         if f'{command} {selection}' not in run:
             found.append('rust.yml: Miri does not build and execute the selected synthetic fixtures with file-io')
     if run.count('-- --list') != 1 or f'inventory=$({command} -- --list)' not in run:
         found.append('rust.yml: Miri must read one interpreted test inventory')
-    selection = re.search(r'for filter in (.*?); do', run, re.DOTALL)
-    filters = set(shlex.split(selection.group(1).replace('\\\n', ' '))) if selection else set()
-    for fixture in ('sdk_copy::tests::', 'source_retention::tests::', 'finder::budget::tests::',
-                    'file::out_param::tests::',
-                    'frames::tests::video_padding_all_formats', 'frames::tests::video_padding_encoders',
-                    'receiver::mixed_tests', 'receiver::latest_report_tests::',
-                    'advanced::kvm::ownership_tests::', 'advanced::reserved_map::tests::',
-                    'asynchronous::scoped_tests', 'advanced::send_slots::tests::',
-                    'advanced::aliasable::tests::', 'advanced::packets::received::tests::',
-                    'advanced::queued::boundary_tests::', 'sender::in_flight::tests::',
-                    'advanced::send::tests::', 'advanced::queued::tests::', 'sender::tests::'):
+    skips = re.search(r'skips=\((.*?)\)', run, re.DOTALL)
+    found += differs('rust.yml: Miri skip policy', shlex.split(skips.group(1)) if skips else [], MIRI_SKIPS)
+    batches = miri_batches(run)
+    found += differs('rust.yml: Miri audited batches', batches, list(MIRI_BATCHES.items()))
+    order = re.search(r'batches=\((.*?)\)', run, re.DOTALL)
+    found += differs('rust.yml: Miri batch order', shlex.split(order.group(1)) if order else [], list(MIRI_BATCHES))
+    filters = [fixture for _, batch in batches for fixture in batch]
+    for fixture in [fixture for batch in MIRI_BATCHES.values() for fixture in batch]:
         if fixture not in filters:
             found.append(f'rust.yml: Miri omits {fixture}')
+    for required in ('batch_tests+=("${selected[@]}")', '-- --exact "${batch_tests[@]}"'):
+        if required not in run:
+            found.append('rust.yml: Miri does not run exact inventory selections')
+    if '--test-threads=1' not in run:
+        found.append('rust.yml: Miri batching increases inter-test concurrency')
+    for required in ('selected_names=()', '"$test" = "$previous"', 'Ambiguous test selection:'):
+        if required not in run:
+            found.append('rust.yml: Miri lacks the overlapping-selection guard')
 
     test = next((step for step in jobs['test']['steps']
                  if step.get('name') == 'Memcheck over scripted capture and encoder padding'), {})
@@ -272,10 +492,11 @@ def memory_checker_violations(rust):
     for required in ('-- --list "$filter"', "if ! grep -q ': test$'", 'No tests selected for filter: $filter', 'exit 1'):
         if required not in test.get('run', ''):
             found.append('rust.yml: scripted Memcheck lacks the empty-selection guard')
-    for required in ('if ! has_tests "$filter" true', 'No tests selected for filter: $filter', 'exit 1'):
+    for required in ('select_tests "$filter" true', 'No tests selected for filter: $filter', 'exit 1'):
         if required not in run:
             found.append('rust.yml: Miri lacks the empty-selection guard')
-    for required in ('if ! has_tests "$skip" false', 'No tests selected for skip: $skip', 'skip_args+=(--skip "$skip")'):
+    for required in ('select_tests "$skip" false', 'No tests selected for skip: $skip',
+                     'Ambiguous skip selection:', 'skip_args+=(--skip "$skip")'):
         if required not in run:
             found.append('rust.yml: Miri lacks the skip-selection guard')
     for required in ('ci/offline/linux.sh', '--test video_padding_sdk', '--features image-encoding'):
@@ -339,8 +560,8 @@ WRONG_EDITS = (
      '          cargo +1.88.0 check --locked --all-targets --target "$TARGET" --all-features\n', '',
      'MSRV check with installed headers'),
     ('compatibility failure stops later editions', 'rust.yml',
-     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features || failed=1\n          done\n          exit "$failed"\n      # A Standard',
-     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features\n          done\n          exit "$failed"\n      # A Standard',
+     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}" || failed=1\n          done\n          exit "$failed"\n      # A Standard',
+     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}"\n          done\n          exit "$failed"\n      # A Standard',
      'accumulate compatibility failures'),
     ('toolchain differs from contributor pin', 'publish.yml', '          toolchain: 1.100.0\n',
      '          toolchain: 1.99.1\n', 'toolchain of verify'),
@@ -530,9 +751,11 @@ class SdkJob(unittest.TestCase):
         cls.job = workflows.load(cls.texts['rust.yml'])['jobs']['sdk']
         cls.rows = cls.job['strategy']['matrix']['include']
         cls.pins = sdk.load_pins()
+        cls.primary = [row for row in cls.rows if row['role'] == 'primary']
 
     def test_matrix_rows_use_pinned_packages_for_their_target(self):
-        self.assertGreaterEqual(len(self.rows), 9)
+        self.assertEqual(len(self.rows), 23)
+        self.assertEqual(sdk_matrix_violations(workflows.load(self.texts['rust.yml'])), [])
         for row in self.rows:
             with self.subTest(row=row['name']):
                 self.assertEqual(sdk.RUNTIMES[row['target']][0], self.pins[row['package']]['platform'])
@@ -541,7 +764,8 @@ class SdkJob(unittest.TestCase):
 
     def test_a_row_installs_only_a_driver_built_for_its_runtime(self):
         rows = [row for row in self.rows if 'hx-driver' in row]
-        self.assertEqual([row['name'] for row in rows], ['linux-x64 advanced-6.4'])
+        self.assertEqual({row['name'] for row in rows},
+                         {'linux-x64 advanced-6.4', 'linux-x64 current-headers', 'linux-x64 baseline-headers'})
         for row in rows:
             driver, package = self.pins[row['hx-driver']], self.pins[row['package']]
             self.assertEqual((driver['platform'], driver['version']), (package['platform'], package['version']))
@@ -552,7 +776,7 @@ class SdkJob(unittest.TestCase):
 
     def test_each_step_promises_exactly_what_its_build_can_check(self):
         """A promise no test in the build can check fails that build; a missing one lets tests skip."""
-        for row in self.rows:
+        for row in self.primary:
             pin, target, driver = self.pins[row['package']], row['target'], self.pins.get(row.get('hx-driver'))
             for step, promise, all_features in (('all features', row['require'], True),
                                                 ('no default features', row.get('require-no-default', '1'), False)):
@@ -560,14 +784,16 @@ class SdkJob(unittest.TestCase):
                     # `1` is implied by every other entry, so it is spelt out only when it stands alone.
                     self.assertEqual(set(promise.split(',')) | {'1'},
                                      checkable(target, pin, all_features=all_features, driver=driver))
-        # A step that may fail without failing the job is a diagnostic, and promises nothing.
-        tests = {step['run']: step['env'] for step in self.job['steps']
-                 if step.get('run', '').startswith('cargo test') and 'continue-on-error' not in step}
         command = 'cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast '
-        self.assertEqual(tests, {
-            command + '--all-features': {'GRAFTON_NDI_REQUIRE_RUNTIME': '${{ matrix.require }}'},
-            command + '--no-default-features': {
-                'GRAFTON_NDI_REQUIRE_RUNTIME': "${{ matrix.require-no-default || '1' }}"}})
+        for name, flags, environment in (
+            ('Tests against the real runtime, all features', '--all-features',
+             {'GRAFTON_NDI_REQUIRE_RUNTIME': '${{ matrix.require }}'}),
+            ('Tests against the real runtime, no default features', '--no-default-features',
+             {'GRAFTON_NDI_REQUIRE_RUNTIME': "${{ matrix.require-no-default || '1' }}"}),
+        ):
+            step = next(step for step in self.job['steps'] if step.get('name') == name)
+            self.assertEqual(step['env'], environment)
+            self.assertIn(command + flags, step['run'])
 
     def test_a_failing_step_does_not_hide_the_steps_after_it(self):
         """Every step after the isolation check runs whenever that check passed, so one run reports everything
@@ -583,12 +809,14 @@ class SdkJob(unittest.TestCase):
                 self.assertTrue(step.get('if', '').startswith('${{ ' + ROW_READY),
                                 f"{step['name']} runs on {step.get('if')!r}")
         self.assertEqual({step['name']: step['if'] for step in after if 'matrix.' in step['if']}, {
+            'Tests against the real runtime, all features': when("matrix.role == 'primary'"),
+            'Tests against the real runtime, no default features': when("matrix.role == 'primary'"),
             'Memcheck over SDK padding': when("matrix.name == 'linux-x64 standard-6.3.2'"),
-            'Lint and document the Advanced implementation': when("contains(matrix.package, 'advanced')"),
+            'Lint and document the Advanced implementation': when("matrix.role == 'primary' && contains(matrix.package, 'advanced')"),
             'Vendored bindings are current': when('matrix.bindings'),
             'Build for the statically linked Apple mobile targets': when('matrix.apple-mobile'),
-            'Current Advanced headers with baseline runtimes': when('matrix.compatibility'),
-            'Baseline SDK builds with the current Advanced runtime': when('matrix.compatibility')})
+            'Current Advanced headers with baseline runtimes': when("matrix.role == 'current-headers'"),
+            'Baseline SDK builds with the current Advanced runtime': when("matrix.role == 'baseline-headers'")})
 
     def test_every_test_step_is_bounded_inside_the_job(self):
         """A test that never returns fails its own step, well before the job's limit, and a failing test binary
@@ -617,7 +845,8 @@ class SdkJob(unittest.TestCase):
                             sdk.version_tuple(self.pins[row['package']]['version']))
             self.assertEqual(self.pins[row['compatibility']]['platform'],
                              self.pins[row['package']]['platform'])
-        steps = [step for step in self.job['steps'] if step.get('if') == when('matrix.compatibility')]
+        steps = [step for step in self.job['steps'] if step.get('if') in {when("matrix.role == 'current-headers'"),
+                                                 when("matrix.role == 'baseline-headers'")}]
         self.assertEqual(len(steps), 2)
         for step in steps:
             self.assertNotIn('env', step)
@@ -637,20 +866,113 @@ class SdkJob(unittest.TestCase):
             self.assertIn(f'export {name}="${{{{ steps.sdk.outputs.{name} }}}}"', steps[1]['run'])
 
     def test_compatibility_loops_run_the_second_edition_after_a_failure(self):
-        steps = [step for step in self.job['steps'] if step.get('if') == when('matrix.compatibility')]
+        steps = [step for step in self.job['steps'] if step.get('if') in {
+            when("matrix.role == 'current-headers'"), when("matrix.role == 'baseline-headers'")}]
         for step in steps:
-            # Keep the actual loop and failure policy; replace environment setup
-            # and the native test command with a deterministic failing first pass.
-            script = step['run']
-            start = script.index('failed=0')
-            script = script[start:]
-            script = re.sub(r'^  (?!cargo test).+$', '', script, flags=re.MULTILINE)
-            script = re.sub(r'cargo test .+?( \|\| failed=1)',
-                            r'echo "$edition"; test "$edition" = advanced\1', script)
-            with self.subTest(step=step['name']):
-                result = subprocess.run(['bash', '-eo', 'pipefail', '-c', script], text=True, capture_output=True)
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertEqual(result.stdout.splitlines(), ['standard', 'advanced'])
+            # Retain the actual loop and its failure policy. Native execution,
+            # or one baseline build's preparation, deterministically fails first.
+            cases = ['runtime']
+            if step['if'] == when("matrix.role == 'baseline-headers'"):
+                cases += ['inventory', 'scope']
+            for failure in cases:
+                script = step['run'][step['run'].index('failed=0'):]
+                lines = []
+                for line in script.splitlines():
+                    if not line.startswith('  '):
+                        lines.append(line)
+                    elif '-- "${skip_args[@]}" || failed=1' in line:
+                        check = 'test "$edition" = advanced' if failure == 'runtime' else 'true'
+                        lines.append(f'  echo "$edition"; {check} || failed=1')
+                    elif failure == 'inventory' and '-- --list' in line:
+                        lines.append(re.sub(r'cargo test .*? > "\$inventory"',
+                                            'test "$edition" = advanced', line))
+                    elif failure == 'scope' and 'python ci/sdk_test_scope.py' in line:
+                        lines.append(re.sub(r'python ci/sdk_test_scope.py .*?(?= \|\|)',
+                                            'test "$edition" = advanced', line))
+                with self.subTest(step=step['name'], failure=failure):
+                    result = subprocess.run(['bash', '-eo', 'pipefail', '-c', '\n'.join(lines)],
+                                            text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    expected = ['standard', 'advanced'] if failure == 'runtime' else ['advanced']
+                    self.assertEqual(result.stdout.splitlines(), expected)
+
+    def test_matrix_guards_reject_removed_or_ambiguous_coverage(self):
+        rust = workflows.load(self.texts['rust.yml'])
+        rows = rust['jobs']['sdk']['strategy']['matrix']['include']
+        self.assertEqual(sdk_matrix_violations(rust), [])
+        for index, row in enumerate(rows):
+            with self.subTest(removed=row['name']):
+                missing = copy.deepcopy(rust)
+                del missing['jobs']['sdk']['strategy']['matrix']['include'][index]
+                self.assertTrue(sdk_matrix_violations(missing))
+        for mutation, expected in (
+            ('duplicate owner', 'unique primary build owner'),
+            ('missing owner', 'unique primary build owner'),
+            ('unknown role', 'unknown scheduling role'),
+            ('different baseline', 'independent SDK compatibility directions'),
+            ('mobile check removed', 'apple-mobile configuration owners'),
+            ('bindings check removed', 'bindings configuration owners'),
+            ('synthetic owner omitted', 'full synthetic-header owner'),
+            ('unknown primary scope', 'unaudited test scope'),
+        ):
+            changed = copy.deepcopy(rust)
+            altered = changed['jobs']['sdk']['strategy']['matrix']['include']
+            if mutation == 'duplicate owner':
+                duplicate = copy.deepcopy(next(row for row in altered
+                                               if row['name'] == 'linux-x64 advanced-6.4'))
+                duplicate['name'] += ' duplicate'
+                altered.append(duplicate)
+            elif mutation == 'missing owner':
+                altered.remove(next(row for row in altered if row['name'] == 'linux-x64 standard-6.1.1'))
+            elif mutation == 'unknown role':
+                altered[-1]['role'] = 'unknown'
+            elif mutation == 'different baseline':
+                altered[-1]['compatibility'] = '6.1.1-standard-linux'
+            elif mutation == 'mobile check removed':
+                del next(row for row in altered if row['name'] == 'macos-arm64 advanced-6.4')['apple-mobile']
+            elif mutation == 'bindings check removed':
+                del next(row for row in altered if row['name'] == 'linux-x64 standard-6.4')['bindings']
+            elif mutation == 'synthetic owner omitted':
+                next(row for row in altered if row['name'] == 'linux-x64 advanced-6.4')['test-scope'] = 'synthetic-headers'
+            else:
+                next(row for row in altered if row['name'] == 'linux-x64 standard-6.4')['test-scope'] = 'runtime'
+            with self.subTest(mutation=mutation):
+                self.assertTrue(any(expected in line for line in sdk_matrix_violations(changed)))
+
+    def test_compatibility_selection_guards_require_inventory_and_scoped_arguments(self):
+        rust = workflows.load(self.texts['rust.yml'])
+        self.assertEqual(implementation_coverage_violations(rust), [])
+        names = ('Current Advanced headers with baseline runtimes',
+                 'Baseline SDK builds with the current Advanced runtime')
+        for name in names:
+            for old, new in (
+                ('-- --list > "$inventory"', '> "$inventory"'),
+                ('python ci/sdk_test_scope.py', 'python ci/misspelled.py'),
+                ('--target "$TARGET" --headers', '--headers'),
+                ('done < "$skip_file"', 'done < /dev/null'),
+                ('--all-features -- "${skip_args[@]}" || failed=1', '--all-features || failed=1'),
+            ):
+                changed = copy.deepcopy(rust)
+                step = next(step for step in changed['jobs']['sdk']['steps'] if step.get('name') == name)
+                self.assertIn(old, step['run'])
+                step['run'] = step['run'].replace(old, new)
+                with self.subTest(step=name, removed=old):
+                    self.assertTrue(implementation_coverage_violations(changed))
+        changed = copy.deepcopy(rust)
+        step = next(step for step in changed['jobs']['sdk']['steps']
+                    if step.get('name') == 'Tests against the real runtime, all features')
+        step['run'] += ' --skip compile_contracts'
+        self.assertTrue(any('omits the primary' in line for line in implementation_coverage_violations(changed)))
+        for old, new in (
+            ('if [ "${{ matrix.test-scope }}" = synthetic-headers ]; then', 'if true; then'),
+            ('--scope synthetic-headers --inventory', '--scope runtime --inventory'),
+        ):
+            changed = copy.deepcopy(rust)
+            step = next(step for step in changed['jobs']['sdk']['steps']
+                        if step.get('name') == 'Tests against the real runtime, all features')
+            step['run'] = step['run'].replace(old, new)
+            self.assertTrue(any('validated owner selection' in line
+                                for line in implementation_coverage_violations(changed)))
 
     def test_each_compatibility_pass_promises_exactly_what_it_can_check(self):
         """The first step builds with the row's headers against each baseline runtime, the second with each
@@ -658,7 +980,8 @@ class SdkJob(unittest.TestCase):
         the row's own runtime has the row's driver beside it. Neither step promises an NDI|HX decoder: the
         row's own runs do, and the decode tests still run, and pass or skip visibly, in the crossed builds."""
         baseline_runtimes, baseline_headers = [step for step in self.job['steps']
-                                               if step.get('if') == when('matrix.compatibility')]
+                                               if step.get('if') in {when("matrix.role == 'current-headers'"),
+                                                 when("matrix.role == 'baseline-headers'")}]
         for row in (row for row in self.rows if 'compatibility' in row):
             current, target, driver = self.pins[row['package']], row['target'], self.pins.get(row.get('hx-driver'))
             baselines = {'standard': self.pins[row['compatibility']], 'advanced': self.pins[row['compatibility-advanced']]}
@@ -700,7 +1023,8 @@ class MemoryCheckers(unittest.TestCase):
         ]
         miri_script = rust['jobs']['miri']['steps'][2]['run']
         skips = shlex.split(re.search(r'skips=\((.*?)\)', miri_script, re.DOTALL).group(1))
-        filters = shlex.split(re.search(r'for filter in (.*?); do', miri_script, re.DOTALL).group(1).replace('\\\n', ' '))
+        batches = miri_batches(miri_script)
+        filters = [fixture for _, batch in batches for fixture in batch]
         inventory = '\n'.join(f'{name}: test' for name in [*skips, *(name + 'fixture' for name in filters)])
         with tempfile.TemporaryDirectory() as directory:
             cargo = Path(directory) / 'cargo'
@@ -743,7 +1067,34 @@ esac
                             calls = calls_file.read_text().splitlines()
                             self.assertEqual(sum(' --list' in call for call in calls), 1)
                             if not selection:
-                                self.assertEqual(sum(' --list' not in call for call in calls), len(filters))
+                                self.assertEqual(sum(' --list' not in call for call in calls), len(batches))
+                                self.assertTrue(all('--test-threads=1' in call and ' --exact ' in call
+                                                    for call in calls if ' --list' not in call))
+
+    def test_miri_inventory_rejects_ambiguous_filters_and_skips(self):
+        rust = workflows.load(read_workflows()['rust.yml'])
+        script = rust['jobs']['miri']['steps'][2]['run']
+        filters = [fixture for batch in MIRI_BATCHES.values() for fixture in batch]
+        inventory = '\n'.join(f'{name}: test' for name in [*MIRI_SKIPS, *(name + 'fixture' for name in filters)])
+        cases = (
+            (inventory + '\n' + MIRI_SKIPS[0] + '_duplicate: test', 'Ambiguous skip selection:'),
+            (inventory + '\n' + filters[0] + filters[1] + 'overlap: test', 'Ambiguous test selection:'),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cargo = Path(directory) / 'cargo'
+            cargo.write_text("""#!/bin/bash
+case " $* " in
+  *" --list "*) printf '%s\\n' "$MIRI_INVENTORY" ;;
+esac
+""")
+            cargo.chmod(0o755)
+            for changed, expected in cases:
+                with self.subTest(expected=expected):
+                    result = subprocess.run(['bash', '-eo', 'pipefail', '-c', script],
+                                            env={**os.environ, 'PATH': directory + os.pathsep + os.environ['PATH'],
+                                                 'MIRI_INVENTORY': changed}, text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn(expected, result.stdout)
 
     def test_missing_detector_configuration_is_reported(self):
         rust = workflows.load(read_workflows()['rust.yml'])
@@ -765,11 +1116,11 @@ esac
                           ('test', 'Memcheck over scripted capture and encoder padding')):
             missing_guard = copy.deepcopy(rust)
             step = next(step for step in missing_guard['jobs'][job]['steps'] if step.get('name') == name)
-            guard = 'if ! has_tests "$filter" true' if job == 'miri' else '-- --list "$filter"'
+            guard = 'select_tests "$filter" true' if job == 'miri' else '-- --list "$filter"'
             step['run'] = step['run'].replace(guard, '')
             variants.append((missing_guard, 'empty-selection guard'))
         missing_skip_guard = copy.deepcopy(rust)
-        missing_skip_guard['jobs']['miri']['steps'][2]['run'] = rust['jobs']['miri']['steps'][2]['run'].replace('if ! has_tests "$skip" false', '')
+        missing_skip_guard['jobs']['miri']['steps'][2]['run'] = rust['jobs']['miri']['steps'][2]['run'].replace('select_tests "$skip" false', '')
         variants.append((missing_skip_guard, 'skip-selection guard'))
         for change in ('remove', 'repeat'):
             broken_inventory = copy.deepcopy(rust)
@@ -786,15 +1137,28 @@ esac
                         'advanced::reserved_map::tests::'):
             missing_reads = copy.deepcopy(rust)
             step = missing_reads['jobs']['miri']['steps'][2]
-            step['run'] = step['run'].replace(fixture + ' \\\n', '')
+            step['run'] = step['run'].replace(fixture + '\n', '')
             variants.append((missing_reads, f'Miri omits {fixture}'))
-        for selection in ('"$filter"', '-- --list'):
+        for selection in ('-- --exact "${batch_tests[@]}"', '-- --list'):
             missing_file = copy.deepcopy(rust)
             step = missing_file['jobs']['miri']['steps'][2]
             step['run'] = step['run'].replace(
                 f'--features advanced,file-io,image-encoding,tokio {selection}',
                 f'--features advanced,image-encoding,tokio {selection}')
             variants.append((missing_file, 'synthetic fixtures with file-io'))
+        for old, new, expected in (
+            ('--test-threads=1', '', 'inter-test concurrency'),
+            ('--exact', '', 'exact inventory selections'),
+            ('skips=(', 'skips=(new_test ', 'Miri skip policy'),
+            ('"$test" = "$previous"', '', 'overlapping-selection guard'),
+            ('batches=(reads media ownership)', 'batches=(reads ownership)', 'Miri batch order'),
+            ('              reads) filters=(', '              unknown) filters=(', 'Miri audited batches'),
+        ):
+            broken_batch = copy.deepcopy(rust)
+            step = broken_batch['jobs']['miri']['steps'][2]
+            # Parsed YAML run bodies have no workflow-level indentation.
+            step['run'] = step['run'].replace(old.lstrip(), new.lstrip())
+            variants.append((broken_batch, expected))
         ungated = copy.deepcopy(rust)
         ungated['jobs']['required-ci']['needs'].remove('miri')
         variants.append((ungated, 'Miri is not required'))
@@ -929,6 +1293,93 @@ class Repository(unittest.TestCase):
         self.assertEqual(set(owned), {'/.github/', '/ci/', '/scripts/', '/.cargo/', '/rust-toolchain.toml',
                                       '/Cargo.toml', '/Cargo.lock', '/xtask/'})
         self.assertEqual({owner for owners in owned.values() for owner in owners}, {'@GrantSparks'})
+
+
+class RepeatedFeatureScopes(unittest.TestCase):
+    def test_fixed_compiler_owner_and_selection_cannot_be_removed(self):
+        rust = workflows.load(read_workflows()['rust.yml'])
+        self.assertEqual(repeated_feature_violations(rust), [])
+        for name, command, stem in REPEATED_FEATURE_TESTS:
+            for operation in (*scoped_commands(command, stem), 'scope_args=()',
+                              f'while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/{stem}-skips.txt"'):
+                with self.subTest(step=name, missing=operation):
+                    broken = copy.deepcopy(rust)
+                    step = next(step for step in broken['jobs']['test']['steps'] if step.get('name') == name)
+                    step['run'] = step['run'].replace(operation, '')
+                    self.assertTrue(repeated_feature_violations(broken))
+            for setting, value in (('env', {'NDI_SDK_DIR': 'a-different-header-build'}),
+                                   ('working-directory', 'another-workspace'),
+                                   ('if', 'false'), ('if', False)):
+                with self.subTest(step=name, changed=setting):
+                    broken = copy.deepcopy(rust)
+                    step = next(step for step in broken['jobs']['test']['steps'] if step.get('name') == name)
+                    step[setting] = value
+                    self.assertTrue(repeated_feature_violations(broken))
+        for condition in (None, 'false'):
+            broken = copy.deepcopy(rust)
+            steps = broken['jobs']['test']['steps']
+            owner = next(step for step in steps if step.get('name') == 'Tests, all features')
+            if condition is None:
+                owner['run'] += ' -- --skip native_loans_and_slot_keys_require_their_owner'
+            else:
+                owner['if'] = condition
+            self.assertTrue(repeated_feature_violations(broken))
+        broken = copy.deepcopy(rust)
+        steps = broken['jobs']['test']['steps']
+        owner = next(step for step in steps if step.get('name') == 'Tests, all features')
+        steps.remove(owner)
+        steps.append(owner)
+        self.assertTrue(repeated_feature_violations(broken))
+
+    def test_scope_validation_precedes_execution_and_preserves_unknown_tests(self):
+        rust = workflows.load(read_workflows()['rust.yml'])
+        fixed = ('attached_modes_fail_the_internal_capture_entry_points',
+                 'frame_parts_require_the_matching_descriptor_validator',
+                 'native_loans_and_slot_keys_require_their_owner')
+        inventory = '\n'.join(f'{name}: test' for name in (
+            'handles_keep_runtime_alive_until_last_drop_and_allow_reinitialization',
+            *fixed, 'unknown_native_case', 'absent_feature_error_variants_are_unavailable',
+            'src/lib.rs - a_doctest (line 1)',
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            cargo = directory / 'cargo'
+            cargo.write_bytes(b'''#!/bin/bash
+printf '%s\n' "$*" >> "$CARGO_CALLS"
+case " $* " in
+  *" --list "*)
+    while IFS= read -r line; do
+      if [ -z "$MISSING_TEST" ] || [[ "$line" != *"$MISSING_TEST"* ]]; then printf '%s\n' "$line"; fi
+    done <<< "$SCOPE_INVENTORY"
+    ;;
+esac
+''')
+            cargo.chmod(0o755)
+            for name, command, stem in REPEATED_FEATURE_TESTS:
+                step = next(step for step in rust['jobs']['test']['steps'] if step.get('name') == name)
+                for missing in ('', fixed[0]):
+                    with self.subTest(step=name, missing=missing):
+                        calls_file = directory / 'calls'
+                        calls_file.write_text('')
+                        result = subprocess.run(['bash', '-eo', 'pipefail', '-c', step['run']], cwd=ROOT,
+                                                env={**os.environ, 'PATH': str(directory) + os.pathsep + os.environ['PATH'],
+                                                     'RUNNER_TEMP': str(directory), 'CARGO_CALLS': str(calls_file),
+                                                     'SCOPE_INVENTORY': inventory, 'MISSING_TEST': missing},
+                                                text=True, capture_output=True)
+                        calls = calls_file.read_text().splitlines()
+                        if missing:
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertIn(missing, result.stderr)
+                            self.assertEqual(len(calls), 1, 'a rejected scope must not execute tests')
+                        else:
+                            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                            self.assertEqual(len(calls), 2)
+                            expected = shlex.split(command)[1:] + ['--']
+                            for test in sorted(fixed):
+                                expected += ['--skip', test]
+                            self.assertEqual(shlex.split(calls[-1]), expected)
+                            self.assertNotIn('unknown_native_case', calls[-1])
+                            self.assertNotIn('absent_feature_error_variants_are_unavailable', calls[-1])
 
 
 if __name__ == '__main__':
