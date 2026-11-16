@@ -974,6 +974,12 @@ impl Control {
     }
 
     fn request_close_now(&self, wake: impl FnOnce()) -> Live<()> {
+        // Count contention while registering the close and publishing shutdown
+        // against the same budget that starts at submission.
+        self.request_close_at(Instant::now(), wake)
+    }
+
+    fn request_close_at(&self, requested: Instant, wake: impl FnOnce()) -> Live<()> {
         let (reply, future) = operation();
         {
             let mut closing = lock(&self.closing);
@@ -989,7 +995,7 @@ impl Control {
             replies.retain(|reply| !reply.shared.cancelled.load(Ordering::Acquire));
             replies.push(reply);
         }
-        if !self.request_shutdown() {
+        if !self.request_shutdown_at(requested) {
             wake();
         }
         future
@@ -998,10 +1004,14 @@ impl Control {
     /// Publish the request and its budget start as one fact. Return whether
     /// shutdown had already been requested, as last-handle drops need to know.
     fn request_shutdown(&self) -> bool {
+        self.request_shutdown_at(Instant::now())
+    }
+
+    fn request_shutdown_at(&self, requested: Instant) -> bool {
         // A finish admitted before this publication must already be in the
         // channel before the owner can begin its shutdown drain.
         let _submission = lock(&self.closing);
-        self.shutdown_at.set(Instant::now()).is_err()
+        self.shutdown_at.set(requested).is_err()
     }
 
     /// Make finish acceptance and enqueue indivisible with shutdown publication,
@@ -3700,6 +3710,62 @@ mod tests {
         // closure cannot subsequently turn their earlier result into success.
         assert!(!closing.is_completed());
         block_on(closing).unwrap();
+    }
+
+    #[test]
+    fn a_close_delayed_by_the_submission_gate_keeps_its_original_cleanup_budget() {
+        for explicit_close in [false, true] {
+            let budget = Duration::from_millis(20);
+            let (device, recorder) = mock_recorder_with_drop_wait(
+                Closing::WhenWaitedFor,
+                AsyncFileOptions::new(),
+                budget,
+            );
+            let (blocked, release) = block_owner(&recorder.worker);
+            let finishing = recorder.finish(Duration::from_secs(30)).submit();
+            let control = Arc::clone(&recorder.worker.control);
+            let sender = recorder.worker.sender.clone();
+            // Supply an already-spent request time to model gate contention
+            // without relying on a scheduling interval crossing a deadline.
+            let requested = Instant::now() - budget - Duration::from_secs(1);
+            let gate = lock(&control.closing);
+            let entered = std::sync::Barrier::new(2);
+            let closing = thread::scope(|scope| {
+                let control = Arc::clone(&control);
+                let entered = &entered;
+                let publication = scope.spawn(move || {
+                    entered.wait();
+                    if explicit_close {
+                        Some(control.request_close_at(requested, || {
+                            let _ = sender.send(Job::Wake);
+                        }))
+                    } else {
+                        assert!(!control.request_shutdown_at(requested));
+                        let _ = sender.send(Job::Wake);
+                        None
+                    }
+                });
+                entered.wait();
+                assert!(!recorder.worker.control.shutdown_requested());
+                drop(gate);
+                publication.join().unwrap()
+            });
+            assert_eq!(control.shutdown_requested_at(), Some(requested));
+            release.send(()).unwrap();
+            block_on(blocked).unwrap();
+            closed(block_on(finishing));
+            if let Some(closing) = closing {
+                block_on(FileOperation::live(closing)).unwrap();
+            }
+            let limit = Instant::now() + Duration::from_secs(5);
+            while device.destroys.load(Ordering::Acquire) == 0 {
+                assert!(Instant::now() < limit);
+                thread::yield_now();
+            }
+            assert_eq!(device.waits.load(Ordering::Acquire), 0);
+            assert_eq!(device.stops.load(Ordering::Acquire), 1);
+            assert!(!device.closed_before_destroy.load(Ordering::Acquire));
+        }
     }
 
     #[test]
