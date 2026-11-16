@@ -49,6 +49,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Load refusals distinguish a missing identification anchor from a missing
   required API entry point. Unreadable version text carries `VersionTextDefect`;
   `InvalidCString` reports its cause once in error chains.
+- Async source-cache hits return on the awaiting task without a blocking-pool
+  handoff; misses retain their timeout, cancellation and publication behavior.
+
 - Discovery snapshots build source strings once from bounded SDK bytes.
   Discovery windows charge shared name and address storage once while counting
   both descriptor containers against their retained byte budget.

@@ -1665,6 +1665,21 @@ impl CacheState {
 }
 
 impl SourceCache {
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn cached_sources(&self, query: HostQuery<'_>) -> Result<Option<Vec<Source>>> {
+        self.entries
+            .probe(query, copy_sources)
+            .map(|(_, sources, _)| sources)
+    }
+
+    #[cfg(all(test, any(feature = "tokio", feature = "smol")))]
+    pub(crate) fn seed_for_test(&self, host: &str, sources: Vec<Source>) {
+        let key = HostKeyBuffer::new(HostQuery::checked(host).unwrap())
+            .into_owned()
+            .unwrap();
+        self.entries.publish(Some(0), key, Arc::new(sources));
+    }
+
     /// Create an empty cache owning `finder` and its discovery configuration.
     ///
     /// This moves the finder without allocating, cloning or making an SDK call.
@@ -1822,6 +1837,25 @@ fn copy_sources(sources: &[Source]) -> Result<Vec<Source>> {
 }
 
 impl CachedSources {
+    /// Clone the map entry under the short lock, then copy descriptors outside it.
+    /// The miss generation belongs to the same lookup used for publication.
+    fn probe(
+        &self,
+        query: HostQuery<'_>,
+        copy: impl FnOnce(&[Source]) -> Result<Vec<Source>>,
+    ) -> Result<(HostKeyBuffer, Option<Vec<Source>>, Option<u64>)> {
+        let key = HostKeyBuffer::new(query);
+        let (snapshot, generation) = {
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (cache.entries.get(key.as_str()).cloned(), cache.generation)
+        };
+        let sources = snapshot.map(|snapshot| copy(&snapshot)).transpose()?;
+        Ok((key, sources, generation))
+    }
+
     fn find_sources_by_host_with(
         &self,
         query: HostQuery<'_>,
@@ -1838,16 +1872,9 @@ impl CachedSources {
         discover: impl FnOnce(HostQuery<'_>, Deadline) -> Result<Vec<Source>>,
         mut copy: impl FnMut(&[Source]) -> Result<Vec<Source>>,
     ) -> Result<Vec<Source>> {
-        let key = HostKeyBuffer::new(query);
-        let (snapshot, generation) = {
-            let cache = self
-                .cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (cache.entries.get(key.as_str()).cloned(), cache.generation)
-        };
-        if let Some(snapshot) = snapshot {
-            return copy(&snapshot);
+        let (key, sources, generation) = self.probe(query, &mut copy)?;
+        if let Some(sources) = sources {
+            return Ok(sources);
         }
         // SDK waits and user discovery run outside the cache mutex. Invalidation
         // changes the generation, so an old result cannot repopulate the cache.

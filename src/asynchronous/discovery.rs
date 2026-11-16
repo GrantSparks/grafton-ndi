@@ -188,7 +188,8 @@ impl<R: AsyncRuntime> AsyncFinder<R, SourceCache> {
     ///
     /// As [`SourceCache::find_sources_by_host`], including best-effort publication.
     /// A cancelled miss does not publish an incomplete discovery window. Cache
-    /// hits also use the blocking pool; returned descriptors are owned copies.
+    /// hits are answered on the awaiting task without the blocking pool;
+    /// returned descriptors are owned copies.
     ///
     /// # Errors
     ///
@@ -199,7 +200,11 @@ impl<R: AsyncRuntime> AsyncFinder<R, SourceCache> {
     #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub async fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
         let deadline = Deadline::after(timeout)?;
-        let query = HostQuery::checked(host)?.into_owned();
+        let query = HostQuery::checked(host)?;
+        if let Some(sources) = self.inner.cached_sources(query)? {
+            return Ok(sources);
+        }
+        let query = query.into_owned();
         let inner = Arc::clone(&self.inner);
         with_deadline_budget::<R, _, _>(deadline, move |deadline, stop| {
             inner.find_sources_by_host_until(query.as_query(), deadline, stop)
@@ -391,6 +396,60 @@ mod tests {
     #[test]
     fn invalid_discovery_inputs_are_refused_without_smol_context() {
         assert_invalid_discovery_inputs::<super::super::Smol>();
+    }
+
+    fn cached_hit_is_ready_on_first_poll<R: AsyncRuntime>() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let adapter = AsyncFinder::<R, SourceCache>::new(SourceCache::new(finder(&ndi)));
+        let expected = Source::new("CAMERA (Program)").unwrap();
+        adapter
+            .cache()
+            .seed_for_test("camera", vec![expected.clone()]);
+        let mut context = Context::from_waker(Waker::noop());
+        let mut lookup = Box::pin(adapter.find_sources_by_host("CAMERA.", Duration::from_secs(30)));
+        let Poll::Ready(result) = lookup.as_mut().poll(&mut context) else {
+            panic!("a cached lookup must complete without dispatching a worker");
+        };
+        assert_eq!(result.unwrap(), vec![expected]);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_cache_hit_needs_no_runtime_or_blocking_worker() {
+        // Without a Tokio context, worker dispatch would return NoRuntime.
+        cached_hit_is_ready_on_first_poll::<super::super::Tokio>();
+    }
+
+    #[cfg(feature = "smol")]
+    #[test]
+    fn smol_cache_hit_is_ready_without_a_blocking_handoff() {
+        cached_hit_is_ready_on_first_poll::<super::super::Smol>();
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_cache_hit_completes_while_the_only_blocking_worker_is_occupied() {
+        use std::sync::mpsc;
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let blocker = ::tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+            started_rx.recv().unwrap();
+            // Dropping this sender on an assertion failure also releases the
+            // blocker, so a failing regression cannot hang runtime shutdown.
+            cached_hit_is_ready_on_first_poll::<super::super::Tokio>();
+            drop(release_tx);
+            blocker.await.unwrap();
+        });
     }
 
     async fn cancelled_native_discovery_releases_its_owner<R: AsyncRuntime>() {
