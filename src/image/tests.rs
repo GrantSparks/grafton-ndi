@@ -3219,3 +3219,50 @@ fn generic_video_sources_encode_and_workspaces_reuse_data_url_conversion() {
         assert_eq!(source.encode_image_data_url(&options).unwrap(), url);
     }
 }
+
+#[test]
+fn lossy_webp_encoder_storage_failure_keeps_its_documented_exception() {
+    for sharp_yuv in [true, false] {
+        let frame = VideoFrame::builder()
+            .resolution(512, 512)
+            .pixel_format(PixelFormat::Rgba)
+            .data([64, 96, 128, 255].repeat(512 * 512))
+            .build()
+            .unwrap();
+        let options = options(ImageFormat::WebpLossy(75)).webp_sharp_yuv(sharp_yuv);
+        let error =
+            crate::test_alloc::fail_allocations_at_least(200_000, || frame.encode_image(&options))
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::InvalidFrame(crate::FrameDefect::EncodingFailed {
+                    codec: crate::ImageCodecKind::Webp,
+                    ..
+                })
+            ),
+            "SharpYUV={sharp_yuv}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn lossy_webp_conversion_storage_failure_reports_image_scratch() {
+    let frame = VideoFrame::builder()
+        .resolution(512, 512)
+        .pixel_format(PixelFormat::Bgra)
+        .data([128, 96, 64, 255].repeat(512 * 512))
+        .build()
+        .unwrap();
+    let error = crate::test_alloc::fail_allocations_at_least(200_000, || {
+        frame.encode_image(&options(ImageFormat::WebpLossy(75)))
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::AllocationFailed(crate::AllocationFailure {
+            kind: crate::AllocationKind::ImageScratch,
+            bytes: Some(1_048_576),
+        })
+    ));
+}

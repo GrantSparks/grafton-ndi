@@ -70,11 +70,16 @@ pub(super) fn encode_lossy(
         },
         &config,
     )
-    .map_err(|error| {
-        Error::InvalidFrame(crate::FrameDefect::EncodingFailed {
-            codec: crate::ImageCodecKind::Webp,
-            diagnostic: error.to_string().into_boxed_str(),
-        })
+    .map_err(encoding_error)
+}
+
+fn encoding_error(error: libwebpop::WebPEncodingError) -> Error {
+    // libwebpop 0.1 supports this type as an Error, but does not guarantee its
+    // variants or expose an allocation classifier. Keep the documented
+    // EncodingFailed exception until a supported classifier is available.
+    Error::InvalidFrame(crate::FrameDefect::EncodingFailed {
+        codec: crate::ImageCodecKind::Webp,
+        diagnostic: error.to_string().into_boxed_str(),
     })
 }
 

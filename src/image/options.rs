@@ -225,6 +225,7 @@ impl ImageFormat {
 /// | Writing or flushing the writer given to `encode_image_to` fails | [`Error::Io`] |
 /// | The required conversion scratch size overflows | [`Error::InvalidFrame`] |
 /// | Conversion scratch cannot be allocated | [`Error::AllocationFailed`] |
+/// | The lossy WebP encoder cannot allocate its working storage | [`Error::InvalidFrame`] (`crate::FrameDefect::EncodingFailed`) |
 /// | The codec fails for another reason | [`Error::InvalidFrame`] |
 ///
 /// `ImageOptions` holds settings only, no buffers, so one value serves any

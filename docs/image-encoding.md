@@ -169,7 +169,10 @@ for application planning.
 
 Inspect the method's `Result`: invalid quality, effort or depth settings return
 `InvalidInput`; malformed color descriptions, HDR refusal, excessive dimensions
-or codec failures return `InvalidFrame`; write and flush failures retain their
+or codec failures return `InvalidFrame`. Conversion scratch allocation failures
+return `AllocationFailed`. The lossy WebP encoder's own allocation failures are
+the exception: they remain `InvalidFrame(FrameDefect::EncodingFailed)` until its
+supported error API can classify them. Write and flush failures retain their
 original `Io` error. A successful writer encode has written every byte and
 flushed the writer. The [API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/image_encoding/struct.ImageOptions.html#errors)
 lists the complete option rules.

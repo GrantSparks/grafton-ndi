@@ -216,7 +216,10 @@ pub enum Error {
     /// [`AllocationFailure`] identifies the storage and its requested size
     /// when known. Discovery copies, image encoding scratch, queued sender
     /// bookkeeping, allocator leases and crate-owned receive buffers all
-    /// report this condition here. A configured budget refusal is instead
+    /// report this condition here. The lossy WebP encoder's own storage is
+    /// the exception: its supported error API cannot classify allocation
+    /// failures, so they remain [`FrameDefect::EncodingFailed`] inside
+    /// [`Error::InvalidFrame`]. A configured budget refusal is instead
     /// [`Error::ResourceLimit`].
     #[error("Allocation failed: {0}")]
     AllocationFailed(AllocationFailure),

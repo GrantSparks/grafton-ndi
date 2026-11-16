@@ -27,6 +27,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Audio allocator padding uses the same validated layout and error causes as
   captured audio, including the 64 MiB active extent limit. Allocator-only audio
   stride and extent error leaves are removed.
+- Lossy WebP encoder storage failures remain `InvalidFrame(EncodingFailed)`
+  because its supported dependency API cannot classify allocation failures;
+  conversion scratch continues to report `AllocationFailed(ImageScratch)`.
 
 - Custom allocator receivers use `advanced::AllocatedReceiver<M = RawCapture>`.
   Replace `AllocatedPacketReceiver` with `AllocatedReceiver<PacketAttached>`;
