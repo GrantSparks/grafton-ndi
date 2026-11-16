@@ -1,9 +1,12 @@
 """Failure cases for documentation links, anchors, examples and snippets."""
+import contextlib
+import io
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import docs  # noqa: E402
@@ -178,6 +181,59 @@ class Documentation(unittest.TestCase):
                 self.assertEqual(len(errors), 2)
                 self.assertIn('missing generated rustdoc page', errors[0])
                 self.assertIn('missing generated rustdoc anchor', errors[1])
+
+    def test_prose_api_names_resolve_against_items_and_members(self):
+        self.write('target/doc/grafton_ndi/index.html', '<a href="struct.Foo.html">Foo</a>')
+        self.write('target/doc/grafton_ndi/struct.Foo.html',
+                   '<section id="method.capture_any"></section><section id="structfield.line_stride"></section>')
+        self.write('README.md', 'Use `Foo::capture_any()` with `capture_any` and `line_stride`.\n'
+                   'Then call `Foo::removed()` or `removed_method(`.\n')
+        errors = docs.guide_api_name_violations(self.root, self.root / 'target/doc')
+        self.assertEqual(len(errors), 2)
+        self.assertIn('README.md:2: unknown documented API name: Foo::removed()', errors[0])
+        self.assertIn('removed_method(', errors[1])
+
+    def test_prose_name_check_skips_history_fences_and_non_api_vocabulary(self):
+        self.write('target/doc/grafton_ndi/index.html', '<html></html>')
+        self.write('examples/old_example.rs', 'fn main() {}')
+        self.write('README.md', '`old_example` `ndi_color_info` `x86_64-unknown-linux-gnu` `*_frames_sent` '
+                   '`src/old_api.rs` `grafton_ndi::image_encoding`\n'
+                   '```rust\n`removed_method`\n```\n')
+        self.write('docs/migration/2.0-to-3.0.md', 'Replace `removed_method` and `Foo::old()`.')
+        self.write('docs/api-conventions.md', 'Use `<kind>` and `new_<kind>`.')
+        self.write('CHANGELOG.md', 'Removed `old_method`.')
+        self.assertEqual(docs.guide_api_name_violations(self.root, self.root / 'target/doc'), [])
+        self.write('docs/usage.md', 'The `removed_method` is gone.')
+        self.assertIn('docs/usage.md:1:', docs.guide_api_name_violations(self.root, self.root / 'target/doc')[0])
+
+    def test_rustdoc_cli_rejects_a_missing_prose_method(self):
+        self.write('target/doc/grafton_ndi/index.html', '<a href="struct.Foo.html">Foo</a>')
+        self.write('target/doc/grafton_ndi/struct.Foo.html', '<section id="method.new"></section>')
+        self.write('docs/usage.md', 'Use `Foo::removed()`.')
+        output = io.StringIO()
+        with mock.patch.object(docs, 'ROOT', self.root), \
+                mock.patch.object(sys, 'argv', ['docs.py', '--rustdoc', str(self.root / 'target/doc')]), \
+                contextlib.redirect_stderr(output):
+            self.assertEqual(docs.main(), 1)
+        self.assertIn('docs/usage.md:1: unknown documented API name: Foo::removed()', output.getvalue())
+
+    def test_prose_name_check_distinguishes_qualified_owners(self):
+        self.write('target/doc/grafton_ndi/index.html', '<a href="struct.Foo.html">Foo</a><a href="struct.Bar.html">Bar</a>')
+        self.write('target/doc/grafton_ndi/struct.Foo.html', '<section id="method.capture_any"></section>')
+        self.write('target/doc/grafton_ndi/struct.Bar.html', '<section id="method.new"></section>')
+        self.write('README.md', '`Bar::capture_any()`')
+        self.assertEqual(len(docs.guide_api_name_violations(self.root, self.root / 'target/doc')), 1)
+
+    def test_prose_name_check_ignores_stale_unlinked_rustdoc_pages(self):
+        self.write('target/doc/grafton_ndi/index.html', '<a href="nested/index.html">nested</a>')
+        self.write('target/doc/grafton_ndi/nested/index.html', '<a href="struct.Current.html">Current</a>')
+        self.write('target/doc/grafton_ndi/nested/struct.Current.html', '<section id="method.current_name"></section>')
+        self.write('target/doc/grafton_ndi/struct.Removed.html', '<section id="method.removed_name"></section>')
+        self.write('README.md', '`Current::current_name()` `Removed::removed_name()` `removed_name`')
+        errors = docs.guide_api_name_violations(self.root, self.root / 'target/doc')
+        self.assertEqual(len(errors), 2)
+        self.assertIn('Removed::removed_name()', errors[0])
+        self.assertIn('removed_name', errors[1])
 
     def test_api_links_cannot_escape_rustdoc_or_match_another_pages_site(self):
         for prefix in (docs.API_SITE, 'https://docs.rs/grafton-ndi/3.0.0/'):
