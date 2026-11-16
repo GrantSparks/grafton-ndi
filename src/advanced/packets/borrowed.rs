@@ -90,6 +90,7 @@ impl<'rx> CompressedVideoRef<'rx> {
     }
 
     borrowed_extras!();
+    video_envelope_accessor!();
 
     /// The packet's codec and video format.
     pub fn format(&self) -> VideoPacketFormat {
@@ -166,6 +167,7 @@ impl<'rx> CompressedAudioRef<'rx> {
     }
 
     borrowed_extras!();
+    audio_envelope_accessor!();
 
     /// The compressed audio codec.
     pub fn codec(&self) -> AudioCodec {

@@ -899,15 +899,18 @@ fn split(bytes: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
 
 /// Check that `received` is the packet `sent`. The SDK owns the envelope's
 /// reserved field, so an envelope is compared by everything else in it.
-fn assert_same_packet(received: &[u8], sent: &[u8], envelope: Option<EnvelopeCodec>) {
+fn assert_same_packet(
+    (bytes, received): (&[u8], Option<PacketEnvelope<'_>>),
+    sent: &[u8],
+    envelope: Option<EnvelopeCodec>,
+) {
     let Some(codec) = envelope else {
-        assert_eq!(received, sent);
+        assert_eq!(bytes, sent);
+        assert!(received.is_none());
         return;
     };
-    let (received, sent) = (
-        PacketEnvelope::parse(received).unwrap(),
-        PacketEnvelope::parse(sent).unwrap(),
-    );
+    let received = received.expect("the validated packet exposes its envelope");
+    let sent = PacketEnvelope::parse(sent).unwrap();
     assert_eq!(received.codec(), Some(codec));
     assert_eq!(
         (
@@ -1079,7 +1082,11 @@ fn compressed_video_arrives_as_sent_by_every_kind_of_send() {
                     Submission::Contiguous => {
                         let mut frame = contiguous();
                         sender.send_video(&mut frame);
-                        assert_same_packet(frame.data(), &bytes, codec.envelope_codec());
+                        assert_same_packet(
+                            (frame.data(), frame.envelope()),
+                            &bytes,
+                            codec.envelope_codec(),
+                        );
                     }
                     Submission::ContiguousAsync => {
                         returned += usize::from(sender.submit_video(contiguous()).is_some());
@@ -1101,7 +1108,11 @@ fn compressed_video_arrives_as_sent_by_every_kind_of_send() {
                     "{codec:?} {submission:?} keyframe={keyframe}"
                 );
                 assert_eq!(received.metadata(), Some(metadata.as_str()));
-                assert_same_packet(received.data(), &bytes, codec.envelope_codec());
+                assert_same_packet(
+                    (received.data(), received.envelope()),
+                    &bytes,
+                    codec.envelope_codec(),
+                );
             }
         }
     }
@@ -1262,7 +1273,7 @@ fn queued_compressed_sources_deliver_aac_and_opus() {
                 (codec, 48_000, 2, samples)
             );
             assert_same_packet(
-                received.data(),
+                (received.data(), received.envelope()),
                 &bytes,
                 (codec == AudioCodec::Aac).then_some(EnvelopeCodec::Aac),
             );
@@ -1413,7 +1424,7 @@ fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
             );
             assert_eq!(received.metadata(), Some(metadata.as_str()));
             let envelope = (codec == AudioCodec::Aac).then_some(EnvelopeCodec::Aac);
-            assert_same_packet(received.data(), &bytes, envelope);
+            assert_same_packet((received.data(), received.envelope()), &bytes, envelope);
         }
     }
     // Opus at five sample rates and six durations; AAC at each sample rate
@@ -1513,7 +1524,11 @@ fn every_video_frame_the_wrapper_admits_is_delivered() {
                 sender.send_video(&mut frame);
                 let received = await_video(receiver, timecode);
                 assert_eq!(received.format(), delivered);
-                assert_same_packet(received.data(), &sent, codec.envelope_codec());
+                assert_same_packet(
+                    (received.data(), received.envelope()),
+                    &sent,
+                    codec.envelope_codec(),
+                );
 
                 timecode += 1;
                 let sent = bytes(timecode);
@@ -1522,7 +1537,11 @@ fn every_video_frame_the_wrapper_admits_is_delivered() {
                 sender.send_scatter_video(&mut frame).unwrap();
                 let received = await_video(receiver, timecode);
                 assert_eq!(received.format(), delivered);
-                assert_same_packet(received.data(), &sent, codec.envelope_codec());
+                assert_same_packet(
+                    (received.data(), received.envelope()),
+                    &sent,
+                    codec.envelope_codec(),
+                );
             }
         }
     }
@@ -1595,7 +1614,11 @@ fn a_relay_delivers_every_packet_it_receives() {
         let relayed = await_video(&mut downstream, timecode);
         assert_eq!(relayed.format(), format);
         assert_eq!(relayed.metadata(), Some("<relayed/>"));
-        assert_same_packet(relayed.data(), &bytes, codec.envelope_codec());
+        assert_same_packet(
+            (relayed.data(), relayed.envelope()),
+            &bytes,
+            codec.envelope_codec(),
+        );
     }
 
     let audio = [
@@ -1628,7 +1651,7 @@ fn a_relay_delivers_every_packet_it_receives() {
                 (codec, sample_rate, channels, samples)
             );
             let envelope = (codec == AudioCodec::Aac).then_some(EnvelopeCodec::Aac);
-            assert_same_packet(relayed.data(), &bytes, envelope);
+            assert_same_packet((relayed.data(), relayed.envelope()), &bytes, envelope);
         }
     }
 }
@@ -1667,9 +1690,9 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
     for _ in 0..3 {
         sender.send_video(&mut frame);
         let received = await_video(&mut receiver, timecode);
-        assert_same_packet(received.data(), &bytes, h264);
+        assert_same_packet((received.data(), received.envelope()), &bytes, h264);
         assert_eq!(received.metadata(), Some("<again/>"));
-        assert_same_packet(frame.data(), &bytes, h264);
+        assert_same_packet((frame.data(), frame.envelope()), &bytes, h264);
         assert_eq!(frame.metadata(), Some("<again/>"));
         ReceivedVideoPacket::from(frame.clone())
             .validate_for_send()
@@ -1683,10 +1706,11 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
     scatter.set_timecode(Timecode::from_ticks(timecode));
     for _ in 0..3 {
         sender.send_scatter_video(&mut scatter).unwrap();
-        assert_same_packet(await_video(&mut receiver, timecode).data(), &bytes, h264);
+        let received = await_video(&mut receiver, timecode);
+        assert_same_packet((received.data(), received.envelope()), &bytes, h264);
     }
     let joined = scatter.into_contiguous_copy();
-    assert_same_packet(joined.data(), &bytes, h264);
+    assert_same_packet((joined.data(), joined.envelope()), &bytes, h264);
 
     // Two frames that take turns being held by an asynchronous send.
     let mut frames = Vec::new();
@@ -1701,11 +1725,12 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
         let (timecode, bytes, frame) = &mut frames[round % 2];
         let frame = frame.take().expect("the frame came back from the sender");
         let replaced = sender.submit_video(frame);
-        assert_same_packet(await_video(&mut receiver, *timecode).data(), bytes, h264);
+        let received = await_video(&mut receiver, *timecode);
+        assert_same_packet((received.data(), received.envelope()), bytes, h264);
         match replaced {
             Some(SubmittedVideo::Contiguous(earlier)) => {
                 let (_, bytes, slot) = &mut frames[(round + 1) % 2];
-                assert_same_packet(earlier.data(), bytes, h264);
+                assert_same_packet((earlier.data(), earlier.envelope()), bytes, h264);
                 *slot = Some(earlier);
             }
             None => assert_eq!(round, 0),
@@ -1723,12 +1748,9 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
         frame.set_timecode(Timecode::from_ticks(timecode));
         for _ in 0..3 {
             sender.sender().send_compressed_audio(&mut frame);
-            assert_same_packet(
-                await_audio(&mut receiver, timecode).data(),
-                &bytes,
-                envelope,
-            );
-            assert_same_packet(frame.data(), &bytes, envelope);
+            let received = await_audio(&mut receiver, timecode);
+            assert_same_packet((received.data(), received.envelope()), &bytes, envelope);
+            assert_same_packet((frame.data(), frame.envelope()), &bytes, envelope);
         }
     }
 }
@@ -1799,7 +1821,11 @@ fn queued_scatter_frames_return_their_original_blocks() {
         frame.set_timecode(Timecode::from_ticks(timecode));
         let id = queue.try_submit(frame).unwrap();
         let received = await_video(&mut receiver, timecode);
-        assert_same_packet(received.data(), &bytes, Some(EnvelopeCodec::H264));
+        assert_same_packet(
+            (received.data(), received.envelope()),
+            &bytes,
+            Some(EnvelopeCodec::H264),
+        );
         let done = queue.next_completed(PATIENCE).unwrap().unwrap();
         assert_eq!(done.id(), id);
         let QueuedVideoFrame::Scatter(frame) = done.into_frame() else {
@@ -1850,7 +1876,11 @@ fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {
     for _ in 0..4 {
         let id = queue.try_submit(frame).unwrap();
         let received = await_video(&mut receiver, timecode);
-        assert_same_packet(received.data(), &bytes, Some(EnvelopeCodec::H264));
+        assert_same_packet(
+            (received.data(), received.envelope()),
+            &bytes,
+            Some(EnvelopeCodec::H264),
+        );
         let completed = queue
             .next_completed(PATIENCE)
             .unwrap()
@@ -1860,7 +1890,11 @@ fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {
         let QueuedVideoFrame::Compressed(sent) = &frame else {
             panic!("a compressed frame was queued");
         };
-        assert_same_packet(sent.data(), &bytes, Some(EnvelopeCodec::H264));
+        assert_same_packet(
+            (sent.data(), sent.envelope()),
+            &bytes,
+            Some(EnvelopeCodec::H264),
+        );
     }
     assert_eq!(queue.retained_frames(), 0);
     assert!(!queue.completion_protocol_failed());
@@ -2025,7 +2059,7 @@ fn a_queued_sender_moves_between_threads() {
     for timecode in sent {
         let frame = await_video(&mut receiver, timecode);
         assert_same_packet(
-            frame.data(),
+            (frame.data(), frame.envelope()),
             &video_bytes(VideoCodec::H264, timecode, true),
             Some(EnvelopeCodec::H264),
         );
@@ -2131,7 +2165,7 @@ fn a_packet_receiver_moves_between_threads() {
                     let timecode = frame.timecode().ticks();
                     assert!(timecode >= FIRST_TIMECODE);
                     assert_same_packet(
-                        frame.data(),
+                        (frame.data(), frame.envelope()),
                         &video_bytes(VideoCodec::H264, timecode, true),
                         Some(EnvelopeCodec::H264),
                     );
