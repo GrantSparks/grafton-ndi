@@ -53,6 +53,90 @@ fn malformed_callback_retains_pending_ownership_and_reports_protocol_failure() {
     assert!(locked.bytes > 0);
 }
 
+#[test]
+fn malformed_callback_publishes_only_after_acquiring_the_state_lock() {
+    let state = CallbackState::new(QueueLimits::default()).unwrap();
+    let locked = state.state.lock().unwrap();
+    std::thread::scope(|scope| {
+        let (started, entering) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let state = &*state;
+        scope.spawn(move || {
+            started.send(()).unwrap();
+            unsafe {
+                completion(
+                    (state as *const CallbackState).cast_mut().cast(),
+                    std::ptr::null(),
+                )
+            };
+            finished.send(()).unwrap();
+        });
+        entering.recv().unwrap();
+        assert!(done.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(!state.protocol_error.load(Ordering::Acquire));
+        drop(locked);
+        done.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(state.protocol_error.load(Ordering::Acquire));
+    });
+}
+
+#[test]
+fn malformed_callback_wakes_a_completion_waiter() {
+    let state = CallbackState::new(QueueLimits::default()).unwrap();
+    retain(&state, 1);
+    std::thread::scope(|scope| {
+        let (started, entering) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let state = &*state;
+        scope.spawn(move || {
+            started.send(()).unwrap();
+            let result = state.next_completed(Deadline::after(Duration::from_secs(30)).unwrap());
+            finished.send(result).unwrap();
+        });
+        entering.recv().unwrap();
+        assert!(done.recv_timeout(Duration::from_millis(50)).is_err());
+        unsafe {
+            completion(
+                (state as *const CallbackState).cast_mut().cast(),
+                std::ptr::null(),
+            )
+        };
+        let result = done.recv_timeout(Duration::from_secs(1));
+        // Do not strand the scoped worker for its whole timeout on failure.
+        if result.is_err() {
+            state.changed.notify_all();
+        }
+        assert!(matches!(
+            result.unwrap(),
+            Err(Error::UnexpectedSdkResult(
+                crate::SdkResultDefect::UnknownCompletion
+            ))
+        ));
+    });
+}
+
+#[test]
+fn malformed_callback_recovers_a_poisoned_state_lock() {
+    let state = CallbackState::new(QueueLimits::default()).unwrap();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _locked = state.state.lock().unwrap();
+        panic!("bookkeeping failed");
+    }));
+    unsafe {
+        completion(
+            (&*state as *const CallbackState).cast_mut().cast(),
+            std::ptr::null(),
+        )
+    };
+    assert!(state.protocol_error.load(Ordering::Acquire));
+    assert!(matches!(
+        state.next_completed(Deadline::after(Duration::ZERO).unwrap()),
+        Err(Error::UnexpectedSdkResult(
+            crate::SdkResultDefect::UnknownCompletion
+        ))
+    ));
+}
+
 #[cfg(ndi_has_advanced_scatter_send)]
 fn scatter() -> ScatterVideoFrame {
     ScatterVideoFrame::new(

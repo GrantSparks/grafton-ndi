@@ -607,6 +607,38 @@ impl CallbackState {
         Ok(())
     }
 
+    /// Publish failure under the same lock that orders a waiter's check and
+    /// park. Recover poison because a bookkeeping panic also reaches here.
+    #[cfg(any(test, ndi_has_advanced_send_completion))]
+    fn publish_protocol_failure(&self) {
+        let _state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.protocol_error.store(true, Ordering::Release);
+        self.changed.notify_all();
+    }
+
+    fn next_completed(&self, deadline: Deadline) -> Result<Option<CompletedVideo>> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(frame) = take_completed(&mut state) {
+                return Ok(Some(frame));
+            }
+            if self.protocol_error.load(Ordering::Acquire) {
+                return Err(Error::UnexpectedSdkResult(
+                    crate::SdkResultDefect::UnknownCompletion,
+                ));
+            }
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|p| p.into_inner());
+            state = next;
+        }
+    }
+
     /// Record that the SDK has finished with the frame whose data is at
     /// `address`. Runs on an SDK thread.
     ///
@@ -629,7 +661,11 @@ impl CallbackState {
             }
             // No frame in flight has this data: the SDK named a frame twice,
             // or one it was never given.
-            None => self.protocol_error.store(true, Ordering::Release),
+            None => {
+                drop(state);
+                self.publish_protocol_failure();
+                return;
+            }
         }
         self.changed.notify_all();
     }
@@ -649,8 +685,7 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
     // `QueuedSender` releases the state only after that.
     let state = unsafe { &*opaque.cast::<CallbackState>() };
     if frame.is_null() {
-        state.protocol_error.store(true, Ordering::Release);
-        state.changed.notify_all();
+        state.publish_protocol_failure();
         return;
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -660,8 +695,7 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
         state.complete(unsafe { (*frame).p_data } as usize);
     }));
     if result.is_err() {
-        state.protocol_error.store(true, Ordering::Release);
-        state.changed.notify_all();
+        state.publish_protocol_failure();
     }
 }
 
@@ -998,34 +1032,7 @@ impl QueuedVideo<'_> {
     ///
     /// As for [`QueuedSender::next_completed`].
     pub fn next_completed(&mut self, timeout: Duration) -> Result<Option<CompletedVideo>> {
-        let deadline = Deadline::after(timeout)?;
-        let mut state = self
-            .pair
-            .loans()
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        loop {
-            if let Some(frame) = take_completed(&mut state) {
-                return Ok(Some(frame));
-            }
-            if self.pair.loans().protocol_error.load(Ordering::Acquire) {
-                return Err(Error::UnexpectedSdkResult(
-                    crate::SdkResultDefect::UnknownCompletion,
-                ));
-            }
-            let remaining = deadline.remaining();
-            if remaining.is_zero() {
-                return Ok(None);
-            }
-            let (next, _) = self
-                .pair
-                .loans()
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|p| p.into_inner());
-            state = next;
-        }
+        self.pair.loans().next_completed(Deadline::after(timeout)?)
     }
 
     /// See [`QueuedSender::retained_frames`].
