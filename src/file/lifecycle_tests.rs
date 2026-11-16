@@ -646,9 +646,27 @@ fn a_family_the_library_lacks_is_refused_as_that_capability_by_the_entry_point_i
     ));
     // Refused before anything is checked or called, even for a path that
     // would be refused too.
+    let async_probe_error = |path| {
+        use std::{
+            future::Future,
+            pin::Pin,
+            task::{Context, Poll, Waker},
+        };
+        let mut probe = AsyncFilePlayer::probe(&api, path).submit();
+        let Poll::Ready(result) =
+            Pin::new(&mut probe).poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("a missing playback family queued probe work");
+        };
+        result.unwrap_err()
+    };
     for error in [
         crate::file::FilePlayer::probe(&api, "recording.mkv").unwrap_err(),
         crate::file::FilePlayer::probe(&api, "").unwrap_err(),
+        crate::file::FilePlayer::probe(&api, "bad\0path.mkv").unwrap_err(),
+        async_probe_error("recording.mkv"),
+        async_probe_error(""),
+        async_probe_error("bad\0path.mkv"),
         crate::file::FilePlayer::new(&api, &FilePlayerOptions::new("mock player")).unwrap_err(),
         crate::file::FilePlayer::new(&api, &FilePlayerOptions::new("")).unwrap_err(),
     ] {

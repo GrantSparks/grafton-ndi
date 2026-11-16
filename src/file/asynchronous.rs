@@ -10,7 +10,7 @@
 //! cannot stall behind cleanup or deadlock one another.
 
 use super::recorder::{CheckedRecorderOptions, FinishReply, FinishWaiters, Settlement};
-use super::types::resolve_path;
+use super::types::path_string;
 use super::{
     EventText, FileApi, FileDuration, FileInfo, FilePlayer, FilePlayerOptions, FilePosition,
     FileRecorder, FileRecorderOptions, FinishStatus, PlayerEvent, PlayerStats, RecorderEvent,
@@ -1853,16 +1853,20 @@ impl ProbeQueue {
 
     /// Probe `path` with `api` once the probes queued before it have run.
     fn probe(&self, api: &FileApi, path: &Path) -> Live<FileInfo> {
-        // Resolve at submission, before the probe waits in its queue.
-        let path = match resolve_path(path, "file path") {
-            Ok((path, _)) => path,
+        // Match synchronous probe precedence before starting a thread or
+        // consuming a queue place, then retain the proved path text.
+        let playback = match api.table::<crate::sys::FilePlayback>() {
+            Ok(playback) => playback,
             Err(error) => return Live::failed(error),
         };
-        let api = api.clone();
+        let path = match path_string(path) {
+            Ok(path) => path,
+            Err(error) => return Live::failed(error),
+        };
         let (reply, future) = operation();
         let job: ProbeJob = Box::new(move || {
             if !reply.shared.cancelled.load(Ordering::Acquire) {
-                reply.complete(crate::file::FilePlayer::probe(&api, path));
+                reply.complete(FilePlayer::probe_checked(playback, &path));
             }
         });
         if let Err(error) = self.submit(job) {
@@ -1999,8 +2003,8 @@ impl AsyncFilePlayer {
         self.worker.prepare(
             move || {
                 // Resolve before waiting in the command queue.
-                let (path, _) = resolve_path(&path, "file path")?;
-                Ok(move |player: &mut FilePlayer| player.start(path))
+                let path = path_string(&path)?;
+                Ok(move |player: &mut FilePlayer| player.start_checked(&path))
             },
             false,
         )
@@ -5323,6 +5327,90 @@ mod tests {
             Err(Error::NativeOperationFailed { .. })
         ));
         assert_eq!(PROBES_BEGUN.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn a_missing_playback_family_never_starts_or_occupies_a_probe_queue() {
+        let queue = ProbeQueue::new(0);
+        let api = FileApi::with_runtime(crate::sys::FileRuntime::test_double(
+            Err(c"NDIlib_file_player_seek_to_frame"),
+            Ok(mock::recording()),
+        ));
+        for path in ["", "bad\0path.mkv", "recording.mkv"] {
+            assert!(matches!(
+                block_on(FileOperation::live(queue.probe(&api, Path::new(path)))),
+                Err(Error::UnsupportedCapability { .. })
+            ));
+            assert!(lock(&queue.sender).is_none());
+        }
+    }
+
+    #[test]
+    fn a_relative_player_start_retains_the_directory_at_submission() {
+        const CHILD: &str = "GRAFTON_FILE_START_PATH_CHILD";
+        if let Some(directory) = std::env::var_os(CHILD) {
+            static STARTED_PATH: Mutex<Option<String>> = Mutex::new(None);
+            unsafe extern "C" fn create(
+                _: *const crate::sys::bindings::NDIlib_file_player_create_t,
+            ) -> crate::sys::bindings::NDIlib_file_player_instance_t {
+                std::ptr::NonNull::dangling().as_ptr()
+            }
+            unsafe extern "C" fn start(
+                _: crate::sys::bindings::NDIlib_file_player_instance_t,
+                path: *const std::ffi::c_char,
+            ) -> bool {
+                // SAFETY: the player wrapper retains its validated FileText.
+                *lock(&STARTED_PATH) = Some(
+                    unsafe { std::ffi::CStr::from_ptr(path) }
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+                true
+            }
+            let api = FileApi::with_runtime(crate::sys::FileRuntime::test_double(
+                Ok(crate::sys::FilePlayback {
+                    NDIlib_file_player_create: create,
+                    NDIlib_file_player_start: start,
+                    ..mock::playback()
+                }),
+                Ok(mock::recording()),
+            ));
+            let player = block_on(AsyncFilePlayer::create(
+                &api,
+                &FilePlayerOptions::new("paths"),
+            ))
+            .unwrap();
+            let (blocked, release) = block_owner(&player.worker);
+            let directory = std::path::PathBuf::from(directory);
+            std::env::set_current_dir(directory.join("submitted")).unwrap();
+            let starting = player.start("clip.mkv").submit();
+            std::env::set_current_dir(directory.join("running")).unwrap();
+            release.send(()).unwrap();
+            block_on(blocked).unwrap();
+            block_on(starting).unwrap();
+            assert_eq!(
+                lock(&STARTED_PATH).as_deref(),
+                directory.join("submitted").join("clip.mkv").to_str()
+            );
+            block_on(player.close()).unwrap();
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("grafton-file-start-path-{}", std::process::id()));
+        std::fs::create_dir_all(directory.join("submitted")).unwrap();
+        std::fs::create_dir_all(directory.join("running")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "file::asynchronous::tests::a_relative_player_start_retains_the_directory_at_submission", "--nocapture"])
+            .env(CHILD, &directory)
+            .output().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
