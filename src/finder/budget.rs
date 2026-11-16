@@ -3,7 +3,7 @@
 use std::{ffi::c_char, mem::size_of};
 
 use crate::{
-    sdk_copy::{CopyBudget, CopyError},
+    sdk_copy::{CopyBudget, TextError},
     Error, ResourceKind, Result,
 };
 
@@ -22,7 +22,7 @@ pub(super) fn descriptor_bytes(count: usize, element_size: usize) -> Result<usiz
     if count > MAX_SOURCES {
         return Err(limit(ResourceKind::FinderSnapshotSources, MAX_SOURCES));
     }
-    CopyBudget::span_bytes(count, element_size).map_err(CopyError::into_error)
+    Ok(CopyBudget::span_bytes(count, element_size)?)
 }
 
 /// Finder's policy omits an entry whose optional string exceeds its bound.
@@ -59,8 +59,8 @@ impl SnapshotBudget {
                 }
                 Ok(text)
             }
-            Err(CopyError::Malformed(_)) => Ok(None),
-            Err(error) => Err(error.into_error()),
+            Err(TextError::Unterminated) => Ok(None),
+            Err(TextError::Failed(error)) => Err(error),
         }
     }
 }
@@ -80,8 +80,8 @@ pub(super) unsafe fn copy_snapshot<D, T>(
     let mut budget = SnapshotBudget::new();
     // SAFETY: the count and native span passed preflight; the caller keeps
     // this array live and excludes snapshot replacement.
-    let raw = unsafe { budget.0.slice(descriptors, count) }.map_err(CopyError::into_error)?;
-    let mut copied = budget.0.reserve(raw.len()).map_err(CopyError::into_error)?;
+    let raw = unsafe { budget.0.slice(descriptors, count) }?;
+    let mut copied = budget.0.reserve(raw.len())?;
     for entry in raw {
         if let Some(value) = copy(entry, &mut budget)? {
             copied.push(value);
@@ -204,8 +204,13 @@ mod tests {
         // No terminator within the individual limit; every scan is charged.
         let unterminated = vec![b'x'; MAX_SDK_STRING_BYTES];
         let malformed = named(unterminated.as_ptr().cast());
-        let valid = named(c"Survivor".as_ptr());
-        assert_eq!(snapshot(&[malformed, valid]).unwrap()[0].name(), "Survivor");
+        let first = named(c"Before".as_ptr());
+        let last = named(c"After".as_ptr());
+        let copied = snapshot(&[first, malformed, last]).unwrap();
+        assert_eq!(
+            copied.iter().map(Source::name).collect::<Vec<_>>(),
+            ["Before", "After"]
+        );
         assert!(matches!(
             snapshot(&[malformed; 4]),
             Err(Error::ResourceLimit { .. })

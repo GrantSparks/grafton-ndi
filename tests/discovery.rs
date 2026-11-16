@@ -713,6 +713,15 @@ fn child(scenario: &str) {
                     "{malformed}"
                 );
                 assert_eq!(snapshot[0].groups(), ["public", "gro\u{fffd}up"]);
+                // A separately valid snapshot still includes both entries;
+                // omission must not affect discovery beyond this copy.
+                std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
+                let restored = SendListener::new(&ndi, &listeners)
+                    .unwrap()
+                    .current_senders()
+                    .unwrap();
+                assert_eq!(restored.len(), 2, "{malformed}: {restored:?}");
+                assert_eq!(restored[0].id().unwrap().as_bytes(), SENDER_ID);
             }
             let mut requested = 0;
             for malformed in [
@@ -766,6 +775,13 @@ fn child(scenario: &str) {
                     }
                 }
                 assert_eq!(log().matches("recv-listener-connect ").count(), requested);
+                std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
+                let restored = RecvListener::new(&ndi, &listeners)
+                    .unwrap()
+                    .current_receivers()
+                    .unwrap();
+                assert_eq!(restored.len(), 2, "{malformed}: {restored:?}");
+                assert_eq!(restored[0].id().unwrap().as_bytes(), RECEIVER_ID);
             }
             assert!(log().contains(&format!(
                 "recv-listener-connect {} {}\n",

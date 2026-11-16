@@ -4,7 +4,7 @@
 use super::{ServerApi, ServerObject};
 use crate::{
     frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
-    sdk_copy::{CopyBudget, CopyError, COPY_LIMIT},
+    sdk_copy::{CopyBudget, SpanError, COPY_LIMIT},
     sys::{self, bindings::*},
     to_ms_checked, Error, Ndi, ResourceKind, Result,
 };
@@ -521,10 +521,10 @@ pub(crate) unsafe fn require_receiver_connect(
     let commands =
         match unsafe { budget.slice(receiver.p_commands.cast_const(), receiver.num_commands) } {
             Ok(commands) => commands,
-            Err(CopyError::Malformed(_)) => {
+            Err(SpanError::Array(_)) => {
                 return Err(Error::ReceiverRequestNotAccepted { advertised: true });
             }
-            Err(CopyError::Failed(error)) => return Err(error),
+            Err(SpanError::Failed(error)) => return Err(error),
         };
     if commands.contains(&NDIlib_receiver_command_e_NDIlib_receiver_command_connect) {
         Ok(())
@@ -596,8 +596,7 @@ impl<A: ListenerApi> Listener<A> {
         let mut count = 0;
         // SAFETY: the exclusive borrow keeps the SDK-owned array unchanged for
         // `'a`; the budget validates the pointer and count before use.
-        unsafe { budget.slice(self.0.api.entries(self.0.instance(), &mut count), count) }
-            .map_err(CopyError::into_error)
+        Ok(unsafe { budget.slice(self.0.api.entries(self.0.instance(), &mut count), count) }?)
     }
     fn subscription(&mut self, id: &A::Id, subscribe: bool) {
         if subscribe {
@@ -649,7 +648,7 @@ impl<A: ListenerApi> Listener<A> {
             // No event arrived only if the count agrees. A null batch with
             // a positive count is malformed, as a membership snapshot is.
             // SAFETY: null is permitted and checked without dereferencing.
-            unsafe { budget.slice(events, count) }.map_err(CopyError::into_error)?;
+            unsafe { budget.slice(events, count) }?;
             return Ok(Vec::new());
         }
         let batch = Batch {
@@ -657,7 +656,7 @@ impl<A: ListenerApi> Listener<A> {
             events,
         };
         // SAFETY: the batch stays allocated until `batch` is dropped below.
-        let raw = unsafe { budget.slice(batch.events, count) }.map_err(CopyError::into_error)?;
+        let raw = unsafe { budget.slice(batch.events, count) }?;
         budget.collect_entries(raw, |event, budget| {
             // SAFETY: the strings belong to the batch, which is still
             // allocated.
@@ -879,7 +878,7 @@ impl SendListener {
             // until the next call on this listener, after this copy.
             unsafe {
                 let groups = budget.slice(sender.p_groups.cast_const(), sender.num_groups)?;
-                let groups = budget.collect(groups, |group, budget| budget.text(*group))?;
+                let groups = budget.collect(groups, |group, budget| Ok(budget.text(*group)?))?;
                 Ok(AdvertisedSender {
                     id: budget.id(sender.p_uuid)?.map(SenderId::from_exact),
                     name: budget.text(sender.p_name)?,
@@ -1165,7 +1164,7 @@ mod tests {
             budget.text(text.as_ptr()).unwrap();
             assert!(matches!(
                 budget.text(text.as_ptr()),
-                Err(CopyError::Failed(Error::ResourceLimit {
+                Err(crate::sdk_copy::TextError::Failed(Error::ResourceLimit {
                     resource: ResourceKind::DiscoveryServerCopyBytes,
                     ..
                 }))
