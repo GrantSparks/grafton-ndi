@@ -48,7 +48,7 @@ class RuntimeTestScopeTests(unittest.TestCase):
 
     def test_each_audit_entry_names_a_real_function_in_its_cited_source(self):
         for source, names in scope.AUDITED.items():
-            functions = set(re.findall(r'\bfn\s+(\w+)\s*\(', (ROOT / source).read_text()))
+            functions = set(re.findall(r'\bfn\s+(\w+)\s*\(', (ROOT / source).read_text(encoding='utf-8')))
             for name in names:
                 with self.subTest(source=source, name=name):
                     self.assertIn(name.rsplit('::', 1)[-1], functions)
