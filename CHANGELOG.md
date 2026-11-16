@@ -359,7 +359,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   divisions; JPEG reuses its final converted row for codec padding. Encoded
   output is unchanged. Measured gains and the JPEG scratch-memory tradeoff are
   recorded in the [performance guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/image-encoding-performance.md).
-- Queued sending reserves stable frame and scatter descriptors at construction.
+- Queued sending reserves stable frame descriptors at construction; scatter
+  frames own their scatter lists.
   Accepted submissions allocate nothing; `QueueFull` refusals allocate only
   their returned `Rejected` value. Completion and collection remain allocation
   free.
