@@ -6,7 +6,7 @@ name: Publish
 #
 # Nothing in this file decides who may publish. A tag runs the workflow of the
 # commit it points at, so whoever can push a tag can also change every check
-# below. The controls are repository settings, listed in order in ci/README.md:
+# below. The controls are repository settings (ci/README.md, "Release controls"):
 # the reviewers the `crates-io` environment requires, the crates.io trusted
 # publisher bound to that environment, and the rule on who may create `v*` tags.
 on:

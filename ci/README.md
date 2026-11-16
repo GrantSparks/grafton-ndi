@@ -119,3 +119,23 @@ with a different version. Inspect actual skips and results for your platform.
 When reporting a problem, include the crate version, platform, Rust version,
 Cargo features, runtime version/edition, command and error output. Do not
 include SDK archives, credentials or private recordings.
+
+## Release controls
+
+Workflows cannot establish repository settings. Before publishing, verify these
+controls in order:
+
+1. The `crates-io` environment requires reviewers, an appropriate self-review
+   rule, and deployment restricted to `v*` tags.
+2. A tag ruleset restricts creating, moving and deleting `v*` tags.
+3. Protection of `main` requires pull requests, Code Owner review and
+   `required-ci`. [CODEOWNERS](../.github/CODEOWNERS) covers files that control CI
+   and publishing.
+4. The crates.io trusted publisher binds this repository, `publish.yml` and the
+   `crates-io` environment.
+5. SDK CI has `NDI_SDK_SOURCES_JSON`, a scoped `NDI_SDK_ARCHIVE_TOKEN`, and
+   `NDI_CI_RELEASED=true` when enabled.
+
+Anyone who can replace a workflow on a tag or branch can replace its checks.
+Repository rules and review enforce these boundaries; the tag-on-main check
+catches mistakes.

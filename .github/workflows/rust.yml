@@ -419,7 +419,7 @@ jobs:
             python ci/sdk.py install "${{ matrix.compatibility-advanced }}" --dest "$RUNNER_TEMP/ndi-compat-advanced" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-advanced.env"
           fi
       # Windows has no test runner to check: its tests run unconfined
-      # (ci/README.md, "Windows").
+      # (ci/README.md, "Loopback-only test runs").
       - name: Test runner leaves loopback networking only
         id: isolation
         run: |

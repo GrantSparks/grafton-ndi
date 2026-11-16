@@ -7,7 +7,9 @@
 //! connect are given one in milliseconds, has stalled.
 //!
 //! On Windows, with a Discovery Server configured that the SDK cannot reach,
-//! about half of such receivers stall (the README's known issues). The report
+//! about half of such receivers stall. The measured limitation is recorded at:
+//! https://github.com/GrantSparks/grafton-ndi/blob/226fa3ef36196bd20c3f0060c3fa0e233b700ace/README.md#receiving-and-sending
+//! The report
 //! this test prints is what a stall is diagnosed with. For the first
 //! [`DIAGNOSED`] stalled receivers the Windows TCP table for the port is taken
 //! ([`common::socket_table`]) and a second receiver is opened to the same

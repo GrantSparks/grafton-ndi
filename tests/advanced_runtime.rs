@@ -3636,7 +3636,8 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
 
 /// Whether this runtime's genlock acquires no reference: the Windows 6.4
 /// runtimes, x64 and x86, whose genlock connects to its reference and stays
-/// inactive. The README lists it as a known issue.
+/// inactive. The measured limitation is recorded at:
+/// https://github.com/GrantSparks/grafton-ndi/blob/226fa3ef36196bd20c3f0060c3fa0e233b700ace/README.md#receiving-and-sending
 fn genlock_acquires_nothing(ndi: &Ndi) -> bool {
     let unsupported = cfg!(windows)
         && ndi
