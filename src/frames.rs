@@ -250,7 +250,7 @@ impl PixelFormat {
     /// # Errors
     ///
     /// Returns [`Error::InvalidFrame`] for invalid dimensions, stride,
-    /// excessive layout size, or arithmetic overflow.
+    /// or excessive layout size.
     pub fn send_buffer_len(
         self,
         width: u32,
@@ -479,16 +479,13 @@ impl PixelFormat {
     /// # Errors
     ///
     /// Returns [`Error::InvalidFrame`] if the width is zero or odd, or if the
-    /// stride does not fit the SDK's signed 32-bit stride field.
+    /// stride exceeds the maximum video frame size.
     pub fn line_stride_bytes(self, width: u32) -> Result<usize> {
         validate_video_width(width.into())?;
-        let stride = min_video_line_stride_checked(self, width as usize)?;
-        if i32::try_from(stride).is_err() {
-            return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
-                crate::LayoutDefect::VideoStrideRange { stride },
-            )));
-        }
-        Ok(stride)
+        let stride = min_video_line_stride(self, width);
+        validate_video_data_len(stride)?;
+        // The byte cap fits usize and the SDK's signed stride field.
+        Ok(stride as usize)
     }
 
     /// Calculate the total buffer size needed for a frame with given dimensions
@@ -514,7 +511,7 @@ impl PixelFormat {
     /// # Errors
     ///
     /// Returns [`Error::InvalidFrame`] if dimensions are invalid for this
-    /// format, if arithmetic overflows, or if the result exceeds the crate's
+    /// format or the result exceeds the crate's
     /// maximum video frame size.
     pub fn buffer_len(
         self,
@@ -3454,7 +3451,15 @@ impl ValidatedVideoLayout {
     ) -> LayoutResult<Self> {
         validate_video_dimensions(width.into(), height.into())?;
 
-        let min_stride = min_video_line_stride_checked(pixel_format, width as usize)?;
+        let minimum = min_video_line_stride(pixel_format, width);
+        // A row larger than the cap cannot describe a frame, even with a
+        // shorter explicit stride. Compute its full extent before narrowing
+        // so the refusal and byte count are identical on every target.
+        if minimum > MAX_VIDEO_BYTES as u64 {
+            let stride = line_stride.map_or(minimum, |stride| (stride as u64).max(minimum));
+            video_plane_layouts(pixel_format.info(), stride, minimum, height as u64)?;
+        }
+        let min_stride = minimum as usize;
         let line_stride = match line_stride {
             None => min_stride,
             Some(0) => return Err(crate::LayoutDefect::VideoZeroStride),
@@ -3471,11 +3476,10 @@ impl ValidatedVideoLayout {
 
         let (plane_layouts, plane_count, data_len_bytes, payload_len_bytes) = video_plane_layouts(
             pixel_format.info(),
-            line_stride,
-            min_stride,
-            height as usize,
+            line_stride as u64,
+            minimum,
+            height as u64,
         )?;
-        validate_video_data_len(data_len_bytes)?;
 
         Ok(Self {
             width,
@@ -3693,26 +3697,19 @@ fn check_video_data_len(layout: &ValidatedVideoLayout, len: usize) -> Result<()>
     Ok(())
 }
 
-fn validate_video_data_len(data_len_bytes: usize) -> LayoutResult<()> {
+fn validate_video_data_len(data_len_bytes: u64) -> LayoutResult<()> {
     debug_assert!(
         data_len_bytes > 0,
         "validated dimensions and stride are positive"
     );
-
-    if data_len_bytes > MAX_VIDEO_BYTES {
-        return Err(crate::LayoutDefect::VideoBytes(data_len_bytes));
+    if data_len_bytes > MAX_VIDEO_BYTES as u64 {
+        return Err(crate::LayoutDefect::VideoBytes(data_len_bytes.into()));
     }
-
     Ok(())
 }
 
-fn min_video_line_stride_checked(pixel_format: PixelFormat, width: usize) -> LayoutResult<usize> {
-    width
-        .checked_mul(pixel_format.info().bytes_per_pixel() as usize)
-        .ok_or(crate::LayoutDefect::VideoStrideOverflow {
-            format: pixel_format,
-            width,
-        })
+fn min_video_line_stride(pixel_format: PixelFormat, width: u32) -> u64 {
+    u64::from(width) * u64::from(pixel_format.info().bytes_per_pixel())
 }
 
 /// Calculate buffer length with checked arithmetic.
@@ -3731,7 +3728,7 @@ fn calculate_buffer_len_for_info_checked(
     y_stride: usize,
     height: usize,
 ) -> Result<usize> {
-    video_plane_layouts(info, y_stride, y_stride, height)
+    video_plane_layouts(info, y_stride as u64, y_stride as u64, height as u64)
         .map(|(_, _, storage, _)| storage)
         .map_err(Into::into)
 }
@@ -3777,29 +3774,32 @@ const MAX_VIDEO_PLANES: usize = 4;
 
 fn video_plane_layouts(
     info: PixelFormatInfo,
-    stride: usize,
-    active: usize,
-    height: usize,
+    stride: u64,
+    active: u64,
+    height: u64,
 ) -> LayoutResult<([VideoPlaneLayout; MAX_VIDEO_PLANES], usize, usize, usize)> {
     let mut dimensions = [(stride, active, height); MAX_VIDEO_PLANES];
     match info.category() {
         FormatCategory::Packed => {}
         FormatCategory::Planar420 => {
             if !height.is_multiple_of(2) || !stride.is_multiple_of(2) {
-                return Err(crate::LayoutDefect::VideoPlanar420 { height, stride });
+                return Err(crate::LayoutDefect::VideoPlanar420 {
+                    height: height as usize,
+                    stride: stride as usize,
+                });
             }
             dimensions[1] = (stride / 2, active / 2, height / 2);
             dimensions[2] = dimensions[1];
         }
         FormatCategory::SemiPlanar420 => {
             if !height.is_multiple_of(2) {
-                return Err(crate::LayoutDefect::VideoSemiPlanar420(height));
+                return Err(crate::LayoutDefect::VideoSemiPlanar420(height as usize));
             }
             dimensions[1] = (stride, active, height / 2);
         }
         FormatCategory::PackedAlpha => {
             if !stride.is_multiple_of(2) {
-                return Err(crate::LayoutDefect::VideoUyvaStride(stride));
+                return Err(crate::LayoutDefect::VideoUyvaStride(stride as usize));
             }
             dimensions[1] = (stride / 2, active / 2, height);
         }
@@ -3808,28 +3808,38 @@ fn video_plane_layouts(
         FormatCategory::Planar444Alpha => {}
     }
     let count = info.plane_count();
+    // Saturation retains one size cause even when an explicit stride near
+    // usize::MAX makes the mathematical extent exceed u64::MAX.
+    let storage = dimensions[..count]
+        .iter()
+        .fold(0u64, |total, &(stride, _, rows)| {
+            total.saturating_add(stride.saturating_mul(rows))
+        });
+    validate_video_data_len(storage)?;
     let mut planes = [VideoPlaneLayout::default(); MAX_VIDEO_PLANES];
-    let mut storage = 0usize;
+    let mut offset = 0usize;
     let mut payload = 0usize;
     for (plane, &(row_stride, active_row_bytes, row_count)) in
         planes.iter_mut().zip(&dimensions[..count])
     {
+        // Each plane and partial sum fits the cap, which fits usize.
+        let (row_stride, active_row_bytes, row_count) = (
+            row_stride as usize,
+            active_row_bytes as usize,
+            row_count as usize,
+        );
         *plane = VideoPlaneLayout {
-            offset: storage,
+            offset,
             row_stride,
             active_row_bytes,
             row_count,
         };
-        storage = row_stride
-            .checked_mul(row_count)
-            .and_then(|n| storage.checked_add(n))
-            .ok_or(crate::LayoutDefect::VideoBufferOverflow)?;
-        // Every active row fits its stride, and the complete storage sum
-        // just passed the overflow check. The active payload cannot exceed it.
+        offset += row_stride * row_count;
         debug_assert!(active_row_bytes <= row_stride);
         payload += active_row_bytes * row_count;
-        debug_assert!(payload <= storage);
+        debug_assert!(payload <= offset);
     }
+    let storage = storage as usize;
     Ok((planes, count, storage, payload))
 }
 
@@ -4035,10 +4045,13 @@ impl ValidatedAudioLayout {
     ) -> LayoutResult<Self> {
         let sample_rate = validate_audio_sample_rate(sample_rate)?;
         let (no_channels, no_samples) = validate_positive_audio_counts(no_channels, no_samples)?;
-        let minimum = no_samples
-            .checked_mul(size_of::<f32>())
-            .ok_or(crate::LayoutDefect::AudioStrideOverflow(no_samples))?;
-        let stride = channel_stride.unwrap_or(minimum);
+        let minimum = no_samples as u64 * size_of::<f32>() as u64;
+        let stride = channel_stride.map_or(minimum, |stride| stride as u64);
+        let sample_count =
+            checked_audio_extent(no_channels, no_samples, stride / size_of::<f32>() as u64)?;
+        // The extent bounds the packed minimum even for a single channel.
+        let minimum = minimum as usize;
+        let stride = stride as usize;
         if i32::try_from(stride).is_err() {
             return Err(crate::LayoutDefect::AudioStrideRange);
         }
@@ -4052,7 +4065,6 @@ impl ValidatedAudioLayout {
             return Err(crate::LayoutDefect::AudioShortStride { stride, minimum });
         }
         let channel_stride_samples = stride / size_of::<f32>();
-        let sample_count = checked_audio_extent(no_channels, no_samples, channel_stride_samples)?;
         Ok(Self {
             format,
             sample_rate,
@@ -4227,30 +4239,16 @@ pub(crate) fn validate_positive_audio_counts(
 fn checked_audio_extent(
     no_channels: usize,
     no_samples: usize,
-    stride_samples: usize,
+    stride_samples: u64,
 ) -> LayoutResult<usize> {
-    let last_channel_offset = no_channels
-        .checked_sub(1)
-        .and_then(|last| last.checked_mul(stride_samples))
-        .ok_or(crate::LayoutDefect::AudioChannelOffset {
-            channels: no_channels,
-            stride: stride_samples,
-        })?;
-    let sample_count = last_channel_offset.checked_add(no_samples).ok_or(
-        crate::LayoutDefect::AudioSampleCount {
-            offset: last_channel_offset,
-            samples: no_samples,
-        },
-    )?;
-    let byte_size = sample_count
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or(crate::LayoutDefect::AudioByteSize(sample_count))?;
-
-    if byte_size > MAX_AUDIO_BYTES {
-        return Err(crate::LayoutDefect::AudioBytes(byte_size));
+    let sample_count = (no_channels as u64 - 1)
+        .saturating_mul(stride_samples)
+        .saturating_add(no_samples as u64);
+    let byte_size = sample_count.saturating_mul(size_of::<f32>() as u64);
+    if byte_size > MAX_AUDIO_BYTES as u64 {
+        return Err(crate::LayoutDefect::AudioBytes(byte_size.into()));
     }
-
-    Ok(sample_count)
+    Ok(sample_count as usize)
 }
 
 /// Validate audio frame layout from raw FFI fields.
@@ -5941,11 +5939,11 @@ mod tests {
         // Padding between channels counts, trailing padding does not.
         assert_eq!(checked_audio_extent(3, 5, 8).unwrap(), 2 * 8 + 5);
         let limit = MAX_AUDIO_BYTES / 4;
-        assert_eq!(checked_audio_extent(1, limit, limit).unwrap(), limit);
-        assert!(checked_audio_extent(1, limit + 1, limit + 1).is_err());
-        assert!(checked_audio_extent(2, limit, limit).is_err());
-        assert!(checked_audio_extent(2, 1, limit).is_err());
-        assert!(checked_audio_extent(2, 1, usize::MAX).is_err());
+        assert_eq!(checked_audio_extent(1, limit, limit as u64).unwrap(), limit);
+        assert!(checked_audio_extent(1, limit + 1, (limit + 1) as u64).is_err());
+        assert!(checked_audio_extent(2, limit, limit as u64).is_err());
+        assert!(checked_audio_extent(2, 1, limit as u64).is_err());
+        assert!(checked_audio_extent(2, 1, usize::MAX as u64).is_err());
     }
 
     #[test]
@@ -6096,7 +6094,7 @@ mod tests {
                 check(channels, samples);
             }
         }
-        // The signed stride boundary is rejected independently of the cap.
+        // Packed strides on either side of the signed boundary exceed the byte cap.
         let at_stride_limit = ValidatedAudioLayout::new_uncompressed(
             AudioFormat::Fltp,
             48_000,
@@ -6116,11 +6114,11 @@ mod tests {
             i32::MAX.unsigned_abs() / 4 + 1,
             None,
         );
-        assert!(over_stride_limit
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("stride"));
+        assert!(matches!(
+            over_stride_limit,
+            Err(Error::InvalidFrame(crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(bytes))))
+                if bytes.get() == (i32::MAX as u64 / 4 + 1) * 4
+        ));
     }
 
     #[test]
@@ -8645,6 +8643,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn oversized_layouts_have_one_size_cause_on_every_target() {
+        for samples in [1 << 25, 1 << 29, 1 << 30] {
+            let expected = crate::LayoutDefect::AudioBytes((u64::from(samples) * 2 * 4).into());
+            assert!(matches!(
+                AudioFrame::builder().num_samples(samples).build().map_err(crate::Rejected::into_error),
+                Err(Error::InvalidFrame(crate::FrameDefect::Layout(cause))) if cause == expected
+            ));
+            assert!(matches!(
+                crate::FrameSyncAudioRequest::capture_at(48_000, 2, samples),
+                Err(Error::InvalidFrame(crate::FrameDefect::Layout(cause))) if cause == expected
+            ));
+        }
+        for (width, height, bytes) in [
+            (1 << 31, 2, 17_179_869_184u64),
+            (1 << 31, 1 << 31, u64::MAX),
+            (1 << 14, 1 << 18, 17_179_869_184),
+        ] {
+            let expected = crate::LayoutDefect::VideoBytes(bytes.into());
+            assert!(matches!(
+                VideoFrame::builder().resolution(width, height).build().map_err(crate::Rejected::into_error),
+                Err(Error::InvalidFrame(crate::FrameDefect::Layout(cause))) if cause == expected
+            ));
+            assert!(matches!(
+                PixelFormat::Bgra.buffer_len(width, height, None),
+                Err(Error::InvalidFrame(crate::FrameDefect::Layout(cause))) if cause == expected
+            ));
+        }
+        for (width, bytes) in [(400_000_000, 1_600_000_000u64), (1 << 30, 4_294_967_296)] {
+            assert!(matches!(
+                PixelFormat::Bgra.line_stride_bytes(width),
+                Err(Error::InvalidFrame(crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(n))))
+                    if n.get() == bytes
+            ));
+        }
+    }
+
     /// Test that audio frames with overflow in checked_mul are rejected
     #[test]
     fn test_audio_overflow_checked_mul() {
@@ -8673,14 +8708,7 @@ mod tests {
             "Should reject audio frame with sample count overflow or exceeding size limit"
         );
 
-        let expected = if usize::BITS == 32 {
-            crate::LayoutDefect::AudioChannelOffset {
-                channels: i32::MAX as usize,
-                stride: 1024,
-            }
-        } else {
-            crate::LayoutDefect::AudioBytes((i32::MAX as u64 * 1024 * 4) as usize)
-        };
+        let expected = crate::LayoutDefect::AudioBytes(8_796_093_018_112u64.into());
         assert!(matches!(
             result,
             Err(Error::InvalidFrame(crate::FrameDefect::Layout(cause))) if cause == expected
@@ -9386,7 +9414,6 @@ mod tests {
                 matches!(
                     msg,
                     crate::FrameDefect::Layout(crate::LayoutDefect::VideoBytes(_))
-                        | crate::FrameDefect::Layout(crate::LayoutDefect::AudioBytes(_))
                 ),
                 "Error should mention size limit, got: {msg}"
             );
@@ -9802,14 +9829,7 @@ mod tests {
             "Should reject audio frame with overflow potential"
         );
 
-        let expected = if usize::BITS == 32 {
-            crate::LayoutDefect::AudioChannelOffset {
-                channels: i32::MAX as usize,
-                stride: 1024,
-            }
-        } else {
-            crate::LayoutDefect::AudioBytes((i32::MAX as u64 * 1024 * 4) as usize)
-        };
+        let expected = crate::LayoutDefect::AudioBytes(8_796_093_018_112u64.into());
         assert!(matches!(
             result,
             Err(Error::InvalidFrame(crate::FrameDefect::Layout(cause))) if cause == expected

@@ -378,20 +378,30 @@ fn compact_scalar_evidence_roundtrips_without_changing_its_diagnostic() {
 }
 
 #[test]
+fn diagnostic_sizes_keep_unsigned_evidence_and_word_alignment() {
+    assert_eq!(std::mem::size_of::<DiagnosticSize>(), 8);
+    assert_eq!(std::mem::align_of::<DiagnosticSize>(), 4);
+    for value in [0, u32::MAX as u64, 1u64 << 63, u64::MAX] {
+        let evidence = DiagnosticSize::new(value);
+        assert_eq!(evidence.get(), value);
+        assert_eq!(format!("{evidence}"), value.to_string());
+        assert_eq!(format!("{evidence:?}"), value.to_string());
+    }
+}
+
+#[test]
 fn layout_defect_diagnostics_preserve_their_text() {
     let cases = [
         ("FrameRate", LayoutDefect::FrameRate { detail: CompactDiagnostic::new(FrameRateDefect { numerator: 30, denominator: 0 }) }, "Invalid frame rate 30/0: both parts must be in 1..=2147483647"),
         ("CompressedVideoDimensions", LayoutDefect::CompressedVideoDimensions { detail: CompactDiagnostic::new(VideoDimensionsDefect { width: 8, height: 4 }) }, "Compressed video dimensions 8x4 must each be in 1..=2147483647"),
         ("VideoZeroStride", LayoutDefect::VideoZeroStride, "Video line stride must be positive, got 0"),
-        ("VideoBufferOverflow", LayoutDefect::VideoBufferOverflow, "Video buffer size overflow"),
         ("AudioStrideRange", LayoutDefect::AudioStrideRange, "Audio channel stride exceeds i32 range"),
         ("VideoWidth", LayoutDefect::VideoWidth((-3).into()), "Video frame has invalid width: -3"),
         ("VideoOddWidth", LayoutDefect::VideoOddWidth((-3).into()), "NDI video frames require even width, got -3"),
         ("VideoHeight", LayoutDefect::VideoHeight((-3).into()), "Video frame has invalid height: -3"),
         ("VideoSdkStride", LayoutDefect::VideoSdkStride(-3), "Uncompressed video frame has invalid line_stride_in_bytes: -3"),
         ("VideoShortStride", LayoutDefect::VideoShortStride { stride: 7, minimum: 12, format: PixelFormat::Bgra, width: 8 }, "Video line_stride_in_bytes 7 is smaller than minimum row size 12 for Bgra width 8"),
-        ("VideoStrideOverflow", LayoutDefect::VideoStrideOverflow { format: PixelFormat::Bgra, width: 8 }, "Video line stride overflow for Bgra width 8"),
-        ("VideoBytes", LayoutDefect::VideoBytes(7), "Video frame exceeds maximum size: 7 bytes > 268435456 bytes"),
+        ("VideoBytes", LayoutDefect::VideoBytes(7u64.into()), "Video frame exceeds maximum size: 7 bytes > 268435456 bytes"),
         ("VideoPlanar420", LayoutDefect::VideoPlanar420 { height: 4, stride: 7 }, "Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height 4 and stride 7"),
         ("VideoSemiPlanar420", LayoutDefect::VideoSemiPlanar420(7), "Semi-planar 4:2:0 (NV12) video frames require even height, got 7"),
         ("VideoUyvaStride", LayoutDefect::VideoUyvaStride(7), "UYVA video frames require even line stride, got 7"),
@@ -401,12 +411,7 @@ fn layout_defect_diagnostics_preserve_their_text() {
         ("AudioStride", LayoutDefect::AudioStride((-3).into()), "Invalid channel_stride_in_bytes: -3"),
         ("AudioStrideAlignment", LayoutDefect::AudioStrideAlignment(7), "channel_stride_in_bytes must be a multiple of 4, got 7"),
         ("AudioShortStride", LayoutDefect::AudioShortStride { stride: 7, minimum: 12 }, "channel_stride_in_bytes 7 is smaller than one channel of audio samples 12"),
-        ("AudioStrideOverflow", LayoutDefect::AudioStrideOverflow(7), "Audio channel stride overflow: 7 samples × 4 bytes"),
-        ("AudioChannelOffset", LayoutDefect::AudioChannelOffset { channels: 2, stride: 7 }, "Audio channel offset overflow: 2 channels × 7 stride samples"),
-        ("AudioSampleCount", LayoutDefect::AudioSampleCount { offset: 17, samples: 16 }, "Audio backing sample count overflow: channel offset 17 + 16 samples"),
-        ("AudioByteSize", LayoutDefect::AudioByteSize(7), "Audio byte size overflow: 7 samples × 4 bytes"),
-        ("AudioBytes", LayoutDefect::AudioBytes(7), "Audio frame exceeds maximum size: 7 bytes > 67108864 bytes"),
-        ("VideoStrideRange", LayoutDefect::VideoStrideRange { stride: 7 }, "Video line stride 7 exceeds i32 range"),
+        ("AudioBytes", LayoutDefect::AudioBytes(7u64.into()), "Audio frame exceeds maximum size: 7 bytes > 67108864 bytes"),
     ];
     check_cases("LayoutDefect", &cases);
 }

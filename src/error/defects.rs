@@ -97,9 +97,6 @@ pub enum LayoutDefect {
     /// Video line stride must be positive, got 0.
     #[error("Video line stride must be positive, got 0")]
     VideoZeroStride,
-    /// Video buffer size overflow.
-    #[error("Video buffer size overflow")]
-    VideoBufferOverflow,
     /// Audio channel stride exceeds i32 range.
     #[error("Audio channel stride exceeds i32 range")]
     AudioStrideRange,
@@ -127,17 +124,9 @@ pub enum LayoutDefect {
         /// The width.
         width: u32,
     },
-    /// Video line stride overflow for {format:?} width {width}.
-    #[error("Video line stride overflow for {format:?} width {width}")]
-    VideoStrideOverflow {
-        /// The format.
-        format: PixelFormat,
-        /// The width.
-        width: usize,
-    },
     /// Video frame exceeds maximum size: {0} bytes > {MAX_VIDEO_BYTES} bytes.
     #[error("Video frame exceeds maximum size: {0} bytes > {MAX_VIDEO_BYTES} bytes")]
-    VideoBytes(usize),
+    VideoBytes(DiagnosticSize),
     /// Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height {height} and stride {stride}.
     #[error("Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height {height} and stride {stride}")]
     VideoPlanar420 {
@@ -182,37 +171,9 @@ pub enum LayoutDefect {
         /// The minimum.
         minimum: usize,
     },
-    /// Audio channel stride overflow: {0} samples × 4 bytes.
-    #[error("Audio channel stride overflow: {0} samples × 4 bytes")]
-    AudioStrideOverflow(usize),
-    /// Audio channel offset overflow: {channels} channels × {stride} stride samples.
-    #[error("Audio channel offset overflow: {channels} channels × {stride} stride samples")]
-    AudioChannelOffset {
-        /// The channels.
-        channels: usize,
-        /// The stride.
-        stride: usize,
-    },
-    /// Audio backing sample count overflow: channel offset {offset} + {samples} samples.
-    #[error("Audio backing sample count overflow: channel offset {offset} + {samples} samples")]
-    AudioSampleCount {
-        /// The offset.
-        offset: usize,
-        /// The samples.
-        samples: usize,
-    },
-    /// Audio byte size overflow: {0} samples × 4 bytes.
-    #[error("Audio byte size overflow: {0} samples × 4 bytes")]
-    AudioByteSize(usize),
     /// Audio frame exceeds maximum size: {0} bytes > {MAX_AUDIO_BYTES} bytes.
     #[error("Audio frame exceeds maximum size: {0} bytes > {MAX_AUDIO_BYTES} bytes")]
-    AudioBytes(usize),
-    /// Video line stride {stride} exceeds i32 range.
-    #[error("Video line stride {stride} exceeds i32 range")]
-    VideoStrideRange {
-        /// The stride.
-        stride: usize,
-    },
+    AudioBytes(DiagnosticSize),
 }
 
 /// Typed causes of [`crate::Error::InvalidFrame`].
@@ -1074,6 +1035,40 @@ pub struct PtzDefect {
     pub minimum: f32,
     /// The maximum.
     pub maximum: f32,
+}
+
+/// An exact unsigned byte count with 32-bit alignment.
+///
+/// Layout size refusals retain counts beyond the address space of 32-bit
+/// targets without allocating or increasing the alignment of an error.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DiagnosticSize([u32; 2]);
+impl DiagnosticSize {
+    /// Retain the byte count without allocating.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self([value as u32, (value >> 32) as u32])
+    }
+    /// The original unsigned byte count.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        (self.0[0] as u64) | ((self.0[1] as u64) << 32)
+    }
+}
+impl From<u64> for DiagnosticSize {
+    fn from(value: u64) -> Self {
+        Self::new(value)
+    }
+}
+impl std::fmt::Display for DiagnosticSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.get(), f)
+    }
+}
+impl std::fmt::Debug for DiagnosticSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.get(), f)
+    }
 }
 
 /// An exact signed 64-bit diagnostic value with 32-bit alignment.

@@ -3096,7 +3096,7 @@ mod tests {
             request.with_stride_bytes(65 * MIB),
             Err(Error::InvalidInput(crate::InputDefect::Layout(
                 crate::LayoutDefect::AudioBytes(bytes)
-            ))) if bytes == 65 * MIB + 4096
+            ))) if bytes.get() == (65 * MIB + 4096) as u64
         ));
         let token = registry
             .register(|request: AllocationRequest| {

@@ -28,6 +28,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 - All relative environment library directories use `LoadRefusal::RelativeSearchDirectory`;
   `LoadAttempt::origin()` identifies the variable that supplied the directory.
+- Oversized video and audio layouts report `VideoBytes` or `AudioBytes` on
+  every target. Their payload is `DiagnosticSize`, an unsigned 64-bit count;
+  arithmetic overflow leaves are removed. Packed line strides share the
+  video byte cap.
 
 - `AudioFormat` converts through `FourCc`; audio descriptors use their validated
   format. `PictureAspectRatio` normalizes negative zero and implements `Eq` and
