@@ -8,12 +8,6 @@ error[E0432]: unresolved imports `grafton_ndi::AvSyncAttached`, `grafton_ndi::Co
   |     |               |                   no `CompressedAudioSendMode` in the root
   |     |               no `CompressedAttached` in the root
   |     no `AvSyncAttached` in the root
-  |
-help: a similar name exists in the module
-  |
-3 -     AvSyncAttached, CompressedAttached, CompressedAudioSendMode, PacketAttached, QueueAttached,
-3 +     AvSyncAttached, CompressedAttached, CompressedAudioDefect, PacketAttached, QueueAttached,
-  |
 
 error[E0603]: enum `AvSyncAttached` is private
  --> tests/ui/advanced/fail/advanced_modes_have_one_public_module.rs:5:29
