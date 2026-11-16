@@ -69,6 +69,14 @@ jobs:
           done
       - name: Bindings generator tests
         run: cargo test --locked --package xtask
+      - name: Rustdoc feature combinations
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          for features in "" image-encoding tokio smol advanced file-io advanced,file-io; do
+            cargo doc --locked --no-deps --no-default-features ${features:+--features "$features"}
+          done
+      # Build all features last: these are the HTML files checked and published.
       - name: Rustdoc
         env:
           RUSTDOCFLAGS: -D warnings

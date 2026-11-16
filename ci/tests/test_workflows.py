@@ -6,6 +6,7 @@ actionlint, in the same job, checks that the files are valid workflows at all.
 """
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -118,7 +119,28 @@ def docs_violations(docs):
             + differs('rust.yml: artifact source', upload.get('with'), {'path': 'target/doc'})
             + differs('rust.yml: deployment environment', deploy.get('environment'),
                       {'name': 'github-pages', 'url': '${{ steps.deployment.outputs.page_url }}'})
-            + differs('rust.yml: deployment scripts', [step for step in deploy['steps'] if 'run' in step], []))
+            + differs('rust.yml: deployment scripts', [step for step in deploy['steps'] if 'run' in step], [])
+            + rustdoc_feature_violations(jobs['lint']['steps']))
+
+
+def rustdoc_feature_violations(steps):
+    """Every linted feature set is documented, before the published full build."""
+    named = {step.get('name'): step for step in steps}
+    clippy = named.get('Clippy', {})
+    rustdoc = named.get('Rustdoc feature combinations', {})
+
+    def features(step):
+        loops = re.findall(r'for features in ([^;]+); do', step.get('run', ''))
+        return [shlex.split(loop) for loop in loops]
+
+    found = differs('rust.yml: rustdoc feature combinations', features(rustdoc), features(clippy))
+    found += differs('rust.yml: rustdoc denies warnings', rustdoc.get('env'), {'RUSTDOCFLAGS': '-D warnings'})
+    if 'cargo doc --locked --no-deps --no-default-features ${features:+--features "$features"}' not in rustdoc.get('run', ''):
+        found.append('rust.yml: rustdoc feature combinations do not build their selected features')
+    names = [step.get('name') for step in steps]
+    if 'Rustdoc feature combinations' not in names or names.index('Rustdoc feature combinations') >= names.index('Rustdoc'):
+        found.append('rust.yml: all-features rustdoc must be built last for checking and publication')
+    return found
 
 
 def gate_violations(rust):
@@ -517,6 +539,20 @@ class Repository(unittest.TestCase):
                 named.update(part for group in match.split() for part in group.strip('"').split(',') if part)
         self.assertGreaterEqual(named, {'advanced', 'file-io'})
         self.assertLessEqual(named, features)
+
+    def test_rustdoc_checks_every_linted_feature_set_and_leaves_the_full_build_last(self):
+        texts = read_workflows()
+        self.assertEqual(violations(texts), [])
+        block = ('      - name: Rustdoc feature combinations\n'
+                 '        env:\n          RUSTDOCFLAGS: -D warnings\n'
+                 '        run: |\n'
+                 '          for features in "" image-encoding tokio smol advanced file-io advanced,file-io; do\n')
+        self.assertIn(block, texts['rust.yml'])
+        for changed, message in ((block.replace('tokio smol', 'tokio'), 'rustdoc feature combinations'),
+                                 (block.replace('-D warnings', ''), 'rustdoc denies warnings')):
+            with self.subTest(message=message):
+                broken = {**texts, 'rust.yml': texts['rust.yml'].replace(block, changed)}
+                self.assertTrue(any(message in error for error in violations(broken)))
 
     def test_repository_cargo_configuration_holds_only_the_xtask_alias(self):
         """Cargo obeys this file in every job that starts in the checkout; it can run programs and redirect registries."""

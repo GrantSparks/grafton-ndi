@@ -21,6 +21,9 @@ cargo build --locked --examples --all-features
 cargo test --locked --all-features
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+for features in "" image-encoding tokio smol advanced file-io advanced,file-io; do
+    RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --no-default-features ${features:+--features "$features"}
+done
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 ```
 

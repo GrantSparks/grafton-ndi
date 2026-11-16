@@ -6,11 +6,16 @@
 //! [`AsyncReceiver::capture_any`] returns whichever owned media item or receiver
 //! event arrives next. The adapter selects the [`AsyncRuntime`] whose blocking
 //! thread pool runs the NDI operations:
-//! [`Tokio`] with the `tokio` Cargo feature, [`Smol`] with the `smol` feature.
-//! The [`tokio`] and [`smol`] submodules name the adapters for one runtime, for
-//! example `grafton_ndi::asynchronous::tokio::AsyncReceiver`. This module
-//! exists when either feature is enabled, and each runtime only with its own
-//! feature; the crate root does not re-export any of it.
+#![cfg_attr(
+    feature = "tokio",
+    doc = "Use [`Tokio`] with the `tokio` Cargo feature; the [`tokio`] submodule names its adapters."
+)]
+#![cfg_attr(
+    feature = "smol",
+    doc = "Use [`Smol`] with the `smol` Cargo feature; the [`smol`] submodule names its adapters."
+)]
+//! This module exists when either feature is enabled, and each runtime only
+//! with its own feature; the crate root does not re-export any of it.
 //!
 //! [`AsyncFinder`] owns a [`crate::Finder`] or [`crate::SourceCache`] for async
 //! selection and complete discovery windows. Its owned [`AsyncSourceWatch`]
@@ -210,8 +215,9 @@ fn tokio_join_error(error: ::tokio::task::JoinError) -> Error {
 }
 
 /// An async runtime whose blocking thread pool runs the NDI operations of an
-/// [`AsyncReceiver`], [`AsyncFinder`] and [`AsyncSourceWatch`]:
-/// [`Tokio`] or [`Smol`].
+/// [`AsyncReceiver`], [`AsyncFinder`] and [`AsyncSourceWatch`].
+#[cfg_attr(feature = "tokio", doc = "[`Tokio`] selects the Tokio runtime.")]
+#[cfg_attr(feature = "smol", doc = "[`Smol`] selects the smol runtime.")]
 ///
 /// The trait is sealed and has no items of its own; it only selects the
 /// runtime.
@@ -284,8 +290,11 @@ impl private::Spawn for Smol {
 /// on the blocking thread pool of the runtime `R`, so that they do not block
 /// the async runtime.
 ///
-/// [`tokio::AsyncReceiver`] and [`smol::AsyncReceiver`] name it for each
-/// runtime.
+#[cfg_attr(
+    feature = "tokio",
+    doc = "[`tokio::AsyncReceiver`] names it for Tokio."
+)]
+#[cfg_attr(feature = "smol", doc = "[`smol::AsyncReceiver`] names it for smol.")]
 ///
 /// # Thread Safety
 ///
