@@ -245,6 +245,99 @@ class Documentation(unittest.TestCase):
         self.assertIn('missing target', errors[0])
         self.assertEqual(snippets, [])
 
+    def test_native_alias_coverage_follows_every_registry_and_new_files(self):
+        forms = ['native_table', 'optional_tables', 'advanced_tables', 'file_families']
+        for index, form in enumerate(forms):
+            self.write(f'src/sys/new_registry_{index}.rs',
+                       f'{form}! {{ struct Table {{ fn NDIlib_call_{index}(); }} }}')
+        self.write('src/sys/api.rs', '// fn NDIlib_comment();\n'
+                   '/* fn NDIlib_block(); /* nested */ */\n'
+                   'const EXAMPLE: &str = r#"native_table! { fn NDIlib_string(); }"#;\n'
+                   'fn NDIlib_unregistered() {}')
+        errors = docs.sdk_alias_violations(self.root)
+        self.assertEqual(len(errors), 4)
+        for index in range(4):
+            self.assertIn(f'NDIlib_call_{index}', errors[index])
+        self.write('src/public.rs', '\n'.join(
+            f'#[doc(alias = "NDIlib_call_{index}")]\npub fn call_{index}() {{}}'
+            for index in range(4)))
+        self.assertEqual(docs.sdk_alias_violations(self.root), [])
+
+    def test_alias_examples_comments_and_internal_code_cannot_cover_public_calls(self):
+        self.write('src/sys/api.rs', 'native_table! { fn NDIlib_public(); }')
+        self.write('src/sys/hidden.rs', '#[doc(alias = "NDIlib_public")] fn internal() {}')
+        self.write('src/public.rs', '// #[doc(alias = "NDIlib_public")]\n'
+                   '/* #[doc(alias = "NDIlib_public")] */\n'
+                   'const EXAMPLE: &str = r##"#[doc(alias = "NDIlib_public")]"##;\n'
+                   'const OTHER: &str = "#[doc(alias = \\"NDIlib_public\\")]";')
+        self.write('src/example_tests.rs', '#[doc(alias = "NDIlib_public")] pub fn test_only() {}')
+        self.assertEqual(len(docs.sdk_alias_violations(self.root)), 1)
+        for declaration in ('fn private() {}', 'pub(crate) fn internal() {}', 'pub struct NotAFunction;'):
+            with self.subTest(declaration=declaration):
+                self.write('src/public.rs', '#[doc(alias = "NDIlib_public")]\n' + declaration)
+                self.assertEqual(len(docs.sdk_alias_violations(self.root)), 1)
+        self.write('src/public.rs', '#[cfg(test)] mod tests { '
+                   '#[doc(alias = "NDIlib_public")] pub fn only_in_tests() {} }')
+        self.assertEqual(len(docs.sdk_alias_violations(self.root)), 1)
+        self.write('src/public.rs', '#[doc(alias = "NDIlib_public")]\n'
+                   '#[must_use]\npub fn public() {}')
+        self.assertEqual(docs.sdk_alias_violations(self.root), [])
+
+    def test_macro_aliases_must_be_forwarded_to_the_matching_public_method(self):
+        self.write('src/sys/api.rs', 'native_table! { fn NDIlib_public(); }')
+        template = ('macro_rules! methods { '
+                    '($sample:ty, $(#[$attr:meta])* $method:ident) => { '
+                    '%s }; }\n'
+                    'methods!(u8, #[doc(alias = "NDIlib_public")] generated);')
+        for expansion in ('fn $method() {}', '$(#[$attr])* fn $method() {}',
+                          '$(#[$other])* pub fn $method() {}',
+                          '$(#[$attr])* pub fn $other() {}'):
+            with self.subTest(expansion=expansion):
+                self.write('src/public.rs', template % expansion)
+                self.assertEqual(len(docs.sdk_alias_violations(self.root)), 1)
+        self.write('src/public.rs', template % '$(#[$attr])* pub fn $method() {}')
+        self.assertEqual(docs.sdk_alias_violations(self.root), [])
+        self.write('src/public.rs', 'macro_rules! literal { () => { '
+                   '#[doc(alias = "NDIlib_public")] pub fn generated() {} }; }')
+        self.assertEqual(docs.sdk_alias_violations(self.root), [])
+
+    def test_internal_native_entry_points_have_explicit_reasons(self):
+        self.assertTrue(all(reason.strip() for reason in docs.INTERNAL_SDK_ENTRY_POINTS.values()))
+        self.write('src/sys/api.rs', 'native_table! { fn NDIlib_recv_free_video_v2(); '
+                   'fn NDIlib_recv_free_new_resource(); }')
+        errors = docs.sdk_alias_violations(self.root)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('NDIlib_recv_free_new_resource', errors[0])
+
+    def test_generated_signatures_reject_underscored_parameters_only(self):
+        self.write('target/doc/grafton_ndi/struct.Example.html',
+                   '<pre class="rust item-decl"><code>pub struct Example;</code></pre>'
+                   '<h4 class="code-header">pub fn new(<span>_options</span>: &amp;Options)</h4>'
+                   '<h4 class="code-header">pub async fn capture(&amp;self,<wbr> _timeout: Duration)</h4>'
+                   '<h4 class="code-header">fn fmt(&amp;self, __formatter: &amp;mut Formatter)</h4>'
+                   '<h4 class="code-header">fn hash&lt;__H: Hasher&gt;(&amp;self, state: &amp;mut __H)</h4>'
+                   '<pre class="rust rust-example-rendered">fn example(_ignored: u8) {}</pre>'
+                   '<p>Text mentions _not_a_parameter: something.</p>')
+        self.write('target/doc/dependency/fn.other.html',
+                   '<pre class="rust item-decl">pub fn other(_foreign: u8)</pre>')
+        errors = docs.parameter_name_violations(self.root, self.root / 'target/doc')
+        self.assertEqual(len(errors), 2)
+        self.assertIn('_options', errors[0])
+        self.assertIn('_timeout', errors[1])
+        self.write('target/doc/grafton_ndi/struct.Example.html',
+                   '<h4 class="code-header">pub fn new(options: &amp;Options)</h4>')
+        self.assertEqual(docs.parameter_name_violations(self.root, self.root / 'target/doc'), [])
+
+    def test_public_trait_required_and_default_method_parameters_are_checked(self):
+        self.write('target/doc/grafton_ndi/trait.Example.html',
+                   '<pre class="rust item-decl"><code>pub trait Example { '
+                   'fn required(_input: u8); fn defaulted(_other: u8) { ... } }</code></pre>'
+                   '<h4 class="code-header">fn defaulted(_other: u8)</h4>')
+        errors = docs.parameter_name_violations(self.root, self.root / 'target/doc')
+        self.assertEqual(len(errors), 2)
+        self.assertIn('_input', errors[0])
+        self.assertIn('_other', errors[1])
+
 
 if __name__ == '__main__':
     unittest.main()

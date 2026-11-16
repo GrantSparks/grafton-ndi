@@ -15,7 +15,7 @@
 use std::{env, time::Duration};
 
 use grafton_ndi::{
-    advanced::{ClockSource, Genlock},
+    advanced::{ClockSource, Genlock, GenlockOptions},
     Error, FrameRate, Ndi, RuntimeOptions, ScanType, SdkEdition, Sender, SenderOptions, VideoFrame,
 };
 
@@ -39,7 +39,11 @@ fn main() -> Result<(), Error> {
         None => println!("No reference source found: running on the system clock"),
     }
 
-    let mut genlock = Genlock::new(&ndi, reference.as_ref(), None)?;
+    let mut options = GenlockOptions::new();
+    if let Some(source) = reference {
+        options = options.source(source);
+    }
+    let mut genlock = Genlock::new(&ndi, &options)?;
     // The genlock paces the frames, so the sender's own clock is switched off.
     let sender = Sender::new(
         &ndi,

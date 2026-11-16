@@ -66,7 +66,9 @@ fn refusing_hdr_before_encoding_allocates_nothing() {
         .metadata("<ndi_color_info transfer=\"bt_2100_pq\"/>")
         .build()
         .unwrap();
-    let (result, allocations) = crate::test_alloc::allocation_count(|| frame.encode_png());
+    let options = crate::image_encoding::ImageOptions::new(crate::image_encoding::ImageFormat::Png);
+    let (result, allocations) =
+        crate::test_alloc::allocation_count(|| frame.encode_image(&options));
     assert!(matches!(
         result,
         Err(Error::InvalidFrame(FrameDefect::HdrRefused {
@@ -127,14 +129,13 @@ fn layout_producer_pairs_choose_the_outer_classification_only() {
     assert_eq!(
         layout_cause(
             crate::PixelFormat::Bgra
-                .info()
-                .buffer_len(8, 0)
+                .buffer_len(2, 0, Some(8))
                 .unwrap_err()
         ),
-        layout_cause(crate::PixelFormat::Bgra.buffer_len(2, 0).unwrap_err())
+        layout_cause(crate::PixelFormat::Bgra.buffer_len(2, 0, None).unwrap_err())
     );
     assert_eq!(
-        layout_cause(crate::PixelFormat::Bgra.buffer_len(2, 0).unwrap_err()),
+        layout_cause(crate::PixelFormat::Bgra.buffer_len(2, 0, None).unwrap_err()),
         LayoutDefect::VideoHeight(0.into())
     );
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate the original, synthetic NDI|HX test pictures with FFmpeg.
+"""Generate synthetic NDI|HX test pictures with FFmpeg in --output-dir.
 
 `chroma-444.hevc` (libx265): a lossless HEVC 4:4:4 frame with alternating
 chroma in adjacent pixels, so subsampling cannot accidentally satisfy the
@@ -13,9 +13,10 @@ H.264 decoder documents 48x48 as its smallest. Without B-frames the SPS lets a
 decoder output the frame at once, and the frame holds only the SPS, the PPS
 and the slice: x264's informational SEI is removed.
 
-No vendor media is included. Only regeneration needs FFmpeg; tests use the
-checked-in bitstreams.
+No vendor media is included. Native tests generate these pictures on demand;
+FFmpeg with libx264/libx265 is needed only when those tests run.
 """
+import argparse
 from pathlib import Path
 import subprocess
 import tempfile
@@ -30,11 +31,11 @@ def ffmpeg(raw, pixel_format, size, codec, output):
         'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
         '-f', 'rawvideo', '-pixel_format', pixel_format, '-video_size', size,
         '-framerate', '30', '-i', str(raw), '-frames:v', '1',
-        *codec, str(Path(__file__).with_name(output)),
+        *codec, str(output),
     ], check=True)
 
 
-def hevc(directory):
+def hevc(directory, output_dir):
     width, height = 64, 32
     planes = [
         bytes(64 + (x + y) % 64 for y in range(height) for x in range(width)),
@@ -47,10 +48,10 @@ def hevc(directory):
         '-c:v', 'libx265', '-preset', 'veryslow', '-x265-params',
         'lossless=1:repeat-headers=1:info=0:pools=none:frame-threads=1:wpp=0',
         '-f', 'hevc',
-    ], 'chroma-444.hevc')
+    ], output_dir / 'chroma-444.hevc')
 
 
-def h264(directory):
+def h264(directory, output_dir):
     width, height = 64, 64
 
     def plane(component, subsampling):
@@ -64,13 +65,17 @@ def h264(directory):
         '-c:v', 'libx264', '-profile:v', 'high', '-preset', 'veryslow', '-qp', '1',
         '-x264-params', 'threads=1:aud=0:bframes=0', '-bsf:v', 'filter_units=remove_types=6',
         '-f', 'h264',
-    ], 'quadrants-420.h264')
+    ], output_dir / 'quadrants-420.h264')
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output-dir', required=True, type=Path)
+    output_dir = parser.parse_args().output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as directory:
-        hevc(directory)
-        h264(directory)
+        hevc(directory, output_dir)
+        h264(directory, output_dir)
 
 
 if __name__ == '__main__':

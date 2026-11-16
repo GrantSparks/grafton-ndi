@@ -1,0 +1,65 @@
+error[E0277]: the trait bound `Unchecked: frames::VideoParts` is not satisfied
+ --> tests/ui/sealed/media_sources.rs
+  |
+  | impl VideoSource for Unchecked {
+  |                      ^^^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `frames::VideoParts` is not implemented for `Unchecked`
+ --> tests/ui/sealed/media_sources.rs
+  |
+  | struct Unchecked;
+  | ^^^^^^^^^^^^^^^^
+  = help: the following other types implement trait `frames::VideoParts`:
+            &T
+            BorrowedVideoFrame<'_>
+            FrameSyncVideoRef<'_>
+            VideoFrame
+            VideoFrameRef<'_>
+note: required by a bound in `VideoSource`
+ --> src/frames.rs
+  |
+  | pub trait VideoSource: VideoParts {
+  |                        ^^^^^^^^^^ required by this bound in `VideoSource`
+  = note: `VideoSource` is a "sealed trait", because to implement it you also need to implement `grafton_ndi::frames::VideoParts`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
+  = help: the following types implement the trait:
+            &T
+            grafton_ndi::frames::PackedVideo<'_>
+            grafton_ndi::VideoFrame
+            grafton_ndi::frames::ValidatedFrame<F, (grafton_ndi::frames::ValidatedVideoLayout, grafton_ndi::frames::VideoHeader)>
+            grafton_ndi::frames::borrowed::VideoRef<'_, S>
+            grafton_ndi::VideoFrameRef<'_>
+            grafton_ndi::FrameSyncVideoRef<'_>
+            grafton_ndi::BorrowedVideoFrame<'_>
+            grafton_ndi::video_conversion::P216Output<'_>
+
+error[E0277]: the trait bound `Unchecked: frames::AudioParts` is not satisfied
+ --> tests/ui/sealed/media_sources.rs
+  |
+  | impl AudioSource for Unchecked {
+  |                      ^^^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `frames::AudioParts` is not implemented for `Unchecked`
+ --> tests/ui/sealed/media_sources.rs
+  |
+  | struct Unchecked;
+  | ^^^^^^^^^^^^^^^^
+  = help: the following other types implement trait `frames::AudioParts`:
+            AudioFrame
+            AudioFrameRef<'_>
+            AvSyncAudioRef<'_>
+            BorrowedAudioFrame<'_>
+            FrameSyncAudioRef<'_>
+note: required by a bound in `AudioSource`
+ --> src/frames.rs
+  |
+  | pub trait AudioSource: AudioParts {
+  |                        ^^^^^^^^^^ required by this bound in `AudioSource`
+  = note: `AudioSource` is a "sealed trait", because to implement it you also need to implement `grafton_ndi::frames::AudioParts`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
+  = help: the following types implement the trait:
+            grafton_ndi::BorrowedAudioFrame<'_>
+            grafton_ndi::AudioFrame
+            grafton_ndi::frames::ValidatedFrame<F, grafton_ndi::frames::ValidatedAudioLayout>
+            grafton_ndi::frames::borrowed::AudioRef<'_, S>
+            grafton_ndi::AudioFrameRef<'_>
+            grafton_ndi::FrameSyncAudioRef<'_>
+            grafton_ndi::advanced::AvSyncAudioRef<'_>

@@ -33,7 +33,7 @@ demonstrations; use the output device's clock for playback. See the
 | Example | Command | What it shows |
 | --- | --- | --- |
 | [`runtime_selection.rs`](runtime_selection.rs) | `cargo run --example runtime_selection` | Select a runtime, inspect it, then start NDI. |
-| [`NDIlib_Find.rs`](NDIlib_Find.rs) | `cargo run --example NDIlib_Find` | Discover NDI sources on the network. |
+| [`find_sources.rs`](find_sources.rs) | `cargo run --example find_sources` | Discover NDI sources on the network. |
 | [`framesync_reception_monitor.rs`](framesync_reception_monitor.rs) | `cargo run --example framesync_reception_monitor -- 'HOST (Audio)' 1500` | Monitor recent audio reception beside borrowed mono FrameSync output; choose the positive grace period in ms for your application. |
 | [`status_monitor.rs`](status_monitor.rs) | `cargo run --example status_monitor` | Print a receiver's connection status changes. |
 | [`routing.rs`](routing.rs) | `cargo run --example routing` | Route receivers to each discovered source in turn. |
@@ -43,12 +43,12 @@ demonstrations; use the output device's clock for playback. See the
 
 | Example | Command | What it shows |
 | --- | --- | --- |
-| [`NDIlib_Recv_Audio.rs`](NDIlib_Recv_Audio.rs) | `cargo run --example NDIlib_Recv_Audio` | Receive and inspect audio. |
-| [`NDIlib_Recv_Audio_16bpp.rs`](NDIlib_Recv_Audio_16bpp.rs) | `cargo run --example NDIlib_Recv_Audio_16bpp` | Convert received audio with the native v3 API and explicit headroom. |
+| [`receive_audio.rs`](receive_audio.rs) | `cargo run --example receive_audio` | Receive and inspect audio. |
+| [`receive_audio_i16.rs`](receive_audio_i16.rs) | `cargo run --example receive_audio_i16` | Convert received audio with the native v3 API and explicit headroom. |
 | [`framesync_audio_playback.rs`](framesync_audio_playback.rs) | `cargo run --example framesync_audio_playback -- 'HOST (Audio)' > output.f32` | Convert borrowed FrameSync audio directly into reusable interleaved f32 PCM output. |
-| [`NDIlib_Recv_FrameSync.rs`](NDIlib_Recv_FrameSync.rs) | `cargo run --example NDIlib_Recv_FrameSync` | Clock-corrected capture with `FrameSync`. |
-| [`NDIlib_Recv_PNG.rs`](NDIlib_Recv_PNG.rs) | `cargo run --features image-encoding --example NDIlib_Recv_PNG` | Receive video and save a PNG. Needs the `image-encoding` feature. |
-| [`NDIlib_Recv_PTZ.rs`](NDIlib_Recv_PTZ.rs) | `cargo run --example NDIlib_Recv_PTZ` | Control PTZ cameras. |
+| [`receive_framesync.rs`](receive_framesync.rs) | `cargo run --example receive_framesync` | Clock-corrected capture with `FrameSync`. |
+| [`receive_png.rs`](receive_png.rs) | `cargo run --features image-encoding --example receive_png` | Receive video and save a PNG. Needs the `image-encoding` feature. |
+| [`receive_ptz.rs`](receive_ptz.rs) | `cargo run --example receive_ptz` | Control PTZ cameras. |
 | [`concurrent_capture.rs`](concurrent_capture.rs) | `cargo run --example concurrent_capture` | Capture video, audio and metadata from one receiver on separate threads. |
 | [`mixed_media_relay.rs`](mixed_media_relay.rs) | `cargo run --example mixed_media_relay -- "HOST (Camera)" "Relay"` | Relay borrowed video/audio and metadata from one mixed-media wait; Ctrl-C stops it. |
 | [`mixed_media_async.rs`](mixed_media_async.rs) | `cargo run --features tokio --example mixed_media_async -- "HOST (Camera)"` | Inspect borrowed mixed media on a blocking worker and return small owned summaries without payload copies; use `--features smol` for smol. |
@@ -57,10 +57,10 @@ demonstrations; use the output device's clock for playback. See the
 
 | Example | Command | What it shows |
 | --- | --- | --- |
-| [`NDIlib_Send_Audio.rs`](NDIlib_Send_Audio.rs) | `cargo run --example NDIlib_Send_Audio` | Send audio. |
-| [`NDIlib_Send_Video.rs`](NDIlib_Send_Video.rs) | `cargo run --example NDIlib_Send_Video` | Send video. |
-| [`async_send.rs`](async_send.rs) | `cargo run --example async_send` | Reuse two owned frames for async sending and recover completed frames. |
-| [`async_send_copy.rs`](async_send_copy.rs) | `cargo run --example async_send_copy` | Copy borrowed pixels into async sends, then into the frames they return. |
+| [`send_audio.rs`](send_audio.rs) | `cargo run --example send_audio` | Send audio. |
+| [`send_video.rs`](send_video.rs) | `cargo run --example send_video` | Send video. |
+| [`submit_video.rs`](submit_video.rs) | `cargo run --example submit_video` | Reuse two owned frames for async sending and recover completed frames. |
+| [`submit_video_copy.rs`](submit_video_copy.rs) | `cargo run --example submit_video_copy` | Copy borrowed pixels into async sends, then into the frames they return. |
 | [`zero_copy_send.rs`](zero_copy_send.rs) | `cargo run --example zero_copy_send` | Render into two reusable owned frames without per-send pixel copies. |
 | [`media_buffers.rs`](media_buffers.rs) | `cargo run --example media_buffers` | Recover and swap pooled buffers, borrow planar audio, inspect trait objects and convert borrowed P216. |
 

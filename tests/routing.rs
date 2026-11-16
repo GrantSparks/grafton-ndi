@@ -23,7 +23,11 @@ fn a_router_advertises_itself_and_accepts_route_changes() {
         advertised.name().ends_with(&format!("({name})")),
         "{advertised}"
     );
-    assert_eq!(router.connection_count(Duration::ZERO).unwrap(), 0);
+    assert_eq!(router.connection_count().unwrap(), 0);
+    assert!(router
+        .wait_for_connection(Duration::ZERO)
+        .unwrap()
+        .is_none());
 
     let sender = Sender::new(
         &ndi,
@@ -33,13 +37,13 @@ fn a_router_advertises_itself_and_accepts_route_changes() {
     )
     .unwrap();
     let target = sender.source().unwrap();
-    router.change(&target).unwrap();
-    router.clear().unwrap();
+    router.set_route(&target).unwrap();
+    router.clear_route().unwrap();
 
     // A router may be used and destroyed on a thread that did not create it.
     std::thread::spawn(move || {
-        router.change(&target).unwrap();
-        assert_eq!(router.connection_count(Duration::ZERO).unwrap(), 0);
+        router.set_route(&target).unwrap();
+        assert_eq!(router.connection_count().unwrap(), 0);
     })
     .join()
     .unwrap();
@@ -63,7 +67,7 @@ fn a_receiver_connects_after_the_route_input_is_dropped() {
     .unwrap();
     {
         let target = common::loopback_source(&ndi, &sender).unwrap();
-        router.change(&target).unwrap();
+        router.set_route(&target).unwrap();
     }
     let route = common::loopback_endpoint(&ndi, router.source().unwrap().name()).unwrap();
     let receiver = Receiver::new(&ndi, &ReceiverOptions::new(route)).unwrap();
@@ -78,8 +82,7 @@ fn a_receiver_connects_after_the_route_input_is_dropped() {
     loop {
         sender.send_video(&frame).unwrap();
         if let Some(received) = receiver
-            .video()
-            .capture_ref(Duration::from_millis(100))
+            .capture_video_ref(Duration::from_millis(100))
             .unwrap()
         {
             assert_eq!((received.width(), received.height()), (64, 32));
@@ -91,5 +94,5 @@ fn a_receiver_connects_after_the_route_input_is_dropped() {
             "the receiver never received the retained route"
         );
     }
-    router.clear().unwrap();
+    router.clear_route().unwrap();
 }

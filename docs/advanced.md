@@ -45,16 +45,16 @@ the native handle or bypass its ownership rules. See the single
 ## Configuration
 
 For objects with an options value, set `config(AdvancedConfig)` before their
-ordinary constructor. `Genlock::new` takes its optional configuration directly
-as an argument. `AdvancedConfig::parse` checks a
+ordinary constructor. Genlock uses `GenlockOptions::config` and
+`Genlock::new(&ndi, &options)`. `AdvancedConfig::parse` checks a
 JSON object of at most one MiB and preserves its text, including unknown
 properties. Property meanings come from the SDK. Debug output and parse errors
 hide the content; `expose_json()` deliberately reveals it, so avoid logging
 credentials or network details it may contain.
 
 [`advanced_source_metadata`](../examples/advanced_source_metadata.rs) shows
-`Finder::sources_with_metadata`. Configuration is also supported by sender,
-receiver, router and Discovery Server options, and directly by `Genlock::new`.
+`Finder::current_sources_with_metadata`. Configuration is also supported by sender,
+receiver, router, Discovery Server and Genlock options.
 `CompressedSender` and
 `PacketReceiver` use the configured entry point even when given no explicit
 configuration. Refer to their constructors for defaults.
@@ -69,8 +69,8 @@ decoded mixed media use the feature-free
 
 Construct a packet receiver with `ReceiverOptions` and a `PassthroughPreset`.
 A supported format named by the preset passes through compressed; other media
-can arrive decoded. `capture_ref(timeout)` returns a borrowed
-`PacketItemRef::{Video, Audio, Metadata, Event}`; `capture(timeout)` makes the
+can arrive decoded. `capture_any_ref(timeout)` returns a borrowed
+`PacketItemRef::{Video, Audio, Metadata, Event}`; `capture_any(timeout)` makes the
 same capture and copies it into an owned `PacketItem`. Compressed references
 expose codec bytes without copying their payload or metadata. Their `to_owned`
 and `copy_into` methods make lossless `ReceivedVideoPacket` and
@@ -81,7 +81,7 @@ disconnected. Packet receivers cannot feed `FrameSync`.
 
 Both capture methods take `&self`; controls remain available through
 `receiver()` while a packet is borrowed. `controls()` reaches exclusive stream
-selection and KVM, and a packet KVM session also provides `capture_ref()`. Its
+selection and KVM, and a packet KVM session also provides `capture_any_ref()`. Its
 result borrows the receiver, so inputs can be released while a packet is held.
 Neither route exposes raw receiver capture. See
 [`advanced_passthrough`](../examples/advanced_passthrough.rs) for receiving and
@@ -125,7 +125,7 @@ returns the displaced `Option<SubmittedVideo>`. Scatter sends retain their
 fallible runtime capability checks. The frame is reusable afterwards.
 Asynchronous video sends hold a frame until
 the next asynchronous send on the same program/preview stream returns it.
-Audio sends are synchronous. `finish_video_async()` waits for pending SDK use
+Audio sends are synchronous. `reclaim_video()` waits for pending SDK use
 and returns both streams' remaining video as `ReclaimedVideo`, keeping the
 source available for further sends. `close()` removes the source and also
 reclaims remaining video. Reclamation does not confirm delivery.
@@ -135,23 +135,26 @@ the SDK can still copy internally.
 The attached sender retains metadata, tally, connection and encoder controls,
 but offers no uncompressed sends and cannot be registered with a
 `SendAdvertiser`. This keeps the native sender from outliving pending storage.
-`CompressedSender::split()` lends video and audio views to separate scoped
-threads. Each view is `Send` and neither is `Sync` or `Clone`; the audio view's
-`sender()` provides metadata and controls while video is being submitted.
+`CompressedSender::split()` returns `CompressedVideo<'_>` and
+`&Sender<CompressedAttached>` for separate scoped workers. The video view is
+`Send` and not `Sync` or `Clone`; the shared sender supports compressed audio,
+metadata and controls while video is submitted. Use
+`sender.sender().send_compressed_audio(&mut frame)` for audio without splitting.
 
 ## Queued sending
 
 Use `QueuedSender` to submit multiple owned raw, compressed or scatter video
 frames without waiting for the previous frame's completion on each submission.
-`QueueOptions` bounds retained frames and bytes, including completed frames not
+`QueueLimits` bounds retained frames and bytes, including completed frames not
 yet collected and spare payload/metadata capacity. Check defaults and exact
-accounting in [`QueueOptions`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.QueueOptions.html).
+accounting in [`QueueLimits`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.QueueLimits.html).
+Pass limits by reference to `QueuedSender::new` or `from_sender`.
 
 `try_submit` returns a `SubmissionId` or the rejected frame. For `QueueFull`,
 collect completions and retry. A frame whose retained allocation capacity
 alone exceeds `max_bytes` returns `InvalidInput`; waiting cannot make it fit.
 Inspect other errors before retrying.
-`try_take_completed` and `wait_completed` return reusable frames on the
+`try_next_completed` and `next_completed` return reusable frames on the
 application thread. Pass a `ScatterVideoFrame` directly to `try_submit` when
 the encoder supplies separate header, payload and parameter-set blocks; it
 returns as `QueuedVideoFrame::Scatter`, and `into_blocks()` recovers the original
@@ -189,7 +192,8 @@ destruction. Keep this blocking shutdown off an async executor. See
 ## Custom receive allocation
 
 Use `AllocatorService` when received buffers must come from application memory.
-Construction requires `ndi.process_lifetime()`, which permanently retains an
+Construct it with `AllocatorService::new(ndi.process_lifetime(), &limits)`;
+the process-lifetime runtime permanently retains an
 initialized runtime reference. If this crate is loaded in a plug-in, its module
 must also remain loaded for the process lifetime because the SDK retains
 callback pointers. Applications that do not opt in keep ordinary lifetimes.
@@ -219,7 +223,7 @@ policy. Unrepresentable video and audio requests are declined without allocating
 on the SDK thread.
 
 `AllocatorService::attach_packets` gives packet capture the same application
-buffers. Use `AllocatedPacketReceiver::capture_ref` to inspect those buffers
+buffers. Use `AllocatedPacketReceiver::capture_any_ref` to inspect those buffers
 in place; owned `capture` copies them. Keeping a packet reference retains its
 allocation and usage charge until the SDK releases that buffer after the
 reference is dropped. For example, after constructing `service` and `packets`:
@@ -228,7 +232,7 @@ reference is dropped. For example, after constructing `service` and `packets`:
 let mut receiver = service.attach_packets(packets)?;
 receiver.set_video_allocator(|request| AllocationBuffer::zeroed(request))?;
 if let Some(PacketItemRef::Video(ReceivedVideoRef::Compressed(packet))) =
-    receiver.capture_ref(Duration::from_secs(1))?
+    receiver.capture_any_ref(Duration::from_secs(1))?
 {
     inspect_codec_bytes(packet.data()); // Still in the policy's allocation.
 }
@@ -273,48 +277,17 @@ outstanding SDK allocations still retain their policies. See
 [`advanced_allocator`](../examples/advanced_allocator.rs), including the
 explicit process-lifetime opt-in and padded-stride policy.
 
-### Pool cycle overhead, November 2026
-
-The ignored `custom_allocation_cycle_cost` harness compares buffers constructed
-inside the policy with `from_external` and `from_pool`, plus a preboxed reference.
-It ran 100,000 cycles per case for a 1920×1080 UYVY request, using sixteen aligned
-backing blocks allocated before timing. The same-thread case measures allocation
-through free; the other cases include an eight-entry bounded channel from one
-or four allocating threads to one freeing thread, and measure each allocation's
-start through completed release. Those patterns include queueing and registry
-contention, rather than isolating a function-call cost. The preboxed reference
-prepares its handle before each cycle's clock, excluding both pool claim and
-boxing; it establishes bookkeeping overhead, not an end-to-end policy cost.
-
-The host was Linux x86-64, Intel Xeon w7-2475X, Rust 1.100.0, locked dependencies
-and the default release profile. Concurrent development work shared the host;
-these are two runs' median and 99th-percentile nanoseconds, with no affinity or
-core isolation. Run-to-run variation is visible; they do not establish a general
-timing advantage. Unit tests
-separately establish zero allocations when a pool policy constructs its buffer
-inside the callback, versus one allocation for an arbitrary external handle.
+The ignored allocation-cycle harness compares pool and external-handle paths
+under same-thread and concurrent callback/free workloads:
 
 ```sh
 cargo test --release --locked --features advanced --lib \
   custom_allocation_cycle_cost -- --ignored --nocapture
 ```
 
-| Path | Thread pattern | Median ns, runs 1 / 2 | p99 ns, runs 1 / 2 |
-| --- | --- | ---: | ---: |
-| External | same-thread | 241 / 308 | 281 / 360 |
-| External | one-to-one | 5660 / 6758 | 10711 / 11267 |
-| External | four-to-one | 20224 / 19561 | 49735 / 44490 |
-| Pool | same-thread | 222 / 288 | 500 / 342 |
-| Pool | one-to-one | 5125 / 4900 | 16406 / 11305 |
-| Pool | four-to-one | 19669 / 19793 | 44083 / 42089 |
-| Preboxed | same-thread | 210 / 209 | 248 / 268 |
-| Preboxed | one-to-one | 5581 / 5653 | 10484 / 10341 |
-| Preboxed | four-to-one | 19097 / 19945 | 45143 / 46074 |
-
-The allocation-free pool constructor avoids one global-allocator call and free
-per frame without changing registry locking. Its Arc still incurs reference
-count traffic. Measure representative callback/free concurrency before drawing
-latency or throughput conclusions.
+Measure representative callback/free concurrency before drawing latency or
+throughput conclusions. The [pool-constructor issue](https://github.com/GrantSparks/grafton-ndi/issues/246#issuecomment-6901596756)
+retains the historical measurements and their limits.
 
 ## Synchronization
 
@@ -348,6 +321,10 @@ time. Its shared receiver permits concurrent compatible capture/control work.
 `Genlock` paces a sender from a reference source. Disable the sender's own
 clocking, obtain `clocks()`, then wait on the video/audio clock before sending
 that media. Each wait reports reference or fallback system clock pacing.
+Create it with `Genlock::new(&ndi, &GenlockOptions::new().source(source))`.
+Options expose `config`, `clear_source`, `clear_config` and matching
+`configured_*` readback. `connect_to(&source)` and `disconnect()` change its
+reference after clock views have been released.
 **Waits block without a cancellation or deadline mechanism.** The clocks borrow
 the genlock, preventing a reference change while in use. `Genlock` is `Send`
 but not `Sync`; the two clocks can wait on separate threads. See
@@ -374,7 +351,7 @@ returns a restricted `KvmReceiver<'_, M>` for mode-permitted capture, event poll
 diagnostics, tally, PTZ, metadata and other shared controls while input stays
 held. Borrowed frames can coexist with mutable input calls. Use `split()`
 for simultaneous FrameSync/AVSync output and a session; packet sessions provide
-`capture()` directly. FrameSync and AvSync views retain metadata capture but
+`capture_any()` directly. FrameSync and AvSync views retain metadata capture but
 have no event polling; use capability getters, source-name polling and connection
 queries.
 

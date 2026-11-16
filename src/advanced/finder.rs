@@ -16,7 +16,7 @@ use crate::finder::{decode_source, SnapshotBudget};
 /// A sender advertises metadata by naming it in the `send.metadata` property
 /// of its configuration, and a finder is told it by a Discovery Server.
 ///
-/// Returned by [`Finder::sources_with_metadata`].
+/// Returned by [`Finder::current_sources_with_metadata`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ExtendedSource {
     source: Source,
@@ -124,7 +124,8 @@ impl Finder {
     /// [`crate::Error::ResourceLimit`] when the descriptor count or total work
     /// exceeds the limits of [`Self::current_sources`]. Advertised metadata
     /// is included in that same byte budget, including lossy UTF-8 expansion.
-    pub fn sources_with_metadata(&self) -> Result<Vec<ExtendedSource>> {
+    #[doc(alias = "NDIlib_find_get_current_sources_v2")]
+    pub fn current_sources_with_metadata(&self) -> Result<Vec<ExtendedSource>> {
         let table = self.runtime().table::<SourceMetadata>()?;
         native!(SourceMetadata, table => {
             self.snapshot(table)

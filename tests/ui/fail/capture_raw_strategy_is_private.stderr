@@ -1,24 +1,23 @@
-error[E0432]: unresolved imports `grafton_ndi::FrameFree`, `grafton_ndi::FrameSyncAudioFree`, `grafton_ndi::FrameSyncVideoFree`
- --> tests/ui/fail/capture_raw_strategy_is_private.rs:1:19
+error[E0603]: module `capture` is private
+ --> tests/ui/fail/capture_raw_strategy_is_private.rs:3:18
   |
-1 | use grafton_ndi::{FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
-  |                   ^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^ no `FrameSyncVideoFree` in the root
-  |                   |          |
-  |                   |          no `FrameSyncAudioFree` in the root
-  |                   no `FrameFree` in the root
+3 | use grafton_ndi::capture::{capture_raw, FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
+  |                  ^^^^^^^ private module
   |
-help: a similar name exists in the module
+note: the module `capture` is defined here
+ --> src/lib.rs
   |
-1 - use grafton_ndi::{FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
-1 + use grafton_ndi::{FrameRate, FrameSyncAudioFree, FrameSyncVideoFree};
+  | mod capture;
+  | ^^^^^^^^^^^
+
+error[E0603]: module `capture` is private
+ --> tests/ui/fail/capture_raw_strategy_is_private.rs:3:18
   |
-help: a similar name exists in the module
+3 | use grafton_ndi::capture::{capture_raw, FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
+  |                  ^^^^^^^ private module --------- trait `FrameFree` is not publicly re-exported
   |
-1 - use grafton_ndi::{FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
-1 + use grafton_ndi::{FrameFree, FrameSyncAudioRef, FrameSyncVideoFree};
+note: the module `capture` is defined here
+ --> src/lib.rs
   |
-help: a similar name exists in the module
-  |
-1 - use grafton_ndi::{FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
-1 + use grafton_ndi::{FrameFree, FrameSyncAudioFree, FrameSyncVideoRef};
-  |
+  | mod capture;
+  | ^^^^^^^^^^^

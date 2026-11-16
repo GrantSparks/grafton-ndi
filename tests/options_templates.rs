@@ -1,6 +1,6 @@
 //! External-caller workflows for cloning, retargeting and resetting options.
 use grafton_ndi::{
-    discovery::{AdvertiserOptions, ListenerOptions, RecvAdvertisement},
+    discovery_server::{AdvertiserOptions, ListenerOptions, RecvAdvertisement},
     routing::RouterOptions,
     FinderOptions, ReceiverBandwidth, ReceiverOptions, RuntimeOptions, SenderOptions, Source,
 };
@@ -8,10 +8,10 @@ use grafton_ndi::{
 #[test]
 fn cloned_templates_can_be_retargeted_without_rebuilding_other_settings() {
     let receiver =
-        ReceiverOptions::snapshot_preset(Source::new("Camera A")).name("Multiview input");
+        ReceiverOptions::snapshot_preset(Source::new("Camera A").unwrap()).name("Multiview input");
     let another = receiver
         .clone()
-        .source(Source::new("Camera B"))
+        .source(Source::new("Camera B").unwrap())
         .clear_name();
     assert_eq!(receiver.configured_source().name(), "Camera A");
     assert_eq!(another.configured_source().name(), "Camera B");
@@ -27,7 +27,7 @@ fn cloned_templates_can_be_retargeted_without_rebuilding_other_settings() {
     assert_eq!(another.configured_name(), None);
 
     let sender = SenderOptions::new("Program A")
-        .groups("Studio")
+        .groups(["Studio"])
         .clock_audio(false)
         .clock_video(false);
     let another = sender.clone().name("Program B").clear_groups();
@@ -37,25 +37,30 @@ fn cloned_templates_can_be_retargeted_without_rebuilding_other_settings() {
     assert!(!another.configured_clock_video());
     assert_eq!(another.configured_groups(), None);
 
-    let router = RouterOptions::new("Router A").groups("Studio");
+    let router = RouterOptions::new("Router A").groups(["Studio"]);
     let another = router.clone().name("Router B").clear_groups();
-    assert_eq!(router.configured_groups(), Some("Studio"));
+    assert_eq!(router.configured_groups(), Some(&["Studio".to_owned()][..]));
     assert_eq!(another.configured_name(), "Router B");
     assert_eq!(another.configured_groups(), None);
 }
 
 #[test]
 fn clearing_an_override_restores_none_instead_of_an_empty_override() {
-    let finder = FinderOptions::new().groups("").extra_ips("192.0.2.1");
-    assert_eq!(finder.configured_groups(), Some(""));
+    let finder = FinderOptions::new()
+        .groups([] as [&str; 0])
+        .extra_ips(["192.0.2.1"]);
+    assert_eq!(finder.configured_groups(), Some(&[] as &[String]));
     let inherited = finder.clone().clear_groups().clear_extra_ips();
     assert_eq!(inherited.configured_groups(), None);
     assert_eq!(inherited.configured_extra_ips(), None);
-    assert_eq!(finder.configured_extra_ips(), Some("192.0.2.1"));
+    assert_eq!(
+        finder.configured_extra_ips(),
+        Some(&["192.0.2.1".to_owned()][..])
+    );
 
     assert_eq!(
         AdvertiserOptions::new()
-            .servers("")
+            .servers([] as [&str; 0])
             .clear_servers()
             .configured_servers(),
         None
@@ -73,8 +78,8 @@ fn clearing_an_override_restores_none_instead_of_an_empty_override() {
         .input_group("Camera A");
     let ungrouped = advertisement.clear_input_group();
     assert_eq!(ungrouped.configured_input_group(), None);
-    assert!(ungrouped.configured_monitoring());
-    assert!(ungrouped.configured_controlling());
+    assert!(ungrouped.configured_allow_monitoring());
+    assert!(ungrouped.configured_allow_controlling());
 
     let runtime = RuntimeOptions::new()
         .library_path("/opt/ndi/libndi.so")
@@ -95,7 +100,7 @@ fn advanced_config_overrides_can_be_removed_from_reused_templates() {
         .clear_config()
         .configured_config()
         .is_none());
-    assert!(ReceiverOptions::new(Source::new("Camera"))
+    assert!(ReceiverOptions::new(Source::new("Camera").unwrap())
         .config(config.clone())
         .clear_config()
         .configured_config()
@@ -140,15 +145,15 @@ fn advanced_config_overrides_can_be_removed_from_reused_templates() {
 #[test]
 fn file_templates_can_retarget_sources_names_and_inherited_settings() {
     use grafton_ndi::file::{
-        FileNaming, FileRuntimeOptions, PlayerOptions, RecorderOptions, SourceSpec,
+        FileApiOptions, FileNaming, FilePlayerOptions, FileRecorderOptions, SourceSpec,
     };
-    let player = PlayerOptions::new("Player A").groups("Studio");
+    let player = FilePlayerOptions::new("Player A").groups(["Studio"]);
     let renamed = player.clone().name("Player B").clear_groups();
     assert_eq!(renamed.configured_name(), "Player B");
     assert_eq!(renamed.configured_groups(), None);
-    assert_eq!(player.configured_groups(), Some("Studio"));
+    assert_eq!(player.configured_groups(), Some(&["Studio".to_owned()][..]));
 
-    let recorder = RecorderOptions::new(SourceSpec::new("Camera A").unwrap())
+    let recorder = FileRecorderOptions::new(SourceSpec::new("Camera A").unwrap())
         .format_change_rollover(true)
         .proxy(false);
     let retargeted = recorder
@@ -161,7 +166,7 @@ fn file_templates_can_retarget_sources_names_and_inherited_settings() {
     assert!(!retargeted.configured_proxy());
     assert_eq!(recorder.configured_source().name(), Some("Camera A"));
 
-    let runtime = FileRuntimeOptions::new()
+    let runtime = FileApiOptions::new()
         .library_path("/opt/ndi/libndi-file.so")
         .clear_library_path();
     assert_eq!(runtime.configured_library_path(), None);
@@ -170,7 +175,7 @@ fn file_templates_can_retarget_sources_names_and_inherited_settings() {
 #[cfg(feature = "image-encoding")]
 #[test]
 fn image_templates_can_change_format_and_retain_processing_choices() {
-    use grafton_ndi::{AlphaMode, Downscale, ImageFormat, ImageOptions};
+    use grafton_ndi::image_encoding::{AlphaMode, Downscale, ImageFormat, ImageOptions};
     let png = ImageOptions::new(ImageFormat::Png)
         .alpha(AlphaMode::Discard)
         .downscale(Downscale::Quarter);

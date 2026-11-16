@@ -109,7 +109,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
     // A sender may expose only its name. Discover its actual port and route
     // the media over loopback, as the integration transport tests do.
     let name = sender.source().unwrap().name().to_owned();
-    let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
+    let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips(["127.0.0.1"])).unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut watch = finder.watch();
     let source = 'found: loop {
@@ -118,7 +118,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
                 if let Some(address) = source.address().filter(|address| !address.is_url()) {
                     let address = address.as_str();
                     let port = address.rsplit(':').next().unwrap();
-                    let endpoint = SourceAddress::new(format!("127.0.0.1:{port}"));
+                    let endpoint = SourceAddress::new(format!("127.0.0.1:{port}")).unwrap();
                     break 'found source.with_address(endpoint);
                 }
             }
@@ -131,7 +131,10 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
     };
     let receiver =
         PacketReceiver::new(&ndi, &ReceiverOptions::new(source), PassthroughPreset::H264).unwrap();
-    assert!(sender.connection_count(Duration::from_secs(15)).unwrap() > 0);
+    assert!(sender
+        .wait_for_connection(Duration::from_secs(15))
+        .unwrap()
+        .is_some());
     for number in 8..25 {
         submit(number, &mut frames, &mut expected);
     }

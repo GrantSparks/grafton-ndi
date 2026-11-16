@@ -11,10 +11,51 @@ unsafe fn count_free<I, F>(_: I, _: &mut F) {
     FREES.with(|count| count.set(count.get() + 1));
 }
 
+trait VideoTest: FrameFree<RawFrame = NDIlib_video_frame_v2_t> + Sized {
+    type Ref<'a>: VideoSource;
+    fn wrap<'a>(guard: Guard<'a, Self>) -> Result<Self::Ref<'a>>;
+}
+impl VideoTest for VideoKind {
+    type Ref<'a> = VideoFrameRef<'a>;
+    fn wrap<'a>(guard: Guard<'a, Self>) -> Result<Self::Ref<'a>> {
+        VideoFrameRef::new(guard)
+    }
+}
+impl VideoTest for FrameSyncVideoFree {
+    type Ref<'a> = FrameSyncVideoRef<'a>;
+    fn wrap<'a>(guard: Guard<'a, Self>) -> Result<Self::Ref<'a>> {
+        FrameSyncVideoRef::new(guard)
+    }
+}
+trait AudioTest: FrameFree<RawFrame = NDIlib_audio_frame_v3_t> + Sized {
+    type Ref<'a>: AudioSource;
+    fn wrap<'a>(guard: Guard<'a, Self>) -> Result<Self::Ref<'a>>;
+}
+impl AudioTest for AudioKind {
+    type Ref<'a> = AudioFrameRef<'a>;
+    fn wrap<'a>(guard: Guard<'a, Self>) -> Result<Self::Ref<'a>> {
+        AudioFrameRef::new(guard)
+    }
+}
+impl AudioTest for FrameSyncAudioFree {
+    type Ref<'a> = FrameSyncAudioRef<'a>;
+    fn wrap<'a>(guard: Guard<'a, Self>) -> Result<Self::Ref<'a>> {
+        FrameSyncAudioRef::new(guard)
+    }
+}
+#[cfg(feature = "advanced")]
+impl AudioTest for AvSyncAudioFree {
+    type Ref<'a> = AvSyncAudioRef<'a>;
+    fn wrap<'a>(guard: Guard<'a, Self>) -> Result<Self::Ref<'a>> {
+        Ok(AvSyncAudioRef::from_validated(ValidatedAudio::audio(
+            guard,
+        )?))
+    }
+}
+
 fn video<S>(metadata: *const c_char, status: FrameMetadataStatus)
 where
-    S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>,
-    for<'a> VideoRef<'a, S>: VideoSource,
+    S: VideoTest,
     S::Instance: Default,
 {
     FREES.with(|count| count.set(0));
@@ -36,7 +77,7 @@ where
         // SAFETY: pixels and metadata stay live until this synthetic guard is
         // released. The callback counts release without freeing borrowed data.
         unsafe {
-            VideoRef::<S>::new(Guard::with_test_free(
+            S::wrap(Guard::with_test_free(
                 S::Instance::default(),
                 raw,
                 count_free,
@@ -122,7 +163,7 @@ where
     };
     // SAFETY: invalid media is rejected before reading pixels; metadata stays live.
     let result = unsafe {
-        VideoRef::<S>::new(Guard::with_test_free(
+        S::wrap(Guard::with_test_free(
             S::Instance::default(),
             invalid,
             count_free,
@@ -134,8 +175,7 @@ where
 
 fn audio<S>(metadata: *const c_char, status: FrameMetadataStatus)
 where
-    S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>,
-    for<'a> AudioRef<'a, S>: AudioSource,
+    S: AudioTest,
     S::Instance: Default,
 {
     FREES.with(|count| count.set(0));
@@ -156,7 +196,7 @@ where
         // SAFETY: samples and metadata remain live until release; the callback
         // counts release without freeing these borrowed allocations.
         unsafe {
-            AudioRef::<S>::from_guard(Guard::with_test_free(
+            S::wrap(Guard::with_test_free(
                 S::Instance::default(),
                 raw,
                 count_free,
@@ -233,7 +273,7 @@ where
     };
     // SAFETY: invalid media is rejected before reading samples; metadata stays live.
     let result = unsafe {
-        AudioRef::<S>::from_guard(Guard::with_test_free(
+        S::wrap(Guard::with_test_free(
             S::Instance::default(),
             invalid,
             count_free,
@@ -312,11 +352,11 @@ fn withheld_video_color_is_refused_on_receiver_framesync_and_owned_frames() {
             ..Default::default()
         };
         macro_rules! check {
-            ($kind:ty) => {{
+            ($name:ident) => {{
                 // SAFETY: the pixels and bounded metadata buffers remain live
                 // and unchanged until the guard drops; release only counts.
                 let frame = unsafe {
-                    VideoRef::<$kind>::new(Guard::with_test_free(ptr::null_mut(), raw, count_free))
+                    $name::new(Guard::with_test_free(ptr::null_mut(), raw, count_free))
                         .unwrap()
                 };
                 let mut owned = frame.to_owned();
@@ -333,25 +373,25 @@ fn withheld_video_color_is_refused_on_receiver_framesync_and_owned_frames() {
                 assert!(matches!(owned.color_info(), Err(Error::InvalidFrame(_))));
                 #[cfg(feature = "image-encoding")]
                 {
-                    assert!(matches!(frame.encode_png(), Err(Error::InvalidFrame(_))));
-                    assert!(matches!(owned.encode_png(), Err(Error::InvalidFrame(_))));
-                    let options = crate::ImageOptions::new(crate::ImageFormat::Png).color(
-                        crate::ColorPolicy::Override {
+                    assert!(matches!(frame.encode_image(&crate::image_encoding::ImageOptions::new(crate::image_encoding::ImageFormat::Png)), Err(Error::InvalidFrame(_))));
+                    assert!(matches!(owned.encode_image(&crate::image_encoding::ImageOptions::new(crate::image_encoding::ImageFormat::Png)), Err(Error::InvalidFrame(_))));
+                    let options = crate::image_encoding::ImageOptions::new(crate::image_encoding::ImageFormat::Png).color(
+                        crate::image_encoding::ColorPolicy::Override {
                             matrix: crate::YuvMatrix::Bt709,
-                            range: crate::YuvRange::Limited,
+                            range: crate::image_encoding::YuvRange::Limited,
                         },
                     );
                     assert_eq!(
                         frame.encode_image(&options).unwrap(),
                         owned.encode_image(&options).unwrap()
                     );
-                    let mut workspace = crate::ImageWorkspace::new();
+                    let mut workspace = crate::image_encoding::ImageWorkspace::new();
                     let mut output = Vec::new();
                     for source in [&frame as &dyn VideoSource, &owned] {
                         assert!(matches!(
                             workspace.encode_to(
                                 source,
-                                &crate::ImageOptions::new(crate::ImageFormat::Png),
+                                &crate::image_encoding::ImageOptions::new(crate::image_encoding::ImageFormat::Png),
                                 &mut output,
                             ),
                             Err(Error::InvalidFrame(_))
@@ -377,8 +417,8 @@ fn withheld_video_color_is_refused_on_receiver_framesync_and_owned_frames() {
                 );
             }};
         }
-        check!(VideoKind);
-        check!(FrameSyncVideoFree);
+        check!(VideoFrameRef);
+        check!(FrameSyncVideoRef);
     }
 }
 
@@ -516,7 +556,7 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
 fn audio_timestamp_normalization_depends_on_the_capture_family() {
     fn check<S>(ticks: i64, expected: Option<SdkTimestamp>)
     where
-        S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>,
+        S: AudioTest,
         S::Instance: Default,
     {
         let mut samples = [0.25f32; 4];
@@ -536,7 +576,7 @@ fn audio_timestamp_normalization_depends_on_the_capture_family() {
         // SAFETY: the guard borrows these live initialized samples; release
         // only updates the counter and does not free their borrowed storage.
         let frame = unsafe {
-            AudioRef::<S>::from_guard(Guard::with_test_free(
+            S::wrap(Guard::with_test_free(
                 S::Instance::default(),
                 raw,
                 count_free,

@@ -29,7 +29,7 @@ fn main() -> Result<(), Error> {
     println!("Searching for NDI sources...");
     // Allow the full discovery window for late sources before taking metadata.
     finder.find_sources(Duration::from_secs(5))?;
-    let sources = finder.sources_with_metadata()?;
+    let sources = finder.current_sources_with_metadata()?;
     if sources.is_empty() {
         println!("No NDI sources found!");
     }

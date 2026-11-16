@@ -1,3 +1,5 @@
+//! Port of SDK sample `NDIlib_Recv_PNG`.
+//!
 //! Example: Receiving NDI video and saving a frame as PNG.
 //!
 //! This example demonstrates receiving a video frame from the first
@@ -7,22 +9,25 @@
 //!
 //! IMPORTANT: This example demonstrates:
 //!
-//! 1. Using `receiver.video().capture_ref()` for reliable frame capture with
+//! 1. Using `receiver.capture_video_ref()` for reliable frame capture with
 //!    automatic retry logic (handles NDI SDK timeout quirks internally)
-//! 2. `VideoFrameRef::encode_png()` for crate-provided image conversion, which
+//! 2. `VideoFrameRef::encode_image(&ImageOptions::new(ImageFormat::Png))` for crate-provided image conversion, which
 //!    handles RGBX/BGRX padding bytes and padded rows
 //!
-//! Run with: `cargo run --features image-encoding --example NDIlib_Recv_PNG`
+//! Run with: `cargo run --features image-encoding --example receive_png`
 //!
 //! The `image-encoding` feature is off by default and this example needs it.
 //!
 //! Optional arguments:
-//! - IP address to search: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- 192.168.0.100`
-//! - Multiple IPs: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- 192.168.0.100 10.0.0.0/24`
-//! - Custom output file: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- --output MyImage.png`
-//! - Both: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
+//! - IP address to search: `cargo run --features image-encoding --example receive_png -- 192.168.0.100`
+//! - Multiple IPs: `cargo run --features image-encoding --example receive_png -- 192.168.0.100 10.0.0.0/24`
+//! - Custom output file: `cargo run --features image-encoding --example receive_png -- --output MyImage.png`
+//! - Both: `cargo run --features image-encoding --example receive_png -- 192.168.0.100 --output MyImage.png`
 
-use grafton_ndi::{Ndi, Receiver, ReceiverColorFormat, ReceiverOptions};
+use grafton_ndi::{
+    image_encoding::{ImageFormat, ImageOptions},
+    Ndi, Receiver, ReceiverColorFormat, ReceiverOptions,
+};
 
 use std::{
     env, fs,
@@ -85,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Waiting for video frames...\n");
 
     let start_time = Instant::now();
-    let Some(video_frame) = receiver.video().capture_ref(Duration::from_secs(60))? else {
+    let Some(video_frame) = receiver.capture_video_ref(Duration::from_secs(60))? else {
         return Err("no video frame arrived within 60 seconds".into());
     };
 
@@ -115,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Timecode: {timecode:016x}");
 
     println!("\nSaving frame as PNG...");
-    let png_bytes = video_frame.encode_png()?;
+    let png_bytes = video_frame.encode_image(&ImageOptions::new(ImageFormat::Png))?;
     fs::write(&output_file, png_bytes)?;
 
     println!("✓ Saved frame as {output_file}");

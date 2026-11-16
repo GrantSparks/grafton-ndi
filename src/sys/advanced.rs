@@ -7,7 +7,7 @@
 use super::{bindings::NDIlib_recv_color_format_e, table::Resolver, Evidence, Table};
 use crate::{
     advanced::PassthroughPreset,
-    capabilities::{Capabilities, CapabilityRefusal, RuntimeFeature},
+    capabilities::{Capabilities, Capability, CapabilityRefusal, RuntimeFeature},
     LoadRefusal, Result,
 };
 use std::ffi::CStr;
@@ -33,6 +33,15 @@ pub(crate) use super::advanced_bindings::NDIlib_genlock_instance_t as GenlockHan
 /// Compile a native expression only when its entire declaration family exists.
 /// Otherwise its table is uninhabited, proving the expression unreachable.
 macro_rules! native {
+    ($Family:ident, $table:expr, uses($($binding:ident),* $(,)?) => $body:expr) => {
+        $crate::sys::advanced::declared! { $Family {{
+            let _: &'static $crate::sys::advanced::$Family = $table;
+            $body
+        }} else {{
+            let _ = ($(&$binding,)*);
+            match *$table {}
+        }}}
+    };
     ($Family:ident, $table:expr => $body:expr) => {
         $crate::sys::advanced::declared! { $Family {{
             let _: &'static $crate::sys::advanced::$Family = $table;
@@ -273,7 +282,7 @@ impl Evidence<'_> {
         self.capabilities
             .passthrough_format(preset)
             .map_err(|refusal| crate::Error::UnsupportedCapability {
-                feature: RuntimeFeature::Passthrough(preset),
+                capability: Capability::Runtime(RuntimeFeature::Passthrough(preset)),
                 refusal,
             })
     }

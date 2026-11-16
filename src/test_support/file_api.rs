@@ -13,9 +13,9 @@ use super::{
 /// [`Requirement::File`]; every other File-loading error fails the test.
 #[cfg(feature = "file-io")]
 pub fn file_api() -> Option<(Ndi, super::api::file::FileApi)> {
-    use super::api::file::{FileApi, FileRuntimeOptions};
+    use super::api::file::{FileApi, FileApiOptions};
     let ndi = ndi()?;
-    match FileApi::open(&ndi, &FileRuntimeOptions::default()) {
+    match FileApi::new(&ndi, &FileApiOptions::default()) {
         Ok(api) => Some((ndi, api)),
         Err(Error::RuntimeLoadFailed(reason)) if !reason.loaded_any() => {
             skip(

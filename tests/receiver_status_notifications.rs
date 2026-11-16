@@ -44,7 +44,7 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
         let options = ReceiverOptions::new(source);
         let media = Receiver::new(&ndi, &options)?;
         wait_until("initial receiver connection", || media.is_connected());
-        while media.poll_event(Duration::from_millis(50))?.is_some() {}
+        while media.next_event(Duration::from_millis(50))?.is_some() {}
         assert!(!media.ptz().is_supported());
         // Exercise two distinct capability invalidations using the SDK's
         // Send_VirtualPTZ / Send_Capabilities XML conventions. Capability flag
@@ -87,24 +87,24 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
                 Duration::from_secs(3)
             };
             match kind {
-                0 => assert!(media.video().capture(poll_timeout)?.is_none()),
-                1 => assert!(media.video().capture_ref(poll_timeout)?.is_none()),
-                2 => assert!(media.audio().capture(poll_timeout)?.is_none()),
+                0 => assert!(media.capture_video(poll_timeout)?.is_none()),
+                1 => assert!(media.capture_video_ref(poll_timeout)?.is_none()),
+                2 => assert!(media.capture_audio(poll_timeout)?.is_none()),
                 3 => {
                     // SDK 6.3 can also deliver capability XML as ordinary
                     // metadata. Consume those valid frames until the status/no-
                     // frame result, rather than assuming a frameless stream.
                     let deadline = Instant::now() + Duration::from_secs(10);
-                    while media.metadata().capture(poll_timeout)?.is_some() {
+                    while media.capture_metadata(poll_timeout)?.is_some() {
                         assert!(Instant::now() < deadline, "metadata queue did not drain");
                     }
                 }
-                4 => assert!(media.video().capture(retry_timeout)?.is_none()),
+                4 => assert!(media.capture_video(retry_timeout)?.is_none()),
                 _ => std::thread::scope(|scope| {
                     let workers: Vec<_> = (0..3)
                         .map(|_| {
                             scope.spawn(|| {
-                                assert!(media.video().capture(poll_timeout).unwrap().is_none());
+                                assert!(media.capture_video(poll_timeout).unwrap().is_none());
                             })
                         })
                         .collect();
@@ -115,14 +115,14 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
             }
             assert!(
                 matches!(
-                    media.poll_event(Duration::ZERO)?,
+                    media.next_event(Duration::ZERO)?,
                     Some(ReceiverEvent::StatusChanged(_))
                 ),
                 "capture kind {kind} lost status"
             );
             assert!(
                 !matches!(
-                    media.poll_event(Duration::ZERO)?,
+                    media.next_event(Duration::ZERO)?,
                     Some(ReceiverEvent::StatusChanged(_))
                 ),
                 "notification replayed"

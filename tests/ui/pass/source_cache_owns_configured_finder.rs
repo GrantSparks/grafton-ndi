@@ -5,7 +5,7 @@ fn cache_contract<T: Send + Sync + 'static>() {}
 
 fn configured(finder: Finder) -> Result<()> {
     let cache = SourceCache::new(finder);
-    let _: Vec<Source> = cache.sources_by_host("studio.local", Duration::ZERO)?;
+    let _: Vec<Source> = cache.find_sources_by_host("studio.local", Duration::ZERO)?;
     cache.invalidate("STUDIO.LOCAL.");
     cache.clear();
     assert!(cache.is_empty());

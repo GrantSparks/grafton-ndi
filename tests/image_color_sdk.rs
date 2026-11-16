@@ -24,9 +24,10 @@ mod helpers;
 common_helpers!(runtime, name, unsupported, loopback);
 
 use grafton_ndi::{
-    capabilities::SdkEdition, ColorInfo, ColorPolicy, Error, FrameSync, ImageFormat, ImageOptions,
-    Ndi, PixelFormat, Receiver, ReceiverColorFormat, ReceiverOptions, ScanType, Sender,
-    SenderOptions, VideoFrame, YuvMatrix, YuvRange,
+    capabilities::SdkEdition,
+    image_encoding::{ColorPolicy, ImageFormat, ImageOptions, YuvRange},
+    ColorInfo, Error, FrameSync, Ndi, PixelFormat, Receiver, ReceiverColorFormat, ReceiverOptions,
+    ScanType, Sender, SenderOptions, VideoFrame, YuvMatrix,
 };
 use std::{
     sync::atomic::{AtomicBool, Ordering},
@@ -138,7 +139,7 @@ fn round_trip(
                 .unwrap();
                 collect(
                     frames,
-                    |timeout| receiver.video().capture(timeout).unwrap(),
+                    |timeout| receiver.capture_video(timeout).unwrap(),
                     &format!("{label} {format:?}"),
                 )
             })
@@ -370,7 +371,11 @@ fn the_sdk_converts_with_bt709_at_every_size_whatever_the_tag_says() {
                 "{case}: the SDK's RGB differs from BT.709 by up to {largest}, {mean:.2} on average"
             );
             // The default policy follows a tag and otherwise takes BT.709.
-            let default = uyvy.encode_png().unwrap();
+            let default = uyvy
+                .encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+                    grafton_ndi::image_encoding::ImageFormat::Png,
+                ))
+                .unwrap();
             if sent
                 .color_info()
                 .unwrap()
@@ -447,7 +452,13 @@ fn the_sdk_repeats_chroma_into_rgb_and_from_4_2_0() {
     // 4:2:2 to RGB: every pixel takes its own block's color, in the SDK's
     // RGB and in the encoder's, which stay within the measured gap.
     let sdk = frame_rgb(&received[0][0]);
-    let encoder = png_rgb(&uyvy.encode_png().unwrap());
+    let encoder = png_rgb(
+        &uyvy
+            .encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+                grafton_ndi::image_encoding::ImageFormat::Png,
+            ))
+            .unwrap(),
+    );
     // The SDK's fixed-point conversion alternates by one code between even
     // and odd pixels; a blend would sit far between the two colors.
     for (rgb, tolerance, whose) in [(&sdk, 1, "the SDK's"), (&encoder, 0, "the encoder's")] {
@@ -570,7 +581,9 @@ fn a_pq_tag_reaches_rgb_receivers_and_their_frames_are_refused() {
         .expect("the PQ tag reaches the RGB receiver");
     assert_eq!(Some(info), p216.color_info().unwrap());
     assert!(info.is_hdr());
-    match rgbx.encode_png() {
+    match rgbx.encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+        grafton_ndi::image_encoding::ImageFormat::Png,
+    )) {
         Err(Error::InvalidFrame(message)) => assert!(
             matches!(
                 message,
@@ -616,10 +629,27 @@ fn framesync_frames_encode_like_the_frames_sent() {
             assert!(Instant::now() < deadline, "FrameSync delivered no frame");
             if let Some(frame) = framesync.capture_video_ref(ScanType::Progressive).unwrap() {
                 if (frame.width(), frame.metadata()) == (320, sent.metadata()) {
-                    assert_eq!(frame.encode_png().unwrap(), sent.encode_png().unwrap());
                     assert_eq!(
-                        frame.encode_jpeg(85).unwrap(),
-                        sent.encode_jpeg(85).unwrap()
+                        frame
+                            .encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+                                grafton_ndi::image_encoding::ImageFormat::Png
+                            ))
+                            .unwrap(),
+                        sent.encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+                            grafton_ndi::image_encoding::ImageFormat::Png
+                        ))
+                        .unwrap()
+                    );
+                    assert_eq!(
+                        frame
+                            .encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+                                grafton_ndi::image_encoding::ImageFormat::Jpeg(85)
+                            ))
+                            .unwrap(),
+                        sent.encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+                            grafton_ndi::image_encoding::ImageFormat::Jpeg(85)
+                        ))
+                        .unwrap()
                     );
                     break;
                 }

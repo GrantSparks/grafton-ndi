@@ -165,7 +165,12 @@ mod send_slots;
                 let source = include_str!("../sender.rs");
                 let start = source.find("pub(crate) struct LoanPair<").unwrap();
                 let tail = &source[start..];
-                let end = tail.find("    #[cfg(feature = \"advanced\")]\n    impl<'a> LoanPair<'a, crate::CompressedAttached").unwrap();
+                // Find the specialized mode, then its gating attribute;
+                // rustfmt may place the impl header on several lines.
+                let specialized = tail.find("crate::advanced::CompressedAttached").unwrap();
+                let end = tail[..specialized]
+                    .rfind("#[cfg(feature = \"advanced\")]")
+                    .unwrap();
                 tail[..end].replace("#[cfg(feature = \"advanced\")]", "")
             },
             completion = {

@@ -8,5 +8,5 @@ error[E0597]: `receiver` does not live long enough
 16 |         receiver
    |         ^^^^^^^^ borrowed value does not live long enough
 ...
-21 |     };
+20 |     };
    |     - `receiver` dropped here while still borrowed

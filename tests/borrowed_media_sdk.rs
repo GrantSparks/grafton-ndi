@@ -47,8 +47,7 @@ fn video(sender: &Sender, receiver: &Receiver, source: &impl VideoSource, expect
     loop {
         sender.send_video(source).unwrap();
         if let Some(frame) = receiver
-            .video()
-            .capture_ref(Duration::from_millis(100))
+            .capture_video_ref(Duration::from_millis(100))
             .unwrap()
         {
             assert_eq!(
@@ -57,8 +56,8 @@ fn video(sender: &Sender, receiver: &Receiver, source: &impl VideoSource, expect
             );
             assert_eq!(frame.frame_rate(), expected.frame_rate());
             assert_eq!(
-                frame.picture_aspect_ratio(),
-                expected.picture_aspect_ratio()
+                frame.picture_aspect_ratio().get(),
+                expected.picture_aspect_ratio().get()
             );
             assert_eq!(frame.scan_type(), expected.scan_type());
             assert_eq!(frame.timecode(), expected.timecode());
@@ -150,8 +149,7 @@ fn audio(
     loop {
         sender.send_audio(source);
         if let Some(frame) = receiver
-            .audio()
-            .capture_ref(Duration::from_millis(100))
+            .capture_audio_ref(Duration::from_millis(100))
             .unwrap()
         {
             assert_eq!(frame.sample_rate(), expected.sample_rate());
@@ -191,7 +189,7 @@ fn receiver_and_framesync_captures_forward_and_convert_without_owned_adapters() 
     let mut pixels = VideoFrame::builder()
         .resolution(66, 48)
         .frame_rate(FrameRate::new(30_000, 1_001).unwrap())
-        .picture_aspect_ratio(1.25)
+        .picture_aspect_ratio(grafton_ndi::PictureAspectRatio::new(1.25).unwrap())
         .timecode(Timecode::from_ticks(123_456))
         .metadata("<relay-video/>")
         .build()
@@ -219,15 +217,13 @@ fn receiver_and_framesync_captures_forward_and_convert_without_owned_adapters() 
         });
         let _stop = Stop(&stop);
         let frame = input
-            .video()
-            .capture_ref(Duration::from_secs(10))
+            .capture_video_ref(Duration::from_secs(10))
             .unwrap()
             .unwrap();
         video(&relay, &output, &frame, &frame.to_owned());
         drop(frame);
         let frame = input
-            .audio()
-            .capture_ref(Duration::from_secs(10))
+            .capture_audio_ref(Duration::from_secs(10))
             .unwrap()
             .unwrap();
         audio(&relay, &output, &converter, &frame, &frame.to_owned());

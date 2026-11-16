@@ -1,5 +1,5 @@
 use grafton_ndi::{
-    discovery::{RecvAdvertiser, RecvListener, SendAdvertiser, SendListener},
+    discovery_server::{RecvAdvertiser, RecvListener, SendAdvertiser, SendListener},
     routing::Router,
 };
 fn assert_send<T: Send>() {}

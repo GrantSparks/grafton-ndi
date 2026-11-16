@@ -1,10 +1,10 @@
-error[E0599]: the method `video` exists for reference `&grafton_ndi::Receiver<PacketAttached>`, but its trait bounds were not satisfied
+error[E0599]: the method `capture_video` exists for reference `&grafton_ndi::Receiver<PacketAttached>`, but its trait bounds were not satisfied
  --> tests/ui/advanced/fail/packet_receiver_has_no_frame_or_event_capture.rs:6:32
   |
-6 |     let _ = packets.receiver().video();
-  |                                ^^^^^ method cannot be called on `&grafton_ndi::Receiver<PacketAttached>` due to unsatisfied trait bounds
+6 |     let _ = packets.receiver().capture_video(Duration::ZERO);
+  |                                ^^^^^^^^^^^^^ method cannot be called on `&grafton_ndi::Receiver<PacketAttached>` due to unsatisfied trait bounds
   |
- ::: src/receiver.rs
+ ::: src/advanced/mod.rs
   |
   | pub enum PacketAttached {}
   | ----------------------- doesn't satisfy `PacketAttached: VideoMode`
@@ -12,27 +12,27 @@ error[E0599]: the method `video` exists for reference `&grafton_ndi::Receiver<Pa
   = note: the following trait bounds were not satisfied:
           `PacketAttached: VideoMode`
 
-error[E0599]: the method `audio` exists for reference `&grafton_ndi::Receiver<PacketAttached>`, but its trait bounds were not satisfied
+error[E0599]: the method `capture_audio` exists for reference `&grafton_ndi::Receiver<PacketAttached>`, but its trait bounds were not satisfied
  --> tests/ui/advanced/fail/packet_receiver_has_no_frame_or_event_capture.rs:7:32
   |
-7 |     let _ = packets.receiver().audio();
-  |                                ^^^^^ method cannot be called on `&grafton_ndi::Receiver<PacketAttached>` due to unsatisfied trait bounds
+7 |     let _ = packets.receiver().capture_audio(Duration::ZERO);
+  |                                ^^^^^^^^^^^^^ method cannot be called on `&grafton_ndi::Receiver<PacketAttached>` due to unsatisfied trait bounds
   |
- ::: src/receiver.rs
+ ::: src/advanced/mod.rs
   |
   | pub enum PacketAttached {}
-  | ----------------------- doesn't satisfy `PacketAttached: MetadataMode`
+  | ----------------------- doesn't satisfy `PacketAttached: AudioMode`
   |
   = note: the following trait bounds were not satisfied:
-          `PacketAttached: MetadataMode`
+          `PacketAttached: AudioMode`
 
-error[E0599]: the method `metadata` exists for reference `&grafton_ndi::Receiver<PacketAttached>`, but its trait bounds were not satisfied
+error[E0599]: the method `capture_metadata` exists for reference `&grafton_ndi::Receiver<PacketAttached>`, but its trait bounds were not satisfied
  --> tests/ui/advanced/fail/packet_receiver_has_no_frame_or_event_capture.rs:8:32
   |
-8 |     let _ = packets.receiver().metadata();
-  |                                ^^^^^^^^
+8 |     let _ = packets.receiver().capture_metadata(Duration::ZERO);
+  |                                ^^^^^^^^^^^^^^^^ method cannot be called on `&grafton_ndi::Receiver<PacketAttached>` due to unsatisfied trait bounds
   |
- ::: src/receiver.rs
+ ::: src/advanced/mod.rs
   |
   | pub enum PacketAttached {}
   | ----------------------- doesn't satisfy `PacketAttached: MetadataMode`
@@ -40,13 +40,13 @@ error[E0599]: the method `metadata` exists for reference `&grafton_ndi::Receiver
   = note: the following trait bounds were not satisfied:
           `PacketAttached: MetadataMode`
 
-error[E0599]: the method `poll_event` exists for reference `&grafton_ndi::Receiver<PacketAttached>`, but its trait bounds were not satisfied
+error[E0599]: the method `next_event` exists for reference `&grafton_ndi::Receiver<PacketAttached>`, but its trait bounds were not satisfied
  --> tests/ui/advanced/fail/packet_receiver_has_no_frame_or_event_capture.rs:9:32
   |
-9 |     let _ = packets.receiver().poll_event(Duration::ZERO);
+9 |     let _ = packets.receiver().next_event(Duration::ZERO);
   |                                ^^^^^^^^^^ method cannot be called on `&grafton_ndi::Receiver<PacketAttached>` due to unsatisfied trait bounds
   |
- ::: src/receiver.rs
+ ::: src/advanced/mod.rs
   |
   | pub enum PacketAttached {}
   | ----------------------- doesn't satisfy `PacketAttached: EventMode`

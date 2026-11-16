@@ -33,7 +33,8 @@ remove the other runtime's direct link or preload. Matching its version or
 edition does not make two different runtime modules interchangeable. A Standard
 runtime in scope also prevents selecting a separate Advanced runtime.
 
-For `UnsupportedCapability`, inspect its feature and typed `refusal` (`reason()` gives its category), then check
+For `UnsupportedCapability`, inspect its `capability` (`Runtime(feature)` or
+`File(family)`) and typed `refusal` (`reason()` gives its category), then check
 [runtime capabilities](setup.md#runtime-capabilities). A Cargo feature, SDK
 edition or exported entry point alone does not establish hardware support or
 license entitlement.
@@ -51,7 +52,7 @@ Advertisers and listeners require NDI 6.4 or later; the wrapper rejects older
 versions. For deployment testing, exercise advertiser handover, server startup
 and reconnection, listener teardown, and receiver connection changes. Avoid
 rapid re-registration of the same source, and keep the server reachable during
-these operations. See the [Discovery Server API](https://grantsparks.github.io/grafton-ndi/grafton_ndi/discovery/index.html).
+these operations. See the [Discovery Server API](https://grantsparks.github.io/grafton-ndi/grafton_ndi/discovery_server/index.html).
 
 ## Receiving and sending
 

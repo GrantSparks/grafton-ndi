@@ -65,7 +65,31 @@ mod send;
 mod send_slots;
 mod sync;
 
-pub use crate::receiver::{AvSyncAttached, PacketAttached};
+/// Receiver mode held by [`PacketReceiver`], with the common controls only.
+/// Packet capture reserves video, audio, metadata and event capture for its owner.
+#[derive(Debug)]
+pub enum PacketAttached {}
+
+/// Receiver mode held by [`AvSync`], which reserves audio for synchronization.
+/// Video, metadata and common controls remain available through its receiver.
+/// Query capabilities, [`crate::Receiver::wait_for_source_name_change`] and
+/// connection statistics because synchronization may consume notifications.
+#[derive(Debug)]
+pub enum AvSyncAttached {}
+
+/// Sender mode held exclusively by [`CompressedSender`].
+/// Video submission belongs to the wrapper; audio goes through its sender.
+#[derive(Debug)]
+pub enum CompressedAttached {}
+
+/// Sender mode held exclusively by [`QueuedSender`].
+/// It submits video and sends both uncompressed and compressed audio.
+#[derive(Debug)]
+pub enum QueueAttached {}
+
+/// Sealed sender modes that send compressed audio: compressed and queued.
+/// Their constructors require an Advanced runtime.
+pub trait CompressedAudioSendMode: crate::sender::SenderMode {}
 pub use allocators::*;
 pub use config::AdvancedConfig;
 pub(crate) use configured::Configurable;

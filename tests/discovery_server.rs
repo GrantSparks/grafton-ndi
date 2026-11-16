@@ -14,7 +14,7 @@ common_helpers!(runtime, prerequisites, name, discovery_server);
 
 use grafton_ndi::{
     capabilities::RuntimeFeature,
-    discovery::{
+    discovery_server::{
         AdvertisedReceiver, AdvertiserOptions, ListenerOptions, ReceiverCommand, RecvAdvertisement,
         RecvAdvertiser, RecvListener, SendAdvertisement, SendAdvertiser, SendListener,
     },
@@ -91,7 +91,7 @@ fn sender(ndi: &Ndi, label: &str) -> Sender {
 
 /// A receiver named `label`, made unique to this process like a [`sender`].
 fn receiver(ndi: &Ndi, label: &str) -> Receiver {
-    let options = ReceiverOptions::new(Source::new("")).name(common::unique_name(label));
+    let options = ReceiverOptions::new(Source::new("").unwrap()).name(common::unique_name(label));
     Receiver::new(ndi, &options).unwrap()
 }
 
@@ -117,20 +117,23 @@ fn advertised_senders_and_receivers_reach_listeners() {
     let sender_name = sender.source().unwrap().name().to_owned();
     let mut send_advertiser = SendAdvertiser::new(
         &ndi,
-        &AdvertiserOptions::default().servers(server.endpoint()),
+        &AdvertiserOptions::default().servers([server.endpoint()]),
     )
     .unwrap();
     let sender_registration = send_advertiser
-        .register(&sender, SendAdvertisement::default().allow_monitoring(true))
+        .register(
+            &sender,
+            &SendAdvertisement::default().allow_monitoring(true),
+        )
         .unwrap();
     let mut send_listener =
         SendListener::new(&ndi, &ListenerOptions::default().server(server.endpoint())).unwrap();
     let advertised_sender = eventually("the sender to be advertised", || {
         send_listener
-            .wait_for_changes(Duration::from_millis(100))
+            .wait_for_change(Duration::from_millis(100))
             .unwrap();
         let advertised = send_listener
-            .snapshot()
+            .current_senders()
             .unwrap()
             .into_iter()
             .find(|advertised| advertised.name() == Some(sender_name.as_str()))?;
@@ -138,6 +141,29 @@ fn advertised_senders_and_receivers_reach_listeners() {
         // observations; a populated snapshot need not publish status first.
         send_listener.is_connected().then_some(advertised)
     });
+    let target = advertised_sender
+        .to_source()
+        .expect("advertised source has a name");
+    assert_eq!(target.name(), sender_name);
+    assert_eq!(
+        target.address().unwrap().as_str(),
+        format!(
+            "{}:{}",
+            advertised_sender.address().unwrap(),
+            advertised_sender.port().unwrap()
+        )
+    );
+    let converted_receiver = Receiver::new(&ndi, &ReceiverOptions::new(target)).unwrap();
+    eventually(
+        "a receiver using AdvertisedSender::to_source to connect",
+        || {
+            sender
+                .wait_for_connection(Duration::from_millis(100))
+                .unwrap()
+        },
+    );
+    drop(converted_receiver);
+
     let sender_id = advertised_sender.id().unwrap().clone();
     send_listener.subscribe(&sender_id);
 
@@ -150,13 +176,13 @@ fn advertised_senders_and_receivers_reach_listeners() {
     let grouped_receiver = receiver(&ndi, "grafton discovery loopback grouped");
     let mut recv_advertiser = RecvAdvertiser::new(
         &ndi,
-        &AdvertiserOptions::default().servers(server.endpoint()),
+        &AdvertiserOptions::default().servers([server.endpoint()]),
     )
     .unwrap();
     let controllable_registration = recv_advertiser
         .register(
             &controllable_receiver,
-            RecvAdvertisement::default()
+            &RecvAdvertisement::default()
                 .allow_monitoring(true)
                 .allow_controlling(true),
         )
@@ -164,7 +190,7 @@ fn advertised_senders_and_receivers_reach_listeners() {
     recv_advertiser
         .register(
             &monitored_receiver,
-            RecvAdvertisement::default()
+            &RecvAdvertisement::default()
                 .allow_monitoring(true)
                 .input_group(GROUP),
         )
@@ -172,7 +198,7 @@ fn advertised_senders_and_receivers_reach_listeners() {
     recv_advertiser
         .register(
             &grouped_receiver,
-            RecvAdvertisement::default()
+            &RecvAdvertisement::default()
                 .allow_controlling(true)
                 .input_group(GROUP),
         )
@@ -181,9 +207,9 @@ fn advertised_senders_and_receivers_reach_listeners() {
         RecvListener::new(&ndi, &ListenerOptions::default().server(server.endpoint())).unwrap();
     let [controllable, monitored, grouped] = eventually("the receivers to be advertised", || {
         recv_listener
-            .wait_for_changes(Duration::from_millis(100))
+            .wait_for_change(Duration::from_millis(100))
             .unwrap();
-        let receivers = recv_listener.snapshot().unwrap();
+        let receivers = recv_listener.current_receivers().unwrap();
         if !recv_listener.is_connected() {
             return None;
         }
@@ -226,10 +252,10 @@ fn advertised_senders_and_receivers_reach_listeners() {
     send_advertiser.unregister(sender_registration).unwrap();
     eventually("the sender to leave the registry", || {
         send_listener
-            .wait_for_changes(Duration::from_millis(100))
+            .wait_for_change(Duration::from_millis(100))
             .unwrap();
         send_listener
-            .snapshot()
+            .current_senders()
             .unwrap()
             .iter()
             .all(|advertised| advertised.id() != Some(&sender_id))
@@ -240,10 +266,10 @@ fn advertised_senders_and_receivers_reach_listeners() {
         .unwrap();
     eventually("the receiver to leave the registry", || {
         recv_listener
-            .wait_for_changes(Duration::from_millis(100))
+            .wait_for_change(Duration::from_millis(100))
             .unwrap();
         recv_listener
-            .snapshot()
+            .current_receivers()
             .unwrap()
             .iter()
             .all(|advertised| advertised.id() != Some(&controllable_id))
@@ -260,30 +286,46 @@ fn creation_does_not_wait_for_the_server() {
     // be given it. Every object is created all the same, accepts work, and
     // reports that it is not connected.
     let endpoint = "127.0.0.1:1";
-    let advertisers = AdvertiserOptions::default().servers(endpoint);
+    let advertisers = AdvertiserOptions::default().servers([endpoint]);
     let listeners = ListenerOptions::default().server(endpoint);
     let sender = sender(&ndi, "grafton discovery unreachable sender");
     let receiver = receiver(&ndi, "grafton discovery unreachable receiver");
     let mut send_advertiser = SendAdvertiser::new(&ndi, &advertisers).unwrap();
     let mut recv_advertiser = RecvAdvertiser::new(&ndi, &advertisers).unwrap();
     send_advertiser
-        .register(&sender, SendAdvertisement::default())
+        .register(&sender, &SendAdvertisement::default())
         .unwrap();
     recv_advertiser
-        .register(&receiver, RecvAdvertisement::default())
+        .register(&receiver, &RecvAdvertisement::default())
         .unwrap();
     let mut send_listener = SendListener::new(&ndi, &listeners).unwrap();
     let mut recv_listener = RecvListener::new(&ndi, &listeners).unwrap();
     assert!(!send_listener.is_connected() && !recv_listener.is_connected());
     assert_eq!(send_listener.server_url().as_deref(), Some(endpoint));
-    assert!(send_listener.snapshot().unwrap().is_empty());
-    assert!(recv_listener.snapshot().unwrap().is_empty());
+    assert!(send_listener.current_senders().unwrap().is_empty());
+    assert!(recv_listener.current_receivers().unwrap().is_empty());
+
+    // A configured list preserves its elements and rejects an empty element
+    // before asking the native advertiser to create anything.
+    assert!(matches!(
+        SendAdvertiser::new(&ndi, &AdvertiserOptions::default().servers([""])),
+        Err(Error::InvalidInput(grafton_ndi::InputDefect::ListElement {
+            setting: "servers",
+            index: 0,
+        }))
+    ));
+    // A listener's singular endpoint still reaches the native address parser.
+    assert!(matches!(
+        SendListener::new(&ndi, &ListenerOptions::default().server("")),
+        Err(Error::InvalidInput(grafton_ndi::InputDefect::DiscoveryAddressRejected(detail)))
+            if detail.address.is_empty()
+    ));
 
     // An address the SDK cannot parse is refused at creation, and the error
     // names the address instead of blaming the network.
-    for address in ["", "not a host:xyz", "127.0.0.1:99999"] {
+    for address in ["not a host:xyz", "127.0.0.1:99999"] {
         let errors = [
-            SendAdvertiser::new(&ndi, &AdvertiserOptions::default().servers(address)).err(),
+            SendAdvertiser::new(&ndi, &AdvertiserOptions::default().servers([address])).err(),
             SendListener::new(&ndi, &ListenerOptions::default().server(address)).err(),
         ];
         for error in errors {
@@ -302,10 +344,10 @@ fn creation_does_not_wait_for_the_server() {
 fn await_listed(listener: &mut SendListener, what: &str, name: &str) {
     eventually(what, || {
         listener
-            .wait_for_changes(Duration::from_millis(100))
+            .wait_for_change(Duration::from_millis(100))
             .unwrap();
         listener
-            .snapshot()
+            .current_senders()
             .unwrap()
             .iter()
             .any(|advertised| advertised.name() == Some(name))
@@ -327,11 +369,11 @@ fn objects_connect_when_their_server_appears() {
     let earlier_name = earlier.source().unwrap().name().to_owned();
     let mut advertiser = SendAdvertiser::new(
         &ndi,
-        &AdvertiserOptions::default().servers(endpoint.as_str()),
+        &AdvertiserOptions::default().servers([endpoint.as_str()]),
     )
     .unwrap();
     advertiser
-        .register(&earlier, SendAdvertisement::default())
+        .register(&earlier, &SendAdvertisement::default())
         .unwrap();
     let mut early_listener = SendListener::new(&ndi, &listeners).unwrap();
     assert!(!early_listener.is_connected());
@@ -355,14 +397,14 @@ fn objects_connect_when_their_server_appears() {
     // the server before it did, and the advertiser may well get there first.
     eventually("the earlier listener to connect", || {
         early_listener
-            .wait_for_changes(Duration::from_millis(100))
+            .wait_for_change(Duration::from_millis(100))
             .unwrap();
         early_listener.is_connected().then_some(())
     });
     let later = sender(&ndi, "grafton discovery late server later sender");
     let later_name = later.source().unwrap().name().to_owned();
     advertiser
-        .register(&later, SendAdvertisement::default())
+        .register(&later, &SendAdvertisement::default())
         .unwrap();
     await_listed(
         &mut early_listener,

@@ -15,7 +15,7 @@
 use std::{env, time::Duration};
 
 use grafton_ndi::{
-    file::{FileApi, FileRuntimeOptions, PlayerEventKind, PlayerOptions},
+    file::{FileApi, FileApiOptions, FilePlayer, FilePlayerOptions, PlayerEventKind},
     Ndi,
 };
 
@@ -30,10 +30,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "grafton-ndi File Player".to_owned());
 
     let ndi = Ndi::new()?;
-    let file = FileApi::open(&ndi, &FileRuntimeOptions::default())?;
+    let file = FileApi::new(&ndi, &FileApiOptions::default())?;
 
     // Probing reads the file's layout without advertising anything.
-    let info = file.probe(&recording)?;
+    let info = FilePlayer::probe(&file, &recording)?;
     println!(
         "{recording}: {:.1} s, {} video / {} audio / {} metadata track(s)",
         info.duration().value().duration().as_secs_f64(),
@@ -43,13 +43,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // The source is advertised from here until the player is dropped.
-    let mut player = file.create_player(&PlayerOptions::new(name))?;
+    let mut player = FilePlayer::new(&file, &FilePlayerOptions::new(name))?;
     println!("Advertising {}", player.advertised_source()?);
     player.start(&recording)?;
 
     // Keep taking events until the file has ended and none is left.
     loop {
-        match player.poll_event(Duration::from_millis(250))? {
+        match player.next_event(Duration::from_millis(250))? {
             Some(event) => match event.kind() {
                 PlayerEventKind::Ended => println!("Reached the end of the file."),
                 PlayerEventKind::Error => {
@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(stats) = player.stats()? {
         println!(
             "Sent {} video frame(s).",
-            stats.video_frames(grafton_ndi::StreamTier::Program)
+            stats.video_frames_sent(grafton_ndi::StreamTier::Program)
         );
     }
     Ok(())

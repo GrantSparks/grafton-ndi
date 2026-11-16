@@ -4,18 +4,21 @@ error[E0277]: `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSync
 5 |     assert_send::<AvSyncAudioRef<'static>>();
   |                   ^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>` cannot be sent between threads safely
   |
-  = help: within `frames::borrowed::AudioRef<'static, grafton_ndi::capture::AvSyncAudioFree>`, the trait `Send` is not implemented for `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>`
+  = help: within `AvSyncAudioRef<'static>`, the trait `Send` is not implemented for `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>`
 help: the following other types implement trait `Send`
  --> src/capture.rs
   |
   | unsafe impl Send for Guard<'_, VideoKind> {}
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, VideoKind>`
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, grafton_ndi::capture::VideoKind>`
   | unsafe impl Sync for Guard<'_, VideoKind> {}
   | unsafe impl Send for Guard<'_, AudioKind> {}
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, AudioKind>`
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, grafton_ndi::capture::AudioKind>`
   | unsafe impl Sync for Guard<'_, AudioKind> {}
   | unsafe impl Send for Guard<'_, MetadataKind> {}
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, MetadataKind>`
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, grafton_ndi::capture::MetadataKind>`
+...
+  | unsafe impl Send for Guard<'_, SenderMetadataFree> {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, grafton_ndi::capture::SenderMetadataFree>`
 note: required because it appears within the type `frames::ValidatedFrame<grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>, frames::ValidatedAudioLayout>`
  --> src/frames.rs
   |
@@ -24,8 +27,13 @@ note: required because it appears within the type `frames::ValidatedFrame<grafto
 note: required because it appears within the type `frames::borrowed::AudioRef<'static, grafton_ndi::capture::AvSyncAudioFree>`
  --> src/frames.rs
   |
-  |     pub struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
-  |                ^^^^^^^^
+  |     pub(crate) struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
+  |                       ^^^^^^^^
+note: required because it appears within the type `AvSyncAudioRef<'static>`
+ --> src/advanced/sync.rs
+  |
+  | pub struct AvSyncAudioRef<'a> {
+  |            ^^^^^^^^^^^^^^
 note: required by a bound in `assert_send`
  --> tests/ui/advanced/fail/avsync_audio_stays_on_its_capture_thread.rs:2:19
   |
@@ -38,18 +46,21 @@ error[E0277]: `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSync
 6 |     assert_sync::<AvSyncAudioRef<'static>>();
   |                   ^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>` cannot be shared between threads safely
   |
-  = help: within `frames::borrowed::AudioRef<'static, grafton_ndi::capture::AvSyncAudioFree>`, the trait `Sync` is not implemented for `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>`
+  = help: within `AvSyncAudioRef<'static>`, the trait `Sync` is not implemented for `grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>`
 help: the following other types implement trait `Sync`
  --> src/capture.rs
   |
   | unsafe impl Sync for Guard<'_, VideoKind> {}
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, VideoKind>`
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, grafton_ndi::capture::VideoKind>`
   | unsafe impl Send for Guard<'_, AudioKind> {}
   | unsafe impl Sync for Guard<'_, AudioKind> {}
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, AudioKind>`
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, grafton_ndi::capture::AudioKind>`
   | unsafe impl Send for Guard<'_, MetadataKind> {}
   | unsafe impl Sync for Guard<'_, MetadataKind> {}
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, MetadataKind>`
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, grafton_ndi::capture::MetadataKind>`
+...
+  | unsafe impl Sync for Guard<'_, SenderMetadataFree> {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, grafton_ndi::capture::SenderMetadataFree>`
 note: required because it appears within the type `frames::ValidatedFrame<grafton_ndi::capture::Guard<'static, grafton_ndi::capture::AvSyncAudioFree>, frames::ValidatedAudioLayout>`
  --> src/frames.rs
   |
@@ -58,8 +69,13 @@ note: required because it appears within the type `frames::ValidatedFrame<grafto
 note: required because it appears within the type `frames::borrowed::AudioRef<'static, grafton_ndi::capture::AvSyncAudioFree>`
  --> src/frames.rs
   |
-  |     pub struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
-  |                ^^^^^^^^
+  |     pub(crate) struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
+  |                       ^^^^^^^^
+note: required because it appears within the type `AvSyncAudioRef<'static>`
+ --> src/advanced/sync.rs
+  |
+  | pub struct AvSyncAudioRef<'a> {
+  |            ^^^^^^^^^^^^^^
 note: required by a bound in `assert_sync`
  --> tests/ui/advanced/fail/avsync_audio_stays_on_its_capture_thread.rs:3:19
   |

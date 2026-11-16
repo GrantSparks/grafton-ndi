@@ -3,9 +3,9 @@
 use std::time::Duration;
 
 use crate::{
-    AudioKind, Capture, CaptureMode, ConnectionStats, EventMode, MetadataKind, MetadataMode,
-    MetadataSource, Ptz, RawCapture, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef,
-    ReceiverMode, Result, SettingChange, Source, SourceNameChange, Tally, VideoKind, VideoMode,
+    AudioMode, ConnectionStats, EventMode, MetadataMode, MetadataSource, Ptz, RawCapture, Receiver,
+    ReceiverEvent, ReceiverItem, ReceiverItemRef, ReceiverMode, Result, SettingChange, Source,
+    SourceNameChange, Tally, VideoMode,
 };
 
 /// Restricted receiver access lent by [`super::KvmSession::receiver`].
@@ -25,6 +25,14 @@ pub struct KvmReceiver<'a, M: ReceiverMode = RawCapture> {
     receiver: &'a Receiver<M>,
 }
 
+impl<M: ReceiverMode> std::fmt::Debug for KvmReceiver<'_, M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvmReceiver")
+            .field("receiver", &self.receiver)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     pub(super) fn new(receiver: &'a Receiver<M>) -> Self {
         Self { receiver }
@@ -35,6 +43,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     /// # Errors
     ///
     /// As for [`Receiver::set_video_delay`].
+    #[doc(alias = "NDIlib_recv_set_video_delay")]
     pub fn set_video_delay(&self, delay: Duration) -> Result<SettingChange> {
         self.receiver.set_video_delay(delay)
     }
@@ -44,6 +53,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     /// # Errors
     ///
     /// As for [`Receiver::video_delay`].
+    #[doc(alias = "NDIlib_recv_get_video_delay")]
     pub fn video_delay(&self) -> Result<Duration> {
         self.receiver.video_delay()
     }
@@ -53,6 +63,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     /// # Errors
     ///
     /// As for [`Receiver::set_audio_delay`].
+    #[doc(alias = "NDIlib_recv_set_audio_delay")]
     pub fn set_audio_delay(&self, delay: Duration) -> Result<SettingChange> {
         self.receiver.set_audio_delay(delay)
     }
@@ -62,6 +73,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     /// # Errors
     ///
     /// As for [`Receiver::audio_delay`].
+    #[doc(alias = "NDIlib_recv_get_audio_delay")]
     pub fn audio_delay(&self) -> Result<Duration> {
         self.receiver.audio_delay()
     }
@@ -71,6 +83,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     /// # Errors
     ///
     /// As for [`Receiver::add_connection_metadata`].
+    #[doc(alias = "NDIlib_recv_add_connection_metadata")]
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         self.receiver.add_connection_metadata(metadata)
     }
@@ -80,6 +93,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     /// # Errors
     ///
     /// As for [`Receiver::clear_connection_metadata`].
+    #[doc(alias = "NDIlib_recv_clear_connection_metadata")]
     pub fn clear_connection_metadata(&self) -> Result<()> {
         self.receiver.clear_connection_metadata()
     }
@@ -89,20 +103,26 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     /// # Errors
     ///
     /// As for [`Receiver::web_control_url`].
+    #[doc(alias = "NDIlib_recv_get_web_control")]
     pub fn web_control_url(&self) -> Result<Option<String>> {
         self.receiver.web_control_url()
     }
 
-    /// Query source-name changes; see [`Receiver::poll_source_name_change`].
+    /// Query source-name changes; see [`Receiver::wait_for_source_name_change`].
     ///
     /// # Errors
     ///
-    /// As for [`Receiver::poll_source_name_change`].
-    pub fn poll_source_name_change(&self, timeout: Duration) -> Result<Option<SourceNameChange>> {
-        self.receiver.poll_source_name_change(timeout)
+    /// As for [`Receiver::wait_for_source_name_change`].
+    #[doc(alias = "NDIlib_recv_get_source_name")]
+    pub fn wait_for_source_name_change(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<SourceNameChange>> {
+        self.receiver.wait_for_source_name_change(timeout)
     }
 
     /// Set upstream tally; see [`Receiver::set_tally`].
+    #[doc(alias = "NDIlib_recv_set_tally")]
     pub fn set_tally(&self, tally: Tally) {
         self.receiver.set_tally(tally)
     }
@@ -112,6 +132,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     /// # Errors
     ///
     /// As for [`Receiver::send_metadata`].
+    #[doc(alias = "NDIlib_recv_send_metadata")]
     pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         self.receiver.send_metadata(metadata)
     }
@@ -122,6 +143,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     }
 
     /// Query connection status; see [`Receiver::is_connected`].
+    #[doc(alias = "NDIlib_recv_get_no_connections")]
     pub fn is_connected(&self) -> bool {
         self.receiver.is_connected()
     }
@@ -132,6 +154,9 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     }
 
     /// Query reception statistics; see [`Receiver::connection_stats`].
+    #[doc(alias = "NDIlib_recv_get_no_connections")]
+    #[doc(alias = "NDIlib_recv_get_performance")]
+    #[doc(alias = "NDIlib_recv_get_queue")]
     pub fn connection_stats(&self) -> Result<ConnectionStats> {
         self.receiver.connection_stats()
     }
@@ -141,43 +166,46 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     /// # Errors
     ///
     /// As for [`Receiver::request_keyframe`].
+    #[doc(alias = "NDIlib_recv_request_keyframe")]
     pub fn request_keyframe(&self) -> Result<()> {
         self.receiver.request_keyframe()
     }
 }
 
-impl<'a, M: VideoMode> KvmReceiver<'a, M> {
-    /// Borrow typed video capture; see [`Receiver::video`] and [`Capture`].
-    #[must_use = "the Capture view does nothing until a capture verb is called"]
-    pub fn video(&self) -> Capture<'a, VideoKind> {
-        self.receiver.video()
-    }
-}
+macro_rules! kvm_capture_methods {
+    ($(($mode:ident, $kind:ident, $owned:ident, $borrowed:ident,
+        $capture:ident, $capture_ref:ident, $capture_with:ident, $label:literal)),* $(,)?) => {
+        $(
+            impl<'a, M: $mode> KvmReceiver<'a, M> {
+                #[doc = concat!("Capture owned ", $label, "; see [`Receiver::", stringify!($capture), "`].")]
+                #[doc(alias = "NDIlib_recv_capture_v3")]
+                pub fn $capture(&self, timeout: Duration) -> Result<Option<crate::$owned>> {
+                    self.receiver.$capture(timeout)
+                }
 
-impl<'a, M: CaptureMode> KvmReceiver<'a, M> {
-    /// Borrow typed audio capture; see [`Receiver::audio`] and [`Capture`].
-    #[must_use = "the Capture view does nothing until a capture verb is called"]
-    pub fn audio(&self) -> Capture<'a, AudioKind> {
-        self.receiver.audio()
-    }
+                #[doc = concat!("Borrow ", $label, "; see [`Receiver::", stringify!($capture_ref), "`].")]
+                /// The frame retains the original receiver borrow and may coexist
+                /// with later mutable KVM session input calls.
+                #[doc(alias = "NDIlib_recv_capture_v3")]
+                pub fn $capture_ref(&self, timeout: Duration) -> Result<Option<crate::$borrowed<'a>>> {
+                    let receiver: &'a Receiver<M> = self.receiver;
+                    receiver.$capture_ref(timeout)
+                }
+            }
+        )*
+    };
 }
-
-impl<'a, M: MetadataMode> KvmReceiver<'a, M> {
-    /// Borrow typed metadata capture; see [`Receiver::metadata`] and [`Capture`].
-    #[must_use = "the Capture view does nothing until a capture verb is called"]
-    pub fn metadata(&self) -> Capture<'a, MetadataKind> {
-        self.receiver.metadata()
-    }
-}
+crate::capture::capture_method_kinds!(kvm_capture_methods);
 
 impl<'a, M: EventMode> KvmReceiver<'a, M> {
-    /// Poll receiver events; see [`Receiver::poll_event`].
+    /// Poll receiver events; see [`Receiver::next_event`].
     ///
     /// # Errors
     ///
-    /// As for [`Receiver::poll_event`].
-    pub fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
-        self.receiver.poll_event(timeout)
+    /// As for [`Receiver::next_event`].
+    #[doc(alias = "NDIlib_recv_capture_v3")]
+    pub fn next_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
+        self.receiver.next_event(timeout)
     }
 }
 
@@ -187,6 +215,7 @@ impl<'a> KvmReceiver<'a> {
     /// # Errors
     ///
     /// As for [`Receiver::capture_any_ref`].
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<ReceiverItemRef<'a>>> {
         self.receiver.capture_any_ref(timeout)
     }
@@ -196,6 +225,7 @@ impl<'a> KvmReceiver<'a> {
     /// # Errors
     ///
     /// As for [`Receiver::capture_any`].
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any(&self, timeout: Duration) -> Result<Option<ReceiverItem>> {
         self.receiver.capture_any(timeout)
     }

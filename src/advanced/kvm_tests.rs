@@ -121,7 +121,7 @@ fn empty_touch_finishes_and_failed_lifts_are_retried() {
     let Some(ndi) = crate::test_support::ndi() else {
         return;
     };
-    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new(""))).unwrap();
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap())).unwrap();
     for retry_on_drop in [false, true] {
         CALLS.with_borrow_mut(|calls| *calls = Calls::default());
         let mut session = KvmSession {
@@ -159,7 +159,7 @@ fn rejected_releases_are_retained_and_drop_retries_only_the_inputs_still_pressed
     let Some(ndi) = crate::test_support::ndi() else {
         return;
     };
-    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new(""))).unwrap();
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap())).unwrap();
     CALLS.with_borrow_mut(|calls| {
         *calls = Calls {
             fail_key_once: true,
@@ -211,7 +211,7 @@ fn every_held_input_combination_retries_only_failed_releases() {
     let Some(ndi) = crate::test_support::ndi() else {
         return;
     };
-    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new(""))).unwrap();
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap())).unwrap();
     // A key, each of the three mouse buttons, and a touch, independently held.
     for held in 0u32..32 {
         // Independently refuse each held input's first release.
@@ -283,11 +283,11 @@ fn every_held_input_combination_retries_only_failed_releases() {
 }
 
 #[test]
-fn restricted_views_and_capture_handles_add_no_allocations_or_native_calls() {
+fn restricted_views_and_rejected_captures_add_no_allocations_or_native_calls() {
     let Some(ndi) = crate::test_support::ndi() else {
         return;
     };
-    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new(""))).unwrap();
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap())).unwrap();
     CALLS.with_borrow_mut(|calls| *calls = Calls::default());
     let session = KvmSession {
         receiver: &receiver,
@@ -296,9 +296,13 @@ fn restricted_views_and_capture_handles_add_no_allocations_or_native_calls() {
         buttons: BTreeSet::new(),
         touching: false,
     };
+    let invalid = crate::MAX_TIMEOUT + Duration::from_millis(1);
     let (view, allocations) = crate::test_alloc::allocation_count(|| {
         let view = session.receiver();
-        let _ = (view.video(), view.audio(), view.metadata(), view.ptz());
+        assert!(view.capture_video_ref(invalid).is_err());
+        assert!(view.capture_audio_ref(invalid).is_err());
+        assert!(view.capture_metadata_ref(invalid).is_err());
+        let _ = view.ptz();
         view
     });
     assert_eq!(allocations, 0);
@@ -315,10 +319,10 @@ fn restricted_views_and_capture_handles_add_no_allocations_or_native_calls() {
     assert_eq!(allocations, 0);
     let invalid = crate::MAX_TIMEOUT + Duration::from_millis(1);
     let (_, direct) = crate::test_alloc::allocation_count(|| {
-        assert!(receiver.video().capture_ref(invalid).is_err());
+        assert!(receiver.capture_video_ref(invalid).is_err());
     });
     let (_, forwarded) = crate::test_alloc::allocation_count(|| {
-        assert!(view.video().capture_ref(invalid).is_err());
+        assert!(view.capture_video_ref(invalid).is_err());
     });
     assert_eq!(forwarded, direct);
 }

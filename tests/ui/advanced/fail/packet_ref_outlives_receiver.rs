@@ -7,10 +7,10 @@ fn escape() -> PacketItemRef<'static> {
     let ndi = Ndi::new().unwrap();
     let receiver = PacketReceiver::new(
         &ndi,
-        &ReceiverOptions::new(Source::new("")),
+        &ReceiverOptions::new(Source::new("").unwrap()),
         PassthroughPreset::Hevc,
     )
     .unwrap();
-    receiver.capture_ref(Duration::ZERO).unwrap().unwrap()
+    receiver.capture_any_ref(Duration::ZERO).unwrap().unwrap()
 }
 fn main() {}

@@ -3,7 +3,7 @@ use std::time::Duration;
 use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
 
 fn receiver(ndi: &Ndi) -> Result<Receiver, grafton_ndi::Error> {
-    let source = Source::new("compile-contract");
+    let source = Source::new("compile-contract").unwrap();
     let options = ReceiverOptions::new(source);
     Receiver::new(ndi, &options)
 }
@@ -13,7 +13,7 @@ fn compile_contract() -> Result<(), grafton_ndi::Error> {
     let ndi = Ndi::new()?;
     let receiver = receiver(&ndi)?;
 
-    if let Some(video) = receiver.video().capture_ref(Duration::from_millis(1))? {
+    if let Some(video) = receiver.capture_video_ref(Duration::from_millis(1))? {
         let _ = (
             video.width(),
             video.height(),
@@ -29,7 +29,7 @@ fn compile_contract() -> Result<(), grafton_ndi::Error> {
             .expect("copy worker");
     }
 
-    if let Some(audio) = receiver.audio().capture_ref(Duration::from_millis(1))? {
+    if let Some(audio) = receiver.capture_audio_ref(Duration::from_millis(1))? {
         let _ = (
             audio.num_channels(),
             audio.num_samples(),
@@ -40,7 +40,7 @@ fn compile_contract() -> Result<(), grafton_ndi::Error> {
             .expect("copy worker");
     }
 
-    if let Some(metadata) = receiver.metadata().capture_ref(Duration::from_millis(1))? {
+    if let Some(metadata) = receiver.capture_metadata_ref(Duration::from_millis(1))? {
         let _ = metadata.data();
         let _owned = metadata.to_owned();
     }

@@ -5,14 +5,13 @@ use crate::capture::CaptureKind;
 use std::time::Duration;
 
 use super::{
-    AdvancedConfig, AudioCodec, CompressedAudioRef, CompressedVideoRef, ReceivedAudioPacket,
-    ReceivedVideoPacket, ReceiverControls, VideoCodec,
+    AdvancedConfig, AudioCodec, CompressedAudioRef, CompressedVideoRef, PacketAttached,
+    ReceivedAudioPacket, ReceivedVideoPacket, ReceiverControls, VideoCodec,
 };
 #[cfg(test)]
 use super::{CompressedAudioFrame, CompressedVideoFrame};
 use crate::{
     capture::{AllSlots, AudioKind, CaptureStrategy, Guard, Media, MetadataKind, VideoKind},
-    receiver::PacketAttached,
     sys::{
         advanced::{native, ReceiverConfiguration},
         bindings::*,
@@ -89,7 +88,7 @@ pub enum ReceivedAudio {
     Compressed(ReceivedAudioPacket),
 }
 
-/// What one [`PacketReceiver::capture`] call produced.
+/// What one [`PacketReceiver::capture_any`] call produced.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum PacketItem {
@@ -176,8 +175,8 @@ impl PacketItemRef<'_> {
 /// A receiver that delivers compressed packets where it can.
 ///
 /// One capture call returns whichever frame or event arrives first, as a
-/// [`PacketItem`] from [`capture`](Self::capture), or a borrowed
-/// [`PacketItemRef`] from [`capture_ref`](Self::capture_ref). It cannot feed a
+/// [`PacketItem`] from [`capture`](Self::capture_any), or a borrowed
+/// [`PacketItemRef`] from [`capture_ref`](Self::capture_any_ref). It cannot feed a
 /// [`FrameSync`](crate::framesync::FrameSync), which needs decoded frames.
 ///
 /// [`receiver`](Self::receiver) and [`controls`](Self::controls) reach
@@ -205,12 +204,12 @@ impl PacketItemRef<'_> {
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// let ndi = Ndi::new()?;
-/// # let source = Source::new("ENCODER (HEVC)");
+/// # let source = Source::new("ENCODER (HEVC)").unwrap();
 /// let mut receiver =
 ///     PacketReceiver::new(&ndi, &ReceiverOptions::new(source), PassthroughPreset::Hevc)?;
 /// receiver.receiver().set_tally(Tally::new(true, false));
 /// if let Some(PacketItem::Video(ReceivedVideo::Compressed(packet))) =
-///     receiver.capture(Duration::from_secs(1))?
+///     receiver.capture_any(Duration::from_secs(1))?
 /// {
 ///     println!("{:?}: {} bytes", packet.format().codec(), packet.data().len());
 /// }
@@ -227,6 +226,14 @@ pub struct PacketReceiver {
     // Borrowed results retain their Guard until dropped; its lifetime keeps
     // this owner alive. Owned capture copies through that same borrowed path.
     pub(crate) receiver: Receiver<PacketAttached>,
+}
+
+impl std::fmt::Debug for PacketReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketReceiver")
+            .field("mode", &std::any::type_name::<PacketAttached>())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PacketReceiver {
@@ -247,6 +254,7 @@ impl PacketReceiver {
     ///
     /// [`Error::UnsupportedCapability`]: crate::Error::UnsupportedCapability
     /// [`RuntimeFeature::Passthrough`]: crate::capabilities::RuntimeFeature::Passthrough
+    #[doc(alias = "NDIlib_recv_create_v4")]
     pub fn new(ndi: &Ndi, options: &ReceiverOptions, preset: PassthroughPreset) -> Result<Self> {
         let options = creation_options(options, ndi.passthrough_format(preset)?);
         let config = AdvancedConfig::or_empty(options.config.as_ref());
@@ -274,14 +282,14 @@ impl PacketReceiver {
     /// and source-name changes.
     ///
     /// Its own frame and event capture is unavailable in the
-    /// [`PacketAttached`] mode; [`capture`](Self::capture) delivers both.
+    /// [`PacketAttached`] mode; [`capture`](Self::capture_any) delivers both.
     pub fn receiver(&self) -> &Receiver<PacketAttached> {
         &self.receiver
     }
 
     /// Borrow exclusive stream controls or start KVM, without permitting
     /// receiver replacement. This allocates nothing and makes no SDK call.
-    /// A KVM session captures packets through its own `capture` method.
+    /// A KVM session captures packets through its own `capture_any` method.
     pub fn controls(&mut self) -> ReceiverControls<'_, PacketAttached> {
         ReceiverControls::new(&mut self.receiver)
     }
@@ -297,7 +305,7 @@ impl PacketReceiver {
     /// once. Status changes include the current connection count, as in raw
     /// mixed capture; pending notifications are delivered before waiting.
     ///
-    /// The timeout is spent as [`Capture::capture`](crate::Capture::capture)
+    /// The timeout is spent as [`Receiver::capture_any`]
     /// spends it. The SDK returns early, with neither a frame nor an event,
     /// while a new connection synchronizes; this captures again until
     /// something arrives, and returns `None` only once the whole timeout is
@@ -314,7 +322,8 @@ impl PacketReceiver {
     /// [`Error::InvalidInput`]: crate::Error::InvalidInput
     /// [`Error::ConnectionLost`]: crate::Error::ConnectionLost
     /// [`Error::InvalidFrame`]: crate::Error::InvalidFrame
-    pub fn capture(&self, timeout: Duration) -> Result<Option<PacketItem>> {
+    #[doc(alias = "NDIlib_recv_capture_v3")]
+    pub fn capture_any(&self, timeout: Duration) -> Result<Option<PacketItem>> {
         Self::capture_from(&self.receiver, timeout)
     }
 
@@ -322,13 +331,14 @@ impl PacketReceiver {
     /// metadata. The item keeps its native buffer until dropped, including
     /// application memory charged to a custom allocator's limits.
     ///
-    /// Timeout, event and reconnect semantics are those of [`Self::capture`].
+    /// Timeout, event and reconnect semantics are those of [`Self::capture_any`].
     /// Shared receiver controls remain available while an item is borrowed.
     ///
     /// # Errors
     ///
-    /// As for [`Self::capture`].
-    pub fn capture_ref(&self, timeout: Duration) -> Result<Option<PacketItemRef<'_>>> {
+    /// As for [`Self::capture_any`].
+    #[doc(alias = "NDIlib_recv_capture_v3")]
+    pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<PacketItemRef<'_>>> {
         Self::capture_ref_from(&self.receiver, timeout)
     }
 
@@ -445,7 +455,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("")))
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap()))
             .unwrap()
             .into_packet_for_test();
         let Some(PacketItem::Event(ReceiverEvent::StatusChanged(status))) =
@@ -652,7 +662,7 @@ mod tests {
             return;
         };
         let receiver: Receiver<PacketAttached> =
-            Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("")))
+            Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap()))
                 .unwrap()
                 .into_packet_for_test();
         native_capture_calls::take();
@@ -719,7 +729,7 @@ mod tests {
                 matches!(
                     result,
                     Err(Error::UnsupportedCapability {
-                        feature,
+                        capability: crate::Capability::Runtime(feature),
                         refusal: crate::CapabilityRefusal::RuntimeTooOld { .. },
                         ..
                     }) if feature == wanted
@@ -728,7 +738,7 @@ mod tests {
             );
         };
 
-        let best = ReceiverOptions::new(Source::new(""))
+        let best = ReceiverOptions::new(Source::new("").unwrap())
             .color_format(ReceiverColorFormat::Best444)
             .allow_video_fields(false);
         // An ordinary receiver would be given Best444.

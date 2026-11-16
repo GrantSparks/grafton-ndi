@@ -12,8 +12,7 @@ fn framesync(sync: &mut FrameSync) -> Result<()> {
     session.receiver().set_tally(Tally::new(true, false));
     let metadata = session
         .receiver()
-        .metadata()
-        .capture_ref(std::time::Duration::ZERO)?;
+        .capture_metadata_ref(std::time::Duration::ZERO)?;
     session.mouse_down(MouseButton::Left)?;
     let video = capture.capture_video_ref(ScanType::Progressive)?;
     let audio = capture.capture_audio_ref(FrameSyncAudioRequest::capture_at(48_000, 2, 480)?)?;
@@ -33,11 +32,10 @@ fn avsync(sync: &mut AvSync) -> Result<()> {
     let (capture, controls) = sync.split();
     let mut session = controls.kvm()?;
     session.mouse_down(MouseButton::Left)?;
-    let metadata = session.receiver().metadata().capture_ref(std::time::Duration::ZERO)?;
+    let metadata = session.receiver().capture_metadata_ref(std::time::Duration::ZERO)?;
     let video = session
         .receiver()
-        .video()
-        .capture_ref(std::time::Duration::ZERO)?;
+        .capture_video_ref(std::time::Duration::ZERO)?;
     if let Some(video) = &video {
         if let Some(stamped) = AvSyncVideo::new(video) {
             let _ = capture.synchronize(stamped, AvSyncRequest::automatic())?;

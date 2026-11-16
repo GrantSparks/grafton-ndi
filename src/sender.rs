@@ -7,21 +7,22 @@ use std::{
     ffi::{CStr, CString},
     fmt,
     marker::PhantomData,
+    num::NonZeroU32,
     ptr,
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
     finder::{RawSource, Source},
     frames::{AudioPartsExt, MetadataPartsExt},
     frames::{
-        AudioSource, FrameMetadataRef, MetadataFrame, MetadataSource, MetadataText, PixelFormat,
-        ScanType, Sendable, ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts,
-        VideoPartsExt, VideoSource,
+        AudioSource, FrameMetadataRef, MetadataFrame, MetadataFrameRef, MetadataSource,
+        MetadataText, PixelFormat, ScanType, Sendable, ValidatedVideoLayout, VideoFrame,
+        VideoHeader, VideoParts, VideoPartsExt, VideoSource,
     },
     pixels::Pixels,
     receiver::Tally,
@@ -29,6 +30,9 @@ use crate::{
     timeout::Deadline,
     to_ms_checked, Error, FrameRate, Ndi, PictureAspectRatio, Rejected, Result, Timecode,
 };
+
+#[cfg(feature = "advanced")]
+use crate::advanced::{CompressedAttached, CompressedAudioSendMode, QueueAttached};
 
 #[cfg(not(target_has_atomic = "ptr"))]
 compile_error!(
@@ -93,7 +97,7 @@ struct Inner {
     instance: SendInstance,
     // The entry points of the runtime that created `instance`.
     core: &'static sys::Core,
-    metadata_capture: parking_lot::Mutex<()>,
+    metadata_capture: SenderMetadataGate,
     tally: TallyState,
     #[cfg(ndi_has_advanced_keyframe_demand)]
     keyframe_changes: crate::keyframe_changes::KeyframeChanges,
@@ -104,6 +108,48 @@ struct Inner {
 // do not poison or declare this themselves, which would otherwise leave
 // senders short of `RefUnwindSafe`. The change feed uses unwind-safe standard locks.
 impl std::panic::RefUnwindSafe for Inner {}
+
+/// Exclusion spans capture through matching free, including a borrowed frame's
+/// lifetime. The mutex itself is held only while changing the occupancy bit,
+/// so the release token can safely move to a scoped worker thread.
+#[derive(Default)]
+struct SenderMetadataGate {
+    occupied: parking_lot::Mutex<bool>,
+    available: parking_lot::Condvar,
+}
+
+// Only the private acquisition/release paths change the occupancy bit, with
+// no application code under its lock. A live lease clears the bit on unwind,
+// after its metadata guard has freed the native frame, so a panic cannot leave
+// capture state half-mutated. This preserves the captured frame's unwind traits.
+impl std::panic::RefUnwindSafe for SenderMetadataGate {}
+
+impl SenderMetadataGate {
+    fn acquire_until(&self, end: Instant) -> Option<SenderMetadataLease<'_>> {
+        let mut occupied = self.occupied.try_lock_until(end)?;
+        while *occupied {
+            if self.available.wait_until(&mut occupied, end).timed_out() && *occupied {
+                return None;
+            }
+        }
+        *occupied = true;
+        Some(SenderMetadataLease { gate: self })
+    }
+}
+
+/// A movable permit retaining a sender's capture/free exclusion. It borrows
+/// the sender-owned gate, so neither the gate nor native sender can disappear
+/// while a captured frame retains it. The frame drops before this token.
+pub(crate) struct SenderMetadataLease<'a> {
+    gate: &'a SenderMetadataGate,
+}
+
+impl Drop for SenderMetadataLease<'_> {
+    fn drop(&mut self) {
+        *self.gate.occupied.lock() = false;
+        self.gate.available.notify_one();
+    }
+}
 
 /// Polling must preserve the SDK's consumable change report for a later wait.
 #[derive(Default)]
@@ -149,6 +195,14 @@ mod ownership {
     // both descriptors alive through the native call, then commits one swap;
     // unwinding cannot leave a dangling native source descriptor.
     impl std::panic::RefUnwindSafe for SenderResource {}
+
+    impl fmt::Debug for SenderResource {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("SenderResource")
+                .field("name", &self._name)
+                .finish_non_exhaustive()
+        }
+    }
 
     impl SenderResource {
         /// The native sender this token keeps alive.
@@ -272,30 +326,11 @@ pub trait SenderMode: mode_sealed::Sealed + Send + Sync {}
 /// [`Sender::send_audio`]: [`RawSend`] and the queued mode.
 pub trait AudioSendMode: SenderMode {}
 
-/// Sealed sender modes that send compressed audio: the compressed and queued
-/// modes. Both require an Advanced runtime at construction.
-#[cfg(feature = "advanced")]
-pub trait CompressedAudioSendMode: SenderMode {}
-
 /// Ordinary sender mode: uncompressed video, including the owned asynchronous
 /// pipeline, audio and metadata. Only a sender in this mode can be registered
-/// with a [`SendAdvertiser`](crate::discovery::SendAdvertiser).
+/// with a [`SendAdvertiser`](crate::discovery_server::SendAdvertiser).
 #[derive(Debug)]
 pub enum RawSend {}
-
-/// Sender mode held exclusively by
-/// [`CompressedSender`](crate::advanced::CompressedSender), which sends the
-/// video and audio itself.
-#[cfg(feature = "advanced")]
-#[derive(Debug)]
-pub enum CompressedAttached {}
-
-/// Sender mode held exclusively by
-/// [`QueuedSender`](crate::advanced::QueuedSender), which sends the video
-/// itself. It sends uncompressed and compressed audio.
-#[cfg(feature = "advanced")]
-#[derive(Debug)]
-pub enum QueueAttached {}
 
 impl mode_sealed::Sealed for RawSend {
     type Native = Shared;
@@ -325,7 +360,7 @@ impl CompressedAudioSendMode for QueueAttached {}
 ///
 /// Create one with [`Sender::new`]. Dropping the sender completes any
 /// in-flight asynchronous video and removes the source from the network,
-/// unless a [`SendAdvertiser`](crate::discovery::SendAdvertiser) registration
+/// unless a [`SendAdvertiser`](crate::discovery_server::SendAdvertiser) registration
 /// still holds it: a registered sender stays on the network until that
 /// registration is removed or its advertiser is dropped.
 ///
@@ -337,10 +372,9 @@ impl CompressedAudioSendMode for QueueAttached {}
 ///
 /// A sender is `Send` and `Sync`. Its operations take `&self` and may run on
 /// several threads at once, except the asynchronous video operations,
-/// `send_video_async`, `send_video_async_copy` and `finish_video_async`, which
+/// `submit_video`, `submit_video_copy` and `reclaim_video`, which
 /// take `&mut self`. Tally polls preserve changes for a waiting thread;
 /// concurrent tally waits serialize and each change is consumed once.
-#[derive(Debug)]
 pub struct Sender<M: SenderMode = RawSend> {
     inner: Inner,
     // The owner of the native sender, with the video pipeline of a mode that
@@ -636,7 +670,9 @@ pub(crate) mod in_flight {
     }
 
     #[cfg(feature = "advanced")]
-    impl<'a> LoanPair<'a, crate::CompressedAttached, &'a mut crate::advanced::PendingStreams> {
+    impl<'a>
+        LoanPair<'a, crate::advanced::CompressedAttached, &'a mut crate::advanced::PendingStreams>
+    {
         /// Submit a frame whose type already proves send admission.
         pub(crate) fn submit_pending(
             &mut self,
@@ -692,7 +728,7 @@ pub(crate) mod in_flight {
     }
 
     #[cfg(feature = "advanced")]
-    impl<'a> LoanPair<'a, crate::QueueAttached, &'a crate::advanced::QueueLoans> {
+    impl<'a> LoanPair<'a, crate::advanced::QueueAttached, &'a crate::advanced::QueueLoans> {
         /// Admission and native dispatch use this pair's own callback and sender.
         /// No caller can supply an entry prepared by another queue.
         pub(crate) fn try_submit_queued(
@@ -1209,10 +1245,11 @@ pub(crate) mod in_flight {
 
 use in_flight::InFlight;
 
-impl fmt::Debug for Inner {
+impl<M: SenderMode> fmt::Debug for Sender<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Inner")
-            .field("instance", &self.instance.0)
+        f.debug_struct("Sender")
+            .field("name", &self.native.resource()._name)
+            .field("mode", &std::any::type_name::<M>())
             .finish_non_exhaustive()
     }
 }
@@ -1220,7 +1257,7 @@ impl fmt::Debug for Inner {
 /// A borrowed video frame that references external pixel data.
 ///
 /// [`Sender::send_video`] sends it synchronously; the buffer can be reused
-/// as soon as the call returns. [`Sender::send_video_async_copy`] copies its
+/// as soon as the call returns. [`Sender::submit_video_copy`] copies its
 /// pixels and metadata into an owned frame for the asynchronous pipeline.
 ///
 /// The x86 builds of the SDK read a little past the end of many UYVY and
@@ -1376,10 +1413,10 @@ crate::frames::video_accessors! {
         /// # Example
         ///
         /// A copy-and-send loop that stops allocating once two frames exist.
-        /// [`Sender::send_video_async`] keeps the frame it is given until the next
+        /// [`Sender::submit_video`] keeps the frame it is given until the next
         /// send, and returns the previous one, which the SDK has finished with:
         /// that frame is the destination of the next copy.
-        /// [`Sender::send_video_async_copy`] keeps its own reusable frames for
+        /// [`Sender::submit_video_copy`] keeps its own reusable frames for
         /// this copy instead.
         ///
         /// ```no_run
@@ -1402,9 +1439,9 @@ crate::frames::video_accessors! {
         ///         }
         ///         None => frame.to_owned(), // the first two frames only
         ///     };
-        ///     spare = sender.send_video_async(owned)?;
+        ///     spare = sender.submit_video(owned)?;
         /// }
-        /// sender.finish_video_async();
+        /// sender.reclaim_video();
         /// # Ok(())
         /// # }
         /// ```
@@ -1506,7 +1543,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
             pixel_format,
             line_stride: None,
             frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
-            aspect_ratio_input: 0.0,
+            aspect_ratio_input: PictureAspectRatio::SQUARE_PIXELS,
             scan_type: ScanType::Progressive,
             timecode: Timecode::SYNTHESIZE,
             metadata: None,
@@ -1552,7 +1589,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
 
 /// Builder for a [`BorrowedVideoFrame`], reached through
 /// [`BorrowedVideoFrame::builder`]. No pixels or metadata are copied.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct BorrowedVideoFrameBuilder<'buf> {
     data: &'buf [u8],
     width: u32,
@@ -1560,7 +1597,7 @@ pub struct BorrowedVideoFrameBuilder<'buf> {
     pixel_format: PixelFormat,
     line_stride: Option<usize>,
     frame_rate: FrameRate,
-    aspect_ratio_input: f32,
+    aspect_ratio_input: PictureAspectRatio,
     scan_type: ScanType,
     timecode: Timecode,
     metadata: Option<&'buf CStr>,
@@ -1591,7 +1628,7 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
     }
     /// Set a finite nonnegative aspect ratio; zero selects square pixels.
     #[must_use]
-    pub fn picture_aspect_ratio(mut self, ratio: f32) -> Self {
+    pub fn picture_aspect_ratio(mut self, ratio: PictureAspectRatio) -> Self {
         self.aspect_ratio_input = ratio;
         self
     }
@@ -1698,7 +1735,7 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
     /// metadata exceeding the 4 MiB cap return [`Error::InvalidFrame`];
     /// invalid metadata UTF-8 returns [`Error::InvalidUtf8`].
     pub fn build(self) -> Result<BorrowedVideoFrame<'buf>> {
-        let picture_aspect_ratio = PictureAspectRatio::from_sdk(self.aspect_ratio_input)?;
+        let picture_aspect_ratio = self.aspect_ratio_input;
         let layout = ValidatedVideoLayout::new_uncompressed(
             self.pixel_format,
             self.width,
@@ -1772,7 +1809,7 @@ impl<M: SenderMode> Sender<M> {
         ) -> sys::table::Called<NDIlib_send_instance_t>,
     ) -> Result<Self> {
         let name = CString::new(options.name.as_str())?;
-        let groups = options.groups.as_deref().map(CString::new).transpose()?;
+        let groups = crate::finder::list_cstring(options.groups.as_deref(), "groups")?;
         let core = &ndi.api().core;
         let instance = create(
             core,
@@ -1790,7 +1827,7 @@ impl<M: SenderMode> Sender<M> {
             inner: Inner {
                 instance,
                 core,
-                metadata_capture: parking_lot::Mutex::new(()),
+                metadata_capture: SenderMetadataGate::default(),
                 tally: TallyState::default(),
                 #[cfg(ndi_has_advanced_keyframe_demand)]
                 keyframe_changes: crate::keyframe_changes::KeyframeChanges::default(),
@@ -1815,10 +1852,11 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCString`] when the name or groups contain a
-    /// NUL byte, [`Error::UnsupportedCapability`] when the options carry an
+    /// Returns [`Error::InvalidCString`] when the name contains a NUL byte,
+    /// [`Error::InvalidInput`] for a group containing a comma or NUL or an empty group, [`Error::UnsupportedCapability`] when the options carry an
     /// Advanced configuration that the runtime or this build cannot take, and
     /// [`Error::NativeOperationFailed`] when the SDK creates no sender.
+    #[doc(alias = "NDIlib_send_create")]
     pub fn new(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
         Self::open(ndi, options)
     }
@@ -1921,6 +1959,7 @@ impl Sender {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_send_send_video_v2")]
     pub fn send_video(&self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
         let authorized = Sendable::borrowed(frame, &self._ndi)?;
         self.native.video.send(authorized)
@@ -1932,7 +1971,7 @@ impl Sender {
     /// synchronizes the previous send and returns its owned frame for reuse.
     /// The first send returns `None`. The returned frame may have been submitted
     /// by ownership or copying. A copied submission instead retains the frame
-    /// it displaces for its next copy. Call [`Self::finish_video_async`] to
+    /// it displaces for its next copy. Call [`Self::reclaim_video`] to
     /// recover the final frame.
     ///
     /// Synchronous sends and explicit flushes complete the operation but retain
@@ -1946,7 +1985,8 @@ impl Sender {
     /// formats need
     /// [`RuntimeFeature::Planar444Video`](crate::RuntimeFeature::Planar444Video)).
     /// No pending send is changed.
-    pub fn send_video_async(
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
+    pub fn submit_video(
         &mut self,
         frame: VideoFrame,
     ) -> std::result::Result<Option<VideoFrame>, Rejected<VideoFrame>> {
@@ -1959,7 +1999,8 @@ impl Sender {
     /// Frames submitted through either owned or copied sending are returned.
     /// Any spare storage retained for copying is released. Repeated calls
     /// return `None`.
-    pub fn finish_video_async(&mut self) -> Option<VideoFrame> {
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
+    pub fn reclaim_video(&mut self) -> Option<VideoFrame> {
         self.native.video.finish()
     }
 
@@ -1972,8 +2013,8 @@ impl Sender {
     /// copies reuse their allocations. Larger layouts or longer metadata grow
     /// each buffer as needed.
     ///
-    /// Recover the final copy with [`Self::finish_video_async`], which also
-    /// releases the spare. Owned submissions through [`Self::send_video_async`]
+    /// Recover the final copy with [`Self::reclaim_video`], which also
+    /// releases the spare. Owned submissions through [`Self::submit_video`]
     /// still return the frame they displace.
     ///
     /// # Errors
@@ -1981,7 +2022,8 @@ impl Sender {
     /// Returns [`Error::UnsupportedCapability`] if this sender's runtime
     /// cannot send the frame's pixel format, checked before anything is
     /// copied. No pending send is changed on failure.
-    pub fn send_video_async_copy(&mut self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
+    pub fn submit_video_copy(&mut self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
         let authorized = Sendable::borrowed(frame, &self._ndi)?;
         self.native.video.copy(authorized);
         Ok(())
@@ -1994,9 +2036,10 @@ impl Sender {
     /// frame is in flight, returns without calling the SDK.
     ///
     /// After this returns, the SDK has released the pending buffer. The sender
-    /// retains the frame; use [`Self::finish_video_async`] or an owned
-    /// submission through [`Self::send_video_async`] to recover it without copying.
-    pub fn flush_async_blocking(&self) {
+    /// retains the frame; use [`Self::reclaim_video`] or an owned
+    /// submission through [`Self::submit_video`] to recover it without copying.
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
+    pub fn flush_video(&self) {
         self.native.video.flush();
     }
 }
@@ -2045,13 +2088,14 @@ impl<M: AudioSendMode> Sender<M> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn send_audio(&self, audio_frame: &(impl AudioSource + ?Sized)) {
+    #[doc(alias = "NDIlib_send_send_audio_v3")]
+    pub fn send_audio(&self, frame: &(impl AudioSource + ?Sized)) {
         // SAFETY: the sender instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
         unsafe {
             self.inner
                 .core
-                .NDIlib_send_send_audio_v3(self.inner.instance.0, &audio_frame.audio_descriptor());
+                .NDIlib_send_send_audio_v3(self.inner.instance.0, &frame.audio_descriptor());
         }
     }
 }
@@ -2117,10 +2161,29 @@ impl<M: SenderMode> Sender<M> {
     /// bounded terminator,
     /// [`Error::InvalidUtf8`] for non-UTF-8 text, and [`Error::UnexpectedSdkResult`]
     /// when the SDK returns a frame type other than metadata or no frame.
+    #[doc(alias = "NDIlib_send_capture")]
     pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
+        Ok(self
+            .capture_metadata_ref(timeout)?
+            .map(|frame| frame.to_owned()))
+    }
+
+    /// Borrow metadata sent back by connected receivers without copying it.
+    ///
+    /// The frame retains capture exclusion until it is dropped, after the SDK
+    /// has freed its metadata. Another capture spends its timeout waiting for
+    /// that release. Video sends use a separate synchronization path.
+    /// The frame can move to a scoped worker thread; its borrow keeps this
+    /// sender alive through the matching native free.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::capture_metadata`].
+    #[doc(alias = "NDIlib_send_capture")]
+    pub fn capture_metadata_ref(&self, timeout: Duration) -> Result<Option<MetadataFrameRef<'_>>> {
         let metadata = self._ndi.table::<sys::SenderMetadata>()?;
         let deadline = Deadline::after(timeout)?;
-        let Some(_lock) = self.inner.metadata_capture.try_lock_until(deadline.end()) else {
+        let Some(lease) = self.inner.metadata_capture.acquire_until(deadline.end()) else {
             return Ok(None);
         };
         let mut raw = NDIlib_metadata_frame_t {
@@ -2129,8 +2192,8 @@ impl<M: SenderMode> Sender<M> {
             p_data: ptr::null_mut(),
         };
         let remaining = deadline.remaining_ms();
-        // SAFETY: the sender instance is live for this borrow and `raw` is
-        // writable storage for one metadata descriptor.
+        // SAFETY: this borrowed sender is live, the lease serializes capture
+        // through matching free, and raw is writable descriptor storage.
         let called = unsafe {
             metadata
                 .named()
@@ -2138,50 +2201,22 @@ impl<M: SenderMode> Sender<M> {
         };
         let kind = *called.value();
         if kind == NDIlib_frame_type_e_NDIlib_frame_type_metadata {
-            /// Frees one frame that `NDIlib_send_capture` filled, through the
-            /// sender and the runtime table that filled it, when dropped.
-            struct Release {
-                instance: NDIlib_send_instance_t,
-                raw: NDIlib_metadata_frame_t,
-                metadata: &'static sys::SenderMetadata,
-            }
-            impl Drop for Release {
-                fn drop(&mut self) {
-                    // SAFETY: a `Release` is built only below, right after
-                    // `NDIlib_send_capture` reported that it filled `raw` on
-                    // `instance` through `metadata`, the table of the runtime
-                    // that created the sender. The guard never leaves this
-                    // call, whose `&Sender` keeps the sender alive and whose
-                    // capture lock is released only after the guard drops.
-                    // This drop is the frame's only release: it is freed
-                    // exactly once, through the same instance, after its last
-                    // read.
-                    unsafe {
-                        self.metadata
-                            .NDIlib_send_free_metadata(self.instance, &self.raw)
-                    };
-                }
-            }
-            // From here the guard owns the captured frame, so every exit frees
-            // it: a validation error, a panic, or the owned copy's return.
-            let guard = Release {
-                instance: self.inner.instance.0,
-                raw,
-                metadata,
+            // SAFETY: this exact sender/runtime just delivered raw and the
+            // lease retains its capture/free exclusion until the borrowed
+            // view releases the guard. Sender metadata follows the SDK's
+            // bounded NUL-terminated string contract; from_sender validates
+            // that contract before exposing any text.
+            let guard = unsafe {
+                crate::capture::Guard::<crate::capture::SenderMetadataFree>::new(
+                    &self._ndi,
+                    crate::capture::SenderMetadataInstance {
+                        instance: self.inner.instance.0,
+                        metadata,
+                    },
+                    raw,
+                )
             };
-            // SAFETY: `NDIlib_send_capture` filled `guard.raw` on this sender
-            // and reported a metadata frame, which stays allocated until the
-            // guard frees it. Processing.NDI.structs.h independently guarantees
-            // `p_data` is a NUL-terminated UTF-8 string, and the SDK's
-            // Send_VirtualPTZ example reads captured sender metadata as that
-            // string, without using `length` as its byte extent. The bounded
-            // scan relies on this native C-string contract for positive counts
-            // too; generic raw descriptors retain their stricter validation.
-            // The text borrows `guard.raw`, so it is copied before the guard
-            // frees the original, unchanged descriptor.
-            let text = unsafe { crate::frames::validate_sender_metadata(&guard.raw)? };
-            let timecode = Timecode::from_ticks(guard.raw.timecode);
-            Ok(Some(MetadataFrame::copied(text, timecode)))
+            MetadataFrameRef::from_sender(guard, lease).map(Some)
         } else if kind == NDIlib_frame_type_e_NDIlib_frame_type_none {
             Ok(None)
         } else {
@@ -2198,8 +2233,9 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// Accepts owned or captured metadata without copying its text in the
     /// wrapper. The SDK copies the text before returning.
-    pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata_frame: &S) {
-        let raw = metadata_frame.metadata_raw();
+    #[doc(alias = "NDIlib_send_send_metadata")]
+    pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) {
+        let raw = metadata.metadata_raw();
         // The borrowed C string remains live through this synchronous SDK call.
         // SAFETY: the sender instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -2234,6 +2270,7 @@ impl<M: SenderMode> Sender<M> {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_send_get_tally")]
     pub fn tally(&self) -> Tally {
         let state = &self.inner.tally;
         let Some(_query) = state.query.try_lock() else {
@@ -2280,6 +2317,7 @@ impl<M: SenderMode> Sender<M> {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_send_get_tally")]
     pub fn wait_for_tally_change(&self, timeout: Duration) -> Result<Option<Tally>> {
         let deadline = Deadline::after(timeout)?;
         let state = &self.inner.tally;
@@ -2311,57 +2349,46 @@ impl<M: SenderMode> Sender<M> {
         )
     }
 
-    /// Get the number of active connections to this sender.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Maximum wait for at least one connected receiver. A zero
-    ///   timeout returns the current count immediately. A nonzero timeout
-    ///   returns as soon as a receiver is connected, or returns zero when the
-    ///   wait expires, as specified by `Processing.NDI.Send.h`. Must not exceed
-    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// Number of active connections as a `u32`.
+    /// The current number of active connections, without waiting.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnexpectedSdkResult`] if the SDK returns a negative connection count.
-    /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    /// [`Error::UnexpectedSdkResult`] if the SDK returns a negative count.
+    #[doc(alias = "NDIlib_send_get_no_connections")]
+    pub fn connection_count(&self) -> Result<u32> {
+        self.connection_count_with_timeout(0)
+    }
+
+    /// Wait up to `timeout` for at least one connected receiver.
     ///
-    /// # Examples
+    /// Returns the nonzero connection count as soon as a receiver is present,
+    /// or `None` when the wait expires. A zero timeout reads the current count.
     ///
-    /// ```no_run
-    /// # use grafton_ndi::{Ndi, SenderOptions};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = Ndi::new()?;
-    /// let options = SenderOptions::new("Test Sender");
-    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    /// # Errors
     ///
-    /// // Get connection count with 1 second timeout
-    /// let count = sender.connection_count(Duration::from_secs(1))?;
-    /// println!("Active connections: {}", count);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn connection_count(&self, timeout: Duration) -> Result<u32> {
-        let timeout_ms = to_ms_checked(timeout)?;
-        // SAFETY: the sender instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
+    /// [`Error::UnexpectedSdkResult`] for a negative native count, and
+    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    #[doc(alias = "NDIlib_send_get_no_connections")]
+    pub fn wait_for_connection(&self, timeout: Duration) -> Result<Option<NonZeroU32>> {
+        self.connection_count_with_timeout(to_ms_checked(timeout)?)
+            .map(NonZeroU32::new)
+    }
+
+    fn connection_count_with_timeout(&self, timeout_ms: u32) -> Result<u32> {
+        // SAFETY: this borrow keeps the sender and its runtime alive through
+        // the bounded query, which writes no Rust-owned state.
         let count = unsafe {
             self.inner
                 .core
                 .named()
                 .NDIlib_send_get_no_connections(self.inner.instance.0, timeout_ms)
         };
-
         // The SDK count is i32, so every nonnegative value fits u32.
         crate::receiver::native_count(count).map(|count| count as u32)
     }
 
     /// Remove all metadata registered for delivery to each new connection.
+    #[doc(alias = "NDIlib_send_clear_connection_metadata")]
     pub fn clear_connection_metadata(&self) {
         // SAFETY: the sender instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -2376,8 +2403,9 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// Accepts owned or captured metadata. The SDK retains its own copy, so
     /// the input can be released as soon as this method returns.
-    pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata_frame: &S) {
-        let raw = metadata_frame.metadata_raw();
+    #[doc(alias = "NDIlib_send_add_connection_metadata")]
+    pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) {
+        let raw = metadata.metadata_raw();
         // The borrowed C string remains live through this synchronous SDK call.
         // SAFETY: the sender instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -2388,13 +2416,10 @@ impl<M: SenderMode> Sender<M> {
         }
     }
 
-    /// Sets failover source.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if source conversion fails.
-    pub fn set_failover(&self, source: &Source) -> Result<()> {
-        let raw_source = Box::new(source.to_raw()?);
+    /// Set the validated failover source.
+    #[doc(alias = "NDIlib_send_set_failover")]
+    pub fn set_failover(&self, source: &Source) {
+        let raw_source = Box::new(source.to_raw());
         let mut failover = self.native.resource().failover.lock();
         // SAFETY: the native owner retains this boxed descriptor and its
         // strings until a later replacement has returned, or native destruction.
@@ -2406,10 +2431,10 @@ impl<M: SenderMode> Sender<M> {
                 .NDIlib_send_set_failover(self.inner.instance.0, raw_source.as_raw())
         }
         *failover = Some(raw_source);
-        Ok(())
     }
 
     /// Clear the failover source previously configured with [`Self::set_failover`].
+    #[doc(alias = "NDIlib_send_set_failover")]
     pub fn clear_failover(&self) {
         let mut failover = self.native.resource().failover.lock();
         // SAFETY: the sender is live, and the previous descriptor stays owned
@@ -2444,6 +2469,7 @@ impl<M: SenderMode> Sender<M> {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_send_get_source_name")]
     pub fn source(&self) -> Result<Source> {
         // SAFETY: the sender instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -2470,15 +2496,15 @@ impl<M: SenderMode> Sender<M> {
 /// # use grafton_ndi::{Ndi, SenderOptions, Sender};
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// # let ndi = Ndi::new()?;
-/// let options = SenderOptions::new("My Sender").groups("Studio");
+/// let options = SenderOptions::new("My Sender").groups(["Studio"]);
 /// let sender = Sender::new(&ndi, &options)?;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SenderOptions {
     name: String,
-    groups: Option<String>,
+    groups: Option<Vec<String>>,
     clock_video: bool,
     clock_audio: bool,
     #[cfg(feature = "advanced")]
@@ -2516,7 +2542,7 @@ impl SenderOptions {
 
     /// Requested discovery groups, or `None` to inherit the NDI configuration.
     #[must_use]
-    pub fn configured_groups(&self) -> Option<&str> {
+    pub fn configured_groups(&self) -> Option<&[String]> {
         self.groups.as_deref()
     }
 
@@ -2552,11 +2578,11 @@ impl SenderOptions {
         }
     }
 
-    /// Set the comma-separated discovery groups the sender is advertised
+    /// Set the discovery groups the sender is advertised
     /// in, instead of those of the NDI configuration.
     #[must_use]
-    pub fn groups(mut self, groups: impl Into<String>) -> Self {
-        self.groups = Some(groups.into());
+    pub fn groups(mut self, groups: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.groups = Some(groups.into_iter().map(Into::into).collect());
         self
     }
 
@@ -2593,6 +2619,46 @@ impl SenderOptions {
 mod tests {
     use super::*;
     use crate::RuntimeFeature;
+
+    #[test]
+    fn metadata_capture_lease_moves_threads_and_retains_the_wait_budget() {
+        let gate = SenderMetadataGate::default();
+        let lease = gate
+            .acquire_until(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        std::thread::scope(|scope| {
+            let (release, released) = std::sync::mpsc::channel();
+            let worker = scope.spawn(move || {
+                released.recv().unwrap();
+                drop(lease);
+            });
+            let started = Instant::now();
+            assert!(gate
+                .acquire_until(started + Duration::from_millis(25))
+                .is_none());
+            assert!(started.elapsed() >= Duration::from_millis(20));
+            release.send(()).unwrap();
+            worker.join().unwrap();
+            let (_, allocations) = crate::test_alloc::allocation_count(|| {
+                let lease = gate.acquire_until(Instant::now()).unwrap();
+                drop(lease);
+            });
+            assert_eq!(allocations, 0, "capture permits must not allocate");
+        });
+    }
+
+    #[test]
+    fn metadata_capture_lease_releases_during_unwind() {
+        fn traits<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        traits::<SenderMetadataLease<'static>>();
+        let gate = SenderMetadataGate::default();
+        let panic = std::panic::catch_unwind(|| {
+            let _lease = gate.acquire_until(Instant::now()).unwrap();
+            panic!("unwind with an outstanding metadata lease");
+        });
+        assert!(panic.is_err());
+        assert!(gate.acquire_until(Instant::now()).is_some());
+    }
 
     #[test]
     fn initialized_extents_preserve_direct_sending_for_every_format_and_scan() {
@@ -2696,7 +2762,7 @@ mod tests {
     #[test]
     fn captured_video_sending_uses_initialized_active_rows_and_preserves_descriptors() {
         use crate::capture::{FrameSyncVideoFree, Guard, VideoKind};
-        use crate::frames::VideoRef;
+        use crate::{FrameSyncVideoRef, VideoFrameRef};
         use std::{
             mem::MaybeUninit,
             sync::atomic::{AtomicUsize, Ordering},
@@ -2756,7 +2822,7 @@ mod tests {
                         .line_stride_bytes(stride)
                         .scan_type(scan)
                         .frame_rate(FrameRate::new(30_000, 1_001).unwrap())
-                        .picture_aspect_ratio(1.25)
+                        .picture_aspect_ratio(PictureAspectRatio::new(1.25).unwrap())
                         .timecode(Timecode::from_ticks(12345))
                         .metadata(c"<captured/>")
                         .build()
@@ -2782,7 +2848,7 @@ mod tests {
                     // SAFETY: each guard borrows the still-live storage and static
                     // metadata. Its callback counts release and frees no memory.
                     let receiver = unsafe {
-                        VideoRef::new(Guard::<VideoKind>::with_test_free(
+                        VideoFrameRef::new(Guard::<VideoKind>::with_test_free(
                             instance,
                             raw,
                             |instance, _| {
@@ -2792,7 +2858,7 @@ mod tests {
                     }
                     .unwrap();
                     let framesync = unsafe {
-                        VideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+                        FrameSyncVideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
                             instance.cast(),
                             raw,
                             |instance, _| {
@@ -2828,10 +2894,7 @@ mod tests {
 
     #[test]
     fn padded_prepared_and_copied_descriptors_fit_their_own_storage() {
-        use crate::{
-            capture::{Guard, VideoKind},
-            frames::{descriptor_tests::assert_extent, VideoRef},
-        };
+        use crate::{capture::Guard, frames::descriptor_tests::assert_extent, VideoFrameRef};
         for (format, stride) in [
             (PixelFormat::Bgra, 512),
             (PixelFormat::Uyvy, 256),
@@ -2847,7 +2910,7 @@ mod tests {
             // SAFETY: the guard borrows the initialized, still-live storage;
             // the synthetic release callback owns and frees nothing.
             let captured = unsafe {
-                VideoRef::<VideoKind>::new(Guard::with_test_free(
+                VideoFrameRef::new(Guard::with_test_free(
                     ptr::null_mut(),
                     Sendable::for_test(&frame).video_descriptor(),
                     |_, _| {},
@@ -2859,7 +2922,7 @@ mod tests {
             let raw = prepared.raw;
             assert_ne!(raw.p_data.cast_const(), storage.as_ptr());
             assert_extent(&raw, staging.as_ptr(), staging.len() + staging.room());
-            // This is the packed copy submitted by send_video_async_copy;
+            // This is the packed copy submitted by submit_video_copy;
             // its authorization is still that of the padded source.
             let mut owned = Sendable::for_test(&frame).copied(None);
             #[allow(irrefutable_let_patterns)]
@@ -2876,7 +2939,7 @@ mod tests {
                 owned.data().len() + owned.tail_room(),
             );
             if let Some(mut sender) = test_sender() {
-                sender.send_video_async_copy(&frame).unwrap();
+                sender.submit_video_copy(&frame).unwrap();
                 {
                     let state = sender.native.video.state.lock().unwrap();
                     let retained = state.in_flight.frame().unwrap();
@@ -2886,7 +2949,7 @@ mod tests {
                         retained.data().len() + retained.tail_room(),
                     );
                 }
-                sender.finish_video_async();
+                sender.reclaim_video();
             }
         }
     }
@@ -2948,7 +3011,7 @@ mod tests {
         let first = test_owned_frame(11);
         let pixels = first.data().as_ptr();
         let metadata = first.metadata_cstr().unwrap().as_ptr();
-        assert!(sender.send_video_async(first).unwrap().is_none());
+        assert!(sender.submit_video(first).unwrap().is_none());
         {
             let video = sender.native.video.state.lock().unwrap();
             let Some(frame) = video.in_flight.frame() else {
@@ -2959,13 +3022,13 @@ mod tests {
         }
         let second = test_owned_frame(22);
         let second_pixels = second.data().as_ptr();
-        let recycled = sender.send_video_async(second).unwrap().unwrap();
+        let recycled = sender.submit_video(second).unwrap().unwrap();
         assert_eq!(recycled.data().as_ptr(), pixels);
         assert_eq!(recycled.metadata_cstr().unwrap().as_ptr(), metadata);
         assert_eq!(recycled.metadata(), Some("<frame value='11'/>"));
-        let final_frame = sender.finish_video_async().unwrap();
+        let final_frame = sender.reclaim_video().unwrap();
         assert_eq!(final_frame.data().as_ptr(), second_pixels);
-        assert!(sender.finish_video_async().is_none());
+        assert!(sender.reclaim_video().is_none());
     }
 
     #[test]
@@ -3006,7 +3069,7 @@ mod tests {
         let pixels = vec![128; 16 * 16 * 4];
         let source = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
             .frame_rate(FrameRate::new(30, 1).unwrap())
-            .picture_aspect_ratio(1.25)
+            .picture_aspect_ratio(PictureAspectRatio::new(1.25).unwrap())
             .timecode(Timecode::from_ticks(1234))
             .metadata(c"<metadata/>")
             .build()
@@ -3015,25 +3078,25 @@ mod tests {
             .metadata(c"<short/>")
             .build()
             .unwrap();
-        sender.send_video_async_copy(&source).unwrap();
-        sender.send_video_async_copy(&source).unwrap();
+        sender.submit_video_copy(&source).unwrap();
+        sender.submit_video_copy(&source).unwrap();
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
             for _ in 0..4 {
-                sender.send_video_async_copy(&shorter).unwrap();
-                sender.send_video_async_copy(&shorter).unwrap();
-                sender.send_video_async_copy(&source).unwrap();
-                sender.send_video_async_copy(&source).unwrap();
+                sender.submit_video_copy(&shorter).unwrap();
+                sender.submit_video_copy(&shorter).unwrap();
+                sender.submit_video_copy(&source).unwrap();
+                sender.submit_video_copy(&source).unwrap();
             }
         });
         assert_eq!(allocations, 0);
-        let copy = sender.finish_video_async().unwrap();
+        let copy = sender.reclaim_video().unwrap();
         assert_eq!(copy.data(), pixels);
         assert_eq!(copy.frame_rate(), source.frame_rate());
-        assert_eq!(copy.picture_aspect_ratio(), 1.25);
+        assert_eq!(copy.picture_aspect_ratio().get(), 1.25);
         assert_eq!(copy.timecode(), Timecode::from_ticks(1234));
         assert_eq!(copy.metadata(), Some("<metadata/>"));
         assert!(sender.native.video.state.lock().unwrap().spare.is_none());
-        assert!(sender.finish_video_async().is_none());
+        assert!(sender.reclaim_video().is_none());
     }
 
     #[test]
@@ -3053,8 +3116,8 @@ mod tests {
             .metadata(c"<metadata/>")
             .build()
             .unwrap();
-        sender.send_video_async_copy(&present).unwrap();
-        sender.send_video_async_copy(&present).unwrap();
+        sender.submit_video_copy(&present).unwrap();
+        sender.submit_video_copy(&present).unwrap();
         // Exclusive async sends do not lock the state. Warm this test's
         // inspection lock, whose first use may allocate on some platforms.
         drop(sender.native.video.state.lock().unwrap());
@@ -3065,7 +3128,7 @@ mod tests {
                     (&empty, Some("")),
                     (&present, Some("<metadata/>")),
                 ] {
-                    sender.send_video_async_copy(source).unwrap();
+                    sender.submit_video_copy(source).unwrap();
                     let state = sender.native.video.state.lock().unwrap();
                     assert_eq!(state.in_flight.frame().unwrap().metadata(), expected);
                 }
@@ -3073,7 +3136,7 @@ mod tests {
         });
         assert_eq!(allocations, 0);
         assert_eq!(
-            sender.finish_video_async().unwrap().metadata(),
+            sender.reclaim_video().unwrap().metadata(),
             Some("<metadata/>")
         );
     }
@@ -3098,36 +3161,36 @@ mod tests {
             .metadata(&metadata)
             .build()
             .unwrap();
-        sender.send_video_async_copy(&small).unwrap();
-        sender.send_video_async_copy(&small).unwrap();
+        sender.submit_video_copy(&small).unwrap();
+        sender.submit_video_copy(&small).unwrap();
         // Each of the two reusable pixel buffers grows once, with no new
         // metadata storage needed. No further growth is needed afterward.
         for _ in 0..2 {
             let ((), allocations) = crate::test_alloc::allocation_count(|| {
-                sender.send_video_async_copy(&large).unwrap();
+                sender.submit_video_copy(&large).unwrap();
             });
             assert_eq!(allocations, 1);
         }
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
-            sender.send_video_async_copy(&large).unwrap();
-            sender.send_video_async_copy(&large).unwrap();
+            sender.submit_video_copy(&large).unwrap();
+            sender.submit_video_copy(&large).unwrap();
         });
         assert_eq!(allocations, 0);
         // Longer metadata likewise grows each reusable metadata buffer once.
         for _ in 0..2 {
             let ((), allocations) = crate::test_alloc::allocation_count(|| {
-                sender.send_video_async_copy(&longer).unwrap();
+                sender.submit_video_copy(&longer).unwrap();
             });
             assert_eq!(allocations, 1);
         }
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
             for _ in 0..4 {
-                sender.send_video_async_copy(&longer).unwrap();
-                sender.send_video_async_copy(&large).unwrap();
+                sender.submit_video_copy(&longer).unwrap();
+                sender.submit_video_copy(&large).unwrap();
             }
         });
         assert_eq!(allocations, 0);
-        sender.finish_video_async();
+        sender.reclaim_video();
     }
 
     #[test]
@@ -3269,7 +3332,7 @@ mod tests {
         for format in PixelFormat::ALL {
             if !matches!(format, PixelFormat::Uyvy | PixelFormat::Uyva) {
                 assert_eq!(format.send_tail_room(), 0, "{format:?}");
-                let len = format.buffer_len(18, 4).unwrap();
+                let len = format.buffer_len(18, 4, None).unwrap();
                 for scan in ScanType::ALL {
                     assert!(
                         in_place(format, 4, scan, None, len, 0),
@@ -3344,7 +3407,7 @@ mod tests {
         let frame = BorrowedVideoFrame::builder(&buffer, 18, 4, PixelFormat::Uyvy)
             .line_stride_bytes(40)
             .frame_rate(FrameRate::new(30000, 1001).unwrap())
-            .picture_aspect_ratio(1.25)
+            .picture_aspect_ratio(PictureAspectRatio::new(1.25).unwrap())
             .scan_type(ScanType::Interlaced)
             .timecode(Timecode::from_ticks(12345))
             .metadata(metadata)
@@ -3540,15 +3603,15 @@ mod tests {
         };
         let frame = test_owned_frame(1);
         let pixels = frame.data().as_ptr();
-        sender.send_video_async(frame).unwrap();
+        sender.submit_video(frame).unwrap();
         sender.send_video(&test_owned_frame(9)).unwrap();
-        sender.flush_async_blocking();
-        assert_eq!(sender.finish_video_async().unwrap().data().as_ptr(), pixels);
+        sender.flush_video();
+        assert_eq!(sender.reclaim_video().unwrap().data().as_ptr(), pixels);
 
         // A copied send retains the released owned frame for its next copy.
         let owned = test_owned_frame(2);
         let owned_pixels = owned.data().as_ptr();
-        sender.send_video_async(owned).unwrap();
+        sender.submit_video(owned).unwrap();
         let data = vec![3; 1024];
         let metadata = CString::new("<copy/>").unwrap();
         {
@@ -3556,7 +3619,7 @@ mod tests {
                 .metadata(&metadata)
                 .build()
                 .unwrap();
-            sender.send_video_async_copy(&borrowed).unwrap();
+            sender.submit_video_copy(&borrowed).unwrap();
         }
         {
             let video = sender.native.video.state.lock().unwrap();
@@ -3580,14 +3643,11 @@ mod tests {
             assert_eq!(copy.metadata().unwrap(), "<copy/>");
         }
         // Copies are ordinary owned frames and are returned for reuse too.
-        let copied = sender
-            .send_video_async(test_owned_frame(4))
-            .unwrap()
-            .unwrap();
+        let copied = sender.submit_video(test_owned_frame(4)).unwrap().unwrap();
         assert_eq!(copied.data()[0], 3);
         assert_eq!(copied.metadata(), Some("<copy/>"));
-        sender.finish_video_async().unwrap();
-        sender.flush_async_blocking();
+        sender.reclaim_video().unwrap();
+        sender.flush_video();
     }
 
     #[test]
@@ -3614,39 +3674,36 @@ mod tests {
         // A synchronous send completes the frame in flight; the next
         // submission returns that original allocation.
         let (a, a_pixels) = frame(1);
-        assert!(sender.send_video_async(a).unwrap().is_none());
+        assert!(sender.submit_video(a).unwrap().is_none());
         assert!(in_flight(&sender));
         sender.send_video(&test_owned_frame(9)).unwrap();
         assert!(!in_flight(&sender));
         let (b, b_pixels) = frame(2);
-        let previous = sender.send_video_async(b).unwrap().unwrap();
+        let previous = sender.submit_video(b).unwrap().unwrap();
         assert_eq!(previous.data().as_ptr(), a_pixels);
 
         // A flush does the same, and a second flush finds nothing in flight.
-        sender.flush_async_blocking();
+        sender.flush_video();
         assert!(!in_flight(&sender));
-        sender.flush_async_blocking();
+        sender.flush_video();
         let (c, c_pixels) = frame(3);
-        let previous = sender.send_video_async(c).unwrap().unwrap();
+        let previous = sender.submit_video(c).unwrap().unwrap();
         assert_eq!(previous.data().as_ptr(), b_pixels);
 
         // A submission completes the in-flight frame it displaces.
         let (d, d_pixels) = frame(4);
-        let previous = sender.send_video_async(d).unwrap().unwrap();
+        let previous = sender.submit_video(d).unwrap().unwrap();
         assert_eq!(previous.data().as_ptr(), c_pixels);
         assert!(in_flight(&sender));
 
         // Finishing recovers a frame a synchronous send already completed.
         sender.send_video(&test_owned_frame(9)).unwrap();
-        assert_eq!(
-            sender.finish_video_async().unwrap().data().as_ptr(),
-            d_pixels
-        );
-        assert!(sender.finish_video_async().is_none());
+        assert_eq!(sender.reclaim_video().unwrap().data().as_ptr(), d_pixels);
+        assert!(sender.reclaim_video().is_none());
 
         // A sender can also be dropped after an explicit flush.
-        sender.send_video_async(frame(5).0).unwrap();
-        sender.flush_async_blocking();
+        sender.submit_video(frame(5).0).unwrap();
+        sender.flush_video();
         drop(sender);
     }
 
@@ -3675,15 +3732,12 @@ mod tests {
             .build()
             .unwrap();
         // An earlier frame stays in flight through every rejection.
-        assert!(sender
-            .send_video_async(test_owned_frame(1))
-            .unwrap()
-            .is_none());
+        assert!(sender.submit_video(test_owned_frame(1)).unwrap().is_none());
         if supported {
             sender.send_video(&frame).unwrap();
-            let previous = sender.send_video_async(frame).unwrap().unwrap();
+            let previous = sender.submit_video(frame).unwrap().unwrap();
             assert_eq!(previous.data()[0], 1);
-            sender.send_video_async_copy(&borrowed).unwrap();
+            sender.submit_video_copy(&borrowed).unwrap();
             assert_eq!(
                 sender
                     .native
@@ -3703,17 +3757,17 @@ mod tests {
                 matches!(
                     error,
                     Error::UnsupportedCapability {
-                        feature: RuntimeFeature::Planar444Video,
+                        capability: crate::Capability::Runtime(RuntimeFeature::Planar444Video),
                         ..
                     }
                 )
             };
             assert!(unsupported(&sender.send_video(&frame).unwrap_err()));
-            let rejected = sender.send_video_async(frame).unwrap_err();
+            let rejected = sender.submit_video(frame).unwrap_err();
             assert!(unsupported(rejected.error()));
             assert_eq!(rejected.into_inner().data().as_ptr(), pixels);
             assert!(unsupported(
-                &sender.send_video_async_copy(&borrowed).unwrap_err()
+                &sender.submit_video_copy(&borrowed).unwrap_err()
             ));
             assert!(sender
                 .native
@@ -3724,7 +3778,7 @@ mod tests {
                 .in_flight
                 .is_in_flight());
         }
-        assert!(sender.finish_video_async().is_some());
+        assert!(sender.reclaim_video().is_some());
     }
 
     #[test]
@@ -3757,7 +3811,7 @@ mod tests {
                     let frame = BorrowedVideoFrame::builder(&data, 4, 4, format)
                         .line_stride_bytes(stride)
                         .frame_rate(rate)
-                        .picture_aspect_ratio(1.25)
+                        .picture_aspect_ratio(PictureAspectRatio::new(1.25).unwrap())
                         .scan_type(ScanType::Interlaced)
                         .timecode(Timecode::from_ticks(0))
                         .metadata(metadata)
@@ -3775,7 +3829,7 @@ mod tests {
                     crate::test_alloc::allocation_count(|| borrowed.to_owned());
                 assert_eq!(allocations, 2);
                 assert_eq!(owned.frame_rate(), rate);
-                assert_eq!(owned.picture_aspect_ratio(), 1.25);
+                assert_eq!(owned.picture_aspect_ratio().get(), 1.25);
                 assert_eq!(owned.scan_type(), ScanType::Interlaced);
                 assert_eq!(
                     (owned.timecode(), owned.timestamp()),
@@ -3851,27 +3905,21 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(frame.timecode(), Timecode::SYNTHESIZE);
-        assert_eq!(frame.picture_aspect_ratio(), 0.0);
+        assert_eq!(frame.picture_aspect_ratio().get(), 0.0);
 
         let frame = BorrowedVideoFrame::builder(&buffer, 64, 36, PixelFormat::Uyvy)
-            .picture_aspect_ratio(0.0)
+            .picture_aspect_ratio(PictureAspectRatio::SQUARE_PIXELS)
             .build()
             .unwrap()
             .with_timecode(Timecode::from_ticks(1234));
         assert_eq!(frame.timecode(), Timecode::from_ticks(1234));
-        assert_eq!(frame.picture_aspect_ratio(), 0.0);
+        assert_eq!(frame.picture_aspect_ratio().get(), 0.0);
         let raw = frame.to_raw();
         assert_eq!((raw.timecode, raw.picture_aspect_ratio), (1234, 0.0));
         assert_eq!(raw.timestamp, NDIlib_recv_timestamp_undefined);
 
         for bad in [-1.0, f32::NAN, f32::INFINITY] {
-            assert!(
-                BorrowedVideoFrame::builder(&buffer, 64, 36, PixelFormat::Uyvy)
-                    .picture_aspect_ratio(bad)
-                    .build()
-                    .is_err(),
-                "{bad}"
-            );
+            assert!(PictureAspectRatio::new(bad).is_err(), "{bad}");
         }
     }
 
@@ -3883,17 +3931,17 @@ mod tests {
                 let mut builder =
                     BorrowedVideoFrame::builder(&pixels, width, height, PixelFormat::Bgra);
                 if let Some(ratio) = ratio {
-                    builder = builder.picture_aspect_ratio(ratio);
+                    builder = builder.picture_aspect_ratio(PictureAspectRatio::new(ratio).unwrap());
                 }
                 let frame = builder.build().unwrap();
                 let expected = ratio.unwrap_or(0.0);
-                assert_eq!(frame.picture_aspect_ratio(), expected);
+                assert_eq!(frame.picture_aspect_ratio().get(), expected);
                 assert_eq!(frame.to_raw().picture_aspect_ratio, expected);
                 let mut copied = frame.to_owned();
-                assert_eq!(copied.picture_aspect_ratio(), expected);
-                copied.set_picture_aspect_ratio(2.0).unwrap();
+                assert_eq!(copied.picture_aspect_ratio().get(), expected);
+                copied.set_picture_aspect_ratio(PictureAspectRatio::new(2.0).unwrap());
                 frame.copy_into(&mut copied);
-                assert_eq!(copied.picture_aspect_ratio(), expected);
+                assert_eq!(copied.picture_aspect_ratio().get(), expected);
             }
         }
     }
@@ -3954,7 +4002,7 @@ mod tests {
     #[test]
     fn test_borrowed_builder_nv12() {
         // NV12 planar format: Y plane + UV plane
-        let expected_size = PixelFormat::Nv12.buffer_len(1920, 1080).unwrap();
+        let expected_size = PixelFormat::Nv12.buffer_len(1920, 1080, None).unwrap();
         let buffer = vec![0u8; expected_size];
         assert!(borrowed(&buffer, 1920, 1080, PixelFormat::Nv12).is_ok());
     }
@@ -3962,7 +4010,7 @@ mod tests {
     #[test]
     fn test_borrowed_builder_i420() {
         // I420 planar format
-        let expected_size = PixelFormat::I420.buffer_len(640, 480).unwrap();
+        let expected_size = PixelFormat::I420.buffer_len(640, 480, None).unwrap();
         let buffer = vec![0u8; expected_size];
         assert!(borrowed(&buffer, 640, 480, PixelFormat::I420).is_ok());
     }
@@ -3997,7 +4045,7 @@ mod tests {
         assert_eq!(frame.height(), 1080);
         assert_eq!(frame.pixel_format(), PixelFormat::Bgra);
         assert_eq!(frame.frame_rate(), FrameRate::new(60, 1).unwrap());
-        assert_eq!(frame.picture_aspect_ratio(), 0.0);
+        assert_eq!(frame.picture_aspect_ratio().get(), 0.0);
         assert_eq!(frame.scan_type(), ScanType::Progressive);
         assert_eq!(frame.timecode(), Timecode::SYNTHESIZE);
         assert_eq!(frame.data().unwrap().len(), buffer.len());
@@ -4054,7 +4102,7 @@ mod tests {
         let height = 1080;
 
         for format in [PixelFormat::Nv12, PixelFormat::I420, PixelFormat::Yv12] {
-            let expected_size = format.buffer_len(width, height).unwrap();
+            let expected_size = format.buffer_len(width, height, None).unwrap();
 
             let buffer = vec![0u8; expected_size];
             let result = borrowed(&buffer, width, height, format);

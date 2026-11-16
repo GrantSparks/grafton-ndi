@@ -7,8 +7,8 @@ use std::time::Duration;
 fn framesync(sync: &mut FrameSync) {
     let session = sync.controls().kvm().unwrap();
     let view = session.receiver();
-    let _ = view.video();
-    let _ = view.audio();
+    let _ = view.capture_video(Duration::ZERO);
+    let _ = view.capture_audio(Duration::ZERO);
     let _ = view.capture_any_ref(Duration::ZERO);
     let _ = view.capture_any(Duration::ZERO);
 }
@@ -16,7 +16,7 @@ fn framesync(sync: &mut FrameSync) {
 fn avsync(sync: &mut AvSync) {
     let session = sync.controls().kvm().unwrap();
     let view = session.receiver();
-    let _ = view.audio();
+    let _ = view.capture_audio(Duration::ZERO);
     let _ = view.capture_any_ref(Duration::ZERO);
     let _ = view.capture_any(Duration::ZERO);
 }
@@ -24,10 +24,10 @@ fn avsync(sync: &mut AvSync) {
 fn packets(packets: &mut PacketReceiver) {
     let session = packets.controls().kvm().unwrap();
     let view = session.receiver();
-    let _ = view.video();
-    let _ = view.audio();
-    let _ = view.metadata();
-    let _ = view.poll_event(Duration::ZERO);
+    let _ = view.capture_video(Duration::ZERO);
+    let _ = view.capture_audio(Duration::ZERO);
+    let _ = view.capture_metadata(Duration::ZERO);
+    let _ = view.next_event(Duration::ZERO);
     let _ = view.capture_any_ref(Duration::ZERO);
     let _ = view.capture_any(Duration::ZERO);
 }

@@ -19,8 +19,16 @@ and explain the change in behavior. Keep native ownership and synchronization
 arguments beside unsafe operations.
 
 Update API documentation and examples when behavior changes, and add migration
-notes when callers must change. Document measured performance with its workload
-and limits; test-run logs and internal audit reports do not belong in the source
-tree.
+notes when callers must change. Follow the [public API conventions](docs/api-conventions.md)
+for names, signatures, traits, ownership and documentation. Keep issue investigations, implementation plans,
+audit reports and measured results on the relevant GitHub issue. Include the
+workload, environment and limits with performance results; repository docs
+should explain how to use and maintain the library.
+
+Keep build outputs, test logs, recordings and reproducible fixture outputs out
+of Git. Commit generators and generate their outputs in temporary directories
+or under `target/`. Compile-failure `.stderr` files are reviewed expectations
+used to detect regressions, so keep them with their test cases. The vendored SDK
+declarations are shipped source needed to build without an installed SDK.
 
 Contributions use the repository's [Apache-2.0 license](LICENSE).

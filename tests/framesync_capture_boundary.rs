@@ -21,7 +21,7 @@ fn attached_receiver_permits_controls_metadata_and_recovery_restores_raw_capture
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let source = Source::new("FrameSync capture boundary");
+    let source = Source::new("FrameSync capture boundary").unwrap();
     let mut receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
     for _ in 0..3 {
         let framesync = FrameSync::new(receiver)?;
@@ -32,10 +32,10 @@ fn attached_receiver_permits_controls_metadata_and_recovery_restores_raw_capture
         drop(_audio);
         framesync.receiver().set_tally(Tally::new(false, true));
         assert!(!framesync.receiver().ptz().is_supported());
-        let _ = framesync.receiver().metadata().capture(Duration::ZERO)?;
+        let _ = framesync.receiver().capture_metadata(Duration::ZERO)?;
         receiver = framesync.into_receiver();
-        assert!(receiver.video().capture(Duration::ZERO)?.is_none());
-        assert!(receiver.audio().capture_ref(Duration::ZERO)?.is_none());
+        assert!(receiver.capture_video(Duration::ZERO)?.is_none());
+        assert!(receiver.capture_audio_ref(Duration::ZERO)?.is_none());
     }
     Ok(())
 }

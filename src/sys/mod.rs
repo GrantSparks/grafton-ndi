@@ -7,6 +7,10 @@
 // Keep the complete generated ABI, including legacy types and constants that
 // safe wrappers do not expose. Coverage tests classify every declared function.
 #[allow(
+    missing_debug_implementations,
+    reason = "private generated ABI declarations are not public Rust API"
+)]
+#[allow(
     non_upper_case_globals,
     non_camel_case_types,
     non_snake_case,
@@ -32,6 +36,10 @@ pub(crate) mod declarations;
 // Preserve the installed header's full ABI even when only some families are
 // wrapped. These allowances apply only to generated declarations.
 #[cfg(ndi_has_advanced_header)]
+#[allow(
+    missing_debug_implementations,
+    reason = "private generated ABI declarations are not public Rust API"
+)]
 #[allow(
     non_upper_case_globals,
     non_camel_case_types,

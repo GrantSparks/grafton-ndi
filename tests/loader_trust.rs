@@ -28,8 +28,8 @@ fn relative_environment_directories_never_run_constructors() {
         assert_eq!(ndi.info().library_path(), Some(trusted.as_path()));
         #[cfg(feature = "file-io")]
         if scenario == "file" {
-            use grafton_ndi::file::{FileApi, FileRuntimeOptions};
-            let file = FileApi::open(&ndi, &FileRuntimeOptions::new()).unwrap();
+            use grafton_ndi::file::{FileApi, FileApiOptions};
+            let file = FileApi::new(&ndi, &FileApiOptions::new()).unwrap();
             assert_eq!(
                 file.library_path(),
                 Some(root.join("loader/libndifile.so.6").as_path())
@@ -129,18 +129,18 @@ fn explicit_paths_avoid_rejected_search_candidates() {
         assert_eq!(marker.exists(), scenario == "default");
         #[cfg(feature = "file-io")]
         if scenario.starts_with("file-") {
-            use grafton_ndi::file::{FileApi, FileRuntimeOptions};
+            use grafton_ndi::file::{FileApi, FileApiOptions};
             let selected = if scenario == "file-companion" {
                 root.join("trusted/libndifile.so.6")
             } else {
                 root.join("file-runtime/libndifile.so.6")
             };
             let options = if scenario == "file-explicit" {
-                FileRuntimeOptions::new().library_path(&selected)
+                FileApiOptions::new().library_path(&selected)
             } else {
-                FileRuntimeOptions::new()
+                FileApiOptions::new()
             };
-            let file = FileApi::open(&ndi, &options).unwrap();
+            let file = FileApi::new(&ndi, &options).unwrap();
             assert_eq!(file.library_path(), Some(selected.as_path()));
             assert_eq!(marker.exists(), scenario == "file-fallback");
         }

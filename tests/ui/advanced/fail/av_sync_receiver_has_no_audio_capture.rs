@@ -6,9 +6,9 @@ use grafton_ndi::{
 };
 use std::time::Duration;
 fn own_audio(receiver: &Receiver<AvSyncAttached>) {
-    let _ = receiver.audio().capture(Duration::ZERO);
+    let _ = receiver.capture_audio(Duration::ZERO);
 }
 fn lent_audio(sync: &AvSync) {
-    let _ = sync.receiver().audio().capture_ref(Duration::ZERO);
+    let _ = sync.receiver().capture_audio_ref(Duration::ZERO);
 }
 fn main() {}

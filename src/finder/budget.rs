@@ -9,6 +9,9 @@ use crate::{
 
 pub(super) use crate::sdk_copy::{allocation_failed, COPY_LIMIT as MAX_BYTES};
 pub(super) const MAX_SOURCES: usize = 16_384;
+// Shared CString storage adds its Arc header, the CString itself and one NUL.
+pub(super) const SOURCE_TEXT_OVERHEAD: usize =
+    2 * size_of::<usize>() + size_of::<std::ffi::CString>() + 1;
 
 pub(super) fn limit(resource: ResourceKind, limit: usize) -> Error {
     Error::ResourceLimit { resource, limit }
@@ -34,13 +37,23 @@ impl SnapshotBudget {
         ))
     }
 
+    /// Charge the shared empty name used for an address-only source.
+    pub(super) fn empty_source_name(&mut self) -> Result<()> {
+        self.0.take(SOURCE_TEXT_OVERHEAD)
+    }
+
     /// # Safety
     /// A non-null pointer remains readable through its first NUL or the SDK
     /// string bound, whichever comes first.
     pub(crate) unsafe fn text(&mut self, pointer: *const c_char) -> Result<Option<String>> {
         // SAFETY: forwarded to the caller's obligations.
         match unsafe { self.0.text(pointer) } {
-            Ok(text) => Ok(text),
+            Ok(text) => {
+                if text.is_some() {
+                    self.0.take(SOURCE_TEXT_OVERHEAD)?;
+                }
+                Ok(text)
+            }
             Err(CopyError::Malformed(_)) => Ok(None),
             Err(error) => Err(error.into_error()),
         }
@@ -136,7 +149,8 @@ mod tests {
 
     #[test]
     fn aggregate_bytes_are_checked_before_string_allocation() {
-        let overhead = 2 * (size_of::<NDIlib_source_t>() + size_of::<Source>());
+        let overhead =
+            2 * (size_of::<NDIlib_source_t>() + size_of::<Source>() + SOURCE_TEXT_OVERHEAD);
         let len = (MAX_BYTES - overhead - 2) / 4;
         let fits = CString::new(vec![b'x'; len]).unwrap();
         assert_eq!(snapshot(&[named(fits.as_ptr()); 2]).unwrap().len(), 2);

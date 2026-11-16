@@ -59,7 +59,10 @@ fn borrowed_video_item_allocates_nothing_and_owned_copy_skips_uninitialized_padd
         unreachable!()
     };
     assert_eq!(frame.data(), [37; 32]);
-    assert_eq!(frame.picture_aspect_ratio(), 1.25);
+    assert_eq!(
+        frame.picture_aspect_ratio(),
+        crate::PictureAspectRatio::new(1.25).unwrap()
+    );
     assert_eq!(frame.timecode(), Timecode::from_ticks(1234));
     assert_eq!(frame.metadata(), Some("<video/>"));
     assert_eq!(releases.load(Ordering::SeqCst), 0);

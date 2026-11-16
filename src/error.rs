@@ -16,15 +16,17 @@ pub use loading::{
 
 use thiserror::Error;
 
-use std::{ffi::NulError, fmt};
+use std::ffi::NulError;
 
-use crate::capabilities::{CapabilityRefusal, RuntimeFeature};
+#[cfg(test)]
+use crate::capabilities::RuntimeFeature;
+use crate::capabilities::{Capability, CapabilityRefusal};
 
 /// Why an async blocking operation could not run.
 ///
 /// Panics are resumed on the awaiting task rather than reported as spawn
 /// failures. This discriminator does not depend on diagnostic text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum SpawnFailure {
     /// The Tokio operation was polled outside a Tokio runtime.
@@ -36,7 +38,7 @@ pub enum SpawnFailure {
 }
 
 /// Why the selected native runtime could not initialize.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum InitializationFailure {
     /// The SDK refused initialization on a supported CPU.
@@ -71,13 +73,13 @@ pub enum Error {
     ///   names every location tried and why each was rejected: the file was
     ///   absent, the operating system could not load it, or it lacks a
     ///   required entry point.
-    /// * Opening the File API (`file::FileApi::open`): no usable File library
+    /// * Opening the File API (`file::FileApi::new`): no usable File library
     ///   was found, with every location tried and the reason for each. A
     ///   library that provides no family of File entry points is not usable.
     ///
     /// Nothing is selected, so the call can be repeated, for example once the
     /// library is installed. A selected File library that lacks the entry
-    /// points of one family is reported as `Error::FileFamilyUnavailable`
+    /// points of one family is reported as [`Error::UnsupportedCapability`]
     /// instead, by every operation that needs that family.
     ///
     /// [`Runtime::select`]: crate::Runtime::select
@@ -88,27 +90,18 @@ pub enum Error {
     /// does not provide.
     ///
     /// `refusal` is the same typed evidence returned by
-    /// [`Capabilities::status`](crate::Capabilities::status). Every operation
+    /// [`Capabilities::status`](crate::Capabilities::status) or
+    /// `file::FileApi::status`. Every operation
     /// is refused before reaching the SDK, and [`Ndi::require_feature`](crate::Ndi::require_feature)
     /// reports the same value in advance. This condition lasts for the process
     /// lifetime: selecting another runtime or supplying missing build declarations
     /// requires a new process or build.
-    #[error("NDI capability {} is unavailable: {refusal}", .feature.name())]
+    #[error("NDI capability {capability} is unavailable: {refusal}")]
     UnsupportedCapability {
         /// The capability, the same whichever operation it gates.
-        feature: RuntimeFeature,
+        capability: Capability,
         /// Why it is unavailable, with the evidence recorded during detection.
         refusal: CapabilityRefusal,
-    },
-
-    /// The selected File library lacks an entry point of the required family.
-    #[cfg(feature = "file-io")]
-    #[error("NDI capability {} is unavailable: the selected library does not export a required function: {}", .family.name(), .missing.to_string_lossy())]
-    FileFamilyUnavailable {
-        /// The family the operation needs.
-        family: crate::file::FileFamily,
-        /// The first required entry point the selected library does not export.
-        missing: &'static std::ffi::CStr,
     },
 
     /// Runtime or File library selection conflicts with the process's native
@@ -288,33 +281,6 @@ pub enum Error {
         limit: usize,
     },
 
-    /// A caller-defined discovery operation finished without a matching source.
-    ///
-    /// This convenience error is constructed by callers when an empty discovery
-    /// result is an application error. Finder selection returns `Ok(None)` and
-    /// source enumeration returns an empty vector when nothing matches; neither
-    /// constructs this error automatically.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use grafton_ndi::Error;
-    /// match some_operation() {
-    ///     Err(Error::NoSourcesFound { criteria }) => {
-    ///         eprintln!("No sources found matching: {}", criteria);
-    ///         // Could widen search criteria or wait longer
-    ///     }
-    ///     Err(e) => eprintln!("Other error: {}", e),
-    ///     Ok(_) => println!("Success"),
-    /// }
-    /// # fn some_operation() -> Result<(), Error> { Ok(()) }
-    /// ```
-    #[error("No NDI sources found matching: {criteria}")]
-    NoSourcesFound {
-        /// The search criteria that yielded no results
-        criteria: String,
-    },
-
     /// A Discovery Server listener did not send a request, because no receiver
     /// it lists accepts it.
     ///
@@ -360,12 +326,12 @@ pub enum Error {
     /// A File API operation is not permitted in the current state of its
     /// recorder or async handle.
     ///
-    /// The [`StateError`](crate::file::StateError) says which state forbids
-    /// it, and [`StateError::is_retryable`](crate::file::StateError::is_retryable)
+    /// The [`StateConflict`](crate::file::StateConflict) says which state forbids
+    /// it, and [`StateConflict::is_retryable`](crate::file::StateConflict::is_retryable)
     /// whether the same call can succeed later without anything else changing.
     #[cfg(feature = "file-io")]
     #[error("Invalid File API state: {0}")]
-    InvalidState(crate::file::StateError),
+    InvalidState(crate::file::StateConflict),
 
     /// An operating-system operation failed.
     ///
@@ -414,70 +380,56 @@ const _: () = {
 /// [`Error::ResourceLimit`]. Byte budgets cover native data inspected and owned
 /// storage retained, as documented by the operation. Match this value rather
 /// than diagnostic text; additional budgets may be introduced in 3.x.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum ResourceKind {
     /// Source descriptors in one plain or Advanced Finder snapshot; the limit
     /// is a number of sources.
+    #[error("Finder snapshot sources")]
     FinderSnapshotSources,
     /// Aggregate bytes scanned or copied for one plain or Advanced Finder
     /// snapshot; the limit is in bytes.
+    #[error("Finder snapshot bytes")]
     FinderSnapshotBytes,
     /// Distinct sources retained over one Finder discovery window; the limit
     /// is a number of sources.
+    #[error("Finder discovery sources")]
     FinderDiscoverySources,
     /// Aggregate owned storage retained over one Finder discovery window;
     /// the limit is in bytes.
+    #[error("Finder discovery bytes")]
     FinderDiscoveryBytes,
     /// Aggregate bytes scanned or copied for one Discovery Server snapshot or
     /// event batch, including nested arrays and strings; the limit is in bytes.
+    #[error("Discovery Server snapshot or event batch bytes")]
     DiscoveryServerCopyBytes,
-}
-
-impl fmt::Display for ResourceKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::FinderSnapshotSources => "Finder snapshot sources",
-            Self::FinderSnapshotBytes => "Finder snapshot bytes",
-            Self::FinderDiscoverySources => "Finder discovery sources",
-            Self::FinderDiscoveryBytes => "Finder discovery bytes",
-            Self::DiscoveryServerCopyBytes => "Discovery Server snapshot or event batch bytes",
-        })
-    }
 }
 
 /// Which bounded queue was full, carried by [`Error::QueueFull`].
 ///
 /// Its `Display` text is for diagnostics; match on the variant rather than
 /// the text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum QueueLimit {
     /// An Advanced `QueuedSender` already holds as many frames as its
-    /// `QueueOptions::max_frames` allows.
+    /// `QueueLimits::max_frames` allows.
+    #[error("queued video frame limit reached")]
     Frames,
     /// The frames an Advanced `QueuedSender` retains leave too little room
-    /// within `QueueOptions::max_bytes` for this frame. The frame itself fits
+    /// within `QueueLimits::max_bytes` for this frame. The frame itself fits
     /// the limit, so collecting completions makes room.
+    #[error("queued video byte limit reached")]
     Bytes,
     /// An async File handle already has as many commands waiting as its
     /// `AsyncFileOptions::command_capacity` allows, and, for a request to
     /// stop, another request to stop waits beyond them.
+    #[error("File command queue is full")]
     FileCommands,
     /// The 64 async File probes that may wait for the process's probe thread
     /// are already waiting.
+    #[error("File probe queue is full")]
     FileProbes,
-}
-
-impl fmt::Display for QueueLimit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Frames => "queued video frame limit reached",
-            Self::Bytes => "queued video byte limit reached",
-            Self::FileCommands => "File command queue is full",
-            Self::FileProbes => "File probe queue is full",
-        })
-    }
 }
 
 /// Why a listener refused to send a receiver request.
@@ -495,7 +447,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn diagnostic_payloads_have_the_common_error_traits() {
+        fn error<T: std::error::Error + std::fmt::Debug + Clone + PartialEq>() {}
+        fn value<T: Copy + Eq + std::hash::Hash>() {}
+
+        error::<SelectionFailure>();
+        error::<LoadFailure>();
+        error::<LoadRefusal>();
+        error::<DiscoveryAddressFailure>();
+        error::<InputDefect>();
+        error::<FrameDefect>();
+        error::<LayoutDefect>();
+        error::<SdkResultDefect>();
+        error::<Capability>();
+        error::<CapabilityRefusal>();
+        error::<crate::CapabilityUnavailable>();
+        error::<QueueLimit>();
+        error::<ResourceKind>();
+        error::<SelectionConflict>();
+        error::<LibraryKind>();
+        error::<ColorMetadataIssue>();
+        error::<FrameRateDefect>();
+        error::<VideoDimensionsDefect>();
+        error::<AudioLengthDefect>();
+        error::<CompressedAudioDefect>();
+        error::<PtzDefect>();
+        error::<SpawnFailure>();
+        error::<InitializationFailure>();
+
+        value::<SdkResultDefect>();
+        value::<Capability>();
+        value::<CapabilityRefusal>();
+        value::<crate::CapabilityUnavailable>();
+        value::<QueueLimit>();
+        value::<ResourceKind>();
+        value::<SelectionConflict>();
+        value::<LibraryKind>();
+        value::<ColorMetadataIssue>();
+        value::<FrameRateDefect>();
+        value::<VideoDimensionsDefect>();
+        value::<AudioLengthDefect>();
+        value::<CompressedAudioDefect>();
+        value::<SpawnFailure>();
+        value::<InitializationFailure>();
+    }
+
+    #[test]
     fn capability_errors_display_the_recorded_evidence() {
+        assert_eq!(
+            Capability::Runtime(RuntimeFeature::Routing).to_string(),
+            "source routing"
+        );
         let required = RuntimeFeature::Planar444Video.minimum_version().unwrap();
         for refusal in [
             CapabilityRefusal::SymbolUnavailable(c"NDIlib_routing_create"),
@@ -506,7 +508,7 @@ mod tests {
             CapabilityRefusal::RuntimeVersionUnknown { required },
         ] {
             let error = Error::UnsupportedCapability {
-                feature: RuntimeFeature::Routing,
+                capability: Capability::Runtime(RuntimeFeature::Routing),
                 refusal,
             };
             assert_eq!(
@@ -520,9 +522,13 @@ mod tests {
     #[cfg(feature = "file-io")]
     #[test]
     fn file_family_errors_name_the_family_and_missing_entry_point() {
-        let error = Error::FileFamilyUnavailable {
-            family: crate::file::FileFamily::Recording,
-            missing: c"NDIlib_file_recorder_rollover",
+        assert_eq!(
+            Capability::File(crate::file::FileFamily::Recording).to_string(),
+            "file recording"
+        );
+        let error = Error::UnsupportedCapability {
+            capability: Capability::File(crate::file::FileFamily::Recording),
+            refusal: CapabilityRefusal::SymbolUnavailable(c"NDIlib_file_recorder_rollover"),
         };
         assert_eq!(error.to_string(), "NDI capability file recording is unavailable: the selected library does not export a required function: NDIlib_file_recorder_rollover");
     }

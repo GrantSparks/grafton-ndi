@@ -54,7 +54,7 @@
 //! ```no_run
 //! use std::sync::{Arc, Mutex};
 //! use grafton_ndi::{
-//!     discovery::{AdvertiserOptions, SendAdvertisement, SendAdvertiser},
+//!     discovery_server::{AdvertiserOptions, SendAdvertisement, SendAdvertiser},
 //!     Ndi, Sender, SenderOptions,
 //! };
 //!
@@ -73,7 +73,7 @@
 //!     let shared = Arc::clone(&shared);
 //!     move || {
 //!         let mut advertiser = shared.advertiser.lock().unwrap();
-//!         advertiser.register(&sender, SendAdvertisement::new())
+//!         advertiser.register(&sender, &SendAdvertisement::new())
 //!     }
 //! });
 //! let _registration = worker.join().unwrap()?;
@@ -130,7 +130,7 @@
 //!
 //! ```no_run
 //! use grafton_ndi::{
-//!     discovery::{ListenerOptions, RecvListener},
+//!     discovery_server::{ListenerOptions, RecvListener},
 //!     Ndi,
 //! };
 //! use std::time::Duration;
@@ -141,11 +141,11 @@
 //! let mut listener = RecvListener::new(&ndi, &options)?;
 //! // The listener connects in the background; give it time to hear from the
 //! // server before reading the registry.
-//! listener.wait_for_changes(Duration::from_secs(2))?;
+//! listener.wait_for_change(Duration::from_secs(2))?;
 //! if !listener.is_connected() {
 //!     println!("no answer from the Discovery Server yet");
 //! }
-//! for receiver in listener.snapshot()? {
+//! for receiver in listener.current_receivers()? {
 //!     println!("{:?} at {:?}", receiver.name(), receiver.address());
 //! }
 //! # Ok(())
@@ -189,14 +189,14 @@ trait Handle: Copy + Send {
 }
 
 trait ServerOptions {
-    fn server(&self) -> Option<&str>;
+    fn server(&self) -> crate::Result<Option<std::ffi::CString>>;
     #[cfg(feature = "advanced")]
     fn config(&self) -> Option<&crate::advanced::AdvancedConfig>;
 }
 
 impl ServerOptions for AdvertiserOptions {
-    fn server(&self) -> Option<&str> {
-        self.configured_servers()
+    fn server(&self) -> crate::Result<Option<std::ffi::CString>> {
+        crate::finder::list_cstring(self.configured_servers(), "servers")
     }
     #[cfg(feature = "advanced")]
     fn config(&self) -> Option<&crate::advanced::AdvancedConfig> {
@@ -205,8 +205,11 @@ impl ServerOptions for AdvertiserOptions {
 }
 
 impl ServerOptions for ListenerOptions {
-    fn server(&self) -> Option<&str> {
+    fn server(&self) -> crate::Result<Option<std::ffi::CString>> {
         self.configured_server()
+            .map(std::ffi::CString::new)
+            .transpose()
+            .map_err(Into::into)
     }
     #[cfg(feature = "advanced")]
     fn config(&self) -> Option<&crate::advanced::AdvancedConfig> {
@@ -391,13 +394,15 @@ impl<A: ServerApi> ServerObject<A> {
     ) -> crate::Result<Self> {
         // Configured gates run first and include this table's own capability.
         let api = ndi.table::<A>()?;
-        let server = options.server();
+        let url = options.server()?;
+        let server = url
+            .as_ref()
+            .map(|url| url.to_str().expect("options came from UTF-8"));
         if A::SINGLE_ENDPOINT && server.is_some_and(|s| s.contains(',')) {
             return Err(crate::Error::InvalidInput(
                 crate::InputDefect::MultipleDiscoveryServers,
             ));
         }
-        let url = server.map(std::ffi::CString::new).transpose()?;
         let settings = A::settings(url.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()));
         let instance = create(api, &settings).into_value();
         if instance.is_null() {

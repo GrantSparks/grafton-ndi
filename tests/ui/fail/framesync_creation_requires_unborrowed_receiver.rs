@@ -1,7 +1,7 @@
 use grafton_ndi::{FrameSync, Receiver};
 use std::time::Duration;
 fn attach(receiver: Receiver) {
-    let frame = receiver.video().capture_ref(Duration::ZERO).unwrap();
+    let frame = receiver.capture_video_ref(Duration::ZERO).unwrap();
     let _ = FrameSync::new(receiver);
     drop(frame);
 }

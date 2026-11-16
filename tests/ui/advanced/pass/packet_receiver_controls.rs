@@ -3,7 +3,7 @@
 // and can be advertised like any other receiver.
 use grafton_ndi::{
     advanced::{AllocatedPacketReceiver, PacketAttached, PacketReceiver},
-    discovery::{RecvAdvertisement, RecvAdvertiser},
+    discovery_server::{RecvAdvertisement, RecvAdvertiser},
     MediaTypes, MetadataFrame, Receiver, ReceiverMode, StreamTier, Tally,
 };
 fn common<M: ReceiverMode>(_: &Receiver<M>) {}
@@ -25,7 +25,7 @@ fn allocated_controls(packets: &mut AllocatedPacketReceiver, advertiser: &mut Re
     controls(packets.receiver());
     let _ = packets.controls().set_stream_tier(StreamTier::Program);
     let _ = packets.controls().set_streams(MediaTypes::VIDEO);
-    let _ = advertiser.register(packets.receiver(), RecvAdvertisement::new());
+    let _ = advertiser.register(packets.receiver(), &RecvAdvertisement::new());
 }
 fn main() {
     let _ = packet_controls;

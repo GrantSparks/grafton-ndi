@@ -12,10 +12,10 @@
 use super::recorder::{CheckedRecorderOptions, FinishReply, FinishWaiters, Settlement};
 use super::types::resolve_path;
 use super::{
-    EventText, FileApi, FileDuration, FileInfo, FilePlayer, FilePosition, FileRecorder,
-    FinishStatus, PlayerEvent, PlayerOptions, PlayerStats, RecorderEvent, RecorderOptions,
+    EventText, FileApi, FileDuration, FileInfo, FilePlayer, FilePlayerOptions, FilePosition,
+    FileRecorder, FileRecorderOptions, FinishStatus, PlayerEvent, PlayerStats, RecorderEvent,
     RecorderState, RecorderStats, RecordingReport, RecordingTarget, RecordingTimecode,
-    SourceFormat, SourceSpec, StateError, StopRequest,
+    SourceFormat, SourceSpec, StateConflict, StopRequest,
 };
 use crate::{timeout::Deadline, Error, MetadataSource, QueueLimit, Result, Source, Timecode};
 use std::{
@@ -71,7 +71,7 @@ fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
 /// capacity must be from 1 through 4096; the `create_with_options`
 /// functions of [`AsyncFilePlayer`] and [`AsyncFileRecorder`] refuse any
 /// other with [`Error::InvalidInput`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AsyncFileOptions {
     command_capacity: usize,
     event_capacity: usize,
@@ -264,7 +264,7 @@ enum Stage<T> {
 ///
 /// An unsubmitted command does not keep an existing player or recorder alive.
 /// Dropping the last handle still shuts down the owner as that handle documents;
-/// later ordinary submissions fail with [`StateError::Closed`]. Closing remains
+/// later ordinary submissions fail with [`StateConflict::Closed`]. Closing remains
 /// idempotent.
 ///
 /// # The command queue
@@ -286,12 +286,12 @@ enum Stage<T> {
 /// Besides the operation's own errors, every operation fails with
 /// [`Error::QueueFull`] and [`QueueLimit::FileCommands`] when the queue
 /// refuses it, as described above, and can fail with
-/// [`Error::InvalidState`]: with [`StateError::Closed`] when the handle has
+/// [`Error::InvalidState`]: with [`StateConflict::Closed`] when the handle has
 /// been closed or its thread stopped normally before carrying the
-/// operation out, and with [`StateError::OwnerFailed`] when that thread failed
+/// operation out, and with [`StateConflict::OwnerFailed`] when that thread failed
 /// instead. Once the thread has failed, the operation it was running, every
 /// operation queued behind it and every later one report
-/// [`StateError::OwnerFailed`], never [`StateError::Closed`].
+/// [`StateConflict::OwnerFailed`], never [`StateConflict::Closed`].
 /// A finish or wait already running can also report `Closed` when a concurrent
 /// close ends its finalization budget without a settled session outcome.
 ///
@@ -310,16 +310,23 @@ impl<T> Unpin for FileOperation<T> {}
 
 impl<T> std::fmt::Debug for FileOperation<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let stage = lock(&self.stage);
-        let submitted = !matches!(*stage, Stage::Deferred(_));
-        let completed = match &*stage {
-            Stage::Deferred(_) => false,
-            Stage::Live(Live::Waiting(shared)) => !matches!(*lock(&shared.slot), Slot::Pending(_)),
-            Stage::Live(Live::Immediate(_)) | Stage::Done => true,
-        };
+        // Formatting never waits for an operation or its response slot.
+        let state = self.stage.try_lock().ok().map(|stage| {
+            let submitted = !matches!(*stage, Stage::Deferred(_));
+            let completed = match &*stage {
+                Stage::Deferred(_) => Some(false),
+                Stage::Live(Live::Waiting(shared)) => shared
+                    .slot
+                    .try_lock()
+                    .ok()
+                    .map(|slot| !matches!(*slot, Slot::Pending(_))),
+                Stage::Live(Live::Immediate(_)) | Stage::Done => Some(true),
+            };
+            (submitted, completed)
+        });
         f.debug_struct("FileOperation")
-            .field("submitted", &submitted)
-            .field("completed", &completed)
+            .field("submitted", &state.map(|(submitted, _)| submitted))
+            .field("completed", &state.and_then(|(_, completed)| completed))
             .finish_non_exhaustive()
     }
 }
@@ -428,9 +435,9 @@ fn deliver<T>(shared: &Shared<T>, value: Result<T>) {
 /// gone: a failed thread, or one that stopped normally.
 fn stopped(failed: bool) -> Error {
     Error::InvalidState(if failed {
-        StateError::OwnerFailed
+        StateConflict::OwnerFailed
     } else {
-        StateError::Closed
+        StateConflict::Closed
     })
 }
 
@@ -738,9 +745,9 @@ impl<E: Send> Expire for EventQueue<E> {
 /// while the player's or recorder's thread is busy with a command that
 /// blocks: a timer thread shared by every handle in the process keeps the
 /// deadline. One future may wait on a handle at a time; a second fails with
-/// [`Error::InvalidState`] and [`StateError::WaiterPending`]. Once the
+/// [`Error::InvalidState`] and [`StateConflict::WaiterPending`]. Once the
 /// handle is closed and every queued event has been taken, the future fails
-/// with [`StateError::Closed`], or with [`StateError::OwnerFailed`] when the
+/// with [`StateConflict::Closed`], or with [`StateConflict::OwnerFailed`] when the
 /// thread failed; that happens as soon as the handle's thread stops taking
 /// events, before the native object is destroyed. Dropping the
 /// future does not stop events from being pumped.
@@ -773,6 +780,15 @@ pub struct FileEventFuture<E> {
     /// This wait's registration with the deadline timer, while it has one.
     timer: Option<TimerKey>,
     taken: bool,
+}
+
+impl<E> std::fmt::Debug for FileEventFuture<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileEventFuture")
+            .field("timeout", &self.budget)
+            .field("completed", &self.taken)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<E> FileEventFuture<E> {
@@ -824,7 +840,10 @@ impl<E> Future for FileEventFuture<E> {
                 .as_ref()
                 .is_some_and(|w| w.token.strong_count() != 0 && !w.token.ptr_eq(&token))
             {
-                return WakerPoll::Ready(Err(Error::InvalidState(StateError::WaiterPending)), None);
+                return WakerPoll::Ready(
+                    Err(Error::InvalidState(StateConflict::WaiterPending)),
+                    None,
+                );
             }
             let ready = if let Some(event) = events.queue.pop_front() {
                 Some(event.map(Some))
@@ -1052,7 +1071,7 @@ trait Owner: 'static {
 impl Owner for FilePlayer {
     type Event = PlayerEvent;
     fn poll_native(&mut self) -> Result<Option<Self::Event>> {
-        self.poll_event(Duration::ZERO)
+        self.next_event(Duration::ZERO)
     }
 }
 
@@ -1060,15 +1079,28 @@ impl Owner for FilePlayer {
 /// Failure teardown explicitly resolves replies before native cleanup.
 struct RecorderOwner {
     recorder: FileRecorder,
-    waiters: FinishWaiters<Reply<FinishStatus>>,
+    waiters: FinishWaiters<FinishResponse>,
 }
 
-impl FinishReply for Reply<FinishStatus> {
+/// Preserve the finish driver's single registry while condition waits expose
+/// only settled outcomes. Mapping a reply never starts or queues another job.
+enum FinishResponse {
+    Finish(Reply<FinishStatus>),
+    Wait(Reply<Option<FinishStatus>>),
+}
+
+impl FinishReply for FinishResponse {
     fn cancelled(&self) -> bool {
-        self.shared.cancelled.load(Ordering::Acquire)
+        match self {
+            Self::Finish(reply) => reply.shared.cancelled.load(Ordering::Acquire),
+            Self::Wait(reply) => reply.shared.cancelled.load(Ordering::Acquire),
+        }
     }
     fn complete(self, result: Result<FinishStatus>) {
-        Reply::complete(self, result);
+        match self {
+            Self::Finish(reply) => reply.complete(result),
+            Self::Wait(reply) => reply.complete(result.map(FinishStatus::into_wait_outcome)),
+        }
     }
 }
 
@@ -1080,7 +1112,7 @@ impl RecorderOwner {
         }
     }
 
-    fn finish(&mut self, deadline: Deadline, stop: bool, reply: Reply<FinishStatus>) {
+    fn finish(&mut self, deadline: Deadline, stop: bool, reply: FinishResponse) {
         if stop {
             self.recorder.request_stop();
         }
@@ -1164,7 +1196,7 @@ impl Owner for RecorderOwner {
     type Event = RecorderEvent;
 
     fn poll_native(&mut self) -> Result<Option<Self::Event>> {
-        self.recorder.poll_event(Duration::ZERO)
+        self.recorder.next_event(Duration::ZERO)
     }
 
     fn after_events(&mut self, drained: bool, events: &EventQueue<Self::Event>, control: &Control) {
@@ -1176,7 +1208,7 @@ impl Owner for RecorderOwner {
     }
 
     fn fail_pending(&mut self) {
-        self.waiters.fail(StateError::OwnerFailed);
+        self.waiters.fail(StateConflict::OwnerFailed);
     }
 
     fn shutdown(
@@ -1222,7 +1254,7 @@ trait HandleOwner: Owner {
 }
 
 impl HandleOwner for FilePlayer {
-    type Options = PlayerOptions;
+    type Options = FilePlayerOptions;
     const THREAD_NAME: &'static str = "ndi-file-player";
 
     type Prepared = super::player::PreparedPlayer;
@@ -1244,7 +1276,7 @@ impl HandleOwner for FilePlayer {
 }
 
 impl HandleOwner for RecorderOwner {
-    type Options = RecorderOptions;
+    type Options = FileRecorderOptions;
     const THREAD_NAME: &'static str = "ndi-file-recorder";
 
     type Prepared = super::recorder::PreparedRecorder;
@@ -1505,16 +1537,16 @@ impl<H: HandleOwner> Worker<H> {
         options: &H::Options,
         wrap: impl FnOnce(Arc<Self>) -> T + Send + 'static,
     ) -> FileOperation<T> {
-        Self::create_with_options(api, options, AsyncFileOptions::new(), wrap)
+        Self::create_with_options(api, options, &AsyncFileOptions::new(), wrap)
     }
 
     fn create_with_options<T: Send + 'static>(
         api: &FileApi,
         options: &H::Options,
-        asynchronous: AsyncFileOptions,
+        asynchronous: &AsyncFileOptions,
         wrap: impl FnOnce(Arc<Self>) -> T + Send + 'static,
     ) -> FileOperation<T> {
-        let (api, options) = (api.clone(), options.clone());
+        let (api, options, asynchronous) = (api.clone(), options.clone(), *asynchronous);
         FileOperation::deferred(move || {
             let asynchronous = match asynchronous.validate() {
                 Ok(options) => options,
@@ -1763,7 +1795,7 @@ impl ProbeQueue {
         let (reply, future) = operation();
         let job: ProbeJob = Box::new(move || {
             if !reply.shared.cancelled.load(Ordering::Acquire) {
-                reply.complete(api.probe(path));
+                reply.complete(crate::file::FilePlayer::probe(&api, path));
             }
         });
         if let Err(error) = self.submit(job) {
@@ -1834,14 +1866,23 @@ pub struct AsyncFilePlayer {
     worker: Arc<Worker<FilePlayer>>,
 }
 
+impl std::fmt::Debug for AsyncFilePlayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncFilePlayer")
+            .field("mode", &"playback")
+            .finish_non_exhaustive()
+    }
+}
+
 impl AsyncFilePlayer {
     /// Create a player and advertise its source, with the default queue sizes.
     ///
-    /// The future fails as [`FileApi::create_player`] does. The options are
+    /// The future fails as [`FilePlayer::new`] does. The options are
     /// only read, so they stay with the caller whatever the outcome.
     /// Options and the required File family are checked at submission, before
     /// an owner thread starts. Native creation runs on that thread.
-    pub fn create(api: &FileApi, options: &PlayerOptions) -> FileOperation<Self> {
+    #[doc(alias = "NDIlib_file_player_create")]
+    pub fn create(api: &FileApi, options: &FilePlayerOptions) -> FileOperation<Self> {
         Worker::<FilePlayer>::create(api, options, |worker| Self { worker })
     }
 
@@ -1851,17 +1892,18 @@ impl AsyncFilePlayer {
     /// [`Error::InvalidInput`] when a queue size is out of range.
     /// Queue sizes, options and the required File family are checked at
     /// submission, before an owner thread starts.
+    #[doc(alias = "NDIlib_file_player_create")]
     pub fn create_with_options(
         api: &FileApi,
-        options: &PlayerOptions,
-        asynchronous: AsyncFileOptions,
+        options: &FilePlayerOptions,
+        asynchronous: &AsyncFileOptions,
     ) -> FileOperation<Self> {
         Worker::<FilePlayer>::create_with_options(api, options, asynchronous, |worker| Self {
             worker,
         })
     }
 
-    /// Read a recording's duration and track layout; see [`FileApi::probe`].
+    /// Read a recording's duration and track layout; see [`FilePlayer::probe`].
     /// No player is created and nothing is advertised.
     ///
     /// Probes run one at a time, in submission order, on one thread
@@ -1871,18 +1913,20 @@ impl AsyncFilePlayer {
     ///
     /// # Errors
     ///
-    /// Those of [`FileApi::probe`], and [`Error::QueueFull`] with
+    /// Those of [`FilePlayer::probe`], and [`Error::QueueFull`] with
     /// [`QueueLimit::FileProbes`] when 64 probes are already waiting; the same
     /// call can succeed once they have run. [`Error::Io`] when the probe
     /// thread is not running and cannot be started; the next probe tries to
-    /// start it again. [`Error::InvalidState`] with [`StateError::OwnerFailed`]
+    /// start it again. [`Error::InvalidState`] with [`StateConflict::OwnerFailed`]
     /// when the probe panicked; the thread goes on with the next one.
+    #[doc(alias = "NDIlib_file_player_probe_file")]
     pub fn probe(api: &FileApi, path: impl AsRef<Path>) -> FileOperation<FileInfo> {
         let (api, path) = (api.clone(), path.as_ref().to_path_buf());
         FileOperation::deferred(move || PROBES.probe(&api, &path))
     }
 
     /// Play a file; see [`FilePlayer::start`].
+    #[doc(alias = "NDIlib_file_player_start")]
     pub fn start(&self, path: impl AsRef<Path>) -> FileOperation<()> {
         let path = path.as_ref().to_path_buf();
         self.worker.prepare(
@@ -1896,6 +1940,7 @@ impl AsyncFilePlayer {
     }
     /// Stop the current file; the source stays advertised. The stop runs even
     /// if the future is dropped after its first poll or explicit submission.
+    #[doc(alias = "NDIlib_file_player_stop")]
     pub fn stop(&self) -> FileOperation<()> {
         self.worker.submit(true, |p| {
             p.stop();
@@ -1903,14 +1948,17 @@ impl AsyncFilePlayer {
         })
     }
     /// Whether a file is playing.
+    #[doc(alias = "NDIlib_file_player_is_running")]
     pub fn is_running(&self) -> FileOperation<bool> {
         self.worker.call(|p| Ok(p.is_running()))
     }
     /// Wait up to `timeout` for the player's next event.
+    #[doc(alias = "NDIlib_file_player_capture_event")]
     pub fn next_event(&self, timeout: Duration) -> FileEventFuture<PlayerEvent> {
         self.worker.next_event(timeout)
     }
     /// How many events the SDK discarded before the player's thread took them.
+    #[doc(alias = "NDIlib_file_player_get_dropped_event_count")]
     pub fn dropped_event_count(&self) -> FileOperation<u64> {
         self.worker.dropped_event_count()
     }
@@ -1920,19 +1968,23 @@ impl AsyncFilePlayer {
         self.worker.notification_dropped_count()
     }
     /// Counters for the current or most recent file.
+    #[doc(alias = "NDIlib_file_player_get_stats")]
     pub fn stats(&self) -> FileOperation<Option<PlayerStats>> {
         self.worker.call(|p| p.stats())
     }
     /// Seek to a position on the file's timeline; see [`FilePlayer::seek`].
+    #[doc(alias = "NDIlib_file_player_seek_to_time")]
     pub fn seek(&self, position: FilePosition) -> FileOperation<()> {
         self.worker.call(move |p| p.seek(position))
     }
     /// Seek to an approximate frame index; see
     /// [`FilePlayer::seek_frame_approximate`].
+    #[doc(alias = "NDIlib_file_player_seek_to_frame")]
     pub fn seek_frame_approximate(&self, frame: u64) -> FileOperation<()> {
         self.worker.call(move |p| p.seek_frame_approximate(frame))
     }
     /// Pause or resume the current file.
+    #[doc(alias = "NDIlib_file_player_set_paused")]
     pub fn set_paused(&self, paused: bool) -> FileOperation<()> {
         self.worker.call(move |p| {
             p.set_paused(paused);
@@ -1940,11 +1992,13 @@ impl AsyncFilePlayer {
         })
     }
     /// Whether the current file is paused.
+    #[doc(alias = "NDIlib_file_player_get_paused")]
     pub fn is_paused(&self) -> FileOperation<bool> {
         self.worker.call(|p| Ok(p.is_paused()))
     }
     /// Set whether playback restarts at the end of a file. The setting is
     /// kept across files.
+    #[doc(alias = "NDIlib_file_player_set_loop")]
     pub fn set_looping(&self, looping: bool) -> FileOperation<()> {
         self.worker.call(move |p| {
             p.set_looping(looping);
@@ -1952,26 +2006,32 @@ impl AsyncFilePlayer {
         })
     }
     /// Whether playback restarts at the end of a file.
+    #[doc(alias = "NDIlib_file_player_get_loop")]
     pub fn is_looping(&self) -> FileOperation<bool> {
         self.worker.call(|p| Ok(p.is_looping()))
     }
     /// The current file's best-known duration, and whether it is final.
+    #[doc(alias = "NDIlib_file_player_get_current_duration")]
     pub fn duration(&self) -> FileOperation<Option<FileDuration>> {
         self.worker.call(|p| Ok(p.duration()))
     }
     /// The position of the frame sent last.
+    #[doc(alias = "NDIlib_file_player_get_current_position")]
     pub fn position(&self) -> FileOperation<Option<FilePosition>> {
         self.worker.call(|p| Ok(p.position()))
     }
     /// The recorded source timecode of the frame sent last.
+    #[doc(alias = "NDIlib_file_player_get_current_source_timecode")]
     pub fn source_timecode(&self) -> FileOperation<Option<Timecode>> {
         self.worker.call(|p| Ok(p.source_timecode()))
     }
     /// The track layout of the current file.
+    #[doc(alias = "NDIlib_file_player_get_source_format")]
     pub fn source_format(&self) -> FileOperation<Option<SourceFormat>> {
         self.worker.source_format()
     }
     /// The NDI source this player advertises.
+    #[doc(alias = "NDIlib_file_player_get_advertised_source")]
     pub fn advertised_source(&self) -> FileOperation<Source> {
         self.worker.call(|p| p.advertised_source())
     }
@@ -1983,14 +2043,15 @@ impl AsyncFilePlayer {
     /// [`FileOperation::submit`], the close runs even if its future is dropped.
     /// Closing again, from this or another clone, while or after it runs
     /// completes at the same time, with the same outcome; later
-    /// operations fail with [`StateError::Closed`], and dropping the clones
+    /// operations fail with [`StateConflict::Closed`], and dropping the clones
     /// afterwards does not block. It does not wait in the command queue, so
     /// a full queue never refuses it.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidState`] with [`StateError::OwnerFailed`] when the
+    /// [`Error::InvalidState`] with [`StateConflict::OwnerFailed`] when the
     /// object's thread failed.
+    #[doc(alias = "NDIlib_file_player_destroy")]
     pub fn close(&self) -> FileOperation<()> {
         self.worker.close()
     }
@@ -2014,7 +2075,7 @@ impl AsyncFilePlayer {
 ///
 /// Dropping the last clone **blocks the dropping thread** until the
 /// recorder's thread has finished: it stops a session that is still open,
-/// waits up to [`RecorderOptions::drop_wait`] for the SDK to finalize the
+/// waits up to [`FileRecorderOptions::drop_wait`] for the SDK to finalize the
 /// file, and destroys the recorder. This is deliberate: when the drop
 /// returns, the file is finalized as far as the SDK reported within that
 /// wait, even when the drop happens as the program exits. The outcome cannot
@@ -2029,15 +2090,24 @@ pub struct AsyncFileRecorder {
     worker: Arc<Worker<RecorderOwner>>,
 }
 
+impl std::fmt::Debug for AsyncFileRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncFileRecorder")
+            .field("mode", &"recording")
+            .finish_non_exhaustive()
+    }
+}
+
 impl AsyncFileRecorder {
     /// Create a recorder with the default queue sizes.
     ///
-    /// The future fails as [`FileApi::create_recorder`] does, including with
+    /// The future fails as [`FileRecorder::new`] does, including with
     /// [`Error::InvalidInput`] for options that conflict. The options are
     /// only read, so they stay with the caller whatever the outcome.
     /// Options and the required File family are checked at submission, before
     /// an owner thread starts. Native creation runs on that thread.
-    pub fn create(api: &FileApi, options: &RecorderOptions) -> FileOperation<Self> {
+    #[doc(alias = "NDIlib_file_recorder_create")]
+    pub fn create(api: &FileApi, options: &FileRecorderOptions) -> FileOperation<Self> {
         Worker::<RecorderOwner>::create(api, options, |worker| Self { worker })
     }
     /// Create a recorder with the given queue sizes.
@@ -2046,10 +2116,11 @@ impl AsyncFileRecorder {
     /// [`Error::InvalidInput`] when a queue size is out of range.
     /// Queue sizes, options and the required File family are checked at
     /// submission, before an owner thread starts.
+    #[doc(alias = "NDIlib_file_recorder_create")]
     pub fn create_with_options(
         api: &FileApi,
-        options: &RecorderOptions,
-        asynchronous: AsyncFileOptions,
+        options: &FileRecorderOptions,
+        asynchronous: &AsyncFileOptions,
     ) -> FileOperation<Self> {
         Worker::<RecorderOwner>::create_with_options(api, options, asynchronous, |worker| Self {
             worker,
@@ -2059,6 +2130,8 @@ impl AsyncFileRecorder {
     /// [`SessionTimecode`](super::SessionTimecode), validated before queuing.
     /// Events left by an earlier refused start are delivered through
     /// [`next_event`](Self::next_event) before the new session begins.
+    #[doc(alias = "NDIlib_file_recorder_start")]
+    #[doc(alias = "NDIlib_file_recorder_start_with_timecode")]
     pub fn start(
         &self,
         target: &RecordingTarget,
@@ -2071,6 +2144,7 @@ impl AsyncFileRecorder {
     }
     /// Ask the SDK to stop the session. Once submitted by polling or calling
     /// [`FileOperation::submit`], the request runs even if its future is dropped.
+    #[doc(alias = "NDIlib_file_recorder_stop")]
     pub fn request_stop(&self) -> FileOperation<StopRequest> {
         self.worker.submit(true, |r| Ok(r.request_stop()))
     }
@@ -2081,17 +2155,17 @@ impl AsyncFileRecorder {
     /// the command spends queued. After submission, dropping the future ends
     /// the wait but not the stop: the recorder keeps stopping and its events
     /// keep being pumped, and
-    /// [`wait_finished`](Self::wait_finished) can pick the wait up again.
+    /// [`wait_for_finish`](Self::wait_for_finish) can pick the wait up again.
     /// While waiting for closure, the owner continues running other commands
     /// and waits from every clone between event bursts. A native call such as
     /// the stop itself may still block that thread. Each concurrent wait keeps
     /// its own submission deadline and observes the same session report.
     ///
     /// If another clone closes the recorder during the wait, this wait ends
-    /// at [`RecorderOptions::drop_wait`] from that close's
+    /// at [`FileRecorderOptions::drop_wait`] from that close's
     /// submission, or this wait's deadline if earlier. Closure established in
     /// that time is reported normally; an unsettled session reports
-    /// [`StateError::Closed`] instead of [`FinishStatus::TimedOut`], because
+    /// [`StateConflict::Closed`] instead of [`FinishStatus::TimedOut`], because
     /// the recorder is being destroyed and cannot be waited on again.
     ///
     /// Events taken during the wait go to [`next_event`](Self::next_event).
@@ -2103,32 +2177,42 @@ impl AsyncFileRecorder {
     ///
     /// Those of [`FileRecorder::finish`], and those every
     /// [`FileOperation`] can fail with.
+    #[doc(alias = "NDIlib_file_recorder_stop")]
+    #[doc(alias = "NDIlib_file_recorder_capture_event")]
     pub fn finish(&self, timeout: Duration) -> FileOperation<FinishStatus> {
-        self.finish_inner(timeout, true)
+        self.finish_inner(timeout, true, FinishResponse::Finish)
     }
     /// Wait up to `timeout` for a stopping session to end; see
-    /// [`FileRecorder::wait_finished`].
+    /// [`FileRecorder::wait_for_finish`].
+    ///
+    /// Returns `None` when the timeout expires, or `Some` with
+    /// [`FinishStatus::Closed`] or [`FinishStatus::Indeterminate`] when the
+    /// session ends. The current report remains available through
+    /// [`report`](Self::report), including after a timeout.
     ///
     /// Events taken during the wait are delivered as by
     /// [`finish`](Self::finish); other commands and waits continue running.
     /// A concurrent close bounds the wait and can
-    /// return [`StateError::Closed`] on the same terms as `finish`.
+    /// return [`StateConflict::Closed`] on the same terms as `finish`.
     ///
     /// # Errors
     ///
-    /// Those of [`FileRecorder::wait_finished`], and those every
+    /// Those of [`FileRecorder::wait_for_finish`], and those every
     /// [`FileOperation`] can fail with.
-    pub fn wait_finished(&self, timeout: Duration) -> FileOperation<FinishStatus> {
-        self.finish_inner(timeout, false)
+    #[doc(alias = "NDIlib_file_recorder_capture_event")]
+    pub fn wait_for_finish(&self, timeout: Duration) -> FileOperation<Option<FinishStatus>> {
+        self.finish_inner(timeout, false, FinishResponse::Wait)
     }
 
     /// Replace the native recorder after abandoning its old session; see
     /// [`FileRecorder::reset`]. Queued events already delivered to this
     /// worker's event stream remain available to the caller. A successful reset
-    /// ends pending finish waits for the old recorder with [`StateError::Closed`];
+    /// ends pending finish waits for the old recorder with [`StateConflict::Closed`];
     /// a failed reset leaves them waiting on the original session.
     /// Options are checked at submission, before waiting in the command queue.
-    pub fn reset(&self, options: &RecorderOptions) -> FileOperation<RecordingReport> {
+    #[doc(alias = "NDIlib_file_recorder_destroy")]
+    #[doc(alias = "NDIlib_file_recorder_create")]
+    pub fn reset(&self, options: &FileRecorderOptions) -> FileOperation<RecordingReport> {
         let options = options.clone();
         self.worker.prepare(
             move || {
@@ -2139,13 +2223,18 @@ impl AsyncFileRecorder {
         )
     }
 
-    fn finish_inner(&self, timeout: Duration, stop: bool) -> FileOperation<FinishStatus> {
+    fn finish_inner<T: Send + 'static>(
+        &self,
+        timeout: Duration,
+        stop: bool,
+        finish_response: fn(Reply<T>) -> FinishResponse,
+    ) -> FileOperation<T> {
         self.worker.prepare_reply(
             move || {
                 // Start at submission, including queue time and the native stop.
                 let deadline = Deadline::after(timeout)?;
                 Ok(move |owner: &mut RecorderOwner, reply| {
-                    owner.finish(deadline, stop, reply);
+                    owner.finish(deadline, stop, finish_response(reply));
                 })
             },
             stop,
@@ -2154,10 +2243,12 @@ impl AsyncFileRecorder {
 
     /// Wait up to `timeout` for the recorder's next event. Dropping the
     /// future does not affect the recording.
+    #[doc(alias = "NDIlib_file_recorder_capture_event")]
     pub fn next_event(&self, timeout: Duration) -> FileEventFuture<RecorderEvent> {
         self.worker.next_event(timeout)
     }
     /// How many events the SDK discarded before the recorder's thread took them.
+    #[doc(alias = "NDIlib_file_recorder_get_dropped_event_count")]
     pub fn dropped_event_count(&self) -> FileOperation<u64> {
         self.worker.dropped_event_count()
     }
@@ -2175,10 +2266,12 @@ impl AsyncFileRecorder {
         self.worker.call(|r| Ok(r.report()))
     }
     /// Whether the SDK is recording or waiting for frames.
+    #[doc(alias = "NDIlib_file_recorder_is_recording")]
     pub fn is_recording(&self) -> FileOperation<bool> {
         self.worker.call(|r| Ok(r.is_recording()))
     }
     /// Switch to recording another source; see [`FileRecorder::set_source`].
+    #[doc(alias = "NDIlib_file_recorder_set_source")]
     pub fn set_source(&self, source: &SourceSpec) -> FileOperation<()> {
         let source = source.clone();
         self.worker.call(move |r| r.set_source(&source))
@@ -2194,6 +2287,7 @@ impl AsyncFileRecorder {
     }
     /// Close the current file and continue in a new one; see
     /// [`FileRecorder::rollover`].
+    #[doc(alias = "NDIlib_file_recorder_rollover")]
     pub fn rollover(&self, target: &RecordingTarget) -> FileOperation<()> {
         let target = target.clone();
         self.worker.call(move |r| r.rollover(&target))
@@ -2205,15 +2299,18 @@ impl AsyncFileRecorder {
     /// retaining the copy until the deferred worker command runs or is
     /// discarded. Accepts owned and captured metadata without retaining a
     /// native frame or borrowing the source through the command's lifetime.
+    #[doc(alias = "NDIlib_file_recorder_inject_metadata")]
     pub fn inject_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> FileOperation<()> {
         let metadata = MetadataSource::to_owned(metadata);
         self.worker.call(move |r| r.inject_metadata(&metadata))
     }
     /// The recorder's running counters.
+    #[doc(alias = "NDIlib_file_recorder_get_stats")]
     pub fn stats(&self) -> FileOperation<Option<RecorderStats>> {
         self.worker.call(|r| r.stats())
     }
     /// The format of the source, once the recorder has seen audio or video.
+    #[doc(alias = "NDIlib_file_recorder_get_source_format")]
     pub fn source_format(&self) -> FileOperation<Option<SourceFormat>> {
         self.worker.source_format()
     }
@@ -2221,7 +2318,7 @@ impl AsyncFileRecorder {
     /// every clone of this handle.
     ///
     /// A session that is still open is stopped and given up to
-    /// [`RecorderOptions::drop_wait`] from this close's submission to finalize
+    /// [`FileRecorderOptions::drop_wait`] from this close's submission to finalize
     /// its file, including time spent in an in-flight finish or wait. A finish
     /// already running keeps its own earlier deadline; destruction then uses
     /// only the remainder of the close's budget. A known file still awaiting
@@ -2232,14 +2329,15 @@ impl AsyncFileRecorder {
     /// or calling [`FileOperation::submit`], the close runs even if its future
     /// is dropped. Closing again, from this or another clone,
     /// while or after it runs completes at the same time, with the same
-    /// outcome; later operations fail with [`StateError::Closed`], and
+    /// outcome; later operations fail with [`StateConflict::Closed`], and
     /// dropping the clones afterwards does not block. It does not wait in the
     /// command queue, so a full queue never refuses it.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidState`] with [`StateError::OwnerFailed`] when the
+    /// [`Error::InvalidState`] with [`StateConflict::OwnerFailed`] when the
     /// object's thread failed.
+    #[doc(alias = "NDIlib_file_recorder_destroy")]
     pub fn close(&self) -> FileOperation<()> {
         self.worker.close()
     }
@@ -2261,6 +2359,21 @@ mod tests {
         *,
     };
     use std::{rc::Rc, task::Wake};
+
+    #[test]
+    fn formatting_an_operation_does_not_wait_for_its_stage_lock() {
+        let operation = Arc::new(FileOperation::<()>::live(Live::Immediate(Ok(()))));
+        let stage = lock(&operation.stage);
+        let (sender, receiver) = mpsc::channel();
+        let other = Arc::clone(&operation);
+        let thread = thread::spawn(move || sender.send(format!("{other:?}")).unwrap());
+        let formatted = receiver.recv_timeout(Duration::from_secs(1));
+        drop(stage);
+        thread.join().unwrap();
+        let formatted = formatted.expect("Debug waited for an operation's stage lock");
+        assert!(formatted.starts_with("FileOperation {"));
+        assert!(formatted.contains("submitted: None"));
+    }
 
     struct Signal(Mutex<bool>, Condvar);
     impl Wake for Signal {
@@ -2970,14 +3083,14 @@ mod tests {
 
     fn owner_failed<T: std::fmt::Debug>(result: Result<T>) {
         assert!(
-            matches!(result, Err(Error::InvalidState(StateError::OwnerFailed))),
+            matches!(result, Err(Error::InvalidState(StateConflict::OwnerFailed))),
             "expected OwnerFailed, got {result:?}"
         );
     }
 
     fn closed<T: std::fmt::Debug>(result: Result<T>) {
         assert!(
-            matches!(result, Err(Error::InvalidState(StateError::Closed))),
+            matches!(result, Err(Error::InvalidState(StateConflict::Closed))),
             "expected Closed, got {result:?}"
         );
     }
@@ -3168,11 +3281,11 @@ mod tests {
             "file-test-recorder",
             move || {
                 installed.install();
-                mock::recorder_api()
-                    .create_recorder(
-                        &RecorderOptions::new(SourceSpec::new("mock source")?).drop_wait(drop_wait),
-                    )
-                    .map(RecorderOwner::new)
+                crate::file::FileRecorder::new(
+                    &mock::recorder_api(),
+                    &FileRecorderOptions::new(SourceSpec::new("mock source")?).drop_wait(drop_wait),
+                )
+                .map(RecorderOwner::new)
             },
             options,
             |worker| AsyncFileRecorder { worker },
@@ -3256,15 +3369,15 @@ mod tests {
         use crate::{Source, SourceAddress};
         let device = mock::Recorder::new(Closing::AtStop);
         let installed = Arc::clone(&device);
-        let selected =
-            Source::new("STUDIO (Camera 2)").with_address(SourceAddress::new("192.0.2.10:5962"));
-        let options = RecorderOptions::new(SourceSpec::try_from(&selected).unwrap());
+        let selected = Source::new("STUDIO (Camera 2)")
+            .unwrap()
+            .with_address(SourceAddress::new("192.0.2.10:5962").unwrap());
+        let options = FileRecorderOptions::new(SourceSpec::try_from(&selected).unwrap());
         let recorder = block_on(spawn_owner(
             "file-endpoint-copy",
             move || {
                 installed.install();
-                mock::recorder_api()
-                    .create_recorder(&options)
+                crate::file::FileRecorder::new(&mock::recorder_api(), &options)
                     .map(RecorderOwner::new)
             },
             AsyncFileOptions::new(),
@@ -3274,7 +3387,8 @@ mod tests {
         drop(selected);
         let command = {
             let selected = Source::new("STUDIO (Program)")
-                .with_address(SourceAddress::new("ndi://camera.local:5963/path"));
+                .unwrap()
+                .with_address(SourceAddress::new("ndi://camera.local:5963/path").unwrap());
             let source = SourceSpec::try_from(&selected).unwrap();
             recorder.set_source(&source)
         };
@@ -3347,9 +3461,11 @@ mod tests {
     fn a_finish_waiter_services_a_status_command_in_its_next_owner_iteration() {
         let device = mock::Recorder::new(Closing::Never);
         device.install();
-        let mut recorder = mock::recorder_api()
-            .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
-            .unwrap();
+        let mut recorder = crate::file::FileRecorder::new(
+            &mock::recorder_api(),
+            &FileRecorderOptions::new(SourceSpec::new("mock").unwrap()),
+        )
+        .unwrap();
         recorder
             .start(
                 &RecordingTarget::new(std::env::temp_dir().join("mock-responsive")).unwrap(),
@@ -3362,7 +3478,7 @@ mod tests {
         owner.finish(
             Deadline::after(Duration::from_secs(2)).unwrap(),
             true,
-            reply,
+            FinishResponse::Finish(reply),
         );
         let control = Arc::new(Control::new());
         let mut commands = 0;
@@ -3425,9 +3541,11 @@ mod tests {
         for completed_session in [false, true] {
             let device = mock::Recorder::new(Closing::AtStop);
             device.install();
-            let mut recorder = mock::recorder_api()
-                .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
-                .unwrap();
+            let mut recorder = crate::file::FileRecorder::new(
+                &mock::recorder_api(),
+                &FileRecorderOptions::new(SourceSpec::new("mock").unwrap()),
+            )
+            .unwrap();
             if completed_session {
                 recorder
                     .start(
@@ -3468,16 +3586,18 @@ mod tests {
         for stopping in [false, true] {
             let device = mock::Recorder::new(Closing::WhenTold);
             device.install();
-            let mut recorder = mock::recorder_api()
-                .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
-                .unwrap();
+            let mut recorder = crate::file::FileRecorder::new(
+                &mock::recorder_api(),
+                &FileRecorderOptions::new(SourceSpec::new("mock").unwrap()),
+            )
+            .unwrap();
             recorder
                 .start(
                     &RecordingTarget::new(std::env::temp_dir().join("mock-active-pump")).unwrap(),
                     RecordingTimecode::Preserve,
                 )
                 .unwrap();
-            recorder.poll_event(Duration::ZERO).unwrap();
+            recorder.next_event(Duration::ZERO).unwrap();
             if stopping {
                 recorder.request_stop();
             }
@@ -3502,11 +3622,11 @@ mod tests {
     fn an_expired_close_spends_its_final_drain_once_including_drop() {
         let device = mock::Recorder::new(Closing::Never);
         device.install();
-        let mut recorder = mock::recorder_api()
-            .create_recorder(
-                &RecorderOptions::new(SourceSpec::new("mock").unwrap()).drop_wait(Duration::ZERO),
-            )
-            .unwrap();
+        let mut recorder = crate::file::FileRecorder::new(
+            &mock::recorder_api(),
+            &FileRecorderOptions::new(SourceSpec::new("mock").unwrap()).drop_wait(Duration::ZERO),
+        )
+        .unwrap();
         let target =
             RecordingTarget::new(std::env::temp_dir().join("mock-close-drain-once")).unwrap();
         recorder
@@ -3521,7 +3641,7 @@ mod tests {
         owner.finish(
             Deadline::after(Duration::from_secs(30)).unwrap(),
             true,
-            reply,
+            FinishResponse::Finish(reply),
         );
         let control = Control::new();
         control.request_shutdown();
@@ -3529,7 +3649,7 @@ mod tests {
         owner.shutdown(Instant::now(), &EventQueue::new(16), &control);
         assert!(matches!(
             block_on(finishing),
-            Err(Error::InvalidState(StateError::Closed))
+            Err(Error::InvalidState(StateConflict::Closed))
         ));
         let after_close = device.captures.load(Ordering::Acquire);
         assert_eq!(
@@ -3545,9 +3665,11 @@ mod tests {
     fn start_forwards_stale_events_through_the_recorder_pump() {
         let device = mock::Recorder::new(Closing::AtStop);
         device.install();
-        let mut recorder = mock::recorder_api()
-            .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
-            .unwrap();
+        let mut recorder = crate::file::FileRecorder::new(
+            &mock::recorder_api(),
+            &FileRecorderOptions::new(SourceSpec::new("mock").unwrap()),
+        )
+        .unwrap();
         let target =
             RecordingTarget::new(std::env::temp_dir().join("mock-start-stale-events")).unwrap();
         device.fail_next_start.store(true, Ordering::Release);
@@ -3577,9 +3699,11 @@ mod tests {
             for stale in [255, 300] {
                 let device = mock::Recorder::new(Closing::AtStop);
                 device.install();
-                let recorder = mock::recorder_api()
-                    .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
-                    .unwrap();
+                let recorder = crate::file::FileRecorder::new(
+                    &mock::recorder_api(),
+                    &FileRecorderOptions::new(SourceSpec::new("mock").unwrap()),
+                )
+                .unwrap();
                 let target =
                     RecordingTarget::new(std::env::temp_dir().join("mock-readable-stale-events"))
                         .unwrap();
@@ -3602,7 +3726,7 @@ mod tests {
                 } else {
                     assert!(matches!(
                         result,
-                        Err(Error::InvalidState(StateError::EarlierSessionEvents))
+                        Err(Error::InvalidState(StateConflict::EarlierSessionEvents))
                     ));
                     assert_eq!(device.starts.load(Ordering::Acquire), 0);
                 }
@@ -3617,9 +3741,11 @@ mod tests {
         for asynchronous in [false, true] {
             let device = mock::Recorder::new(Closing::AtStop);
             device.install();
-            let mut recorder = mock::recorder_api()
-                .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
-                .unwrap();
+            let mut recorder = crate::file::FileRecorder::new(
+                &mock::recorder_api(),
+                &FileRecorderOptions::new(SourceSpec::new("mock").unwrap()),
+            )
+            .unwrap();
             let target =
                 RecordingTarget::new(std::env::temp_dir().join("mock-undrainable-stale-events"))
                     .unwrap();
@@ -3635,7 +3761,7 @@ mod tests {
             };
             assert!(matches!(
                 result,
-                Err(Error::InvalidState(StateError::EarlierSessionEvents))
+                Err(Error::InvalidState(StateConflict::EarlierSessionEvents))
             ));
             assert_eq!(device.starts.load(Ordering::Acquire), 0);
             assert_eq!(
@@ -3650,9 +3776,11 @@ mod tests {
     fn a_deadline_drain_is_bounded_even_when_more_events_remain() {
         let device = mock::Recorder::new(Closing::Never);
         device.install();
-        let mut recorder = mock::recorder_api()
-            .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
-            .unwrap();
+        let mut recorder = crate::file::FileRecorder::new(
+            &mock::recorder_api(),
+            &FileRecorderOptions::new(SourceSpec::new("mock").unwrap()),
+        )
+        .unwrap();
         recorder
             .start(
                 &RecordingTarget::new(std::env::temp_dir().join("mock-drain-limit")).unwrap(),
@@ -3665,7 +3793,11 @@ mod tests {
         let mut owner = RecorderOwner::new(recorder);
         let (reply, finishing) = operation();
         let finishing = FileOperation::live(finishing);
-        owner.finish(Deadline::after(Duration::ZERO).unwrap(), true, reply);
+        owner.finish(
+            Deadline::after(Duration::ZERO).unwrap(),
+            true,
+            FinishResponse::Finish(reply),
+        );
         owner.settle_at(
             false,
             &EventQueue::new(16),
@@ -3693,20 +3825,22 @@ mod tests {
     ) {
         let device = mock::Recorder::new(Closing::WhenTold);
         device.install();
-        let mut recorder = mock::recorder_api()
-            .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
-            .unwrap();
+        let mut recorder = crate::file::FileRecorder::new(
+            &mock::recorder_api(),
+            &FileRecorderOptions::new(SourceSpec::new("mock").unwrap()),
+        )
+        .unwrap();
         recorder
             .start(
                 &RecordingTarget::new(std::env::temp_dir().join("mock-expiry-drain")).unwrap(),
                 RecordingTimecode::Preserve,
             )
             .unwrap();
-        recorder.poll_event(Duration::ZERO).unwrap();
+        recorder.next_event(Duration::ZERO).unwrap();
         let mut owner = RecorderOwner::new(recorder);
         let (reply, finishing) = operation();
         let finishing = FileOperation::live(finishing);
-        owner.finish(deadline, true, reply);
+        owner.finish(deadline, true, FinishResponse::Finish(reply));
         (device, owner, finishing)
     }
 
@@ -3724,23 +3858,25 @@ mod tests {
         }
         let device = mock::Recorder::new(Closing::Never);
         device.install();
-        let mut recorder = mock::recorder_api()
-            .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
-            .unwrap();
+        let mut recorder = crate::file::FileRecorder::new(
+            &mock::recorder_api(),
+            &FileRecorderOptions::new(SourceSpec::new("mock").unwrap()),
+        )
+        .unwrap();
         recorder
             .start(
                 &RecordingTarget::new(std::env::temp_dir().join("mock-settlement-close")).unwrap(),
                 RecordingTimecode::Preserve,
             )
             .unwrap();
-        recorder.poll_event(Duration::ZERO).unwrap();
+        recorder.next_event(Duration::ZERO).unwrap();
         let mut owner = RecorderOwner::new(recorder);
         let (reply, finishing) = operation();
         let finishing = FileOperation::live(finishing);
         owner.finish(
             Deadline::after(Duration::from_secs(30)).unwrap(),
             true,
-            reply,
+            FinishResponse::Finish(reply),
         );
         device.dropped_events.store(1, Ordering::Release);
         assert!(owner.poll_native().unwrap().is_none());
@@ -3777,7 +3913,7 @@ mod tests {
         // alone must prevent following the inherited report or a new session.
         owner
             .recorder
-            .reset(&RecorderOptions::new(
+            .reset(&FileRecorderOptions::new(
                 SourceSpec::new("replacement").unwrap(),
             ))
             .unwrap();
@@ -3790,7 +3926,7 @@ mod tests {
         );
         assert!(matches!(
             block_on(finishing),
-            Err(Error::InvalidState(StateError::Closed))
+            Err(Error::InvalidState(StateConflict::Closed))
         ));
     }
 
@@ -3803,7 +3939,7 @@ mod tests {
         replacement.install();
         assert!(owner
             .recorder
-            .reset(&RecorderOptions::new(
+            .reset(&FileRecorderOptions::new(
                 SourceSpec::new("replacement").unwrap()
             ))
             .is_err());
@@ -3877,7 +4013,7 @@ mod tests {
             .is_pending());
         let (reply, later) = operation();
         let later = FileOperation::live(later);
-        owner.finish(later_deadline, false, reply);
+        owner.finish(later_deadline, false, FinishResponse::Finish(reply));
         let events = EventQueue::new(16);
         let control = Control::new();
         owner.settle_at(false, &events, &control, false, at);
@@ -3897,16 +4033,58 @@ mod tests {
     }
 
     #[test]
+    fn condition_wait_timeout_retains_report_and_a_later_wait_observes_closure() {
+        let (device, recorder) = mock_recorder(Closing::WhenTold);
+        block_on(recorder.request_stop()).unwrap();
+        let before = block_on(recorder.report()).unwrap();
+        let expired = recorder.wait_for_finish(Duration::ZERO);
+        assert!(
+            !expired.is_completed(),
+            "an unpolled wait must remain deferred"
+        );
+        assert!(block_on(expired).unwrap().is_none());
+        assert_eq!(block_on(recorder.report()).unwrap(), before);
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        let waiting = recorder.wait_for_finish(Duration::from_secs(5)).submit();
+        await_finish(&recorder);
+        assert_eq!(
+            block_on(recorder.report()).unwrap(),
+            before,
+            "report commands must remain available during a pending wait"
+        );
+        device.close();
+        let Some(FinishStatus::Closed(report)) = block_on(waiting).unwrap() else {
+            panic!("the later wait must observe confirmed closure");
+        };
+        assert!(report.closure_confirmed());
+        assert_eq!(report, block_on(recorder.report()).unwrap());
+        block_on(recorder.close()).unwrap();
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn condition_wait_reports_an_indeterminate_session_as_a_settled_outcome() {
+        let (device, recorder) = mock_recorder(Closing::AtStop);
+        device.dropped_events.store(1, Ordering::Release);
+        block_on(recorder.request_stop()).unwrap();
+        let Some(FinishStatus::Indeterminate(report)) =
+            block_on(recorder.wait_for_finish(Duration::ZERO)).unwrap()
+        else {
+            panic!("the lost SDK event prevents confirmation, not settlement");
+        };
+        assert_eq!(report.dropped_events(), 1);
+        assert_eq!(report, block_on(recorder.report()).unwrap());
+        block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
     fn concurrent_finish_waiters_keep_their_deadlines_and_share_the_closure() {
         let (device, recorder) = mock_recorder(Closing::WhenTold);
         let first = recorder.finish(Duration::from_secs(5)).submit();
         await_finish(&recorder);
-        let expired = recorder.wait_finished(Duration::ZERO).submit();
-        assert!(matches!(
-            block_on(expired).unwrap(),
-            FinishStatus::TimedOut(_)
-        ));
-        let second = recorder.wait_finished(Duration::from_secs(5)).submit();
+        let expired = recorder.wait_for_finish(Duration::ZERO).submit();
+        assert!(block_on(expired).unwrap().is_none());
+        let second = recorder.wait_for_finish(Duration::from_secs(5)).submit();
         assert_eq!(
             block_on(recorder.worker.call(|owner| Ok(owner.waiters.len()))).unwrap(),
             2
@@ -3915,7 +4093,7 @@ mod tests {
         let first = block_on(first).unwrap();
         let second = block_on(second).unwrap();
         assert!(matches!(first, FinishStatus::Closed(_)));
-        assert_eq!(first, second);
+        assert_eq!(Some(first), second);
         block_on(recorder.close()).unwrap();
     }
 
@@ -3924,7 +4102,7 @@ mod tests {
         let (device, recorder) = mock_recorder(Closing::WhenTold);
         let cancelled = recorder.finish(Duration::from_secs(5)).submit();
         await_finish(&recorder);
-        let retained = recorder.wait_finished(Duration::from_secs(5)).submit();
+        let retained = recorder.wait_for_finish(Duration::from_secs(5)).submit();
         drop(cancelled);
         assert_eq!(
             block_on(recorder.worker.call(|owner| Ok(owner.waiters.len()))).unwrap(),
@@ -3933,7 +4111,7 @@ mod tests {
         device.close();
         assert!(matches!(
             block_on(retained).unwrap(),
-            FinishStatus::Closed(_)
+            Some(FinishStatus::Closed(_))
         ));
         block_on(recorder.close()).unwrap();
     }
@@ -3951,7 +4129,7 @@ mod tests {
             Ok(())
         }))
         .unwrap();
-        let options = RecorderOptions::new(SourceSpec::new("replacement").unwrap());
+        let options = FileRecorderOptions::new(SourceSpec::new("replacement").unwrap());
         assert!(block_on(recorder.reset(&options)).is_err());
         assert!(!finishing.is_completed());
         replacement.refuse_creation.store(false, Ordering::Release);
@@ -3964,7 +4142,7 @@ mod tests {
         block_on(recorder.reset(&options)).unwrap();
         assert!(matches!(
             block_on(finishing),
-            Err(Error::InvalidState(StateError::Closed))
+            Err(Error::InvalidState(StateConflict::Closed))
         ));
         assert_eq!(device.destroys.load(Ordering::Acquire), 1);
         assert_eq!(
@@ -3999,9 +4177,9 @@ mod tests {
                 assert!(matches!(
                     result,
                     Err(Error::InvalidState(error)) if error == if outcome == OwnerExit::Failed {
-                        StateError::OwnerFailed
+                        StateConflict::OwnerFailed
                     } else {
-                        StateError::Closed
+                        StateConflict::Closed
                     }
                 ));
             }
@@ -4009,7 +4187,7 @@ mod tests {
                 if outcome == OwnerExit::Failed {
                     assert!(matches!(
                         result,
-                        Err(Error::InvalidState(StateError::OwnerFailed))
+                        Err(Error::InvalidState(StateConflict::OwnerFailed))
                     ));
                 } else {
                     assert!(result.is_ok());
@@ -4091,7 +4269,7 @@ mod tests {
         ] {
             assert!(matches!(
                 result,
-                Err(Error::InvalidState(StateError::OwnerFailed))
+                Err(Error::InvalidState(StateConflict::OwnerFailed))
             ));
         }
         assert_eq!(device.destroys.load(Ordering::Acquire), 1);
@@ -4116,7 +4294,7 @@ mod tests {
             fn wake(self: Arc<Self>) {
                 let failed = matches!(
                     Pin::new(&mut *lock(&self.event)).poll(&mut Context::from_waker(Waker::noop())),
-                    Poll::Ready(Err(Error::InvalidState(StateError::OwnerFailed)))
+                    Poll::Ready(Err(Error::InvalidState(StateConflict::OwnerFailed)))
                 );
                 let _ = self
                     .observed
@@ -4133,7 +4311,7 @@ mod tests {
         );
         let player = block_on(AsyncFilePlayer::create(
             &api,
-            &PlayerOptions::new("failed player"),
+            &FilePlayerOptions::new("failed player"),
         ))
         .unwrap();
         let (observed, receive) = mpsc::channel();
@@ -4155,11 +4333,11 @@ mod tests {
         );
         assert!(matches!(
             block_on(failed),
-            Err(Error::InvalidState(StateError::OwnerFailed))
+            Err(Error::InvalidState(StateConflict::OwnerFailed))
         ));
         assert!(matches!(
             block_on(player.close()),
-            Err(Error::InvalidState(StateError::OwnerFailed))
+            Err(Error::InvalidState(StateConflict::OwnerFailed))
         ));
         assert_eq!(DESTROYS.load(Ordering::Acquire), 1);
     }
@@ -4170,30 +4348,34 @@ mod tests {
             mock_recorder_with_drop_wait(Closing::Never, AsyncFileOptions::new(), Duration::ZERO);
         let first = recorder.finish(Duration::from_secs(5)).submit();
         await_finish(&recorder);
-        let second = recorder.wait_finished(Duration::from_secs(5)).submit();
+        let second = recorder.wait_for_finish(Duration::from_secs(5)).submit();
         let failed = recorder
             .worker
             .call(|_| -> Result<()> { panic!("owner failure") })
             .submit();
-        for result in [block_on(first), block_on(second)] {
+        for result in [block_on(first).map(|_| ()), block_on(second).map(|_| ())] {
             assert!(matches!(
                 result,
-                Err(Error::InvalidState(StateError::OwnerFailed))
+                Err(Error::InvalidState(StateConflict::OwnerFailed))
             ));
         }
         assert!(matches!(
             block_on(failed),
-            Err(Error::InvalidState(StateError::OwnerFailed))
+            Err(Error::InvalidState(StateConflict::OwnerFailed))
         ));
         assert!(matches!(
             block_on(recorder.close()),
-            Err(Error::InvalidState(StateError::OwnerFailed))
+            Err(Error::InvalidState(StateConflict::OwnerFailed))
         ));
     }
 
     #[test]
     fn finish_and_wait_report_closure_when_another_clone_closes_within_the_shared_budget() {
-        for stop in [true, false] {
+        fn check<T: std::fmt::Debug>(
+            stop: bool,
+            start: impl FnOnce(&AsyncFileRecorder) -> FileOperation<T>,
+            is_closed: impl FnOnce(&T) -> bool,
+        ) {
             let (device, recorder) = mock_recorder_with_drop_wait(
                 Closing::WhenTold,
                 AsyncFileOptions::new(),
@@ -4202,12 +4384,7 @@ mod tests {
             if !stop {
                 block_on(recorder.request_stop()).unwrap();
             }
-            let finishing = if stop {
-                recorder.finish(Duration::from_secs(30))
-            } else {
-                recorder.wait_finished(Duration::from_secs(30))
-            }
-            .submit();
+            let finishing = start(&recorder).submit();
             await_finish(&recorder);
             let other = recorder.clone();
             let closed = other.close().submit();
@@ -4217,15 +4394,25 @@ mod tests {
             assert!(!finishing.is_completed());
             device.close();
             let outcome = block_on(finishing).unwrap();
-            assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+            assert!(is_closed(&outcome), "{outcome:?}");
             block_on(closed).unwrap();
             assert!(device.closed_before_destroy.load(Ordering::Acquire));
             assert_eq!(device.destroys.load(Ordering::Acquire), 1);
             assert!(matches!(
-                block_on(recorder.wait_finished(Duration::ZERO)),
-                Err(Error::InvalidState(StateError::Closed))
+                block_on(recorder.wait_for_finish(Duration::ZERO)),
+                Err(Error::InvalidState(StateConflict::Closed))
             ));
         }
+        check(
+            true,
+            |recorder| recorder.finish(Duration::from_secs(30)),
+            |outcome| matches!(outcome, FinishStatus::Closed(_)),
+        );
+        check(
+            false,
+            |recorder| recorder.wait_for_finish(Duration::from_secs(30)),
+            |outcome| matches!(outcome, Some(FinishStatus::Closed(_))),
+        );
     }
 
     #[test]
@@ -4265,7 +4452,7 @@ mod tests {
         let (waits_at_reply, replied_at) = reply.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(matches!(
             block_on(finishing),
-            Err(Error::InvalidState(StateError::Closed))
+            Err(Error::InvalidState(StateConflict::Closed))
         ));
         block_on(closed).unwrap();
         let elapsed = replied_at.duration_since(requested);
@@ -4316,7 +4503,7 @@ mod tests {
         let closed = recorder.close().submit();
         assert!(matches!(
             block_on(finishing),
-            Err(Error::InvalidState(StateError::Closed))
+            Err(Error::InvalidState(StateConflict::Closed))
         ));
         assert!(
             began.elapsed() < Duration::from_millis(500),
@@ -4333,20 +4520,22 @@ mod tests {
     fn sync_drop_keeps_an_indeterminate_recorder_until_its_known_file_closes() {
         let device = mock::Recorder::new(Closing::StoppedBeforeClose(Duration::from_millis(100)));
         device.install();
-        let mut recorder = mock::recorder_api()
-            .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
-            .unwrap();
+        let mut recorder = crate::file::FileRecorder::new(
+            &mock::recorder_api(),
+            &FileRecorderOptions::new(SourceSpec::new("mock").unwrap()),
+        )
+        .unwrap();
         let target = RecordingTarget::new(std::env::temp_dir().join("mock-cleanup")).unwrap();
         recorder
             .start(&target, RecordingTimecode::Preserve)
             .unwrap();
-        recorder.poll_event(Duration::ZERO).unwrap();
+        recorder.next_event(Duration::ZERO).unwrap();
         device.dropped_events.store(1, Ordering::Release);
         let outcome = recorder.finish(Duration::ZERO).unwrap();
         assert!(matches!(outcome, FinishStatus::Indeterminate(_)));
         assert!(matches!(
             recorder.start(&target, RecordingTimecode::Preserve),
-            Err(Error::InvalidState(StateError::PreviousSessionOpen))
+            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
         ));
         drop(recorder);
         assert!(device.closed_before_destroy.load(Ordering::Acquire));
@@ -4370,14 +4559,16 @@ mod tests {
     fn a_known_file_closed_after_an_indeterminate_report_allows_another_start() {
         let device = mock::Recorder::new(Closing::Never);
         device.install();
-        let mut recorder = mock::recorder_api()
-            .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
-            .unwrap();
+        let mut recorder = crate::file::FileRecorder::new(
+            &mock::recorder_api(),
+            &FileRecorderOptions::new(SourceSpec::new("mock").unwrap()),
+        )
+        .unwrap();
         let target = RecordingTarget::new(std::env::temp_dir().join("mock-restart")).unwrap();
         recorder
             .start(&target, RecordingTimecode::Preserve)
             .unwrap();
-        recorder.poll_event(Duration::ZERO).unwrap();
+        recorder.next_event(Duration::ZERO).unwrap();
         device.dropped_events.store(1, Ordering::Release);
         assert!(matches!(
             recorder.finish(Duration::ZERO).unwrap(),
@@ -4386,10 +4577,10 @@ mod tests {
         let report = recorder.report();
         assert!(matches!(
             recorder.start(&target, RecordingTimecode::Preserve),
-            Err(Error::InvalidState(StateError::PreviousSessionOpen))
+            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
         ));
         device.close();
-        recorder.poll_event(Duration::ZERO).unwrap();
+        recorder.next_event(Duration::ZERO).unwrap();
         assert_eq!(recorder.report(), report);
         assert_eq!(
             recorder
@@ -4468,10 +4659,10 @@ mod tests {
         drop(finishing);
         assert_eq!(block_on(recorder.state()).unwrap(), RecorderState::Stopping);
         assert_eq!(device.destroys.load(Ordering::Acquire), 0);
-        let waiting = recorder.wait_finished(Duration::from_secs(5)).submit();
+        let waiting = recorder.wait_for_finish(Duration::from_secs(5)).submit();
         device.close();
         let outcome = block_on(waiting).unwrap();
-        let FinishStatus::Closed(report) = outcome else {
+        let Some(FinishStatus::Closed(report)) = outcome else {
             panic!("expected confirmed closure after the later close event: {outcome:?}")
         };
         assert!(report.closure_confirmed());
@@ -4962,7 +5153,7 @@ mod tests {
             .is_pending());
         assert!(matches!(
             block_on(events.wait(Duration::ZERO)),
-            Err(Error::InvalidState(StateError::WaiterPending))
+            Err(Error::InvalidState(StateConflict::WaiterPending))
         ));
         drop(first);
         assert_eq!(block_on(events.wait(Duration::ZERO)).unwrap(), None);
@@ -4975,11 +5166,11 @@ mod tests {
         block_on(worker.control.request_close(|| {})).unwrap();
         assert!(matches!(
             block_on(event),
-            Err(Error::InvalidState(StateError::Closed))
+            Err(Error::InvalidState(StateConflict::Closed))
         ));
         assert!(matches!(
             block_on(worker.call(|_| Ok(()))),
-            Err(Error::InvalidState(StateError::Closed))
+            Err(Error::InvalidState(StateConflict::Closed))
         ));
         dropped.recv_timeout(Duration::from_secs(1)).unwrap();
     }
@@ -5029,7 +5220,7 @@ mod tests {
     fn an_async_timeout_out_of_range_fails_at_submission_and_stops_nothing() {
         let (device, recorder) = mock_recorder(Closing::AtStop);
         let too_long = crate::MAX_TIMEOUT + Duration::from_nanos(1);
-        for finishing in [recorder.finish(too_long), recorder.wait_finished(too_long)] {
+        fn assert_refused<T: std::fmt::Debug>(finishing: FileOperation<T>, too_long: Duration) {
             let finishing = finishing.submit();
             // Completed at submission: nothing was queued.
             assert!(finishing.is_completed());
@@ -5039,6 +5230,8 @@ mod tests {
                 "{result:?}"
             );
         }
+        assert_refused(recorder.finish(too_long), too_long);
+        assert_refused(recorder.wait_for_finish(too_long), too_long);
         assert_eq!(
             block_on(recorder.state()).unwrap(),
             RecorderState::Recording
@@ -5074,7 +5267,7 @@ mod tests {
         let api = FileApi::with_tables(mock::playback_with_unreadable_formats(), mock::recording());
         let player = block_on(AsyncFilePlayer::create(
             &api,
-            &PlayerOptions::new("mock player"),
+            &FilePlayerOptions::new("mock player"),
         ))
         .unwrap();
         let event = block_on(player.next_event(Duration::from_secs(5)))
@@ -5183,7 +5376,7 @@ mod tests {
         let outcome = block_on(waiting.as_mut());
         let waited = begun.elapsed();
         assert!(
-            matches!(outcome, Err(Error::InvalidState(StateError::Closed))),
+            matches!(outcome, Err(Error::InvalidState(StateConflict::Closed))),
             "{outcome:?}"
         );
         assert!(
@@ -5298,7 +5491,7 @@ mod tests {
             }
         }
         impl HandleOwner for NeverCreated {
-            type Options = RecorderOptions;
+            type Options = FileRecorderOptions;
             type Prepared = super::super::recorder::PreparedRecorder;
             const THREAD_NAME: &'static str = "must-not-create";
             fn prepare(api: FileApi, options: &Self::Options) -> Result<Self::Prepared> {
@@ -5316,10 +5509,10 @@ mod tests {
         }
         let api = mock::recorder_api();
         for options in [
-            RecorderOptions::new(SourceSpec::new("mock").unwrap())
+            FileRecorderOptions::new(SourceSpec::new("mock").unwrap())
                 .naming(FileNaming::Exact)
                 .format_change_rollover(true),
-            RecorderOptions::new(SourceSpec::new("mock").unwrap())
+            FileRecorderOptions::new(SourceSpec::new("mock").unwrap())
                 .naming(FileNaming::Pattern("{prefix}/{index}/clip.mkv".into())),
         ] {
             let refused = Worker::<NeverCreated>::create(&api, &options, |worker| worker).submit();
@@ -5329,37 +5522,37 @@ mod tests {
             assert!(public.is_completed());
             assert!(matches!(block_on(public), Err(Error::InvalidInput(_))));
         }
-        let bad_player = AsyncFilePlayer::create(&api, &PlayerOptions::new("")).submit();
+        let bad_player = AsyncFilePlayer::create(&api, &FilePlayerOptions::new("")).submit();
         assert!(bad_player.is_completed());
         assert!(matches!(block_on(bad_player), Err(Error::InvalidInput(_))));
         let missing = FileApi::with_runtime(crate::sys::FileRuntime::test_double(
             Err(c"NDIlib_file_player_create"),
             Err(c"NDIlib_file_recorder_create"),
         ));
-        let player = AsyncFilePlayer::create(&missing, &PlayerOptions::new("mock")).submit();
+        let player = AsyncFilePlayer::create(&missing, &FilePlayerOptions::new("mock")).submit();
         assert!(player.is_completed());
         assert!(matches!(
             block_on(player),
-            Err(Error::FileFamilyUnavailable { .. })
+            Err(Error::UnsupportedCapability { .. })
         ));
-        let options = RecorderOptions::new(SourceSpec::new("mock").unwrap());
+        let options = FileRecorderOptions::new(SourceSpec::new("mock").unwrap());
         let recorder = AsyncFileRecorder::create(&missing, &options).submit();
         assert!(recorder.is_completed());
         assert!(matches!(
             block_on(recorder),
-            Err(Error::FileFamilyUnavailable { .. })
+            Err(Error::UnsupportedCapability { .. })
         ));
         let never = Worker::<NeverCreated>::create(&missing, &options, |worker| worker).submit();
         assert!(never.is_completed());
         assert!(matches!(
             block_on(never),
-            Err(Error::FileFamilyUnavailable { .. })
+            Err(Error::UnsupportedCapability { .. })
         ));
     }
 
     #[test]
     fn a_refused_create_allocates_only_its_options_validation() {
-        let options = RecorderOptions::new(SourceSpec::new("mock").unwrap())
+        let options = FileRecorderOptions::new(SourceSpec::new("mock").unwrap())
             .naming(FileNaming::Exact)
             .format_change_rollover(true);
         let (resolved, expected) = crate::test_alloc::allocation_count(|| options.resolve());
@@ -5378,7 +5571,7 @@ mod tests {
     fn a_refused_reset_does_not_wait_behind_a_blocked_owner_command() {
         let (device, recorder) = mock_recorder(Closing::AtStop);
         let (blocked, release) = block_owner(&recorder.worker);
-        let options = RecorderOptions::new(SourceSpec::new("replacement").unwrap())
+        let options = FileRecorderOptions::new(SourceSpec::new("replacement").unwrap())
             .naming(FileNaming::Exact)
             .format_change_rollover(true);
         let refused = recorder.reset(&options).submit();
@@ -5394,7 +5587,7 @@ mod tests {
 
     #[test]
     fn async_creation_refuses_conflicting_options() {
-        let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap())
+        let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
             .naming(FileNaming::Exact)
             .format_change_rollover(true);
         assert!(matches!(
@@ -5409,11 +5602,11 @@ mod tests {
             "{prefix}_{index}/clip.mkv",
             "{index}{prefix}.mkv",
         ] {
-            let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap())
+            let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
                 .naming(FileNaming::Pattern(pattern.into()));
             let api = mock::recorder_api();
             assert!(matches!(
-                api.create_recorder(&options),
+                crate::file::FileRecorder::new(&api, &options),
                 Err(Error::InvalidInput(
                     crate::InputDefect::FilenamePatternIndexInDirectory
                 ))
@@ -5458,24 +5651,24 @@ mod tests {
             );
         }
         let api = mock::recorder_api();
-        let player_options = PlayerOptions::new("mock player");
+        let player_options = FilePlayerOptions::new("mock player");
         assert!(matches!(
             block_on(AsyncFilePlayer::create_with_options(
                 &api,
                 &player_options,
-                AsyncFileOptions::new().event_capacity(0),
+                &AsyncFileOptions::new().event_capacity(0),
             )),
             Err(Error::InvalidInput(crate::InputDefect::FileQueueCapacity {
                 queue: "event",
                 capacity: 0
             }))
         ));
-        let recorder_options = RecorderOptions::new(SourceSpec::new("mock source").unwrap());
+        let recorder_options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap());
         assert!(matches!(
             block_on(AsyncFileRecorder::create_with_options(
                 &api,
                 &recorder_options,
-                AsyncFileOptions::new().command_capacity(0),
+                &AsyncFileOptions::new().command_capacity(0),
             )),
             Err(Error::InvalidInput(crate::InputDefect::FileQueueCapacity {
                 queue: "command",

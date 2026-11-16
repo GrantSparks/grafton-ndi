@@ -119,7 +119,7 @@ listener_api!(
 ///
 /// Without an explicit server the SDK uses the Discovery Server from the NDI
 /// configuration. If that names none either, the listener cannot be created.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ListenerOptions {
     server: Option<String>,
     #[cfg(feature = "advanced")]
@@ -385,6 +385,24 @@ impl AdvertisedSender {
     pub fn groups(&self) -> &[String] {
         &self.groups
     }
+    /// Convert this advertised sender into a connection target.
+    ///
+    /// Returns `None` when the server supplied no source name. An address is
+    /// included only when both the address and a valid port were advertised.
+    /// IPv6 literals are enclosed in brackets before their port is appended.
+    pub fn to_source(&self) -> Option<crate::Source> {
+        let mut source = crate::Source::new(self.name.as_ref()?).ok()?;
+        if let (Some(address), Some(port)) = (&self.address, self.port) {
+            let endpoint = if address.parse::<std::net::Ipv6Addr>().is_ok() {
+                format!("[{address}]:{port}")
+            } else {
+                format!("{address}:{port}")
+            };
+            source = source.with_address(crate::SourceAddress::new(endpoint).ok()?);
+        }
+        Some(source)
+    }
+
     /// Whether this listener is subscribed to the sender's events.
     pub fn events_subscribed(&self) -> bool {
         self.subscribed
@@ -567,7 +585,7 @@ impl<A: ListenerApi> Listener<A> {
         // check in tests/discovery_server.rs exercises that SDK assumption.
         unsafe { endpoint(url) }
     }
-    fn wait_for_changes(&mut self, timeout: Duration) -> Result<bool> {
+    fn wait_for_change(&mut self, timeout: Duration) -> Result<bool> {
         let timeout = to_ms_checked(timeout)?;
         // SAFETY: the listener instance is live for this borrow.
         Ok(unsafe { self.0.api.wait_for_entries(self.0.instance(), timeout) })
@@ -591,7 +609,7 @@ impl<A: ListenerApi> Listener<A> {
             }
         };
     }
-    fn capture_events(&mut self, timeout: Duration) -> Result<Vec<ListenerEvent<A::Id>>> {
+    fn next_events(&mut self, timeout: Duration) -> Result<Vec<ListenerEvent<A::Id>>> {
         struct Batch<'a, A: ListenerApi> {
             listener: &'a Listener<A>,
             events: *const NDIlib_listener_event,
@@ -691,12 +709,16 @@ const _: () = {
 
 impl fmt::Debug for SendListener {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SendListener").finish_non_exhaustive()
+        f.debug_struct("SendListener")
+            .field("server", &self.inner.0._url)
+            .finish_non_exhaustive()
     }
 }
 impl fmt::Debug for RecvListener {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RecvListener").finish_non_exhaustive()
+        f.debug_struct("RecvListener")
+            .field("server", &self.inner.0._url)
+            .finish_non_exhaustive()
     }
 }
 
@@ -705,6 +727,8 @@ macro_rules! listener_methods {
         /// Whether the listener is connected to its Discovery Server right
         /// now. A listener that is not connected keeps trying. This reports
         /// registry connectivity, not progress of any receiver media.
+        #[doc(alias = "NDIlib_send_listener_is_connected")]
+        #[doc(alias = "NDIlib_recv_listener_is_connected")]
         pub fn is_connected(&self) -> bool {
             self.inner.is_connected()
         }
@@ -720,6 +744,8 @@ macro_rules! listener_methods {
         /// caller of this getter would have to handle. Bytes that are not
         /// UTF-8 are replaced with U+FFFD, as in the other text a listener
         /// reports.
+        #[doc(alias = "NDIlib_send_listener_get_server_url")]
+        #[doc(alias = "NDIlib_recv_listener_get_server_url")]
         pub fn server_url(&self) -> Option<String> {
             self.inner.server_url()
         }
@@ -729,11 +755,15 @@ macro_rules! listener_methods {
         ///
         /// Returns [`Error::InvalidInput`] when `timeout` exceeds
         /// [`crate::MAX_TIMEOUT`].
-        pub fn wait_for_changes(&mut self, timeout: Duration) -> Result<bool> {
-            self.inner.wait_for_changes(timeout)
+        #[doc(alias = "NDIlib_send_listener_wait_for_senders")]
+        #[doc(alias = "NDIlib_recv_listener_wait_for_receivers")]
+        pub fn wait_for_change(&mut self, timeout: Duration) -> Result<bool> {
+            self.inner.wait_for_change(timeout)
         }
         /// Ask to receive the events of the peer `id` names. The next snapshot
         /// reports whether the subscription is active.
+        #[doc(alias = "NDIlib_send_listener_subscribe_events")]
+        #[doc(alias = "NDIlib_recv_listener_subscribe_events")]
         pub fn subscribe(&mut self, id: &$Id) {
             self.inner.subscription(id, true)
         }
@@ -745,6 +775,8 @@ macro_rules! listener_methods {
         /// defect the crate cannot prevent. Dropping the listener ends its
         /// subscriptions without that risk. See the
         /// [module documentation](super#sdk-defects-that-remain-in-64).
+        #[doc(alias = "NDIlib_send_listener_unsubscribe_events")]
+        #[doc(alias = "NDIlib_recv_listener_unsubscribe_events")]
         pub fn unsubscribe(&mut self, id: &$Id) {
             self.inner.subscription(id, false)
         }
@@ -763,8 +795,10 @@ macro_rules! listener_methods {
         /// [`Error::UnexpectedSdkResult`] when the top-level batch array is
         /// malformed or storage cannot be reserved. The SDK has already
         /// handed a rejected batch over, so it is freed and its events are lost.
-        pub fn capture_events(&mut self, timeout: Duration) -> Result<Vec<ListenerEvent<$Id>>> {
-            self.inner.capture_events(timeout)
+        #[doc(alias = "NDIlib_send_listener_get_events")]
+        #[doc(alias = "NDIlib_recv_listener_get_events")]
+        pub fn next_events(&mut self, timeout: Duration) -> Result<Vec<ListenerEvent<$Id>>> {
+            self.inner.next_events(timeout)
         }
     };
 }
@@ -786,6 +820,8 @@ impl SendListener {
     /// NDI configuration supplies none.
     ///
     /// [sender discovery]: crate::capabilities::RuntimeFeature::SenderDiscovery
+    #[doc(alias = "NDIlib_send_listener_create")]
+    #[doc(alias = "NDIlib_send_listener_create_ex")]
     pub fn new(ndi: &Ndi, options: &ListenerOptions) -> Result<Self> {
         Ok(Self {
             inner: Listener::new(ndi, options)?,
@@ -804,7 +840,8 @@ impl SendListener {
     /// Returns [`Error::ResourceLimit`] when copying would exceed the 16 MiB
     /// budget, and [`Error::UnexpectedSdkResult`] when the top-level snapshot
     /// array is malformed or storage cannot be reserved.
-    pub fn snapshot(&mut self) -> Result<Vec<AdvertisedSender>> {
+    #[doc(alias = "NDIlib_send_listener_get_senders")]
+    pub fn current_senders(&mut self) -> Result<Vec<AdvertisedSender>> {
         let mut budget = copy_budget();
         let raw = self.inner.entries(&mut budget)?;
         budget.collect_entries(raw, |sender, budget| {
@@ -844,6 +881,8 @@ impl RecvListener {
     /// NDI configuration supplies none.
     ///
     /// [receiver discovery]: crate::capabilities::RuntimeFeature::ReceiverDiscovery
+    #[doc(alias = "NDIlib_recv_listener_create")]
+    #[doc(alias = "NDIlib_recv_listener_create_ex")]
     pub fn new(ndi: &Ndi, options: &ListenerOptions) -> Result<Self> {
         Ok(Self {
             inner: Listener::new(ndi, options)?,
@@ -862,7 +901,8 @@ impl RecvListener {
     /// Returns [`Error::ResourceLimit`] when copying would exceed the 16 MiB
     /// budget, and [`Error::UnexpectedSdkResult`] when the top-level snapshot
     /// array is malformed or storage cannot be reserved.
-    pub fn snapshot(&mut self) -> Result<Vec<AdvertisedReceiver>> {
+    #[doc(alias = "NDIlib_recv_listener_get_receivers")]
+    pub fn current_receivers(&mut self) -> Result<Vec<AdvertisedReceiver>> {
         let mut budget = copy_budget();
         let raw = self.inner.entries(&mut budget)?;
         budget.collect_entries(raw, |receiver, budget| {
@@ -894,7 +934,7 @@ impl RecvListener {
         })
     }
     /// Ask the receiver `id` names to connect to the NDI source called
-    /// `source`.
+    /// `source_name`.
     ///
     /// The request checks the listener's current borrowed membership, comparing
     /// exact identifiers and reading only the matched receiver's commands. It
@@ -904,7 +944,7 @@ impl RecvListener {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCString`] when `source` contains a NUL byte;
+    /// Returns [`Error::InvalidCString`] when `source_name` contains a NUL byte;
     /// [`Error::ReceiverRequestNotAccepted`] when no receiver the listener
     /// lists has this identifier (`advertised` is false: the listener may not
     /// have connected yet, the receiver may not be registered, or its entry
@@ -916,8 +956,9 @@ impl RecvListener {
     /// array; and [`Error::ResourceLimit`] when that array and the target's
     /// commands exceed the 16 MiB inspection budget. Unrelated fields are
     /// neither scanned nor copied and cannot spend that budget.
-    pub fn request_connect(&mut self, id: &ReceiverId, source: &str) -> Result<()> {
-        self.request(id, Some(source))
+    #[doc(alias = "NDIlib_recv_listener_send_connect")]
+    pub fn request_connect(&mut self, id: &ReceiverId, source_name: &str) -> Result<()> {
+        self.request(id, Some(source_name))
     }
     /// Ask the receiver `id` names to disconnect from its current source.
     ///
@@ -929,6 +970,7 @@ impl RecvListener {
     /// # Errors
     ///
     /// As for [`Self::request_connect`], without the NUL check.
+    #[doc(alias = "NDIlib_recv_listener_send_connect")]
     pub fn request_disconnect(&mut self, id: &ReceiverId) -> Result<()> {
         self.request(id, None)
     }
@@ -956,6 +998,41 @@ impl RecvListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advertised_sources_use_name_and_only_complete_addresses() {
+        let mut sender = AdvertisedSender {
+            id: None,
+            name: Some("Studio (Camera)".into()),
+            metadata: None,
+            address: Some("192.0.2.10".into()),
+            port: Some(5960),
+            groups: vec![],
+            subscribed: false,
+        };
+        let source = sender.to_source().unwrap();
+        assert_eq!(source.name(), "Studio (Camera)");
+        assert_eq!(source.address().unwrap().as_str(), "192.0.2.10:5960");
+        for (address, endpoint) in [
+            ("192.0.2.10", "192.0.2.10:5960"),
+            ("camera.local", "camera.local:5960"),
+            ("2001:db8::10", "[2001:db8::10]:5960"),
+            ("[2001:db8::10]", "[2001:db8::10]:5960"),
+        ] {
+            sender.address = Some(address.into());
+            let source = sender.to_source().unwrap();
+            let actual = source.address().unwrap();
+            assert_eq!(actual.as_str(), endpoint);
+            assert_eq!(actual.port(), Some(5960));
+        }
+        sender.port = None;
+        assert!(sender.to_source().unwrap().address().is_none());
+        sender.port = Some(5960);
+        sender.address = None;
+        assert!(sender.to_source().unwrap().address().is_none());
+        sender.name = None;
+        assert!(sender.to_source().is_none());
+    }
 
     #[test]
     fn receiver_request_lookup_uses_exact_ids_and_only_the_matched_commands() {

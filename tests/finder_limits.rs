@@ -48,7 +48,7 @@ fn finder_enforces_snapshot_and_whole_window_limits() {
                 finder.find_source(Duration::ZERO, |_| true),
                 Err(Error::ResourceLimit { .. })
             ));
-            limited(cache.sources_by_host("studio", Duration::ZERO));
+            limited(cache.find_sources_by_host("studio", Duration::ZERO));
             assert!(cache.is_empty());
         }
         #[cfg(feature = "advanced")]
@@ -57,7 +57,7 @@ fn finder_enforces_snapshot_and_whole_window_limits() {
                 .capabilities()
                 .supports(grafton_ndi::capabilities::RuntimeFeature::SourceMetadata)
         {
-            let result = finder.sources_with_metadata();
+            let result = finder.current_sources_with_metadata();
             if scenario == "many-short" {
                 assert_eq!(result.unwrap().len(), 16_384);
             } else {

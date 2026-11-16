@@ -4,13 +4,13 @@
 use std::ptr;
 use std::{cell::Cell, marker::PhantomData, sync::Arc};
 
-use super::{invalid_input, sdk_quantity, AdvancedConfig, ReceiverControls};
+use super::{invalid_input, sdk_quantity, AdvancedConfig, AvSyncAttached, ReceiverControls};
 use crate::{
     capture::AvSyncAudioFree,
     finder::RawSource,
     frames::AudioRef,
     frames::MAX_AUDIO_BYTES,
-    receiver::{AvSyncAttached, ReceiverCore, Released},
+    receiver::{ReceiverCore, Released},
     sys::{
         advanced::{native, AvSync as AvSyncTable, Genlock as GenlockTable},
         bindings::*,
@@ -158,7 +158,9 @@ pub enum AvSyncOutcome {
 /// FrameSync audio references, it stays on its capture thread (`!Send`, `!Sync`).
 /// Several references may be retained across later synchronizations and freed
 /// in any order. The synchronizer remains borrowed until all are released.
-pub type AvSyncAudioRef<'a> = AudioRef<'a, AvSyncAudioFree>;
+pub struct AvSyncAudioRef<'a> {
+    pub(crate) inner: AudioRef<'a, AvSyncAudioFree>,
+}
 
 /// A synchronization outcome whose audio remains borrowed from the SDK.
 #[derive(Debug)]
@@ -320,12 +322,12 @@ impl Drop for AvResource {
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// let ndi = Ndi::new()?;
-/// # let source = Source::new("");
+/// # let source = Source::new("").unwrap();
 /// let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
 /// let sync = AvSync::new(receiver)?;
 ///
 /// // The frame stays in the SDK's buffer: nothing is copied.
-/// if let Some(captured) = sync.receiver().video().capture_ref(Duration::from_secs(1))? {
+/// if let Some(captured) = sync.receiver().capture_video_ref(Duration::from_secs(1))? {
 ///     // A captured frame has its sender's timestamp when the SDK knows it.
 ///     if let Some(video) = AvSyncVideo::new(&captured) {
 ///         if let AvSyncOutcome::Audio { frame, .. } =
@@ -357,6 +359,14 @@ struct NotSync(PhantomData<Cell<()>>);
 // It holds nothing, so a panic cannot leave it half-changed.
 impl std::panic::RefUnwindSafe for NotSync {}
 
+impl std::fmt::Debug for AvSync {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AvSync")
+            .field("mode", &std::any::type_name::<AvSyncAttached>())
+            .finish_non_exhaustive()
+    }
+}
+
 impl AvSync {
     /// Start synchronizing the audio of `receiver`.
     ///
@@ -366,6 +376,7 @@ impl AvSync {
     /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
     /// build without the Advanced SDK), or [`Error::NativeOperationFailed`]
     /// when the SDK creates no synchronizer.
+    #[doc(alias = "NDIlib_avsync_create")]
     pub fn new(receiver: Receiver) -> std::result::Result<Self, Rejected<Receiver>> {
         let table = match receiver.core._ndi.table::<AvSyncTable>() {
             Ok(table) => table,
@@ -394,7 +405,7 @@ impl AvSync {
     /// Event polling is unavailable because native synchronization can consume
     /// status notifications. Query `ptz().is_supported()`, `web_control_url()`
     /// or Advanced KVM's `is_supported()` for capabilities, use
-    /// `poll_source_name_change()` for the connected source, and
+    /// `wait_for_source_name_change()` for the connected source, and
     /// `is_connected()` or `connection_stats()` for connection state.
     ///
     /// A video frame captured through it can be handed to
@@ -405,7 +416,7 @@ impl AvSync {
     /// ```compile_fail,E0277
     /// use grafton_ndi::advanced::AvSync;
     /// fn capture(sync: &AvSync) {
-    ///     let _ = sync.receiver().audio();
+    ///     let _ = sync.receiver().capture_audio(std::time::Duration::ZERO);
     /// }
     /// ```
     ///
@@ -479,6 +490,7 @@ impl AvSync {
     /// internal error, and [`Error::UnexpectedSdkResult`] for an unknown
     /// status or a format change to a sample rate or channel count that is
     /// not positive.
+    #[doc(alias = "NDIlib_avsync_synchronize")]
     pub fn synchronize(
         &self,
         video: AvSyncVideo<'_>,
@@ -490,6 +502,7 @@ impl AvSync {
     /// Borrow matched audio without allocating or copying samples. Timing,
     /// statuses and errors are as for [`Self::synchronize`]. The returned
     /// frame keeps this synchronizer borrowed until it is released.
+    #[doc(alias = "NDIlib_avsync_synchronize")]
     pub fn synchronize_ref(
         &self,
         video: AvSyncVideo<'_>,
@@ -509,12 +522,14 @@ impl AvSync {
     /// # Errors
     ///
     /// As for [`synchronize`](Self::synchronize).
+    #[doc(alias = "NDIlib_avsync_synchronize")]
     pub fn queued_audio(&self, request: AvSyncRequest) -> Result<AvSyncOutcome> {
         Ok(self.queued_audio_ref(request)?.to_owned())
     }
 
     /// Borrow queued audio without copying; see [`Self::queued_audio`] for
     /// request semantics and errors.
+    #[doc(alias = "NDIlib_avsync_synchronize")]
     pub fn queued_audio_ref(&self, request: AvSyncRequest) -> Result<AvSyncOutcomeRef<'_>> {
         self.capture().queued_audio_ref(request)
     }
@@ -543,6 +558,14 @@ pub struct AvSyncCapture<'a> {
     _thread: PhantomData<*mut ()>,
 }
 
+impl std::fmt::Debug for AvSyncCapture<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AvSyncCapture")
+            .field("mode", &std::any::type_name::<AvSyncAttached>())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> AvSyncCapture<'a> {
     /// Match audio to `video`; see [`AvSync::synchronize`] for timing,
     /// allocation costs, format changes and no-audio results.
@@ -550,6 +573,7 @@ impl<'a> AvSyncCapture<'a> {
     /// # Errors
     ///
     /// As for [`AvSync::synchronize`].
+    #[doc(alias = "NDIlib_avsync_synchronize")]
     pub fn synchronize(
         &self,
         video: AvSyncVideo<'_>,
@@ -560,6 +584,7 @@ impl<'a> AvSyncCapture<'a> {
 
     /// Borrow matched audio; see [`AvSync::synchronize_ref`] for ownership,
     /// timing and errors. The result borrows the synchronizer itself.
+    #[doc(alias = "NDIlib_avsync_synchronize")]
     pub fn synchronize_ref(
         &self,
         video: AvSyncVideo<'_>,
@@ -573,11 +598,13 @@ impl<'a> AvSyncCapture<'a> {
     /// # Errors
     ///
     /// As for [`AvSync::synchronize`].
+    #[doc(alias = "NDIlib_avsync_synchronize")]
     pub fn queued_audio(&self, request: AvSyncRequest) -> Result<AvSyncOutcome> {
         Ok(self.queued_audio_ref(request)?.to_owned())
     }
 
     /// Borrow queued audio; see [`AvSync::queued_audio_ref`].
+    #[doc(alias = "NDIlib_avsync_synchronize")]
     pub fn queued_audio_ref(&self, request: AvSyncRequest) -> Result<AvSyncOutcomeRef<'a>> {
         self.request(None, request)
     }
@@ -873,7 +900,8 @@ struct GenResource {
     handle: GenlockInstance,
     table: &'static GenlockTable,
     _ndi: Ndi,
-    _source: Option<Box<RawSource>>,
+    source: Option<Source>,
+    _raw_source: Option<Box<RawSource>>,
     _config: Option<AdvancedConfig>,
 }
 
@@ -918,6 +946,60 @@ impl Drop for GenResource {
     }
 }
 
+/// Optional reference source and native configuration for a [`Genlock`].
+///
+/// An empty configuration starts on the system clock with the SDK defaults.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct GenlockOptions {
+    source: Option<Source>,
+    config: Option<AdvancedConfig>,
+}
+
+impl GenlockOptions {
+    /// Follow the system clock with the SDK's default configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Follow `source` when the genlock is created.
+    #[must_use]
+    pub fn source(mut self, source: Source) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// The configured reference source, before any genlock is created.
+    pub fn configured_source(&self) -> Option<&Source> {
+        self.source.as_ref()
+    }
+
+    /// Restore the default system-clock source.
+    #[must_use]
+    pub fn clear_source(mut self) -> Self {
+        self.source = None;
+        self
+    }
+
+    /// Use this native JSON configuration at creation.
+    #[must_use]
+    pub fn config(mut self, config: AdvancedConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// The exact configuration given to [`Self::config`].
+    pub fn configured_config(&self) -> Option<&AdvancedConfig> {
+        self.config.as_ref()
+    }
+
+    /// Restore the SDK's default native configuration.
+    #[must_use]
+    pub fn clear_config(mut self) -> Self {
+        self.config = None;
+        self
+    }
+}
+
 /// Clocks locked to the timing of a reference NDI source.
 ///
 /// A genlock paces a sender so that its frames leave in step with another
@@ -943,12 +1025,12 @@ impl Drop for GenResource {
 /// # Examples
 ///
 /// ```no_run
-/// use grafton_ndi::{advanced::Genlock, FrameRate, Ndi, ScanType, Source};
+/// use grafton_ndi::{advanced::{Genlock, GenlockOptions}, FrameRate, Ndi, ScanType, Source};
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// let ndi = Ndi::new()?;
-/// # let reference = Source::new("");
-/// let mut genlock = Genlock::new(&ndi, Some(&reference), None)?;
+/// # let reference = Source::new("").unwrap();
+/// let mut genlock = Genlock::new(&ndi, &GenlockOptions::new().source(reference))?;
 /// let (mut video, _audio) = genlock.clocks();
 /// let paced_by = video.wait(FrameRate::new(60_000, 1001)?, ScanType::Progressive);
 /// println!("frame paced by {paced_by:?}");
@@ -965,30 +1047,35 @@ pub struct Genlock {
     _not_sync: NotSync,
 }
 
+impl std::fmt::Debug for Genlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Genlock")
+            .field("source", &self.resource.source)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Genlock {
-    /// Create a genlock that follows `source`, or with `None` one that runs on
-    /// the system clock until [`connect`](Self::connect) names a source.
+    /// Create a genlock with a reference source and native configuration from
+    /// `options`. With no source it follows the system clock until
+    /// [`connect_to`](Self::connect_to) names one.
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
-    /// build without the Advanced SDK), an invalid-string error for a source
-    /// containing NUL, and [`Error::NativeOperationFailed`] when the SDK
-    /// creates no genlock.
-    pub fn new(
-        ndi: &Ndi,
-        _source: Option<&Source>,
-        _config: Option<&AdvancedConfig>,
-    ) -> Result<Self> {
+    /// [`Error::UnsupportedCapability`] without an Advanced runtime or the
+    /// corresponding Advanced SDK declarations, and
+    /// [`Error::NativeOperationFailed`] when the SDK creates no genlock.
+    #[doc(alias = "NDIlib_genlock_create")]
+    pub fn new(ndi: &Ndi, options: &GenlockOptions) -> Result<Self> {
         let table = ndi.table::<GenlockTable>()?;
-        native!(Genlock, table => {
-            let source = _source.map(Source::to_raw).transpose()?.map(Box::new);
-            // SAFETY: the source descriptor and the configuration point to
-            // strings that this value keeps alive for as long as the genlock.
+        native!(Genlock, table, uses(options) => {
+            let source = options.source.as_ref().map(Source::to_raw).map(Box::new);
+            // SAFETY: the source descriptor and configuration point to strings
+            // this resource retains until after native destruction.
             let handle = unsafe {
                 table.named().NDIlib_genlock_create(
                     source.as_ref().map_or(ptr::null(), |source| source.as_raw()),
-                    _config.map_or(ptr::null(), AdvancedConfig::as_ptr),
+                    options.config.as_ref().map_or(ptr::null(), AdvancedConfig::as_ptr),
                 )
             }.created()?.as_ptr();
             Ok(Self {
@@ -996,41 +1083,50 @@ impl Genlock {
                     handle: GenlockInstance(handle),
                     table,
                     _ndi: ndi.clone(),
-                    _source: source,
-                    _config: _config.cloned(),
+                    source: options.source.clone(),
+                    _raw_source: source,
+                    _config: options.config.clone(),
                 },
                 _not_sync: NotSync(PhantomData),
             })
         })
     }
 
-    /// Follow a different source, or with `None` run on the system clock.
+    /// Follow the timing of `source`.
     ///
-    /// The exclusive borrow means no clock from [`clocks`](Self::clocks) is in
-    /// use while the reference changes.
-    ///
-    /// # Errors
-    ///
-    /// An invalid-string error for a source containing NUL.
-    pub fn connect(&mut self, source: Option<&Source>) -> Result<()> {
-        // Validate before reaching the native boundary.
-        let _source = source.map(Source::to_raw).transpose()?.map(Box::new);
-        native!(Genlock, self.resource.table => {
+    /// No clock from [`clocks`](Self::clocks) can be in use while this exclusive
+    /// borrow changes the reference. A [`Source`] is already validated.
+    #[doc(alias = "NDIlib_genlock_connect")]
+    pub fn connect_to(&mut self, source: &Source) {
+        self.connect_source(Some(source));
+    }
+
+    /// Stop following a reference source and use the system clock.
+    #[doc(alias = "NDIlib_genlock_connect")]
+    pub fn disconnect(&mut self) {
+        self.connect_source(None);
+    }
+
+    fn connect_source(&mut self, source: Option<&Source>) {
+        let raw_source = source.map(Source::to_raw).map(Box::new);
+        native!(Genlock, self.resource.table, uses(source, raw_source) => {
             let GenResource { handle, table, .. } = self.resource;
-            // SAFETY: the genlock is live and no wait is in progress, and the new
-            // descriptor is stored below before the earlier one is released.
+            // SAFETY: the genlock is live with no wait in progress. Both the old
+            // and replacement descriptors remain alive through this call; the
+            // replacement is retained before the earlier one is released.
             unsafe {
                 table.NDIlib_genlock_connect(
                     handle.0,
-                    _source.as_ref().map_or(ptr::null(), |source| source.as_raw()),
+                    raw_source.as_ref().map_or(ptr::null(), |source| source.as_raw()),
                 )
             };
-            self.resource._source = _source;
-            Ok(())
+            self.resource._raw_source = raw_source;
+            self.resource.source = source.cloned();
         })
     }
 
     /// Whether a reference signal is being received.
+    #[doc(alias = "NDIlib_genlock_is_active")]
     pub fn is_active(&self) -> bool {
         // SAFETY: the genlock is live for this borrow.
         native!(Genlock, self.resource.table => unsafe {
@@ -1063,12 +1159,19 @@ pub struct VideoClock<'a> {
     _not_sync: NotSync,
 }
 
+impl std::fmt::Debug for VideoClock<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoClock").finish_non_exhaustive()
+    }
+}
+
 impl VideoClock<'_> {
     /// Block until the next frame of a stream with this frame rate and scan
     /// type is due, and report which clock timed it.
-    pub fn wait(&mut self, _frame_rate: FrameRate, _scan_type: ScanType) -> ClockSource {
-        native!(Genlock, self.resource.table => {
-            let timing = video_timing(_frame_rate, _scan_type);
+    #[doc(alias = "NDIlib_genlock_wait_video")]
+    pub fn wait(&mut self, frame_rate: FrameRate, scan_type: ScanType) -> ClockSource {
+        native!(Genlock, self.resource.table, uses(frame_rate, scan_type) => {
+            let timing = video_timing(frame_rate, scan_type);
             let GenResource { handle, table, .. } = *self.resource;
             // SAFETY: the genlock outlives this clock, and only this clock waits
             // for video.
@@ -1086,6 +1189,12 @@ pub struct AudioClock<'a> {
     _not_sync: NotSync,
 }
 
+impl std::fmt::Debug for AudioClock<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioClock").finish_non_exhaustive()
+    }
+}
+
 impl AudioClock<'_> {
     /// Block until `num_samples` samples per channel at `sample_rate` hertz
     /// are due, and report which clock timed them.
@@ -1093,6 +1202,7 @@ impl AudioClock<'_> {
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when a value is zero or exceeds `i32::MAX`.
+    #[doc(alias = "NDIlib_genlock_wait_audio")]
     pub fn wait(&mut self, sample_rate: u32, num_samples: u32) -> Result<ClockSource> {
         // Validate the request even in builds without the native family.
         let _timing = audio_timing(sample_rate, num_samples)?;
@@ -1145,6 +1255,24 @@ mod tests {
     use super::*;
     use crate::frames::AudioPartsExt;
 
+    #[test]
+    fn genlock_options_roundtrip_and_clear_without_a_runtime() {
+        let source = Source::new("HOST (Reference)").unwrap();
+        let config = AdvancedConfig::parse(r#"{"genlock":{"marker":"retained"}}"#).unwrap();
+        let defaults = GenlockOptions::new();
+        assert_eq!(defaults, GenlockOptions::default());
+        assert!(defaults.configured_source().is_none());
+        assert!(defaults.configured_config().is_none());
+        let options = defaults
+            .clone()
+            .source(source.clone())
+            .config(config.clone());
+        assert_eq!(options.configured_source(), Some(&source));
+        assert_eq!(options.configured_config(), Some(&config));
+        assert_eq!(options, options.clone());
+        assert_eq!(options.clear_source().clear_config(), defaults);
+    }
+
     unsafe fn inspect(
         status: Synchronized,
         audio: &NDIlib_audio_frame_v3_t,
@@ -1168,13 +1296,13 @@ mod tests {
         };
         let events = track(|| {
             let receiver =
-                Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new(""))).unwrap();
+                Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new("").unwrap()))
+                    .unwrap();
             let sync = AvSync::new(receiver).unwrap();
             let receiver = sync.into_receiver();
             assert_eq!(snapshot(), ["avsync"]);
             assert!(receiver
-                .audio()
-                .capture(std::time::Duration::ZERO)
+                .capture_audio(std::time::Duration::ZERO)
                 .unwrap()
                 .is_none());
             drop(receiver);
@@ -1191,7 +1319,8 @@ mod tests {
         for recover in [false, true] {
             let events = track(|| {
                 let receiver =
-                    Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new(""))).unwrap();
+                    Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new("").unwrap()))
+                        .unwrap();
                 let sync = AvSync::new(receiver).unwrap();
                 if recover {
                     drop(sync.into_receiver());
@@ -1428,7 +1557,8 @@ mod tests {
         if !ndi.capabilities().supports(crate::RuntimeFeature::AvSync) {
             return;
         }
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+        let receiver =
+            Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
         let mut sync = AvSync::new(receiver).unwrap();
         let supported = ndi
             .capabilities()
@@ -1467,7 +1597,9 @@ mod tests {
                         matches!(
                             result,
                             Err(Error::UnsupportedCapability {
-                                feature: crate::RuntimeFeature::Planar444Video,
+                                capability: crate::Capability::Runtime(
+                                    crate::RuntimeFeature::Planar444Video
+                                ),
                                 refusal: crate::CapabilityRefusal::RuntimeTooOld { .. },
                                 ..
                             })
@@ -1650,7 +1782,8 @@ mod tests {
         let Some(ndi) = crate::test_support::advanced_ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new(""))).unwrap();
+        let receiver =
+            Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new("").unwrap())).unwrap();
         let sync = AvSync::new(receiver).unwrap();
         let AvResource { handle, table, .. } = &sync.resource;
         let mut raw = AvSyncRequest::automatic().raw();

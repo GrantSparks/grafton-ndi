@@ -29,7 +29,7 @@ fn owning_cache_retains_discovery_scope_and_runtime_across_server_workers() {
         };
         assert!(Ndi::is_running(), "the cache keeps its runtime initialized");
         let feeds = cache
-            .sources_by_host("studio", Duration::from_millis(80))
+            .find_sources_by_host("studio", Duration::from_millis(80))
             .unwrap();
         assert_eq!(feeds.len(), 4);
         assert!(feeds.iter().all(|feed| feed.matches_host("192.0.2.20")));
@@ -46,14 +46,16 @@ fn owning_cache_retains_discovery_scope_and_runtime_across_server_workers() {
         std::thread::spawn(move || {
             assert!(Ndi::is_running());
             assert_eq!(
-                worker.sources_by_host("STUDIO.", Duration::ZERO).unwrap(),
+                worker
+                    .find_sources_by_host("STUDIO.", Duration::ZERO)
+                    .unwrap(),
                 feeds
             );
             worker.invalidate("studio");
             assert!(worker.is_empty());
             assert_eq!(
                 worker
-                    .sources_by_host("studio", Duration::ZERO)
+                    .find_sources_by_host("studio", Duration::ZERO)
                     .unwrap()
                     .len(),
                 4
@@ -111,8 +113,8 @@ fn finder(ndi: &Ndi, group: &str) -> Finder {
     Finder::new(
         ndi,
         &FinderOptions::new()
-            .groups(group)
-            .extra_ips("192.0.2.10,192.0.2.20")
+            .groups([group])
+            .extra_ips(["192.0.2.10", "192.0.2.20"])
             .show_local_sources(false),
     )
     .unwrap()
@@ -141,7 +143,7 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
         );
         assert_eq!(
             selected.address(),
-            Some(&SourceAddress::new("192.0.2.10:5962"))
+            Some(&SourceAddress::new("192.0.2.10:5962").unwrap())
         );
         assert!(studio
             .find_source_by_name("camera 2", Duration::ZERO)
@@ -162,7 +164,7 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
             Err(Error::InvalidInput(_))
         ));
         // Reentrant snapshots prove predicates run after releasing the SDK snapshot lock.
-        let target = SourceAddress::new("192.0.2.10:5962");
+        let target = SourceAddress::new("192.0.2.10:5962").unwrap();
         let program = studio
             .find_source(Duration::ZERO, |source| {
                 assert!(!studio.current_sources().unwrap().is_empty());
@@ -188,7 +190,9 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
             .is_none());
         assert!(before.elapsed() >= Duration::from_millis(40));
         let cache = SourceCache::new(studio);
-        let feeds = cache.sources_by_host("STUDIO", Duration::ZERO).unwrap();
+        let feeds = cache
+            .find_sources_by_host("STUDIO", Duration::ZERO)
+            .unwrap();
         assert_eq!(
             feeds.len(),
             4,
@@ -196,16 +200,18 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
         );
         assert!(feeds.contains(&selected));
         assert_eq!(
-            cache.sources_by_host("studio.", Duration::ZERO).unwrap(),
+            cache
+                .find_sources_by_host("studio.", Duration::ZERO)
+                .unwrap(),
             feeds
         );
         assert_eq!(cache.len(), 1);
         assert!(matches!(
-            cache.sources_by_host("studio", Duration::MAX),
+            cache.find_sources_by_host("studio", Duration::MAX),
             Err(Error::InvalidInput(_))
         ));
         assert!(cache
-            .sources_by_host("absent", Duration::ZERO)
+            .find_sources_by_host("absent", Duration::ZERO)
             .unwrap()
             .is_empty());
         assert_eq!(cache.len(), 1, "empty sets are not cached");
@@ -219,13 +225,15 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
             .unwrap()
             .unwrap();
         let remote_feeds = remote_cache
-            .sources_by_host("studio", Duration::ZERO)
+            .find_sources_by_host("studio", Duration::ZERO)
             .unwrap();
         assert_eq!(remote_feeds.len(), 4);
         assert!(remote_feeds
             .iter()
             .all(|feed| feed.matches_host("192.0.2.20")));
-        let studio_feeds = cache.sources_by_host("studio", Duration::ZERO).unwrap();
+        let studio_feeds = cache
+            .find_sources_by_host("studio", Duration::ZERO)
+            .unwrap();
         assert!(studio_feeds
             .iter()
             .all(|feed| feed.matches_host("192.0.2.10")));
@@ -234,7 +242,7 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
         let staggered_cache = SourceCache::new(staggered);
         let started = Instant::now();
         let all = staggered_cache
-            .sources_by_host("studio", Duration::from_millis(80))
+            .find_sources_by_host("studio", Duration::from_millis(80))
             .unwrap();
         assert!(started.elapsed() >= Duration::from_millis(80));
         assert_eq!(all.len(), 4);

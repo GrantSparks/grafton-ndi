@@ -24,7 +24,8 @@ fn refused<T: std::fmt::Debug>(result: Result<T, Error>, function: &str, expecte
 fn negative_counts_are_errors_and_status_survives() {
     if let Some(path) = std::env::var_os("GRAFTON_NEGATIVE_COUNTS_CHILD") {
         let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(path)).unwrap();
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+        let receiver =
+            Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
         for selected in [
             "connections",
             "received-video",
@@ -58,17 +59,17 @@ fn negative_counts_are_errors_and_status_survives() {
         std::env::set_var("GRAFTON_FAKE_NEGATIVE_COUNT", "connections");
         assert!(!receiver.is_connected());
         std::env::set_var("GRAFTON_FAKE_CAPTURE_SCRIPT", "negative-count:status");
-        assert!(receiver.video().capture(Duration::ZERO).unwrap().is_none());
+        assert!(receiver.capture_video(Duration::ZERO).unwrap().is_none());
         refused(
-            receiver.poll_event(Duration::ZERO),
+            receiver.next_event(Duration::ZERO),
             "NDIlib_recv_get_no_connections",
             -1,
         );
         std::env::remove_var("GRAFTON_FAKE_NEGATIVE_COUNT");
         assert!(
-            matches!(receiver.poll_event(Duration::ZERO).unwrap(), Some(ReceiverEvent::StatusChanged(status)) if status.connections() == 0)
+            matches!(receiver.next_event(Duration::ZERO).unwrap(), Some(ReceiverEvent::StatusChanged(status)) if status.connections() == 0)
         );
-        assert!(receiver.poll_event(Duration::ZERO).unwrap().is_none());
+        assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
         assert_eq!(receiver.connection_stats().unwrap().connections(), 0);
         let framesync = FrameSync::new(receiver).unwrap();
         std::env::set_var("GRAFTON_FAKE_NEGATIVE_COUNT", "queue-depth");

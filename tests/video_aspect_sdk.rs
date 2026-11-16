@@ -35,7 +35,8 @@ fn non_widescreen_video_arrives_with_its_requested_display_geometry() -> grafton
                 .resolution(width, height)
                 .timecode(timecode);
             if let Some(ratio) = ratio {
-                builder = builder.picture_aspect_ratio(ratio);
+                builder = builder
+                    .picture_aspect_ratio(grafton_ndi::PictureAspectRatio::new(ratio).unwrap());
             }
             let video = builder.build()?;
             let mut borrowed =
@@ -43,7 +44,8 @@ fn non_widescreen_video_arrives_with_its_requested_display_geometry() -> grafton
                     .frame_rate(video.frame_rate())
                     .timecode(timecode);
             if let Some(ratio) = ratio {
-                borrowed = borrowed.picture_aspect_ratio(ratio);
+                borrowed = borrowed
+                    .picture_aspect_ratio(grafton_ndi::PictureAspectRatio::new(ratio).unwrap());
             }
             let borrowed = borrowed.build()?;
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -54,16 +56,16 @@ fn non_widescreen_video_arrives_with_its_requested_display_geometry() -> grafton
                 // unpaced burst that overloads the native receiver.
                 sender.send_video(&video)?;
                 sender.send_video(&borrowed)?;
-                if let Some(received) = receiver.video().capture_ref(Duration::from_millis(100))? {
+                if let Some(received) = receiver.capture_video_ref(Duration::from_millis(100))? {
                     last_received =
                         Some((received.width(), received.height(), received.timecode()));
                     if received.timecode() == timecode {
                         assert_eq!((received.width(), received.height()), (width, height));
                         // A runtime may resolve the zero sentinel to the dimension ratio.
-                        let effective = if received.picture_aspect_ratio() == 0.0 {
+                        let effective = if received.picture_aspect_ratio().get() == 0.0 {
                             width as f32 / height as f32
                         } else {
-                            received.picture_aspect_ratio()
+                            received.picture_aspect_ratio().get()
                         };
                         let expected = ratio.unwrap_or(width as f32 / height as f32);
                         assert!(
@@ -71,10 +73,16 @@ fn non_widescreen_video_arrives_with_its_requested_display_geometry() -> grafton
                             "{width}x{height}: expected {expected}, received {effective}"
                         );
                         let mut copy = received.to_owned();
-                        assert_eq!(copy.picture_aspect_ratio(), received.picture_aspect_ratio());
-                        copy.set_picture_aspect_ratio(2.0)?;
+                        assert_eq!(
+                            copy.picture_aspect_ratio().get(),
+                            received.picture_aspect_ratio().get()
+                        );
+                        copy.set_picture_aspect_ratio(grafton_ndi::PictureAspectRatio::new(2.0)?);
                         received.copy_into(&mut copy);
-                        assert_eq!(copy.picture_aspect_ratio(), received.picture_aspect_ratio());
+                        assert_eq!(
+                            copy.picture_aspect_ratio().get(),
+                            received.picture_aspect_ratio().get()
+                        );
                         break;
                     }
                 }

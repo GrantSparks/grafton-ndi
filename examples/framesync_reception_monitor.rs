@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ndi = Ndi::new()?;
     let receiver = Receiver::new(
         &ndi,
-        &ReceiverOptions::new(Source::new(source)).bandwidth(ReceiverBandwidth::AudioOnly),
+        &ReceiverOptions::new(Source::new(source)?).bandwidth(ReceiverBandwidth::AudioOnly),
     )?;
     let framesync = FrameSync::new(receiver).map_err(Error::from)?;
     let request = FrameSyncAudioRequest::capture_at(48_000, 1, 480)?;
@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             while !stopped.load(Ordering::Relaxed) {
                 if framesync
                     .receiver()
-                    .poll_source_name_change(Duration::ZERO)?
+                    .wait_for_source_name_change(Duration::ZERO)?
                     .is_some()
                 {
                     monitor.reset();

@@ -177,7 +177,7 @@ impl<P: Sample, const WEIGHTED: bool> Sink<P> for Accumulate<'_, P, WEIGHTED> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{frames::VideoParts, image::Source, PixelFormat, VideoFrame, YuvMatrix};
+    use crate::{frames::VideoParts, image_encoding::Source, PixelFormat, VideoFrame, YuvMatrix};
 
     use super::super::options::YuvRange;
 

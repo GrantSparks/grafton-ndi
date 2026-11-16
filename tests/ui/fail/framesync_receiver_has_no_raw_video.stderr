@@ -1,8 +1,22 @@
-error[E0599]: the method `video` exists for reference `&grafton_ndi::Receiver<FrameSyncAttached>`, but its trait bounds were not satisfied
+error[E0599]: the method `capture_video` exists for reference `&grafton_ndi::Receiver<FrameSyncAttached>`, but its trait bounds were not satisfied
  --> tests/ui/fail/framesync_receiver_has_no_raw_video.rs:3:27
   |
-3 |     let _ = fs.receiver().video();
-  |                           ^^^^^ method cannot be called on `&grafton_ndi::Receiver<FrameSyncAttached>` due to unsatisfied trait bounds
+3 |     let _ = fs.receiver().capture_video(std::time::Duration::ZERO);
+  |                           ^^^^^^^^^^^^^ method cannot be called on `&grafton_ndi::Receiver<FrameSyncAttached>` due to unsatisfied trait bounds
+  |
+ ::: src/receiver.rs
+  |
+  | pub enum FrameSyncAttached {}
+  | -------------------------- doesn't satisfy `FrameSyncAttached: VideoMode`
+  |
+  = note: the following trait bounds were not satisfied:
+          `FrameSyncAttached: VideoMode`
+
+error[E0599]: the method `capture_video_ref` exists for reference `&grafton_ndi::Receiver<FrameSyncAttached>`, but its trait bounds were not satisfied
+ --> tests/ui/fail/framesync_receiver_has_no_raw_video.rs:4:27
+  |
+4 |     let _ = fs.receiver().capture_video_ref(std::time::Duration::ZERO);
+  |                           ^^^^^^^^^^^^^^^^^ method cannot be called on `&grafton_ndi::Receiver<FrameSyncAttached>` due to unsatisfied trait bounds
   |
  ::: src/receiver.rs
   |

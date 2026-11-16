@@ -58,6 +58,15 @@ For example, use `advanced,file` when both are installed. Unknown tokens and
 requirements that the build cannot exercise are errors. Decoder fixtures do
 not establish compatibility with every third-party stream or hardware codec.
 
+Native NDI|HX tests need Python 3 and FFmpeg with the `libx264` and `libx265`
+encoders. They generate their synthetic H.264/HEVC pictures once per test
+process in a temporary directory and remove the files after reading them.
+SDK-free tests do not need these tools. To inspect the pictures separately:
+
+```sh
+python3 tests/support/generate_hx.py --output-dir target/test-data/ndi-hx
+```
+
 ### Loopback-only test runs
 
 Native tests create network-visible NDI objects.

@@ -47,7 +47,7 @@ async fn later_items<R: AsyncRuntime>(ndi: &Ndi, runtime: &str) -> Result<(), Er
     let source = common::loopback_source(ndi, &sender)?;
     let receiver = AsyncReceiver::<R>::new(Receiver::new(ndi, &ReceiverOptions::new(source))?);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !receiver.is_connected() {
+    while !receiver.receiver().is_connected() {
         assert!(Instant::now() < deadline, "receiver did not connect");
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -60,11 +60,9 @@ async fn later_items<R: AsyncRuntime>(ndi: &Ndi, runtime: &str) -> Result<(), Er
         let (finished, done) = mpsc::channel();
         let finished = WorkerFinished(finished);
         abandon(
-            receiver
-                .video()
-                .capture_with(Duration::from_secs(4), move |_| {
-                    drop(finished);
-                }),
+            receiver.capture_video_with(Duration::from_secs(4), move |_| {
+                drop(finished);
+            }),
         );
         // Native waits and worker scheduling can overrun a nominal 100 ms
         // attempt. A sleep alone cannot prove the abandoned attempt ended.
@@ -79,7 +77,7 @@ async fn later_items<R: AsyncRuntime>(ndi: &Ndi, runtime: &str) -> Result<(), Er
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             sender.send_video(&video)?;
-            let frame = receiver.video().capture(Duration::from_millis(100)).await?;
+            let frame = receiver.capture_video(Duration::from_millis(100)).await?;
             if frame.is_some_and(|frame| frame.timecode() == timecode) {
                 break;
             }

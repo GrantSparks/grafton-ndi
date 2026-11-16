@@ -6,7 +6,7 @@ use grafton_ndi::{
 
 fn video<S: VideoSource + ?Sized>(sender: &mut Sender, frame: &S) {
     sender.send_video(frame).unwrap();
-    sender.send_video_async_copy(frame).unwrap();
+    sender.submit_video_copy(frame).unwrap();
     let _ = frame.sends_in_place();
 }
 

@@ -246,7 +246,7 @@ fn a_waiter_registered_during_clone_keeps_its_reservation_when_the_first_poll_lo
     let mut first = events.wait(Duration::from_secs(60));
     assert!(matches!(
         poll(&mut first, &probe.waker()),
-        Poll::Ready(Err(Error::InvalidState(StateError::WaiterPending)))
+        Poll::Ready(Err(Error::InvalidState(StateConflict::WaiterPending)))
     ));
     drop(first);
     events.push(Ok(7));
@@ -276,7 +276,7 @@ fn events_and_closure_during_waker_cloning_are_observed_by_the_same_poll() {
         if close {
             assert!(matches!(
                 result,
-                Poll::Ready(Err(Error::InvalidState(StateError::Closed)))
+                Poll::Ready(Err(Error::InvalidState(StateConflict::Closed)))
             ));
         } else {
             assert!(matches!(result, Poll::Ready(Ok(Some(7)))));
@@ -320,7 +320,7 @@ fn event_bursts_wake_once_without_cloning_or_releasing_the_waiter_reservation() 
     let mut competing = events.wait(Duration::ZERO);
     assert!(matches!(
         poll(&mut competing, &waker),
-        Poll::Ready(Err(Error::InvalidState(StateError::WaiterPending)))
+        Poll::Ready(Err(Error::InvalidState(StateConflict::WaiterPending)))
     ));
     assert!(matches!(
         poll(&mut future, &waker),
@@ -353,7 +353,7 @@ fn expiration_and_close_wake_without_cloning_and_pending_polls_rearm() {
     assert_eq!(probe.clones.load(Ordering::Relaxed), 2);
     assert!(matches!(
         poll(&mut future, &waker),
-        Poll::Ready(Err(Error::InvalidState(StateError::Closed)))
+        Poll::Ready(Err(Error::InvalidState(StateConflict::Closed)))
     ));
 }
 

@@ -5,7 +5,7 @@ use grafton_ndi::{
 
 fn framesync(sync: &mut FrameSync, next: &Source) {
     let session = sync.controls().kvm().unwrap();
-    session.receiver().connect_to(next).unwrap();
+    session.receiver().connect_to(next);
 }
 
 fn avsync(sync: &mut AvSync) {
@@ -15,12 +15,12 @@ fn avsync(sync: &mut AvSync) {
 
 fn packets(packets: &mut PacketReceiver) {
     let session = packets.controls().kvm().unwrap();
-    session.receiver().reconnect().unwrap();
+    session.receiver().reconnect();
 }
 
 fn allocated(receiver: &mut AllocatedReceiver, next: &Source) {
     let session = receiver.controls().kvm().unwrap();
-    session.receiver().connect_to(next).unwrap();
+    session.receiver().connect_to(next);
 }
 
 fn allocated_packets(packets: &mut AllocatedPacketReceiver) {

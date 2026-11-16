@@ -40,16 +40,16 @@ use crate::{
 /// // Find sources in specific groups, other machines only
 /// let options = FinderOptions::new()
 ///     .show_local_sources(false)
-///     .groups("Public,Studio");
+///     .groups(["Public", "Studio"]);
 ///
 /// // Also query hosts that discovery does not reach
-/// let options = FinderOptions::new().extra_ips("192.168.1.100,10.0.0.100");
+/// let options = FinderOptions::new().extra_ips(["192.168.1.100", "10.0.0.100"]);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FinderOptions {
     show_local_sources: bool,
-    groups: Option<String>,
-    extra_ips: Option<String>,
+    groups: Option<Vec<String>>,
+    extra_ips: Option<Vec<String>>,
     #[cfg(feature = "advanced")]
     config: Option<crate::advanced::AdvancedConfig>,
 }
@@ -91,13 +91,13 @@ impl FinderOptions {
 
     /// Requested discovery groups, or `None` to inherit the NDI configuration.
     #[must_use]
-    pub fn configured_groups(&self) -> Option<&str> {
+    pub fn configured_groups(&self) -> Option<&[String]> {
         self.groups.as_deref()
     }
 
-    /// Requested comma-separated direct IP addresses, if any.
+    /// Requested direct IP addresses, in their stored order, if any.
     #[must_use]
-    pub fn configured_extra_ips(&self) -> Option<&str> {
+    pub fn configured_extra_ips(&self) -> Option<&[String]> {
         self.extra_ips.as_deref()
     }
 
@@ -127,19 +127,19 @@ impl FinderOptions {
         self
     }
 
-    /// Set the comma-separated groups to search, such as `"Public,Studio"`,
-    /// instead of those of the NDI configuration.
+    /// Set the groups to search instead of those of the NDI configuration.
+    /// Creation refuses empty elements and elements containing a comma or NUL.
     #[must_use]
-    pub fn groups(mut self, groups: impl Into<String>) -> Self {
-        self.groups = Some(groups.into());
+    pub fn groups(mut self, groups: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.groups = Some(groups.into_iter().map(Into::into).collect());
         self
     }
 
-    /// Set comma-separated IP addresses to query directly, for sources that
-    /// discovery does not reach.
+    /// Set IP addresses to query directly for sources discovery does not reach.
+    /// Creation refuses empty elements and elements containing a comma or NUL.
     #[must_use]
-    pub fn extra_ips(mut self, ips: impl Into<String>) -> Self {
-        self.extra_ips = Some(ips.into());
+    pub fn extra_ips(mut self, ips: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.extra_ips = Some(ips.into_iter().map(Into::into).collect());
         self
     }
 
@@ -154,6 +154,28 @@ impl FinderOptions {
         self.config = Some(config);
         self
     }
+}
+
+/// Validate and join a configured list only at native-owner construction.
+/// Every element must be representable without changing list boundaries.
+pub(crate) fn list_cstring(
+    values: Option<&[String]>,
+    setting: &'static str,
+) -> Result<Option<CString>> {
+    values
+        .map(|values| {
+            for (index, value) in values.iter().enumerate() {
+                if value.is_empty() || value.contains([',', '\0']) {
+                    return Err(Error::InvalidInput(crate::InputDefect::ListElement {
+                        setting,
+                        index,
+                    }));
+                }
+            }
+            // Every element was checked, and the separator contains no NUL.
+            Ok(CString::new(values.join(",")).expect("validated list elements contain no NUL"))
+        })
+        .transpose()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,6 +226,15 @@ pub struct Finder {
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
     _ndi: Ndi,
+}
+
+impl fmt::Debug for Finder {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Finder")
+            .field("groups", &self._groups)
+            .field("extra_ips", &self._extra_ips)
+            .finish_non_exhaustive()
+    }
 }
 
 // The mutex guards a native snapshot's lifetime, not mutable Rust state. A
@@ -320,6 +351,14 @@ pub struct SourceWatch<'finder> {
     observed: Cell<u64>,
 }
 
+impl fmt::Debug for SourceWatch<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceWatch")
+            .field("finder", &self.finder)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SourceWatch<'_> {
     /// Copy the currently known sources and record the generation before
     /// copying, preserving any report that arrives during the snapshot.
@@ -338,6 +377,7 @@ impl SourceWatch<'_> {
     /// # Errors
     ///
     /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub fn wait_for_change(&mut self, timeout: Duration) -> Result<bool> {
         Ok(self.wait_until(Deadline::after(timeout)?, NeverStop))
     }
@@ -392,6 +432,9 @@ pub(crate) unsafe fn snapshot_entry(
     budget: &mut SnapshotBudget,
 ) -> Result<Option<Source>> {
     let (name, address) = source_pointers(source);
+    if name.is_null() && !address.is_null() {
+        budget.empty_source_name()?;
+    }
     // SAFETY: the caller keeps both strings readable through their terminator
     // or the SDK string bound. This policy skips malformed strings while
     // retaining their scan charges in the snapshot's shared budget.
@@ -437,9 +480,9 @@ pub(crate) unsafe fn decode_source(
         let Some(address) = copy(address)? else {
             return Ok(None);
         };
-        Some(SourceAddress::new(address))
+        Some(SourceAddress::new(address)?)
     };
-    Ok(Some(Source { name, address }))
+    Ok(Some(Source::new(name)?.with_optional_address(address)))
 }
 
 impl Finder {
@@ -452,11 +495,13 @@ impl Finder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCString`] when the groups or extra addresses
-    /// contain a NUL byte, [`Error::UnsupportedCapability`] when the options
+    /// Returns [`Error::InvalidInput`] when a group or extra address is empty
+    /// or contains a comma or NUL, [`Error::UnsupportedCapability`] when the options
     /// carry an Advanced configuration that the runtime or this build cannot
     /// take, and [`Error::NativeOperationFailed`] when the SDK creates no
     /// finder.
+    #[doc(alias = "NDIlib_find_create_v2")]
+    #[doc(alias = "NDIlib_find_create_v3")]
     pub fn new(ndi: &Ndi, options: &FinderOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
         if let Some(config) = &options.config {
@@ -492,12 +537,8 @@ impl Finder {
             &NDIlib_find_create_t,
         ) -> sys::table::Called<NDIlib_find_instance_t>,
     ) -> Result<Self> {
-        let groups = settings.groups.as_deref().map(CString::new).transpose()?;
-        let extra_ips = settings
-            .extra_ips
-            .as_deref()
-            .map(CString::new)
-            .transpose()?;
+        let groups = list_cstring(settings.groups.as_deref(), "groups")?;
+        let extra_ips = list_cstring(settings.extra_ips.as_deref(), "extra_ips")?;
         let instance = create(
             &ndi.api().core,
             &NDIlib_find_create_t {
@@ -664,6 +705,7 @@ impl Finder {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_find_get_current_sources")]
     pub fn current_sources(&self) -> Result<Vec<Source>> {
         self.snapshot(&self._ndi.api().core)
     }
@@ -895,11 +937,11 @@ fn accumulate_sources(
                 budget::MAX_SOURCES,
             ));
         }
-        let text_bytes = source.name.capacity()
+        let text_bytes = source.name.storage_bytes()
             + source
                 .address
                 .as_ref()
-                .map_or(0, |address| address.0.capacity());
+                .map_or(0, |address| address.0.storage_bytes());
         let bytes = retained_bytes
             .checked_add(text_bytes * 2)
             .ok_or_else(|| budget::limit(ResourceKind::FinderDiscoveryBytes, budget::MAX_BYTES))?;
@@ -929,7 +971,7 @@ fn accumulate_sources(
                 budget::MAX_BYTES,
             ));
         }
-        seen.insert(source.try_copy()?);
+        seen.insert(source.clone());
         discovered.push(source);
         *retained_bytes = bytes;
     }
@@ -1088,25 +1130,63 @@ impl HostKeyBuffer {
 
 /// Opaque network address text of an NDI source.
 ///
-/// Equality and hashing compare the exact text the SDK receives. The derived
-/// URL classification does not establish the codec or whether it uses NDI|HX.
+/// Construction refuses NUL bytes and keeps the native representation ready
+/// for connection requests. Equality and hashing compare the exact text the SDK
+/// receives. URL classification does not establish the codec or NDI|HX use.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SourceAddress(String);
+pub struct SourceAddress(SourceText);
+
+/// Validated UTF-8 with exactly one trailing NUL, shared by descriptors and
+/// their native borrowers. All SDK pointers lead into this immutable storage.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SourceText(Arc<CString>);
+
+impl SourceText {
+    fn new(text: String) -> Result<Self> {
+        Ok(Self(Arc::new(CString::new(text)?)))
+    }
+
+    fn as_str(&self) -> &str {
+        // SAFETY: the CString was constructed from a String, and its immutable
+        // shared backing cannot change after construction.
+        unsafe { std::str::from_utf8_unchecked(self.0.as_bytes()) }
+    }
+
+    fn as_ptr(&self) -> *const c_char {
+        self.0.as_ptr()
+    }
+
+    fn storage_bytes(&self) -> usize {
+        self.0.as_bytes_with_nul().len()
+            + 2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<CString>()
+    }
+}
+
+impl fmt::Debug for SourceText {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
 
 impl SourceAddress {
-    /// Keep the address text unchanged, without interpreting or validating it.
-    pub fn new(text: impl Into<String>) -> Self {
-        Self(text.into())
+    /// Keep the opaque address text unchanged after checking its native form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCString`] when the address contains a NUL byte.
+    pub fn new(text: impl Into<String>) -> Result<Self> {
+        SourceText::new(text.into()).map(Self)
     }
 
     /// The exact address text, whether it names a host, IP address or URL.
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 
     /// Whether the address contains a URL scheme separator (`://`).
     pub fn is_url(&self) -> bool {
-        self.0.contains("://")
+        self.as_str().contains("://")
     }
 
     /// Check whether this address has the exact host or IP.
@@ -1124,11 +1204,11 @@ impl SourceAddress {
     /// ```
     /// use grafton_ndi::SourceAddress;
     ///
-    /// let addr = SourceAddress::new("192.168.1.100:5960".to_string());
+    /// let addr = SourceAddress::new("192.168.1.100:5960".to_string()).unwrap();
     /// assert!(addr.matches_host("192.168.1.100"));
     /// assert!(!addr.matches_host("192.168.1"));
     ///
-    /// let url = SourceAddress::new("http://camera.local:8080".to_string());
+    /// let url = SourceAddress::new("http://camera.local:8080".to_string()).unwrap();
     /// assert!(url.matches_host("camera.local"));
     /// ```
     pub fn matches_host(&self, host: &str) -> bool {
@@ -1157,13 +1237,13 @@ impl SourceAddress {
     /// ```
     /// use grafton_ndi::SourceAddress;
     ///
-    /// let addr = SourceAddress::new("192.168.1.100:5960".to_string());
+    /// let addr = SourceAddress::new("192.168.1.100:5960".to_string()).unwrap();
     /// assert_eq!(addr.port(), Some(5960));
     ///
-    /// let no_port = SourceAddress::new("192.168.1.100".to_string());
+    /// let no_port = SourceAddress::new("192.168.1.100".to_string()).unwrap();
     /// assert_eq!(no_port.port(), None);
     ///
-    /// let url = SourceAddress::new("http://camera.local:8080".to_string());
+    /// let url = SourceAddress::new("http://camera.local:8080".to_string()).unwrap();
     /// assert_eq!(url.port(), Some(8080));
     /// ```
     pub fn port(&self) -> Option<u16> {
@@ -1191,22 +1271,21 @@ impl SourceAddress {
 /// ```
 /// use grafton_ndi::{Source, SourceAddress};
 ///
-/// let source = Source::new("LAPTOP (Camera 1)")
-///     .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
+/// let source = Source::new("LAPTOP (Camera 1)").unwrap()
+///     .with_address(SourceAddress::new("192.168.1.100:5960".to_string()).unwrap());
 /// assert_eq!(source.name(), "LAPTOP (Camera 1)");
 /// assert_eq!(source.to_string(), "LAPTOP (Camera 1)@192.168.1.100:5960");
-/// assert!(Source::new("LAPTOP (Camera 1)").address().is_none());
+/// assert!(Source::new("LAPTOP (Camera 1)").unwrap().address().is_none());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Source {
-    name: String,
+    name: SourceText,
     address: Option<SourceAddress>,
 }
 
 #[repr(C)]
 pub(crate) struct RawSource {
-    _name: CString,
-    _address: Option<CString>,
+    _source: Source,
     raw: NDIlib_source_t,
 }
 
@@ -1229,23 +1308,21 @@ impl RawSource {
 }
 
 impl Source {
-    /// Copy the name and opaque address text with exact reservations.
-    fn try_copy(&self) -> Result<Self> {
-        let name = budget::copy_string(&self.name)?;
-        let address = self
-            .address
-            .as_ref()
-            .map(|address| budget::copy_string(address.as_str()).map(SourceAddress::new))
-            .transpose()?;
-        Ok(Self { name, address })
+    /// The source named `name`, without an address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCString`] when the name contains a NUL byte.
+    pub fn new(name: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            name: SourceText::new(name.into())?,
+            address: None,
+        })
     }
 
-    /// The source named `name`, without an address.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            address: None,
-        }
+    fn with_optional_address(mut self, address: Option<SourceAddress>) -> Self {
+        self.address = address;
+        self
     }
 
     /// This source, at `address`.
@@ -1260,7 +1337,7 @@ impl Source {
     /// The NDI source name (e.g., "MACHINE (Source Name)"). A source the SDK
     /// described by its address alone has an empty name.
     pub fn name(&self) -> &str {
-        &self.name
+        self.name.as_str()
     }
 
     /// The network address for connecting to this source, when known.
@@ -1294,8 +1371,8 @@ impl Source {
     /// ```
     /// use grafton_ndi::{Source, SourceAddress};
     ///
-    /// let source = Source::new("CAMERA1 (Chan1, 192.168.0.107)")
-    ///     .with_address(SourceAddress::new("192.168.0.107:5960".to_string()));
+    /// let source = Source::new("CAMERA1 (Chan1, 192.168.0.107)").unwrap()
+    ///     .with_address(SourceAddress::new("192.168.0.107:5960".to_string()).unwrap());
     ///
     /// assert!(source.matches_host("192.168.0.107"));
     /// assert!(source.matches_host("CAMERA1"));
@@ -1316,7 +1393,7 @@ impl Source {
         match query {
             HostQuery::Ip(_) => false,
             HostQuery::Host(_) | HostQuery::Machine(_) => self
-                .name
+                .name()
                 .split_once(" (")
                 .filter(|(_, source)| source.ends_with(')'))
                 .is_some_and(|(machine, _)| query.matches(machine)),
@@ -1341,8 +1418,8 @@ impl Source {
     /// ```
     /// use grafton_ndi::{Source, SourceAddress};
     ///
-    /// let source = Source::new("CAMERA1")
-    ///     .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
+    /// let source = Source::new("CAMERA1").unwrap()
+    ///     .with_address(SourceAddress::new("192.168.1.100:5960".to_string()).unwrap());
     ///
     /// assert_eq!(source.host(), Some("192.168.1.100"));
     /// ```
@@ -1395,31 +1472,21 @@ impl Source {
         .ok_or_else(failed)
     }
 
-    /// Copy the source's strings into owned C strings and build the native
-    /// descriptor that points into them. RawSource keeps those allocations
-    /// alive for every SDK call that borrows its descriptor.
-    pub(crate) fn to_raw(&self) -> Result<RawSource> {
-        let name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
-
-        let address = self
-            .address
-            .as_ref()
-            .map(|address| CString::new(address.as_str()))
-            .transpose()?;
-        let p_address = address
-            .as_ref()
-            .map_or(ptr::null(), |address| address.as_ptr());
-        let p_ndi_name = name.as_ptr();
-        Ok(RawSource {
-            _name: name,
-            _address: address,
+    /// Retain the source's validated storage and lend its native descriptor.
+    /// No strings are allocated or validated again.
+    pub(crate) fn to_raw(&self) -> RawSource {
+        RawSource {
+            _source: self.clone(),
             raw: NDIlib_source_t {
-                p_ndi_name,
+                p_ndi_name: self.name.as_ptr(),
                 __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
-                    p_url_address: p_address,
+                    p_url_address: self
+                        .address
+                        .as_ref()
+                        .map_or(ptr::null(), |address| address.0.as_ptr()),
                 },
             },
-        })
+        }
     }
 }
 
@@ -1429,17 +1496,17 @@ impl Display for Source {
             Some(address) => write!(
                 f,
                 "{name}@{address}",
-                name = self.name,
+                name = self.name(),
                 address = address.as_str()
             ),
-            None => write!(f, "{name}", name = self.name),
+            None => write!(f, "{name}", name = self.name()),
         }
     }
 }
 
 /// A thread-safe cache of complete host result sets in one finder's scope.
 ///
-/// A host can publish several feeds. [`Self::sources_by_host`] retains every
+/// A host can publish several feeds. [`Self::find_sources_by_host`] retains every
 /// distinct matching descriptor observed over its discovery window, rather than
 /// choosing a feed by arrival order. Use [`Finder::find_source`] for a selection
 /// that should return as soon as a particular feed appears.
@@ -1471,10 +1538,10 @@ impl Display for Source {
 /// # use std::time::Duration;
 /// # fn main() -> grafton_ndi::Result<()> {
 /// let ndi = Ndi::new()?;
-/// let finder = Finder::new(&ndi, &FinderOptions::new().groups("Studio")
-///     .extra_ips("192.168.0.107"))?;
+/// let finder = Finder::new(&ndi, &FinderOptions::new().groups(["Studio"])
+///     .extra_ips(["192.168.0.107"]))?;
 /// let cache = SourceCache::new(finder);
-/// let feeds = cache.sources_by_host("192.168.0.107", Duration::from_secs(5))?;
+/// let feeds = cache.find_sources_by_host("192.168.0.107", Duration::from_secs(5))?;
 /// for feed in feeds { println!("{feed}"); }
 /// # Ok(())
 /// # }
@@ -1482,6 +1549,14 @@ impl Display for Source {
 pub struct SourceCache {
     finder: Finder,
     entries: CachedSources,
+}
+
+impl fmt::Debug for SourceCache {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceCache")
+            .field("finder", &self.finder)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Default)]
@@ -1526,7 +1601,7 @@ impl SourceCache {
     /// }
     ///
     /// fn server_state(ndi: &Ndi) -> Result<Arc<ServerState>> {
-    ///     let options = FinderOptions::new().groups("Studio");
+    ///     let options = FinderOptions::new().groups(["Studio"]);
     ///     let finder = Finder::new(ndi, &options)?;
     ///     Ok(Arc::new(ServerState {
     ///         sources: SourceCache::new(finder),
@@ -1572,21 +1647,22 @@ impl SourceCache {
     /// discovery/resource errors propagate without filling an entry. A completed
     /// result the cache cannot store is returned uncached. IP hints must already
     /// be configured on the finder; this method does not change its scope.
-    pub fn sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
-        self.entries.sources_by_host_with(host, timeout, |query| {
-            self.discover_host_until(query, Deadline::after(timeout)?, NeverStop)
-        })
+    pub fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
+        self.entries
+            .find_sources_by_host_with(host, timeout, |query| {
+                self.discover_host_until(query, Deadline::after(timeout)?, NeverStop)
+            })
     }
 
     #[cfg(any(feature = "tokio", feature = "smol"))]
-    pub(crate) fn sources_by_host_until(
+    pub(crate) fn find_sources_by_host_until(
         &self,
         host: &str,
         deadline: Deadline,
         stop: impl Stop,
     ) -> Result<Vec<Source>> {
         self.entries
-            .sources_by_host_with(host, deadline.remaining(), |query| {
+            .find_sources_by_host_with(host, deadline.remaining(), |query| {
                 self.discover_host_until(query, deadline, stop)
             })
     }
@@ -1636,29 +1712,29 @@ impl SourceCache {
     }
 }
 
-/// Fallible owned descriptor copies: discovery has already bounded their total
-/// count and bytes, and each copy keeps that bound rather than growing capacity.
+/// Fallibly reserve descriptor copies while sharing their immutable, validated
+/// source strings. Discovery has already bounded the string storage.
 fn copy_sources(sources: &[Source]) -> Result<Vec<Source>> {
     let mut copy = Vec::new();
     copy.try_reserve_exact(sources.len())
         .map_err(|_| budget::allocation_failed())?;
     for source in sources {
-        copy.push(source.try_copy()?);
+        copy.push(source.clone());
     }
     Ok(copy)
 }
 
 impl CachedSources {
-    fn sources_by_host_with(
+    fn find_sources_by_host_with(
         &self,
         host: &str,
         timeout: Duration,
         discover: impl FnOnce(HostQuery<'_>) -> Result<Vec<Source>>,
     ) -> Result<Vec<Source>> {
-        self.sources_by_host_with_copy(host, timeout, discover, copy_sources)
+        self.find_sources_by_host_with_copy(host, timeout, discover, copy_sources)
     }
 
-    fn sources_by_host_with_copy(
+    fn find_sources_by_host_with_copy(
         &self,
         host: &str,
         timeout: Duration,
@@ -1695,7 +1771,7 @@ impl CachedSources {
                     return Ok(sources);
                 }
             }
-            // The bounded, fallible deep copy happens outside the mutex.
+            // The bounded, fallible descriptor copy happens outside the mutex.
             // Publication must still recheck both generation and key: another
             // discovery or invalidation may have completed during this copy.
             let Ok(snapshot) = copy(&sources) else {
@@ -1771,12 +1847,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_values_refuse_nul_before_any_native_use() {
+        assert!(matches!(
+            Source::new("Camera\0other"),
+            Err(Error::InvalidCString(_))
+        ));
+        assert!(matches!(
+            SourceAddress::new("camera\0other"),
+            Err(Error::InvalidCString(_))
+        ));
+        assert_eq!(Source::new("").unwrap().name(), "");
+        assert_eq!(SourceAddress::new("").unwrap().as_str(), "");
+    }
+
+    #[test]
+    fn native_source_descriptors_share_validated_storage_without_allocating() {
+        let source = Source::new("Studio (Camera)")
+            .unwrap()
+            .with_address(SourceAddress::new("192.0.2.1:5960").unwrap());
+        let (raw, allocations) = crate::test_alloc::allocation_count(|| {
+            let first = source.to_raw();
+            let second = source.to_raw();
+            assert_eq!(first.as_raw().p_ndi_name, second.as_raw().p_ndi_name);
+            // SAFETY: both descriptors initialized their address pointer.
+            unsafe {
+                assert_eq!(
+                    first.as_raw().__bindgen_anon_1.p_url_address,
+                    second.as_raw().__bindgen_anon_1.p_url_address
+                );
+            }
+            first
+        });
+        assert_eq!(allocations, 0);
+        drop(source);
+        // SAFETY: RawSource retains the immutable strings after Source is dropped.
+        unsafe {
+            assert_eq!(
+                std::ffi::CStr::from_ptr(raw.as_raw().p_ndi_name),
+                c"Studio (Camera)"
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(raw.as_raw().__bindgen_anon_1.p_url_address),
+                c"192.0.2.1:5960"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_lists_preserve_elements_and_validate_at_owner_creation() {
+        let options = FinderOptions::new()
+            .groups(["Public", "Studio"])
+            .extra_ips(["192.0.2.1", "192.0.2.2"]);
+        assert_eq!(options.configured_groups().unwrap(), ["Public", "Studio"]);
+        assert_eq!(
+            list_cstring(options.configured_groups(), "groups")
+                .unwrap()
+                .as_deref(),
+            Some(c"Public,Studio")
+        );
+        assert_eq!(list_cstring(None, "groups").unwrap(), None);
+        assert_eq!(
+            list_cstring(Some(&[]), "groups").unwrap().as_deref(),
+            Some(c"")
+        );
+        for invalid in ["", "Studio,Public", "Studio\0Public"] {
+            let options = FinderOptions::new().groups(["valid", invalid]);
+            assert_eq!(options.configured_groups().unwrap()[1], invalid);
+            assert!(matches!(
+                list_cstring(options.configured_groups(), "groups"),
+                Err(Error::InvalidInput(crate::InputDefect::ListElement {
+                    setting: "groups",
+                    index: 1
+                }))
+            ));
+        }
+    }
+
+    #[test]
     fn cache_descriptor_copies_release_the_global_mutex_and_recheck_publication() {
         let cache = CachedSources::default();
-        let sources = vec![Source::new("camera (Program)")];
+        let sources = vec![Source::new("camera (Program)").unwrap()];
         for hit in [false, true] {
             let result = cache
-                .sources_by_host_with_copy(
+                .find_sources_by_host_with_copy(
                     "camera",
                     Duration::ZERO,
                     |_| {
@@ -1796,7 +1949,7 @@ mod tests {
         }
         cache.clear();
         let result = cache
-            .sources_by_host_with_copy(
+            .find_sources_by_host_with_copy(
                 "camera",
                 Duration::ZERO,
                 |_| Ok(sources.clone()),
@@ -1812,7 +1965,7 @@ mod tests {
             "invalidation during snapshot preparation suppresses publication"
         );
         cache
-            .sources_by_host_with_copy(
+            .find_sources_by_host_with_copy(
                 "camera",
                 Duration::ZERO,
                 |_| {
@@ -1827,10 +1980,10 @@ mod tests {
     #[test]
     fn publication_failure_returns_discovery_but_hit_failure_is_reported() {
         let cache = CachedSources::default();
-        let sources = vec![Source::new("camera (Program)")];
+        let sources = vec![Source::new("camera (Program)").unwrap()];
         for invalidate in [false, true] {
             let result = cache
-                .sources_by_host_with_copy(
+                .find_sources_by_host_with_copy(
                     "camera",
                     Duration::ZERO,
                     |_| Ok(sources.clone()),
@@ -1846,9 +1999,9 @@ mod tests {
             assert!(cache.is_empty());
         }
         cache
-            .sources_by_host_with("camera", Duration::ZERO, |_| Ok(sources.clone()))
+            .find_sources_by_host_with("camera", Duration::ZERO, |_| Ok(sources.clone()))
             .unwrap();
-        let result = cache.sources_by_host_with_copy(
+        let result = cache.find_sources_by_host_with_copy(
             "camera",
             Duration::ZERO,
             |_| panic!("a hit must not run discovery"),
@@ -1869,13 +2022,14 @@ mod tests {
         // Apple pthread mutexes allocate their native storage on the first
         // lock. Initialize it before measuring publication into the empty map.
         assert!(cache.is_empty());
-        let sources = vec![Source::new("camera (Program)")];
+        let sources = vec![Source::new("camera (Program)").unwrap()];
         let (result, allocations) = crate::test_alloc::allocation_count(|| {
-            cache.sources_by_host_with("camera", Duration::ZERO, |_| Ok(sources))
+            cache.find_sources_by_host_with("camera", Duration::ZERO, |_| Ok(sources))
         });
         assert_eq!(result.unwrap().len(), 1);
-        // One vector, its name, the Arc header, host key and map storage.
-        assert_eq!(allocations, 5);
+        // One vector, its Arc header, host key and map storage. The validated
+        // source name is shared with the caller rather than allocated again.
+        assert_eq!(allocations, 4);
         assert_eq!(cache.len(), 1);
     }
 
@@ -1985,7 +2139,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let finder = Finder::new(&ndi, &FinderOptions::new().groups("Studio")).unwrap();
+        let finder = Finder::new(&ndi, &FinderOptions::new().groups(["Studio"])).unwrap();
         let instance = finder.instance;
         let (cache, allocations) = crate::test_alloc::allocation_count(|| SourceCache::new(finder));
         assert_eq!(allocations, 0);
@@ -2098,38 +2252,42 @@ mod tests {
         ] {
             for (first, second) in [(a, b), (b, a)] {
                 let cache = CachedSources::default();
-                let old = Source::new("camera").with_address(SourceAddress::new("192.0.2.1:5960"));
+                let old = Source::new("camera")
+                    .unwrap()
+                    .with_address(SourceAddress::new("192.0.2.1:5960").unwrap());
                 let fresh = old
                     .clone()
-                    .with_address(SourceAddress::new("192.0.2.1:5961"));
+                    .with_address(SourceAddress::new("192.0.2.1:5961").unwrap());
                 cache
-                    .sources_by_host_with(first, Duration::ZERO, |_| Ok(vec![old.clone()]))
+                    .find_sources_by_host_with(first, Duration::ZERO, |_| Ok(vec![old.clone()]))
                     .unwrap();
                 let (identical, identical_allocs) = crate::test_alloc::allocation_count(|| {
                     cache
-                        .sources_by_host_with(first, Duration::ZERO, |_| panic!("cache hit"))
+                        .find_sources_by_host_with(first, Duration::ZERO, |_| panic!("cache hit"))
                         .unwrap()
                 });
                 let (equivalent, equivalent_allocs) = crate::test_alloc::allocation_count(|| {
                     cache
-                        .sources_by_host_with(second, Duration::ZERO, |_| {
+                        .find_sources_by_host_with(second, Duration::ZERO, |_| {
                             panic!("equivalent cache hit")
                         })
                         .unwrap()
                 });
                 assert_eq!(identical, vec![old.clone()]);
                 assert_eq!(equivalent, vec![old]);
-                assert_eq!(identical_allocs, 3); // Vector plus two descriptor strings.
+                assert_eq!(identical_allocs, 1); // Only the vector; validated strings are shared.
                 assert_eq!(equivalent_allocs, identical_allocs);
                 assert_eq!(cache.len(), 1);
                 assert!(cache
-                    .sources_by_host_with(second, Duration::MAX, |_| panic!("invalid timeout"))
+                    .find_sources_by_host_with(second, Duration::MAX, |_| panic!("invalid timeout"))
                     .is_err());
                 cache.invalidate(second);
                 assert!(cache.is_empty());
                 assert_eq!(
                     cache
-                        .sources_by_host_with(first, Duration::ZERO, |_| Ok(vec![fresh.clone()]))
+                        .find_sources_by_host_with(first, Duration::ZERO, |_| Ok(vec![
+                            fresh.clone()
+                        ]))
                         .unwrap(),
                     vec![fresh]
                 );
@@ -2138,12 +2296,12 @@ mod tests {
                 assert_eq!(cache.len(), 1);
                 cache.clear();
                 assert!(cache
-                    .sources_by_host_with(first, Duration::ZERO, |_| Err(Error::InvalidInput(
+                    .find_sources_by_host_with(first, Duration::ZERO, |_| Err(Error::InvalidInput(
                         crate::InputDefect::InvalidHostQuery
                     )))
                     .is_err());
                 assert!(cache
-                    .sources_by_host_with(second, Duration::ZERO, |_| Ok(Vec::new()))
+                    .find_sources_by_host_with(second, Duration::ZERO, |_| Ok(Vec::new()))
                     .unwrap()
                     .is_empty());
                 assert!(cache.is_empty());
@@ -2154,33 +2312,40 @@ mod tests {
     #[test]
     fn exact_host_matching_ignores_labels_ports_and_url_payloads() {
         let other = Source::new("CAMERA10 (192.168.1.1)")
-            .with_address(SourceAddress::new("192.168.1.100:5960"));
+            .unwrap()
+            .with_address(SourceAddress::new("192.168.1.100:5960").unwrap());
         assert!(!other.matches_host("192.168.1.1"));
         assert!(!other.matches_host("5960"));
         assert!(!other.matches_host("CAMERA1"));
-        let exact = Source::new("CAMERA1 (Program)").with_address(SourceAddress::new(
-            "http://user:pass@Camera.Local:8080/ndi?next=192.0.2.1",
-        ));
+        let exact = Source::new("CAMERA1 (Program)").unwrap().with_address(
+            SourceAddress::new("http://user:pass@Camera.Local:8080/ndi?next=192.0.2.1").unwrap(),
+        );
         assert!(exact.matches_host("camera.local."));
         assert!(exact.matches_host("camera1"));
         assert!(!exact.matches_host("192.0.2.1"));
         assert!(!exact.matches_host("Program"));
-        let ipv6 = SourceAddress::new("[2001:0db8:0:0:0:0:0:1]:5960");
+        let ipv6 = SourceAddress::new("[2001:0db8:0:0:0:0:0:1]:5960").unwrap();
         assert!(ipv6.matches_host("2001:db8::1"));
         assert!(ipv6.matches_host("[2001:db8::1]"));
-        let studio = Source::new("Studio A (Camera)");
+        let studio = Source::new("Studio A (Camera)").unwrap();
         assert!(studio.matches_host("studio a"));
         assert!(studio.matches_host("STUDIO A."));
         assert!(!studio.matches_host("Studio"));
         assert!(!studio.matches_host("Camera"));
-        assert!(Source::new("STUDIO_PC (Camera)").matches_host("studio_pc"));
-        let unicode = Source::new("ÉTAGE A (Camera)");
+        assert!(Source::new("STUDIO_PC (Camera)")
+            .unwrap()
+            .matches_host("studio_pc"));
+        let unicode = Source::new("ÉTAGE A (Camera)").unwrap();
         assert!(unicode.matches_host("Étage a"));
         assert!(!unicode.matches_host("étage a"));
-        assert!(!SourceAddress::new("http://studio-a:80").matches_host("Studio A"));
+        assert!(!SourceAddress::new("http://studio-a:80")
+            .unwrap()
+            .matches_host("Studio A"));
         // Even opaque address text that contains the same machine name cannot
         // make a machine query match an address rather than the SDK label.
-        assert!(!SourceAddress::new("Studio A:5960").matches_host("Studio A"));
+        assert!(!SourceAddress::new("Studio A:5960")
+            .unwrap()
+            .matches_host("Studio A"));
         let too_long = "x".repeat(254);
         for invalid in [
             "",
@@ -2252,12 +2417,14 @@ mod tests {
     fn cache_selects_exact_host_and_rejects_invalid_queries_before_discovery() {
         let cache = CachedSources::default();
         let wrong = Source::new("CAMERA10 (Program)")
-            .with_address(SourceAddress::new("192.168.1.100:5960"));
-        let right =
-            Source::new("CAMERA1 (Program)").with_address(SourceAddress::new("192.168.1.1:5961"));
+            .unwrap()
+            .with_address(SourceAddress::new("192.168.1.100:5960").unwrap());
+        let right = Source::new("CAMERA1 (Program)")
+            .unwrap()
+            .with_address(SourceAddress::new("192.168.1.1:5961").unwrap());
         let timeout = Duration::ZERO;
         let selected = cache
-            .sources_by_host_with("192.168.1.1", timeout, |query| {
+            .find_sources_by_host_with("192.168.1.1", timeout, |query| {
                 Ok([wrong.clone(), right.clone()]
                     .into_iter()
                     .filter(|s| s.matches_query(query))
@@ -2268,7 +2435,7 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert_eq!(
             cache
-                .sources_by_host_with("192.168.1.1", timeout, |_| panic!("cache hit"))
+                .find_sources_by_host_with("192.168.1.1", timeout, |_| panic!("cache hit"))
                 .unwrap(),
             vec![right]
         );
@@ -2284,7 +2451,7 @@ mod tests {
             &too_long,
         ] {
             assert!(matches!(
-                cache.sources_by_host_with(invalid, timeout, |_| panic!(
+                cache.find_sources_by_host_with(invalid, timeout, |_| panic!(
                     "invalid query reached discovery"
                 )),
                 Err(Error::InvalidInput(_))
@@ -2300,13 +2467,17 @@ mod tests {
             let cache = Arc::new(CachedSources::default());
             let (started_tx, started_rx) = mpsc::channel();
             let (resume_tx, resume_rx) = mpsc::channel();
-            let old = Source::new("old").with_address(SourceAddress::new("192.0.2.1:5960"));
-            let fresh = Source::new("fresh").with_address(SourceAddress::new("192.0.2.1:5961"));
+            let old = Source::new("old")
+                .unwrap()
+                .with_address(SourceAddress::new("192.0.2.1:5960").unwrap());
+            let fresh = Source::new("fresh")
+                .unwrap()
+                .with_address(SourceAddress::new("192.0.2.1:5961").unwrap());
             let pending = Arc::clone(&cache);
             let old_result = old.clone();
             let thread = std::thread::spawn(move || {
                 pending
-                    .sources_by_host_with("CAMERA.LOCAL.", Duration::ZERO, |_| {
+                    .find_sources_by_host_with("CAMERA.LOCAL.", Duration::ZERO, |_| {
                         started_tx.send(()).unwrap();
                         resume_rx.recv().unwrap();
                         Ok(vec![old_result])
@@ -2321,14 +2492,16 @@ mod tests {
             }
             assert_eq!(cache.len(), 0);
             let found = cache
-                .sources_by_host_with("camera.local", Duration::ZERO, |_| Ok(vec![fresh.clone()]))
+                .find_sources_by_host_with("camera.local", Duration::ZERO, |_| {
+                    Ok(vec![fresh.clone()])
+                })
                 .unwrap();
             assert_eq!(found, vec![fresh.clone()]);
             resume_tx.send(()).unwrap();
             assert_eq!(thread.join().unwrap(), vec![old]);
             assert_eq!(
                 cache
-                    .sources_by_host_with("Camera.Local.", Duration::ZERO, |_| panic!(
+                    .find_sources_by_host_with("Camera.Local.", Duration::ZERO, |_| panic!(
                         "fresh entry was overwritten"
                     ))
                     .unwrap(),
@@ -2347,10 +2520,10 @@ mod tests {
             let pending = Arc::clone(&cache);
             let thread = std::thread::spawn(move || {
                 pending
-                    .sources_by_host_with("camera.local", Duration::ZERO, |_| {
+                    .find_sources_by_host_with("camera.local", Duration::ZERO, |_| {
                         started_tx.send(()).unwrap();
                         resume_rx.recv().unwrap();
-                        Ok(vec![Source::new("CAMERA (Program)")])
+                        Ok(vec![Source::new("CAMERA (Program)").unwrap()])
                     })
                     .unwrap()
             });
@@ -2371,10 +2544,14 @@ mod tests {
         let cache = CachedSources::default();
         cache.cache.lock().unwrap().generation = Some(u64::MAX);
         cache.invalidate("absent");
-        let source = Source::new("camera").with_address(SourceAddress::new("192.0.2.1"));
+        let source = Source::new("camera")
+            .unwrap()
+            .with_address(SourceAddress::new("192.0.2.1").unwrap());
         assert_eq!(
             cache
-                .sources_by_host_with("192.0.2.1", Duration::ZERO, |_| Ok(vec![source.clone()]))
+                .find_sources_by_host_with("192.0.2.1", Duration::ZERO, |_| Ok(
+                    vec![source.clone()]
+                ))
                 .unwrap(),
             vec![source]
         );
@@ -2409,7 +2586,9 @@ mod tests {
             ("http://camera?x=:123", "camera", None),
             ("http://user:pass@[::1]:8080/path", "::1", Some(8080)),
         ] {
-            let source = Source::new("").with_address(SourceAddress::new(address));
+            let source = Source::new("")
+                .unwrap()
+                .with_address(SourceAddress::new(address).unwrap());
             assert_eq!(source.host(), Some(host), "{address}");
             assert_eq!(source.address().unwrap().port(), port, "{address}");
         }
@@ -2434,8 +2613,10 @@ mod tests {
             "ndi://h:1",
             "opaque text",
         ] {
-            let configured = Source::new("Camera").with_address(SourceAddress::new(text));
-            let raw = configured.to_raw().unwrap();
+            let configured = Source::new("Camera")
+                .unwrap()
+                .with_address(SourceAddress::new(text).unwrap());
+            let raw = configured.to_raw();
             // SAFETY: RawSource lends its descriptor while retaining both C
             // strings for this synchronous owned copy.
             let discovered = unsafe { source_from_raw(raw.as_raw(), c"test") }.unwrap();
@@ -2463,9 +2644,15 @@ mod tests {
 
     #[test]
     fn discovery_accumulates_distinct_name_and_address_text_in_order() {
-        let first = Source::new("Camera").with_address(SourceAddress::new("192.0.2.1"));
-        let changed = first.clone().with_address(SourceAddress::new("192.0.2.2"));
-        let same_address = first.clone().with_address(SourceAddress::new("192.0.2.1"));
+        let first = Source::new("Camera")
+            .unwrap()
+            .with_address(SourceAddress::new("192.0.2.1").unwrap());
+        let changed = first
+            .clone()
+            .with_address(SourceAddress::new("192.0.2.2").unwrap());
+        let same_address = first
+            .clone()
+            .with_address(SourceAddress::new("192.0.2.1").unwrap());
         let mut seen = HashSet::new();
         let mut discovered = Vec::new();
         let mut bytes = 0;
@@ -2489,11 +2676,11 @@ mod tests {
             HostKeyBuffer::new(HostQuery::parse("camera").unwrap())
                 .into_owned()
                 .unwrap(),
-            Arc::new(vec![Source::new("camera")]),
+            Arc::new(vec![Source::new("camera").unwrap()]),
         );
         for host in ["camera", "not_cached"] {
             assert!(matches!(
-                cache.sources_by_host_with(host, Duration::MAX, |_| panic!("invalid timeout")),
+                cache.find_sources_by_host_with(host, Duration::MAX, |_| panic!("invalid timeout")),
                 Err(Error::InvalidInput(_))
             ));
         }
@@ -2501,9 +2688,9 @@ mod tests {
         // uses the runtime.
         assert_eq!(
             cache
-                .sources_by_host_with("camera", Duration::ZERO, |_| panic!("cache hit"))
+                .find_sources_by_host_with("camera", Duration::ZERO, |_| panic!("cache hit"))
                 .unwrap(),
-            vec![Source::new("camera")]
+            vec![Source::new("camera").unwrap()]
         );
     }
 
@@ -2634,7 +2821,9 @@ mod tests {
                 name,
                 ip,
                 Expected::Source(
-                    Source::new("Camera").with_address(SourceAddress::new("192.0.2.1:5960")),
+                    Source::new("Camera")
+                        .unwrap()
+                        .with_address(SourceAddress::new("192.0.2.1:5960").unwrap()),
                 ),
             ),
             (
@@ -2643,7 +2832,8 @@ mod tests {
                 url,
                 Expected::Source(
                     Source::new("Camera")
-                        .with_address(SourceAddress::new("ndi://camera.local:5960")),
+                        .unwrap()
+                        .with_address(SourceAddress::new("ndi://camera.local:5960").unwrap()),
                 ),
             ),
             (
@@ -2651,7 +2841,9 @@ mod tests {
                 ptr::null(),
                 ip,
                 Expected::Source(
-                    Source::new("").with_address(SourceAddress::new("192.0.2.1:5960")),
+                    Source::new("")
+                        .unwrap()
+                        .with_address(SourceAddress::new("192.0.2.1:5960").unwrap()),
                 ),
             ),
             (
@@ -2664,32 +2856,40 @@ mod tests {
                 "lossy name",
                 c"Cam\xff".as_ptr(),
                 ptr::null(),
-                Expected::Source(Source::new("Cam\u{fffd}")),
+                Expected::Source(Source::new("Cam\u{fffd}").unwrap()),
             ),
             ("unterminated name", malformed, ip, Expected::Malformed),
             (
                 "name only",
                 name,
                 ptr::null(),
-                Expected::Source(Source::new("Camera")),
+                Expected::Source(Source::new("Camera").unwrap()),
             ),
             (
                 "empty name",
                 empty,
                 ptr::null(),
-                Expected::Source(Source::new("")),
+                Expected::Source(Source::new("").unwrap()),
             ),
             (
                 "empty address only",
                 ptr::null(),
                 empty,
-                Expected::Source(Source::new("").with_address(SourceAddress::new(""))),
+                Expected::Source(
+                    Source::new("")
+                        .unwrap()
+                        .with_address(SourceAddress::new("").unwrap()),
+                ),
             ),
             (
                 "empty address",
                 name,
                 empty,
-                Expected::Source(Source::new("Camera").with_address(SourceAddress::new(""))),
+                Expected::Source(
+                    Source::new("Camera")
+                        .unwrap()
+                        .with_address(SourceAddress::new("").unwrap()),
+                ),
             ),
             ("unterminated address", name, malformed, Expected::Malformed),
         ];
@@ -2862,7 +3062,7 @@ mod tests {
         assert!(
             matches!(source.address(), Some(address) if address.is_url() && address.as_str() == "ndi://127.0.0.1:5960")
         );
-        let roundtrip = source.to_raw().unwrap();
+        let roundtrip = source.to_raw();
         assert!(!roundtrip.as_raw().p_ndi_name.is_null());
     }
 

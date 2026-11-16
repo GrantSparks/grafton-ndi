@@ -11,13 +11,13 @@
 //! # use std::time::Duration;
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! # let ndi = Ndi::new()?;
-//! # let source = Source::new("CAMERA (Program)");
+//! # let source = Source::new("CAMERA (Program)").unwrap();
 //! // In real usage, obtain the source from Finder::find_sources().
 //! let options = ReceiverOptions::new(source).bandwidth(ReceiverBandwidth::MetadataOnly);
 //! let receiver = Receiver::new(&ndi, &options)?;
 //!
 //! if let Some(ReceiverEvent::StatusChanged(_)) =
-//!     receiver.poll_event(Duration::from_millis(1000))?
+//!     receiver.next_event(Duration::from_millis(1000))?
 //! {
 //!     println!("The SDK reported a status change");
 //! }
@@ -30,6 +30,9 @@
 
 #[cfg(test)]
 use crate::RuntimeFeature;
+
+#[cfg(feature = "advanced")]
+use crate::advanced::{AvSyncAttached, PacketAttached};
 
 use std::{
     ffi::CString,
@@ -225,7 +228,7 @@ impl<T> From<Option<T>> for Retry<T> {
 
 /// Run `attempt` until it returns a value or `deadline` is spent: the one
 /// capture loop behind every receiver capture, for all frame kinds, for both
-/// [`Capture`] verbs and the async ones, and behind [`Receiver::poll_event`]
+/// typed capture methods and the async ones, and behind [`Receiver::next_event`]
 /// and the Advanced packet receivers' capture.
 ///
 /// The SDK returns from a capture early, without a frame, while a new
@@ -458,7 +461,7 @@ impl ReceiverBandwidth {
 /// # use grafton_ndi::{Ndi, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, Source};
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// # let ndi = Ndi::new()?;
-/// # let source = Source::new("CAMERA (Program)");
+/// # let source = Source::new("CAMERA (Program)").unwrap();
 /// // In real usage, obtain the source from Finder::find_sources().
 /// let options = ReceiverOptions::new(source)
 ///     .color_format(ReceiverColorFormat::UyvyBgra)
@@ -468,7 +471,7 @@ impl ReceiverBandwidth {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReceiverOptions {
     source: Source,
     color_format: ReceiverColorFormat,
@@ -595,8 +598,10 @@ impl ReceiverOptions {
     ///
     /// // Capture and encode in one line (requires image-encoding feature)
     /// #[cfg(feature = "image-encoding")]
-    /// if let Some(frame) = receiver.video().capture(Duration::from_secs(5))? {
-    ///     let png_bytes = frame.encode_png()?;
+    /// if let Some(frame) = receiver.capture_video(Duration::from_secs(5))? {
+    ///     let png_bytes = frame.encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+    ///         grafton_ndi::image_encoding::ImageFormat::Png,
+    ///     ))?;
     ///     std::fs::write("snapshot.png", &png_bytes)?;
     /// }
     /// # Ok(())
@@ -632,7 +637,7 @@ impl ReceiverOptions {
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// // Capture full quality frames
-    /// if let Some(frame) = receiver.video().capture(Duration::from_secs(5))? {
+    /// if let Some(frame) = receiver.capture_video(Duration::from_secs(5))? {
     ///     println!("Captured {width}x{height} frame", width = frame.width(), height = frame.height());
     /// }
     /// # Ok(())
@@ -778,7 +783,7 @@ pub(crate) struct ValidatedReceiveOptions<'a> {
 
 impl ValidatedReceiveOptions<'_> {
     pub(crate) fn to_raw(&self) -> Result<RawRecvCreateV3> {
-        let source = self.options.source.to_raw()?;
+        let source = self.options.source.to_raw();
         let name = self.options.name.as_deref().map(CString::new).transpose()?;
         let p_ndi_recv_name = name.as_ref().map_or(ptr::null(), |n| n.as_ptr());
         let source_raw = *source.as_raw();
@@ -798,10 +803,14 @@ impl ValidatedReceiveOptions<'_> {
 
 mod mode_sealed {
     pub trait Sealed {}
-    pub trait MetadataSealed {}
-    pub trait EventSealed {}
-    pub trait CaptureSealed {}
-    pub trait VideoSealed {}
+    #[allow(private_bounds)]
+    pub trait MetadataSealed: super::Permits<crate::capture::MetadataKind> {}
+    #[allow(private_bounds)]
+    pub trait EventSealed: super::Permits<crate::capture::NoSlots> {}
+    #[allow(private_bounds)]
+    pub trait AudioSealed: super::Permits<crate::capture::AudioKind> {}
+    #[allow(private_bounds)]
+    pub trait VideoSealed: super::Permits<crate::capture::VideoKind> {}
 }
 
 /// Sealed receiver capability mode: what a [`Receiver`] may do besides its
@@ -810,7 +819,7 @@ mod mode_sealed {
 /// The common controls work in every mode: tally, PTZ, upstream metadata,
 /// connection statistics, delays, source-name changes, connecting and
 /// reconnecting. [`MetadataMode`] adds typed metadata capture, [`EventMode`]
-/// adds event polling, [`CaptureMode`] adds audio capture, and [`VideoMode`]
+/// adds event polling, [`AudioMode`] adds audio capture, and [`VideoMode`]
 /// adds video capture. Only [`RawCapture`] permits every capture kind and
 /// event polling.
 pub trait ReceiverMode: mode_sealed::Sealed + Send + Sync {}
@@ -820,17 +829,15 @@ pub trait ReceiverMode: mode_sealed::Sealed + Send + Sync {}
 ///
 /// Metadata capture retains any notifications it encounters for a later raw
 /// receiver, but does not grant event polling; see [`EventMode`].
-#[allow(private_bounds)]
-pub trait MetadataMode: ReceiverMode + mode_sealed::MetadataSealed + Permits<MetadataKind> {}
+pub trait MetadataMode: ReceiverMode + mode_sealed::MetadataSealed {}
 
 /// Sealed receiver mode permitting event polling: [`RawCapture`].
 ///
 /// Native FrameSync and AV sync can consume status notifications before an
 /// attached receiver observes them. Attached receivers therefore use capability
-/// getters, [`Receiver::poll_source_name_change`], [`Receiver::is_connected`]
+/// getters, [`Receiver::wait_for_source_name_change`], [`Receiver::is_connected`]
 /// and [`Receiver::connection_stats`] rather than event polling.
-#[allow(private_bounds)]
-pub trait EventMode: ReceiverMode + mode_sealed::EventSealed + Permits<NoSlots> {}
+pub trait EventMode: ReceiverMode + mode_sealed::EventSealed {}
 
 /// Sealed receiver mode in which the receiver's own audio and metadata
 /// capture are available: [`RawCapture`].
@@ -839,8 +846,7 @@ pub trait EventMode: ReceiverMode + mode_sealed::EventSealed + Permits<NoSlots> 
 /// that holds the receiver: [`FrameSyncAttached`] to a
 /// [`FrameSync`](crate::FrameSync) and, with the `advanced` feature,
 /// `AvSyncAttached` to an Advanced `AvSync`.
-#[allow(private_bounds)]
-pub trait CaptureMode: MetadataMode + mode_sealed::CaptureSealed + Permits<AudioKind> {}
+pub trait AudioMode: MetadataMode + mode_sealed::AudioSealed {}
 
 /// Sealed receiver mode in which the receiver's own video capture is
 /// available: [`RawCapture`] and, with the `advanced` feature, the
@@ -848,8 +854,7 @@ pub trait CaptureMode: MetadataMode + mode_sealed::CaptureSealed + Permits<Audio
 ///
 /// A mode without it hands the receiver's video to the object that holds the
 /// receiver.
-#[allow(private_bounds)]
-pub trait VideoMode: ReceiverMode + mode_sealed::VideoSealed + Permits<VideoKind> {}
+pub trait VideoMode: ReceiverMode + mode_sealed::VideoSealed {}
 
 /// The one crate-internal permission table for both typed and slot-set capture.
 /// ReceiverMode seals the implementors. Public modes inherit their permissions,
@@ -926,7 +931,7 @@ pub enum RawCapture {}
 /// Event polling is unavailable because native synchronization can consume
 /// status notifications. Query capabilities with [`Ptz::is_supported`] and
 /// [`Receiver::web_control_url`] (or Advanced KVM's `is_supported`), source
-/// names with [`Receiver::poll_source_name_change`], and connection state with
+/// names with [`Receiver::wait_for_source_name_change`], and connection state with
 /// [`Receiver::is_connected`] and [`Receiver::connection_stats`].
 /// Its video and audio capture are unavailable: FrameSync returns them through
 /// [`FrameSync::capture_video`](crate::FrameSync::capture_video) and
@@ -942,44 +947,19 @@ pub enum RawCapture {}
 /// audio.
 #[derive(Debug)]
 pub enum FrameSyncAttached {}
-/// Receiver mode held by
-/// [`PacketReceiver`](crate::advanced::PacketReceiver), with the common
-/// controls only.
-///
-/// Packet capture takes every frame and event the receiver delivers, so the
-/// receiver's own video, audio, metadata and event capture are unavailable in
-/// this mode.
-#[cfg(feature = "advanced")]
-#[derive(Debug)]
-pub enum PacketAttached {}
-/// Receiver mode held by [`AvSync`](crate::advanced::AvSync), whose
-/// synchronizer takes the receiver's audio.
-///
-/// The receiver's own video and metadata capture and common controls remain
-/// available. Its audio capture is unavailable: the synchronizer consumes the
-/// audio and returns it matched to video through
-/// [`AvSync::synchronize`](crate::advanced::AvSync::synchronize).
-/// Event polling is unavailable for the same reason as [`FrameSyncAttached`].
-/// Use [`Ptz::is_supported`], [`Receiver::web_control_url`] and Advanced KVM's
-/// `is_supported` to query capabilities, [`Receiver::poll_source_name_change`]
-/// for source names, and [`Receiver::is_connected`] or
-/// [`Receiver::connection_stats`] for connection state.
-#[cfg(feature = "advanced")]
-#[derive(Debug)]
-pub enum AvSyncAttached {}
 impl mode_sealed::Sealed for RawCapture {}
 impl mode_sealed::Sealed for FrameSyncAttached {}
 impl mode_sealed::MetadataSealed for RawCapture {}
 impl mode_sealed::EventSealed for RawCapture {}
 impl mode_sealed::MetadataSealed for FrameSyncAttached {}
-impl mode_sealed::CaptureSealed for RawCapture {}
+impl mode_sealed::AudioSealed for RawCapture {}
 impl mode_sealed::VideoSealed for RawCapture {}
 impl ReceiverMode for RawCapture {}
 impl ReceiverMode for FrameSyncAttached {}
 impl MetadataMode for RawCapture {}
 impl EventMode for RawCapture {}
 impl MetadataMode for FrameSyncAttached {}
-impl CaptureMode for RawCapture {}
+impl AudioMode for RawCapture {}
 impl VideoMode for RawCapture {}
 #[cfg(feature = "advanced")]
 impl mode_sealed::Sealed for PacketAttached {}
@@ -1004,12 +984,24 @@ impl VideoMode for AvSyncAttached {}
 /// same resource core; see [`ReceiverMode`].
 ///
 /// Dropping the receiver disconnects it from its source, unless a
-/// [`RecvAdvertiser`](crate::discovery::RecvAdvertiser) registration still
+/// [`RecvAdvertiser`](crate::discovery_server::RecvAdvertiser) registration still
 /// holds it: a registered receiver stays connected, and advertised, until that
 /// registration is removed or its advertiser is dropped.
 pub struct Receiver<M: ReceiverMode = RawCapture> {
     pub(crate) core: Arc<ReceiverCore>,
     _mode: PhantomData<M>,
+}
+
+impl<M: ReceiverMode> std::fmt::Debug for Receiver<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Receiver")
+            .field(
+                "name",
+                &self.core._name.as_ref().map(|name| name.to_string_lossy()),
+            )
+            .field("mode", &std::any::type_name::<M>())
+            .finish_non_exhaustive()
+    }
 }
 
 // Preserve the owned receiver's pre-Arc unwind contract. Its private core keeps
@@ -1031,11 +1023,11 @@ pub(crate) struct ConnectionTarget {
 }
 
 impl ConnectionTarget {
-    pub(crate) fn new(source: &Source) -> Result<Self> {
-        Ok(Self {
+    pub(crate) fn new(source: &Source) -> Self {
+        Self {
             source: source.clone(),
-            raw: Box::new(source.to_raw()?),
-        })
+            raw: Box::new(source.to_raw()),
+        }
     }
 }
 
@@ -1135,17 +1127,16 @@ impl Receiver {
     /// copy or allocation. No Advanced feature or runtime is required.
     ///
     /// A single native wait requests every media kind, so a silent stream
-    /// does not delay other kinds behind its own timeout. See [`Capture`]
-    /// for the shared wait budget and zero-timeout
-    /// behavior. The returned item borrows this receiver; media references
+    /// does not delay other kinds behind its own timeout. All capture methods share the same wait-budget and zero-timeout
+    /// behavior described by [`Self::capture_video_ref`]. The returned item borrows this receiver; media references
     /// may move to scoped worker threads while that borrow remains live.
     ///
     /// Pending and native events are consumed once, competing with
-    /// [`Self::poll_event`] and other combined captures. They are coalesced
+    /// [`Self::next_event`] and other combined captures. They are coalesced
     /// invalidations, with no ordered history or broadcast guarantee. Typed
     /// media captures retain their events for these consumers.
     /// [`ReceiverEvent::SourceChanged`] requires the separate
-    /// [`Self::poll_source_name_change`] query for the new name.
+    /// [`Self::wait_for_source_name_change`] query for the new name.
     ///
     /// This operation exists only in ordinary raw-capture mode. FrameSync,
     /// AvSync and packet receivers reserve some or all native media slots.
@@ -1156,6 +1147,7 @@ impl Receiver {
     /// [`Error::ConnectionLost`] when the SDK reports a lost connection, and
     /// the same frame-validation errors as typed borrowed capture. Rejected
     /// frames are freed through their matching native free operation.
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<ReceiverItemRef<'_>>> {
         self.capture_any_ref_until(Deadline::after(timeout)?, NeverStop)
     }
@@ -1173,6 +1165,7 @@ impl Receiver {
     /// # Errors
     ///
     /// The errors of [`Self::capture_any_ref`].
+    #[doc(alias = "NDIlib_recv_capture_v3")]
     pub fn capture_any(&self, timeout: Duration) -> Result<Option<ReceiverItem>> {
         self.capture_any_until(Deadline::after(timeout)?)
     }
@@ -1183,9 +1176,10 @@ impl Receiver {
     ///
     /// Returns [`Error::UnsupportedCapability`] when the options need a mode the
     /// selected runtime lacks, or carry an Advanced configuration that the
-    /// runtime or this build cannot take; [`Error::InvalidCString`] for a name
-    /// or source that contains a NUL byte; and [`Error::NativeOperationFailed`]
+    /// runtime or this build cannot take; [`Error::InvalidCString`] for a receiver
+    /// name that contains a NUL byte; and [`Error::NativeOperationFailed`]
     /// when the SDK creates no receiver.
+    #[doc(alias = "NDIlib_recv_create_v3")]
     pub fn new(ndi: &Ndi, options: &ReceiverOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
         if let Some(config) = &options.config {
@@ -1288,49 +1282,47 @@ impl<M: SynchronizerMode> Receiver<M> {
     }
 }
 
-impl<M: VideoMode> Receiver<M> {
-    /// Capture **video** frames from this receiver.
-    ///
-    /// Returns a [`Capture`] view with two verbs, which both wait up to their
-    /// timeout for a frame:
-    ///
-    /// - [`capture`](Capture::capture) copies the frame into an owned
-    ///   [`VideoFrame`];
-    /// - [`capture_ref`](Capture::capture_ref) borrows the SDK's buffer in
-    ///   place.
-    ///
-    /// Video frames may carry per-row padding (e.g. RGBX/BGRX); see
-    /// [`VideoFrame`] for how to read them correctly.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = Ndi::new()?;
-    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
-    /// // An owned copy
-    /// if let Some(frame) = receiver.video().capture(Duration::from_secs(5))? {
-    ///     println!("{}x{}", frame.width(), frame.height());
-    /// }
-    ///
-    /// // Zero-copy borrow
-    /// if let Some(frame) = receiver.video().capture_ref(Duration::from_secs(1))? {
-    ///     for plane in frame.planes() {
-    ///         for row in plane.rows() {
-    ///             println!("{} active bytes in place", row.len());
-    ///         }
-    ///     }
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[must_use = "the Capture view does nothing until a capture verb is called"]
-    pub fn video(&self) -> Capture<'_, VideoKind> {
-        Capture::new(self)
-    }
+macro_rules! receiver_capture_methods {
+    ($(($mode:ident, $kind:ident, $owned:ident, $borrowed:ident,
+        $capture:ident, $capture_ref:ident, $capture_with:ident, $label:literal)),* $(,)?) => {
+        $(
+            impl<M: $mode> Receiver<M> {
+                #[doc = concat!("Wait up to `timeout` for ", $label, " and copy it into an owned frame.")]
+                ///
+                /// A zero timeout makes one nonblocking SDK attempt. Early SDK
+                /// status and source reports are retained for `next_event`, and
+                /// capture continues until a frame arrives or the budget expires.
+                /// Each native attempt waits at most 100 ms; validation and copying
+                /// can finish after the budget. `None` alone does not establish
+                /// disconnection or freshness.
+                ///
+                /// # Errors
+                ///
+                /// Invalid timeouts, a lost connection, or invalid SDK frame data.
+                #[doc(alias = "NDIlib_recv_capture_v3")]
+                pub fn $capture(&self, timeout: Duration) -> Result<Option<$owned>> {
+                    Ok(self.$capture_ref(timeout)?.as_ref().map($borrowed::to_owned))
+                }
+
+                #[doc = concat!("Wait up to `timeout` for ", $label, " and borrow its native buffer.")]
+                ///
+                /// The returned frame borrows the receiver and releases its SDK
+                /// buffer when dropped. Capture retains status and source reports
+                /// for `next_event`. A zero timeout makes one nonblocking attempt;
+                /// each other attempt waits at most 100 ms within the shared budget.
+                ///
+                /// # Errors
+                ///
+                /// Invalid timeouts, a lost connection, or invalid SDK frame data.
+                #[doc(alias = "NDIlib_recv_capture_v3")]
+                pub fn $capture_ref(&self, timeout: Duration) -> Result<Option<$borrowed<'_>>> {
+                    self.core.capture_ref_until::<$kind>(Deadline::after(timeout)?, NeverStop)
+                }
+            }
+        )*
+    };
 }
+crate::capture::capture_method_kinds!(receiver_capture_methods);
 
 impl<M: ReceiverMode> Receiver<M> {
     /// Typed capture for an adapter whose receiver mode permits this kind.
@@ -1387,7 +1379,7 @@ impl<M: ReceiverMode> Receiver<M> {
             .map(ReceiverItemRef::to_owned))
     }
 
-    pub(crate) fn poll_event_until(
+    pub(crate) fn next_event_until(
         &self,
         deadline: Deadline,
         stop: impl Stop,
@@ -1415,6 +1407,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// [`Error::InvalidInput`] for a delay above two seconds, and
     /// [`Error::UnsupportedCapability`] without
     /// [`RuntimeFeature::ReceiveDelay`](crate::RuntimeFeature::ReceiveDelay).
+    #[doc(alias = "NDIlib_recv_set_video_delay")]
     pub fn set_video_delay(&self, delay: Duration) -> Result<SettingChange> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
@@ -1430,6 +1423,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// [`Error::UnsupportedCapability`] without
     /// [`RuntimeFeature::ReceiveDelay`](crate::RuntimeFeature::ReceiveDelay), and [`Error::UnexpectedSdkResult`]
     /// when the SDK reports a delay outside 0 to 2000 ms.
+    #[doc(alias = "NDIlib_recv_get_video_delay")]
     pub fn video_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
         // SAFETY: the receiver instance is live for this borrow.
@@ -1444,6 +1438,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Errors
     ///
     /// As for [`Self::set_video_delay`].
+    #[doc(alias = "NDIlib_recv_set_audio_delay")]
     pub fn set_audio_delay(&self, delay: Duration) -> Result<SettingChange> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
@@ -1457,6 +1452,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Errors
     ///
     /// As for [`Self::video_delay`].
+    #[doc(alias = "NDIlib_recv_get_audio_delay")]
     pub fn audio_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
         // SAFETY: the receiver instance is live for this borrow.
@@ -1467,6 +1463,7 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Accepts owned or captured metadata. The receiver keeps its own copy,
     /// so the input need not outlive the registration.
+    #[doc(alias = "NDIlib_recv_add_connection_metadata")]
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let table = self.core.connection_metadata()?;
         let mut registrations = self.core.connection_metadata.lock();
@@ -1478,6 +1475,7 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 
     /// Clear metadata registered for subsequent receiver connections.
+    #[doc(alias = "NDIlib_recv_clear_connection_metadata")]
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.core.connection_metadata()?;
         let mut registrations = self.core.connection_metadata.lock();
@@ -1489,6 +1487,7 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 
     /// Copy the optional device web-control URL. This does not open the URL.
+    #[doc(alias = "NDIlib_recv_get_web_control")]
     pub fn web_control_url(&self) -> Result<Option<String>> {
         // The query comes with the function that releases what it returns.
         let (web_control, strings) = self
@@ -1517,9 +1516,13 @@ impl<M: ReceiverMode> Receiver<M> {
     /// The SDK reports each change once, so a name that is not valid UTF-8 is
     /// not an error: invalid sequences are replaced with U+FFFD, as
     /// [`Finder`](crate::Finder) does for discovered source names.
-    pub fn poll_source_name_change(&self, timeout: Duration) -> Result<Option<SourceNameChange>> {
+    #[doc(alias = "NDIlib_recv_get_source_name")]
+    pub fn wait_for_source_name_change(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<SourceNameChange>> {
         self.core
-            .poll_source_name_change_until(Deadline::after(timeout)?, NeverStop)
+            .wait_for_source_name_change_until(Deadline::after(timeout)?, NeverStop)
     }
 
     /// Request a different source and remember it as the connection target.
@@ -1528,11 +1531,11 @@ impl<M: ReceiverMode> Receiver<M> {
     /// and updates [`Self::connection_target`] together. Captures may continue
     /// while the SDK applies the change.
     /// Success means the request was issued, not that the source is available.
-    /// Invalid input leaves the target unchanged. Existing FrameSync ownership
+    /// The source was validated at construction. Existing FrameSync ownership
     /// remains.
-    pub fn connect_to(&self, source: &Source) -> Result<()> {
-        self.connect_target(ConnectionTarget::new(source)?);
-        Ok(())
+    #[doc(alias = "NDIlib_recv_connect")]
+    pub fn connect_to(&self, source: &Source) {
+        self.connect_target(ConnectionTarget::new(source));
     }
 
     /// Apply an input already validated on the synchronous or async caller.
@@ -1544,6 +1547,7 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Serializes with other local connection changes, as [`Self::reconnect`]
     /// does, while captures may continue.
+    #[doc(alias = "NDIlib_recv_connect")]
     pub fn disconnect(&self) {
         self.core.lock_connection().disconnect();
     }
@@ -1553,6 +1557,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// The SDK keeps the state and sends it to every source the receiver
     /// connects to, so it can be set before a connection and survives a
     /// reconnect.
+    #[doc(alias = "NDIlib_recv_set_tally")]
     pub fn set_tally(&self, tally: Tally) {
         // `Processing.NDI.Recv.h`: the flag is false when nothing is
         // connected, and the state is sent the moment something connects, so
@@ -1575,6 +1580,7 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// [`Error::NotConnected`] when the receiver is connected to no source,
     /// so nothing was sent.
+    #[doc(alias = "NDIlib_recv_send_metadata")]
     pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let raw = metadata.metadata_raw();
         // SAFETY: the receiver instance is live for this borrow, and the
@@ -1601,7 +1607,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
-    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::monitoring_preset(Source::new("CAMERA (Program)")))?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::monitoring_preset(Source::new("CAMERA (Program)").unwrap()))?;
     /// let ptz = receiver.ptz();
     /// if ptz.is_supported() {
     ///     ptz.zoom(0.5)?;
@@ -1629,7 +1635,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
-    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)").unwrap()))?;
     /// if receiver.is_connected() {
     ///     println!("Still connected to source");
     /// } else {
@@ -1640,6 +1646,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// ```
     /// A negative native count reports no established connection; use
     /// [`Self::connection_stats`] to inspect that SDK contract error.
+    #[doc(alias = "NDIlib_recv_get_no_connections")]
     pub fn is_connected(&self) -> bool {
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -1667,7 +1674,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// This requests the last local target again. If a Discovery Server client
     /// remotely changed this receiver's source, reconnecting replaces that
     /// remote routing with the local target. Observe remote changes through
-    /// [`Self::poll_source_name_change`].
+    /// [`Self::wait_for_source_name_change`].
     ///
     /// Observe native connection state with [`Self::is_connected`] and
     /// progress of the expected media with [`Self::connection_stats`]. A
@@ -1685,6 +1692,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// `NDIlib_recv_connect` reports no status: returning means the request was
     /// issued, not that the feed recovered. Confirm recovery through
     /// [`Self::connection_stats`].
+    #[doc(alias = "NDIlib_recv_connect")]
     pub fn reconnect(&self) {
         self.core.lock_connection().reconnect();
     }
@@ -1695,7 +1703,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// successful [`Self::connect_to`]. [`Self::disconnect`] retains it, and
     /// [`Self::reconnect`] requests it again. A Discovery Server client's remote
     /// connection change does not update this local target. Observe actual
-    /// connection changes with [`Self::poll_source_name_change`].
+    /// connection changes with [`Self::wait_for_source_name_change`].
     /// The snapshot clones the source's name and address. It never waits for
     /// captures or queued connection changes; a concurrent `connect_to` holds
     /// the target lock only while replacing the value after its request returns.
@@ -1704,7 +1712,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
     /// # fn main() -> grafton_ndi::Result<()> {
     /// # let ndi = Ndi::new()?;
-    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)").unwrap()))?;
     /// println!("Requested target: {}", receiver.connection_target());
     /// # Ok(())
     /// # }
@@ -1737,7 +1745,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
-    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)").unwrap()))?;
     /// let stats = receiver.connection_stats()?;
     /// println!("Connections: {connections}", connections = stats.connections());
     /// println!("Video frames: {received} (dropped: {dropped})",
@@ -1748,6 +1756,9 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_recv_get_no_connections")]
+    #[doc(alias = "NDIlib_recv_get_performance")]
+    #[doc(alias = "NDIlib_recv_get_queue")]
     pub fn connection_stats(&self) -> Result<ConnectionStats> {
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -1803,10 +1814,10 @@ impl<M: EventMode> Receiver<M> {
     /// Events are coalesced invalidations, including those that media capture
     /// passed over and kept, not an ordered history or broadcast stream.
     /// Concurrent pollers and combined captures compete to consume a pending one. The new source
-    /// name is read with the SDK's separate [`Self::poll_source_name_change`]
+    /// name is read with the SDK's separate [`Self::wait_for_source_name_change`]
     /// API.
     ///
-    /// The timeout is spent as the [`Capture`] verbs spend it: in attempts of
+    /// The timeout is spent as the typed capture methods spend it: in attempts of
     /// at most 100 ms, each of which first takes a pending event and otherwise
     /// waits in the SDK for the rest of the attempt. The SDK's early returns
     /// are waited over, so `None`
@@ -1821,64 +1832,9 @@ impl<M: EventMode> Receiver<M> {
     /// (~49.7 days), and [`Error::ConnectionLost`] when the SDK reports a lost
     /// connection, or [`Error::UnexpectedSdkResult`] when a status snapshot
     /// contains a negative native connection count. Its invalidation stays pending.
-    pub fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
-        self.poll_event_until(Deadline::after(timeout)?, NeverStop)
-    }
-}
-
-/// The receiver's typed metadata capture and, in a [`CaptureMode`], audio.
-impl<M: MetadataMode> Receiver<M> {
-    /// Capture **audio** frames from this receiver.
-    ///
-    /// Returns a [`Capture`] view; see [`Receiver::video`] for its two verbs,
-    /// [`capture`](Capture::capture) and [`capture_ref`](Capture::capture_ref).
-    /// It exists in each [`CaptureMode`]: a [`FrameSync`](crate::FrameSync)
-    /// and an Advanced `AvSync` take the audio of the receiver they hold.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = Ndi::new()?;
-    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
-    /// if let Some(audio) = receiver.audio().capture_ref(Duration::from_secs(1))? {
-    ///     println!("{} channels, {} samples", audio.num_channels(), audio.num_samples());
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[must_use = "the Capture view does nothing until a capture verb is called"]
-    pub fn audio(&self) -> Capture<'_, AudioKind>
-    where
-        M: CaptureMode,
-    {
-        Capture::new(self)
-    }
-
-    /// Capture **metadata** frames from this receiver.
-    ///
-    /// Returns a [`Capture`] view; see [`Receiver::video`] for its two verbs,
-    /// [`capture`](Capture::capture) and [`capture_ref`](Capture::capture_ref).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = Ndi::new()?;
-    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
-    /// if let Some(meta) = receiver.metadata().capture(Duration::from_millis(100))? {
-    ///     println!("metadata: {}", meta.data());
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[must_use = "the Capture view does nothing until a capture verb is called"]
-    pub fn metadata(&self) -> Capture<'_, MetadataKind> {
-        Capture::new(self)
+    #[doc(alias = "NDIlib_recv_capture_v3")]
+    pub fn next_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
+        self.next_event_until(Deadline::after(timeout)?, NeverStop)
     }
 }
 
@@ -1927,7 +1883,7 @@ impl ReceiverCore {
     ///
     /// Runs concurrently with other captures and connection changes. `None`
     /// when the SDK returned without a frame of this kind; a
-    /// notification it returned instead is kept for [`Receiver::poll_event`].
+    /// notification it returned instead is kept for [`Receiver::next_event`].
     fn poll_ref_until<K: CaptureKind>(&self, attempt: Attempt) -> Result<Retry<K::Ref<'_>>> {
         let lock = self.capture_lock(attempt);
         let result = capture_raw::<K>(&lock)?;
@@ -1958,7 +1914,7 @@ impl ReceiverCore {
         }
     }
 
-    /// The one capture loop, behind [`Capture::capture_ref`] and every owned
+    /// The one capture loop, behind every borrowed and owned
     /// capture: SDK captures in [`capture_within`]'s attempts until one
     /// delivers a frame of kind `K` or `deadline` is spent.
     fn capture_ref_until<K: CaptureKind>(
@@ -2041,7 +1997,7 @@ impl ReceiverCore {
         })
     }
 
-    /// Keep a notification a capture reported for [`Receiver::poll_event`].
+    /// Keep a notification a capture reported for [`Receiver::next_event`].
     fn retain(&self, notification: Notification) {
         match notification {
             Notification::None => {}
@@ -2065,20 +2021,20 @@ impl ReceiverCore {
             .map(ReceiverEvent::Unknown))
     }
 
-    /// The one implementation of [`Receiver::poll_source_name_change`], also
+    /// The one implementation of [`Receiver::wait_for_source_name_change`], also
     /// behind the async receivers' version: wait until `deadline` for a
     /// change of the connected source's name.
     ///
     /// The tables are resolved after the caller validated the timeout, so an
     /// invalid timeout is reported before a missing capability.
-    pub(crate) fn poll_source_name_change_until(
+    pub(crate) fn wait_for_source_name_change_until(
         &self,
         deadline: Deadline,
         stop: impl Stop,
     ) -> Result<Option<SourceNameChange>> {
         // The query comes with the function that releases what it returns.
         let (source_name, strings) = self.source_name_tables()?;
-        self.poll_source_name_change_with(source_name, strings, deadline, stop)
+        self.wait_for_source_name_change_with(source_name, strings, deadline, stop)
     }
 
     pub(crate) fn source_name_tables(
@@ -2087,9 +2043,9 @@ impl ReceiverCore {
         self._ndi.table()
     }
 
-    /// [`Self::poll_source_name_change_until`] through the given tables, so
+    /// [`Self::wait_for_source_name_change_until`] through the given tables, so
     /// that a test can substitute the SDK functions.
-    pub(crate) fn poll_source_name_change_with(
+    pub(crate) fn wait_for_source_name_change_with(
         &self,
         source_name: &sys::ReceiverSourceName,
         strings: &sys::ReceiverStrings,
@@ -2243,98 +2199,6 @@ pub(crate) mod native_capture_calls {
     }
 }
 
-/// Publish one event immediately after a test prepares a capture attempt, so
-/// its second pending-event check can be tested without a scheduling race.
-/// A typed view over a [`Receiver`] for capturing frames of one kind.
-///
-/// Created by [`Receiver::video`], [`Receiver::audio`], and
-/// [`Receiver::metadata`]. The view is a cheap borrow of the receiver and does
-/// nothing on its own; call one of its verbs to capture:
-///
-/// - [`capture`](Self::capture) copies the frame into an owned value that
-///   can be kept, sent or moved to another thread.
-/// - [`capture_ref`](Self::capture_ref) borrows the SDK's buffer in place,
-///   with no allocation and no copy. It is the one for in-place processing:
-///   for a 1920×1080 BGRA frame it avoids ~8.3 MB of copying per frame
-///   (~475 MB/s at 60 fps). Synchronous sends accept these references;
-///   convert with `to_owned` when you need to retain a frame or submit an
-///   owned asynchronous send.
-///
-/// Both wait up to their timeout for a frame. The SDK returns from a capture
-/// early, without a frame, while a new connection synchronizes and whenever
-/// it reports a status or source change; both verbs capture again until a
-/// frame arrives, and return `Ok(None)` only once the whole timeout is spent.
-/// A status or source change they pass over is kept for
-/// [`Receiver::poll_event`].
-///
-/// Each attempt waits at most 100 ms. Captures of different kinds and
-/// connection changes may run concurrently. Each timeout budget starts when
-/// the verb is called; a zero timeout makes one nonblocking SDK attempt.
-/// SDK calls and owned-frame copying may finish after
-/// the budget expires, so the timeout is not a strict wall-clock completion
-/// guarantee.
-///
-/// A video view exists in each [`VideoMode`], an audio view in each
-/// [`CaptureMode`] and a metadata view in each [`MetadataMode`]. FrameSync
-/// owns video and audio capture until [`crate::FrameSync::into_receiver`]
-/// restores the ordinary mode, and an Advanced `AvSync` owns audio capture
-/// until its `into_receiver` does.
-pub struct Capture<'rx, K: CaptureKind> {
-    // Only new can erase the mode, after checking its Permits<K> bound.
-    rx: &'rx ReceiverCore,
-    _kind: PhantomData<K>,
-}
-
-impl<'rx, K: CaptureKind> Capture<'rx, K> {
-    fn new<M: Permits<K>>(rx: &'rx Receiver<M>) -> Self {
-        Self {
-            rx: &rx.core,
-            _kind: PhantomData,
-        }
-    }
-
-    /// Wait up to `timeout` for a frame and return an owned copy of it, or
-    /// `None` when none arrived in time.
-    ///
-    /// A delivered frame may have waited in the native queue; `None` alone
-    /// does not establish disconnection or freshness. See the
-    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
-    ///
-    /// See [`Capture`] for how the timeout is spent; [`Duration::ZERO`]
-    /// makes one attempt without waiting.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
-    /// (~49.7 days), [`Error::ConnectionLost`] when the SDK reports a lost
-    /// connection, and the errors of validating and copying the frame.
-    pub fn capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
-        Ok(self.capture_ref(timeout)?.as_ref().map(K::ref_to_owned))
-    }
-
-    /// Wait up to `timeout` for a frame and borrow the SDK's buffer in
-    /// place, or return `None` when none arrived in time.
-    ///
-    /// A delivered frame may have waited in the native queue; `None` alone
-    /// does not establish disconnection or freshness.
-    ///
-    /// The returned reference borrows the [`Receiver`] (not this temporary
-    /// view), so it may outlive the `Capture` while keeping the receiver
-    /// borrowed. See [`Capture`] for how the timeout is spent.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
-    /// (~49.7 days), [`Error::ConnectionLost`] when the SDK reports a lost
-    /// connection, and the errors of validating the frame.
-    pub fn capture_ref(&self, timeout: Duration) -> Result<Option<K::Ref<'rx>>> {
-        // Bind through `'rx` so the returned borrow is tied to the receiver, not
-        // to this short-lived view.
-        let rx: &'rx ReceiverCore = self.rx;
-        rx.capture_ref_until::<K>(Deadline::after(timeout)?, NeverStop)
-    }
-}
-
 /// Pan, tilt, zoom, focus, white balance and exposure control of the source a
 /// [`Receiver`] is connected to, from [`Receiver::ptz`].
 ///
@@ -2346,9 +2210,21 @@ pub struct Ptz<'rx> {
     core: &'rx ReceiverCore,
 }
 
+impl std::fmt::Debug for Ptz<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ptz")
+            .field(
+                "receiver_name",
+                &self.core._name.as_ref().map(|name| name.to_string_lossy()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 impl Ptz<'_> {
     /// Whether the connected source accepts PTZ commands.
     #[must_use]
+    #[doc(alias = "NDIlib_recv_ptz_is_supported")]
     pub fn is_supported(&self) -> bool {
         // SAFETY: the receiver instance is live for the handle's borrow.
         unsafe {
@@ -2363,6 +2239,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_recall_preset")]
     pub fn recall_preset(&self, preset: u8, speed: f32) -> Result<()> {
         let preset = validate_ptz_preset(preset)?;
         validate_ptz_value("speed", speed, 0.0, 1.0)?;
@@ -2374,6 +2251,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_store_preset")]
     pub fn store_preset(&self, preset: u8) -> Result<()> {
         let preset = validate_ptz_preset(preset)?;
         ptz_command!(self, NDIlib_recv_ptz_store_preset, preset)
@@ -2385,6 +2263,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_zoom")]
     pub fn zoom(&self, zoom: f32) -> Result<()> {
         validate_ptz_value("zoom", zoom, 0.0, 1.0)?;
         ptz_command!(self, NDIlib_recv_ptz_zoom, zoom)
@@ -2396,6 +2275,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_zoom_speed")]
     pub fn zoom_speed(&self, speed: f32) -> Result<()> {
         validate_ptz_value("zoom speed", speed, -1.0, 1.0)?;
         ptz_command!(self, NDIlib_recv_ptz_zoom_speed, speed)
@@ -2407,6 +2287,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_pan_tilt")]
     pub fn pan_tilt(&self, pan: f32, tilt: f32) -> Result<()> {
         validate_ptz_value("pan", pan, -1.0, 1.0)?;
         validate_ptz_value("tilt", tilt, -1.0, 1.0)?;
@@ -2419,6 +2300,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_pan_tilt_speed")]
     pub fn pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> Result<()> {
         validate_ptz_value("pan speed", pan_speed, -1.0, 1.0)?;
         validate_ptz_value("tilt speed", tilt_speed, -1.0, 1.0)?;
@@ -2430,6 +2312,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_auto_focus")]
     pub fn auto_focus(&self) -> Result<()> {
         ptz_command!(self, NDIlib_recv_ptz_auto_focus)
     }
@@ -2440,6 +2323,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_focus")]
     pub fn focus(&self, focus: f32) -> Result<()> {
         validate_ptz_value("focus", focus, 0.0, 1.0)?;
         ptz_command!(self, NDIlib_recv_ptz_focus, focus)
@@ -2451,6 +2335,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_focus_speed")]
     pub fn focus_speed(&self, speed: f32) -> Result<()> {
         validate_ptz_value("focus speed", speed, -1.0, 1.0)?;
         ptz_command!(self, NDIlib_recv_ptz_focus_speed, speed)
@@ -2461,6 +2346,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_white_balance_auto")]
     pub fn white_balance_auto(&self) -> Result<()> {
         ptz_command!(self, NDIlib_recv_ptz_white_balance_auto)
     }
@@ -2470,6 +2356,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_white_balance_indoor")]
     pub fn white_balance_indoor(&self) -> Result<()> {
         ptz_command!(self, NDIlib_recv_ptz_white_balance_indoor)
     }
@@ -2479,6 +2366,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_white_balance_outdoor")]
     pub fn white_balance_outdoor(&self) -> Result<()> {
         ptz_command!(self, NDIlib_recv_ptz_white_balance_outdoor)
     }
@@ -2488,6 +2376,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_white_balance_oneshot")]
     pub fn white_balance_oneshot(&self) -> Result<()> {
         ptz_command!(self, NDIlib_recv_ptz_white_balance_oneshot)
     }
@@ -2497,6 +2386,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_white_balance_manual")]
     pub fn white_balance_manual(&self, red: f32, blue: f32) -> Result<()> {
         validate_ptz_value("red", red, 0.0, 1.0)?;
         validate_ptz_value("blue", blue, 0.0, 1.0)?;
@@ -2508,6 +2398,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_exposure_auto")]
     pub fn exposure_auto(&self) -> Result<()> {
         ptz_command!(self, NDIlib_recv_ptz_exposure_auto)
     }
@@ -2517,6 +2408,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_exposure_manual")]
     pub fn exposure_manual(&self, level: f32) -> Result<()> {
         validate_ptz_value("exposure level", level, 0.0, 1.0)?;
         ptz_command!(self, NDIlib_recv_ptz_exposure_manual, level)
@@ -2528,6 +2420,7 @@ impl Ptz<'_> {
     /// # Errors
     ///
     /// See [`Ptz`].
+    #[doc(alias = "NDIlib_recv_ptz_exposure_manual_v2")]
     pub fn exposure_manual_detailed(&self, iris: f32, gain: f32, shutter_speed: f32) -> Result<()> {
         validate_ptz_value("iris", iris, 0.0, 1.0)?;
         validate_ptz_value("gain", gain, 0.0, 1.0)?;
@@ -2982,7 +2875,7 @@ mod tests {
     }
 
     #[test]
-    fn media_source_and_unknown_events_are_retained_for_poll_event() {
+    fn media_source_and_unknown_events_are_retained_for_next_event() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
@@ -3082,10 +2975,13 @@ mod tests {
             return;
         };
         for source in [
-            Source::new("retained name"),
+            Source::new("retained name").unwrap(),
             Source::new("retained URL")
-                .with_address(crate::SourceAddress::new("ndi://127.0.0.1:5961")),
-            Source::new("retained IP").with_address(crate::SourceAddress::new("127.0.0.1:5961")),
+                .unwrap()
+                .with_address(crate::SourceAddress::new("ndi://127.0.0.1:5961").unwrap()),
+            Source::new("retained IP")
+                .unwrap()
+                .with_address(crate::SourceAddress::new("127.0.0.1:5961").unwrap()),
         ] {
             let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source.clone())).unwrap();
             let ((), allocations) = crate::test_alloc::allocation_count(|| receiver.reconnect());
@@ -3229,7 +3125,7 @@ mod tests {
         let poll = |changed, name: Option<&[u8]>| {
             NEXT.with(|next| *next.borrow_mut() = (changed, name.map(<[u8]>::to_vec)));
             let before = FREES.load(Ordering::Relaxed);
-            let change = receiver.core.poll_source_name_change_with(
+            let change = receiver.core.wait_for_source_name_change_with(
                 &source_name,
                 &strings,
                 Deadline::after(Duration::ZERO).unwrap(),
@@ -3294,7 +3190,7 @@ mod tests {
         };
         let result = receiver
             .core
-            .poll_source_name_change_with(
+            .wait_for_source_name_change_with(
                 &source_name,
                 &strings,
                 Deadline::after(Duration::from_secs(2)).unwrap(),
@@ -3315,7 +3211,7 @@ mod tests {
         let stopped = AtomicBool::new(true);
         assert!(receiver
             .core
-            .poll_source_name_change_with(
+            .wait_for_source_name_change_with(
                 &source_name,
                 &strings,
                 Deadline::after(Duration::from_secs(2)).unwrap(),
@@ -3328,7 +3224,7 @@ mod tests {
 
     /// A source no receiver can connect to: no name and no address.
     fn test_source() -> Source {
-        Source::new("")
+        Source::new("").unwrap()
     }
 
     /// The options of a receiver that stays unconnected.
@@ -3512,16 +3408,16 @@ mod tests {
     }
 
     #[test]
-    fn pending_status_survives_an_invalid_poll_event_timeout() {
+    fn pending_status_survives_an_invalid_next_event_timeout() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         receiver.core.pending_status.publish();
-        assert!(receiver.poll_event(Duration::MAX).is_err());
+        assert!(receiver.next_event(Duration::MAX).is_err());
         assert!(receiver.core.pending_status.is_pending());
         assert!(matches!(
-            receiver.poll_event(Duration::ZERO).unwrap(),
+            receiver.next_event(Duration::ZERO).unwrap(),
             Some(ReceiverEvent::StatusChanged(_))
         ));
         assert!(!receiver.core.pending_status.is_pending());
@@ -3535,13 +3431,13 @@ mod tests {
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         let excessive = crate::MAX_TIMEOUT + Duration::from_nanos(1);
         for result in [
-            receiver.video().capture(excessive).map(drop),
-            receiver.audio().capture_ref(excessive).map(drop),
-            receiver.metadata().capture(excessive).map(drop),
+            receiver.capture_video(excessive).map(drop),
+            receiver.capture_audio_ref(excessive).map(drop),
+            receiver.capture_metadata(excessive).map(drop),
             receiver.capture_any(excessive).map(drop),
             receiver.capture_any_ref(excessive).map(drop),
-            receiver.poll_event(excessive).map(drop),
-            receiver.poll_source_name_change(excessive).map(drop),
+            receiver.next_event(excessive).map(drop),
+            receiver.wait_for_source_name_change(excessive).map(drop),
         ] {
             assert!(matches!(result, Err(Error::InvalidInput(_))), "{result:?}");
         }
@@ -3682,7 +3578,7 @@ mod tests {
             let events = scope.spawn(|| {
                 barrier.wait();
                 matches!(
-                    receiver.poll_event(Duration::ZERO).unwrap(),
+                    receiver.next_event(Duration::ZERO).unwrap(),
                     Some(ReceiverEvent::Unknown(987))
                 )
             });
@@ -3804,7 +3700,7 @@ mod tests {
             .capture_result::<VideoKind>(CaptureResult::Notification(Notification::StatusChanged))
             .unwrap();
         assert!(matches!(
-            receiver.poll_event(Duration::ZERO).unwrap(),
+            receiver.next_event(Duration::ZERO).unwrap(),
             Some(ReceiverEvent::StatusChanged(_))
         ));
     }
@@ -3822,7 +3718,7 @@ mod tests {
         assert_eq!(Arc::as_ptr(&fs.receiver().core), original_core);
         let receiver = fs.into_receiver();
         assert!(matches!(
-            receiver.poll_event(Duration::ZERO).unwrap(),
+            receiver.next_event(Duration::ZERO).unwrap(),
             Some(ReceiverEvent::StatusChanged(_))
         ));
         assert!(!receiver.core.pending_status.is_pending());
@@ -3952,16 +3848,14 @@ mod tests {
             let receiver = &receiver;
             let worker = scope.spawn(move || {
                 native_capture_calls::take();
-                assert!(receiver.video().capture(Duration::ZERO).unwrap().is_none());
-                assert!(receiver.poll_event(Duration::ZERO).unwrap().is_none());
+                assert!(receiver.capture_video(Duration::ZERO).unwrap().is_none());
+                assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
                 assert!(receiver
-                    .audio()
-                    .capture(Duration::from_millis(5))
+                    .capture_audio(Duration::from_millis(5))
                     .unwrap()
                     .is_none());
                 assert!(receiver
-                    .metadata()
-                    .capture_ref(Duration::from_millis(5))
+                    .capture_metadata_ref(Duration::from_millis(5))
                     .unwrap()
                     .is_none());
                 done.send(native_capture_calls::take()).unwrap();
@@ -3975,11 +3869,11 @@ mod tests {
         });
     }
 
-    /// A long `poll_event` uses bounded attempts alongside connection changes
+    /// A long `next_event` uses bounded attempts alongside connection changes
     /// and other captures. An event retained by another capture ends that poll
     /// at its next attempt.
     #[test]
-    fn a_long_poll_event_allows_reconnect_and_observes_a_retained_event() {
+    fn a_long_next_event_allows_reconnect_and_observes_a_retained_event() {
         use std::{sync::mpsc, time::Instant};
         let Some(ndi) = crate::test_support::ndi() else {
             return;
@@ -3994,7 +3888,7 @@ mod tests {
                 loop {
                     // Nothing is connected, so only the event published
                     // below ends a poll before its timeout.
-                    let event = receiver.poll_event(Duration::from_secs(5)).unwrap();
+                    let event = receiver.next_event(Duration::from_secs(5)).unwrap();
                     if stop.load(Ordering::Acquire) {
                         return event;
                     }
@@ -4007,7 +3901,7 @@ mod tests {
             let capture = scope.spawn(move || {
                 native_capture_calls::take();
                 let began = Instant::now();
-                let frame = receiver.metadata().capture(budget).unwrap();
+                let frame = receiver.capture_metadata(budget).unwrap();
                 (
                     frame.is_none(),
                     began.elapsed(),
@@ -4043,7 +3937,7 @@ mod tests {
         });
     }
 
-    /// `poll_event` gives each SDK call one poll interval of its timeout at
+    /// `next_event` gives each SDK call one poll interval of its timeout at
     /// most.
     ///
     /// What each call is given, and that the poll ends only once the budget
@@ -4053,7 +3947,7 @@ mod tests {
     /// clock-driven tests below check, such as
     /// `retry_follows_a_full_wait_at_once`.
     #[test]
-    fn poll_event_spends_its_timeout_in_bounded_attempts() {
+    fn next_event_spends_its_timeout_in_bounded_attempts() {
         use std::time::Instant;
         let Some(ndi) = crate::test_support::ndi() else {
             return;
@@ -4061,13 +3955,13 @@ mod tests {
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         // A zero timeout makes exactly one attempt, with a zero SDK wait.
         native_capture_calls::take();
-        assert!(receiver.poll_event(Duration::ZERO).unwrap().is_none());
+        assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
         assert_eq!(native_capture_calls::take_with_longest_wait(), (1, 0));
         // Nothing is connected: the whole budget is spent, in attempts of at
         // most one poll interval each.
         let budget = Duration::from_millis(450);
         let began = Instant::now();
-        assert!(receiver.poll_event(budget).unwrap().is_none());
+        assert!(receiver.next_event(budget).unwrap().is_none());
         assert!(began.elapsed() >= budget, "{:?}", began.elapsed());
         let (calls, longest_wait) = native_capture_calls::take_with_longest_wait();
         assert!(calls >= 1, "{calls} SDK calls");

@@ -25,7 +25,7 @@ use crate::{Error, Result};
 /// assert_eq!(format!("{config:?}"), "AdvancedConfig([REDACTED])");
 /// # Ok::<(), grafton_ndi::Error>(())
 /// ```
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct AdvancedConfig(Arc<str>);
 
 impl AdvancedConfig {

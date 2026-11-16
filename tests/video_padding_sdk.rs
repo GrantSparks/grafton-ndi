@@ -38,8 +38,24 @@ fn verify_owned(frame: &VideoFrame) {
     std::fs::write("/dev/null", frame.data()).unwrap();
     #[cfg(feature = "image-encoding")]
     {
-        std::fs::write("/dev/null", frame.encode_png().unwrap()).unwrap();
-        std::fs::write("/dev/null", frame.encode_jpeg(85).unwrap()).unwrap();
+        std::fs::write(
+            "/dev/null",
+            frame
+                .encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+                    grafton_ndi::image_encoding::ImageFormat::Png,
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            "/dev/null",
+            frame
+                .encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+                    grafton_ndi::image_encoding::ImageFormat::Jpeg(85),
+                ))
+                .unwrap(),
+        )
+        .unwrap();
     }
 }
 
@@ -93,21 +109,23 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
     // Resolve the advertised machine component through equivalent spellings.
     let advertised = sender.source().unwrap();
     let host = advertised.name().split_once(" (").unwrap().0;
-    let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
+    let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips(["127.0.0.1"])).unwrap();
     let cache = SourceCache::new(finder);
     let first = cache
-        .sources_by_host(&host.to_ascii_uppercase(), Duration::from_secs(1))
+        .find_sources_by_host(&host.to_ascii_uppercase(), Duration::from_secs(1))
         .unwrap();
     assert_eq!(
         cache
-            .sources_by_host(&format!("{}.", host.to_ascii_lowercase()), Duration::ZERO)
+            .find_sources_by_host(&format!("{}.", host.to_ascii_lowercase()), Duration::ZERO)
             .unwrap(),
         first
     );
     assert_eq!(cache.len(), 1);
     cache.invalidate(&host.to_ascii_lowercase());
     assert!(cache.is_empty());
-    let rediscovered = cache.sources_by_host(host, Duration::from_secs(1)).unwrap();
+    let rediscovered = cache
+        .find_sources_by_host(host, Duration::from_secs(1))
+        .unwrap();
     let selected = rediscovered
         .into_iter()
         .find(|s| s.name() == advertised.name())
@@ -145,8 +163,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                 "receiver did not produce a frame"
             );
             if let Some(frame) = receiver
-                .video()
-                .capture_ref(Duration::from_millis(100))
+                .capture_video_ref(Duration::from_millis(100))
                 .unwrap()
             {
                 break frame;
@@ -165,8 +182,24 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         assert_eq!(active, 82_176);
         #[cfg(feature = "image-encoding")]
         {
-            std::fs::write("/dev/null", borrowed.encode_png().unwrap()).unwrap();
-            std::fs::write("/dev/null", borrowed.encode_jpeg(85).unwrap()).unwrap();
+            std::fs::write(
+                "/dev/null",
+                borrowed
+                    .encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+                        grafton_ndi::image_encoding::ImageFormat::Png,
+                    ))
+                    .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                "/dev/null",
+                borrowed
+                    .encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+                        grafton_ndi::image_encoding::ImageFormat::Jpeg(85),
+                    ))
+                    .unwrap(),
+            )
+            .unwrap();
         }
         let owned = borrowed.to_owned();
         verify_owned(&owned);
@@ -183,8 +216,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         assert_eq!(reused.data().as_ptr(), reused_pixels);
         drop(borrowed);
         let owned_capture = receiver
-            .video()
-            .capture(Duration::from_secs(10))
+            .capture_video(Duration::from_secs(10))
             .unwrap()
             .expect("a frame within the timeout");
         verify_owned(&owned_capture);
@@ -197,7 +229,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                 AsyncReceiver::new(self::receiver(&ndi, receiver.connection_target()));
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let frame = runtime
-                .block_on(async_receiver.video().capture(Duration::from_secs(10)))
+                .block_on(async_receiver.capture_video(Duration::from_secs(10)))
                 .unwrap()
                 .expect("a frame within the timeout");
             verify_owned(&frame);
@@ -208,7 +240,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             use grafton_ndi::asynchronous::smol::AsyncReceiver;
             let async_receiver =
                 AsyncReceiver::new(self::receiver(&ndi, receiver.connection_target()));
-            let frame = smol::block_on(async_receiver.video().capture(Duration::from_secs(10)))
+            let frame = smol::block_on(async_receiver.capture_video(Duration::from_secs(10)))
                 .unwrap()
                 .expect("a frame within the timeout");
             verify_owned(&frame);
@@ -230,8 +262,24 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                 }
                 #[cfg(feature = "image-encoding")]
                 {
-                    std::fs::write("/dev/null", frame.encode_png().unwrap()).unwrap();
-                    std::fs::write("/dev/null", frame.encode_jpeg(85).unwrap()).unwrap();
+                    std::fs::write(
+                        "/dev/null",
+                        frame
+                            .encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+                                grafton_ndi::image_encoding::ImageFormat::Png,
+                            ))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        "/dev/null",
+                        frame
+                            .encode_image(&grafton_ndi::image_encoding::ImageOptions::new(
+                                grafton_ndi::image_encoding::ImageFormat::Jpeg(85),
+                            ))
+                            .unwrap(),
+                    )
+                    .unwrap();
                 }
                 verify_owned(&frame.to_owned());
                 frame.copy_into(&mut reused);
@@ -249,14 +297,12 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         );
         let _ = framesync
             .receiver()
-            .metadata()
-            .capture(Duration::ZERO)
+            .capture_metadata(Duration::ZERO)
             .unwrap();
         let receiver = framesync.into_receiver();
         verify_owned(
             &receiver
-                .video()
-                .capture(Duration::from_secs(10))
+                .capture_video(Duration::from_secs(10))
                 .unwrap()
                 .expect("a frame within the timeout"),
         );
@@ -268,11 +314,11 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         )
         .unwrap();
         let original = owned.data().as_ptr();
-        assert!(resend.send_video_async(owned).unwrap().is_none());
-        resend.send_video_async_copy(&owned_capture).unwrap();
+        assert!(resend.submit_video(owned).unwrap().is_none());
+        resend.submit_video_copy(&owned_capture).unwrap();
         // The next copy reuses the released original allocation.
-        resend.send_video_async_copy(&owned_capture).unwrap();
-        let last = resend.finish_video_async().unwrap();
+        resend.submit_video_copy(&owned_capture).unwrap();
+        let last = resend.reclaim_video().unwrap();
         assert_eq!(last.data().as_ptr(), original);
         verify_owned(&last);
     });
@@ -284,7 +330,9 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
 #[cfg(feature = "image-encoding")]
 #[test]
 fn live_yuv_frames_encode_from_sdk_rows() {
-    use grafton_ndi::{AlphaMode, Downscale, ImageFormat, ImageOptions, SampleDepth};
+    use grafton_ndi::image_encoding::{
+        AlphaMode, Downscale, ImageFormat, ImageOptions, SampleDepth,
+    };
 
     let Some(ndi) = common::ndi() else {
         return;
@@ -366,8 +414,7 @@ fn live_yuv_frames_encode_from_sdk_rows() {
                         "{format:?} {color_format:?}: no frame"
                     );
                     if let Some(frame) = receiver
-                        .video()
-                        .capture_ref(Duration::from_millis(100))
+                        .capture_video_ref(Duration::from_millis(100))
                         .unwrap()
                     {
                         if frame.width() as usize == width {

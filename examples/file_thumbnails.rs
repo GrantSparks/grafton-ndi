@@ -21,7 +21,7 @@
 //! * This example requires exactly one video track. With program and proxy
 //!   tracks, the 6.4 File player can report a `FirstFrame` timecode that does
 //!   not arrive at the full-bandwidth receiver. Record with
-//!   `RecorderOptions::proxy(false)`, as `file_record` does. A full-bandwidth
+//!   `FileRecorderOptions::proxy(false)`, as `file_record` does. A full-bandwidth
 //!   receiver and [`Downscale::Quarter`] need no recorded proxy.
 //! * After a seek the receiver first delivers the frames it had queued. The
 //!   `FirstFrame` event carries the source timecode of the frame the seek
@@ -38,9 +38,9 @@ use std::{
 };
 
 use grafton_ndi::{
-    file::{FileApi, FilePlayer, FilePosition, FileRuntimeOptions, PlayerEventKind, PlayerOptions},
-    Downscale, Finder, FinderOptions, ImageFormat, ImageOptions, ImageWorkspace, Ndi, Receiver,
-    ReceiverOptions, VideoFrameRef,
+    file::{FileApi, FileApiOptions, FilePlayer, FilePlayerOptions, FilePosition, PlayerEventKind},
+    image_encoding::{Downscale, ImageFormat, ImageOptions, ImageWorkspace},
+    Finder, FinderOptions, Ndi, Receiver, ReceiverOptions, VideoFrameRef,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -60,11 +60,11 @@ fn main() -> Result<()> {
     }
 
     let ndi = Ndi::new()?;
-    let file = FileApi::open(&ndi, &FileRuntimeOptions::default())?;
-    let info = file.probe(&recording)?;
+    let file = FileApi::new(&ndi, &FileApiOptions::default())?;
+    let info = FilePlayer::probe(&file, &recording)?;
     if info.video_track_count() != 1 {
         return Err(
-            "thumbnails require exactly one video track; record with RecorderOptions::proxy(false)"
+            "thumbnails require exactly one video track; record with FileRecorderOptions::proxy(false)"
                 .into(),
         );
     }
@@ -73,11 +73,15 @@ fn main() -> Result<()> {
     // A group of its own keeps the player's source off every other
     // receiver's list.
     let group = format!("thumbnails-{}", std::process::id());
-    let mut player =
-        file.create_player(&PlayerOptions::new("Thumbnails").groups(group.as_str()))?;
+    let mut player = FilePlayer::new(
+        &file,
+        &FilePlayerOptions::new("Thumbnails").groups([group.as_str()]),
+    )?;
     let finder = Finder::new(
         &ndi,
-        &FinderOptions::new().groups(group).extra_ips("127.0.0.1"),
+        &FinderOptions::new()
+            .groups([group])
+            .extra_ips(["127.0.0.1"]),
     )?;
     let name = player.advertised_source()?.name().to_owned();
     let source = finder
@@ -95,7 +99,7 @@ fn main() -> Result<()> {
         if Instant::now() >= connected_by {
             return Err("the thumbnail receiver did not connect".into());
         }
-        receiver.poll_event(Duration::from_millis(50))?;
+        receiver.next_event(Duration::from_millis(50))?;
     }
     player.start(&recording)?;
     for i in 0..count {
@@ -129,10 +133,10 @@ fn first_frame<'a>(player: &mut FilePlayer, receiver: &'a Receiver) -> Result<Vi
     let deadline = Instant::now() + PATIENCE;
     let mut first_frame = None;
     while Instant::now() < deadline {
-        let frame = receiver.video().capture_ref(Duration::from_millis(10))?;
+        let frame = receiver.capture_video_ref(Duration::from_millis(10))?;
         // Read events after capture so a first-frame event queued during that
         // capture can identify this frame before it is released.
-        while let Some(event) = player.poll_event(Duration::ZERO)? {
+        while let Some(event) = player.next_event(Duration::ZERO)? {
             match event.kind() {
                 PlayerEventKind::FirstFrame => {
                     // Keep playback from outrunning capture/encoding and

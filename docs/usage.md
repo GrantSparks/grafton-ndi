@@ -29,15 +29,18 @@ A zero timeout makes one non-waiting attempt, which can miss a busy snapshot
 lock. Native snapshot work, copying and caller predicates can finish after the
 budget. `current_sources()` uses ordinary blocking serialization. Discovery
 cannot guarantee continued availability or observation of every source. Source
-identity compares the name and opaque address text. Construct addresses with
-`SourceAddress::new(text)`; inspect `as_str()` or the derived `is_url()` test.
+identity compares the name and opaque address text. `Source::new(name)?` and
+`SourceAddress::new(text)?` reject interior NULs once at construction. Inspect
+addresses through `as_str()` or the derived `is_url()` test. Finder list settings
+accept iterables, such as `groups(["Public", "Studio"])` and
+`extra_ips(["192.0.2.10"])`; their readback accessors return slices.
 
 Snapshots and accumulated results have bounded, fallible allocations.
 `Error::ResourceLimit` identifies the resource and units through `ResourceKind`.
 Invalid snapshot arrays and allocation failures return `UnexpectedSdkResult`;
 individual malformed descriptors can be skipped. See
 [`Finder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.Finder.html)
-for exact limits. Run [`NDIlib_Find`](../examples/NDIlib_Find.rs) to inspect the
+for exact limits. Run [`find_sources`](../examples/find_sources.rs) to inspect the
 names your network advertises.
 
 ### Keep discovery in server state
@@ -47,7 +50,7 @@ in service state, optionally shared through `Arc<SourceCache>`. It owns the
 finder and retains its runtime, so no lifetime parameter or separately stored
 finder is needed. `cache.finder()` lends that same finder for uncached work.
 
-`sources_by_host(host, timeout)` returns every matching feed, leaving feed
+`find_sources_by_host(host, timeout)` returns every matching feed, leaving feed
 selection to the caller. A miss observes the full discovery window; a hit
 returns owned descriptor copies. Empty results are not cached. Entries remain
 stale until `invalidate(host)` or `clear()` removes them: choose an invalidation
@@ -81,9 +84,10 @@ accessors report stored requests, including unset values, rather than a live
 object's effective settings. Cloning options preserves those requests;
 chainable setters replace them and `clear_*` restores inherited defaults.
 
-Use `receiver.video()`, `.audio()` or `.metadata()` for dedicated media workers.
-Their `capture_ref(timeout)` borrows an SDK buffer; `capture(timeout)` copies
-into an owned frame. A wait that expires returns `Ok(None)`. Different media
+Use `capture_video_ref(timeout)`, `capture_audio_ref(timeout)` or
+`capture_metadata_ref(timeout)` for dedicated media workers. The matching
+`capture_video`, `capture_audio` and `capture_metadata` methods copy into owned
+frames. A wait that expires returns `Ok(None)`. Different media
 workers can capture concurrently; see
 [`concurrent_capture`](../examples/concurrent_capture.rs).
 
@@ -105,9 +109,9 @@ is needed. [`mixed_media_relay`](../examples/mixed_media_relay.rs) demonstrates
 matching items and forwarding borrowed media synchronously.
 
 Combined capture consumes pending and native receiver events. Typed capture
-retains events for `poll_event` or a combined reader. These consumers compete
+retains events for `next_event` or a combined reader. These consumers compete
 for coalesced invalidations; they receive neither broadcasts nor an ordered
-history. After `SourceChanged`, query `poll_source_name_change` for the connected
+history. After `SourceChanged`, query `wait_for_source_name_change` for the connected
 name. The shared wait budget covers bounded native attempts. Connection changes
 may run concurrently. A queued frame may predate the current wait, and a timeout
 alone does not prove disconnection or stale input.
@@ -118,7 +122,9 @@ Create `Sender::new(&ndi, &SenderOptions::new(name))`. Set sender clocking for
 the application's cadence, and construct video with an explicit `FrameRate`
 when 60 fps is unsuitable. Owned, borrowed and compressed video construction
 all default to 60 fps. The default picture aspect uses square pixels; set
-`picture_aspect_ratio` for anamorphic output. Captured and copied timing/aspect
+`picture_aspect_ratio(PictureAspectRatio::new(ratio)?)` for anamorphic output.
+Aspect accessors return that validated type; `.get()` reads its numeric value.
+Captured and copied timing/aspect
 properties are preserved.
 
 Choose the send method by storage ownership:
@@ -126,18 +132,18 @@ Choose the send method by storage ownership:
 | Input | Method | When storage can be reused |
 | --- | --- | --- |
 | Owned or borrowed media | `send_video`, `send_audio`, `send_metadata` | When the synchronous call returns |
-| Owned video | `send_video_async` | When a later call returns the completed frame |
-| Borrowed video | `send_video_async_copy` | Input is copied into reusable sender storage before submission |
+| Owned video | `submit_video` | When a later call returns the completed frame |
+| Borrowed video | `submit_video_copy` | Input is copied into reusable sender storage before submission |
 
 The SDK's asynchronous send pipeline is separate from Rust futures and may
 block while synchronizing. Reuse two owned frames and recover the final one
-with `finish_video_async()`; see [`async_send`](../examples/async_send.rs).
-[`async_send_copy`](../examples/async_send_copy.rs) shows the copying variant.
+with `reclaim_video()`; see [`submit_video`](../examples/submit_video.rs).
+[`submit_video_copy`](../examples/submit_video_copy.rs) shows the copying variant.
 
 `VideoSource`, `AudioSource` and `MetadataSource` let synchronous operations
 accept owned frames and validated borrowed captures directly. Native audio
 conversion also accepts borrowed audio and writes into caller-provided output;
-see [`NDIlib_Recv_Audio_16bpp`](../examples/NDIlib_Recv_Audio_16bpp.rs).
+see [`receive_audio_i16`](../examples/receive_audio_i16.rs).
 Borrowing a frame avoids an intermediate owned copy but does not guarantee an
 in-place video send: padded captures and formats needing SDK tail room use
 reusable staging. `frame.sends_in_place()` reports the selected path.
@@ -178,7 +184,7 @@ the receiver in `Rejected` on failure. It reserves raw video and audio capture;
 `receiver()` still provides metadata and shared controls. Native synchronization
 can consume status notifications, so attached receivers have no event polling.
 Query `ptz().is_supported()`, `web_control_url()` or KVM support for capabilities,
-`poll_source_name_change()` for the source, and `is_connected()` or
+`wait_for_source_name_change()` for the source, and `is_connected()` or
 `connection_stats()` for connection state.
 `into_receiver()` restores ordinary capture.
 
@@ -256,7 +262,7 @@ This monitor is a recent-reception heuristic and does not reconnect automaticall
 Use `set_tally` for upstream program/preview state, `ptz()` for supported camera
 controls, and `send_metadata` for upstream metadata (`Error::NotConnected` when
 there is no source). [`status_monitor`](../examples/status_monitor.rs) shows
-status events; [`NDIlib_Recv_PTZ`](../examples/NDIlib_Recv_PTZ.rs) checks PTZ
+status events; [`receive_ptz`](../examples/receive_ptz.rs) checks PTZ
 support before sending controls.
 
 `connect_to(&source)` remembers a new requested target; `connection_target()`
@@ -265,7 +271,7 @@ it. Success means the request was issued; observe connection state and media
 progress separately.
 
 The connection target is the last local request. A Discovery Server client's
-remote source change is observed through `poll_source_name_change()` and does
+remote source change is observed through `wait_for_source_name_change()` and does
 not update `connection_target()`. Calling `reconnect()` requests the local
 target again, replacing any remote routing.
 
@@ -281,7 +287,7 @@ callback; each native wait lasts at most 100 ms.
 
 Wrap a configured finder in `asynchronous::<runtime>::AsyncFinder::new(finder)`
 for `find_source`, `find_source_by_name` and `find_sources`. `AsyncSourceCache`
-also provides `sources_by_host`. These calls use the same first-poll budget and
+also provides `find_sources_by_host`. These calls use the same first-poll budget and
 cancellation rule. Invalid names, host queries and timeouts are refused before
 worker submission. Predicates must be `Send + 'static`, and a running predicate
 or snapshot copy finishes. Async waits slice native calls into at most 100 ms;
@@ -292,7 +298,8 @@ Take snapshots and wait through that same cursor. Failed or dropped operations
 leave its generation unchanged, so a report published while a wait was abandoned
 is visible to its next wait. Each consumer creates its own watch.
 
-Use typed `capture_with(timeout, callback)` or mixed
+Use typed `capture_video_with(timeout, callback)`, `capture_audio_with` or
+`capture_metadata_with`, or mixed
 `capture_any_with(timeout, callback)` for immediate inspection. A synchronous
 callback borrows validated media on the capturing worker; only its
 `Send + 'static` result crosses back to the task. The callback and its captures
@@ -305,11 +312,14 @@ cancelled blocking task.
 Keep callbacks bounded: they hold an SDK buffer and occupy a worker. The wait
 timeout does not bound callback duration or cancel its side effects. Scoped
 processing makes no wrapper payload copies; runtime/task and user callback
-allocations still apply. Owned `capture`/`capture_any`, or `to_owned()` within a
+allocations still apply. Owned `capture_video`/`capture_audio`/`capture_metadata`
+and `capture_any`, or `to_owned()` within a
 callback, copy media for retention across awaits.
 [`mixed_media_async`](../examples/mixed_media_async.rs) shows both runtimes.
 Use async reconnect/event methods for waits; waiting through the synchronous
 `receiver()` blocks the calling thread.
+Use that same `receiver()` view for non-blocking controls and diagnostics,
+including `is_connected`, `connection_stats`, tally and PTZ.
 
 ## Optional workflows
 

@@ -188,7 +188,7 @@ impl<'a> Run<'a> {
             }
             cycle.stats = receiver.connection_stats().unwrap();
         }
-        cycle.sender_connections = match self.sender.connection_count(Duration::ZERO) {
+        cycle.sender_connections = match self.sender.connection_count() {
             Ok(count) => format!("sender connections {count}"),
             Err(error) => format!("sender connection count failed: {error}"),
         };
@@ -206,7 +206,7 @@ impl<'a> Run<'a> {
             if outcome.counted.is_none() && receiver.connection_stats().unwrap().connections() > 0 {
                 outcome.counted = Some(since.elapsed());
             }
-            if receiver.video().capture(SLICE).unwrap().is_some() {
+            if receiver.capture_video(SLICE).unwrap().is_some() {
                 outcome.framed = Some(since.elapsed());
                 break;
             }

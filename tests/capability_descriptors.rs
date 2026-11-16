@@ -73,7 +73,7 @@ fn calls(prefix: &str) -> usize {
 fn refused(error: &Error, expected: RuntimeFeature) {
     assert!(
         matches!(error, Error::UnsupportedCapability {
-        feature, refusal: grafton_ndi::CapabilityRefusal::RuntimeTooOld { .. }, ..
+        capability: grafton_ndi::Capability::Runtime(feature), refusal: grafton_ndi::CapabilityRefusal::RuntimeTooOld { .. }, ..
     } if *feature == expected),
         "wrong gate refusal: {error}"
     );
@@ -149,7 +149,7 @@ fn run_child(library: &Path, modern: bool, directory: &Path) {
 fn sending(ndi: &Ndi, modern: bool) {
     let mut sender = Sender::new(ndi, &SenderOptions::new("descriptor gates")).unwrap();
     let earlier = frame(PixelFormat::Bgra);
-    assert!(sender.send_video_async(earlier).unwrap().is_none());
+    assert!(sender.submit_video(earlier).unwrap().is_none());
     for format in PIXELS {
         let supported = modern || !gated(format);
         let input = frame(format);
@@ -162,7 +162,7 @@ fn sending(ndi: &Ndi, modern: bool) {
         assert_eq!(calls("video-send:"), before + usize::from(supported));
         let pixels = input.data().as_ptr();
         let before = calls("sender-submit");
-        match sender.send_video_async(input) {
+        match sender.submit_video(input) {
             Ok(_) => assert!(supported),
             Err(rejected) => {
                 assert!(!supported);
@@ -176,19 +176,19 @@ fn sending(ndi: &Ndi, modern: bool) {
         let input = frame(format);
         let before = calls("sender-submit");
         accepted(
-            sender.send_video_async_copy(&input),
+            sender.submit_video_copy(&input),
             supported,
             RuntimeFeature::Planar444Video,
         );
         assert_eq!(calls("sender-submit"), before + usize::from(supported));
     }
-    assert!(sender.finish_video_async().is_some());
+    assert!(sender.reclaim_video().is_some());
     // A refusal must also leave a prior owned submission untouched.
     if !modern {
         let mut sender = Sender::new(ndi, &SenderOptions::new("pending descriptor gate")).unwrap();
         let earlier = frame(PixelFormat::Bgra);
         let pointer = earlier.data().as_ptr();
-        sender.send_video_async(earlier).unwrap();
+        sender.submit_video(earlier).unwrap();
         for format in [
             PixelFormat::Na48,
             PixelFormat::Nb48,
@@ -197,13 +197,10 @@ fn sending(ndi: &Ndi, modern: bool) {
         ] {
             let input = frame(format);
             assert!(sender.send_video(&input).is_err());
-            assert!(sender.send_video_async_copy(&input).is_err());
-            assert!(sender.send_video_async(input).is_err());
+            assert!(sender.submit_video_copy(&input).is_err());
+            assert!(sender.submit_video(input).is_err());
         }
-        assert_eq!(
-            sender.finish_video_async().unwrap().data().as_ptr(),
-            pointer
-        );
+        assert_eq!(sender.reclaim_video().unwrap().data().as_ptr(), pointer);
     }
 }
 
@@ -235,7 +232,7 @@ fn receiving(ndi: &Ndi, modern: bool) {
             } else {
                 None
             };
-            let options = ReceiverOptions::new(Source::new("fixture"))
+            let options = ReceiverOptions::new(Source::new("fixture").unwrap())
                 .color_format(color)
                 .bandwidth(bandwidth);
             let before = calls("receiver-create");
@@ -252,12 +249,11 @@ fn receiving(ndi: &Ndi, modern: bool) {
             );
         }
     }
-    let malformed = ReceiverOptions::new(Source::new("fixture\0name"))
+    let malformed = ReceiverOptions::new(Source::new("fixture").unwrap())
+        .name("fixture\0name")
         .color_format(ReceiverColorFormat::Best444);
     let before = calls("receiver-create");
-    let error = Receiver::new(ndi, &malformed)
-        .err()
-        .expect("invalid source name");
+    let error = Receiver::new(ndi, &malformed).expect_err("invalid receiver name");
     if modern {
         assert!(matches!(error, Error::InvalidCString(_)));
     } else {
@@ -269,7 +265,7 @@ fn receiving(ndi: &Ndi, modern: bool) {
 #[cfg(feature = "advanced")]
 fn advanced(ndi: &Ndi, modern: bool) {
     use grafton_ndi::advanced::{
-        AdvancedConfig, AvSync, AvSyncOutcome, AvSyncRequest, AvSyncVideo, QueueOptions,
+        AdvancedConfig, AvSync, AvSyncOutcome, AvSyncRequest, AvSyncVideo, QueueLimits,
         QueuedSender, QueuedVideoFrame,
     };
     if let Err(error) = ndi.require_feature(RuntimeFeature::SendCompletion) {
@@ -298,7 +294,7 @@ fn advanced(ndi: &Ndi, modern: bool) {
             RuntimeFeature::ReceiveVideoOnly,
         ),
     ] {
-        let options = ReceiverOptions::new(Source::new("configured gate fixture"))
+        let options = ReceiverOptions::new(Source::new("configured gate fixture").unwrap())
             .color_format(color)
             .bandwidth(bandwidth)
             .config(AdvancedConfig::parse("{}").unwrap());
@@ -309,7 +305,7 @@ fn advanced(ndi: &Ndi, modern: bool) {
     let mut queue = QueuedSender::new(
         ndi,
         &SenderOptions::new("queued descriptor gates"),
-        QueueOptions::default(),
+        &QueueLimits::default(),
     )
     .unwrap();
     for format in PIXELS {
@@ -321,7 +317,7 @@ fn advanced(ndi: &Ndi, modern: bool) {
             Ok(_) => {
                 assert!(supported);
                 let completed = queue
-                    .try_take_completed()
+                    .try_next_completed()
                     .expect("immediate native completion");
                 let QueuedVideoFrame::Pixels(recovered) = completed.into_frame() else {
                     panic!("wrong queued variant")
@@ -340,8 +336,11 @@ fn advanced(ndi: &Ndi, modern: bool) {
         assert_eq!(calls("sender-submit"), before + usize::from(supported));
         assert_eq!(queue.retained_frames(), 0);
     }
-    let receiver =
-        Receiver::new(ndi, &ReceiverOptions::new(Source::new("AV sync fixture"))).unwrap();
+    let receiver = Receiver::new(
+        ndi,
+        &ReceiverOptions::new(Source::new("AV sync fixture").unwrap()),
+    )
+    .unwrap();
     let mut sync = AvSync::new(receiver).unwrap();
     for (serial, (token, format)) in [
         ("gate-na48", PixelFormat::Na48),
@@ -356,8 +355,7 @@ fn advanced(ndi: &Ndi, modern: bool) {
         std::env::set_var("GRAFTON_FAKE_CAPTURE_SCRIPT", format!("{serial}:{token}"));
         let captured = sync
             .receiver()
-            .video()
-            .capture_ref(Duration::ZERO)
+            .capture_video_ref(Duration::ZERO)
             .unwrap()
             .unwrap();
         assert_eq!(captured.pixel_format(), format);
@@ -402,11 +400,14 @@ fn advanced(ndi: &Ndi, modern: bool) {
 
 #[cfg(feature = "advanced")]
 fn synchronizer_lifetimes(ndi: &Ndi) {
-    use grafton_ndi::advanced::{AdvancedConfig, AvSync, Genlock};
+    use grafton_ndi::advanced::{AdvancedConfig, AvSync, Genlock, GenlockOptions};
     for recover in [false, true] {
         let start = events().len();
-        let receiver =
-            Receiver::new(ndi, &ReceiverOptions::new(Source::new("lifetime fixture"))).unwrap();
+        let receiver = Receiver::new(
+            ndi,
+            &ReceiverOptions::new(Source::new("lifetime fixture").unwrap()),
+        )
+        .unwrap();
         let sync = AvSync::new(receiver).unwrap();
         if recover {
             drop(sync.into_receiver());
@@ -426,14 +427,18 @@ fn synchronizer_lifetimes(ndi: &Ndi) {
         );
         return;
     }
-    let source = Source::new("genlock-source");
+    let source = Source::new("genlock-source").unwrap();
     let config = AdvancedConfig::parse(r#"{"marker":"alive"}"#).unwrap();
-    let mut genlock = Genlock::new(ndi, Some(&source), Some(&config)).unwrap();
+    let mut genlock = Genlock::new(
+        ndi,
+        &GenlockOptions::new()
+            .source(source.clone())
+            .config(config.clone()),
+    )
+    .unwrap();
     drop(source);
     drop(config);
-    genlock
-        .connect(Some(&Source::new("genlock-reconnected")))
-        .unwrap();
+    genlock.connect_to(&Source::new("genlock-reconnected").unwrap());
     drop(genlock);
     assert!(events().contains(r#"genlock-destroy:genlock-reconnected:{"marker":"alive"}"#));
 }
@@ -451,11 +456,11 @@ fn allocator_lifetimes(ndi: &Ndi) {
         return;
     }
     let service =
-        AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default()).unwrap();
+        AllocatorService::new(ndi.process_lifetime(), &AllocatorLimits::default()).unwrap();
     for packets in [false, true] {
         for recover in [false, true] {
             let start = events().len();
-            let options = ReceiverOptions::new(Source::new("allocator lifetime fixture"));
+            let options = ReceiverOptions::new(Source::new("allocator lifetime fixture").unwrap());
             if packets {
                 let receiver = PacketReceiver::new(ndi, &options, PassthroughPreset::Hevc).unwrap();
                 let mut receiver = service.attach_packets(receiver).unwrap();

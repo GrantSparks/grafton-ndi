@@ -15,17 +15,17 @@ use crate::Error;
 ///
 /// ```no_run
 /// use grafton_ndi::{
-///     discovery::{AdvertiserOptions, SendAdvertisement, SendAdvertiser},
+///     discovery_server::{AdvertiserOptions, SendAdvertisement, SendAdvertiser},
 ///     Sender, SenderOptions, Ndi,
 /// };
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// let ndi = Ndi::new()?;
-/// let server = AdvertiserOptions::default().servers("127.0.0.1");
+/// let server = AdvertiserOptions::default().servers(["127.0.0.1"]);
 /// let mut studio = SendAdvertiser::new(&ndi, &server)?;
 /// let mut backup = SendAdvertiser::new(&ndi, &server)?;
 /// let sender = Sender::new(&ndi, &SenderOptions::new("Camera 1"))?;
-/// let registration = studio.register(&sender, SendAdvertisement::default())?;
+/// let registration = studio.register(&sender, &SendAdvertisement::default())?;
 ///
 /// // Only the advertiser that issued a registration can remove it. Another
 /// // one hands it back with the reason instead of consuming it.

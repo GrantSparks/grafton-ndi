@@ -1,7 +1,7 @@
-error[E0599]: the method `poll_event` exists for reference `&grafton_ndi::Receiver<FrameSyncAttached>`, but its trait bounds were not satisfied
+error[E0599]: the method `next_event` exists for reference `&grafton_ndi::Receiver<FrameSyncAttached>`, but its trait bounds were not satisfied
  --> tests/ui/fail/framesync_receiver_has_no_event_polling.rs:5:29
   |
-5 |     let _ = sync.receiver().poll_event(Duration::ZERO);
+5 |     let _ = sync.receiver().next_event(Duration::ZERO);
   |                             ^^^^^^^^^^ method cannot be called on `&grafton_ndi::Receiver<FrameSyncAttached>` due to unsatisfied trait bounds
   |
  ::: src/receiver.rs

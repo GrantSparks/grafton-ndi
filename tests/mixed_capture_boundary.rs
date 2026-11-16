@@ -82,7 +82,8 @@ fn native_payload(kind: &str) -> usize {
 
 fn exercise(library: std::path::PathBuf) {
     let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
-    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("fixture"))).unwrap();
+    let receiver =
+        Receiver::new(&ndi, &ReceiverOptions::new(Source::new("fixture").unwrap())).unwrap();
     script(1, "video,planar,alpha,audio,metadata,status,source,unknown");
     for (kind, payload) in [("video", 32), ("planar", 24), ("alpha", 24)] {
         let before = frees("video");
@@ -105,7 +106,7 @@ fn exercise(library: std::path::PathBuf) {
             .flatten()
             .all(|&pixel| pixel == 37));
         assert_eq!(frame.frame_rate(), FrameRate::new(30_000, 1001).unwrap());
-        assert_eq!(frame.picture_aspect_ratio(), 1.25);
+        assert_eq!(frame.picture_aspect_ratio().get(), 1.25);
         assert_eq!(frame.scan_type(), ScanType::Field1);
         assert_eq!(frame.timecode(), Timecode::from_ticks(1234));
         assert_eq!(frame.timestamp().unwrap().ticks(), 5678);
@@ -114,7 +115,7 @@ fn exercise(library: std::path::PathBuf) {
             unreachable!()
         };
         assert_eq!(owned.data(), vec![37; payload]);
-        assert_eq!(owned.picture_aspect_ratio(), 1.25);
+        assert_eq!(owned.picture_aspect_ratio().get(), 1.25);
         assert_eq!(owned.metadata(), Some("<video/>"));
         assert_eq!(owned.timecode(), frame.timecode());
         assert_eq!(frees("video"), before);
@@ -156,7 +157,7 @@ fn exercise(library: std::path::PathBuf) {
         assert_eq!(event, expected);
     }
     assert!(
-        receiver.poll_event(Duration::ZERO).unwrap().is_none(),
+        receiver.next_event(Duration::ZERO).unwrap().is_none(),
         "returned events must not be retained again"
     );
 
@@ -164,7 +165,7 @@ fn exercise(library: std::path::PathBuf) {
     // reports the same value once through its own event constructor.
     script(90, "unknown");
     assert_eq!(
-        receiver.poll_event(Duration::ZERO).unwrap(),
+        receiver.next_event(Duration::ZERO).unwrap(),
         Some(ReceiverEvent::Unknown(987))
     );
     assert!(log().lines().last().unwrap().ends_with(":000:0"));
@@ -175,15 +176,14 @@ fn exercise(library: std::path::PathBuf) {
         Some(ReceiverItemRef::Event(ReceiverEvent::Unknown(987)))
     ));
     assert!(log().lines().last().unwrap().ends_with(":111:0"));
-    assert!(receiver.poll_event(Duration::ZERO).unwrap().is_none());
+    assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
     assert!(receiver.capture_any_ref(Duration::ZERO).unwrap().is_none());
 
     // Typed capture retains an invalidation and combined capture consumes it
     // without making another native call, including for a zero timeout.
     script(2, "status");
     assert!(receiver
-        .audio()
-        .capture_ref(Duration::ZERO)
+        .capture_audio_ref(Duration::ZERO)
         .unwrap()
         .is_none());
     let calls = captures();
@@ -192,7 +192,7 @@ fn exercise(library: std::path::PathBuf) {
         Some(ReceiverItem::Event(ReceiverEvent::StatusChanged(_)))
     ));
     assert_eq!(captures(), calls);
-    assert!(receiver.poll_event(Duration::ZERO).unwrap().is_none());
+    assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
 
     for (serial, token, family) in [
         (3, "bad-video", "video"),
@@ -336,7 +336,13 @@ fn exercise_async(ndi: &Ndi) {
             .is_none());
         cancel_scoped(receiver, serial + 500, true, true).await;
     }
-    let make = || Receiver::new(ndi, &ReceiverOptions::new(Source::new("async fixture"))).unwrap();
+    let make = || {
+        Receiver::new(
+            ndi,
+            &ReceiverOptions::new(Source::new("async fixture").unwrap()),
+        )
+        .unwrap()
+    };
     #[cfg(feature = "tokio")]
     ::tokio::runtime::Builder::new_current_thread()
         .build()
@@ -402,8 +408,7 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
         let before = frees("video");
         let once = Box::new(bytes);
         let summary = receiver
-            .video()
-            .capture_with(Duration::ZERO, move |frame| {
+            .capture_video_with(Duration::ZERO, move |frame| {
                 assert_ne!(std::thread::current().id(), caller);
                 assert!(frame.data().is_none());
                 assert_eq!(
@@ -440,8 +445,7 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
             .unwrap();
         assert_eq!(frees("video"), before + 1);
         let owned = receiver
-            .video()
-            .capture(Duration::ZERO)
+            .capture_video(Duration::ZERO)
             .await
             .unwrap()
             .unwrap();
@@ -488,8 +492,7 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
     );
     let before = frees("audio");
     let audio = receiver
-        .audio()
-        .capture_with(Duration::ZERO, |frame| {
+        .capture_audio_with(Duration::ZERO, |frame| {
             assert!(frame.data().is_none());
             assert_eq!(
                 frame.channel_data(0).unwrap().as_ptr() as usize,
@@ -518,8 +521,7 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
     let before = frees("metadata");
     assert_eq!(
         receiver
-            .metadata()
-            .capture_with(Duration::ZERO, |frame| {
+            .capture_metadata_with(Duration::ZERO, |frame| {
                 assert_eq!(frame.data().as_ptr() as usize, native_payload("metadata"));
                 (frame.data().len(), frame.timecode())
             })
@@ -538,8 +540,7 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
     assert_eq!(metadata.data(), "<metadata/>");
     assert_eq!(frees("metadata"), before + 2);
     assert!(receiver
-        .video()
-        .capture_with(Duration::ZERO, |_| panic!("notification"))
+        .capture_video_with(Duration::ZERO, |_| panic!("notification"))
         .await
         .unwrap()
         .is_none());
@@ -571,7 +572,7 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
             Some(expected)
         );
     }
-    assert!(receiver.poll_event(Duration::ZERO).await.unwrap().is_none());
+    assert!(receiver.next_event(Duration::ZERO).await.unwrap().is_none());
 
     for (index, token, family) in [
         (20, "bad-video", "video"),
@@ -583,20 +584,17 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
         let typed: grafton_ndi::Result<Option<()>> = match family {
             "video" => {
                 receiver
-                    .video()
-                    .capture_with(Duration::ZERO, |_| panic!("invalid video"))
+                    .capture_video_with(Duration::ZERO, |_| panic!("invalid video"))
                     .await
             }
             "audio" => {
                 receiver
-                    .audio()
-                    .capture_with(Duration::ZERO, |_| panic!("invalid audio"))
+                    .capture_audio_with(Duration::ZERO, |_| panic!("invalid audio"))
                     .await
             }
             _ => {
                 receiver
-                    .metadata()
-                    .capture_with(Duration::ZERO, |_| panic!("invalid text"))
+                    .capture_metadata_with(Duration::ZERO, |_| panic!("invalid text"))
                     .await
             }
         };
@@ -611,8 +609,7 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
     }
     script(serial + 30, "none,none,error,error");
     assert!(receiver
-        .video()
-        .capture_with(Duration::ZERO, |_| panic!("miss"))
+        .capture_video_with(Duration::ZERO, |_| panic!("miss"))
         .await
         .unwrap()
         .is_none());
@@ -622,7 +619,7 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
         .unwrap()
         .is_none());
     assert!(matches!(
-        receiver.video().capture_with(Duration::ZERO, |_| ()).await,
+        receiver.capture_video_with(Duration::ZERO, |_| ()).await,
         Err(Error::ConnectionLost)
     ));
     assert!(matches!(
@@ -631,7 +628,7 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
     ));
     let calls = captures();
     assert!(matches!(
-        receiver.video().capture_with(Duration::MAX, |_| ()).await,
+        receiver.capture_video_with(Duration::MAX, |_| ()).await,
         Err(Error::InvalidInput(_))
     ));
     assert!(matches!(
@@ -652,20 +649,17 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
             match family {
                 "video" => {
                     receiver
-                        .video()
-                        .capture_with(Duration::ZERO, |_| panic!("callback panic"))
+                        .capture_video_with(Duration::ZERO, |_| panic!("callback panic"))
                         .await
                 }
                 "audio" => {
                     receiver
-                        .audio()
-                        .capture_with(Duration::ZERO, |_| panic!("callback panic"))
+                        .capture_audio_with(Duration::ZERO, |_| panic!("callback panic"))
                         .await
                 }
                 _ => {
                     receiver
-                        .metadata()
-                        .capture_with(Duration::ZERO, |_| panic!("callback panic"))
+                        .capture_metadata_with(Duration::ZERO, |_| panic!("callback panic"))
                         .await
                 }
             }
@@ -692,8 +686,7 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
         let before = frees("video");
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let video = receiver.video();
-        let mut abandoned = Box::pin(video.capture_with(Duration::ZERO, move |_| {
+        let mut abandoned = Box::pin(receiver.capture_video_with(Duration::ZERO, move |_| {
             entered_tx.send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             std::panic::panic_any(77_u32);
@@ -715,8 +708,7 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(receiver
-            .video()
-            .capture(Duration::ZERO)
+            .capture_video(Duration::ZERO)
             .await
             .unwrap()
             .is_some());
@@ -727,13 +719,11 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
     script(serial + 50, "video,audio");
     let reenter = receiver.clone();
     receiver
-        .video()
-        .capture_with(Duration::ZERO, move |_| {
+        .capture_video_with(Duration::ZERO, move |_| {
             reenter.receiver().reconnect();
             assert!(reenter
                 .receiver()
-                .audio()
-                .capture_ref(Duration::ZERO)
+                .capture_audio_ref(Duration::ZERO)
                 .unwrap()
                 .is_some());
         })
@@ -795,8 +785,7 @@ async fn cancel_scoped<R: grafton_ndi::asynchronous::AsyncRuntime>(
     let mut future = Box::pin(async {
         if typed {
             receiver
-                .video()
-                .capture_with(Duration::from_millis(200), move |frame| {
+                .capture_video_with(Duration::from_millis(200), move |frame| {
                     process(frame.width())
                 })
                 .await

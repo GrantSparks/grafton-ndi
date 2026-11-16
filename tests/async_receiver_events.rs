@@ -1,5 +1,5 @@
 //! An async receiver reaches its whole receiver: the status changes that its
-//! captures pass over are returned by `AsyncReceiver::poll_event`, as
+//! captures pass over are returned by `AsyncReceiver::next_event`, as
 //! `receiver_status_notifications.rs` shows for the synchronous captures, and
 //! its async connection changes reach the SDK receiver.
 #![cfg(any(feature = "tokio", feature = "smol"))]
@@ -25,7 +25,7 @@ fn wait_until(stage: &str, mut condition: impl FnMut() -> bool) {
 }
 
 /// Each async capture kind keeps the status change its receiver's capability
-/// update causes, for `AsyncReceiver::poll_event`. The waits for the SDK to
+/// update causes, for `AsyncReceiver::next_event`. The waits for the SDK to
 /// see each update use the lent receiver's controls.
 async fn async_capture_retains_capability_notifications<R: AsyncRuntime>(
     ndi: &Ndi,
@@ -47,8 +47,10 @@ async fn async_capture_retains_capability_notifications<R: AsyncRuntime>(
         let source = common::loopback_source(ndi, sender)?;
         eprintln!("{runtime} capture case {kind}: connecting to {source:?}");
         let media = AsyncReceiver::<R>::new(Receiver::new(ndi, &ReceiverOptions::new(source))?);
-        wait_until("initial receiver connection", || media.is_connected());
-        while media.poll_event(Duration::from_millis(50)).await?.is_some() {}
+        wait_until("initial receiver connection", || {
+            media.receiver().is_connected()
+        });
+        while media.next_event(Duration::from_millis(50)).await?.is_some() {}
         assert!(!media.receiver().ptz().is_supported());
         // The same two capability invalidations as the synchronous test, with
         // its single-invalidation coverage on Windows.
@@ -84,27 +86,27 @@ async fn async_capture_retains_capability_notifications<R: AsyncRuntime>(
                 Duration::from_secs(3)
             };
             match kind {
-                0 => assert!(media.video().capture(timeout).await?.is_none()),
-                1 => assert!(media.audio().capture(timeout).await?.is_none()),
+                0 => assert!(media.capture_video(timeout).await?.is_none()),
+                1 => assert!(media.capture_audio(timeout).await?.is_none()),
                 _ => {
                     // The SDK can also deliver capability XML as ordinary
                     // metadata. Consume those frames until the status result.
                     let deadline = Instant::now() + Duration::from_secs(10);
-                    while media.metadata().capture(timeout).await?.is_some() {
+                    while media.capture_metadata(timeout).await?.is_some() {
                         assert!(Instant::now() < deadline, "metadata queue did not drain");
                     }
                 }
             }
             assert!(
                 matches!(
-                    media.poll_event(Duration::ZERO).await?,
+                    media.next_event(Duration::ZERO).await?,
                     Some(ReceiverEvent::StatusChanged(_))
                 ),
                 "{runtime} capture kind {kind} lost status"
             );
             assert!(
                 !matches!(
-                    media.poll_event(Duration::ZERO).await?,
+                    media.next_event(Duration::ZERO).await?,
                     Some(ReceiverEvent::StatusChanged(_))
                 ),
                 "notification replayed"
@@ -126,13 +128,13 @@ async fn async_connection_changes_reach_the_receiver<R: AsyncRuntime>(
     )?;
     let source = common::loopback_source(ndi, &sender)?;
     // Created for no source at all, so only `connect_to` can connect it.
-    let nowhere = Source::new("");
+    let nowhere = Source::new("").unwrap();
     let media =
         AsyncReceiver::<R>::new(Receiver::new(ndi, &ReceiverOptions::new(nowhere.clone()))?);
-    assert!(!media.is_connected());
+    assert!(!media.receiver().is_connected());
 
     media.connect_to(&source).await?;
-    wait_until("connect_to", || media.is_connected());
+    wait_until("connect_to", || media.receiver().is_connected());
     if ndi
         .require_feature(RuntimeFeature::ConnectedSourceName)
         .is_ok()
@@ -141,7 +143,7 @@ async fn async_connection_changes_reach_the_receiver<R: AsyncRuntime>(
         loop {
             assert!(Instant::now() < deadline, "no source-name change reported");
             match media
-                .poll_source_name_change(Duration::from_millis(500))
+                .wait_for_source_name_change(Duration::from_millis(500))
                 .await?
             {
                 Some(SourceNameChange::Connected(name)) if name == source.name() => {
@@ -154,10 +156,12 @@ async fn async_connection_changes_reach_the_receiver<R: AsyncRuntime>(
     }
 
     media.disconnect().await?;
-    wait_until("disconnect", || !media.is_connected());
+    wait_until("disconnect", || !media.receiver().is_connected());
     assert_eq!(media.receiver().connection_target(), source);
     media.reconnect().await?;
-    wait_until("reconnect to the latest target", || media.is_connected());
+    wait_until("reconnect to the latest target", || {
+        media.receiver().is_connected()
+    });
     assert_eq!(media.receiver().connection_target(), source);
     Ok(())
 }
@@ -172,7 +176,7 @@ mod tokio_runtime {
     }
 
     #[test]
-    fn tokio_capture_retains_notifications_for_poll_event() -> Result<(), Error> {
+    fn tokio_capture_retains_notifications_for_next_event() -> Result<(), Error> {
         let Some(ndi) = common::ndi() else {
             return Ok(());
         };
@@ -198,7 +202,7 @@ mod smol_runtime {
     use grafton_ndi::asynchronous::Smol;
 
     #[test]
-    fn smol_capture_retains_notifications_for_poll_event() -> Result<(), Error> {
+    fn smol_capture_retains_notifications_for_next_event() -> Result<(), Error> {
         let Some(ndi) = common::ndi() else {
             return Ok(());
         };

@@ -50,8 +50,8 @@ fn kvm_release_precedes_connection_changes_on_the_same_receiver() {
 
 fn exercise_kvm(library: std::path::PathBuf) {
     let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
-    let first = Source::new("STUDIO (A)");
-    let next = Source::new("STUDIO (B)");
+    let first = Source::new("STUDIO (A)").unwrap();
+    let next = Source::new("STUDIO (B)").unwrap();
     let mut receiver = Receiver::new(&ndi, &ReceiverOptions::new(first.clone())).unwrap();
     if !ndi.capabilities().supports(RuntimeFeature::Kvm) {
         assert!(matches!(
@@ -64,7 +64,7 @@ fn exercise_kvm(library: std::path::PathBuf) {
     let mut session = receiver.kvm().unwrap();
     let before = fs::read_to_string(&log_path).unwrap();
     let view = session.receiver();
-    let _ = (view.video(), view.audio(), view.metadata(), view.ptz());
+    let _ = view.ptz();
     assert_eq!(fs::read_to_string(&log_path).unwrap(), before);
     assert_eq!(view.connection_target(), first);
     view.set_tally(grafton_ndi::Tally::new(true, false));
@@ -77,13 +77,9 @@ fn exercise_kvm(library: std::path::PathBuf) {
         "GRAFTON_FAKE_CAPTURE_SCRIPT",
         "kvm:video,audio,metadata,status,video",
     );
-    let video = view.video().capture_ref(Duration::ZERO).unwrap().unwrap();
-    let audio = view.audio().capture_ref(Duration::ZERO).unwrap().unwrap();
-    let metadata = view
-        .metadata()
-        .capture_ref(Duration::ZERO)
-        .unwrap()
-        .unwrap();
+    let video = view.capture_video_ref(Duration::ZERO).unwrap().unwrap();
+    let audio = view.capture_audio_ref(Duration::ZERO).unwrap().unwrap();
+    let metadata = view.capture_metadata_ref(Duration::ZERO).unwrap().unwrap();
     assert!(view.capture_any_ref(Duration::ZERO).unwrap().is_some());
     let mixed = view.capture_any_ref(Duration::ZERO).unwrap();
     assert_eq!(
@@ -100,7 +96,7 @@ fn exercise_kvm(library: std::path::PathBuf) {
     session.release_all().unwrap();
     drop((video, audio, metadata, mixed));
     drop(session);
-    receiver.connect_to(&next).unwrap();
+    receiver.connect_to(&next);
     let mut session = receiver.kvm().unwrap();
     assert_eq!(session.receiver().connection_target(), next);
     session.key_down(0xff0d).unwrap();
@@ -266,7 +262,7 @@ fn controls_keep_the_same_receiver_and_synchronizer() {
 
 fn exercise(library: std::path::PathBuf) {
     let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
-    let source = Source::new("STUDIO (Clocked)");
+    let source = Source::new("STUDIO (Clocked)").unwrap();
     let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source.clone())).unwrap();
     let mut sync = FrameSync::new(receiver).unwrap();
     assert_eq!(sync.receiver().connection_target(), source);
@@ -274,7 +270,7 @@ fn exercise(library: std::path::PathBuf) {
         .capture_video_ref(ScanType::Progressive)
         .unwrap()
         .unwrap();
-    assert_eq!(before.picture_aspect_ratio(), 1.25);
+    assert_eq!(before.picture_aspect_ratio().get(), 1.25);
     drop(before);
 
     if ndi

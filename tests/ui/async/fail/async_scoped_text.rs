@@ -4,8 +4,7 @@ async fn contract<R: grafton_ndi::asynchronous::AsyncRuntime>(
 ) {
     use std::time::Duration;
     receiver
-        .metadata()
-        .capture_with(Duration::ZERO, |frame| frame.data())
+        .capture_metadata_with(Duration::ZERO, |frame| frame.data())
         .await
         .unwrap();
 }

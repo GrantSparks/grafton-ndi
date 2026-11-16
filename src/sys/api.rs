@@ -15,7 +15,9 @@ use super::{
     table::{native_table, Resolver},
 };
 use crate::{
-    capabilities::{Capabilities, CapabilityRefusal, RuntimeFeature, SdkEdition, SdkVersion},
+    capabilities::{
+        Capabilities, Capability, CapabilityRefusal, RuntimeFeature, SdkEdition, SdkVersion,
+    },
     Error, LoadRefusal, Result,
 };
 
@@ -504,7 +506,10 @@ impl<'a> Evidence<'a> {
     pub(crate) fn require(self, feature: RuntimeFeature) -> Result<()> {
         self.capabilities
             .decision(feature)
-            .map_err(|refusal| Error::UnsupportedCapability { feature, refusal })
+            .map_err(|refusal| Error::UnsupportedCapability {
+                capability: Capability::Runtime(feature),
+                refusal,
+            })
     }
 
     /// The table sealed with its capability's decision at load time.
@@ -515,7 +520,10 @@ impl<'a> Evidence<'a> {
     ) -> Result<&'a T> {
         table
             .as_ref()
-            .map_err(|&refusal| Error::UnsupportedCapability { feature, refusal })
+            .map_err(|&refusal| Error::UnsupportedCapability {
+                capability: Capability::Runtime(feature),
+                refusal,
+            })
     }
 }
 

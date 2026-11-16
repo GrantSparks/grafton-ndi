@@ -4,8 +4,11 @@
 
 use super::{jpeg, png::row_buffer, webp, Plan, Source};
 use crate::{
-    AlphaMode, BorrowedVideoFrame, ColorPolicy, Downscale, Error, HdrPolicy, ImageFormat,
-    ImageOptions, PixelFormat, PngCompression, SampleDepth, VideoFrame, YuvMatrix, YuvRange,
+    image_encoding::{
+        AlphaMode, ColorPolicy, Downscale, HdrPolicy, ImageFormat, ImageOptions, PngCompression,
+        SampleDepth, YuvRange,
+    },
+    BorrowedVideoFrame, Error, PixelFormat, VideoFrame, YuvMatrix,
 };
 
 // ---------------------------------------------------------------------------
@@ -630,7 +633,14 @@ fn a_chroma_impulse_covers_exactly_the_pixels_it_is_sited_on() {
             Site::Cb(i) | Site::Cr(i) if i == impulse => 200 << (s.bits - 8),
             Site::Cb(_) | Site::Cr(_) => neutral(s.bits),
         });
-        let decoded = decode_png(&codes.frame(None).encode_png().unwrap());
+        let decoded = decode_png(
+            &codes
+                .frame(None)
+                .encode_image(&crate::image_encoding::ImageOptions::new(
+                    crate::image_encoding::ImageFormat::Png,
+                ))
+                .unwrap(),
+        );
         let gray = &decoded.samples[..4];
         let changed: Vec<(usize, usize)> = (0..height)
             .flat_map(|y| (0..width).map(move |x| (x, y)))
@@ -699,7 +709,7 @@ fn padded(
         .build()
         .unwrap();
     let stride = packed.line_stride_bytes() + padding;
-    let len = format.info().buffer_len(stride, height).unwrap();
+    let len = format.buffer_len(width, height, Some(stride)).unwrap();
     let mut frame =
         VideoFrame::with_line_stride(format, width, height, stride, vec![0xEE; len], None);
     let base = frame.data().as_ptr() as usize;
@@ -1012,9 +1022,19 @@ fn rgb_png_and_scalar_jpeg_keep_the_bytes_of_grafton_ndi_2() {
         .filter(|(_, quality, _)| quality.is_none() || !accelerated)
     {
         let frames = identity_frames(format);
-        let shortcut = identity_hash(frames.iter().map(|frame| match quality {
-            None => frame.encode_png().unwrap(),
-            Some(quality) => frame.encode_jpeg(quality).unwrap(),
+        let shortcut = identity_hash(frames.iter().map(|frame| {
+            match quality {
+                None => frame
+                    .encode_image(&crate::image_encoding::ImageOptions::new(
+                        crate::image_encoding::ImageFormat::Png,
+                    ))
+                    .unwrap(),
+                Some(quality) => frame
+                    .encode_image(&crate::image_encoding::ImageOptions::new(
+                        crate::image_encoding::ImageFormat::Jpeg(quality),
+                    ))
+                    .unwrap(),
+            }
         }));
         assert_eq!(shortcut, expected, "{format:?} {quality:?} shortcut");
         let options = ImageOptions::new(quality.map_or(ImageFormat::Png, ImageFormat::Jpeg));
@@ -1411,7 +1431,12 @@ fn data_urls_carry_the_image_and_are_allocated_once() {
         assert_eq!(url.capacity(), url.len());
         let image = STANDARD.decode(url.strip_prefix(prefix).unwrap()).unwrap();
         assert_eq!(image, frame.encode_image(&options(format)).unwrap());
-        assert_eq!(frame.encode_data_url(format).unwrap(), url);
+        assert_eq!(
+            frame
+                .encode_image_data_url(&crate::image_encoding::ImageOptions::new(format))
+                .unwrap(),
+            url
+        );
     }
 }
 
@@ -1536,8 +1561,12 @@ fn hdr_frames_are_refused_by_default_in_every_format() {
                 .build()
                 .unwrap();
             for shortcut in [
-                frame.encode_png(),
-                frame.encode_jpeg(85),
+                frame.encode_image(&crate::image_encoding::ImageOptions::new(
+                    crate::image_encoding::ImageFormat::Png,
+                )),
+                frame.encode_image(&crate::image_encoding::ImageOptions::new(
+                    crate::image_encoding::ImageFormat::Jpeg(85),
+                )),
                 frame.encode_image(&options(ImageFormat::WebpLossless)),
                 frame.encode_image(&options(ImageFormat::WebpLossy(75))),
             ] {
@@ -1703,7 +1732,11 @@ fn unreadable_color_metadata_is_refused_unless_the_caller_overrides() {
             .build()
             .unwrap();
         assert!(frame.color_info().is_err());
-        let message = invalid_frame(frame.encode_png());
+        let message = invalid_frame(
+            frame.encode_image(&crate::image_encoding::ImageOptions::new(
+                crate::image_encoding::ImageFormat::Png,
+            )),
+        );
         assert!(
             matches!(
                 message,
@@ -1770,7 +1803,7 @@ fn withheld_color_metadata_is_refused_by_every_encoder_before_output() {
                 assert_eq!(out.written, 0);
                 invalid_frame(super::encode(source(), &sdk));
                 invalid_frame(super::encode_data_url(source(), &sdk));
-                let mut workspace = crate::ImageWorkspace::new();
+                let mut workspace = crate::image_encoding::ImageWorkspace::new();
                 invalid_frame(workspace.encode_source(source(), &sdk));
                 assert_eq!(workspace.retained_bytes(), 0);
 
@@ -1864,7 +1897,7 @@ fn every_writer_encode_reports_final_flush_and_buffered_write_failures() {
         .data(vec![127; 16])
         .build()
         .unwrap();
-    let mut workspace = crate::ImageWorkspace::new();
+    let mut workspace = crate::image_encoding::ImageWorkspace::new();
     for options in [
         options(ImageFormat::Png),
         options(ImageFormat::Png).depth(SampleDepth::Sixteen),
@@ -1947,11 +1980,19 @@ fn conflicting_options_are_refused_before_anything_is_written() {
     }
     for quality in [0, 101] {
         assert!(matches!(
-            invalid_input(frame.encode_jpeg(quality)),
+            invalid_input(
+                frame.encode_image(&crate::image_encoding::ImageOptions::new(
+                    crate::image_encoding::ImageFormat::Jpeg(quality)
+                ))
+            ),
             crate::InputDefect::ImageQuality { .. }
         ));
         assert!(matches!(
-            invalid_input(frame.encode_data_url(ImageFormat::Jpeg(quality))),
+            invalid_input(
+                frame.encode_image_data_url(&crate::image_encoding::ImageOptions::new(
+                    ImageFormat::Jpeg(quality)
+                ))
+            ),
             crate::InputDefect::ImageQuality { .. }
         ));
     }
@@ -1961,7 +2002,9 @@ fn conflicting_options_are_refused_before_anything_is_written() {
         .metadata("<ndi_color_info transfer=\"bt_2100_pq\"/>")
         .build()
         .unwrap();
-    invalid_input(hdr.encode_jpeg(0));
+    invalid_input(hdr.encode_image(&crate::image_encoding::ImageOptions::new(
+        crate::image_encoding::ImageFormat::Jpeg(0),
+    )));
     invalid_input(hdr.encode_image(&options(ImageFormat::WebpLossy(101))));
     invalid_input(hdr.encode_image(&options(ImageFormat::WebpLossy(75)).webp_effort(7)));
     // Codec-specific settings remain available when switching formats.
@@ -1994,7 +2037,9 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
         .build()
         .unwrap();
     assert!(matches!(
-        invalid_frame(wide.encode_jpeg(85)),
+        invalid_frame(wide.encode_image(&crate::image_encoding::ImageOptions::new(
+            crate::image_encoding::ImageFormat::Jpeg(85)
+        ))),
         crate::FrameDefect::ImageDimension {
             codec: crate::ImageCodec::Jpeg,
             dimension: crate::ImageDimension::Width,
@@ -2013,7 +2058,9 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
         .build()
         .unwrap();
     assert!(matches!(
-        invalid_frame(tall.encode_jpeg(85)),
+        invalid_frame(tall.encode_image(&crate::image_encoding::ImageOptions::new(
+            crate::image_encoding::ImageFormat::Jpeg(85)
+        ))),
         crate::FrameDefect::ImageDimension {
             codec: crate::ImageCodec::Jpeg,
             dimension: crate::ImageDimension::Height,
@@ -2113,7 +2160,13 @@ fn reduced_images_are_the_block_averages_of_the_full_image() {
             .data(any_frame_bytes(format, width, height, 77))
             .build()
             .unwrap();
-        let full = decode_png(&frame.encode_png().unwrap());
+        let full = decode_png(
+            &frame
+                .encode_image(&crate::image_encoding::ImageOptions::new(
+                    crate::image_encoding::ImageFormat::Png,
+                ))
+                .unwrap(),
+        );
         for (downscale, size) in [
             (Downscale::Half, 2),
             (Downscale::Quarter, 4),
@@ -2254,7 +2307,7 @@ fn image_encoding_compatibility_fingerprints() {
 
 #[test]
 fn workspace_reuses_conversion_capacity_across_formats_sizes_and_failures() {
-    let mut workspace = crate::ImageWorkspace::new();
+    let mut workspace = crate::image_encoding::ImageWorkspace::new();
     assert_eq!(workspace.retained_bytes(), 0);
     for (width, height, seed) in [(34, 18, 7), (18, 6, 89), (2, 2, 42)] {
         for format in PixelFormat::ALL {
@@ -2298,14 +2351,18 @@ fn workspace_reuses_conversion_capacity_across_formats_sizes_and_failures() {
         workspace
             .encode(&frame, &options(ImageFormat::Png))
             .unwrap(),
-        frame.encode_png().unwrap()
+        frame
+            .encode_image(&crate::image_encoding::ImageOptions::new(
+                crate::image_encoding::ImageFormat::Png
+            ))
+            .unwrap()
     );
 }
 
 #[test]
 fn warm_workspace_conversion_does_not_allocate() {
     use crate::test_alloc::allocation_count;
-    let mut workspace = crate::ImageWorkspace::new();
+    let mut workspace = crate::image_encoding::ImageWorkspace::new();
     for format in PixelFormat::ALL {
         for (width, height) in [(34, 18), (18, 6), (2, 2)] {
             let bytes = any_frame_bytes(format, width, height, 23);
@@ -2574,7 +2631,7 @@ fn workspace_resources() {
             ),
         ] {
             for warm in [false, true] {
-                let mut workspace = crate::ImageWorkspace::new();
+                let mut workspace = crate::image_encoding::ImageWorkspace::new();
                 black_box(workspace.encode(&frame, &options).unwrap());
                 for sample in 0..3 {
                     if !warm {
@@ -2630,7 +2687,7 @@ fn workspace_output_growth_resources() {
                 let options = options(format)
                     .png_compression(PngCompression::Fast)
                     .downscale(reduction);
-                let mut workspace = crate::ImageWorkspace::new();
+                let mut workspace = crate::image_encoding::ImageWorkspace::new();
                 let expected = workspace.encode(&frame, &options).unwrap();
                 let mut output = Output::default();
                 workspace.encode_to(&frame, &options, &mut output).unwrap();
@@ -2953,7 +3010,7 @@ fn png_scratch_failure_precedes_every_output_byte() {
             let mut output = Vec::new();
             let _reset = Reset;
             super::FAIL_SCRATCH_RESERVATION.with(|fail| fail.set(true));
-            let error = crate::ImageWorkspace::new()
+            let error = crate::image_encoding::ImageWorkspace::new()
                 .encode_to(&frame, &options, &mut output)
                 .unwrap_err();
             assert!(matches!(
@@ -2974,7 +3031,7 @@ fn anamorphic_png_and_jpeg_tags_preserve_display_aspect() {
                 let frame = VideoFrame::builder()
                     .resolution(width, height)
                     .pixel_format(pixel_format)
-                    .picture_aspect_ratio(aspect)
+                    .picture_aspect_ratio(crate::PictureAspectRatio::new(aspect).unwrap())
                     .build()
                     .unwrap();
                 for reduction in [
@@ -3033,7 +3090,7 @@ fn square_pixel_encodes_stay_identical_and_extreme_aspects_remain_positive() {
             .build()
             .unwrap();
         let mut explicit = base.clone();
-        explicit.set_picture_aspect_ratio(1.8).unwrap();
+        explicit.set_picture_aspect_ratio(crate::PictureAspectRatio::new(1.8).unwrap());
         for reduction in [
             Downscale::Off,
             Downscale::Half,
@@ -3052,7 +3109,7 @@ fn square_pixel_encodes_stay_identical_and_extreme_aspects_remain_positive() {
     for aspect in [f32::MIN_POSITIVE, f32::MAX] {
         let frame = VideoFrame::builder()
             .resolution(2, 2)
-            .picture_aspect_ratio(aspect)
+            .picture_aspect_ratio(crate::PictureAspectRatio::new(aspect).unwrap())
             .build()
             .unwrap();
         let source = Source::new(&frame);
@@ -3076,7 +3133,7 @@ fn warm_workspace_allocates_output_once_without_retaining_it() {
         ImageFormat::WebpLossless,
     ] {
         let options = options(format);
-        let mut workspace = crate::ImageWorkspace::new();
+        let mut workspace = crate::image_encoding::ImageWorkspace::new();
         let expected = workspace.encode(&frame, &options).unwrap();
         let retained = workspace.retained_bytes();
         let mut reused = Vec::with_capacity(expected.len());
@@ -3129,5 +3186,34 @@ fn reader_format_facts_match_the_frame_layout_for_every_format() {
                 super::Reader::<u8>::new(&source, YuvMatrix::Bt709, YuvRange::Limited, keep);
             assert_eq!(reader.has_alpha(), keep && info.has_alpha(), "{format:?}");
         }
+    }
+}
+
+#[test]
+fn generic_video_sources_encode_and_workspaces_reuse_data_url_conversion() {
+    fn encode<T: crate::VideoSource>(frame: &T, options: &ImageOptions) -> (Vec<u8>, String) {
+        let image = frame.encode_image(options).unwrap();
+        let mut output = Vec::new();
+        frame.encode_image_to(options, &mut output).unwrap();
+        assert_eq!(image, output);
+        (image, frame.encode_image_data_url(options).unwrap())
+    }
+    let frame = VideoFrame::builder().resolution(4, 4).build().unwrap();
+    let mut workspace = super::ImageWorkspace::new();
+    for format in [
+        ImageFormat::Png,
+        ImageFormat::Jpeg(85),
+        ImageFormat::WebpLossless,
+    ] {
+        let options = ImageOptions::new(format);
+        let (image, url) = encode(&frame, &options);
+        assert_eq!(workspace.encode_data_url(&frame, &options).unwrap(), url);
+        assert_eq!(workspace.encode(&frame, &options).unwrap(), image);
+        let retained = workspace.retained_bytes();
+        assert_eq!(workspace.encode_data_url(&frame, &options).unwrap(), url);
+        assert_eq!(workspace.retained_bytes(), retained);
+        let source: &dyn crate::VideoSource = &frame;
+        assert_eq!(source.encode_image(&options).unwrap(), image);
+        assert_eq!(source.encode_image_data_url(&options).unwrap(), url);
     }
 }

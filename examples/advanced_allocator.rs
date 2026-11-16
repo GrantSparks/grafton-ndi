@@ -47,7 +47,7 @@ fn main() -> Result<(), Error> {
         &ReceiverOptions::new(source).name("Allocator Example"),
     )?;
     // Custom allocation keeps the NDI runtime initialized until the process exits.
-    let service = AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default())?;
+    let service = AllocatorService::new(ndi.process_lifetime(), &AllocatorLimits::default())?;
     let mut receiver = service.attach(receiver)?;
 
     // Called on SDK threads: pad every video line to a multiple of 256 bytes.
@@ -59,8 +59,7 @@ fn main() -> Result<(), Error> {
     for _ in 0..120 {
         if let Some(frame) = receiver
             .receiver()
-            .video()
-            .capture_ref(Duration::from_secs(1))?
+            .capture_video_ref(Duration::from_secs(1))?
         {
             println!("{}x{} frame", frame.width(), frame.height());
         }

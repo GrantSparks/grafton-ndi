@@ -10,7 +10,7 @@ mod runtime_fixture;
 
 use grafton_ndi::{
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
-    discovery::{
+    discovery_server::{
         AdvertiserOptions, ListenerOptions, ReceiverCommand, ReceiverId, ReceiverStream,
         RecvAdvertisement, RecvAdvertiser, RecvListener, SendAdvertisement, SendAdvertiser,
         SendListener,
@@ -160,7 +160,7 @@ fn constructor_errors(
 /// The options of an advertiser and a listener for [`SERVER`].
 fn server() -> (AdvertiserOptions, ListenerOptions) {
     (
-        AdvertiserOptions::default().servers(SERVER),
+        AdvertiserOptions::default().servers([SERVER]),
         ListenerOptions::default().server(SERVER),
     )
 }
@@ -177,7 +177,7 @@ fn assert_refused(ndi: &Ndi, expected: CapabilityUnavailable) {
     {
         for error in [error, ndi.require_feature(feature).err()] {
             let Some(Error::UnsupportedCapability {
-                feature: refused,
+                capability: grafton_ndi::Capability::Runtime(refused),
                 refusal,
             }) = error
             else {
@@ -247,7 +247,7 @@ fn child(scenario: &str) {
                 // The capability's own gate names the function too.
                 for error in [error, ndi.require_feature(feature).err()] {
                     let Some(Error::UnsupportedCapability {
-                        feature: refused,
+                        capability: grafton_ndi::Capability::Runtime(refused),
                         refusal,
                     }) = error
                     else {
@@ -261,8 +261,10 @@ fn child(scenario: &str) {
                     );
                 }
             }
-            let Err(Error::UnsupportedCapability { feature, refusal }) =
-                Router::new(&ndi, &RouterOptions::new("bare"))
+            let Err(Error::UnsupportedCapability {
+                capability: grafton_ndi::Capability::Runtime(feature),
+                refusal,
+            }) = Router::new(&ndi, &RouterOptions::new("bare"))
             else {
                 panic!("routing needs its functions");
             };
@@ -346,7 +348,7 @@ fn child(scenario: &str) {
         }
         "advertisement_options_reach_the_sdk" => {
             let receiver = |name: &str| {
-                let options = ReceiverOptions::new(Source::new("")).name(name);
+                let options = ReceiverOptions::new(Source::new("").unwrap()).name(name);
                 Receiver::new(&ndi, &options).unwrap()
             };
             let (controlled, monitored) = (receiver("controlled"), receiver("monitored"));
@@ -354,7 +356,7 @@ fn child(scenario: &str) {
             let in_group = advertiser
                 .register(
                     &controlled,
-                    RecvAdvertisement::default()
+                    &RecvAdvertisement::default()
                         .allow_controlling(true)
                         .input_group("Program feed"),
                 )
@@ -362,7 +364,7 @@ fn child(scenario: &str) {
             advertiser
                 .register(
                     &monitored,
-                    RecvAdvertisement::default().allow_monitoring(true),
+                    &RecvAdvertisement::default().allow_monitoring(true),
                 )
                 .unwrap();
             let events = log();
@@ -397,12 +399,12 @@ fn child(scenario: &str) {
             let (plain, monitored) = (sender("plain").unwrap(), sender("monitored").unwrap());
             let mut advertiser = SendAdvertiser::new(&ndi, &advertisers).unwrap();
             advertiser
-                .register(&plain, SendAdvertisement::default())
+                .register(&plain, &SendAdvertisement::default())
                 .unwrap();
             advertiser
                 .register(
                     &monitored,
-                    SendAdvertisement::default().allow_monitoring(true),
+                    &SendAdvertisement::default().allow_monitoring(true),
                 )
                 .unwrap();
             let events = log();
@@ -421,7 +423,7 @@ fn child(scenario: &str) {
         }
         "malformed_text_is_decoded_lossily" => {
             let mut listener = SendListener::new(&ndi, &listeners).unwrap();
-            let senders = listener.snapshot().unwrap();
+            let senders = listener.current_senders().unwrap();
             let [malformed, plain] = senders.as_slice() else {
                 panic!("expected two senders, got {senders:?}");
             };
@@ -442,7 +444,7 @@ fn child(scenario: &str) {
             assert!(plain.events_subscribed());
 
             let mut listener = RecvListener::new(&ndi, &listeners).unwrap();
-            let receivers = listener.snapshot().unwrap();
+            let receivers = listener.current_receivers().unwrap();
             let [malformed, fixed] = receivers.as_slice() else {
                 panic!("expected two receivers, got {receivers:?}");
             };
@@ -462,7 +464,7 @@ fn child(scenario: &str) {
         }
         "identifiers_round_trip_exactly" => {
             let mut senders = SendListener::new(&ndi, &listeners).unwrap();
-            let sender = senders.snapshot().unwrap().remove(0);
+            let sender = senders.current_senders().unwrap().remove(0);
             let id = sender.id().unwrap();
             senders.subscribe(id);
             senders.unsubscribe(id);
@@ -472,7 +474,7 @@ fn child(scenario: &str) {
             assert!(events.contains(&format!("send-listener-unsubscribe {expected}\n")));
 
             let mut receivers = RecvListener::new(&ndi, &listeners).unwrap();
-            let snapshot = receivers.snapshot().unwrap();
+            let snapshot = receivers.current_receivers().unwrap();
             let controllable = snapshot[0].id().unwrap();
             receivers.subscribe(controllable);
             receivers
@@ -512,7 +514,7 @@ fn child(scenario: &str) {
         }
         "event_batches" => {
             let mut senders = SendListener::new(&ndi, &listeners).unwrap();
-            let events = senders.capture_events(Duration::from_millis(5)).unwrap();
+            let events = senders.next_events(Duration::from_millis(5)).unwrap();
             let [first, second] = events.as_slice() else {
                 panic!("expected two events, got {events:?}");
             };
@@ -521,7 +523,7 @@ fn child(scenario: &str) {
             assert_eq!(first.value(), Some("<tally on=\"\u{fffd}\"/>"));
             assert!(second.id().is_none() && second.name().is_none() && second.value().is_none());
             // A poll that finds nothing is an empty batch with nothing to free.
-            assert!(senders.capture_events(Duration::ZERO).unwrap().is_empty());
+            assert!(senders.next_events(Duration::ZERO).unwrap().is_empty());
             assert_eq!(
                 log().matches("send-listener-free-events\n").count(),
                 1,
@@ -531,7 +533,7 @@ fn child(scenario: &str) {
 
             let mut receivers = RecvListener::new(&ndi, &listeners).unwrap();
             // The longest wait never reaches the SDK's indefinite 0xFFFFFFFF.
-            let events = receivers.capture_events(grafton_ndi::MAX_TIMEOUT).unwrap();
+            let events = receivers.next_events(grafton_ndi::MAX_TIMEOUT).unwrap();
             assert_eq!(events[0].id().unwrap().as_bytes(), RECEIVER_ID);
             assert!(log().contains("recv-listener-events 4294967294\n"));
             assert_eq!(log().matches("recv-listener-free-events\n").count(), 1);
@@ -542,7 +544,7 @@ fn child(scenario: &str) {
             // The number of events is not itself a limit: only the bytes they
             // take to copy are.
             std::env::set_var("GRAFTON_FAKE_EVENT_COUNT", "70000");
-            let events = listener.capture_events(wait).unwrap();
+            let events = listener.next_events(wait).unwrap();
             assert_eq!(events.len(), 70_000);
             assert_eq!(events[69_998].name(), Some("tally"));
             assert!(events[69_999].name().is_none());
@@ -552,7 +554,7 @@ fn child(scenario: &str) {
             // rejected batch exactly once and remain usable.
             std::env::set_var("GRAFTON_FAKE_EVENT_COUNT", "250000");
             assert!(matches!(
-                listener.capture_events(wait),
+                listener.next_events(wait),
                 Err(Error::ResourceLimit {
                     resource: ResourceKind::DiscoveryServerCopyBytes,
                     limit: 16_777_216,
@@ -560,7 +562,7 @@ fn child(scenario: &str) {
             ));
             let mut receivers = RecvListener::new(&ndi, &listeners).unwrap();
             assert!(matches!(
-                receivers.capture_events(wait),
+                receivers.next_events(wait),
                 Err(Error::ResourceLimit {
                     resource: ResourceKind::DiscoveryServerCopyBytes,
                     limit: 16_777_216,
@@ -574,27 +576,27 @@ fn child(scenario: &str) {
             let Err(Error::ResourceLimit {
                 resource: ResourceKind::DiscoveryServerCopyBytes,
                 limit: 16_777_216,
-            }) = listener.capture_events(wait)
+            }) = listener.next_events(wait)
             else {
                 panic!("a batch larger than the copy limit must be refused");
             };
             assert_eq!(log().matches("send-listener-free-events\n").count(), 3);
             std::env::remove_var("GRAFTON_FAKE_EVENT_COUNT");
-            assert_eq!(listener.capture_events(wait).unwrap().len(), 2);
-            assert_eq!(receivers.capture_events(wait).unwrap().len(), 2);
+            assert_eq!(listener.next_events(wait).unwrap().len(), 2);
+            assert_eq!(receivers.next_events(wait).unwrap().len(), 2);
         }
         "null_event_batch_with_a_count_is_refused" => {
             let mut listener = SendListener::new(&ndi, &listeners).unwrap();
             std::env::set_var("GRAFTON_FAKE_NULL_EVENT_BATCH", "1");
             assert!(matches!(
-                listener.capture_events(Duration::from_millis(5)),
+                listener.next_events(Duration::from_millis(5)),
                 Err(Error::UnexpectedSdkResult(_))
             ));
             assert_eq!(log().matches("send-listener-free-events\n").count(), 0);
             std::env::remove_var("GRAFTON_FAKE_NULL_EVENT_BATCH");
             assert_eq!(
                 listener
-                    .capture_events(Duration::from_millis(5))
+                    .next_events(Duration::from_millis(5))
                     .unwrap()
                     .len(),
                 2
@@ -607,12 +609,12 @@ fn child(scenario: &str) {
                 let result = if array == "groups" {
                     SendListener::new(&ndi, &listeners)
                         .unwrap()
-                        .snapshot()
+                        .current_senders()
                         .map(drop)
                 } else {
                     RecvListener::new(&ndi, &listeners)
                         .unwrap()
-                        .snapshot()
+                        .current_receivers()
                         .map(drop)
                 };
                 let Err(Error::ResourceLimit {
@@ -627,7 +629,7 @@ fn child(scenario: &str) {
             assert_eq!(
                 SendListener::new(&ndi, &listeners)
                     .unwrap()
-                    .snapshot()
+                    .current_senders()
                     .unwrap()
                     .len(),
                 2
@@ -635,7 +637,7 @@ fn child(scenario: &str) {
             assert_eq!(
                 RecvListener::new(&ndi, &listeners)
                     .unwrap()
-                    .snapshot()
+                    .current_receivers()
                     .unwrap()
                     .len(),
                 2
@@ -652,7 +654,7 @@ fn child(scenario: &str) {
             ] {
                 std::env::set_var("GRAFTON_FAKE_DISCOVERY_MALFORMED", malformed);
                 let mut listener = SendListener::new(&ndi, &listeners).unwrap();
-                let snapshot = listener.snapshot().unwrap();
+                let snapshot = listener.current_senders().unwrap();
                 assert_eq!(snapshot.len(), 1, "{malformed}: {snapshot:?}");
                 assert_eq!(
                     snapshot[0].id().unwrap().as_bytes(),
@@ -673,7 +675,7 @@ fn child(scenario: &str) {
             ] {
                 std::env::set_var("GRAFTON_FAKE_DISCOVERY_MALFORMED", malformed);
                 let mut listener = RecvListener::new(&ndi, &listeners).unwrap();
-                let snapshot = listener.snapshot().unwrap();
+                let snapshot = listener.current_receivers().unwrap();
                 assert_eq!(snapshot.len(), 1, "{malformed}: {snapshot:?}");
                 let survivor = snapshot[0].id().unwrap();
                 assert_eq!(survivor.as_bytes(), RECEIVER_ID, "{malformed}");
@@ -725,7 +727,7 @@ fn child(scenario: &str) {
             std::env::set_var("GRAFTON_FAKE_DISCOVERY_MALFORMED", "receiver-copy-budget");
             let mut listener = RecvListener::new(&ndi, &listeners).unwrap();
             assert!(matches!(
-                listener.snapshot(),
+                listener.current_receivers(),
                 Err(Error::ResourceLimit {
                     resource: ResourceKind::DiscoveryServerCopyBytes,
                     limit: 16_777_216,
@@ -757,14 +759,14 @@ fn child(scenario: &str) {
                 .enumerate()
             {
                 std::env::set_var("GRAFTON_FAKE_DISCOVERY_MALFORMED", malformed);
-                let events = senders.capture_events(wait).unwrap();
+                let events = senders.next_events(wait).unwrap();
                 assert_eq!(events.len(), 1, "{malformed}: {events:?}");
                 assert!(
                     events[0].id().is_none()
                         && events[0].name().is_none()
                         && events[0].value().is_none()
                 );
-                let events = receivers.capture_events(wait).unwrap();
+                let events = receivers.next_events(wait).unwrap();
                 assert_eq!(events.len(), 1, "{malformed}: {events:?}");
                 assert!(
                     events[0].id().is_none()
@@ -781,8 +783,8 @@ fn child(scenario: &str) {
                 );
             }
             std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
-            assert_eq!(senders.capture_events(wait).unwrap().len(), 2);
-            assert_eq!(receivers.capture_events(wait).unwrap().len(), 2);
+            assert_eq!(senders.next_events(wait).unwrap().len(), 2);
+            assert_eq!(receivers.next_events(wait).unwrap().len(), 2);
             assert_eq!(log().matches("send-listener-free-events\n").count(), 4);
             assert_eq!(log().matches("recv-listener-free-events\n").count(), 4);
         }
@@ -791,12 +793,12 @@ fn child(scenario: &str) {
             let mut receivers = RecvListener::new(&ndi, &listeners).unwrap();
             std::env::set_var("GRAFTON_FAKE_DISCOVERY_MALFORMED", "senders-null");
             assert!(matches!(
-                senders.snapshot(),
+                senders.current_senders(),
                 Err(Error::UnexpectedSdkResult(_))
             ));
             std::env::set_var("GRAFTON_FAKE_DISCOVERY_MALFORMED", "receivers-null");
             assert!(matches!(
-                receivers.snapshot(),
+                receivers.current_receivers(),
                 Err(Error::UnexpectedSdkResult(_))
             ));
             let target = ReceiverId::new(RECEIVER_ID).unwrap();
@@ -810,32 +812,33 @@ fn child(scenario: &str) {
             ));
             assert_eq!(log().matches("recv-listener-connect ").count(), 0);
             std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
-            assert_eq!(senders.snapshot().unwrap().len(), 2);
-            assert_eq!(receivers.snapshot().unwrap().len(), 2);
+            assert_eq!(senders.current_senders().unwrap().len(), 2);
+            assert_eq!(receivers.current_receivers().unwrap().len(), 2);
         }
         "owners_move_between_threads" => {
             let sender = Sender::new(&ndi, &SenderOptions::new("moved")).unwrap();
-            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+            let receiver =
+                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
             let mut router = Router::new(&ndi, &RouterOptions::new("moved router")).unwrap();
             let mut send_advertiser = SendAdvertiser::new(&ndi, &advertisers).unwrap();
             let mut recv_advertiser = RecvAdvertiser::new(&ndi, &advertisers).unwrap();
             let mut send_listener = SendListener::new(&ndi, &listeners).unwrap();
             let mut recv_listener = RecvListener::new(&ndi, &listeners).unwrap();
             let sent = send_advertiser
-                .register(&sender, SendAdvertisement::default())
+                .register(&sender, &SendAdvertisement::default())
                 .unwrap();
             let received = recv_advertiser
-                .register(&receiver, RecvAdvertisement::default())
+                .register(&receiver, &RecvAdvertisement::default())
                 .unwrap();
             // Each owner is used, and then destroyed, on a thread that did
             // not create it.
             std::thread::spawn(move || {
-                router.clear().unwrap();
+                router.clear_route().unwrap();
                 assert_eq!(router.source().unwrap().name(), "moved router");
                 send_advertiser.unregister(sent).unwrap();
                 recv_advertiser.unregister(received).unwrap();
-                assert_eq!(send_listener.snapshot().unwrap().len(), 2);
-                assert_eq!(recv_listener.snapshot().unwrap().len(), 2);
+                assert_eq!(send_listener.current_senders().unwrap().len(), 2);
+                assert_eq!(recv_listener.current_receivers().unwrap().len(), 2);
             })
             .join()
             .unwrap();
@@ -864,37 +867,40 @@ fn child(scenario: &str) {
             let mut router = Router::new(&ndi, &RouterOptions::new("refusal names")).unwrap();
             std::env::set_var("GRAFTON_FAKE_ROUTING_CHANGE", "refuse");
             assert_name(
-                router.change(&Source::new("target")).unwrap_err(),
+                router
+                    .set_route(&Source::new("target").unwrap())
+                    .unwrap_err(),
                 c"NDIlib_routing_change",
             );
             std::env::remove_var("GRAFTON_FAKE_ROUTING_CHANGE");
             std::env::set_var("GRAFTON_FAKE_ROUTING_CLEAR", "refuse");
-            assert_name(router.clear().unwrap_err(), c"NDIlib_routing_clear");
+            assert_name(router.clear_route().unwrap_err(), c"NDIlib_routing_clear");
             std::env::remove_var("GRAFTON_FAKE_ROUTING_CLEAR");
 
             let sender = Sender::new(&ndi, &SenderOptions::new("refused registration")).unwrap();
-            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+            let receiver =
+                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
             let mut send_advertiser = SendAdvertiser::new(&ndi, &advertisers).unwrap();
             let mut recv_advertiser = RecvAdvertiser::new(&ndi, &advertisers).unwrap();
             std::env::set_var("GRAFTON_FAKE_ADVERTISER_ADD", "refuse");
             assert_name(
                 send_advertiser
-                    .register(&sender, SendAdvertisement::default())
+                    .register(&sender, &SendAdvertisement::default())
                     .unwrap_err(),
                 c"NDIlib_send_advertiser_add_sender",
             );
             assert_name(
                 recv_advertiser
-                    .register(&receiver, RecvAdvertisement::default())
+                    .register(&receiver, &RecvAdvertisement::default())
                     .unwrap_err(),
                 c"NDIlib_recv_advertiser_add_receiver",
             );
             std::env::remove_var("GRAFTON_FAKE_ADVERTISER_ADD");
             let send_registration = send_advertiser
-                .register(&sender, SendAdvertisement::default())
+                .register(&sender, &SendAdvertisement::default())
                 .unwrap();
             let recv_registration = recv_advertiser
-                .register(&receiver, RecvAdvertisement::default())
+                .register(&receiver, &RecvAdvertisement::default())
                 .unwrap();
             std::env::set_var("GRAFTON_FAKE_ADVERTISER_REMOVE", "refuse");
             for (rejected, expected) in [
@@ -916,7 +922,7 @@ fn child(scenario: &str) {
             std::env::remove_var("GRAFTON_FAKE_ADVERTISER_REMOVE");
 
             let mut listener = RecvListener::new(&ndi, &listeners).unwrap();
-            let snapshot = listener.snapshot().unwrap();
+            let snapshot = listener.current_receivers().unwrap();
             let receiver = snapshot[0].id().unwrap();
             std::env::set_var("GRAFTON_FAKE_LISTENER_CONNECT", "refuse");
             assert_name(
@@ -931,12 +937,14 @@ fn child(scenario: &str) {
         }
         "routing" => {
             let mut router =
-                Router::new(&ndi, &RouterOptions::new("Program").groups("public")).unwrap();
+                Router::new(&ndi, &RouterOptions::new("Program").groups(["public"])).unwrap();
             assert_eq!(router.source().unwrap().name(), "Program");
-            assert_eq!(router.connection_count(Duration::ZERO).unwrap(), 0);
-            router.change(&Source::new("STUDIO (Camera 2)")).unwrap();
-            router.clear().unwrap();
-            assert!(router.connection_count(Duration::MAX).is_err());
+            assert_eq!(router.connection_count().unwrap(), 0);
+            router
+                .set_route(&Source::new("STUDIO (Camera 2)").unwrap())
+                .unwrap();
+            router.clear_route().unwrap();
+            assert!(router.wait_for_connection(Duration::MAX).is_err());
             drop(router);
             assert_eq!(
                 log(),

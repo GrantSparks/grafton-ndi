@@ -250,8 +250,9 @@ impl Sink<u8> for CachedComponents<'_> {
 mod tests {
     use super::*;
     use crate::{
-        image::{Plan, Source},
-        ImageFormat, ImageOptions, PixelFormat, VideoFrame,
+        image_encoding::{ImageFormat, ImageOptions},
+        image_encoding::{Plan, Source},
+        PixelFormat, VideoFrame,
     };
 
     fn decode(bytes: &[u8], size: (u16, u16)) -> Vec<u8> {
@@ -272,10 +273,10 @@ mod tests {
                 .data(vec![127; 18 * height as usize * 4])
                 .build()
                 .unwrap();
-            let options =
-                ImageOptions::new(ImageFormat::Jpeg(85)).downscale(crate::Downscale::Eighth);
+            let options = ImageOptions::new(ImageFormat::Jpeg(85))
+                .downscale(crate::image_encoding::Downscale::Eighth);
             let (image, rows) =
-                crate::image::read::count_rows(|| frame.encode_image(&options).unwrap());
+                crate::image_encoding::read::count_rows(|| frame.encode_image(&options).unwrap());
             assert_eq!(rows, height as usize, "source height {height}");
             assert_eq!(
                 decode(&image, (3, height.div_ceil(8) as u16)).len(),

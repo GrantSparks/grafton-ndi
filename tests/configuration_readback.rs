@@ -1,6 +1,6 @@
 //! Configuration inspection is SDK-free and reports stored requests.
 use grafton_ndi::{
-    discovery::{AdvertiserOptions, ListenerOptions, RecvAdvertisement, SendAdvertisement},
+    discovery_server::{AdvertiserOptions, ListenerOptions, RecvAdvertisement, SendAdvertisement},
     routing::RouterOptions,
     FinderOptions, FrameSyncAudioRequest, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions,
     RuntimeOptions, SdkEdition, SenderOptions, Source,
@@ -8,7 +8,7 @@ use grafton_ndi::{
 
 #[test]
 fn receiver_options_report_presets_and_last_setter_wins() {
-    let options = ReceiverOptions::snapshot_preset(Source::new("Venue (Audio)"))
+    let options = ReceiverOptions::snapshot_preset(Source::new("Venue (Audio)").unwrap())
         .bandwidth(ReceiverBandwidth::AudioOnly)
         .name("first")
         .name("venue-audio");
@@ -21,7 +21,7 @@ fn receiver_options_report_presets_and_last_setter_wins() {
     assert!(!options.configured_allow_video_fields());
     assert_eq!(options.configured_name(), Some("venue-audio"));
     assert_eq!(
-        ReceiverOptions::new(Source::new("default")).configured_name(),
+        ReceiverOptions::new(Source::new("default").unwrap()).configured_name(),
         None
     );
 }
@@ -30,24 +30,36 @@ fn receiver_options_report_presets_and_last_setter_wins() {
 fn other_core_settings_are_stored_without_runtime_selection() {
     let finder = FinderOptions::new()
         .show_local_sources(false)
-        .groups("Studio")
-        .extra_ips("127.0.0.1");
+        .groups(["Studio"])
+        .extra_ips(["127.0.0.1"]);
     assert!(!finder.configured_show_local_sources());
-    assert_eq!(finder.configured_groups(), Some("Studio"));
-    assert_eq!(finder.configured_extra_ips(), Some("127.0.0.1"));
+    assert_eq!(
+        finder.configured_groups(),
+        Some(["Studio".to_owned()].as_slice())
+    );
+    assert_eq!(
+        finder.configured_extra_ips(),
+        Some(["127.0.0.1".to_owned()].as_slice())
+    );
 
     let sender = SenderOptions::new("Program")
-        .groups("Main")
+        .groups(["Main"])
         .clock_audio(false)
         .clock_video(false);
     assert_eq!(sender.configured_name(), "Program");
-    assert_eq!(sender.configured_groups(), Some("Main"));
+    assert_eq!(
+        sender.configured_groups(),
+        Some(["Main".to_owned()].as_slice())
+    );
     assert!(!sender.configured_clock_audio());
     assert!(!sender.configured_clock_video());
 
-    let router = RouterOptions::new("Route").groups("Control");
+    let router = RouterOptions::new("Route").groups(["Control"]);
     assert_eq!(router.configured_name(), "Route");
-    assert_eq!(router.configured_groups(), Some("Control"));
+    assert_eq!(
+        router.configured_groups(),
+        Some(["Control".to_owned()].as_slice())
+    );
 
     let runtime = RuntimeOptions::new()
         .library_path("/tmp/libndi.so")
@@ -81,19 +93,19 @@ fn discovery_settings_preserve_unset_values() {
     );
     assert_eq!(
         AdvertiserOptions::new()
-            .servers("one,two")
+            .servers(["one", "two"])
             .configured_servers(),
-        Some("one,two")
+        Some(["one".to_owned(), "two".to_owned()].as_slice())
     );
     assert!(SendAdvertisement::new()
         .allow_monitoring(true)
-        .configured_monitoring());
+        .configured_allow_monitoring());
     let receiver = RecvAdvertisement::new()
         .allow_monitoring(true)
         .allow_controlling(true)
         .input_group("Studio");
-    assert!(receiver.configured_monitoring());
-    assert!(receiver.configured_controlling());
+    assert!(receiver.configured_allow_monitoring());
+    assert!(receiver.configured_allow_controlling());
     assert_eq!(receiver.configured_input_group(), Some("Studio"));
 }
 
@@ -101,22 +113,25 @@ fn discovery_settings_preserve_unset_values() {
 #[test]
 fn file_settings_keep_optional_rollover_distinct() {
     use grafton_ndi::file::{
-        AsyncFileOptions, FileNaming, FileRuntimeOptions, PlayerOptions, RecorderOptions,
+        AsyncFileOptions, FileApiOptions, FileNaming, FilePlayerOptions, FileRecorderOptions,
         SourceSpec,
     };
     use grafton_ndi::MediaTypes;
     use std::{path::Path, time::Duration};
 
-    let runtime = FileRuntimeOptions::new().library_path("/tmp/file.so");
+    let runtime = FileApiOptions::new().library_path("/tmp/file.so");
     assert_eq!(
         runtime.configured_library_path(),
         Some(Path::new("/tmp/file.so"))
     );
-    let player = PlayerOptions::new("Replay").groups("Program");
+    let player = FilePlayerOptions::new("Replay").groups(["Program"]);
     assert_eq!(player.configured_name(), "Replay");
-    assert_eq!(player.configured_groups(), Some("Program"));
+    assert_eq!(
+        player.configured_groups(),
+        Some(["Program".to_owned()].as_slice())
+    );
     let source = SourceSpec::new("Camera").unwrap();
-    let base = RecorderOptions::new(source.clone()).naming(FileNaming::Exact);
+    let base = FileRecorderOptions::new(source.clone()).naming(FileNaming::Exact);
     assert_eq!(base.configured_source(), &source);
     assert_eq!(base.configured_format_change_rollover(), None);
     assert_eq!(base.configured_naming(), &FileNaming::Exact);
@@ -148,7 +163,7 @@ fn file_settings_keep_optional_rollover_distinct() {
 #[cfg(feature = "image-encoding")]
 #[test]
 fn image_settings_report_stored_choices() {
-    use grafton_ndi::{
+    use grafton_ndi::image_encoding::{
         AlphaMode, ColorPolicy, Downscale, HdrPolicy, ImageFormat, ImageOptions, PngCompression,
         SampleDepth,
     };
@@ -178,9 +193,9 @@ fn image_settings_report_stored_choices() {
 #[cfg(feature = "advanced")]
 #[test]
 fn advanced_configuration_is_borrowed_without_native_capability() {
-    use grafton_ndi::advanced::{AdvancedConfig, QueueOptions};
+    use grafton_ndi::advanced::{AdvancedConfig, QueueLimits};
     let config = AdvancedConfig::parse(r#"{"test":true}"#).unwrap();
-    let options = ReceiverOptions::new(Source::new("x")).config(config.clone());
+    let options = ReceiverOptions::new(Source::new("x").unwrap()).config(config.clone());
     assert_eq!(
         options.configured_config().unwrap().expose_json(),
         config.expose_json()
@@ -190,9 +205,97 @@ fn advanced_configuration_is_borrowed_without_native_capability() {
     assert!(RouterOptions::new("x").configured_config().is_none());
     assert!(ListenerOptions::new().configured_config().is_none());
     assert!(AdvertiserOptions::new().configured_config().is_none());
-    let queue = QueueOptions::new().max_frames(3).max_bytes(2048);
+    let queue = QueueLimits::new().max_frames(3).max_bytes(2048);
     assert_eq!(
         (queue.configured_max_frames(), queue.configured_max_bytes()),
         (3, 2048)
     );
+}
+
+#[test]
+fn options_equality_compares_independently_constructed_settings() {
+    macro_rules! compare {
+        ($base:expr, $changed:expr) => {{
+            assert_eq!($base, $base);
+            assert_ne!($base, $changed);
+        }};
+    }
+    compare!(
+        FinderOptions::new(),
+        FinderOptions::new().show_local_sources(false)
+    );
+    compare!(SenderOptions::new("program"), SenderOptions::new("backup"));
+    compare!(
+        ReceiverOptions::new(Source::new("camera").unwrap()),
+        ReceiverOptions::new(Source::new("camera").unwrap()).allow_video_fields(false)
+    );
+    compare!(RouterOptions::new("route"), RouterOptions::new("other"));
+    compare!(
+        RuntimeOptions::new(),
+        RuntimeOptions::new().edition(SdkEdition::Advanced)
+    );
+    compare!(
+        AdvertiserOptions::new(),
+        AdvertiserOptions::new().servers(["studio"])
+    );
+    compare!(
+        ListenerOptions::new(),
+        ListenerOptions::new().server("studio")
+    );
+    compare!(
+        SendAdvertisement::new(),
+        SendAdvertisement::new().allow_monitoring(true)
+    );
+    compare!(
+        RecvAdvertisement::new(),
+        RecvAdvertisement::new().allow_controlling(true)
+    );
+
+    #[cfg(feature = "advanced")]
+    {
+        use grafton_ndi::advanced::{AdvancedConfig, AllocatorLimits, GenlockOptions, QueueLimits};
+        compare!(QueueLimits::new(), QueueLimits::new().max_frames(3));
+        compare!(
+            GenlockOptions::new(),
+            GenlockOptions::new().source(Source::new("reference").unwrap())
+        );
+        compare!(
+            AllocatorLimits::new(),
+            AllocatorLimits::new().max_generations(3)
+        );
+        assert_eq!(
+            AdvancedConfig::parse(r#"{"mode":"studio"}"#).unwrap(),
+            AdvancedConfig::parse(r#"{"mode":"studio"}"#).unwrap()
+        );
+    }
+    #[cfg(feature = "file-io")]
+    {
+        use grafton_ndi::file::{
+            AsyncFileOptions, FileApiOptions, FilePlayerOptions, FileRecorderOptions, SourceSpec,
+        };
+        compare!(
+            FileApiOptions::new(),
+            FileApiOptions::new().library_path("/tmp/file.so")
+        );
+        compare!(
+            FilePlayerOptions::new("program"),
+            FilePlayerOptions::new("backup")
+        );
+        compare!(
+            FileRecorderOptions::new(SourceSpec::new("camera").unwrap()),
+            FileRecorderOptions::new(SourceSpec::new("camera").unwrap()).proxy(false)
+        );
+        compare!(
+            AsyncFileOptions::new(),
+            AsyncFileOptions::new().command_capacity(7)
+        );
+    }
+    #[cfg(feature = "image-encoding")]
+    {
+        use grafton_ndi::image_encoding::{ImageFormat, ImageOptions};
+        compare!(
+            ImageOptions::new(ImageFormat::Png),
+            ImageOptions::new(ImageFormat::Jpeg(80))
+        );
+    }
 }

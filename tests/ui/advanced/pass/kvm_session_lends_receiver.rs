@@ -5,23 +5,22 @@ use std::time::Duration;
 
 use grafton_ndi::{
     advanced::{AllocatedPacketReceiver, KvmReceiver, MouseButton, PacketAttached, PacketReceiver},
-    CaptureMode, EventMode, MetadataFrame, MetadataMode, Receiver, ReceiverMode, Source, Tally, VideoMode,
+    AudioMode, EventMode, MetadataFrame, MetadataMode, Receiver, ReceiverMode, Source, Tally, VideoMode,
 };
 
 fn drag_across_frames(receiver: &mut Receiver) {
     let mut session = receiver.kvm().unwrap();
     let lent = session.receiver();
-    let frame = lent.video().capture_ref(Duration::ZERO).unwrap();
-    let audio = lent.audio().capture_ref(Duration::ZERO).unwrap();
-    let metadata = lent.metadata().capture_ref(Duration::ZERO).unwrap();
+    let frame = lent.capture_video_ref(Duration::ZERO).unwrap();
+    let audio = lent.capture_audio_ref(Duration::ZERO).unwrap();
+    let metadata = lent.capture_metadata_ref(Duration::ZERO).unwrap();
     let mixed = session.receiver().capture_any_ref(Duration::ZERO).unwrap();
     session.key_down(0xffe1).unwrap();
     session.move_pointer(0.25, 0.25).unwrap();
     session.mouse_down(MouseButton::Left).unwrap();
     let next = session
         .receiver()
-        .video()
-        .capture_ref(Duration::ZERO)
+        .capture_video_ref(Duration::ZERO)
         .unwrap();
     session.move_pointer(0.75, 0.75).unwrap();
     session.mouse_up(MouseButton::Left).unwrap();
@@ -32,7 +31,7 @@ fn drag_across_frames(receiver: &mut Receiver) {
 fn packet_session(packets: &mut PacketReceiver) {
     let mut session = packets.controls().kvm().unwrap();
     session.mouse_down(MouseButton::Left).unwrap();
-    let _event = session.capture(Duration::ZERO).unwrap();
+    let _event = session.capture_any(Duration::ZERO).unwrap();
     session.mouse_up(MouseButton::Left).unwrap();
     let _: KvmReceiver<'_, PacketAttached> = session.receiver();
 }
@@ -40,7 +39,7 @@ fn packet_session(packets: &mut PacketReceiver) {
 fn allocated_packet_session(packets: &mut AllocatedPacketReceiver) {
     let mut session = packets.controls().kvm().unwrap();
     session.key_down(0xffe1).unwrap();
-    let _ = session.capture(Duration::ZERO).unwrap();
+    let _ = session.capture_any(Duration::ZERO).unwrap();
     session.release_all().unwrap();
 }
 
@@ -51,7 +50,7 @@ fn controls<M: ReceiverMode>(receiver: KvmReceiver<'_, M>) {
     let _ = receiver.add_connection_metadata(&metadata);
     let _ = receiver.clear_connection_metadata();
     let _ = receiver.web_control_url();
-    let _ = receiver.poll_source_name_change(Duration::ZERO);
+    let _ = receiver.wait_for_source_name_change(Duration::ZERO);
     let _ = receiver.ptz().is_supported();
     let _ = receiver.is_connected();
     let _ = receiver.connection_target();
@@ -64,18 +63,18 @@ fn controls<M: ReceiverMode>(receiver: KvmReceiver<'_, M>) {
 }
 
 fn video<M: VideoMode>(receiver: KvmReceiver<'_, M>) {
-    let _ = receiver.video().capture_ref(Duration::ZERO);
+    let _ = receiver.capture_video_ref(Duration::ZERO);
 }
 
-fn audio<M: CaptureMode>(receiver: KvmReceiver<'_, M>) {
-    let _ = receiver.audio().capture_ref(Duration::ZERO);
+fn audio<M: AudioMode>(receiver: KvmReceiver<'_, M>) {
+    let _ = receiver.capture_audio_ref(Duration::ZERO);
 }
 
 fn metadata<M: MetadataMode>(receiver: KvmReceiver<'_, M>) {
-    let _ = receiver.metadata().capture_ref(Duration::ZERO);
+    let _ = receiver.capture_metadata_ref(Duration::ZERO);
 }
 fn events<M: EventMode>(receiver: KvmReceiver<'_, M>) {
-    let _ = receiver.poll_event(Duration::ZERO);
+    let _ = receiver.next_event(Duration::ZERO);
 }
 
 fn scoped_controls_and_input(receiver: &mut Receiver) {
@@ -95,7 +94,7 @@ fn switch(receiver: &mut Receiver, next: &Source) {
     session.key_down(0xffe1).unwrap();
     session.release_all().unwrap();
     drop(session);
-    receiver.connect_to(next).unwrap();
+    receiver.connect_to(next);
     receiver.disconnect();
     receiver.reconnect();
     let mut session = receiver.kvm().unwrap();

@@ -9,7 +9,8 @@ use std::{
 
 use crate::{
     sys::{self, bindings::*},
-    Error, FourCc, FrameRate, MediaTypes, Result, ScanType, SdkResultDefect, StreamTier, Timecode,
+    Error, FourCc, FrameRate, MediaTypes, PictureAspectRatio, Result, ScanType, SdkResultDefect,
+    StreamTier, Timecode,
 };
 
 /// Why an operation is not permitted in the current state, carried by
@@ -17,44 +18,53 @@ use crate::{
 ///
 /// Its `Display` text describes the state for diagnostics; match on the
 /// variant rather than the text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
-pub enum StateError {
+pub enum StateConflict {
     /// A session is recording or stopping, so another cannot start. Finish
     /// it, or keep taking events until it has ended.
+    #[error("finish the previous session before starting another")]
     PreviousSessionOpen,
     /// Events from an earlier session kept arriving, so a new session was not
     /// started.
+    #[error("the recorder keeps producing events from an earlier session")]
     EarlierSessionEvents,
     /// Waiting for a session to end needs a session that has been asked to
     /// stop, or that the SDK is ending.
+    #[error("request a stop before waiting for the session to end")]
     StopNotRequested,
     /// The session is stopping.
+    #[error("the session is stopping")]
     Stopping,
     /// The operation needs a session that is recording.
+    #[error("the operation needs a session that is recording")]
     NotRecording,
     /// The recorder names its files exactly, so it cannot switch to a new file
     /// during a session: the next file would have the same name. Use a
     /// filename pattern with `{index}`.
+    #[error("a recorder with an exact file name cannot switch to a new file during a session")]
     ExactFileName,
     /// Another event future is already waiting on the async handle, which
     /// delivers each event to one waiter. A close never reports this: closes
     /// made while one is awaited complete with it.
+    #[error("another File event waiter is already pending")]
     WaiterPending,
     /// The async handle's object has been closed, or its thread stopped
     /// normally before it carried out the operation. A thread that failed
     /// reports [`OwnerFailed`](Self::OwnerFailed) instead.
     /// Also returned by an in-flight async finish or wait when a concurrent
     /// close's remaining finalization budget ends without a settled outcome.
+    #[error("File owner has closed")]
     Closed,
     /// The async handle's thread failed, for example by panicking. The
     /// operation it was running, every command queued behind it, every later
     /// command, every event wait and the close report this, not
     /// [`Closed`](Self::Closed).
+    #[error("File owner thread failed")]
     OwnerFailed,
 }
 
-impl StateError {
+impl StateConflict {
     /// Whether the same call can succeed later without anything else changing
     /// on this handle: true only for [`WaiterPending`](Self::WaiterPending),
     /// once the other waiter has finished. A full command queue, which can
@@ -67,35 +77,14 @@ impl StateError {
     }
 }
 
-impl std::fmt::Display for StateError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::PreviousSessionOpen => "finish the previous session before starting another",
-            Self::EarlierSessionEvents => {
-                "the recorder keeps producing events from an earlier session"
-            }
-            Self::StopNotRequested => "request a stop before waiting for the session to end",
-            Self::Stopping => "the session is stopping",
-            Self::NotRecording => "the operation needs a session that is recording",
-            Self::ExactFileName => {
-                "a recorder with an exact file name cannot switch to a new file during a session"
-            }
-            Self::WaiterPending => "another File event waiter is already pending",
-            Self::Closed => "File owner has closed",
-            Self::OwnerFailed => "File owner thread failed",
-        })
-    }
-}
-
 /// `value` as a C string for the SDK.
 ///
 /// # Errors
 ///
-/// [`Error::InvalidInput`] naming `what` when `value` is empty and
-/// `allow_empty` is false, and [`Error::InvalidCString`] when it contains a
-/// NUL.
-fn cstring(value: &str, what: &'static str, allow_empty: bool) -> Result<CString> {
-    if !allow_empty && value.is_empty() {
+/// [`Error::InvalidInput`] naming `what` when `value` is empty, and
+/// [`Error::InvalidCString`] when it contains a NUL.
+fn cstring(value: &str, what: &'static str) -> Result<CString> {
+    if value.is_empty() {
         return Err(Error::InvalidInput(crate::InputDefect::Empty { what }));
     }
     Ok(CString::new(value)?)
@@ -203,16 +192,17 @@ impl TryFrom<&crate::Source> for SourceSpec {
 /// nothing.
 ///
 /// The options are checked when a player is created from them, by
-/// [`FileApi::create_player`](super::FileApi::create_player) or
+/// [`FilePlayer::new`](super::FilePlayer::new) or
 /// [`AsyncFilePlayer::create`](super::AsyncFilePlayer::create): the name must
-/// not be empty, and neither the name nor the groups may contain a NUL.
-#[derive(Debug, Clone)]
-pub struct PlayerOptions {
+/// not be empty or contain a NUL. Each group must be nonempty and contain
+/// neither a comma nor a NUL.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FilePlayerOptions {
     pub(super) name: String,
-    groups: Option<String>,
+    groups: Option<Vec<String>>,
 }
 
-impl PlayerOptions {
+impl FilePlayerOptions {
     /// Replace the advertised player name, preserving every other setting.
     #[must_use]
     pub fn name(mut self, name: impl Into<String>) -> Self {
@@ -235,7 +225,7 @@ impl PlayerOptions {
 
     /// Requested discovery groups, or `None` to inherit the NDI configuration.
     #[must_use]
-    pub fn configured_groups(&self) -> Option<&str> {
+    pub fn configured_groups(&self) -> Option<&[String]> {
         self.groups.as_deref()
     }
 
@@ -248,11 +238,13 @@ impl PlayerOptions {
         }
     }
 
-    /// Set the comma-separated NDI groups the player's source is advertised
-    /// in, instead of those of the NDI configuration.
+    /// Set the NDI groups the player's source is advertised in, instead of
+    /// those of the NDI configuration. An empty list advertises no groups.
+    /// Each group is checked when the player is created: it must be nonempty
+    /// and contain neither a comma nor a NUL.
     #[must_use]
-    pub fn groups(mut self, groups: impl Into<String>) -> Self {
-        self.groups = Some(groups.into());
+    pub fn groups(mut self, groups: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.groups = Some(groups.into_iter().map(Into::into).collect());
         self
     }
 
@@ -260,16 +252,13 @@ impl PlayerOptions {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when the name is empty, and
-    /// [`Error::InvalidCString`] when the name or the groups contain a NUL.
+    /// [`Error::InvalidInput`] when the name is empty or a group is empty
+    /// or contains a comma or NUL. [`Error::InvalidCString`] when the name
+    /// contains a NUL.
     pub(super) fn resolve(&self) -> Result<ResolvedPlayerOptions> {
         Ok(ResolvedPlayerOptions {
-            name: cstring(&self.name, "player name", false)?,
-            groups: self
-                .groups
-                .as_deref()
-                .map(|groups| cstring(groups, "player groups", true))
-                .transpose()?,
+            name: cstring(&self.name, "player name")?,
+            groups: crate::finder::list_cstring(self.groups.as_deref(), "player groups")?,
         })
     }
 }
@@ -317,12 +306,12 @@ pub enum FileNaming {
     ///
     /// * a format change of the source closes the file and ends the session,
     ///   which [`RecordingReport::stopped_by_sdk`] then reports; see
-    ///   [`RecorderOptions::format_change_rollover`];
+    ///   [`FileRecorderOptions::format_change_rollover`];
     /// * format-change rollover switched on, or a nonzero
-    ///   [`RecorderOptions::rollover_size`], is refused with
+    ///   [`FileRecorderOptions::rollover_size`], is refused with
     ///   [`Error::InvalidInput`] when the recorder is created;
     /// * [`FileRecorder::set_source`] is refused during a session with
-    ///   [`StateError::ExactFileName`].
+    ///   [`StateConflict::ExactFileName`].
     ///
     /// [`FileRecorder::rollover`] to a new target still works. Use
     /// [`Indexed`](Self::Indexed), or a [`Pattern`](Self::Pattern) with
@@ -359,13 +348,13 @@ pub enum FileNaming {
 /// Recorder configuration fixed when its native instance is created.
 ///
 /// Nothing is checked until a recorder is created from the options, by
-/// [`FileApi::create_recorder`](super::FileApi::create_recorder),
+/// [`FileRecorder::new`](super::FileRecorder::new),
 /// [`FileRecorder::reset`](super::FileRecorder::reset) or
 /// [`AsyncFileRecorder::create`](super::AsyncFileRecorder::create). The
 /// options are then checked against each other, so the order of the setter
 /// calls does not matter.
-#[derive(Debug, Clone)]
-pub struct RecorderOptions {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FileRecorderOptions {
     pub(super) source: SourceSpec,
     pub(super) tracks: MediaTypes,
     pub(super) planar_audio: bool,
@@ -377,7 +366,7 @@ pub struct RecorderOptions {
     pub(super) drop_wait: Duration,
 }
 
-impl RecorderOptions {
+impl FileRecorderOptions {
     /// Replace the recording source, preserving every other setting.
     #[must_use]
     pub fn source(mut self, source: SourceSpec) -> Self {
@@ -580,7 +569,7 @@ impl RecorderOptions {
         };
         let naming = NamePattern::new(pattern)?;
         let pattern = given
-            .then(|| cstring(pattern, "filename pattern", false))
+            .then(|| cstring(pattern, "filename pattern"))
             .transpose()?;
         if naming.is_exact() {
             if self.format_change_rollover == Some(true) {
@@ -1088,7 +1077,7 @@ pub struct VideoTrack {
     frame_rate: Option<FrameRate>,
     fourcc: FourCc,
     scan_type: Option<ScanType>,
-    picture_aspect_ratio: Option<f32>,
+    picture_aspect_ratio: Option<PictureAspectRatio>,
 }
 
 impl VideoTrack {
@@ -1129,7 +1118,7 @@ impl VideoTrack {
 
     /// The display aspect ratio of the full frame, such as 16/9, or `None`
     /// when it is not known, in which case the pixels are square.
-    pub fn picture_aspect_ratio(&self) -> Option<f32> {
+    pub fn picture_aspect_ratio(&self) -> Option<PictureAspectRatio> {
         self.picture_aspect_ratio
     }
 }
@@ -1456,18 +1445,18 @@ pub struct PlayerStats {
 
 impl PlayerStats {
     /// Sent video frames for the program or preview stream.
-    pub fn video_frames(&self, tier: StreamTier) -> u64 {
+    pub fn video_frames_sent(&self, tier: StreamTier) -> u64 {
         match tier {
             StreamTier::Program => self.program_video_frames,
             StreamTier::Preview => self.preview_video_frames,
         }
     }
     /// Sent audio packet count.
-    pub fn audio_frames(&self) -> u64 {
+    pub fn audio_frames_sent(&self) -> u64 {
         self.audio_frames
     }
     /// Sent metadata packet count.
-    pub fn metadata_frames(&self) -> u64 {
+    pub fn metadata_frames_sent(&self) -> u64 {
         self.metadata_frames
     }
     /// Playback wall-clock duration reported by the SDK.
@@ -1503,15 +1492,15 @@ impl RecorderStats {
         self.bytes_written
     }
     /// Muxed video packet count.
-    pub fn video_frames(&self) -> u64 {
+    pub fn video_frames_written(&self) -> u64 {
         self.video_frames
     }
     /// Muxed audio packet count.
-    pub fn audio_frames(&self) -> u64 {
+    pub fn audio_frames_written(&self) -> u64 {
         self.audio_frames
     }
     /// Muxed metadata packet count.
-    pub fn metadata_frames(&self) -> u64 {
+    pub fn metadata_frames_written(&self) -> u64 {
         self.metadata_frames
     }
     /// Video packets dropped by the receiver.
@@ -1539,7 +1528,7 @@ impl RecorderStats {
         self.metadata_frames_dropped_by_pipeline
     }
     /// Writer-stage drops across all tracks.
-    pub fn writer_dropped(&self) -> u64 {
+    pub fn frames_dropped_by_writer(&self) -> u64 {
         self.writer_dropped
     }
     /// Completed rollover count.
@@ -1644,7 +1633,11 @@ impl VideoTrack {
             .ok(),
             fourcc: FourCc::from_raw(raw.fourcc),
             scan_type: scan_type(raw.frame_format_type),
-            picture_aspect_ratio: (ratio.is_finite() && ratio > 0.0).then_some(ratio),
+            picture_aspect_ratio: if ratio > 0.0 {
+                PictureAspectRatio::new(ratio).ok()
+            } else {
+                None
+            },
         })
     }
 }
@@ -1793,10 +1786,10 @@ mod tests {
             metadata_frames_sent: u64::MAX,
             playback_wallclock_100ns: 55,
         });
-        assert_eq!(playback.video_frames(StreamTier::Program), 11);
-        assert_eq!(playback.video_frames(StreamTier::Preview), 22);
-        assert_eq!(playback.audio_frames(), 33);
-        assert_eq!(playback.metadata_frames(), u64::MAX);
+        assert_eq!(playback.video_frames_sent(StreamTier::Program), 11);
+        assert_eq!(playback.video_frames_sent(StreamTier::Preview), 22);
+        assert_eq!(playback.audio_frames_sent(), 33);
+        assert_eq!(playback.metadata_frames_sent(), u64::MAX);
         assert_eq!(playback.wallclock().ticks(), 55);
 
         let recording = RecorderStats::from_sdk(&NDIlib_file_recorder_stats_t {
@@ -1818,16 +1811,16 @@ mod tests {
             last_metadata_pts_100ns: 15,
         });
         assert_eq!(recording.bytes_written(), u64::MAX);
-        assert_eq!(recording.video_frames(), 1);
-        assert_eq!(recording.audio_frames(), 2);
-        assert_eq!(recording.metadata_frames(), 3);
+        assert_eq!(recording.video_frames_written(), 1);
+        assert_eq!(recording.audio_frames_written(), 2);
+        assert_eq!(recording.metadata_frames_written(), 3);
         assert_eq!(recording.video_frames_dropped_by_receiver(), 4);
         assert_eq!(recording.audio_frames_dropped_by_receiver(), 5);
         assert_eq!(recording.metadata_frames_dropped_by_receiver(), 6);
         assert_eq!(recording.video_frames_dropped_by_pipeline(), 7);
         assert_eq!(recording.audio_frames_dropped_by_pipeline(), 8);
         assert_eq!(recording.metadata_frames_dropped_by_pipeline(), 9);
-        assert_eq!(recording.writer_dropped(), 10);
+        assert_eq!(recording.frames_dropped_by_writer(), 10);
         assert_eq!(recording.rollover_count(), 11);
         assert_eq!(recording.recording_time().ticks(), 12);
         assert_eq!(recording.last_video_pts().ticks(), 13);
@@ -1866,7 +1859,7 @@ mod tests {
     }
 
     #[test]
-    fn a_nul_in_any_string_for_the_sdk_is_the_crates_c_string_error() {
+    fn a_nul_in_paths_or_scalar_strings_is_the_crates_c_string_error() {
         // An absolute path on every platform: `/take` is not one on Windows, where
         // it would be resolved against the current drive and the NUL would sit
         // after that prefix. The path is used as it is, so the NUL stays where
@@ -1878,15 +1871,14 @@ mod tests {
         assert_eq!(nul_position(RecordingTarget::new(&nul)), at);
         assert_eq!(nul_position(SourceSpec::new("cam\0era")), 3);
         assert_eq!(nul_position(SourceSpec::from_url("url\0tail")), 3);
-        assert_eq!(nul_position(PlayerOptions::new("Re\0play").resolve()), 2);
         assert_eq!(
-            nul_position(PlayerOptions::new("Replay").groups("a\0b").resolve()),
-            1
+            nul_position(FilePlayerOptions::new("Re\0play").resolve()),
+            2
         );
         let pattern = FileNaming::Pattern("{prefix}\0_{index}.mkv".into());
         assert_eq!(
             nul_position(
-                RecorderOptions::new(SourceSpec::new("camera").unwrap())
+                FileRecorderOptions::new(SourceSpec::new("camera").unwrap())
                     .naming(pattern)
                     .resolve()
             ),
@@ -2052,54 +2044,86 @@ mod tests {
     fn discovered_sources_pin_the_complete_endpoint_without_name_precedence() {
         use crate::{Source, SourceAddress};
         for address in [
-            SourceAddress::new("192.0.2.10:5962"),
-            SourceAddress::new("ndi://user@camera.local:5962/path?opaque=1"),
+            SourceAddress::new("192.0.2.10:5962").unwrap(),
+            SourceAddress::new("ndi://user@camera.local:5962/path?opaque=1").unwrap(),
         ] {
             let text = address.as_str();
-            for name in ["STUDIO (Camera 2)", "", "diagnostic\0name"] {
-                let selected = Source::new(name).with_address(address.clone());
+            for name in ["STUDIO (Camera 2)", ""] {
+                let selected = Source::new(name).unwrap().with_address(address.clone());
                 let spec = SourceSpec::try_from(&selected).unwrap();
                 assert_eq!(spec.name(), None, "name must not override an endpoint");
                 assert_eq!(spec.url(), Some(text));
                 assert_eq!(spec.clone(), spec);
             }
         }
-        let named = Source::new("STUDIO (Camera 2)");
+        let named = Source::new("STUDIO (Camera 2)").unwrap();
         let spec = SourceSpec::try_from(&named).unwrap();
         assert_eq!(spec.name(), Some(named.name()));
         assert_eq!(spec.url(), None);
         let addressed = named
             .clone()
-            .with_address(SourceAddress::new("192.0.2.10:5962"));
+            .with_address(SourceAddress::new("192.0.2.10:5962").unwrap());
         let logical = SourceSpec::new(addressed.name()).unwrap();
         assert_eq!(logical.name(), Some(addressed.name()));
         assert_eq!(logical.url(), None);
-        for bad in ["", "bad\0endpoint"] {
-            let selected = named.clone().with_address(SourceAddress::new(bad));
-            assert!(
-                SourceSpec::try_from(&selected).is_err(),
-                "invalid endpoint must not fall back to name"
-            );
-        }
-        assert!(SourceSpec::try_from(&Source::new("")).is_err());
+        let selected = named.clone().with_address(SourceAddress::new("").unwrap());
+        assert!(
+            SourceSpec::try_from(&selected).is_err(),
+            "invalid endpoint must not fall back to name"
+        );
+        assert!(SourceSpec::try_from(&Source::new("").unwrap()).is_err());
         assert!(matches!(
-            SourceSpec::try_from(&Source::new("bad\0name")),
+            Source::new("bad\0name"),
+            Err(Error::InvalidCString(_))
+        ));
+        assert!(matches!(
+            SourceAddress::new("bad\0endpoint"),
             Err(Error::InvalidCString(_))
         ));
     }
 
     #[test]
+    fn player_group_lists_round_trip_and_reject_ambiguous_elements() {
+        let options = FilePlayerOptions::new("Replay").groups(["Public", "Studio"]);
+        assert_eq!(
+            options.configured_groups(),
+            Some(&["Public".to_owned(), "Studio".to_owned()][..])
+        );
+        assert_eq!(options.clone(), options);
+        assert_eq!(
+            options.resolve().unwrap().groups.unwrap().as_bytes(),
+            b"Public,Studio"
+        );
+        for value in ["", "Public,Studio", "bad\0group"] {
+            assert_eq!(
+                invalid_cause(
+                    FilePlayerOptions::new("Replay")
+                        .groups(["valid", value])
+                        .resolve()
+                ),
+                crate::InputDefect::ListElement {
+                    setting: "player groups",
+                    index: 1
+                },
+            );
+        }
+    }
+
+    #[test]
     fn player_options_are_checked_when_they_are_resolved() {
-        let resolved = PlayerOptions::new("Replay").groups("").resolve().unwrap();
+        let resolved = FilePlayerOptions::new("Replay")
+            .groups([] as [&str; 0])
+            .resolve()
+            .unwrap();
         assert_eq!(resolved.name.as_bytes(), b"Replay");
         assert_eq!(resolved.groups.unwrap().as_bytes(), b"");
-        assert!(PlayerOptions::new("Replay")
+        assert!(FilePlayerOptions::new("Replay")
             .resolve()
             .unwrap()
             .groups
             .is_none());
         assert_eq!(
-            invalid_cause(PlayerOptions::new("").resolve()),
+            invalid_cause(FilePlayerOptions::new("").resolve()),
             crate::InputDefect::Empty {
                 what: "player name"
             }
@@ -2108,8 +2132,8 @@ mod tests {
 
     #[test]
     fn a_drop_wait_beyond_the_largest_timeout_is_refused_when_resolved() {
-        let options = RecorderOptions::new(SourceSpec::new("camera").unwrap());
-        assert_eq!(options.drop_wait, RecorderOptions::DEFAULT_DROP_WAIT);
+        let options = FileRecorderOptions::new(SourceSpec::new("camera").unwrap());
+        assert_eq!(options.drop_wait, FileRecorderOptions::DEFAULT_DROP_WAIT);
         options
             .clone()
             .drop_wait(crate::MAX_TIMEOUT)
@@ -2126,7 +2150,7 @@ mod tests {
 
     #[test]
     fn tracks_do_not_silently_map_empty_to_all() {
-        let options = RecorderOptions::new(SourceSpec::new("camera").unwrap());
+        let options = FileRecorderOptions::new(SourceSpec::new("camera").unwrap());
         assert_eq!(options.tracks, MediaTypes::ALL);
         assert!(options.resolve().is_ok());
         let empty = options.clone().tracks(MediaTypes::NONE);
@@ -2141,7 +2165,7 @@ mod tests {
 
     /// The pattern the SDK is given for `naming`.
     fn sdk_pattern(naming: FileNaming) -> Result<Option<String>> {
-        let options = RecorderOptions::new(SourceSpec::new("camera").unwrap()).naming(naming);
+        let options = FileRecorderOptions::new(SourceSpec::new("camera").unwrap()).naming(naming);
         Ok(options
             .resolve()?
             .pattern
@@ -2203,7 +2227,7 @@ mod tests {
 
     #[test]
     fn only_a_pending_waiter_is_retryable() {
-        use StateError::*;
+        use StateConflict::*;
         for (state, retryable) in [
             (PreviousSessionOpen, false),
             (EarlierSessionEvents, false),
@@ -2222,20 +2246,20 @@ mod tests {
     #[test]
     fn state_errors_keep_their_messages() {
         assert_eq!(
-            StateError::PreviousSessionOpen.to_string(),
+            StateConflict::PreviousSessionOpen.to_string(),
             "finish the previous session before starting another"
         );
         assert_eq!(
-            Error::InvalidState(StateError::Stopping).to_string(),
+            Error::InvalidState(StateConflict::Stopping).to_string(),
             "Invalid File API state: the session is stopping"
         );
     }
 
-    fn options() -> RecorderOptions {
-        RecorderOptions::new(SourceSpec::new("camera").unwrap())
+    fn options() -> FileRecorderOptions {
+        FileRecorderOptions::new(SourceSpec::new("camera").unwrap())
     }
 
-    fn refused(options: RecorderOptions) -> crate::InputDefect {
+    fn refused(options: FileRecorderOptions) -> crate::InputDefect {
         match options.resolve() {
             Err(Error::InvalidInput(reason)) => reason,
             Err(other) => panic!("expected the options to be refused as input: {other}"),
@@ -2258,7 +2282,7 @@ mod tests {
                 "{pattern:?}"
             );
         }
-        let exact = |options: RecorderOptions| options.resolve().unwrap().naming.is_exact();
+        let exact = |options: FileRecorderOptions| options.resolve().unwrap().naming.is_exact();
         assert!(!exact(options()));
         assert!(exact(options().naming(FileNaming::Exact)));
         assert!(exact(
@@ -2273,7 +2297,8 @@ mod tests {
 
     #[test]
     fn format_change_rollover_follows_the_naming_unless_set() {
-        let rolls = |options: RecorderOptions| options.resolve().unwrap().format_change_rollover;
+        let rolls =
+            |options: FileRecorderOptions| options.resolve().unwrap().format_change_rollover;
         assert!(rolls(options()));
         assert!(!rolls(options().naming(FileNaming::Exact)));
         assert!(!rolls(options().format_change_rollover(false)));
@@ -2314,7 +2339,7 @@ mod tests {
 
     #[test]
     fn player_template_clear_groups_restores_the_native_null_default() {
-        let template = PlayerOptions::new("Replay A").groups("");
+        let template = FilePlayerOptions::new("Replay A").groups([] as [&str; 0]);
         let override_groups = template.resolve().unwrap();
         assert!(override_groups.groups.is_some());
         let inherited = template.name("Replay B").clear_groups().resolve().unwrap();
@@ -2715,7 +2740,10 @@ mod tests {
         );
         assert_eq!(track.fourcc().raw().to_le_bytes(), *b"H264");
         assert_eq!(track.scan_type(), Some(ScanType::Progressive));
-        assert_eq!(track.picture_aspect_ratio(), Some(16.0 / 9.0));
+        assert_eq!(
+            track.picture_aspect_ratio(),
+            Some(PictureAspectRatio::new(16.0 / 9.0).unwrap())
+        );
 
         // Zero is what the SDK reports for what it does not know yet.
         let unknown = VideoTrack::from_sdk(&NDIlib_file_video_track_format_t {

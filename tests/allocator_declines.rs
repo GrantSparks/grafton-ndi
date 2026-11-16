@@ -44,7 +44,7 @@ fn an_insufficient_native_byte_grant_counts_declines_without_retaining_storage()
         .max_allocations(2)
         .max_allocation_bytes(1024)
         .max_bytes(1024);
-    let service = AllocatorService::new(ndi.process_lifetime(), limits).unwrap();
+    let service = AllocatorService::new(ndi.process_lifetime(), &limits).unwrap();
     let mut receiver = service.attach(receiver).unwrap();
     let policy_calls = Arc::new(AtomicUsize::new(0));
     receiver
@@ -66,8 +66,7 @@ fn an_insufficient_native_byte_grant_counts_declines_without_retaining_storage()
         sender.send_video(&video).unwrap();
         assert!(receiver
             .receiver()
-            .video()
-            .capture_ref(Duration::from_millis(100))
+            .capture_video_ref(Duration::from_millis(100))
             .unwrap()
             .is_none());
     }

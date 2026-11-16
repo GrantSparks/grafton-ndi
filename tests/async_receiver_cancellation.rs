@@ -48,7 +48,11 @@ fn destroyed() -> usize {
 async fn cancelled_waits<R: AsyncRuntime>(ndi: &Ndi) {
     for kind in 0..4 {
         let receiver = AsyncReceiver::<R>::new(
-            Receiver::new(ndi, &ReceiverOptions::new(Source::new("cancel fixture"))).unwrap(),
+            Receiver::new(
+                ndi,
+                &ReceiverOptions::new(Source::new("cancel fixture").unwrap()),
+            )
+            .unwrap(),
         );
         let before = calls(kind == 3);
         let before_destroyed = destroyed();
@@ -56,16 +60,16 @@ async fn cancelled_waits<R: AsyncRuntime>(ndi: &Ndi) {
             let budget = Duration::from_secs(30);
             match kind {
                 0 => {
-                    receiver.video().capture(budget).await.unwrap();
+                    receiver.capture_video(budget).await.unwrap();
                 }
                 1 => {
                     receiver.capture_any(budget).await.unwrap();
                 }
                 2 => {
-                    receiver.poll_event(budget).await.unwrap();
+                    receiver.next_event(budget).await.unwrap();
                 }
                 _ => {
-                    receiver.poll_source_name_change(budget).await.unwrap();
+                    receiver.wait_for_source_name_change(budget).await.unwrap();
                 }
             }
         });

@@ -3,9 +3,9 @@
 use grafton_ndi::advanced::PacketReceiver;
 use std::time::Duration;
 fn own_capture(packets: &PacketReceiver) {
-    let _ = packets.receiver().video();
-    let _ = packets.receiver().audio();
-    let _ = packets.receiver().metadata();
-    let _ = packets.receiver().poll_event(Duration::ZERO);
+    let _ = packets.receiver().capture_video(Duration::ZERO);
+    let _ = packets.receiver().capture_audio(Duration::ZERO);
+    let _ = packets.receiver().capture_metadata(Duration::ZERO);
+    let _ = packets.receiver().next_event(Duration::ZERO);
 }
 fn main() {}

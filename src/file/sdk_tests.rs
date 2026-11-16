@@ -121,7 +121,7 @@ impl LiveSource {
     fn loopback(ndi: &crate::Ndi, sender: &crate::Sender) -> SourceSpec {
         let name = sender.source().unwrap().name().to_owned();
         let finder =
-            crate::Finder::new(ndi, &crate::FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
+            crate::Finder::new(ndi, &crate::FinderOptions::new().extra_ips(["127.0.0.1"])).unwrap();
         let source = finder
             .find_source(PATIENCE, |source| {
                 source.name() == name && source.address().is_some_and(|address| !address.is_url())
@@ -133,7 +133,8 @@ impl LiveSource {
             .unwrap()
             .port()
             .expect("an address with a port");
-        let selected = source.with_address(crate::SourceAddress::new(format!("127.0.0.1:{port}")));
+        let selected =
+            source.with_address(crate::SourceAddress::new(format!("127.0.0.1:{port}")).unwrap());
         SourceSpec::try_from(&selected).unwrap()
     }
 }
@@ -148,8 +149,8 @@ impl Drop for LiveSource {
 }
 
 /// Options that record the live source's video to exactly the given file name.
-pub(super) fn exact_video(source: &LiveSource) -> RecorderOptions {
-    RecorderOptions::new(source.spec.clone())
+pub(super) fn exact_video(source: &LiveSource) -> FileRecorderOptions {
+    FileRecorderOptions::new(source.spec.clone())
         .naming(FileNaming::Exact)
         .proxy(false)
         .tracks(MediaTypes::VIDEO)
@@ -167,7 +168,7 @@ fn assert_live_video(track: &VideoTrack) {
     assert!(
         track
             .picture_aspect_ratio()
-            .is_some_and(|ratio| (ratio - 16.0 / 9.0).abs() < 1e-3),
+            .is_some_and(|ratio| (ratio.get() - 16.0 / 9.0).abs() < 1e-3),
         "{track:?}"
     );
 }
@@ -176,7 +177,7 @@ fn assert_live_video(track: &VideoTrack) {
 fn await_event(recorder: &mut FileRecorder, kind: RecorderEventKind) -> RecorderEvent {
     let deadline = Instant::now() + PATIENCE;
     while Instant::now() < deadline {
-        let Some(event) = recorder.poll_event(Duration::from_millis(50)).unwrap() else {
+        let Some(event) = recorder.next_event(Duration::from_millis(50)).unwrap() else {
             continue;
         };
         assert!(
@@ -242,7 +243,7 @@ impl Timeline {
                 Instant::now() < deadline,
                 "no {kind:?} event for {file:?} arrived; the recorder reported:\n{self}"
             );
-            if let Some(event) = recorder.poll_event(Duration::from_millis(50)).unwrap() {
+            if let Some(event) = recorder.next_event(Duration::from_millis(50)).unwrap() {
                 let failed = matches!(
                     event.kind(),
                     RecorderEventKind::Error | RecorderEventKind::OpenFailed
@@ -305,7 +306,7 @@ fn panic_unfinalized(api: &FileApi, file: &Path, info: &FileInfo, timeline: &Tim
     let reported = Instant::now();
     let bytes = std::fs::metadata(file).map(|metadata| metadata.len());
     let later = loop {
-        if api.probe(file).is_ok_and(|info| info.duration().is_final()) {
+        if crate::file::FilePlayer::probe(api, file).is_ok_and(|info| info.duration().is_final()) {
             break format!("a probe found it finalized {:?} later", reported.elapsed());
         }
         if reported.elapsed() >= PATIENCE {
@@ -323,7 +324,7 @@ fn panic_unfinalized(api: &FileApi, file: &Path, info: &FileInfo, timeline: &Tim
 
 /// Record a short clip of `source` to `file` and return its report.
 fn record_clip(api: &FileApi, source: &LiveSource, file: &PathBuf) -> RecordingReport {
-    let mut recorder = api.create_recorder(&exact_video(source)).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(api, &exact_video(source)).unwrap();
     recorder
         .start(
             &RecordingTarget::new(file).unwrap(),
@@ -379,7 +380,7 @@ fn the_longest_exact_event_path_records_closes_and_starts_again() {
             "x".repeat(filename_bytes - 5 + extra)
         ))
     };
-    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     let unreportable = RecordingTarget::new(file('r', 1)).unwrap();
     assert_eq!(unreportable.path().to_str().unwrap().len(), limit + 1);
     assert!(matches!(
@@ -419,7 +420,7 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
     let source = LiveSource::start(&ndi, "record");
     let file = scratch.path("take.mkv");
 
-    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     assert_eq!(recorder.state(), RecorderState::Idle);
     assert_eq!(recorder.last_accepted_source(), Some(&source.spec));
     let session = recorder
@@ -441,7 +442,7 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
     assert!(recorder.source_format().unwrap().is_some());
     thread::sleep(Duration::from_millis(300));
     let stats = recorder.stats().unwrap().expect("counters while recording");
-    assert!(stats.video_frames() > 0);
+    assert!(stats.video_frames_written() > 0);
 
     let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
         panic!("the recording was not confirmed closed");
@@ -454,13 +455,13 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
     assert_eq!(recorder.state(), RecorderState::Closed);
     assert!(!recorder.is_recording());
 
-    let info = api.probe(&file).unwrap();
+    let info = crate::file::FilePlayer::probe(&api, &file).unwrap();
     assert_eq!(info.video_track_count(), 1);
     assert_live_video(&info.source_format().unwrap().video_tracks()[0]);
     assert!(info.duration().is_final());
     assert!(info.duration().value().ticks() > 0);
     assert!(matches!(
-        api.probe(scratch.path("absent.mkv")),
+        crate::file::FilePlayer::probe(&api, scratch.path("absent.mkv")),
         Err(Error::NativeOperationFailed { .. })
     ));
 }
@@ -472,10 +473,10 @@ fn a_rollover_requested_just_before_the_stop_still_ends_in_a_confirmed_close() {
     };
     let scratch = Scratch::new("late-rollover");
     let source = LiveSource::start(&ndi, "late-rollover");
-    let options = RecorderOptions::new(source.spec.clone())
+    let options = FileRecorderOptions::new(source.spec.clone())
         .proxy(false)
         .tracks(MediaTypes::VIDEO);
-    let mut recorder = api.create_recorder(&options).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&api, &options).unwrap();
     recorder
         .start(
             &RecordingTarget::new(scratch.path("first")).unwrap(),
@@ -500,10 +501,10 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
     };
     let scratch = Scratch::new("rollovers");
     let source = LiveSource::start(&ndi, "rollovers");
-    let options = RecorderOptions::new(source.spec.clone())
+    let options = FileRecorderOptions::new(source.spec.clone())
         .proxy(false)
         .tracks(MediaTypes::VIDEO);
-    let mut recorder = api.create_recorder(&options).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&api, &options).unwrap();
     let mut timeline = Timeline::new();
     let started = timeline.mark();
     recorder
@@ -545,7 +546,7 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
     reported.sort();
     assert_eq!(written, reported, "the files on disk:\n{timeline}");
     for file in &files {
-        let info = api.probe(file).unwrap();
+        let info = crate::file::FilePlayer::probe(&api, file).unwrap();
         if info.duration().is_final() {
             continue;
         }
@@ -575,12 +576,12 @@ fn rollovers_open_the_next_file_before_closing_the_previous_file() {
     for proxy in [false, true] {
         for mechanism in ["explicit", "source", "size"] {
             let prefix = format!("{mechanism}-proxy-{proxy}");
-            let options = RecorderOptions::new(source.spec.clone())
+            let options = FileRecorderOptions::new(source.spec.clone())
                 .naming(FileNaming::Indexed)
                 .proxy(proxy)
                 .tracks(MediaTypes::VIDEO)
                 .rollover_size(if mechanism == "size" { 65_536 } else { 0 });
-            let mut recorder = api.create_recorder(&options).unwrap();
+            let mut recorder = crate::file::FileRecorder::new(&api, &options).unwrap();
             let mut timeline = Timeline::new();
             recorder
                 .start(
@@ -634,7 +635,7 @@ fn generated_recording_timecode_replays_its_explicit_start() {
     let source = LiveSource::start(&ndi, "generated-timecode");
     let file = scratch.path("timecode.mkv");
     let start = crate::Timecode::from_ticks(360_000_000_000);
-    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     recorder
         .start(
             &RecordingTarget::new(&file).unwrap(),
@@ -647,10 +648,13 @@ fn generated_recording_timecode_replays_its_explicit_start() {
         recorder.finish(PATIENCE).unwrap(),
         FinishStatus::Closed(_)
     ));
-    assert!(api.probe(&file).unwrap().duration().is_final());
+    assert!(crate::file::FilePlayer::probe(&api, &file)
+        .unwrap()
+        .duration()
+        .is_final());
 
     let name = format!("grafton-generated-timecode-player-{}", std::process::id());
-    let mut player = api.create_player(&PlayerOptions::new(name)).unwrap();
+    let mut player = crate::file::FilePlayer::new(&api, &FilePlayerOptions::new(name)).unwrap();
     player.start(&file).unwrap();
     let deadline = Instant::now() + PATIENCE;
     loop {
@@ -658,7 +662,7 @@ fn generated_recording_timecode_replays_its_explicit_start() {
             Instant::now() < deadline,
             "no first playback frame event arrived"
         );
-        let Some(event) = player.poll_event(Duration::from_millis(50)).unwrap() else {
+        let Some(event) = player.next_event(Duration::from_millis(50)).unwrap() else {
             continue;
         };
         assert_ne!(event.kind(), PlayerEventKind::Error, "{event:?}");
@@ -674,7 +678,7 @@ fn generated_recording_timecode_replays_its_explicit_start() {
             Instant::now() < deadline,
             "playback timecodes did not advance from {start:?}"
         );
-        let event = player.poll_event(Duration::from_millis(50)).unwrap();
+        let event = player.next_event(Duration::from_millis(50)).unwrap();
         assert!(event.is_none_or(|event| event.kind() != PlayerEventKind::Error));
         let timecode = player
             .source_timecode()
@@ -696,17 +700,17 @@ fn injected_metadata_is_recorded_on_the_metadata_track() {
     let scratch = Scratch::new("metadata");
     let source = LiveSource::start(&ndi, "metadata");
     let file = scratch.path("marked.mkv");
-    let options = RecorderOptions::new(source.spec.clone())
+    let options = FileRecorderOptions::new(source.spec.clone())
         .naming(FileNaming::Exact)
         .proxy(false)
         .tracks(MediaTypes::VIDEO | MediaTypes::METADATA);
-    let mut recorder = api.create_recorder(&options).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&api, &options).unwrap();
     let marker = crate::MetadataFrame::new("<marker cue=\"intro\"/>")
         .unwrap()
         .with_timecode(crate::Timecode::from_ticks(0));
     assert!(matches!(
         recorder.inject_metadata(&marker),
-        Err(Error::InvalidState(StateError::NotRecording))
+        Err(Error::InvalidState(StateConflict::NotRecording))
     ));
     recorder
         .start(
@@ -723,7 +727,12 @@ fn injected_metadata_is_recorded_on_the_metadata_track() {
         recorder.finish(PATIENCE).unwrap(),
         FinishStatus::Closed(_)
     ));
-    assert_eq!(api.probe(&file).unwrap().metadata_track_count(), 1);
+    assert_eq!(
+        crate::file::FilePlayer::probe(&api, &file)
+            .unwrap()
+            .metadata_track_count(),
+        1
+    );
 }
 
 /// What a drop leaves behind with the real library.
@@ -741,7 +750,7 @@ fn dropping_a_recorder_leaves_a_finalized_file() {
     let scratch = Scratch::new("drop");
     let source = LiveSource::start(&ndi, "drop");
     let file = scratch.path("dropped.mkv");
-    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     recorder
         .start(
             &RecordingTarget::new(&file).unwrap(),
@@ -751,7 +760,7 @@ fn dropping_a_recorder_leaves_a_finalized_file() {
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
     thread::sleep(Duration::from_millis(300));
     drop(recorder);
-    let info = api.probe(&file).unwrap();
+    let info = crate::file::FilePlayer::probe(&api, &file).unwrap();
     assert!(info.duration().is_final());
     assert!(info.duration().value().ticks() > 0);
 }
@@ -785,7 +794,7 @@ fn dropping_an_async_recorder_leaves_a_finalized_file() {
     );
     drop(recorder);
     // No wait here: the drop itself returns only once the file is finalized.
-    let info = api.probe(&file).unwrap();
+    let info = crate::file::FilePlayer::probe(&api, &file).unwrap();
     assert!(info.duration().is_final());
     assert!(info.duration().value().ticks() > 0);
 }
@@ -824,7 +833,7 @@ fn an_async_recorder_finishes_and_closes_without_blocking() {
     let deadline = Instant::now() + PATIENCE;
     while block_on(recorder.stats())
         .unwrap()
-        .is_none_or(|stats| stats.video_frames() == 0)
+        .is_none_or(|stats| stats.video_frames_written() == 0)
     {
         assert!(
             Instant::now() < deadline,
@@ -836,14 +845,20 @@ fn an_async_recorder_finishes_and_closes_without_blocking() {
         block_on(recorder.finish(PATIENCE)).unwrap(),
         FinishStatus::Closed(_)
     ));
-    assert!(api.probe(&next_file).unwrap().duration().is_final());
+    assert!(crate::file::FilePlayer::probe(&api, &next_file)
+        .unwrap()
+        .duration()
+        .is_final());
     let retained = recorder.clone();
     block_on(recorder.close()).unwrap();
     assert!(
         block_on(retained.state()).is_err(),
         "a close ends every clone of the handle"
     );
-    assert!(api.probe(&file).unwrap().duration().is_final());
+    assert!(crate::file::FilePlayer::probe(&api, &file)
+        .unwrap()
+        .duration()
+        .is_final());
 }
 
 #[test]
@@ -856,7 +871,7 @@ fn a_player_plays_a_recording_and_keeps_its_source_between_files() {
     record_clip(&api, &LiveSource::start(&ndi, "player"), &clip);
 
     let name = format!("grafton-file-player-{}", std::process::id());
-    let mut player = api.create_player(&PlayerOptions::new(&name)).unwrap();
+    let mut player = crate::file::FilePlayer::new(&api, &FilePlayerOptions::new(&name)).unwrap();
     let source = player.advertised_source().unwrap();
     assert!(source.name().contains(&name), "{source:?}");
     assert!(!player.is_running());
@@ -877,7 +892,7 @@ fn a_player_plays_a_recording_and_keeps_its_source_between_files() {
     let deadline = Instant::now() + PATIENCE;
     loop {
         assert!(Instant::now() < deadline, "the file was not reported open");
-        let Some(event) = player.poll_event(Duration::from_millis(50)).unwrap() else {
+        let Some(event) = player.next_event(Duration::from_millis(50)).unwrap() else {
             continue;
         };
         assert_ne!(
@@ -938,7 +953,11 @@ fn an_async_player_runs_on_its_own_thread_and_closes_every_clone() {
         1
     );
     let name = format!("grafton-file-async-player-{}", std::process::id());
-    let player = block_on(AsyncFilePlayer::create(&api, &PlayerOptions::new(&name))).unwrap();
+    let player = block_on(AsyncFilePlayer::create(
+        &api,
+        &FilePlayerOptions::new(&name),
+    ))
+    .unwrap();
     assert!(block_on(player.advertised_source())
         .unwrap()
         .name()
@@ -965,28 +984,31 @@ fn the_file_library_stays_selected_after_its_handles_are_dropped() {
     };
     let selected = api.library_path().map(PathBuf::from);
     drop(api);
-    let reopened = FileApi::open(&ndi, &FileRuntimeOptions::default()).unwrap();
+    let reopened = FileApi::new(&ndi, &FileApiOptions::default()).unwrap();
     assert_eq!(reopened.library_path().map(PathBuf::from), selected);
     // Its entry points are still callable.
     assert!(matches!(
-        reopened.probe(std::env::temp_dir().join("grafton-ndi-absent.mkv")),
+        crate::file::FilePlayer::probe(
+            &reopened,
+            std::env::temp_dir().join("grafton-ndi-absent.mkv")
+        ),
         Err(Error::NativeOperationFailed { .. })
     ));
     if let Some(selected) = selected {
         assert!(matches!(
-            FileApi::open(
+            FileApi::new(
                 &ndi,
-                &FileRuntimeOptions::default().library_path(selected.with_file_name("other"))
+                &FileApiOptions::default().library_path(selected.with_file_name("other"))
             ),
             Err(Error::RuntimeConflict(failure)) if failure.kind() == crate::SelectionConflict::DifferentLibrary
         ));
-        FileApi::open(&ndi, &FileRuntimeOptions::default().library_path(selected)).unwrap();
+        FileApi::new(&ndi, &FileApiOptions::default().library_path(selected)).unwrap();
     }
 }
 
 /// Options under which a format change ends the session instead of rolling over.
-fn stop_on_format_change(source: &LiveSource) -> RecorderOptions {
-    RecorderOptions::new(source.spec.clone())
+fn stop_on_format_change(source: &LiveSource) -> FileRecorderOptions {
+    FileRecorderOptions::new(source.spec.clone())
         .proxy(false)
         .tracks(MediaTypes::VIDEO)
         .format_change_rollover(false)
@@ -999,9 +1021,8 @@ fn a_session_the_library_ended_on_a_format_change_can_be_followed_by_another() {
     };
     let scratch = Scratch::new("format-stop");
     let source = LiveSource::start(&ndi, "format-stop");
-    let mut recorder = api
-        .create_recorder(&stop_on_format_change(&source))
-        .unwrap();
+    let mut recorder =
+        crate::file::FileRecorder::new(&api, &stop_on_format_change(&source)).unwrap();
     recorder
         .start(
             &RecordingTarget::new(scratch.path("first")).unwrap(),
@@ -1015,7 +1036,7 @@ fn a_session_the_library_ended_on_a_format_change_can_be_followed_by_another() {
     let deadline = Instant::now() + PATIENCE;
     while recorder.state() != RecorderState::Closed {
         assert!(Instant::now() < deadline, "{:?}", recorder.state());
-        recorder.poll_event(Duration::from_millis(50)).unwrap();
+        recorder.next_event(Duration::from_millis(50)).unwrap();
     }
     let report = recorder.report();
     assert!(report.closure_confirmed());
@@ -1069,7 +1090,7 @@ fn an_async_session_the_library_ended_on_a_format_change_can_be_followed_by_anot
     let deadline = Instant::now() + PATIENCE;
     while block_on(recorder.stats())
         .unwrap()
-        .is_none_or(|stats| stats.video_frames() == 0)
+        .is_none_or(|stats| stats.video_frames_written() == 0)
     {
         assert!(Instant::now() < deadline, "nothing was recorded");
         thread::sleep(Duration::from_millis(20));
@@ -1103,7 +1124,7 @@ fn a_rollover_into_a_missing_directory_is_refused_and_the_session_goes_on() {
         Err(Error::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
         other => panic!("expected the directory to be reported missing: {other:?}"),
     };
-    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     not_found(
         recorder
             .start(&missing(), RecordingTimecode::Preserve)
@@ -1136,10 +1157,10 @@ fn a_file_that_received_nothing_is_reported_as_empty() {
     };
     let scratch = Scratch::new("empty-file");
     let source = LiveSource::start(&ndi, "empty-file");
-    let options = RecorderOptions::new(source.spec.clone())
+    let options = FileRecorderOptions::new(source.spec.clone())
         .proxy(false)
         .tracks(MediaTypes::VIDEO);
-    let mut recorder = api.create_recorder(&options).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&api, &options).unwrap();
     recorder
         .start(
             &RecordingTarget::new(scratch.path("take")).unwrap(),
@@ -1332,7 +1353,7 @@ fn await_state(recorder: &mut FileRecorder, wanted: RecorderState) {
     let deadline = Instant::now() + PATIENCE;
     while recorder.state() != wanted {
         assert!(Instant::now() < deadline, "{:?}", recorder.state());
-        recorder.poll_event(Duration::from_millis(50)).unwrap();
+        recorder.next_event(Duration::from_millis(50)).unwrap();
     }
 }
 
@@ -1344,7 +1365,7 @@ fn an_exact_recording_ends_at_a_format_change_with_its_file_finalized() {
     let scratch = Scratch::new("exact-format");
     let source = LiveSource::start(&ndi, "exact-format");
     let file = scratch.path("take.mkv");
-    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     recorder
         .start(
             &RecordingTarget::new(&file).unwrap(),
@@ -1366,7 +1387,7 @@ fn an_exact_recording_ends_at_a_format_change_with_its_file_finalized() {
         panic!("the session had been closed");
     };
     assert!(finished.stopped_by_sdk());
-    let info = api.probe(&file).unwrap();
+    let info = crate::file::FilePlayer::probe(&api, &file).unwrap();
     assert!(info.duration().is_final());
     assert!(info.duration().value().ticks() > 0);
 }
@@ -1379,7 +1400,7 @@ fn an_exact_session_refuses_a_change_of_source_and_keeps_recording() {
     let scratch = Scratch::new("exact-source");
     let source = LiveSource::start(&ndi, "exact-source");
     let file = scratch.path("take.mkv");
-    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     recorder
         .start(
             &RecordingTarget::new(&file).unwrap(),
@@ -1390,14 +1411,14 @@ fn an_exact_session_refuses_a_change_of_source_and_keeps_recording() {
 
     assert!(matches!(
         recorder.set_source(&source.spec),
-        Err(Error::InvalidState(StateError::ExactFileName))
+        Err(Error::InvalidState(StateConflict::ExactFileName))
     ));
-    let before = recorder.stats().unwrap().unwrap().video_frames();
+    let before = recorder.stats().unwrap().unwrap().video_frames_written();
     let deadline = Instant::now() + PATIENCE;
-    while recorder.stats().unwrap().unwrap().video_frames() <= before {
+    while recorder.stats().unwrap().unwrap().video_frames_written() <= before {
         assert!(Instant::now() < deadline, "the session stopped recording");
         assert!(recorder
-            .poll_event(Duration::from_millis(20))
+            .next_event(Duration::from_millis(20))
             .unwrap()
             .is_none_or(|event| {
                 !matches!(
@@ -1415,7 +1436,10 @@ fn an_exact_session_refuses_a_change_of_source_and_keeps_recording() {
     assert!(!report.stopped_by_sdk());
     assert_eq!(report.closed_files(), 1);
     assert_eq!(report.error_events(), 0);
-    assert!(api.probe(&file).unwrap().duration().is_final());
+    assert!(crate::file::FilePlayer::probe(&api, &file)
+        .unwrap()
+        .duration()
+        .is_final());
 }
 
 #[test]
@@ -1427,7 +1451,7 @@ fn an_exact_target_that_exists_is_refused_before_the_library_sees_it() {
     let source = LiveSource::start(&ndi, "exact-exists");
     let file = scratch.path("taken.mkv");
     std::fs::write(&file, b"kept").unwrap();
-    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     match recorder.start(
         &RecordingTarget::new(&file).unwrap(),
         RecordingTimecode::Preserve,
@@ -1439,7 +1463,7 @@ fn an_exact_target_that_exists_is_refused_before_the_library_sees_it() {
     }
     // Had the library been asked, it would have queued an open-failed event.
     assert!(recorder
-        .poll_event(Duration::from_millis(200))
+        .next_event(Duration::from_millis(200))
         .unwrap()
         .is_none());
     assert_eq!(recorder.state(), RecorderState::Idle);
@@ -1455,7 +1479,7 @@ fn finishing_without_a_wait_reports_the_close_the_stop_queued() {
     let scratch = Scratch::new("finish-now");
     let source = LiveSource::start(&ndi, "finish-now");
     let file = scratch.path("take.mkv");
-    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
+    let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     recorder
         .start(
             &RecordingTarget::new(&file).unwrap(),
@@ -1472,5 +1496,8 @@ fn finishing_without_a_wait_reports_the_close_the_stop_queued() {
     };
     assert!(report.closure_confirmed());
     assert!(!report.stopped_by_sdk());
-    assert!(api.probe(&file).unwrap().duration().is_final());
+    assert!(crate::file::FilePlayer::probe(&api, &file)
+        .unwrap()
+        .duration()
+        .is_final());
 }

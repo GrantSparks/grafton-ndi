@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Multiple changes may coalesce; refresh capabilities on each notification.
     // Monitor status changes
     while !stop.load(Ordering::Relaxed) {
-        match receiver.poll_event(Duration::from_secs(1))? {
+        match receiver.next_event(Duration::from_secs(1))? {
             Some(ReceiverEvent::StatusChanged(status)) => {
                 println!(
                     "[Status Change] Connections: {} (source capabilities may also have changed)",

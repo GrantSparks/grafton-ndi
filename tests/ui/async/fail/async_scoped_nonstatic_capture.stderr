@@ -1,19 +1,18 @@
 error[E0373]: closure may outlive the current function, but it borrows `local`, which is owned by the current function
- --> tests/ui/async/fail/async_scoped_nonstatic_capture.rs:9:39
+ --> tests/ui/async/fail/async_scoped_nonstatic_capture.rs:8:45
   |
-9 |         .capture_with(Duration::ZERO, |_| &local)
-  |                                       ^^^  ----- `local` is borrowed here
-  |                                       |
-  |                                       may outlive borrowed value `local`
+8 |         .capture_video_with(Duration::ZERO, |_| &local)
+  |                                             ^^^  ----- `local` is borrowed here
+  |                                             |
+  |                                             may outlive borrowed value `local`
   |
 note: function requires argument type to outlive `'static`
  --> tests/ui/async/fail/async_scoped_nonstatic_capture.rs:7:5
   |
 7 | /     receiver
-8 | |         .video()
-9 | |         .capture_with(Duration::ZERO, |_| &local)
-  | |_________________________________________________^
+8 | |         .capture_video_with(Duration::ZERO, |_| &local)
+  | |_______________________________________________________^
 help: to force the closure to take ownership of `local` (and any other referenced variables), use the `move` keyword
   |
-9 |         .capture_with(Duration::ZERO, move |_| &local)
-  |                                       ++++
+8 |         .capture_video_with(Duration::ZERO, move |_| &local)
+  |                                             ++++

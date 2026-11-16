@@ -16,7 +16,7 @@ use std::ffi::c_void;
 use super::{
     send::PendingVideo,
     send_slots::{DescriptorLease, Released, SlotKey},
-    CompressedVideoFrame, ScatterVideoFrame, SubmittedVideo,
+    CompressedVideoFrame, QueueAttached, ScatterVideoFrame, SubmittedVideo,
 };
 use crate::{
     frames::Sendable,
@@ -26,7 +26,7 @@ use crate::{
         bindings::*,
     },
     timeout::Deadline,
-    Error, Ndi, QueueAttached, QueueLimit, Rejected, Result, Sender, SenderOptions, VideoFrame,
+    Error, Ndi, QueueLimit, Rejected, Result, Sender, SenderOptions, VideoFrame,
 };
 
 use super::aliasable::AliasableBox;
@@ -42,19 +42,19 @@ use super::send_slots::DescriptorSlots;
 /// and 512 MiB. Construction reserves one stable frame descriptor per frame.
 /// Scatter frames own their scatter-list descriptors. Completed frames retain
 /// their slots until collected.
-#[derive(Debug, Clone, Copy)]
-pub struct QueueOptions {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QueueLimits {
     frames: usize,
     bytes: usize,
 }
 
-impl Default for QueueOptions {
+impl Default for QueueLimits {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl QueueOptions {
+impl QueueLimits {
     /// Requested maximum frame count.
     #[must_use]
     pub fn configured_max_frames(&self) -> usize {
@@ -202,7 +202,7 @@ impl QueuedVideoFrame {
             |frame| Ok(Sendable::for_test(frame)),
             || {
                 scatter.ok_or(Error::UnsupportedCapability {
-                    feature: crate::RuntimeFeature::ScatterSend,
+                    capability: crate::Capability::Runtime(crate::RuntimeFeature::ScatterSend),
                     refusal: crate::CapabilityRefusal::SymbolUnavailable(
                         c"NDIlib_send_send_video_scatter",
                     ),
@@ -371,7 +371,7 @@ struct State {
     ready: VecDeque<ReadyEntry>,
     bytes: usize,
     next: u64,
-    options: QueueOptions,
+    options: QueueLimits,
     // Free keys are the frame capacity. A lease dropped while unwinding
     // retires its key, so the queue may have fewer usable slots than requested.
     free: Vec<SlotKey>,
@@ -546,7 +546,7 @@ impl CallbackState {
     }
 
     #[cfg(any(test, ndi_has_advanced_send_completion))]
-    fn new(options: QueueOptions) -> Result<Box<Self>> {
+    fn new(options: QueueLimits) -> Result<Box<Self>> {
         let options = options.validate()?;
         use super::send_slots::unavailable;
         let mut in_flight = HashMap::new();
@@ -670,10 +670,10 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 /// An ordinary asynchronous send must wait for the previous frame before it
 /// can accept the next. This sender instead keeps every submitted frame until
 /// the SDK reports it complete, so submission never waits on a slow
-/// connection, up to the limits in [`QueueOptions`]. No application code runs
+/// connection, up to the limits in [`QueueLimits`]. No application code runs
 /// on an SDK thread: completed frames are collected with
-/// [`try_take_completed`](Self::try_take_completed) or
-/// [`wait_completed`](Self::wait_completed) and can be reused.
+/// [`try_next_completed`](Self::try_next_completed) or
+/// [`next_completed`](Self::next_completed) and can be reused.
 ///
 /// It is [`Send`] and [`Sync`]: it can be moved to, and its read-only methods
 /// called from, any thread, while submitting and collecting frames takes it
@@ -688,14 +688,14 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 /// in both directions, tally, connections, failover, and the Advanced
 /// controls) and [`send_audio`](Sender::send_audio), but none of the video
 /// sends, and which cannot be registered with a
-/// [`SendAdvertiser`](crate::discovery::SendAdvertiser).
+/// [`SendAdvertiser`](crate::discovery_server::SendAdvertiser).
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use std::time::Duration;
 /// use grafton_ndi::{
-///     advanced::{QueueOptions, QueuedSender},
+///     advanced::{QueueLimits, QueuedSender},
 ///     SenderOptions, VideoFrame, Ndi,
 /// };
 ///
@@ -704,10 +704,10 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 /// let mut sender = QueuedSender::new(
 ///     &ndi,
 ///     &SenderOptions::new("Queued"),
-///     QueueOptions::default().max_frames(4),
+///     &QueueLimits::default().max_frames(4),
 /// )?;
 /// let id = sender.try_submit(VideoFrame::builder().resolution(1920, 1080).build()?)?;
-/// if let Some(done) = sender.wait_completed(Duration::from_secs(1))? {
+/// if let Some(done) = sender.next_completed(Duration::from_secs(1))? {
 ///     assert_eq!(done.id(), id);
 /// }
 /// # Ok(())
@@ -760,11 +760,12 @@ impl QueuedSender {
     /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
     /// build without the Advanced SDK), [`Error::InvalidInput`] for
     /// limits outside their range, and the errors of [`Sender::new`].
-    pub fn new(ndi: &Ndi, _options: &SenderOptions, _limits: QueueOptions) -> Result<Self> {
+    #[doc(alias = "NDIlib_send_set_video_async_completion")]
+    pub fn new(ndi: &Ndi, options: &SenderOptions, limits: &QueueLimits) -> Result<Self> {
         let table = ndi.table::<SendCompletion>()?;
-        native!(SendCompletion, table => {
-            let callback = CallbackState::new(_limits)?;
-            let sender = Sender::open(ndi, _options)?;
+        native!(SendCompletion, table, uses(options, limits) => {
+            let callback = CallbackState::new(*limits)?;
+            let sender = Sender::open(ndi, options)?;
             Ok(Self::install(sender, callback, table))
         })
     }
@@ -782,16 +783,17 @@ impl QueuedSender {
     /// limits outside their range or a sender that is registered with an
     /// advertiser (a registration keeps the native sender alive after this
     /// value is dropped, when the completion state no longer exists).
+    #[doc(alias = "NDIlib_send_set_video_async_completion")]
     pub fn from_sender(
         sender: Sender,
-        _limits: QueueOptions,
+        limits: &QueueLimits,
     ) -> std::result::Result<(Self, Option<VideoFrame>), Rejected<Sender>> {
         let table = match sender.runtime().table::<SendCompletion>() {
             Ok(table) => table,
             Err(error) => return Err(Rejected::new(error, sender)),
         };
-        native!(SendCompletion, table => {
-            let callback = match CallbackState::new(_limits) {
+        native!(SendCompletion, table, uses(limits) => {
+            let callback = match CallbackState::new(*limits) {
                 Ok(callback) => callback,
                 Err(error) => return Err(Rejected::new(error, sender)),
             };
@@ -884,15 +886,17 @@ impl QueuedSender {
     /// # Errors
     ///
     /// Returns the frame with [`Error::InvalidInput`] when its retained
-    /// allocation capacity alone exceeds [`QueueOptions::max_bytes`], or with
+    /// allocation capacity alone exceeds [`QueueLimits::max_bytes`], or with
     /// [`Error::QueueFull`] when the frames already retained leave no room
-    /// within [`QueueOptions`] ([`QueueLimit::Frames`] or
+    /// within [`QueueLimits`] ([`QueueLimit::Frames`] or
     /// [`QueueLimit::Bytes`]; collect completed frames and submit it again),
     /// with [`Error::UnexpectedSdkResult`] when the queue has failed (see
     /// [`completion_protocol_failed`](Self::completion_protocol_failed)),
     /// with [`Error::UnsupportedCapability`] when the runtime lacks scatter
     /// sending or cannot send an uncompressed frame's pixel format
     /// (as [`Sender::send_video`] checks).
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
+    #[doc(alias = "NDIlib_send_send_video_scatter_async")]
     pub fn try_submit(
         &mut self,
         frame: impl Into<QueuedVideoFrame>,
@@ -901,8 +905,8 @@ impl QueuedSender {
     }
 
     /// Take one completed frame, if there is one.
-    pub fn try_take_completed(&mut self) -> Option<CompletedVideo> {
-        self.video().try_take_completed()
+    pub fn try_next_completed(&mut self) -> Option<CompletedVideo> {
+        self.video().try_next_completed()
     }
 
     /// Wait up to `timeout` for a completed frame. `None` means none completed
@@ -913,8 +917,8 @@ impl QueuedSender {
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
     /// and [`Error::UnexpectedSdkResult`] when the queue has failed (see
     /// [`completion_protocol_failed`](Self::completion_protocol_failed)).
-    pub fn wait_completed(&mut self, timeout: Duration) -> Result<Option<CompletedVideo>> {
-        self.video().wait_completed(timeout)
+    pub fn next_completed(&mut self, timeout: Duration) -> Result<Option<CompletedVideo>> {
+        self.video().next_completed(timeout)
     }
 
     /// The number of frames held: those still being sent and those completed
@@ -946,6 +950,7 @@ impl QueuedSender {
     /// Native destruction waits without a timeout for the SDK to finish with
     /// every pending frame. Run this on a blocking thread when using an async
     /// executor. Only the returned collection is allocated.
+    #[doc(alias = "NDIlib_send_destroy")]
     pub fn close(self) -> Vec<CompletedVideo> {
         self.lending.close()
     }
@@ -967,6 +972,8 @@ impl QueuedVideo<'_> {
     /// # Errors
     ///
     /// As for [`QueuedSender::try_submit`].
+    #[doc(alias = "NDIlib_send_send_video_async_v2")]
+    #[doc(alias = "NDIlib_send_send_video_scatter_async")]
     pub fn try_submit(
         &mut self,
         frame: impl Into<QueuedVideoFrame>,
@@ -974,8 +981,8 @@ impl QueuedVideo<'_> {
         self.pair.try_submit_queued(frame)
     }
 
-    /// See [`QueuedSender::try_take_completed`].
-    pub fn try_take_completed(&mut self) -> Option<CompletedVideo> {
+    /// See [`QueuedSender::try_next_completed`].
+    pub fn try_next_completed(&mut self) -> Option<CompletedVideo> {
         let mut state = self
             .pair
             .loans()
@@ -985,12 +992,12 @@ impl QueuedVideo<'_> {
         take_completed(&mut state)
     }
 
-    /// See [`QueuedSender::wait_completed`].
+    /// See [`QueuedSender::next_completed`].
     ///
     /// # Errors
     ///
-    /// As for [`QueuedSender::wait_completed`].
-    pub fn wait_completed(&mut self, timeout: Duration) -> Result<Option<CompletedVideo>> {
+    /// As for [`QueuedSender::next_completed`].
+    pub fn next_completed(&mut self, timeout: Duration) -> Result<Option<CompletedVideo>> {
         let deadline = Deadline::after(timeout)?;
         let mut state = self
             .pair
@@ -1054,7 +1061,7 @@ mod tests {
             &ndi,
             &SenderOptions::new(crate::test_support::unique_name("split-allocation"))
                 .clock_video(false),
-            QueueOptions::default(),
+            &QueueLimits::default(),
         )
         .unwrap();
         let frame = VideoFrame::builder().resolution(16, 16).build().unwrap();
@@ -1119,7 +1126,7 @@ mod tests {
 
     #[test]
     fn an_occupied_completion_key_preserves_every_retained_entry_and_free_slot() {
-        let callback = CallbackState::new(QueueOptions::default().max_frames(2)).unwrap();
+        let callback = CallbackState::new(QueueLimits::default().max_frames(2)).unwrap();
         let (id, key) = reject_an_occupied_completion_key(&callback);
         callback.complete(key);
         let mut state = callback.state.lock().unwrap();
@@ -1137,7 +1144,7 @@ mod tests {
         let queue = QueuedSender::new(
             &ndi,
             &SenderOptions::new(crate::test_support::unique_name("duplicate-key-close")),
-            QueueOptions::default().max_frames(2),
+            &QueueLimits::default().max_frames(2),
         )
         .unwrap();
         let (id, key) = reject_an_occupied_completion_key(queue.lending.loans());
@@ -1152,7 +1159,7 @@ mod tests {
 
     #[test]
     fn slots_are_retained_through_out_of_order_completion_and_reused_after_collection() {
-        let callback = CallbackState::new(QueueOptions::default().max_frames(3)).unwrap();
+        let callback = CallbackState::new(QueueLimits::default().max_frames(3)).unwrap();
         let mut admitted = Vec::new();
         for _ in 0..3 {
             let frame = VideoFrame::builder().resolution(2, 2).build().unwrap();
@@ -1236,9 +1243,9 @@ mod tests {
             for limit in [QueueLimit::Frames, QueueLimit::Bytes] {
                 let first = make();
                 let limits = if limit == QueueLimit::Frames {
-                    QueueOptions::default().max_frames(1)
+                    QueueLimits::default().max_frames(1)
                 } else {
-                    QueueOptions::default()
+                    QueueLimits::default()
                         .max_frames(2)
                         .max_bytes(first.retained_bytes())
                 };
@@ -1246,7 +1253,7 @@ mod tests {
                     &ndi,
                     &SenderOptions::new(crate::test_support::unique_name("reserved-admission"))
                         .clock_video(false),
-                    limits,
+                    &limits,
                 )
                 .unwrap();
                 let (result, allocations) =
@@ -1261,7 +1268,7 @@ mod tests {
                 assert_eq!(allocations, 1, "only the Rejected box, variant {variant}");
                 assert_eq!(
                     queue
-                        .wait_completed(Duration::from_secs(5))
+                        .next_completed(Duration::from_secs(5))
                         .unwrap()
                         .unwrap()
                         .id(),
@@ -1279,7 +1286,7 @@ mod tests {
 
     #[test]
     fn rebuilding_the_completion_index_reuses_reserved_storage_and_preserves_loans() {
-        let callback = CallbackState::new(QueueOptions::default().max_frames(4)).unwrap();
+        let callback = CallbackState::new(QueueLimits::default().max_frames(4)).unwrap();
         let admitted = (0..3)
             .map(|_| {
                 let frame = VideoFrame::builder().resolution(2, 2).build().unwrap();
@@ -1332,8 +1339,7 @@ mod tests {
     #[test]
     fn descriptor_admission_and_collection_stay_allocation_free_under_churn() {
         for capacity in [2, 4, 7, 8, 14, 16, 28, 56, 112] {
-            let callback =
-                CallbackState::new(QueueOptions::default().max_frames(capacity)).unwrap();
+            let callback = CallbackState::new(QueueLimits::default().max_frames(capacity)).unwrap();
             let mut frames = (0..2304)
                 .map(|_| VideoFrame::builder().resolution(2, 2).build().unwrap())
                 .collect::<Vec<_>>();
@@ -1385,7 +1391,7 @@ mod tests {
 
     #[test]
     fn permanent_admission_check_needs_no_lock_or_descriptor() {
-        let state = CallbackState::new(QueueOptions::default().max_bytes(4)).unwrap();
+        let state = CallbackState::new(QueueLimits::default().max_bytes(4)).unwrap();
         // An occupied lock cannot delay this allocation-free refusal.
         let _locked = state.state.lock().unwrap();
         let (result, allocations) =
@@ -1429,7 +1435,7 @@ mod tests {
             let pointer = pixels.data().as_ptr();
             let bytes = pixels.retained_bytes();
             let frame = QueuedVideoFrame::from(pixels).authorize_for_test(None);
-            let callback = CallbackState::new(QueueOptions::default()).unwrap();
+            let callback = CallbackState::new(QueueLimits::default()).unwrap();
             let mut state = callback.state.lock().unwrap();
             let admitted = state.admit(frame, bytes, &callback.protocol_error).unwrap();
             crate::frames::descriptor_tests::assert_extent(
@@ -1465,7 +1471,7 @@ mod tests {
             };
             let bytes = frame.retained_bytes();
             let authorized = frame.authorize_for_test(Some(table));
-            let callback = CallbackState::new(QueueOptions::default()).unwrap();
+            let callback = CallbackState::new(QueueLimits::default()).unwrap();
             let admitted = callback
                 .state
                 .lock()
@@ -1488,7 +1494,7 @@ mod tests {
 
     #[test]
     fn a_retired_slot_reduces_capacity_and_collection_still_allows_retry() {
-        let callback = CallbackState::new(QueueOptions::default().max_frames(3)).unwrap();
+        let callback = CallbackState::new(QueueLimits::default().max_frames(3)).unwrap();
         drop(
             callback
                 .state
@@ -1540,7 +1546,7 @@ mod tests {
 
     #[test]
     fn retired_slots_preserve_byte_frame_and_identifier_refusal_order() {
-        let callback = CallbackState::new(QueueOptions::default().max_frames(1)).unwrap();
+        let callback = CallbackState::new(QueueLimits::default().max_frames(1)).unwrap();
         let frame = || VideoFrame::builder().resolution(2, 2).build().unwrap();
         let mut state = callback.state.lock().unwrap();
         state.next = u64::MAX;
@@ -1586,7 +1592,7 @@ mod tests {
             let queue = QueuedSender::new(
                 &ndi,
                 &SenderOptions::new(crate::test_support::unique_name("retired-slot-teardown")),
-                QueueOptions::default().max_frames(4),
+                &QueueLimits::default().max_frames(4),
             )
             .unwrap();
             let callback = queue.lending.loans();
@@ -1628,7 +1634,7 @@ mod tests {
         let queue = QueuedSender::new(
             &ndi,
             &SenderOptions::new(crate::test_support::unique_name("close-order")),
-            QueueOptions::default(),
+            &QueueLimits::default(),
         )
         .unwrap();
         let state = queue.lending.loans();
@@ -1669,7 +1675,7 @@ mod tests {
         let queue = QueuedSender::new(
             &ndi,
             &SenderOptions::new(crate::test_support::unique_name("drop-allocation")),
-            QueueOptions::default(),
+            &QueueLimits::default(),
         )
         .unwrap();
         let state = queue.lending.loans();
@@ -1688,7 +1694,7 @@ mod tests {
         let queue = QueuedSender::new(
             &ndi,
             &SenderOptions::new(crate::test_support::unique_name("close-empty")),
-            QueueOptions::default(),
+            &QueueLimits::default(),
         )
         .unwrap();
         let (completed, allocations) = crate::test_alloc::allocation_count(|| queue.close());
@@ -1698,7 +1704,7 @@ mod tests {
 
     #[test]
     fn concurrent_and_out_of_order_callbacks_preserve_owned_frames() {
-        let state = CallbackState::new(QueueOptions::default()).unwrap();
+        let state = CallbackState::new(QueueLimits::default()).unwrap();
         let a = insert(&state, 1);
         let b = insert(&state, 2);
         state.complete(b);
@@ -1723,20 +1729,20 @@ mod tests {
         let mut sender = Sender::new(&ndi, &options).unwrap();
         let frame = VideoFrame::builder().resolution(16, 16).build().unwrap();
         let pixels = frame.data().as_ptr();
-        assert!(sender.send_video_async(frame).unwrap().is_none());
+        assert!(sender.submit_video(frame).unwrap().is_none());
         let (mut queue, earlier) =
-            QueuedSender::from_sender(sender, QueueOptions::default()).unwrap();
+            QueuedSender::from_sender(sender, &QueueLimits::default()).unwrap();
         assert_eq!(earlier.unwrap().data().as_ptr(), pixels);
         // The queue sends on the converted sender.
         let next = VideoFrame::builder().resolution(16, 16).build().unwrap();
         let id = queue.try_submit(next).unwrap();
-        let completed = queue.wait_completed(Duration::from_secs(5)).unwrap();
+        let completed = queue.next_completed(Duration::from_secs(5)).unwrap();
         assert_eq!(completed.unwrap().id(), id);
     }
 
     #[test]
     fn duplicate_and_unknown_completions_do_not_release_storage() {
-        let state = CallbackState::new(QueueOptions::default()).unwrap();
+        let state = CallbackState::new(QueueLimits::default()).unwrap();
         let a = insert(&state, 1);
         state.complete(a);
         state.complete(a);
@@ -1754,7 +1760,7 @@ mod tests {
     /// collection gives any of it back.
     #[test]
     fn completion_moves_an_entry_without_allocating_or_freeing() {
-        let state = CallbackState::new(QueueOptions::default().max_frames(3)).unwrap();
+        let state = CallbackState::new(QueueLimits::default().max_frames(3)).unwrap();
         let keys = [insert(&state, 1), insert(&state, 2), insert(&state, 3)];
         let capacities = |state: &CallbackState| {
             let s = state.state.lock().unwrap();
@@ -1781,3 +1787,19 @@ mod tests {
 #[cfg(test)]
 #[path = "queued_boundary_tests.rs"]
 mod boundary_tests;
+
+impl std::fmt::Debug for QueuedSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueuedSender")
+            .field("sender", self.sender())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for QueuedVideo<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueuedVideo")
+            .field("sender", self.pair.sender())
+            .finish_non_exhaustive()
+    }
+}

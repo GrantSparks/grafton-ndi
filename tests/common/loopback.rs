@@ -19,7 +19,7 @@ pub fn loopback_source(ndi: &Ndi, sender: &Sender) -> grafton_ndi::Result<Source
 /// their source, not themselves.
 pub fn loopback_endpoint(ndi: &Ndi, name: &str) -> grafton_ndi::Result<Source> {
     let (source, port) = advertised_endpoint(ndi, name)?;
-    let loopback = SourceAddress::new(format!("{}:{port}", Ipv4Addr::LOCALHOST));
+    let loopback = SourceAddress::new(format!("{}:{port}", Ipv4Addr::LOCALHOST))?;
     Ok(source.with_address(loopback))
 }
 
@@ -33,7 +33,7 @@ pub fn advertised_endpoint(ndi: &Ndi, name: &str) -> grafton_ndi::Result<(Source
 /// A finder that also asks this machine's loopback address for sources, as
 /// [`advertised_endpoint`] looks senders up.
 pub fn loopback_finder(ndi: &Ndi) -> grafton_ndi::Result<Finder> {
-    Finder::new(ndi, &FinderOptions::new().extra_ips("127.0.0.1"))
+    Finder::new(ndi, &FinderOptions::new().extra_ips(["127.0.0.1"]))
 }
 
 /// [`advertised_endpoint`], through `finder`, which the caller keeps.

@@ -16,7 +16,7 @@ mod fixture;
 use fixture::FixtureDir;
 use grafton_ndi::{
     file::{
-        FileApi, FileNaming, FileRuntimeOptions, FinishStatus, RecorderEventKind, RecorderOptions,
+        FileApi, FileApiOptions, FileNaming, FileRecorderOptions, FinishStatus, RecorderEventKind,
         RecorderState, RecordingTarget, RecordingTimecode, SourceSpec,
     },
     Error, SelectionConflict,
@@ -34,7 +34,7 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
     let Some(ndi) = common::ndi() else {
         return;
     };
-    let api = match FileApi::open(&ndi, &FileRuntimeOptions::new()) {
+    let api = match FileApi::new(&ndi, &FileApiOptions::new()) {
         Ok(api) => api,
         Err(Error::RuntimeLoadFailed(reason)) if !reason.loaded_any() => {
             common::skip(common::Requirement::File, &reason.to_string());
@@ -50,10 +50,10 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
     };
     if let Ok(operation) = std::env::var("GRAFTON_FILE_RACE_OPERATION") {
         let target = PathBuf::from(std::env::var_os("GRAFTON_FILE_RACE_TARGET").unwrap());
-        let options = RecorderOptions::new(SourceSpec::from_url("127.0.0.1:59999").unwrap())
+        let options = FileRecorderOptions::new(SourceSpec::from_url("127.0.0.1:59999").unwrap())
             .naming(FileNaming::Exact)
             .drop_wait(Duration::from_secs(1));
-        let mut recorder = api.create_recorder(&options).unwrap();
+        let mut recorder = grafton_ndi::file::FileRecorder::new(&api, &options).unwrap();
         let target = RecordingTarget::new(&target).unwrap();
         if operation == "start" {
             assert!(matches!(
@@ -71,7 +71,7 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
                 .unwrap();
             // Let the native session publish its initial open before rollover.
             for _ in 0..5 {
-                recorder.poll_event(Duration::from_millis(20)).unwrap();
+                recorder.next_event(Duration::from_millis(20)).unwrap();
             }
             recorder.rollover(&target).unwrap();
             // With no incoming packets the SDK defers the cut. Stopping
@@ -81,7 +81,7 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
             let (mut open_failed, mut error) = (false, false);
             let mut events = Vec::new();
             while Instant::now() < deadline && !(open_failed && error && !recorder.is_recording()) {
-                if let Some(event) = recorder.poll_event(Duration::from_millis(20)).unwrap() {
+                if let Some(event) = recorder.next_event(Duration::from_millis(20)).unwrap() {
                     events.push(event.kind());
                     open_failed |= event.kind() == RecorderEventKind::OpenFailed;
                     error |= event.kind() == RecorderEventKind::Error;

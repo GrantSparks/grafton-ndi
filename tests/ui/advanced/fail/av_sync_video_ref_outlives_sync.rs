@@ -3,7 +3,7 @@
 use grafton_ndi::advanced::AvSync;
 use std::time::Duration;
 fn outlive(sync: AvSync) {
-    let video = sync.receiver().video().capture_ref(Duration::ZERO).unwrap();
+    let video = sync.receiver().capture_video_ref(Duration::ZERO).unwrap();
     let receiver = sync.into_receiver();
     drop(video);
     drop(receiver);

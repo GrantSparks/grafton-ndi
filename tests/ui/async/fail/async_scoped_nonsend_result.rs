@@ -4,8 +4,7 @@ async fn contract<R: grafton_ndi::asynchronous::AsyncRuntime>(
 ) {
     use std::time::Duration;
     receiver
-        .video()
-        .capture_with(Duration::ZERO, |_| std::rc::Rc::new(42))
+        .capture_video_with(Duration::ZERO, |_| std::rc::Rc::new(42))
         .await
         .unwrap();
 }

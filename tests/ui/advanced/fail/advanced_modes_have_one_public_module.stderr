@@ -1,0 +1,76 @@
+error[E0432]: unresolved imports `grafton_ndi::AvSyncAttached`, `grafton_ndi::CompressedAttached`, `grafton_ndi::CompressedAudioSendMode`, `grafton_ndi::PacketAttached`, `grafton_ndi::QueueAttached`
+ --> tests/ui/advanced/fail/advanced_modes_have_one_public_module.rs:3:5
+  |
+3 |     AvSyncAttached, CompressedAttached, CompressedAudioSendMode, PacketAttached, QueueAttached,
+  |     ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^ no `QueueAttached` in the root
+  |     |               |                   |                        |
+  |     |               |                   |                        no `PacketAttached` in the root
+  |     |               |                   no `CompressedAudioSendMode` in the root
+  |     |               no `CompressedAttached` in the root
+  |     no `AvSyncAttached` in the root
+  |
+help: a similar name exists in the module
+  |
+3 -     AvSyncAttached, CompressedAttached, CompressedAudioSendMode, PacketAttached, QueueAttached,
+3 +     AvSyncAttached, CompressedAttached, CompressedAudioDefect, PacketAttached, QueueAttached,
+  |
+
+error[E0603]: enum `AvSyncAttached` is private
+ --> tests/ui/advanced/fail/advanced_modes_have_one_public_module.rs:5:29
+  |
+5 | use grafton_ndi::receiver::{AvSyncAttached as ReceiverAvSync, PacketAttached as ReceiverPackets};
+  |                             ^^^^^^^^^^^^^^ private enum
+  |
+note: the enum `AvSyncAttached` is defined here
+ --> src/receiver.rs
+  |
+  | use crate::advanced::{AvSyncAttached, PacketAttached};
+  |                       ^^^^^^^^^^^^^^
+
+error[E0603]: enum `PacketAttached` is private
+ --> tests/ui/advanced/fail/advanced_modes_have_one_public_module.rs:5:63
+  |
+5 | use grafton_ndi::receiver::{AvSyncAttached as ReceiverAvSync, PacketAttached as ReceiverPackets};
+  |                                                               ^^^^^^^^^^^^^^ private enum
+  |
+note: the enum `PacketAttached` is defined here
+ --> src/receiver.rs
+  |
+  | use crate::advanced::{AvSyncAttached, PacketAttached};
+  |                                       ^^^^^^^^^^^^^^
+
+error[E0603]: enum `CompressedAttached` is private
+ --> tests/ui/advanced/fail/advanced_modes_have_one_public_module.rs:7:5
+  |
+7 |     CompressedAttached as SenderCompressed, CompressedAudioSendMode as SenderCompressedAudio,
+  |     ^^^^^^^^^^^^^^^^^^ private enum
+  |
+note: the enum `CompressedAttached` is defined here
+ --> src/sender.rs
+  |
+  | use crate::advanced::{CompressedAttached, CompressedAudioSendMode, QueueAttached};
+  |                       ^^^^^^^^^^^^^^^^^^
+
+error[E0603]: trait `CompressedAudioSendMode` is private
+ --> tests/ui/advanced/fail/advanced_modes_have_one_public_module.rs:7:45
+  |
+7 |     CompressedAttached as SenderCompressed, CompressedAudioSendMode as SenderCompressedAudio,
+  |                                             ^^^^^^^^^^^^^^^^^^^^^^^ private trait
+  |
+note: the trait `CompressedAudioSendMode` is defined here
+ --> src/sender.rs
+  |
+  | use crate::advanced::{CompressedAttached, CompressedAudioSendMode, QueueAttached};
+  |                                           ^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum `QueueAttached` is private
+ --> tests/ui/advanced/fail/advanced_modes_have_one_public_module.rs:8:5
+  |
+8 |     QueueAttached as SenderQueued,
+  |     ^^^^^^^^^^^^^ private enum
+  |
+note: the enum `QueueAttached` is defined here
+ --> src/sender.rs
+  |
+  | use crate::advanced::{CompressedAttached, CompressedAudioSendMode, QueueAttached};
+  |                                                                    ^^^^^^^^^^^^^

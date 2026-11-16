@@ -10,7 +10,7 @@ use std::{ffi::CString, ptr, str};
 use crate::{
     capture::{
         AudioKind, FrameFree, FrameSyncAudioFree, FrameSyncVideoFree, Guard, RecvAudioGuard,
-        RecvMetadataGuard, VideoKind,
+        RecvMetadataGuard, SenderMetadataFree, VideoKind,
     },
     framesync::{AudioInputFormat, FrameSyncAudioRef, FrameSyncVideoRef},
     pixels::Pixels,
@@ -221,66 +221,6 @@ impl PixelFormatInfo {
             self.category,
             FormatCategory::Planar420 | FormatCategory::SemiPlanar420
         )
-    }
-
-    /// Calculate total buffer size for given dimensions and stride using
-    /// checked arithmetic.
-    ///
-    /// # Arguments
-    ///
-    /// * `line_stride` - The first-plane line stride in bytes (for planar formats) or total line stride (for packed formats)
-    /// * `height` - Frame height in pixels
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidFrame`] if `line_stride` or `height` is zero,
-    /// if planar 4:2:0 stride/height requirements are not met, if arithmetic
-    /// overflows, or if the result exceeds the crate's maximum video frame
-    /// size.
-    ///
-    /// # Format-specific calculations
-    ///
-    /// - **Packed RGB/YUV** (BGRA/BGRX/RGBA/RGBX/UYVY): `line_stride * height`
-    /// - **Packed 4:2:2 with alpha UYVA**: requires even stride, then
-    ///   `UYVY + A` where:
-    ///   - UYVY plane: `line_stride * height`
-    ///   - Alpha plane: `(line_stride/2) * height`
-    /// - **Semi-planar 4:2:2 P216**: `Y + CbCr` where each plane is
-    ///   `line_stride * height`
-    /// - **Semi-planar 4:2:2 with alpha PA16**: `Y + CbCr + A` where each
-    ///   plane is `line_stride * height`
-    /// - **Planar 4:2:0 YV12/I420**: requires even stride and height,
-    ///   then `Y + U + V` where:
-    ///   - Y plane: `line_stride * height`
-    ///   - U plane: `(line_stride/2) * (height/2)`
-    ///   - V plane: `(line_stride/2) * (height/2)`
-    /// - **Semi-planar 4:2:0 NV12**: requires even height (any stride), then
-    ///   `Y + UV` where:
-    ///   - Y plane: `line_stride * height`
-    ///   - UV plane: `line_stride * (height/2)`
-    /// - **Planar 4:4:4** (NA48/NA4G, and NB48/NB4G with alpha): three or
-    ///   four planes of `line_stride * height`
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use grafton_ndi::PixelFormat;
-    ///
-    /// // NV12 with 2048-byte rows: Y (2048*1080) + UV (2048*540).
-    /// assert_eq!(PixelFormat::Nv12.info().buffer_len(2048, 1080)?, 3_317_760);
-    /// # Ok::<(), grafton_ndi::Error>(())
-    /// ```
-    pub fn buffer_len(&self, line_stride: usize, height: u32) -> Result<usize> {
-        if line_stride == 0 {
-            return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
-                crate::LayoutDefect::VideoZeroStride,
-            )));
-        }
-        validate_video_height(i64::from(height))?;
-
-        let len = calculate_buffer_len_for_info_checked(*self, line_stride, height as usize)?;
-        validate_video_data_len(len)?;
-        Ok(len)
     }
 }
 
@@ -563,8 +503,9 @@ impl PixelFormat {
     /// Calculate the total buffer size needed for a frame with given dimensions
     /// using checked arithmetic.
     ///
-    /// This computes the validated minimum stride from the width and delegates
-    /// to the shared video layout validator.
+    /// `line_stride_bytes` is `None` for tightly packed rows, or the byte
+    /// distance between row starts. Explicit strides must hold the active
+    /// width. The result includes all planes, without SDK send tail room.
     ///
     /// # Examples
     ///
@@ -572,10 +513,10 @@ impl PixelFormat {
     /// use grafton_ndi::PixelFormat;
     ///
     /// // BGRA 1920x1080: 1920 * 4 * 1080 = 8,294,400 bytes
-    /// assert_eq!(PixelFormat::Bgra.buffer_len(1920, 1080)?, 8_294_400);
+    /// assert_eq!(PixelFormat::Bgra.buffer_len(1920, 1080, None)?, 8_294_400);
     ///
     /// // NV12 1920x1080: Y (1920*1080) + UV (1920*540) = 3,110,400 bytes
-    /// assert_eq!(PixelFormat::Nv12.buffer_len(1920, 1080)?, 3_110_400);
+    /// assert_eq!(PixelFormat::Nv12.buffer_len(1920, 1080, None)?, 3_110_400);
     /// # Ok::<(), grafton_ndi::Error>(())
     /// ```
     ///
@@ -584,8 +525,19 @@ impl PixelFormat {
     /// Returns [`Error::InvalidFrame`] if dimensions are invalid for this
     /// format, if arithmetic overflows, or if the result exceeds the crate's
     /// maximum video frame size.
-    pub fn buffer_len(self, width: u32, height: u32) -> Result<usize> {
-        let layout = ValidatedVideoLayout::new_uncompressed(self, width, height, None)?;
+    pub fn buffer_len(
+        self,
+        width: u32,
+        height: u32,
+        line_stride_bytes: Option<usize>,
+    ) -> Result<usize> {
+        if line_stride_bytes == Some(0) {
+            return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
+                crate::LayoutDefect::VideoZeroStride,
+            )));
+        }
+        let layout =
+            ValidatedVideoLayout::new_uncompressed(self, width, height, line_stride_bytes)?;
         Ok(layout.data_len_bytes)
     }
 
@@ -990,7 +942,7 @@ pub trait VideoSource: VideoParts {
     fn frame_rate(&self) -> FrameRate;
 
     /// Display width divided by height; zero means square pixels.
-    fn picture_aspect_ratio(&self) -> f32;
+    fn picture_aspect_ratio(&self) -> PictureAspectRatio;
 
     /// Progressive, interlaced, or field scanning.
     fn scan_type(&self) -> ScanType;
@@ -1050,6 +1002,27 @@ pub trait VideoSource: VideoParts {
     /// owned frames and eligible packed captures send directly. An external
     /// [`crate::BorrowedVideoFrame`] retains its explicit padding/tail policy.
     fn sends_in_place(&self) -> bool;
+
+    /// Encode this frame using the image format and conversion options.
+    #[cfg(feature = "image-encoding")]
+    fn encode_image(&self, options: &crate::image_encoding::ImageOptions) -> Result<Vec<u8>>;
+
+    /// Encode into a writer, flushing it when encoding succeeds.
+    #[cfg(feature = "image-encoding")]
+    fn encode_image_to<W: std::io::Write>(
+        &self,
+        options: &crate::image_encoding::ImageOptions,
+        out: W,
+    ) -> Result<()>
+    where
+        Self: Sized;
+
+    /// Encode this frame as a base64 data URL.
+    #[cfg(feature = "image-encoding")]
+    fn encode_image_data_url(
+        &self,
+        options: &crate::image_encoding::ImageOptions,
+    ) -> Result<String>;
 }
 
 /// The owned copy of `source`: `packed`, its packed layout, with `data`,
@@ -1078,6 +1051,19 @@ fn packed_video<P: VideoParts + ?Sized>(
 // One accessor list defines the inherent surface and the sealed trait impl.
 // Only owned data needs an adapter: its infallible slice becomes Some(slice).
 macro_rules! source_accessor_forward {
+    (#[cfg($cfg:meta)] $($rest:tt)*) => {
+        #[cfg($cfg)]
+        $crate::frames::source_accessor_forward! { $($rest)* }
+    };
+    (#[$attr:meta] $($rest:tt)*) => {
+        $crate::frames::source_accessor_forward! { $($rest)* }
+    };
+    ($frame:ty; $name:ident<$generic:ident: $bound:path>(&$this:ident $(, $arg:ident: $arg_ty:ty)*) $(-> $ret:ty)? where Self: $sized:path;) => {
+        #[inline]
+        fn $name<$generic: $bound>(&$this $(, $arg: $arg_ty)*) $(-> $ret)? where Self: $sized {
+            <$frame>::$name($this $(, $arg)*)
+        }
+    };
     ($frame:ty; $name:ident(&$this:ident $(, $arg:ident: $arg_ty:ty)*) $(-> $ret:ty)?;) => {
         #[inline]
         fn $name(&$this $(, $arg: $arg_ty)*) $(-> $ret)? {
@@ -1100,8 +1086,8 @@ macro_rules! source_accessors {
         source($source:path);
         methods {
             $(
-                $(#[$doc:meta])*
-                fn $method:ident(&$this:ident $(, $arg:ident: $arg_ty:ty)*) $(-> $ret:ty)?
+                $(#[$($doc:tt)*])*
+                fn $method:ident $(<$generic:ident: $bound:path>)? (&$this:ident $(, $arg:ident: $arg_ty:ty)* $(,)?) $(-> $ret:ty)? $(where Self: $sized:path)?
                 $body:block $(=> ($map:ident, $trait_ret:ty))?
             )*
         }
@@ -1110,8 +1096,8 @@ macro_rules! source_accessors {
         $(#[$attr])*
         impl<$($generics)*> $frame {
             $(
-                $(#[$doc])*
-                pub fn $method(&$this $(, $arg: $arg_ty)*) $(-> $ret)? $body
+                $(#[$($doc)*])*
+                pub fn $method $(<$generic: $bound>)? (&$this $(, $arg: $arg_ty)*) $(-> $ret)? $(where Self: $sized)? $body
             )*
             $($extra)*
         }
@@ -1119,7 +1105,8 @@ macro_rules! source_accessors {
         impl<$($generics)*> $source for $frame {
             $(
                 $crate::frames::source_accessor_forward! {
-                    $frame; $method(&$this $(, $arg: $arg_ty)*) $(-> $ret)? $(=> ($map, $trait_ret))?;
+                    $(#[$($doc)*])*
+                    $frame; $method $(<$generic: $bound>)? (&$this $(, $arg: $arg_ty)*) $(-> $ret)? $(where Self: $sized)? $(=> ($map, $trait_ret))?;
                 }
             )*
         }
@@ -1190,8 +1177,8 @@ macro_rules! video_accessors {
                 /// Get the picture aspect ratio, width over height as displayed; `0.0`
                 /// means square pixels.
                 #[inline]
-                fn picture_aspect_ratio(&self) -> f32 {
-                    $crate::frames::VideoParts::header(self).picture_aspect_ratio().get()
+                fn picture_aspect_ratio(&self) -> $crate::PictureAspectRatio {
+                    $crate::frames::VideoParts::header(self).picture_aspect_ratio()
                 }
 
                 /// Get the scan type: progressive, interlaced, or a single field.
@@ -1314,8 +1301,6 @@ macro_rules! video_accessors {
                     $crate::frames::VideoPartsExt::can_send_direct(self)
                 }
 
-            }
-            extra {
                 /// Encode the frame as an image, as `options` describe.
                 ///
                 /// Every uncompressed pixel format encodes, as PNG, JPEG or
@@ -1324,7 +1309,7 @@ macro_rules! video_accessors {
                 /// frame's `ndi_color_info` metadata names another matrix; a frame
                 /// tagged PQ or HLG is refused unless the options ask for its code
                 /// values. See
-                /// [`ImageOptions`](crate::ImageOptions) for formats, color, HDR,
+                /// [`ImageOptions`](crate::image_encoding::ImageOptions) for formats, color, HDR,
                 /// bit depth, alpha, reduction, cost and memory.
                 ///
                 $(#[$images])*
@@ -1341,9 +1326,9 @@ macro_rules! video_accessors {
                 /// code values for JPEG or WebP.
                 /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) for a frame
                 /// the options cannot encode: a PQ or HLG frame under
-                /// [`HdrPolicy::Refuse`](crate::HdrPolicy::Refuse), unreadable
+                /// [`HdrPolicy::Refuse`](crate::image_encoding::HdrPolicy::Refuse), unreadable
                 /// `ndi_color_info` or withheld received metadata under
-                /// [`ColorPolicy::Sdk`](crate::ColorPolicy::Sdk),
+                /// [`ColorPolicy::Sdk`](crate::image_encoding::ColorPolicy::Sdk),
                 /// or an image larger than its codec allows; and when the codec
                 /// fails.
                 ///
@@ -1351,7 +1336,7 @@ macro_rules! video_accessors {
                 ///
                 #[doc = concat!("```", $fence)]
                 #[doc = $example]
-                /// use grafton_ndi::{Downscale, ImageFormat, ImageOptions, PngCompression};
+                /// use grafton_ndi::{image_encoding::{Downscale, ImageFormat, ImageOptions, PngCompression}};
                 ///
                 /// let options = ImageOptions::new(ImageFormat::Png)
                 ///     .png_compression(PngCompression::Fast)
@@ -1360,8 +1345,8 @@ macro_rules! video_accessors {
                 /// # Ok::<(), Box<dyn std::error::Error>>(())
                 /// ```
                 #[cfg(feature = "image-encoding")]
-                pub fn encode_image(&self, options: &$crate::ImageOptions) -> $crate::Result<Vec<u8>> {
-                    $crate::image::encode($crate::image::Source::new(self), options)
+                fn encode_image(&self, options: &$crate::image_encoding::ImageOptions) -> $crate::Result<Vec<u8>> {
+                    $crate::image_encoding::encode($crate::image_encoding::Source::new(self), options)
                 }
 
                 /// Encode the frame as an image, as `options` describe, writing it
@@ -1387,7 +1372,7 @@ macro_rules! video_accessors {
                 ///
                 #[doc = concat!("```", $fence)]
                 #[doc = $example]
-                /// use grafton_ndi::{ImageFormat, ImageOptions};
+                /// use grafton_ndi::{image_encoding::{ImageFormat, ImageOptions}};
                 ///
                 /// let options = ImageOptions::new(ImageFormat::Jpeg(85));
                 /// let mut jpeg = Vec::new();
@@ -1399,12 +1384,13 @@ macro_rules! video_accessors {
                 /// # Ok::<(), Box<dyn std::error::Error>>(())
                 /// ```
                 #[cfg(feature = "image-encoding")]
-                pub fn encode_image_to<W: ::std::io::Write>(
+                fn encode_image_to<W: ::std::io::Write>(
                     &self,
-                    options: &$crate::ImageOptions,
-                    mut out: W,
-                ) -> $crate::Result<()> {
-                    $crate::image::encode_to($crate::image::Source::new(self), options, &mut out)
+                    options: &$crate::image_encoding::ImageOptions,
+                    out: W,
+                ) -> $crate::Result<()> where Self: Sized {
+                    let mut out = out;
+                    $crate::image_encoding::encode_to($crate::image_encoding::Source::new(self), options, &mut out)
                 }
 
                 /// Encode the frame as an image, as `options` describe, in a
@@ -1422,7 +1408,7 @@ macro_rules! video_accessors {
                 ///
                 #[doc = concat!("```", $fence)]
                 #[doc = $example]
-                /// use grafton_ndi::{Downscale, ImageFormat, ImageOptions};
+                /// use grafton_ndi::{image_encoding::{Downscale, ImageFormat, ImageOptions}};
                 ///
                 /// let options = ImageOptions::new(ImageFormat::Jpeg(80)).downscale(Downscale::Quarter);
                 /// let url = frame.encode_image_data_url(&options)?;
@@ -1430,86 +1416,14 @@ macro_rules! video_accessors {
                 /// # Ok::<(), Box<dyn std::error::Error>>(())
                 /// ```
                 #[cfg(feature = "image-encoding")]
-                pub fn encode_image_data_url(&self, options: &$crate::ImageOptions) -> $crate::Result<String> {
-                    $crate::image::encode_data_url($crate::image::Source::new(self), options)
-                }
-
-                /// Encode the frame as an 8-bit RGBA PNG at the default
-                /// compression level.
-                ///
-                /// Exactly [`encode_image`](Self::encode_image) with
-                /// `ImageOptions::new(ImageFormat::Png)`, and its checks. A snapshot
-                /// loop of camera video is far faster with
-                /// [`PngCompression::Fast`](crate::PngCompression::Fast) or
-                /// [`ImageFormat::WebpLossless`](crate::ImageFormat::WebpLossless).
-                ///
-                /// # Errors
-                ///
-                /// As for [`encode_image`](Self::encode_image).
-                ///
-                /// # Example
-                ///
-                #[doc = concat!("```", $fence)]
-                #[doc = $example]
-                /// let png = frame.encode_png()?;
-                /// println!("{} bytes of PNG", png.len());
-                /// # Ok::<(), Box<dyn std::error::Error>>(())
-                /// ```
-                #[cfg(feature = "image-encoding")]
-                pub fn encode_png(&self) -> $crate::Result<Vec<u8>> {
-                    self.encode_image(&$crate::ImageOptions::new($crate::ImageFormat::Png))
-                }
-
-                /// Encode the frame as a JPEG of `quality`, from 1, the lowest, to
-                /// 100, the highest; 80 to 95 are typical.
-                ///
-                /// Exactly [`encode_image`](Self::encode_image) with
-                /// `ImageOptions::new(ImageFormat::Jpeg(quality))`, and its checks.
-                ///
-                /// # Errors
-                ///
-                /// As for [`encode_image`](Self::encode_image): a quality outside
-                /// 1 to 100 is [`Error::InvalidInput`](crate::Error::InvalidInput).
-                ///
-                /// # Example
-                ///
-                #[doc = concat!("```", $fence)]
-                #[doc = $example]
-                /// let jpeg = frame.encode_jpeg(85)?;
-                /// println!("{} bytes of JPEG", jpeg.len());
-                /// # Ok::<(), Box<dyn std::error::Error>>(())
-                /// ```
-                #[cfg(feature = "image-encoding")]
-                pub fn encode_jpeg(&self, quality: u8) -> $crate::Result<Vec<u8>> {
-                    self.encode_image(&$crate::ImageOptions::new($crate::ImageFormat::Jpeg(quality)))
-                }
-
-                /// Encode the frame in `format` as a base64 data URL.
-                ///
-                /// Exactly [`encode_image_data_url`](Self::encode_image_data_url)
-                /// with `ImageOptions::new(format)`, and its checks.
-                ///
-                /// # Errors
-                ///
-                /// As for [`encode_image`](Self::encode_image).
-                ///
-                /// # Example
-                ///
-                #[doc = concat!("```", $fence)]
-                #[doc = $example]
-                /// use grafton_ndi::ImageFormat;
-                ///
-                /// let url = frame.encode_data_url(ImageFormat::Jpeg(90))?;
-                /// println!("<img src=\"{url}\">");
-                /// # Ok::<(), Box<dyn std::error::Error>>(())
-                /// ```
-                #[cfg(feature = "image-encoding")]
-                pub fn encode_data_url(&self, format: $crate::ImageFormat) -> $crate::Result<String> {
-                    self.encode_image_data_url(&$crate::ImageOptions::new(format))
+                fn encode_image_data_url(&self, options: &$crate::image_encoding::ImageOptions) -> $crate::Result<String> {
+                    $crate::image_encoding::encode_data_url($crate::image_encoding::Source::new(self), options)
                 }
 
             }
+            extra {}
         }
+
         $(#[$attr])*
         impl<$($generics)*> ::std::fmt::Debug for $frame {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -1654,7 +1568,7 @@ impl VideoFrame {
             height: 1080,
             pixel_format: PixelFormat::Bgra,
             frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
-            aspect_ratio_input: 0.0,
+            picture_aspect_ratio: PictureAspectRatio::SQUARE_PIXELS,
             scan_type: ScanType::Progressive,
             timecode: Timecode::SYNTHESIZE,
             metadata: None,
@@ -1699,13 +1613,9 @@ impl VideoFrame {
     /// Set the picture aspect ratio, width over height as displayed; `0.0`
     /// means square pixels.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidFrame`] if `ratio` is negative or not finite.
-    /// The frame is unchanged.
-    pub fn set_picture_aspect_ratio(&mut self, ratio: f32) -> Result<()> {
-        self.header.picture_aspect_ratio = PictureAspectRatio::from_sdk(ratio)?;
-        Ok(())
+    /// The validated ratio is stored without further checks.
+    pub fn set_picture_aspect_ratio(&mut self, ratio: PictureAspectRatio) {
+        self.header.picture_aspect_ratio = ratio;
     }
 
     /// Recover the original pixel vector, retaining its allocation and capacity.
@@ -1856,7 +1766,7 @@ impl VideoFrame {
         // SAFETY: the descriptor points into `self`, which the reference
         // borrows, and the no-op free releases nothing it does not own.
         unsafe {
-            VideoRef::new(Guard::<crate::capture::FrameSyncVideoFree>::with_test_free(
+            FrameSyncVideoRef::new(Guard::<crate::capture::FrameSyncVideoFree>::with_test_free(
                 ptr::null_mut(),
                 self.as_test_raw(),
                 |_, _| {},
@@ -1873,7 +1783,7 @@ pub struct VideoFrameBuilder {
     height: u32,
     pixel_format: PixelFormat,
     frame_rate: FrameRate,
-    aspect_ratio_input: f32,
+    picture_aspect_ratio: PictureAspectRatio,
     scan_type: ScanType,
     timecode: Timecode,
     metadata: Option<String>,
@@ -1907,8 +1817,8 @@ impl VideoFrameBuilder {
     /// Set the picture aspect ratio, width over height as displayed; `0.0`
     /// means square pixels. It must be finite and nonnegative.
     #[must_use]
-    pub fn picture_aspect_ratio(mut self, ratio: f32) -> Self {
-        self.aspect_ratio_input = ratio;
+    pub fn picture_aspect_ratio(mut self, ratio: PictureAspectRatio) -> Self {
+        self.picture_aspect_ratio = ratio;
         self
     }
 
@@ -2007,13 +1917,13 @@ impl VideoFrameBuilder {
     /// # Errors
     ///
     /// Returns the unchanged builder with [`Error::InvalidFrame`] if the
-    /// resolution, pixel format, aspect ratio, metadata size or supplied data
+    /// resolution, pixel format, metadata size or supplied data
     /// length do not form a
     /// valid frame, and [`Error::InvalidCString`] for metadata containing a
     /// NUL byte.
     pub fn build(mut self) -> std::result::Result<VideoFrame, Rejected<Self>> {
         let mut validate = || -> Result<_> {
-            let picture_aspect_ratio = PictureAspectRatio::from_sdk(self.aspect_ratio_input)?;
+            let picture_aspect_ratio = self.picture_aspect_ratio;
             let layout = ValidatedVideoLayout::new_uncompressed(
                 self.pixel_format,
                 self.width,
@@ -3875,6 +3785,7 @@ fn calculate_buffer_len_checked(
     calculate_buffer_len_for_info_checked(pixel_format.info(), y_stride, height)
 }
 
+#[cfg(test)]
 fn calculate_buffer_len_for_info_checked(
     info: PixelFormatInfo,
     y_stride: usize,
@@ -5104,14 +5015,14 @@ mod borrowed {
     use super::*;
 
     #[allow(private_bounds)]
-    pub struct VideoRef<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> {
+    pub(crate) struct VideoRef<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> {
         /// The captured frame and the layout, header and metadata text validated
         /// from it once, when it was captured; accessors read the cached values.
         pub(super) frame: ValidatedVideo<Guard<'a, S>>,
     }
 
     #[allow(private_bounds)]
-    pub struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
+    pub(crate) struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
         /// The captured frame and the layout and metadata text validated from it
         /// once, when it was captured; accessors read the cached values.
         pub(super) frame: ValidatedAudio<Guard<'a, S>>,
@@ -5129,7 +5040,9 @@ pub(crate) use borrowed::{AudioRef, VideoRef};
 /// active rows or planes; trailing padding after a single active row does not
 /// prevent a contiguous view. Use `planes()` and each plane's rows for padded layouts.
 /// See [`crate::FrameSyncVideoRef`] for clock-driven capture.
-pub type VideoFrameRef<'rx> = VideoRef<'rx, VideoKind>;
+pub struct VideoFrameRef<'rx> {
+    inner: VideoRef<'rx, VideoKind>,
+}
 
 #[allow(private_bounds)]
 impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
@@ -5192,6 +5105,22 @@ unsafe impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoParts for Vid
 
 macro_rules! borrowed_video_accessors {
     ($name:ident, $strategy:ty) => {
+        impl<'a> $name<'a> {
+            pub(crate) fn new(guard: Guard<'a, $strategy>) -> Result<Self> {
+                Ok(Self { inner: VideoRef::new(guard)? })
+            }
+
+        }
+
+        // SAFETY: the private core retains the validated native loan, and this
+        // concrete wrapper delegates every part to that same immutable core.
+        unsafe impl VideoParts for $name<'_> {
+            fn layout(&self) -> &ValidatedVideoLayout { VideoParts::layout(&self.inner) }
+            fn header(&self) -> &VideoHeader { VideoParts::header(&self.inner) }
+            fn pixels(&self) -> *const u8 { VideoParts::pixels(&self.inner) }
+            fn frame_metadata(&self) -> FrameMetadataRef<'_> { VideoParts::frame_metadata(&self.inner) }
+            fn sdk_timestamp(&self) -> Option<SdkTimestamp> { VideoParts::sdk_timestamp(&self.inner) }
+        }
         video_accessors! {
             impl['a] $name<'a>;
             debug(<$strategy as FrameFree>::REF_DEBUG_NAME, "active data (bytes)" = payload_len_bytes);
@@ -5212,7 +5141,7 @@ macro_rules! borrowed_video_accessors {
                 /// [`Self::to_owned`] for a tightly packed owned buffer. A single packed
                 /// row can be borrowed even when its stride includes trailing padding.
             } {
-        self.frame.active_data()
+        self.inner.frame.active_data()
     }
             to_owned(self) {
                 /// Copy this borrowed frame into an owned `VideoFrame`.
@@ -5227,7 +5156,7 @@ macro_rules! borrowed_video_accessors {
                 /// The copy cannot fail: capture validated everything it relies on, and
                 /// the packed layout of a valid frame is valid.
             } {
-        self.frame.owned_copy()
+        self.inner.frame.owned_copy()
     }
             copy_into {
                 /// Copy this borrowed frame into `destination`, reusing its allocations.
@@ -5265,7 +5194,7 @@ macro_rules! borrowed_video_accessors {
  # finder.watch().wait_for_change(Duration::from_secs(1))?;
  # let Some(source) = finder.current_sources()?.into_iter().next() else { return Ok(()) };
  # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
- # let Some(frame) = receiver.video().capture_ref(Duration::from_secs(5))? else { return Ok(()) };") {
+ # let Some(frame) = receiver.capture_video_ref(Duration::from_secs(5))? else { return Ok(()) };") {
                 /// It encodes directly from the borrowed SDK pixels, without first
                 /// copying the frame into an owned [`VideoFrame`].
             }
@@ -5274,6 +5203,14 @@ macro_rules! borrowed_video_accessors {
 }
 borrowed_video_accessors!(VideoFrameRef, VideoKind);
 borrowed_video_accessors!(FrameSyncVideoRef, FrameSyncVideoFree);
+
+#[cfg(feature = "advanced")]
+impl VideoFrameRef<'_> {
+    /// The original receiver descriptor retained by this frame's guard.
+    pub(crate) fn raw(&self) -> &NDIlib_video_frame_v2_t {
+        self.inner.raw()
+    }
+}
 
 /// A zero-copy audio frame captured from a [`Receiver`](crate::Receiver).
 ///
@@ -5284,7 +5221,9 @@ borrowed_video_accessors!(FrameSyncVideoRef, FrameSyncVideoFree);
 /// `channel_data()` or `channels()` to read initialized samples. Every captured
 /// audio frame has at least one channel and one sample per channel.
 /// See [`crate::FrameSyncAudioRef`] for clock-driven capture.
-pub type AudioFrameRef<'rx> = AudioRef<'rx, AudioKind>;
+pub struct AudioFrameRef<'rx> {
+    inner: AudioRef<'rx, AudioKind>,
+}
 
 #[allow(private_bounds)]
 impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
@@ -5342,6 +5281,25 @@ unsafe impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioParts for Aud
 
 macro_rules! borrowed_audio_accessors {
     ($name:ident, $strategy:ty) => {
+        // SAFETY: all parts borrow the one validated descriptor retained by
+        // this wrapper's private core, with no change to storage or freeing.
+        unsafe impl AudioParts for $name<'_> {
+            fn layout(&self) -> &ValidatedAudioLayout {
+                AudioParts::layout(&self.inner)
+            }
+            fn audio_timecode(&self) -> Timecode {
+                AudioParts::audio_timecode(&self.inner)
+            }
+            fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+                AudioParts::sdk_timestamp(&self.inner)
+            }
+            fn samples(&self) -> *const f32 {
+                AudioParts::samples(&self.inner)
+            }
+            fn frame_metadata(&self) -> FrameMetadataRef<'_> {
+                AudioParts::frame_metadata(&self.inner)
+            }
+        }
         audio_accessors! {
                 impl['a] $name<'a>;
                 debug(<$strategy as FrameFree>::REF_DEBUG_NAME);
@@ -5365,7 +5323,7 @@ macro_rules! borrowed_audio_accessors {
                     /// Use [`channel_data`](Self::channel_data) or [`channels`](Self::channels)
                     /// for those buffers.
                 } {
-            self.frame.contiguous_samples()
+            self.inner.frame.contiguous_samples()
         }
                 to_owned(self) {
                     /// Copy this borrowed frame into an owned `AudioFrame`.
@@ -5379,7 +5337,7 @@ macro_rules! borrowed_audio_accessors {
                     ///
                     /// The copy cannot fail: capture validated everything it relies on.
                 } {
-            self.frame.owned_copy()
+            self.inner.frame.owned_copy()
         }
                 copy_into {
                     /// Copy this borrowed frame into `destination`, reusing its allocations.
@@ -5411,19 +5369,28 @@ borrowed_audio_accessors!(FrameSyncAudioRef, FrameSyncAudioFree);
 #[cfg(feature = "advanced")]
 borrowed_audio_accessors!(AvSyncAudioRef, AvSyncAudioFree);
 
-impl<'rx> AudioRef<'rx, AudioKind> {
-    /// Create a borrowed audio frame from a receiver RAII guard, validated
-    /// as [`from_guard`](Self::from_guard) describes.
+impl<'rx> AudioFrameRef<'rx> {
     pub(crate) fn new(guard: RecvAudioGuard<'rx>) -> Result<Self> {
-        Self::from_guard(guard)
+        Ok(Self {
+            inner: AudioRef::from_guard(guard)?,
+        })
     }
 }
 
-impl<'fs> AudioRef<'fs, FrameSyncAudioFree> {
-    /// Create a borrowed audio frame from a FrameSync RAII guard, validated
-    /// as [`from_guard`](Self::from_guard) describes.
+impl<'fs> FrameSyncAudioRef<'fs> {
     pub(crate) fn new(guard: Guard<'fs, FrameSyncAudioFree>) -> Result<Self> {
-        Self::from_guard(guard)
+        Ok(Self {
+            inner: AudioRef::from_guard(guard)?,
+        })
+    }
+}
+
+#[cfg(all(feature = "advanced", any(test, ndi_has_advanced_av_sync)))]
+impl<'a> AvSyncAudioRef<'a> {
+    pub(crate) fn from_validated(frame: ValidatedAudio<Guard<'a, AvSyncAudioFree>>) -> Self {
+        Self {
+            inner: AudioRef::from_validated(frame),
+        }
     }
 }
 
@@ -5431,7 +5398,7 @@ impl<'fs> AudioRef<'fs, FrameSyncAudioFree> {
 ///
 /// This type wraps an RAII guard that owns the NDI frame buffer lifetime,
 /// exposing a safe, zero-copy view of the metadata string. The frame is automatically
-/// freed when dropped via `NDIlib_recv_free_metadata`.
+/// freed when dropped through its receiver or sender's matching metadata release.
 ///
 /// **Key characteristics:**
 /// - Zero allocations: References NDI SDK buffers directly
@@ -5446,11 +5413,11 @@ impl<'fs> AudioRef<'fs, FrameSyncAudioFree> {
 /// # use std::time::Duration;
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// # let ndi = Ndi::new()?;
-/// # let source = Source::new("Test");
+/// # let source = Source::new("Test").unwrap();
 /// # let options = ReceiverOptions::new(source);
 /// # let receiver = Receiver::new(&ndi, &options)?;
 /// // Zero-copy capture
-/// if let Some(frame) = receiver.metadata().capture_ref(Duration::from_millis(1000))? {
+/// if let Some(frame) = receiver.capture_metadata_ref(Duration::from_millis(1000))? {
 ///     println!("Metadata: {}", frame.data());
 ///
 ///     // Frame is freed here when `frame` goes out of scope
@@ -5462,14 +5429,74 @@ pub struct MetadataFrameRef<'rx> {
     /// The captured frame and its text, validated once when it was captured;
     /// `data()` and `as_bytes()` read the cached length. The empty null frame
     /// has no text.
-    frame: ValidatedMetadata<RecvMetadataGuard<'rx>>,
+    frame: MetadataLoan<'rx>,
+}
+
+struct SenderMetadataGuard<'a> {
+    guard: Guard<'a, SenderMetadataFree>,
+    // Fields drop in declaration order on every exit, including validation
+    // errors and unwinding: native free always precedes capture-gate release.
+    _lease: crate::sender::SenderMetadataLease<'a>,
+}
+
+impl HoldsDescriptor for SenderMetadataGuard<'_> {
+    type Descriptor = NDIlib_metadata_frame_t;
+    fn descriptor(&self) -> &Self::Descriptor {
+        self.guard.frame()
+    }
+}
+
+enum MetadataLoan<'a> {
+    Receiver(ValidatedMetadata<RecvMetadataGuard<'a>>),
+    Sender(ValidatedMetadata<SenderMetadataGuard<'a>>),
+}
+
+impl MetadataLoan<'_> {
+    fn descriptor(&self) -> &NDIlib_metadata_frame_t {
+        match self {
+            Self::Receiver(frame) => frame.descriptor(),
+            Self::Sender(frame) => frame.descriptor(),
+        }
+    }
+    fn metadata(&self) -> Option<MetadataText<'_>> {
+        match self {
+            Self::Receiver(frame) => frame.metadata(),
+            Self::Sender(frame) => frame.metadata(),
+        }
+    }
 }
 
 impl<'rx> MetadataFrameRef<'rx> {
     /// Create a borrowed metadata frame from an RAII guard.
     pub(crate) fn new(guard: RecvMetadataGuard<'rx>) -> Result<Self> {
         let frame = ValidatedMetadata::metadata_frame(guard)?;
-        Ok(Self { frame })
+        Ok(Self {
+            frame: MetadataLoan::Receiver(frame),
+        })
+    }
+
+    /// Validate a sender's bounded C-string result while retaining its capture gate.
+    pub(crate) fn from_sender(
+        guard: Guard<'rx, SenderMetadataFree>,
+        lease: crate::sender::SenderMetadataLease<'rx>,
+    ) -> Result<Self> {
+        let guard = SenderMetadataGuard {
+            guard,
+            _lease: lease,
+        };
+        // SAFETY: the sender guard retains its delivered descriptor and the
+        // SDK's NUL-terminated UTF-8 storage through matching native release.
+        // Sender captures permit a positive count that excludes the terminator.
+        let metadata_state =
+            FrameMetadataState::from_text(unsafe { validate_sender_metadata(guard.descriptor())? });
+        let frame = ValidatedMetadata {
+            frame: guard,
+            metadata_state,
+            validated: (),
+        };
+        Ok(Self {
+            frame: MetadataLoan::Sender(frame),
+        })
     }
 
     /// Get the timecode.
@@ -5740,7 +5767,7 @@ mod tests {
             };
             // Only initialized active bytes may be read; padding stays uninitialized.
             let frame = unsafe {
-                VideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+                FrameSyncVideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
                     ptr::null_mut(),
                     raw,
                     |_, _| {},
@@ -5803,7 +5830,9 @@ mod tests {
                     matches!(
                         result,
                         Err(Error::UnsupportedCapability {
-                            feature: crate::capabilities::RuntimeFeature::Planar444Video,
+                            capability: crate::Capability::Runtime(
+                                crate::capabilities::RuntimeFeature::Planar444Video
+                            ),
                             ..
                         })
                     ),
@@ -6177,7 +6206,7 @@ mod tests {
                 // Null FrameSync guards skip SDK calls; storage and metadata
                 // live until both independent guards and their views are gone.
                 let make = || unsafe {
-                    VideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+                    FrameSyncVideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
                         ptr::null_mut(),
                         raw,
                         |_, _| {},
@@ -6273,7 +6302,7 @@ mod tests {
                 assert_eq!(owned.line_stride_bytes(), dimensions[0].0);
                 assert_eq!(owned.metadata(), Some("<video-padding/>"));
                 assert_eq!(owned.frame_rate(), FrameRate::new(30000, 1001).unwrap());
-                assert_eq!(owned.picture_aspect_ratio(), 1.25);
+                assert_eq!(owned.picture_aspect_ratio().get(), 1.25);
                 assert_eq!(owned.scan_type(), ScanType::Interlaced);
                 assert_eq!(
                     (owned.timecode(), owned.timestamp()),
@@ -6327,7 +6356,7 @@ mod tests {
                 }
                 let send = crate::BorrowedVideoFrame::builder(&initialized, 4, 4, format)
                     .frame_rate(FrameRate::new(30000, 1001).unwrap())
-                    .picture_aspect_ratio(1.25)
+                    .picture_aspect_ratio(crate::PictureAspectRatio::new(1.25).unwrap())
                     .scan_type(ScanType::Interlaced)
                     .timecode(Timecode::from_ticks(12345))
                     .line_stride_bytes(stride)
@@ -6479,7 +6508,7 @@ mod tests {
                 ..Default::default()
             };
             let frame = unsafe {
-                VideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+                FrameSyncVideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
                     ptr::null_mut(),
                     raw,
                     |_, _| {},
@@ -6512,7 +6541,7 @@ mod tests {
     fn video_padding_encoders_never_read_uninitialized_gaps() {
         use crate::{
             capture::{FrameSyncVideoFree, Guard},
-            AlphaMode, Downscale, ImageFormat, ImageOptions, SampleDepth,
+            image_encoding::{AlphaMode, Downscale, ImageFormat, ImageOptions, SampleDepth},
         };
         use std::mem::MaybeUninit;
         let outputs = [
@@ -6560,7 +6589,7 @@ mod tests {
             // SAFETY: the descriptor points into `storage`, which outlives
             // the reference, and the no-op free releases nothing.
             let borrowed = unsafe {
-                VideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+                FrameSyncVideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
                     ptr::null_mut(),
                     raw,
                     |_, _| {},
@@ -6608,7 +6637,7 @@ mod tests {
             ..Default::default()
         };
         let frame = unsafe {
-            VideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+            FrameSyncVideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
                 ptr::null_mut(),
                 raw,
                 |_, _| {},
@@ -6629,7 +6658,7 @@ mod tests {
         assert_eq!(built.pixel_format(), PixelFormat::Bgra);
         assert_eq!(built.scan_type(), ScanType::Progressive);
         assert_eq!(built.frame_rate(), FrameRate::new(60, 1).unwrap());
-        assert_eq!(built.picture_aspect_ratio(), 0.0);
+        assert_eq!(built.picture_aspect_ratio().get(), 0.0);
         assert_eq!(built.timecode(), Timecode::SYNTHESIZE);
         assert_eq!(built.timestamp(), None);
         assert!(built.data().iter().all(|&byte| byte == 0));
@@ -6638,8 +6667,8 @@ mod tests {
         frame.set_timecode(Timecode::from_ticks(123));
         frame.set_scan_type(ScanType::Field1);
         frame.set_frame_rate(FrameRate::new(30000, 1001).unwrap());
-        frame.set_picture_aspect_ratio(0.0).unwrap();
-        assert!(frame.set_picture_aspect_ratio(f32::NAN).is_err());
+        frame.set_picture_aspect_ratio(crate::PictureAspectRatio::new(0.0).unwrap());
+        assert!(PictureAspectRatio::new(f32::NAN).is_err());
         let raw = frame.as_test_raw();
         assert_eq!(raw.timecode, 123);
         assert_eq!(raw.timestamp, NDIlib_recv_timestamp_undefined);
@@ -6734,12 +6763,12 @@ mod tests {
             );
 
             // 1920x1080, stride = 1920 * 4 = 7680
-            let len = info.buffer_len(7680, 1080).unwrap();
+            let len = fmt.buffer_len(1920, 1080, Some(7680)).unwrap();
             assert_eq!(len, 7680 * 1080, "Format {:?} even dimensions", fmt);
 
-            // Odd dimensions: 1921x1081
-            let len = info.buffer_len(7684, 1081).unwrap();
-            assert_eq!(len, 7684 * 1081, "Format {:?} odd dimensions", fmt);
+            // Padded rows with an odd height
+            let len = fmt.buffer_len(1920, 1081, Some(7684)).unwrap();
+            assert_eq!(len, 7684 * 1081, "Format {:?} padded rows", fmt);
         }
     }
 
@@ -6750,7 +6779,9 @@ mod tests {
         let info = PixelFormat::Uyvy.info();
         assert_eq!(info.bytes_per_pixel(), 2);
         assert_eq!(info.category(), FormatCategory::Packed);
-        let len = info.buffer_len(3840, 1080).unwrap();
+        let len = PixelFormat::Uyvy
+            .buffer_len(1920, 1080, Some(3840))
+            .unwrap();
         assert_eq!(len, 3840 * 1080);
 
         // UYVA: UYVY plane (2 bytes per pixel) + alpha plane at half stride
@@ -6758,19 +6789,27 @@ mod tests {
         assert_eq!(info.bytes_per_pixel(), 2);
         assert_eq!(info.category(), FormatCategory::PackedAlpha);
         assert!(!info.is_planar_420());
-        let len = info.buffer_len(3840, 1080).unwrap();
+        let len = PixelFormat::Uyva
+            .buffer_len(1920, 1080, Some(3840))
+            .unwrap();
         assert_eq!(len, 3840 * 1080 + 1920 * 1080);
         // Padded stride: alpha plane follows at stride / 2
-        let len = info.buffer_len(4096, 1080).unwrap();
+        let len = PixelFormat::Uyva
+            .buffer_len(1920, 1080, Some(4096))
+            .unwrap();
         assert_eq!(len, 4096 * 1080 + 2048 * 1080);
-        assert!(info.buffer_len(3841, 1080).is_err());
+        assert!(PixelFormat::Uyva
+            .buffer_len(1920, 1080, Some(3841))
+            .is_err());
 
         // P216: 16-bit Y plane + 16-bit CbCr plane, both at the line stride
         let info = PixelFormat::P216.info();
         assert_eq!(info.bytes_per_pixel(), 2);
         assert_eq!(info.category(), FormatCategory::SemiPlanar422);
         assert!(!info.is_planar_420());
-        let len = info.buffer_len(3840, 1080).unwrap();
+        let len = PixelFormat::P216
+            .buffer_len(1920, 1080, Some(3840))
+            .unwrap();
         assert_eq!(len, 3840 * 1080 * 2);
 
         // PA16: P216 + 16-bit alpha plane at the line stride
@@ -6778,7 +6817,9 @@ mod tests {
         assert_eq!(info.bytes_per_pixel(), 2);
         assert_eq!(info.category(), FormatCategory::SemiPlanar422Alpha);
         assert!(!info.is_planar_420());
-        let len = info.buffer_len(3840, 1080).unwrap();
+        let len = PixelFormat::Pa16
+            .buffer_len(1920, 1080, Some(3840))
+            .unwrap();
         assert_eq!(len, 3840 * 1080 * 3);
     }
 
@@ -6796,12 +6837,16 @@ mod tests {
         assert_eq!(info.bytes_per_pixel(), 1);
         assert_eq!(info.category(), FormatCategory::Planar420);
         assert!(info.is_planar_420());
-        let len = info.buffer_len(y_stride, 1080).unwrap();
+        let len = PixelFormat::Yv12
+            .buffer_len(1920, 1080, Some(y_stride))
+            .unwrap();
         assert_eq!(len, 3_110_400, "YV12 1920x1080");
 
         let info = PixelFormat::I420.info();
         assert_eq!(info.category(), FormatCategory::Planar420);
-        let len = info.buffer_len(y_stride, 1080).unwrap();
+        let len = PixelFormat::I420
+            .buffer_len(1920, 1080, Some(y_stride))
+            .unwrap();
         assert_eq!(len, 3_110_400, "I420 1920x1080");
     }
 
@@ -6810,8 +6855,12 @@ mod tests {
     fn test_pixel_format_info_planar_420_odd() {
         let y_stride = 1921;
 
-        assert!(PixelFormat::Yv12.info().buffer_len(y_stride, 1081).is_err());
-        assert!(PixelFormat::I420.info().buffer_len(y_stride, 1081).is_err());
+        assert!(PixelFormat::Yv12
+            .buffer_len(1920, 1081, Some(y_stride))
+            .is_err());
+        assert!(PixelFormat::I420
+            .buffer_len(1920, 1081, Some(y_stride))
+            .is_err());
     }
 
     /// Test PixelFormatInfo for semi-planar NV12 with even dimensions
@@ -6827,7 +6876,9 @@ mod tests {
         assert_eq!(info.bytes_per_pixel(), 1);
         assert_eq!(info.category(), FormatCategory::SemiPlanar420);
         assert!(info.is_planar_420());
-        let len = info.buffer_len(y_stride, 1080).unwrap();
+        let len = PixelFormat::Nv12
+            .buffer_len(1920, 1080, Some(y_stride))
+            .unwrap();
         assert_eq!(len, 3_110_400, "NV12 1920x1080");
     }
 
@@ -6835,7 +6886,9 @@ mod tests {
     #[test]
     fn test_pixel_format_info_nv12_odd() {
         let y_stride = 1921;
-        assert!(PixelFormat::Nv12.info().buffer_len(y_stride, 1081).is_err());
+        assert!(PixelFormat::Nv12
+            .buffer_len(1920, 1081, Some(y_stride))
+            .is_err());
     }
 
     /// 4:2:0 parity is decided only by the shared plane layout, so every path
@@ -6857,7 +6910,7 @@ mod tests {
         ];
         for (format, height, stride, accepted) in cases {
             let label = format!("{format:?} {stride}x{height}");
-            let info_len = format.info().buffer_len(stride, height);
+            let info_len = format.buffer_len(1920, height, Some(stride));
             let layout = ValidatedVideoLayout::new_uncompressed(format, 1920, height, Some(stride));
             assert_eq!(info_len.is_ok(), accepted, "buffer_len {label}");
             assert_eq!(layout.is_ok(), accepted, "new_uncompressed {label}");
@@ -6872,7 +6925,7 @@ mod tests {
                 assert_eq!(layout.data_len_bytes, len, "{label}");
             }
             if !accepted && height % 2 == 0 {
-                let msg = format.info().buffer_len(stride, height).unwrap_err();
+                let msg = format.buffer_len(1920, height, Some(stride)).unwrap_err();
                 assert!(
                     matches!(msg, Error::InvalidFrame(crate::FrameDefect::Layout(crate::LayoutDefect::VideoPlanar420 {stride:found,..})) if found==stride),
                     "{label}: {msg}"
@@ -6881,12 +6934,40 @@ mod tests {
         }
         // NV12 odd stride: the UV plane is height/2 rows of the full stride.
         assert_eq!(
-            PixelFormat::Nv12.info().buffer_len(1921, 1080).unwrap(),
+            PixelFormat::Nv12
+                .buffer_len(1920, 1080, Some(1921))
+                .unwrap(),
             1921 * 1080 + 1921 * 540
         );
     }
 
     /// Test PixelFormat::line_stride_bytes for all formats
+    #[test]
+    fn buffer_len_checks_explicit_stride_against_active_width() {
+        assert_eq!(
+            PixelFormat::Bgra
+                .buffer_len(1920, 1080, Some(7684))
+                .unwrap(),
+            7684 * 1080
+        );
+        assert_eq!(
+            PixelFormat::Nv12
+                .buffer_len(1920, 1080, Some(2048))
+                .unwrap(),
+            3_317_760
+        );
+        assert!(PixelFormat::Bgra
+            .buffer_len(1920, 1080, Some(7679))
+            .is_err());
+        assert!(PixelFormat::Bgra.buffer_len(1920, 1080, Some(0)).is_err());
+        assert_eq!(
+            PixelFormat::Bgra.buffer_len(1920, 1080, None).unwrap(),
+            PixelFormat::Bgra
+                .buffer_len(1920, 1080, Some(7680))
+                .unwrap()
+        );
+    }
+
     #[test]
     fn test_pixel_format_line_stride() {
         // Packed RGB: 4 bytes per pixel
@@ -6915,25 +6996,46 @@ mod tests {
     #[test]
     fn test_pixel_format_buffer_size() {
         // Packed RGB: width * 4 * height
-        assert_eq!(PixelFormat::Bgra.buffer_len(1920, 1080).unwrap(), 8_294_400);
-        assert_eq!(PixelFormat::Rgba.buffer_len(1920, 1080).unwrap(), 8_294_400);
+        assert_eq!(
+            PixelFormat::Bgra.buffer_len(1920, 1080, None).unwrap(),
+            8_294_400
+        );
+        assert_eq!(
+            PixelFormat::Rgba.buffer_len(1920, 1080, None).unwrap(),
+            8_294_400
+        );
 
         // Planar 4:2:0: Y + U + V = 1.5 * width * height
-        assert_eq!(PixelFormat::Yv12.buffer_len(1920, 1080).unwrap(), 3_110_400);
-        assert_eq!(PixelFormat::I420.buffer_len(1920, 1080).unwrap(), 3_110_400);
+        assert_eq!(
+            PixelFormat::Yv12.buffer_len(1920, 1080, None).unwrap(),
+            3_110_400
+        );
+        assert_eq!(
+            PixelFormat::I420.buffer_len(1920, 1080, None).unwrap(),
+            3_110_400
+        );
 
         // Semi-planar 4:2:0: Y + UV = 1.5 * width * height
-        assert_eq!(PixelFormat::Nv12.buffer_len(1920, 1080).unwrap(), 3_110_400);
+        assert_eq!(
+            PixelFormat::Nv12.buffer_len(1920, 1080, None).unwrap(),
+            3_110_400
+        );
 
         // UYVA: UYVY + alpha = 3 * width * height
-        assert_eq!(PixelFormat::Uyva.buffer_len(1920, 1080).unwrap(), 6_220_800);
+        assert_eq!(
+            PixelFormat::Uyva.buffer_len(1920, 1080, None).unwrap(),
+            6_220_800
+        );
 
         // Semi-planar 4:2:2 16-bit: Y + CbCr = 4 * width * height
-        assert_eq!(PixelFormat::P216.buffer_len(1920, 1080).unwrap(), 8_294_400);
+        assert_eq!(
+            PixelFormat::P216.buffer_len(1920, 1080, None).unwrap(),
+            8_294_400
+        );
 
         // Semi-planar 4:2:2 16-bit with alpha: Y + CbCr + A = 6 * width * height
         assert_eq!(
-            PixelFormat::Pa16.buffer_len(1920, 1080).unwrap(),
+            PixelFormat::Pa16.buffer_len(1920, 1080, None).unwrap(),
             12_441_600
         );
     }
@@ -6988,7 +7090,7 @@ mod tests {
                 // the same checks.
                 if let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) {
                     assert!(
-                        format.buffer_len(width, height).is_err(),
+                        format.buffer_len(width, height, None).is_err(),
                         "{format:?} {width}x{height}"
                     );
                     assert!(VideoFrame::builder()
@@ -7033,7 +7135,7 @@ mod tests {
             }
             for height in [1, 2, 3] {
                 let valid = !format.info().is_planar_420() || height % 2 == 0;
-                assert_eq!(format.buffer_len(2, height).is_ok(), valid);
+                assert_eq!(format.buffer_len(2, height, None).is_ok(), valid);
                 assert_eq!(
                     VideoFrame::builder()
                         .resolution(2, height)
@@ -7492,13 +7594,16 @@ mod tests {
         let fs_guard = unsafe {
             Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), fs_raw, |_, _| {})
         };
-        let fs = VideoRef::<FrameSyncVideoFree>::new(fs_guard).expect("framesync video ref");
+        let fs = FrameSyncVideoRef::new(fs_guard).expect("framesync video ref");
 
         assert_eq!(recv.width(), fs.width());
         assert_eq!(recv.height(), fs.height());
         assert_eq!(recv.pixel_format(), fs.pixel_format());
         assert_eq!(recv.frame_rate(), fs.frame_rate());
-        assert_eq!(recv.picture_aspect_ratio(), fs.picture_aspect_ratio());
+        assert_eq!(
+            recv.picture_aspect_ratio().get(),
+            fs.picture_aspect_ratio().get()
+        );
         assert_eq!(recv.scan_type(), fs.scan_type());
         assert_eq!(recv.scan_type(), ScanType::Interlaced);
         assert_eq!(recv.timecode(), fs.timecode());
@@ -7562,7 +7667,7 @@ mod tests {
             )
         };
         assert!(matches!(
-            VideoRef::<FrameSyncVideoFree>::new(fs_guard),
+            FrameSyncVideoRef::new(fs_guard),
             Err(Error::InvalidFrame(_))
         ));
     }
@@ -8743,23 +8848,15 @@ mod tests {
     }
 
     #[test]
-    fn test_video_builder_rejects_invalid_send_metadata() {
+    fn invalid_send_metadata_is_rejected_at_value_construction() {
         assert!(matches!(FrameRate::new(0, 1), Err(Error::InvalidInput(_))));
         assert!(matches!(FrameRate::new(30, 0), Err(Error::InvalidInput(_))));
-        assert!(matches!(
-            VideoFrame::builder()
-                .picture_aspect_ratio(f32::NAN)
-                .build()
-                .map_err(Rejected::into_error),
-            Err(Error::InvalidFrame(_))
-        ));
-        assert!(matches!(
-            VideoFrame::builder()
-                .picture_aspect_ratio(-1.0)
-                .build()
-                .map_err(Rejected::into_error),
-            Err(Error::InvalidFrame(_))
-        ));
+        for ratio in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(matches!(
+                PictureAspectRatio::new(ratio),
+                Err(Error::InvalidInput(_))
+            ));
+        }
     }
 
     #[test]
@@ -8769,45 +8866,35 @@ mod tests {
                 .resolution(width, height)
                 .build()
                 .unwrap();
-            assert_eq!(frame.picture_aspect_ratio(), 0.0);
+            assert_eq!(frame.picture_aspect_ratio().get(), 0.0);
             assert_eq!(frame.as_test_raw().picture_aspect_ratio, 0.0);
             for builder in [
                 VideoFrame::builder()
-                    .picture_aspect_ratio(1.25)
+                    .picture_aspect_ratio(crate::PictureAspectRatio::new(1.25).unwrap())
                     .resolution(width, height),
                 VideoFrame::builder()
                     .resolution(width, height)
-                    .picture_aspect_ratio(1.25),
+                    .picture_aspect_ratio(crate::PictureAspectRatio::new(1.25).unwrap()),
             ] {
                 let frame = builder.build().unwrap();
-                assert_eq!(frame.picture_aspect_ratio(), 1.25);
+                assert_eq!(frame.picture_aspect_ratio().get(), 1.25);
                 assert_eq!(frame.as_test_raw().picture_aspect_ratio, 1.25);
             }
         }
         for ratio in [0.0, 1.25] {
             let frame = VideoFrame::builder()
                 .resolution(16, 16)
-                .picture_aspect_ratio(ratio)
+                .picture_aspect_ratio(crate::PictureAspectRatio::new(ratio).unwrap())
                 .build()
                 .unwrap();
             let raw = frame.as_test_raw();
             // SAFETY: `raw` borrows this live owned frame's initialized pixels.
             let captured = unsafe { ValidatedVideo::video_descriptor(&raw).unwrap() };
             let mut copy = captured.owned_copy();
-            assert_eq!(copy.picture_aspect_ratio(), ratio);
-            copy.set_picture_aspect_ratio(2.0).unwrap();
+            assert_eq!(copy.picture_aspect_ratio().get(), ratio);
+            copy.set_picture_aspect_ratio(crate::PictureAspectRatio::new(2.0).unwrap());
             captured.copy_into_owned(&mut copy);
             assert_eq!(copy.as_test_raw().picture_aspect_ratio, ratio);
-        }
-        for ratio in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            assert!(matches!(
-                VideoFrame::builder()
-                    .resolution(16, 16)
-                    .picture_aspect_ratio(ratio)
-                    .build()
-                    .map_err(Rejected::into_error),
-                Err(Error::InvalidFrame(_))
-            ));
         }
     }
 
@@ -9252,7 +9339,7 @@ mod tests {
         };
         let guard =
             unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = AudioRef::<FrameSyncAudioFree>::new(guard).unwrap();
+        let frame = FrameSyncAudioRef::new(guard).unwrap();
         assert!(frame.data().is_none());
         assert_eq!(frame.channel_data(0).unwrap(), &[1.0, 2.0, 3.0]);
         assert_eq!(frame.channel_data(1).unwrap(), &[4.0, 5.0, 6.0]);
@@ -9633,7 +9720,7 @@ mod tests {
         }
     }
 
-    /// Test calculate_buffer_len_checked matches PixelFormatInfo::buffer_len for valid inputs
+    /// Test the raw plane-size kernel matches the public validated layout sizing
     #[test]
     fn test_calculate_buffer_len_checked_matches_public_helper() {
         let test_cases = [
@@ -9645,7 +9732,9 @@ mod tests {
         ];
 
         for (format, stride, height) in test_cases {
-            let expected = format.info().buffer_len(stride, height as u32).unwrap();
+            let expected = format
+                .buffer_len(1920, height as u32, Some(stride))
+                .unwrap();
             let result = calculate_buffer_len_checked(format, stride, height);
 
             assert!(
@@ -9764,12 +9853,29 @@ mod tests {
         fn copy(&self, destination: &mut F);
     }
 
-    impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> CopySource<VideoFrame> for VideoRef<'_, S> {
+    impl CopySource<VideoFrame> for VideoFrameRef<'_> {
         fn owned(&self) -> VideoFrame {
-            self.frame.owned_copy()
+            self.to_owned()
         }
         fn copy(&self, destination: &mut VideoFrame) {
-            self.frame.copy_into_owned(destination);
+            self.copy_into(destination);
+        }
+    }
+
+    impl CopySource<VideoFrame> for FrameSyncVideoRef<'_> {
+        fn owned(&self) -> VideoFrame {
+            self.to_owned()
+        }
+        fn copy(&self, destination: &mut VideoFrame) {
+            self.copy_into(destination);
+        }
+    }
+    impl CopySource<AudioFrame> for FrameSyncAudioRef<'_> {
+        fn owned(&self) -> AudioFrame {
+            self.to_owned()
+        }
+        fn copy(&self, destination: &mut AudioFrame) {
+            self.copy_into(destination);
         }
     }
 
@@ -9782,12 +9888,12 @@ mod tests {
         }
     }
 
-    impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> CopySource<AudioFrame> for AudioRef<'_, S> {
+    impl CopySource<AudioFrame> for AudioFrameRef<'_> {
         fn owned(&self) -> AudioFrame {
-            self.frame.owned_copy()
+            self.to_owned()
         }
         fn copy(&self, destination: &mut AudioFrame) {
-            self.frame.copy_into_owned(destination);
+            self.copy_into(destination);
         }
     }
 
@@ -9815,7 +9921,7 @@ mod tests {
                             .scan_type(scan)
                     };
                     let room = format.send_buffer_len(18, height, None, scan).unwrap()
-                        - format.buffer_len(18, height).unwrap();
+                        - format.buffer_len(18, height, None).unwrap();
                     let holds_room = |frame: &VideoFrame, label: &str| {
                         assert_eq!(frame.tail_room(), room, "{format:?} {label}");
                         assert_eq!(frame.data.room_bytes(), vec![0; room], "{format:?} {label}");
@@ -10198,11 +10304,7 @@ mod tests {
         // metadata outlive every reference.
         let (framesync, received, bare) = unsafe {
             (
-                AudioRef::<FrameSyncAudioFree>::new(Guard::with_test_free(
-                    ptr::null_mut(),
-                    raw,
-                    |_, _| {},
-                )),
+                FrameSyncAudioRef::new(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})),
                 AudioFrameRef::new(RecvAudioGuard::with_test_free(
                     ptr::null_mut(),
                     raw,
@@ -10259,7 +10361,7 @@ mod tests {
             None => frame.to_owned(),
         };
         let sent = owned.data().as_ptr();
-        *spare = sender.send_video_async(owned).unwrap();
+        *spare = sender.submit_video(owned).unwrap();
         sent
     }
 
@@ -10288,7 +10390,7 @@ mod tests {
             }
         });
         assert_eq!(allocations, 0);
-        let last = sender.finish_video_async().unwrap();
+        let last = sender.reclaim_video().unwrap();
         let previous = spare.unwrap();
         assert_eq!(
             (last.data().as_ptr(), previous.data().as_ptr()),

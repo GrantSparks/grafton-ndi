@@ -11,7 +11,9 @@ mod runtime_fixture;
 use fixture::FixtureDir;
 use grafton_ndi::{
     capabilities::{CapabilityUnavailable, SdkEdition},
-    file::{FileApi, FileFamily, FileRuntimeOptions, PlayerOptions, RecorderOptions, SourceSpec},
+    file::{
+        FileApi, FileApiOptions, FileFamily, FilePlayerOptions, FileRecorderOptions, SourceSpec,
+    },
     runtime::RuntimeOptions,
     Error, LibraryKind, LoadFailure, LoadOrigin, LoadRefusal, Ndi, SelectionConflict,
 };
@@ -230,8 +232,8 @@ fn select(fixtures: &Fixtures, arrangement: &Arrangement) -> Ndi {
     .unwrap()
 }
 
-fn explicit(path: PathBuf) -> FileRuntimeOptions {
-    FileRuntimeOptions::default().library_path(path)
+fn explicit(path: PathBuf) -> FileApiOptions {
+    FileApiOptions::default().library_path(path)
 }
 
 /// Why no File library could be loaded.
@@ -261,7 +263,9 @@ fn conflicting(result: Result<FileApi, Error>) -> SelectionConflict {
 /// The build number of the runtime the loaded File library's imports are
 /// bound to, which the fake library reports through a probe.
 fn bound_runtime(api: &FileApi) -> u32 {
-    api.probe("recording.mkv").unwrap().track_count()
+    grafton_ndi::file::FilePlayer::probe(api, "recording.mkv")
+        .unwrap()
+        .track_count()
 }
 
 /// Whether a file whose path contains `name` is mapped into this process.
@@ -273,28 +277,28 @@ fn is_loaded(name: &str) -> bool {
 }
 
 fn child(name: &str, fixtures: &Fixtures) {
-    let defaults = FileRuntimeOptions::default();
+    let defaults = FileApiOptions::default();
     match name {
         "relative_path_selects_nothing" => {
             let ndi = select(fixtures, &PAIRED);
             assert!(matches!(
-                FileApi::open(&ndi, &explicit(PathBuf::from(FILE_LIBRARY))),
+                FileApi::new(&ndi, &explicit(PathBuf::from(FILE_LIBRARY))),
                 Err(Error::InvalidInput(_))
             ));
             assert!(!is_loaded("libndifile.so.6"));
-            let api = FileApi::open(&ndi, &defaults).unwrap();
+            let api = FileApi::new(&ndi, &defaults).unwrap();
             assert_eq!(bound_runtime(&api), PAIRED.build);
         }
         "beside_the_runtime_first_and_pinned" => {
             let ndi = select(fixtures, &PAIRED);
-            let api = FileApi::open(&ndi, &defaults).unwrap();
+            let api = FileApi::new(&ndi, &defaults).unwrap();
             let selected = fixtures.file(PAIRED.directory);
             assert_eq!(api.library_path(), Some(selected.as_path()));
             assert_eq!(bound_runtime(&api), PAIRED.build);
 
             // A different library cannot replace the selected one.
             let Err(Error::RuntimeConflict(failure)) =
-                FileApi::open(&ndi, &explicit(fixtures.file(OTHER.directory)))
+                FileApi::new(&ndi, &explicit(fixtures.file(OTHER.directory)))
             else {
                 panic!("expected path conflict")
             };
@@ -307,10 +311,10 @@ fn child(name: &str, fixtures: &Fixtures) {
             );
             assert_eq!(failure.foreign_module(), None);
             assert!(matches!(
-                FileApi::open(&ndi, &explicit(PathBuf::from(FILE_LIBRARY))),
+                FileApi::new(&ndi, &explicit(PathBuf::from(FILE_LIBRARY))),
                 Err(Error::InvalidInput(_))
             ));
-            FileApi::open(&ndi, &explicit(selected.clone())).unwrap();
+            FileApi::new(&ndi, &explicit(selected.clone())).unwrap();
 
             // Dropping every handle unloads nothing, so entry points held by
             // anything still running stay valid, and the selection stands.
@@ -319,13 +323,13 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert!(!Ndi::is_running());
             assert!(is_loaded(selected.to_str().unwrap()));
             let ndi = select(fixtures, &PAIRED);
-            let api = FileApi::open(&ndi, &defaults).unwrap();
+            let api = FileApi::new(&ndi, &defaults).unwrap();
             assert_eq!(api.library_path(), Some(selected.as_path()));
             assert_eq!(bound_runtime(&api), PAIRED.build);
         }
         "runtime_directory_when_not_beside_the_runtime" => {
             let ndi = select(fixtures, &BARE);
-            let api = FileApi::open(&ndi, &defaults).unwrap();
+            let api = FileApi::new(&ndi, &defaults).unwrap();
             assert_eq!(api.library_path(), Some(fixtures.file("runtime").as_path()));
             // It has no runtime beside it: the loader bound it to the selected
             // one, which is already loaded under the name it asks for.
@@ -339,7 +343,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             )
             .unwrap();
             // A File library that exists and would load.
-            let reason = conflicting(FileApi::open(
+            let reason = conflicting(FileApi::new(
                 &ndi,
                 &explicit(fixtures.file(PAIRED.directory)),
             ));
@@ -355,7 +359,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             // library's dependency is satisfied by the runtime beside it.
             let ndi = select(fixtures, &UNNAMED);
             let foreign = fixtures.file(OTHER.directory);
-            let reason = unavailable(FileApi::open(&ndi, &explicit(foreign.clone())));
+            let reason = unavailable(FileApi::new(&ndi, &explicit(foreign.clone())));
             assert!(reason.loaded_any());
             assert_eq!(reason.attempts().len(), 1);
             let attempt = &reason.attempts()[0];
@@ -363,7 +367,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert_eq!(attempt.location(), foreign);
             assert_eq!(attempt.refusal(), &LoadRefusal::BoundToAnotherRuntime);
             // Nothing was selected, so the right library can still be.
-            let api = FileApi::open(&ndi, &defaults).unwrap();
+            let api = FileApi::new(&ndi, &defaults).unwrap();
             assert_eq!(
                 api.library_path(),
                 Some(fixtures.file(UNNAMED.directory).as_path())
@@ -387,10 +391,10 @@ fn child(name: &str, fixtures: &Fixtures) {
             }
             let requested = fixtures.file(PAIRED.directory);
             for explicit_path in [None, Some(requested.as_path())] {
-                let options = explicit_path.map_or_else(FileRuntimeOptions::default, |path| {
-                    FileRuntimeOptions::default().library_path(path)
+                let options = explicit_path.map_or_else(FileApiOptions::default, |path| {
+                    FileApiOptions::default().library_path(path)
                 });
-                let Err(Error::RuntimeConflict(failure)) = FileApi::open(&ndi, &options) else {
+                let Err(Error::RuntimeConflict(failure)) = FileApi::new(&ndi, &options) else {
                     panic!("expected a foreign runtime conflict before opening the File library");
                 };
                 assert_eq!(failure.kind(), SelectionConflict::ForeignRuntimeInScope);
@@ -423,14 +427,14 @@ fn child(name: &str, fixtures: &Fixtures) {
         }
         "the_preloaded_selected_runtime_can_load_its_file_library" => {
             let ndi = select(fixtures, &PAIRED);
-            let api = FileApi::open(&ndi, &defaults).unwrap();
+            let api = FileApi::new(&ndi, &defaults).unwrap();
             assert_eq!(bound_runtime(&api), PAIRED.build);
         }
         "failure_names_every_location" => {
             // No File library can bind to this runtime, so the outcome does
             // not depend on what the machine has installed.
             let ndi = select(fixtures, &LONELY);
-            let reason = unavailable(FileApi::open(&ndi, &defaults));
+            let reason = unavailable(FileApi::new(&ndi, &defaults));
             let beside_executable = std::env::current_exe()
                 .unwrap()
                 .with_file_name(FILE_LIBRARY);
@@ -447,27 +451,30 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert_eq!(attempts[2].location(), Path::new(FILE_LIBRARY));
             assert_eq!(attempts[2].origin(), LoadOrigin::LoaderSearch);
             // A failed search leaves selection open: it fails the same way again.
-            unavailable(FileApi::open(&ndi, &defaults));
+            unavailable(FileApi::new(&ndi, &defaults));
         }
         "incomplete_family_is_unavailable_alone" => {
             let ndi = select(fixtures, &PAIRED);
             // A library that lacks one family is selected for the other.
-            let api = FileApi::open(&ndi, &explicit(fixtures.file("partial"))).unwrap();
+            let api = FileApi::new(&ndi, &explicit(fixtures.file("partial"))).unwrap();
             assert_eq!(
                 (api.status(FileFamily::Recording)).reason(),
                 Some(CapabilityUnavailable::SymbolUnavailable)
             );
             assert!(api.supports(FileFamily::Playback));
-            let options = RecorderOptions::new(SourceSpec::new("a source").unwrap());
-            match api.create_recorder(&options) {
-                Err(Error::FileFamilyUnavailable { family, missing }) => {
+            let options = FileRecorderOptions::new(SourceSpec::new("a source").unwrap());
+            match grafton_ndi::file::FileRecorder::new(&api, &options) {
+                Err(Error::UnsupportedCapability {
+                    capability: grafton_ndi::Capability::File(family),
+                    refusal: grafton_ndi::CapabilityRefusal::SymbolUnavailable(missing),
+                }) => {
                     assert_eq!(family, FileFamily::Recording);
                     assert_eq!(missing, c"NDIlib_file_recorder_rollover");
                 }
                 other => panic!("expected recording to be unavailable: {other:?}"),
             }
             // The library stays selected, and the family stays unavailable.
-            let reopened = FileApi::open(&ndi, &defaults).unwrap();
+            let reopened = FileApi::new(&ndi, &defaults).unwrap();
             assert_eq!(
                 reopened.library_path(),
                 Some(fixtures.file("partial").as_path())
@@ -476,7 +483,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             // Playback is complete in this library and still reaches it.
             assert_eq!(bound_runtime(&api), PAIRED.build);
             assert!(matches!(
-                api.create_player(&PlayerOptions::new("a player")),
+                grafton_ndi::file::FilePlayer::new(&api, &FilePlayerOptions::new("a player")),
                 Err(Error::NativeOperationFailed { .. })
             ));
         }

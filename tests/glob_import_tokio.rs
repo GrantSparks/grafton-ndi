@@ -1,18 +1,157 @@
-//! `use grafton_ndi::*` must not hide the `tokio` crate: the crate root
-//! exports no item named `tokio`, so the glob import and `use tokio::...`
-//! resolve without ambiguity.
+//! A root glob import must coexist with common external crate names.
+//!
+//! The generated consumer supplies real external crates named `image`, `tokio`
+//! and `smol`. Its unqualified imports must resolve without explicit aliases
+//! that could hide an ambiguous root export.
 
-#![cfg(feature = "tokio")]
+#[path = "support/fixture.rs"]
+mod fixture;
 
+#[cfg(feature = "tokio")]
 use grafton_ndi::*;
+#[cfg(feature = "tokio")]
 use tokio::runtime::Builder;
 
+#[cfg(feature = "tokio")]
 #[test]
 fn glob_import_leaves_the_tokio_crate_nameable() {
     let runtime = Builder::new_current_thread().build().unwrap();
     assert_eq!(runtime.block_on(async { 1 + 1 }), 2);
-    // An item from the glob import is still usable.
     assert_eq!(PixelFormat::Bgra, PixelFormat::Bgra);
-    // The async receiver is reached through its module path.
     let _ = std::mem::size_of::<asynchronous::tokio::AsyncReceiver>();
+}
+
+#[test]
+fn root_glob_import_keeps_external_crates_unambiguous() {
+    use std::{fs, path::PathBuf, process::Command};
+
+    let directory = fixture::FixtureDir::create("glob-import");
+    let root = directory.path();
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dependency_path = manifest
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let features = [
+        (cfg!(feature = "advanced"), "advanced"),
+        (cfg!(feature = "file-io"), "file-io"),
+        (cfg!(feature = "image-encoding"), "image-encoding"),
+        (cfg!(feature = "tokio"), "tokio"),
+        (cfg!(feature = "smol"), "smol"),
+    ]
+    .into_iter()
+    .filter(|(enabled, _)| *enabled)
+    .map(|(_, feature)| format!("\"{feature}\""))
+    .collect::<Vec<_>>()
+    .join(", ");
+    let dependency = format!(
+        "{{ path = \"{dependency_path}\", default-features = false, features = [{features}] }}"
+    );
+
+    let mut members = vec!["valid".to_string()];
+    for name in ["image", "tokio", "smol"] {
+        let external = root.join(format!("external-{name}"));
+        fs::create_dir_all(external.join("src")).unwrap();
+        fs::write(
+            external.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+        fs::write(external.join("src/lib.rs"), "pub const EXTERNAL: u8 = 1;\n").unwrap();
+        members.push(format!("external-{name}"));
+
+        let shadow = root.join(format!("shadow-{name}"));
+        fs::create_dir_all(shadow.join("src")).unwrap();
+        fs::write(
+            shadow.join("Cargo.toml"),
+            format!("[package]\nname = \"shadow-{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[dependencies]\nimplementation = {{ package = \"grafton-ndi\", {}\n", &dependency[1..]),
+        )
+        .unwrap();
+        fs::write(
+            shadow.join("src/lib.rs"),
+            format!(
+                "pub use implementation::*;\npub mod {name} {{ pub const EXTERNAL: u8 = 2; }}\n"
+            ),
+        )
+        .unwrap();
+        members.push(format!("shadow-{name}"));
+        members.push(format!("bad-{name}"));
+    }
+    for name in ["valid", "bad-image", "bad-tokio", "bad-smol"] {
+        let consumer = root.join(name);
+        fs::create_dir_all(consumer.join("src")).unwrap();
+        let api = if name == "valid" {
+            format!("grafton-ndi = {dependency}")
+        } else {
+            let shadow = name.strip_prefix("bad-").unwrap();
+            format!(
+                "grafton-ndi = {{ package = \"shadow-{shadow}\", path = \"../shadow-{shadow}\" }}"
+            )
+        };
+        fs::write(
+            consumer.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[dependencies]\n{api}\nimage = {{ path = \"../external-image\" }}\ntokio = {{ path = \"../external-tokio\" }}\nsmol = {{ path = \"../external-smol\" }}\n"),
+        )
+        .unwrap();
+        fs::write(
+            consumer.join("src/main.rs"),
+            "use grafton_ndi::*;\nuse image::EXTERNAL as IMAGE;\nuse tokio::EXTERNAL as TOKIO;\nuse smol::EXTERNAL as SMOL;\nfn main() { let _ = (PixelFormat::Bgra, IMAGE, TOKIO, SMOL); }\n",
+        )
+        .unwrap();
+    }
+    let members = members
+        .into_iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[workspace]\nresolver = \"2\"\nmembers = [{members}]\n"),
+    )
+    .unwrap();
+    fs::copy(manifest.join("Cargo.lock"), root.join("Cargo.lock")).unwrap();
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                manifest.join(path)
+            }
+        })
+        .unwrap_or_else(|| manifest.join("target"))
+        .join("glob-import");
+    for name in ["valid", "bad-image", "bad-tokio", "bad-smol"] {
+        let output = Command::new(env!("CARGO"))
+            .current_dir(root)
+            .env("CARGO_TARGET_DIR", &target)
+            .env("CARGO_BUILD_JOBS", "1")
+            .env("CARGO_TERM_COLOR", "never")
+            .args([
+                "check",
+                "--offline",
+                "--package",
+                name,
+                "--target",
+                env!("GRAFTON_NDI_TARGET"),
+            ])
+            .output()
+            .expect("compile the glob import consumer");
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        if name == "valid" {
+            assert!(
+                output.status.success(),
+                "external crate names became ambiguous:\n{diagnostics}"
+            );
+        } else {
+            assert!(
+                !output.status.success(),
+                "the fixture accepted an ambiguous root export: {name}"
+            );
+            assert!(
+                diagnostics.contains("E0659"),
+                "the fixture failed for a different reason:\n{diagnostics}"
+            );
+        }
+    }
 }

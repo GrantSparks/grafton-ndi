@@ -378,13 +378,13 @@ fn test_timeout_duration_calculation() {
 fn test_source_address_contains_host() {
     use crate::finder::SourceAddress;
 
-    let ip_addr = SourceAddress::new("192.168.1.100:5960".to_string());
+    let ip_addr = SourceAddress::new("192.168.1.100:5960".to_string()).unwrap();
     assert!(ip_addr.matches_host("192.168.1.100"));
     assert!(!ip_addr.matches_host("192.168.1"));
     assert!(!ip_addr.matches_host("5960"));
     assert!(!ip_addr.matches_host("192.168.2"));
 
-    let url_addr = SourceAddress::new("http://camera.local:8080".to_string());
+    let url_addr = SourceAddress::new("http://camera.local:8080".to_string()).unwrap();
     assert!(url_addr.matches_host("camera.local"));
     assert!(!url_addr.matches_host("camera"));
     assert!(!url_addr.matches_host("8080"));
@@ -396,29 +396,29 @@ fn test_source_address_contains_host() {
 fn test_source_address_port() {
     use crate::finder::SourceAddress;
 
-    let ip_with_port = SourceAddress::new("192.168.1.100:5960".to_string());
+    let ip_with_port = SourceAddress::new("192.168.1.100:5960".to_string()).unwrap();
     assert_eq!(ip_with_port.port(), Some(5960));
 
-    let ip_no_port = SourceAddress::new("192.168.1.100".to_string());
+    let ip_no_port = SourceAddress::new("192.168.1.100".to_string()).unwrap();
     assert_eq!(ip_no_port.port(), None);
 
-    let url_with_port = SourceAddress::new("http://camera.local:8080".to_string());
+    let url_with_port = SourceAddress::new("http://camera.local:8080".to_string()).unwrap();
     assert_eq!(url_with_port.port(), Some(8080));
 
-    let url_with_path = SourceAddress::new("http://camera.local:8080/stream".to_string());
+    let url_with_path = SourceAddress::new("http://camera.local:8080/stream".to_string()).unwrap();
     assert_eq!(url_with_path.port(), Some(8080));
 
-    let url_no_port = SourceAddress::new("http://camera.local".to_string());
+    let url_no_port = SourceAddress::new("http://camera.local".to_string()).unwrap();
     assert_eq!(url_no_port.port(), None);
 
-    let url_scheme_only = SourceAddress::new("http://camera.local/stream".to_string());
+    let url_scheme_only = SourceAddress::new("http://camera.local/stream".to_string()).unwrap();
     assert_eq!(url_scheme_only.port(), None);
 
     // An unbracketed IPv6 literal has no explicit port delimiter.
-    let ipv6_literal = SourceAddress::new("fe80::1:5960".to_string());
+    let ipv6_literal = SourceAddress::new("fe80::1:5960".to_string()).unwrap();
     assert_eq!(ipv6_literal.port(), None);
 
-    let ipv6_with_port = SourceAddress::new("[fe80::1]:5960".to_string());
+    let ipv6_with_port = SourceAddress::new("[fe80::1]:5960".to_string()).unwrap();
     assert_eq!(ipv6_with_port.port(), Some(5960));
 }
 
@@ -427,7 +427,8 @@ fn test_source_matches_host() {
     use crate::finder::{Source, SourceAddress};
 
     let source = Source::new("CAMERA1 (Chan1)")
-        .with_address(SourceAddress::new("192.168.0.107:5960".to_string()));
+        .unwrap()
+        .with_address(SourceAddress::new("192.168.0.107:5960".to_string()).unwrap());
     assert!(source.matches_host("192.168.0.107"));
     assert!(!source.matches_host("192.168.0"));
     assert!(!source.matches_host("192.168.1"));
@@ -437,12 +438,13 @@ fn test_source_matches_host() {
     assert!(!source.matches_host("CAMERA2"));
 
     let url_source = Source::new("Studio Camera")
-        .with_address(SourceAddress::new("http://studio.local:8080".to_string()));
+        .unwrap()
+        .with_address(SourceAddress::new("http://studio.local:8080".to_string()).unwrap());
     assert!(url_source.matches_host("studio.local"));
     assert!(!url_source.matches_host("Studio"));
     assert!(!url_source.matches_host("other"));
 
-    let no_addr_source = Source::new("Local Source");
+    let no_addr_source = Source::new("Local Source").unwrap();
     assert!(!no_addr_source.matches_host("Local"));
     assert!(!no_addr_source.matches_host("192.168.1.1"));
 }
@@ -451,28 +453,32 @@ fn test_source_matches_host() {
 fn test_source_host() {
     use crate::finder::{Source, SourceAddress};
 
-    let ip_source =
-        Source::new("CAMERA1").with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
+    let ip_source = Source::new("CAMERA1")
+        .unwrap()
+        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()).unwrap());
     assert_eq!(ip_source.host(), Some("192.168.1.100"));
 
-    let ip_no_port =
-        Source::new("CAMERA2").with_address(SourceAddress::new("192.168.1.101".to_string()));
+    let ip_no_port = Source::new("CAMERA2")
+        .unwrap()
+        .with_address(SourceAddress::new("192.168.1.101".to_string()).unwrap());
     assert_eq!(ip_no_port.host(), Some("192.168.1.101"));
 
     let url_source = Source::new("Studio")
-        .with_address(SourceAddress::new("http://camera.local:8080".to_string()));
+        .unwrap()
+        .with_address(SourceAddress::new("http://camera.local:8080".to_string()).unwrap());
     assert_eq!(url_source.host(), Some("camera.local"));
 
-    let url_with_path = Source::new("Studio2").with_address(SourceAddress::new(
-        "http://camera.local:8080/stream".to_string(),
-    ));
+    let url_with_path = Source::new("Studio2")
+        .unwrap()
+        .with_address(SourceAddress::new("http://camera.local:8080/stream".to_string()).unwrap());
     assert_eq!(url_with_path.host(), Some("camera.local"));
 
-    let url_no_scheme =
-        Source::new("Studio3").with_address(SourceAddress::new("camera.local:8080".to_string()));
+    let url_no_scheme = Source::new("Studio3")
+        .unwrap()
+        .with_address(SourceAddress::new("camera.local:8080".to_string()).unwrap());
     assert_eq!(url_no_scheme.host(), Some("camera.local"));
 
-    let none_source = Source::new("None");
+    let none_source = Source::new("None").unwrap();
     assert_eq!(none_source.host(), None);
 }
 
@@ -481,7 +487,8 @@ fn test_source_matching_real_world_example() {
     use crate::finder::{Source, SourceAddress};
 
     let source = Source::new("CAMERA1 (Chan1, 192.168.0.107)")
-        .with_address(SourceAddress::new("192.168.0.107:5960".to_string()));
+        .unwrap()
+        .with_address(SourceAddress::new("192.168.0.107:5960".to_string()).unwrap());
 
     assert!(source.matches_host("192.168.0.107"));
     assert!(!source.matches_host("192.168.0"));
@@ -499,7 +506,8 @@ fn test_receiver_snapshot_preset() {
     };
 
     let source = Source::new("Test Source")
-        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
+        .unwrap()
+        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()).unwrap());
 
     let customized = ReceiverOptions::snapshot_preset(source.clone()).name("My Snapshot Receiver");
     let _ = format!("{customized:?}");
@@ -513,7 +521,8 @@ fn test_receiver_high_quality_preset() {
     };
 
     let source = Source::new("Test Source")
-        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
+        .unwrap()
+        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()).unwrap());
 
     let customized = ReceiverOptions::high_quality_preset(source.clone()).name("My HQ Receiver");
     let _ = format!("{customized:?}");
@@ -527,7 +536,8 @@ fn test_receiver_monitoring_preset() {
     };
 
     let source = Source::new("Test Source")
-        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
+        .unwrap()
+        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()).unwrap());
 
     let customized = ReceiverOptions::monitoring_preset(source.clone()).name("My Monitor");
     let _ = format!("{customized:?}");
@@ -541,7 +551,8 @@ fn test_receiver_presets_are_distinct() {
     };
 
     let source = Source::new("Test Source")
-        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()));
+        .unwrap()
+        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()).unwrap());
 
     let _snapshot = ReceiverOptions::snapshot_preset(source.clone());
     let _hq = ReceiverOptions::high_quality_preset(source.clone());
@@ -572,7 +583,7 @@ fn test_tokio_async_receiver_creation() {
         use crate::asynchronous::tokio::AsyncReceiver;
 
         // Mock receiver (won't actually work without NDI initialized)
-        let source = Source::new("Test");
+        let source = Source::new("Test").unwrap();
 
         // This won't run but proves the API compiles
         if false {
@@ -601,7 +612,7 @@ fn test_tokio_async_receiver_methods_exist() {
 
     // Test that all methods exist and can be called (in a closure that won't execute)
     let _ = || async {
-        let source = Source::new("Test");
+        let source = Source::new("Test").unwrap();
 
         if false {
             use std::sync::Arc;
@@ -612,24 +623,22 @@ fn test_tokio_async_receiver_methods_exist() {
 
             // All these methods should exist and be callable
             let _ = async_receiver
-                .video()
-                .capture(std::time::Duration::from_secs(5))
+                .capture_video(std::time::Duration::from_secs(5))
                 .await;
 
             let _ = async_receiver
-                .audio()
-                .capture(std::time::Duration::from_secs(5))
+                .capture_audio(std::time::Duration::from_secs(5))
                 .await;
 
             let _ = async_receiver
-                .metadata()
-                .capture(std::time::Duration::from_secs(5))
+                .capture_metadata(std::time::Duration::from_secs(5))
                 .await;
 
             // Liveness / recovery primitives (Issue #997).
-            let _: bool = async_receiver.is_connected();
-            let _stats = async_receiver.connection_stats().unwrap();
+            let _: bool = async_receiver.receiver().is_connected();
+            let _stats = async_receiver.receiver().connection_stats().unwrap();
             let _: u64 = async_receiver
+                .receiver()
                 .connection_stats()
                 .unwrap()
                 .video_frames_received();
@@ -652,7 +661,7 @@ fn test_smol_async_receiver_creation() {
     let _ = || {
         use crate::asynchronous::smol::AsyncReceiver;
 
-        let source = Source::new("Test");
+        let source = Source::new("Test").unwrap();
 
         // This won't run but proves the API compiles
         if false {
@@ -680,7 +689,7 @@ fn test_smol_async_receiver_methods_exist() {
 
     // Test that all methods exist and can be called (in a closure that won't execute)
     let _ = || async {
-        let source = Source::new("Test");
+        let source = Source::new("Test").unwrap();
 
         if false {
             use std::sync::Arc;
@@ -691,24 +700,22 @@ fn test_smol_async_receiver_methods_exist() {
 
             // All these methods should exist and be callable
             let _ = async_receiver
-                .video()
-                .capture(std::time::Duration::from_secs(5))
+                .capture_video(std::time::Duration::from_secs(5))
                 .await;
 
             let _ = async_receiver
-                .audio()
-                .capture(std::time::Duration::from_secs(5))
+                .capture_audio(std::time::Duration::from_secs(5))
                 .await;
 
             let _ = async_receiver
-                .metadata()
-                .capture(std::time::Duration::from_secs(5))
+                .capture_metadata(std::time::Duration::from_secs(5))
                 .await;
 
             // Liveness / recovery primitives (Issue #997).
-            let _: bool = async_receiver.is_connected();
-            let _stats = async_receiver.connection_stats().unwrap();
+            let _: bool = async_receiver.receiver().is_connected();
+            let _stats = async_receiver.receiver().connection_stats().unwrap();
             let _: u64 = async_receiver
+                .receiver()
                 .connection_stats()
                 .unwrap()
                 .video_frames_received();

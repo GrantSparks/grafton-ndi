@@ -16,7 +16,8 @@ use std::{process::Command, time::Duration};
 fn malformed_per_frame_metadata_preserves_typed_mixed_and_async_media() {
     if let Some(library) = std::env::var_os("GRAFTON_METADATA_BOUNDARY_CHILD") {
         let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("fixture"))).unwrap();
+        let receiver =
+            Receiver::new(&ndi, &ReceiverOptions::new(Source::new("fixture").unwrap())).unwrap();
         synchronous(&receiver);
         #[cfg(feature = "tokio")]
         ::tokio::runtime::Builder::new_current_thread()
@@ -24,8 +25,11 @@ fn malformed_per_frame_metadata_preserves_typed_mixed_and_async_media() {
             .unwrap()
             .block_on(asynchronous(
                 grafton_ndi::asynchronous::tokio::AsyncReceiver::new(
-                    Receiver::new(&ndi, &ReceiverOptions::new(Source::new("tokio fixture")))
-                        .unwrap(),
+                    Receiver::new(
+                        &ndi,
+                        &ReceiverOptions::new(Source::new("tokio fixture").unwrap()),
+                    )
+                    .unwrap(),
                 ),
                 100,
             ));
@@ -104,7 +108,8 @@ fn video(frame: &impl VideoSource, status: FrameMetadataStatus) {
     #[cfg(feature = "image-encoding")]
     {
         use grafton_ndi::{
-            ColorPolicy, ImageFormat, ImageOptions, ImageWorkspace, YuvMatrix, YuvRange,
+            image_encoding::{ColorPolicy, ImageFormat, ImageOptions, ImageWorkspace, YuvRange},
+            YuvMatrix,
         };
         let defaults = ImageOptions::new(ImageFormat::Png);
         let mut workspace = ImageWorkspace::new();
@@ -119,7 +124,7 @@ fn video(frame: &impl VideoSource, status: FrameMetadataStatus) {
         ));
         assert!(output.is_empty());
         assert!(matches!(
-            owned.encode_png(),
+            workspace.encode_data_url(frame, &defaults),
             Err(grafton_ndi::Error::InvalidFrame(_))
         ));
         assert!(matches!(
@@ -160,19 +165,11 @@ fn synchronous(receiver: &Receiver) {
     for (index, (kind, status)) in cases().into_iter().enumerate() {
         script(index * 4, kind);
         if kind.starts_with("video") {
-            let frame = receiver
-                .video()
-                .capture_ref(Duration::ZERO)
-                .unwrap()
-                .unwrap();
+            let frame = receiver.capture_video_ref(Duration::ZERO).unwrap().unwrap();
             video(&frame, status);
             video(&frame.to_owned(), status);
         } else {
-            let frame = receiver
-                .audio()
-                .capture_ref(Duration::ZERO)
-                .unwrap()
-                .unwrap();
+            let frame = receiver.capture_audio_ref(Duration::ZERO).unwrap().unwrap();
             audio(&frame, status);
             audio(&frame.to_owned(), status);
         }
@@ -185,12 +182,12 @@ fn synchronous(receiver: &Receiver) {
         script(index * 4 + 2, kind);
         if kind.starts_with("video") {
             video(
-                &receiver.video().capture(Duration::ZERO).unwrap().unwrap(),
+                &receiver.capture_video(Duration::ZERO).unwrap().unwrap(),
                 status,
             );
         } else {
             audio(
-                &receiver.audio().capture(Duration::ZERO).unwrap().unwrap(),
+                &receiver.capture_audio(Duration::ZERO).unwrap().unwrap(),
                 status,
             );
         }
@@ -213,8 +210,7 @@ async fn asynchronous<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
         if kind.starts_with("video") {
             assert_eq!(
                 receiver
-                    .video()
-                    .capture_with(Duration::ZERO, move |frame| video(frame, status))
+                    .capture_video_with(Duration::ZERO, move |frame| video(frame, status))
                     .await
                     .unwrap(),
                 Some(())
@@ -222,8 +218,7 @@ async fn asynchronous<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
         } else {
             assert_eq!(
                 receiver
-                    .audio()
-                    .capture_with(Duration::ZERO, move |frame| audio(frame, status))
+                    .capture_audio_with(Duration::ZERO, move |frame| audio(frame, status))
                     .await
                     .unwrap(),
                 Some(())
@@ -245,8 +240,7 @@ async fn asynchronous<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
         if kind.starts_with("video") {
             video(
                 &receiver
-                    .video()
-                    .capture(Duration::ZERO)
+                    .capture_video(Duration::ZERO)
                     .await
                     .unwrap()
                     .unwrap(),
@@ -255,8 +249,7 @@ async fn asynchronous<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
         } else {
             audio(
                 &receiver
-                    .audio()
-                    .capture(Duration::ZERO)
+                    .capture_audio(Duration::ZERO)
                     .await
                     .unwrap()
                     .unwrap(),

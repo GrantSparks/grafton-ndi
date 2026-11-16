@@ -26,7 +26,7 @@ use super::{
 #[cfg(ndi_link_static)]
 use crate::LoadFailure;
 use crate::{
-    capabilities::{CapabilityRefusal, CapabilityStatus},
+    capabilities::{Capability, CapabilityRefusal, CapabilityStatus},
     file::FileFamily,
     Error, LibraryKind, LoadRefusal, Result, SelectionFailure,
 };
@@ -213,15 +213,15 @@ impl FileRuntime {
     ///
     /// # Errors
     ///
-    /// [`Error::FileFamilyUnavailable`] with the family and the first
+    /// [`Error::UnsupportedCapability`] with the family and the first
     /// entry point the library does not export, exactly when
     /// [`Self::status`] reports the family unavailable.
     pub(crate) fn table<T: FileTable>(&self) -> Result<&T> {
         T::resolved(self)
             .as_ref()
-            .map_err(|symbol| Error::FileFamilyUnavailable {
-                family: T::FAMILY,
-                missing: symbol,
+            .map_err(|symbol| Error::UnsupportedCapability {
+                capability: Capability::File(T::FAMILY),
+                refusal: CapabilityRefusal::SymbolUnavailable(symbol),
             })
     }
 
@@ -388,7 +388,10 @@ mod tests {
     fn refusal<T>(result: Result<T>) -> Option<(FileFamily, &'static CStr)> {
         match result {
             Ok(_) => None,
-            Err(Error::FileFamilyUnavailable { family, missing }) => Some((family, missing)),
+            Err(Error::UnsupportedCapability {
+                capability: Capability::File(family),
+                refusal: CapabilityRefusal::SymbolUnavailable(missing),
+            }) => Some((family, missing)),
             Err(other) => panic!("unexpected error: {other}"),
         }
     }

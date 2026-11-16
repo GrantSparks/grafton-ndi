@@ -196,7 +196,9 @@ fn different_sdk_versions_exchange_video_audio_and_metadata() {
     let receiver = Receiver::new(
         &ndi,
         &ReceiverOptions::new(
-            Source::new(name.to_owned()).with_address(SourceAddress::new(address.to_owned())),
+            Source::new(name.to_owned())
+                .unwrap()
+                .with_address(SourceAddress::new(address.to_owned()).unwrap()),
         )
         .color_format(ReceiverColorFormat::BgrxBgra),
     )
@@ -208,7 +210,7 @@ fn different_sdk_versions_exchange_video_audio_and_metadata() {
             Instant::now() < deadline,
             "cross-SDK delivery: video={video}, audio={audio}, metadata={metadata}"
         );
-        if let Some(frame) = receiver.video().capture(Duration::from_millis(20)).unwrap() {
+        if let Some(frame) = receiver.capture_video(Duration::from_millis(20)).unwrap() {
             assert_eq!((frame.width(), frame.height()), (64, 32));
             assert!(matches!(
                 frame.pixel_format(),
@@ -225,7 +227,7 @@ fn different_sdk_versions_exchange_video_audio_and_metadata() {
                 .all(|(&actual, expected)| actual.abs_diff(expected) <= 8)));
             video = true;
         }
-        if let Some(frame) = receiver.audio().capture(Duration::from_millis(20)).unwrap() {
+        if let Some(frame) = receiver.capture_audio(Duration::from_millis(20)).unwrap() {
             assert_eq!((frame.sample_rate(), frame.num_channels()), (48_000, 2));
             assert_eq!(frame.timecode(), TIMECODE);
             assert!(!frame.data().is_empty());
@@ -236,8 +238,7 @@ fn different_sdk_versions_exchange_video_audio_and_metadata() {
             audio = true;
         }
         if let Some(frame) = receiver
-            .metadata()
-            .capture(Duration::from_millis(20))
+            .capture_metadata(Duration::from_millis(20))
             .unwrap()
         {
             if frame.data() == METADATA {

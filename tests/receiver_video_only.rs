@@ -61,10 +61,9 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
             sender.send_video(&video).unwrap();
             sender.send_audio(&audio);
             ordinary_audio +=
-                usize::from(ordinary.audio().capture(Duration::ZERO).unwrap().is_some());
+                usize::from(ordinary.capture_audio(Duration::ZERO).unwrap().is_some());
             if receiver
-                .video()
-                .capture(Duration::from_millis(20))
+                .capture_video(Duration::from_millis(20))
                 .unwrap()
                 .is_some()
             {
@@ -72,7 +71,7 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
                 connected_since.get_or_insert_with(Instant::now);
             }
             assert!(
-                receiver.audio().capture(Duration::ZERO).unwrap().is_none(),
+                receiver.capture_audio(Duration::ZERO).unwrap().is_none(),
                 "{bandwidth:?} delivered audio"
             );
             if videos >= 10
@@ -93,7 +92,7 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
                 receiver.connection_target(),
                 receiver.connection_stats().unwrap(),
                 ordinary.connection_stats().unwrap(),
-                sender.connection_count(Duration::ZERO),
+                sender.connection_count(),
                 common::port_of(&receiver.connection_target())
                     .and_then(common::socket_table)
                     .map_or_else(String::new, |table| format!("\n{table}"))

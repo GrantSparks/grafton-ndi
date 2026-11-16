@@ -10,18 +10,19 @@ grafton-ndi = { version = "3.0", features = ["image-encoding"] }
 
 ## Encoding a frame
 
-Run the [`NDIlib_Recv_PNG` example](../examples/NDIlib_Recv_PNG.rs) with a source
+Run the [`receive_png` example](../examples/receive_png.rs) with a source
 visible on your network:
 
 ```sh
-cargo run --example NDIlib_Recv_PNG --features image-encoding -- --output snapshot.png
+cargo run --example receive_png --features image-encoding -- --output snapshot.png
 ```
 
 It selects the first discovered source, captures one frame and writes
 `snapshot.png`. Use `ImageOptions::new(format)` with a frame's `encode_image`
 to allocate a `Vec<u8>`, `encode_image_to` to write to an `io::Write`, or
-`encode_image_data_url` for a base64 URL. `encode_png` and `encode_jpeg` are
-conveniences. See [`ImageOptions`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/struct.ImageOptions.html)
+`encode_image_data_url` for a base64 URL. Import options and formats through
+`grafton_ndi::image_encoding`. The same encoding surface is available to generic
+`VideoSource` code. See [`ImageOptions`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/image_encoding/struct.ImageOptions.html)
 for compile-checked examples and exact option/error contracts.
 
 All frame and option validation occurs before writing. A later codec or writer
@@ -31,7 +32,8 @@ capacity is useful. For files or sockets, consider `BufWriter` for the codecs
 that write incrementally.
 
 For repeated snapshots, `ImageWorkspace::new()` provides `encode(&frame,
-&options)` and `encode_to(&frame, &options, &mut output)`. It retains conversion
+&options)`, `encode_to(&frame, &options, &mut output)` and
+`encode_data_url(&frame, &options)`. It retains conversion
 scratch across calls, including WebP's whole converted image, PNG rows and
 downscale sums. `retained_bytes()` reports wrapper capacity; `release()` frees
 it. Use a separate workspace for each concurrent worker. Codec allocations
@@ -121,7 +123,7 @@ explicitly if that is what the consumer needs.
 
 The encoder writes a `cICP` color tag for BT.2020 primaries or PQ/HLG transfer
 metadata. It leaves BT.601/BT.709 SDR and untagged inputs without that chunk.
-See [`HdrPolicy`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/enum.HdrPolicy.html)
+See [`HdrPolicy`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/image_encoding/enum.HdrPolicy.html)
 for the code-value contract.
 
 ## Reducing an image
@@ -152,7 +154,7 @@ Inspect the method's `Result`: invalid quality, effort or depth settings return
 `InvalidInput`; malformed color descriptions, HDR refusal, excessive dimensions
 or codec failures return `InvalidFrame`; write and flush failures retain their
 original `Io` error. A successful writer encode has written every byte and
-flushed the writer. The [API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/struct.ImageOptions.html#errors)
+flushed the writer. The [API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/image_encoding/struct.ImageOptions.html#errors)
 lists the complete option rules.
 
 ## Thumbnails from a recording
@@ -162,7 +164,7 @@ into a private NDI group, seeks to spaced positions and writes quarter-size
 JPEGs. It requires exactly one video track: with program and proxy tracks, the
 6.4 File player's `FirstFrame` timecode can fail to match the received video.
 The [`file_record` example](../examples/file_record.rs) uses
-`RecorderOptions::proxy(false)` to produce suitable recordings.
+`FileRecorderOptions::proxy(false)` to produce suitable recordings.
 
 The receiver connects before playback starts. Video and events are drained
 together; playback pauses at `FirstFrame` while the receiver catches up and

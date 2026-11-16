@@ -57,7 +57,7 @@ fn inspect_video(source: &(impl VideoSource + ?Sized)) {
     assert_eq!(source.pixel_format(), PixelFormat::Bgra);
     assert_eq!(source.frame_rate(), FrameRate::new(25, 1).unwrap());
     assert_eq!(source.scan_type(), ScanType::Progressive);
-    assert_eq!(source.picture_aspect_ratio(), 0.0);
+    assert_eq!(source.picture_aspect_ratio().get(), 0.0);
     assert_eq!(source.timecode(), Timecode::from_ticks(456));
     assert_eq!(source.timestamp(), None);
     assert_eq!(source.metadata(), Some("<video/>"));

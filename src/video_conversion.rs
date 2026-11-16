@@ -261,6 +261,14 @@ pub struct VideoConverter {
     conversion: &'static sys::VideoConversion,
 }
 
+impl std::fmt::Debug for VideoConverter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoConverter")
+            .field("runtime", self._ndi.info())
+            .finish_non_exhaustive()
+    }
+}
+
 impl VideoConverter {
     /// Resolve both native utility functions from one initialized runtime.
     ///
@@ -287,6 +295,7 @@ impl VideoConverter {
     /// [`Error::InvalidFrame`] when `destination` is not a P216 frame of the
     /// layout's dimensions, or `source` is shorter than the layout's storage.
     /// `destination` is then unchanged.
+    #[doc(alias = "NDIlib_util_V210_to_P216")]
     pub fn v210_to_p216(
         &self,
         layout: V210Layout,
@@ -331,6 +340,7 @@ impl VideoConverter {
     /// [`Error::InvalidFrame`] when `source` is not a P216 frame of the
     /// layout's dimensions, or `destination` is shorter than the layout's
     /// storage. `destination` is then unchanged.
+    #[doc(alias = "NDIlib_util_P216_to_V210")]
     pub fn p216_to_v210(
         &self,
         source: &(impl VideoSource + ?Sized),
@@ -654,11 +664,7 @@ mod tests {
 
     #[test]
     fn strided_borrowed_and_captured_p216_convert_without_pixel_copies() {
-        use crate::{
-            capture::{FrameSyncVideoFree, Guard, VideoKind},
-            frames::VideoRef,
-            BorrowedVideoFrame,
-        };
+        use crate::{capture::Guard, BorrowedVideoFrame, FrameSyncVideoRef, VideoFrameRef};
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
@@ -688,15 +694,11 @@ mod tests {
                     // SAFETY: Both synthetic guards borrow storage and static
                     // metadata for this test, and neither callback frees them.
                     let receiver = unsafe {
-                        VideoRef::<VideoKind>::new(Guard::with_test_free(
-                            ptr::null_mut(),
-                            raw,
-                            |_, _| {},
-                        ))
+                        VideoFrameRef::new(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {}))
                     }
                     .unwrap();
                     let framesync = unsafe {
-                        VideoRef::<FrameSyncVideoFree>::new(Guard::with_test_free(
+                        FrameSyncVideoRef::new(Guard::with_test_free(
                             ptr::null_mut(),
                             raw,
                             |_, _| {},

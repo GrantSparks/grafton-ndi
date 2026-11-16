@@ -3,7 +3,7 @@ use std::time::Duration;
 use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
 
 fn receiver(ndi: &Ndi) -> Receiver {
-    let source = Source::new("compile-contract");
+    let source = Source::new("compile-contract").unwrap();
     let options = ReceiverOptions::new(source);
     Receiver::new(ndi, &options).unwrap()
 }
@@ -14,8 +14,7 @@ fn main() {
     let frame_ref = {
         let receiver = receiver(&ndi);
         receiver
-            .audio()
-            .capture_ref(Duration::from_millis(1))
+            .capture_audio_ref(Duration::from_millis(1))
             .unwrap()
             .unwrap()
     };

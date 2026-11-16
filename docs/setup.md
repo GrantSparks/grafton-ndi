@@ -104,7 +104,7 @@ The reported edition does not establish license entitlement.
 
 Cargo features expose Rust APIs; `ndi.capabilities()` reports optional native
 operations. Use `ndi.require_feature(RuntimeFeature::ReceiveDelay)?` to require
-one. `UnsupportedCapability` identifies its feature and a typed
+one. `UnsupportedCapability` identifies `Capability::Runtime(feature)` and a typed
 `CapabilityRefusal`, including the missing symbol or required version. Its
 `reason()` gives the refusal category; see
 [`CapabilityUnavailable`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/capabilities/enum.CapabilityUnavailable.html).
@@ -114,7 +114,9 @@ Discovery Server advertisers and listeners require NDI 6.4 or later. Other
 operations may depend on exported entry points, version, edition and build
 headers. Query the selected runtime instead of inferring support from a version
 matrix. The separate File library reports its families through `FileApi::status`
-and `supports`; operations refuse a missing family with `FileFamilyUnavailable`. See the [File guide](file-io.md).
+and `supports`, or validates them with `require_family`. Missing families use
+the same `UnsupportedCapability` variant with `Capability::File(family)`.
+See the [File guide](file-io.md).
 
 Selection failures are structured. `RuntimeLoadFailed(failure)` exposes each
 attempt's location, `LoadOrigin`, and `LoadRefusal`; `failure.loaded_any()`
@@ -145,7 +147,7 @@ fn main() -> grafton_ndi::Result<()> {
 
 That selection has no fallback. Native dependencies still follow platform loader
 rules and need trusted locations. File API users must also select an absolute
-`FileRuntimeOptions::library_path` or trust all its search directories, starting
+`FileApiOptions::library_path` or trust all its search directories, starting
 with the core runtime's companion directory. Inspect `FileApi::library_path`;
 see [File library deployment](file-io.md#requirements).
 
