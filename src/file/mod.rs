@@ -84,8 +84,12 @@
 //! only when it is [`FinishStatus::Closed`], and inspect the [`RecordingReport`]
 //! for errors during the session. [`RecordingReport::stopped_by_sdk`] says
 //! whether the SDK ended the session before it was asked to stop. Dropping a
-//! recorder whose session is still open performs the same stop and wait,
-//! bounded by [`FileRecorderOptions::drop_wait`], but cannot report the outcome.
+//! recorder whose session is still open requests the stop and waits within
+//! [`FileRecorderOptions::drop_wait`], but cannot report the outcome. This
+//! budget starts at drop (or async close submission) and includes the native
+//! stop; after it returns, only the remaining budget is available for events.
+//! Synchronous [`FileRecorder::finish`] instead measures its event wait from
+//! the stop's return, giving finalization the full requested wait.
 //!
 //! After a finalization timeout, [`FileRecorder::reset`] explicitly abandons
 //! the uncertain session and replaces its native instance. The old report is

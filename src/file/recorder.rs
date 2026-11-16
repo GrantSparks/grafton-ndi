@@ -120,7 +120,8 @@ impl SessionPhase {
 }
 
 impl RecordingReport {
-    /// The session's number, counting from one for each recorder.
+    /// The session's number, counting from one for each recorder; zero when
+    /// the recorder has not started a session.
     pub fn session(&self) -> u64 {
         self.session
     }
@@ -886,7 +887,9 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 /// [`FinishStatus::Closed`]. Dropping a recorder waits up to
 /// [`FileRecorderOptions::drop_wait`] while the session is open or a file it
 /// reported open has not been reported closed, including after an
-/// indeterminate outcome. Drop cannot report whether cleanup succeeded;
+/// indeterminate outcome. This budget starts at drop and includes the native
+/// stop; synchronous `finish` starts its event wait after the stop returns.
+/// Drop cannot report whether cleanup succeeded;
 /// [`abandon`](Self::abandon) skips the wait.
 ///
 /// # What a closed file means

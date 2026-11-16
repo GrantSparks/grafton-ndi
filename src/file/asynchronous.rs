@@ -2159,8 +2159,9 @@ impl AsyncFilePlayer {
 ///
 /// Dropping the last clone **blocks the dropping thread** until the
 /// recorder's thread has finished: it stops a session that is still open,
-/// waits up to [`FileRecorderOptions::drop_wait`] for the SDK to finalize the
-/// file, and destroys the recorder. This is deliberate: when the drop
+/// waits for the SDK to finalize the file within one
+/// [`FileRecorderOptions::drop_wait`] budget measured from drop and including
+/// the native stop, then destroys the recorder. This is deliberate: when the drop
 /// returns, the file is finalized as far as the SDK reported within that
 /// wait, even when the drop happens as the program exits. The outcome cannot
 /// be reported. A caller that must not block, such as a task on an async
@@ -2247,7 +2248,7 @@ impl AsyncFileRecorder {
     ///
     /// If another clone closes the recorder during the wait, this wait ends
     /// at [`FileRecorderOptions::drop_wait`] from that close's
-    /// submission, or this wait's deadline if earlier. Closure established in
+    /// submission, including the native stop, or this wait's deadline if earlier. Closure established in
     /// that time is reported normally; an unsettled session reports
     /// [`StateConflict::Closed`] instead of [`FinishStatus::TimedOut`], because
     /// the recorder is being destroyed and cannot be waited on again.
@@ -2424,8 +2425,8 @@ impl AsyncFileRecorder {
     ///
     /// A session that is still open is stopped and given up to
     /// [`FileRecorderOptions::drop_wait`] from this close's submission to finalize
-    /// its file, including time spent in an in-flight finish or wait. A finish
-    /// already running keeps its own earlier deadline; destruction then uses
+    /// its file, including the native stop and time spent in a submitted finish
+    /// or wait. A finish, queued or running, keeps its own earlier deadline; destruction then uses
     /// only the remainder of the close's budget. A known file still awaiting
     /// closure is given that time even after an indeterminate report. The future
     /// completes when the SDK has destroyed the recorder, and does not say

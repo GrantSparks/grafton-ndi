@@ -136,17 +136,23 @@ prevent confirmation. If recovery is needed, `reset` replaces the native
 recorder and returns the old session's report; `abandon` destroys it without
 waiting. Either can leave an unfinished file.
 
-Drop requests a stop and waits for closure events up to `drop_wait` (five
-seconds by default), including known pending files after an indeterminate
-outcome, but cannot report the outcome. Until those files close, a new start
+Drop requests a stop and waits for closure events within one `drop_wait`
+budget (five seconds by default), including known pending files after an
+indeterminate outcome, but cannot report the outcome. The budget starts at
+drop, or an async close's submission, and includes the native stop. The stop
+can itself outlast the budget; after it returns, only the remaining time is
+available for closure events. Synchronous `FileRecorder::finish` instead
+measures its event wait from the stop's return, giving closure its full
+requested wait. Until those files close, a new start
 returns `PreviousSessionOpen`; poll for closure or use `reset` to abandon them.
 Use explicit finishing when the result matters. See
 [`FileRecorder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorder.html)
 for state transitions, error conditions and recovery.
 
-If another async clone calls `close` while `finish` or `wait_for_finish` runs,
+If another async clone calls `close` while a submitted `finish` or
+`wait_for_finish` is queued or running,
 the wait uses the earlier of its own deadline and `drop_wait` measured from
-the close's submission. A settled session reports `Closed` or `Indeterminate`
+the close's submission, including the native stop. A settled session reports `Closed` or `Indeterminate`
 (wrapped in `Some` for `wait_for_finish`); an unsettled one returns
 `InvalidState(Closed)` if that budget ends first. Neither `TimedOut` from
 `finish` nor `None` from `wait_for_finish` would be appropriate for a handle
@@ -205,7 +211,8 @@ same `None`/`Some` distinction. After an expired wait, await
 
 Await `finish`, inspect its report, then await `close` to shut down all clones
 without blocking the executor. **Dropping the last clone blocks** until its
-worker exits; `drop_wait` does not bound native stop or destruction calls.
+worker exits. Its `drop_wait` budget includes the native stop, which can
+itself outlast that budget; native destruction can also take longer.
 When an executor callback drops the last clone on a File owner, timer or probe
 thread, it requests shutdown without waiting. This lets those threads keep
 delivering notifications; await `close` when cleanup must have completed.

@@ -171,8 +171,10 @@ impl FilePlayer {
     /// # Errors
     ///
     /// [`Error::NativeOperationFailed`] when the SDK cannot open the file,
-    /// [`Error::InvalidInput`] when the path is empty or is not UTF-8, and
-    /// [`Error::InvalidCString`] when it contains a NUL.
+    /// [`Error::InvalidInput`] when the path is empty or is not UTF-8,
+    /// [`Error::InvalidCString`] when it contains a NUL, and [`Error::Io`] when
+    /// a relative path cannot be resolved because the current directory is
+    /// unavailable.
     #[doc(alias = "NDIlib_file_player_start")]
     pub fn start(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = types::path_string(path.as_ref())?;

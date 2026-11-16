@@ -21,8 +21,11 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
 pub enum StateConflict {
-    /// A session is recording or stopping, so another cannot start. Finish
-    /// it, or keep taking events until it has ended.
+    /// A session is recording or stopping, or an indeterminate session still
+    /// has a known file awaiting its closure event, so another cannot start.
+    /// Finish the session or take events until its files close; use
+    /// [`FileRecorder::reset`](super::FileRecorder::reset) to abandon it and
+    /// replace its native recorder.
     #[error("finish the previous session before starting another")]
     PreviousSessionOpen,
     /// Events from an earlier session kept arriving, so a new session was not
@@ -423,7 +426,8 @@ impl FileRecorderOptions {
         self.rollover_size
     }
 
-    /// Requested maximum wait on drop.
+    /// Requested cleanup budget from drop or async close submission, including
+    /// the native stop.
     #[must_use]
     pub fn configured_drop_wait(&self) -> Duration {
         self.drop_wait
@@ -444,18 +448,22 @@ impl FileRecorderOptions {
         }
     }
 
-    /// How long dropping a recorder waits for its open file to be finalized,
-    /// unless [`drop_wait`](Self::drop_wait) says otherwise.
+    /// Default cleanup budget from drop or async close submission, including
+    /// the native stop; [`drop_wait`](Self::drop_wait) overrides it.
     pub const DEFAULT_DROP_WAIT: Duration = Duration::from_secs(5);
 
     /// Set how long dropping the recorder waits for an unfinished session.
     ///
     /// The SDK finalizes a file between the stop request and its file-closed
     /// event; destroying the recorder sooner may leave a truncated file. A
-    /// recorder dropped with a session still open therefore requests the stop
-    /// and waits up to `wait` for that event before it is destroyed. The wait
-    /// ends as soon as the file is closed, so the limit only matters when the
-    /// SDK does not report closure. `Duration::ZERO` waits for no future events:
+    /// recorder dropped with a session still open requests the stop and waits
+    /// for closure within one `wait` budget, measured from drop or an async
+    /// close's submission and including the native stop. The native stop can
+    /// itself outlast that budget; only the remaining time is available for
+    /// closure events after it returns. Synchronous
+    /// [`FileRecorder::finish`](super::FileRecorder::finish) instead starts its
+    /// wait after the stop returns, giving closure its full requested wait.
+    /// Cleanup ends as soon as the file is closed. `Duration::ZERO` waits for no future events:
     /// the stop is requested and a bounded nonblocking drain takes queued
     /// events before destruction. [`FileRecorder::abandon`](super::FileRecorder::abandon)
     /// takes no events.

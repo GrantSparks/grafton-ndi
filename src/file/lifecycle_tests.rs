@@ -471,6 +471,7 @@ fn a_recorder_that_never_started_is_destroyed_without_a_stop() {
         &FileRecorderOptions::new(SourceSpec::new("mock source").unwrap()),
     )
     .unwrap();
+    assert_eq!(recorder.report().session(), 0);
     assert_eq!(recorder.request_stop(), StopRequest::NotStarted);
     assert!(matches!(
         recorder.finish(Duration::ZERO),
@@ -900,6 +901,23 @@ fn finish_starts_its_wait_once_the_stop_has_returned() {
     let mut recorder = recording_on(&device);
     let outcome = recorder.finish(Duration::from_millis(250)).unwrap();
     assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+}
+
+#[test]
+fn drop_spends_its_cleanup_budget_on_the_native_stop_before_waiting_for_closure() {
+    let device = mock::Recorder::new(Closing::AfterSlowStop(
+        Duration::from_millis(300),
+        Duration::from_millis(50),
+    ));
+    let recorder = recording_with(
+        &device,
+        FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
+            .drop_wait(Duration::from_millis(250)),
+    );
+    drop(recorder);
+    assert_eq!(device.stops.load(Ordering::Acquire), 1);
+    assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    assert!(!device.closed_before_destroy.load(Ordering::Acquire));
 }
 
 #[test]
