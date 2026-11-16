@@ -2,7 +2,7 @@
 // common control a passthrough relay needs, with or without custom allocators,
 // and can be advertised like any other receiver.
 use grafton_ndi::{
-    advanced::{AllocatedPacketReceiver, PacketAttached, PacketReceiver},
+    advanced::{AllocatedReceiver, PacketAttached, PacketReceiver},
     discovery_server::{RecvAdvertisement, RecvAdvertiser},
     MediaTypes, MetadataFrame, Receiver, ReceiverMode, StreamTier, Tally,
 };
@@ -21,7 +21,10 @@ fn packet_controls(packets: &mut PacketReceiver) {
     let _ = packets.controls().set_stream_tier(StreamTier::Preview);
     let _ = packets.controls().set_streams(MediaTypes::VIDEO);
 }
-fn allocated_controls(packets: &mut AllocatedPacketReceiver, advertiser: &mut RecvAdvertiser) {
+fn allocated_controls(
+    packets: &mut AllocatedReceiver<PacketAttached>,
+    advertiser: &mut RecvAdvertiser,
+) {
     controls(packets.receiver());
     let _ = packets.controls().set_stream_tier(StreamTier::Program);
     let _ = packets.controls().set_streams(MediaTypes::VIDEO);

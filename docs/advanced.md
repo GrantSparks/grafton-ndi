@@ -232,9 +232,9 @@ Audio requests above the 64 MiB capture limit are declined as
 policy. Unrepresentable video and audio requests are declined without allocating
 on the SDK thread.
 
-`AllocatorService::attach_packets` gives packet capture the same application
-buffers. Use `AllocatedPacketReceiver::capture_any_ref` to inspect those buffers
-in place; owned `capture_any` copies them. Keeping a packet reference retains its
+`AllocatorService::attach_packets` returns `AllocatedReceiver<PacketAttached>`
+with the same application buffers. Use its `capture_any_ref` to inspect those
+buffers in place; owned `capture_any` copies them. Keeping a packet reference retains its
 allocation and usage charge until the SDK releases that buffer after the
 reference is dropped. For example, after constructing `service` and `packets`:
 

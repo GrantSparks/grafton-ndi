@@ -2232,7 +2232,9 @@ fn an_allocated_packet_receiver_moves_between_threads() {
             let _stop = StopOnDrop(&stop);
             let mut packets = packets;
             // Capture until video arrives after `count`'s policy has run.
-            let used = |packets: &mut AllocatedPacketReceiver, count: &AtomicUsize, which: &str| {
+            let used = |packets: &mut AllocatedReceiver<PacketAttached>,
+                        count: &AtomicUsize,
+                        which: &str| {
                 let deadline = Instant::now() + PATIENCE;
                 let mut videos = 0;
                 loop {

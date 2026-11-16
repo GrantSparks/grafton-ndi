@@ -1208,7 +1208,6 @@ impl AllocatorService {
         receiver: Receiver,
     ) -> std::result::Result<AllocatedReceiver, Rejected<Receiver>> {
         self.allocation(receiver)
-            .map(|inner| AllocatedReceiver { inner })
     }
 
     /// Take a packet receiver so that its allocators can be set.
@@ -1219,20 +1218,18 @@ impl AllocatorService {
     pub fn attach_packets(
         self,
         receiver: PacketReceiver,
-    ) -> std::result::Result<AllocatedPacketReceiver, Rejected<PacketReceiver>> {
-        match self.allocation(receiver.receiver) {
-            Ok(inner) => Ok(AllocatedPacketReceiver { inner }),
-            Err(rejected) => Err(rejected.map(PacketReceiver::from_receiver)),
-        }
+    ) -> std::result::Result<AllocatedReceiver<PacketAttached>, Rejected<PacketReceiver>> {
+        self.allocation(receiver.receiver)
+            .map_err(|rejected| rejected.map(PacketReceiver::from_receiver))
     }
 
     /// Take `receiver`, in any mode, with no allocator of its own set yet.
     fn allocation<M: ReceiverMode>(
         self,
         receiver: Receiver<M>,
-    ) -> std::result::Result<Allocation<M>, Rejected<Receiver<M>>> {
+    ) -> std::result::Result<AllocatedReceiver<M>, Rejected<Receiver<M>>> {
         match self.runtime.ndi().table::<ReceiveAllocators>() {
-            Ok(table) => Ok(Allocation {
+            Ok(table) => Ok(AllocatedReceiver {
                 registration: Registration {
                     core: receiver.core.clone(),
                     table,
@@ -1249,129 +1246,6 @@ impl AllocatorService {
     }
 }
 
-/// A [`PacketReceiver`] whose frames can be received into application memory.
-///
-/// [`into_packet_receiver`](Self::into_packet_receiver) gives the packet
-/// receiver back. [`receiver`](Self::receiver) reaches the receiver's
-/// controls, as [`PacketReceiver::receiver`] does, and
-/// [`controls`](Self::controls) reaches exclusive stream controls and KVM.
-/// The receiver is lent mutably only inside `ReceiverControls`, which prevents
-/// replacement. Its allocator registration keeps its own reference to the
-/// original receiver core, so resetting always reaches that native instance.
-///
-/// # Threading
-///
-/// It is [`Send`] and [`Sync`], as the packet receiver and an
-/// [`AllocatedReceiver`] are: capturing, setting and resetting allocators,
-/// and dropping it can each happen on any thread. Captures borrow it immutably;
-/// changing allocators requires an exclusive borrow.
-pub struct AllocatedPacketReceiver {
-    // Its Send and Sync are those of the allocation, which an
-    // AllocatedReceiver shares. The SDK calls the policies on threads of its
-    // own, possibly several at once, and lets the allocators be changed at
-    // any time, with each allocation freed exactly once through the free
-    // function it was made with (Advanced SDK manual, 25.4.2.1). Neither a
-    // policy nor its registration is tied to the thread that set it: the
-    // opaque value is a token into the process-wide registry, which every
-    // callback locks.
-    inner: Allocation<PacketAttached>,
-}
-
-impl std::fmt::Debug for AllocatedPacketReceiver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AllocatedPacketReceiver")
-            .field("mode", &std::any::type_name::<PacketAttached>())
-            .finish_non_exhaustive()
-    }
-}
-
-impl AllocatedPacketReceiver {
-    /// Wait up to `timeout` for the next frame or event; see
-    /// [`PacketReceiver::capture_any`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`PacketReceiver::capture_any`], including [`crate::Error::UnexpectedSdkResult`]
-    /// once per failed status publication, whose event remains pending.
-    #[doc(alias = "NDIlib_recv_capture_v3")]
-    pub fn capture_any(&self, timeout: std::time::Duration) -> Result<Option<PacketItem>> {
-        PacketReceiver::capture_from(self.inner.receiver(), timeout)
-    }
-
-    /// Borrow a packet directly from SDK or application-provided storage.
-    /// A held item keeps its custom allocation charged until the SDK releases
-    /// it after the item is dropped. See [`PacketReceiver::capture_any_ref`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`PacketReceiver::capture_any_ref`], including [`crate::Error::UnexpectedSdkResult`]
-    /// once per failed status publication, whose event remains pending.
-    #[doc(alias = "NDIlib_recv_capture_v3")]
-    pub fn capture_any_ref(
-        &self,
-        timeout: std::time::Duration,
-    ) -> Result<Option<PacketItemRef<'_>>> {
-        PacketReceiver::capture_ref_from(self.inner.receiver(), timeout)
-    }
-
-    /// The receiver, for its controls; see [`PacketReceiver::receiver`].
-    pub fn receiver(&self) -> &Receiver<PacketAttached> {
-        self.inner.receiver()
-    }
-
-    /// Borrow exclusive stream controls or start KVM without permitting
-    /// receiver replacement. This allocates nothing and makes no SDK call.
-    /// A KVM session captures packets through its own `capture_any` method.
-    pub fn controls(&mut self) -> ReceiverControls<'_, PacketAttached> {
-        ReceiverControls::new(self.inner.receiver_mut())
-    }
-
-    /// Receive video into memory from `policy`; see
-    /// [`AllocatedReceiver::set_video_allocator`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`AllocatedReceiver::set_video_allocator`].
-    #[doc(alias = "NDIlib_recv_set_video_allocator")]
-    pub fn set_video_allocator<P: ReceiveAllocator>(
-        &mut self,
-        policy: P,
-    ) -> std::result::Result<(), Rejected<P>> {
-        self.inner.set_allocator(Stream::Video, policy)
-    }
-
-    /// Receive audio into memory from `policy`; see
-    /// [`AllocatedReceiver::set_audio_allocator`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`AllocatedReceiver::set_audio_allocator`].
-    #[doc(alias = "NDIlib_recv_set_audio_allocator")]
-    pub fn set_audio_allocator<P: ReceiveAllocator>(
-        &mut self,
-        policy: P,
-    ) -> std::result::Result<(), Rejected<P>> {
-        self.inner.set_allocator(Stream::Audio, policy)
-    }
-
-    /// Return to the SDK's own video memory.
-    #[doc(alias = "NDIlib_recv_set_video_allocator")]
-    pub fn reset_video_allocator(&mut self) {
-        self.inner.install(Stream::Video, None);
-    }
-
-    /// Return to the SDK's own audio memory.
-    #[doc(alias = "NDIlib_recv_set_audio_allocator")]
-    pub fn reset_audio_allocator(&mut self) {
-        self.inner.install(Stream::Audio, None);
-    }
-
-    /// Return to the SDK's own memory and give the packet receiver back.
-    pub fn into_packet_receiver(self) -> PacketReceiver {
-        PacketReceiver::from_receiver(self.inner.into_receiver())
-    }
-}
-
 /// Which of a receiver's two allocators an operation concerns.
 #[derive(Clone, Copy)]
 enum Stream {
@@ -1381,11 +1255,34 @@ enum Stream {
 
 /// A receiver whose frames can be received into application memory.
 ///
+/// The default [`RawCapture`] mode retains ordinary receiver capture.
+/// [`AllocatorService::attach_packets`] returns the [`PacketAttached`] mode,
+/// which captures through [`capture_any`](AllocatedReceiver::capture_any) and
+/// [`capture_any_ref`](AllocatedReceiver::capture_any_ref).
+/// [`receiver`](Self::receiver) lends the receiver in its existing mode;
+/// [`controls`](Self::controls) permits exclusive stream controls and KVM
+/// without allowing that receiver to be replaced.
+///
+/// Dropping this owner, or taking the receiver back, returns it to the SDK's
+/// own memory first. The receiver may live on in a
+/// [`RecvAdvertiser`](crate::discovery_server::RecvAdvertiser) registration;
+/// allocations it still holds are freed through the process-wide token registry.
+/// The registration retains the exact receiver core, so resetting always
+/// reaches the original native instance.
+///
 /// Setting an allocator replaces the previous one for frames allocated from
 /// then on. Frames allocated earlier stay in the memory the earlier policy
 /// supplied, and that policy is kept until the SDK has freed the last of
 /// them. Only a call of the earlier policy still running when the replacement
 /// is installed is declined.
+///
+/// # Threading
+///
+/// Both returned modes are [`Send`] and [`Sync`]: capturing, changing allocators
+/// and dropping the owner can happen on any thread. Captures borrow it shared;
+/// changing allocators requires an exclusive borrow. The SDK calls policies
+/// on its own threads, possibly concurrently, and frees each allocation through
+/// the callback that created it. Registry access is synchronized.
 ///
 /// # Examples
 ///
@@ -1414,29 +1311,30 @@ enum Stream {
 /// # Ok(())
 /// # }
 /// ```
-pub struct AllocatedReceiver {
-    inner: Allocation<RawCapture>,
+pub struct AllocatedReceiver<M: ReceiverMode = RawCapture> {
+    registration: Registration,
+    receiver: Receiver<M>,
 }
 
-impl std::fmt::Debug for AllocatedReceiver {
+impl<M: ReceiverMode> std::fmt::Debug for AllocatedReceiver<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AllocatedReceiver")
-            .field("mode", &std::any::type_name::<RawCapture>())
+            .field("mode", &std::any::type_name::<M>())
             .finish_non_exhaustive()
     }
 }
 
-impl AllocatedReceiver {
-    /// The receiver, for capturing and control.
-    pub fn receiver(&self) -> &Receiver {
-        self.inner.receiver()
+impl<M: ReceiverMode> AllocatedReceiver<M> {
+    /// The receiver, for capture permitted by its mode and shared controls.
+    pub fn receiver(&self) -> &Receiver<M> {
+        &self.receiver
     }
 
     /// Borrow exclusive stream controls or start KVM without permitting
     /// receiver replacement. This allocates nothing and makes no SDK call.
-    /// Capture through the KVM session's lent receiver while inputs are held.
-    pub fn controls(&mut self) -> ReceiverControls<'_, RawCapture> {
-        ReceiverControls::new(self.inner.receiver_mut())
+    /// Capture through the KVM session while inputs are held.
+    pub fn controls(&mut self) -> ReceiverControls<'_, M> {
+        ReceiverControls::new(&mut self.receiver)
     }
 
     /// Receive video into memory from `policy`.
@@ -1451,7 +1349,7 @@ impl AllocatedReceiver {
         &mut self,
         policy: P,
     ) -> std::result::Result<(), Rejected<P>> {
-        self.inner.set_allocator(Stream::Video, policy)
+        self.set_allocator(Stream::Video, policy)
     }
 
     /// Receive audio into memory from `policy`.
@@ -1464,47 +1362,21 @@ impl AllocatedReceiver {
         &mut self,
         policy: P,
     ) -> std::result::Result<(), Rejected<P>> {
-        self.inner.set_allocator(Stream::Audio, policy)
+        self.set_allocator(Stream::Audio, policy)
     }
 
     /// Return to the SDK's own video memory.
     #[doc(alias = "NDIlib_recv_set_video_allocator")]
     pub fn reset_video_allocator(&mut self) {
-        self.inner.install(Stream::Video, None);
+        self.registration.install(Stream::Video, None);
     }
 
     /// Return to the SDK's own audio memory.
     #[doc(alias = "NDIlib_recv_set_audio_allocator")]
     pub fn reset_audio_allocator(&mut self) {
-        self.inner.install(Stream::Audio, None);
+        self.registration.install(Stream::Audio, None);
     }
 
-    /// Return to the SDK's own memory and give the receiver back.
-    pub fn into_receiver(self) -> Receiver {
-        self.inner.into_receiver()
-    }
-}
-
-/// A receiver in mode `M` and the allocators set on it: what
-/// [`AllocatedReceiver`] and [`AllocatedPacketReceiver`] share.
-///
-/// Dropping it, or taking the receiver back, returns the receiver to the
-/// SDK's own memory first. The receiver itself may live on afterwards, in a
-/// [`RecvAdvertiser`](crate::discovery_server::RecvAdvertiser) registration: the
-/// allocations it still holds are then freed through the token-keyed registry,
-/// which outlives every receiver.
-struct Allocation<M: ReceiverMode> {
-    registration: Registration,
-    receiver: Receiver<M>,
-}
-
-impl<M: ReceiverMode> Allocation<M> {
-    fn receiver(&self) -> &Receiver<M> {
-        &self.receiver
-    }
-    fn receiver_mut(&mut self) -> &mut Receiver<M> {
-        &mut self.receiver
-    }
     fn set_allocator<P: ReceiveAllocator>(
         &mut self,
         stream: Stream,
@@ -1514,16 +1386,55 @@ impl<M: ReceiverMode> Allocation<M> {
         self.registration.install(stream, Some(token));
         Ok(())
     }
-    fn install(&mut self, stream: Stream, token: Option<usize>) {
-        self.registration.install(stream, token);
-    }
-    fn into_receiver(self) -> Receiver<M> {
+    fn release_receiver(self) -> Receiver<M> {
         let Self {
             registration,
             receiver,
         } = self;
         drop(registration);
         receiver
+    }
+}
+
+impl AllocatedReceiver<RawCapture> {
+    /// Return to the SDK's own memory and give the receiver back.
+    pub fn into_receiver(self) -> Receiver {
+        self.release_receiver()
+    }
+}
+
+impl AllocatedReceiver<PacketAttached> {
+    /// Wait up to `timeout` for the next frame or event; see
+    /// [`PacketReceiver::capture_any`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`PacketReceiver::capture_any`], including [`crate::Error::UnexpectedSdkResult`]
+    /// once per failed status publication, whose event remains pending.
+    #[doc(alias = "NDIlib_recv_capture_v3")]
+    pub fn capture_any(&self, timeout: std::time::Duration) -> Result<Option<PacketItem>> {
+        PacketReceiver::capture_from(self.receiver(), timeout)
+    }
+
+    /// Borrow a packet directly from SDK or application-provided storage.
+    /// A held item keeps its custom allocation charged until the SDK releases
+    /// it after the item is dropped. See [`PacketReceiver::capture_any_ref`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`PacketReceiver::capture_any_ref`], including [`crate::Error::UnexpectedSdkResult`]
+    /// once per failed status publication, whose event remains pending.
+    #[doc(alias = "NDIlib_recv_capture_v3")]
+    pub fn capture_any_ref(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<PacketItemRef<'_>>> {
+        PacketReceiver::capture_ref_from(self.receiver(), timeout)
+    }
+
+    /// Return to the SDK's own memory and give the packet receiver back.
+    pub fn into_packet_receiver(self) -> PacketReceiver {
+        PacketReceiver::from_receiver(self.release_receiver())
     }
 }
 

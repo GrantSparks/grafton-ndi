@@ -17,6 +17,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- Custom allocator receivers use `advanced::AllocatedReceiver<M = RawCapture>`.
+  Replace `AllocatedPacketReceiver` with `AllocatedReceiver<PacketAttached>`;
+  allocator methods are shared, while capture and recovery follow the mode.
+
 - Explicit zero video strides are refused consistently by sizing and borrowed
   builders. Use `None` or `clear_line_stride_bytes()` for packed rows; received
   SDK descriptors retain their documented zero-stride sentinel.

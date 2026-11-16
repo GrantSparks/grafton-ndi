@@ -1,0 +1,17 @@
+error[E0599]: no method named `capture_any` found for reference `&AllocatedReceiver` in the current scope
+ --> tests/ui/advanced/fail/allocated_receiver_modes_preserve_capture.rs:8:22
+  |
+8 |     let _ = receiver.capture_any(Duration::ZERO);
+  |                      ^^^^^^^^^^^ method not found in `&AllocatedReceiver`
+
+error[E0599]: no method named `into_receiver` found for struct `AllocatedReceiver<PacketAttached>` in the current scope
+  --> tests/ui/advanced/fail/allocated_receiver_modes_preserve_capture.rs:12:14
+   |
+12 |     receiver.into_receiver()
+   |              ^^^^^^^^^^^^^
+   |
+help: there is a method `receiver` with a similar name
+   |
+12 -     receiver.into_receiver()
+12 +     receiver.receiver()
+   |

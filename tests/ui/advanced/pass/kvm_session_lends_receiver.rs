@@ -4,8 +4,9 @@
 use std::time::Duration;
 
 use grafton_ndi::{
-    advanced::{AllocatedPacketReceiver, KvmReceiver, MouseButton, PacketAttached, PacketReceiver},
-    AudioMode, EventMode, MetadataFrame, MetadataMode, Receiver, ReceiverMode, Source, Tally, VideoMode,
+    advanced::{AllocatedReceiver, KvmReceiver, MouseButton, PacketAttached, PacketReceiver},
+    AudioMode, EventMode, MetadataFrame, MetadataMode, Receiver, ReceiverMode, Source, Tally,
+    VideoMode,
 };
 
 fn drag_across_frames(receiver: &mut Receiver) {
@@ -36,7 +37,7 @@ fn packet_session(packets: &mut PacketReceiver) {
     let _: KvmReceiver<'_, PacketAttached> = session.receiver();
 }
 
-fn allocated_packet_session(packets: &mut AllocatedPacketReceiver) {
+fn allocated_packet_session(packets: &mut AllocatedReceiver<PacketAttached>) {
     let mut session = packets.controls().kvm().unwrap();
     session.key_down(0xffe1).unwrap();
     let _ = session.capture_any(Duration::ZERO).unwrap();

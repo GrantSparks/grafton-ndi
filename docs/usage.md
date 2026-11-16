@@ -226,7 +226,7 @@ rustdoc:
 | `advanced::AvSync` | Video-timestamp-matched audio | Video and metadata |
 | `advanced::PacketReceiver` | Owned packets, decoded media and events | None |
 | `advanced::AllocatedReceiver` | Typed or combined capture | Video, audio, metadata and events |
-| `advanced::AllocatedPacketReceiver` | Owned packets, decoded media and events | None |
+| `advanced::AllocatedReceiver<advanced::PacketAttached>` | Owned packets, decoded media and events | None |
 
 Attached owners lend shared controls through `receiver()` and exclusive Advanced
 controls through `controls()` without allowing the receiver to be replaced.
