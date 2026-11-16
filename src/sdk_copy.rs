@@ -76,6 +76,11 @@ impl CopyBudget {
         Ok(())
     }
 
+    #[cfg(all(test, feature = "advanced"))]
+    pub(crate) fn remaining(&self) -> usize {
+        self.remaining
+    }
+
     /// Check spans before pointer arithmetic or reservation, on every target.
     pub(crate) fn span_bytes(count: usize, element_size: usize) -> CopyResult<usize> {
         count

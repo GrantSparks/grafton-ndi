@@ -432,6 +432,20 @@ pub(crate) unsafe fn snapshot_entry(
     budget: &mut SnapshotBudget,
 ) -> Result<Option<Source>> {
     let (name, address) = source_pointers(source);
+    // SAFETY: forwarded from the descriptor's bounded string contract.
+    unsafe { snapshot_source(name, address, budget) }
+}
+
+/// Copy source text through the policy shared by every finder snapshot.
+///
+/// # Safety
+/// Each non-null pointer stays readable through its first NUL or the SDK
+/// string bound, whichever comes first, until copying finishes.
+pub(crate) unsafe fn snapshot_source(
+    name: *const c_char,
+    address: *const c_char,
+    budget: &mut SnapshotBudget,
+) -> Result<Option<Source>> {
     if name.is_null() && !address.is_null() {
         budget.empty_source_name()?;
     }

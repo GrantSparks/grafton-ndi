@@ -37,6 +37,11 @@ impl SnapshotBudget {
         ))
     }
 
+    #[cfg(all(test, feature = "advanced"))]
+    pub(crate) fn spent(&self) -> usize {
+        MAX_BYTES - self.0.remaining()
+    }
+
     /// Charge the shared empty name used for an address-only source.
     pub(super) fn empty_source_name(&mut self) -> Result<()> {
         self.0.take(SOURCE_TEXT_OVERHEAD)
