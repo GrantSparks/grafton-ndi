@@ -983,7 +983,9 @@ pub enum RawCapture {}
 /// frames, none of which then reach the FrameSync, which returns silence in
 /// their place. Metadata is not taken that way: every metadata frame still
 /// reaches the receiver's own capture while the FrameSync pulls video and
-/// audio.
+/// audio. `framesync_pulls_leave_sequenced_metadata_for_the_attached_receiver`
+/// in `tests/framesync_capture_boundary.rs` repeats that metadata check on
+/// every runtime exercised by CI.
 #[derive(Debug)]
 pub enum FrameSyncAttached {}
 impl mode_sealed::Sealed for RawCapture {}
