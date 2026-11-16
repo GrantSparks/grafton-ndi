@@ -54,8 +54,10 @@
 //! Dropping a future sets a cancellation flag. Work is skipped if the blocking
 //! closure observes that flag at its entry gate. A budgeted wait also checks
 //! it before each subsequent attempt. An attempt already in flight, lasting at
-//! most 100 ms in the SDK, can still consume an item and run its scoped callback
-//! after the future was dropped. Callback time and side effects are not cancelled
+//! most 100 ms in the SDK, can still consume media and run its scoped callback
+//! after the future was dropped. Undelivered receiver events and source-name
+//! changes are retained for a later wait, including when a completed worker
+//! was never polled again. Callback time and side effects are not cancelled
 //! by the wait timeout either. A panic is caught on the worker, where SDK guards
 //! are released, then resumed on the awaiting task with its original payload.
 //! It unwinds through `select!` or `join!` as any other task panic does. If the
@@ -317,7 +319,8 @@ impl private::Spawn for Smol {
 /// [`Error::SpawnFailed`] carries a typed [`SpawnFailure`] for a missing Tokio
 /// context or a cancelled task. A panic on the worker is resumed on the awaiting
 /// task with its original payload, after SDK guards are released on the worker.
-/// An abandoned operation discards its result and any caught panic payload.
+/// An abandoned operation discards media and any caught panic payload;
+/// undelivered events and source-name changes are retained for later waits.
 ///
 /// # Example
 ///
@@ -387,6 +390,58 @@ where
 // Only the result leaves this scope, including when a task is abandoned.
 fn process_captured<V, T>(captured: Option<V>, process: impl FnOnce(&V) -> T) -> Option<T> {
     captured.as_ref().map(process)
+}
+
+/// A completed notification is either delivered to its future or returned to
+/// the receiver when the runtime drops an abandoned worker's output.
+struct ReceiverDelivery<T: ReplayReceiverValue> {
+    receiver: Arc<Receiver>,
+    value: Option<T>,
+}
+
+impl<T: ReplayReceiverValue> ReceiverDelivery<T> {
+    fn new(receiver: Arc<Receiver>, value: T) -> Self {
+        Self {
+            receiver,
+            value: Some(value),
+        }
+    }
+
+    fn take(mut self) -> T {
+        self.value.take().expect("delivery is consumed once")
+    }
+}
+
+impl<T: ReplayReceiverValue> Drop for ReceiverDelivery<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            value.replay(&self.receiver);
+        }
+    }
+}
+
+trait ReplayReceiverValue {
+    fn replay(self, receiver: &Receiver);
+}
+
+impl ReplayReceiverValue for ReceiverEvent {
+    fn replay(self, receiver: &Receiver) {
+        receiver.core.retain_event(self);
+    }
+}
+
+impl ReplayReceiverValue for SourceNameChange {
+    fn replay(self, receiver: &Receiver) {
+        receiver.core.retain_source_name_change(self);
+    }
+}
+
+impl ReplayReceiverValue for ReceiverItem {
+    fn replay(self, receiver: &Receiver) {
+        if let Self::Event(event) = self {
+            event.replay(receiver);
+        }
+    }
 }
 
 impl<R: AsyncRuntime> AsyncReceiver<R> {
@@ -463,11 +518,24 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// # Cancellation
     ///
     /// Dropping the future skips queued work and stops a started wait before
-    /// its next attempt. The attempt already in flight can still consume an
-    /// item whose result is discarded; each native wait lasts at most 100 ms.
+    /// its next attempt. The attempt already in flight can still consume media
+    /// whose result is discarded; each native wait lasts at most 100 ms.
+    /// An undelivered event is retained for the next event or combined capture,
+    /// including when the worker completed before the future was dropped.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub async fn capture_any(&self, timeout: Duration) -> Result<Option<ReceiverItem>> {
-        self.capture_any_with(timeout, |item| item.to_owned()).await
+        let receiver = Arc::clone(&self.inner);
+        Ok(
+            with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
+                let value = receiver
+                    .capture_any_ref_until(deadline, stop)?
+                    .as_ref()
+                    .map(ReceiverItemRef::to_owned);
+                Ok(value.map(|value| ReceiverDelivery::new(receiver, value)))
+            })
+            .await?
+            .map(ReceiverDelivery::take),
+        )
     }
 
     /// Process the next video, audio, metadata or receiver event on the
@@ -491,7 +559,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// [`capture_any`](Self::capture_any). Callback execution time and side
     /// effects are not cancelled by the timeout or by dropping the future.
     /// An item delivered by the attempt in flight still runs its callback
-    /// even if the future was dropped.
+    /// even if the future was dropped. An event passed to the callback has
+    /// reached application code and is not re-published.
     ///
     /// # Errors
     ///
@@ -549,15 +618,20 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// # Cancellation
     ///
     /// Dropping the future skips queued work and stops a started wait before
-    /// its next attempt. The attempt already in flight can still consume an
-    /// event whose result is discarded; each native wait lasts at most 100 ms.
+    /// its next attempt. An event taken by an in-flight or completed worker
+    /// is retained for the next event or combined capture if this future never
+    /// receives it. Each native wait lasts at most 100 ms.
     #[doc(alias = "NDIlib_recv_capture_v3")]
     pub async fn next_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
         let receiver = Arc::clone(&self.inner);
-        with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
-            receiver.next_event_until(deadline, stop)
-        })
-        .await
+        Ok(
+            with_timeout_budget::<R, _, _>(timeout, move |deadline, stop| {
+                let value = receiver.next_event_until(deadline, stop)?;
+                Ok(value.map(|value| ReceiverDelivery::new(receiver, value)))
+            })
+            .await?
+            .map(ReceiverDelivery::take),
+        )
     }
 
     /// Async version of [`Receiver::wait_for_source_name_change`]: wait up to
@@ -591,9 +665,10 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// # Cancellation
     ///
     /// Dropping the future skips queued work and stops a started wait before
-    /// its next attempt. The attempt already in flight can still consume a
-    /// change whose result is discarded; each native wait lasts at most 100 ms.
-    /// The SDK reports each change once.
+    /// its next attempt. A one-shot change taken by an in-flight or completed
+    /// worker is retained for the next name-change wait if this future never
+    /// receives it. Retained changes are taken before another native query;
+    /// each native wait lasts at most 100 ms.
     #[doc(alias = "NDIlib_recv_get_source_name")]
     pub async fn wait_for_source_name_change(
         &self,
@@ -604,12 +679,17 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
         // its inputs independent of reference-lifetime inference on the MSRV.
         let (source_name, strings) = *self.inner.core.source_name_tables()?;
         let receiver = Arc::clone(&self.inner);
-        R::spawn_stoppable(private::Token, move |stop| {
-            receiver
-                .core
-                .wait_for_source_name_change_with(&source_name, &strings, deadline, stop)
+        Ok(R::spawn_stoppable(private::Token, move |stop| {
+            let value = receiver.core.wait_for_source_name_change_with(
+                &source_name,
+                &strings,
+                deadline,
+                stop,
+            )?;
+            Ok::<_, Error>(value.map(|value| ReceiverDelivery::new(receiver, value)))
         })
-        .await?
+        .await??
+        .map(ReceiverDelivery::take))
     }
 
     /// Point the underlying receiver at a different source and remember it as
@@ -1191,6 +1271,23 @@ mod receiver_tests {
         AsyncReceiver::new(
             Receiver::new(ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
         )
+    }
+
+    #[test]
+    fn receiver_delivery_replays_only_while_armed() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver =
+            Arc::new(Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap());
+        let event = ReceiverEvent::Unknown(4321);
+        drop(ReceiverDelivery::new(Arc::clone(&receiver), event));
+        assert_eq!(receiver.next_event(Duration::ZERO).unwrap(), Some(event));
+        assert_eq!(
+            ReceiverDelivery::new(Arc::clone(&receiver), event).take(),
+            event
+        );
+        assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
     }
 
     // Scoped entry points keep capturing while local connection changes are

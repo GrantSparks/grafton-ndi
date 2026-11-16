@@ -195,7 +195,7 @@ export! {
     }
 }
 
-// A bounded no-change wait used to observe async source-query cancellation.
+// A bounded wait with optional one-shot changes for async cancellation tests.
 #[cfg(fake_source_name)]
 export! {
     fn NDIlib_recv_get_source_name(_p_instance: NDIlib_recv_instance_t, name: *mut *const c_char, timeout_in_ms: u32) -> bool {
@@ -203,6 +203,25 @@ export! {
         let delay = std::env::var("GRAFTON_FAKE_SOURCE_NAME_DELAY_MS")
             .unwrap_or_default().parse::<u64>().unwrap_or(0);
         std::thread::sleep(std::time::Duration::from_millis(delay.min(timeout_in_ms.into())));
+        static SCRIPT: std::sync::Mutex<(String, bool)> = std::sync::Mutex::new((String::new(), false));
+        let text = std::env::var("GRAFTON_FAKE_SOURCE_NAME_SCRIPT").unwrap_or_default();
+        let mut script = SCRIPT.lock().unwrap();
+        if script.0 != text {
+            *script = (text, false);
+        }
+        if !script.1 {
+            script.1 = true;
+            if let Some((_, change)) = script.0.split_once(':') {
+                let pointer = if change == "disconnected" {
+                    std::ptr::null()
+                } else {
+                    CString::new(change).unwrap().into_raw().cast_const()
+                };
+                unsafe { name.write(pointer) };
+                log("source-name-change");
+                return true;
+            }
+        }
         unsafe { name.write(std::ptr::null()) };
         false
     }

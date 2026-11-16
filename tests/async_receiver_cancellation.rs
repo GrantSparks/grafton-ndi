@@ -12,15 +12,204 @@ mod runtime_fixture;
 
 use grafton_ndi::{
     asynchronous::{AsyncReceiver, AsyncRuntime},
-    Ndi, Receiver, ReceiverOptions, RuntimeOptions, Source,
+    Ndi, Receiver, ReceiverEvent, ReceiverItem, ReceiverOptions, RuntimeOptions, Source,
+    SourceNameChange,
 };
 use std::{
     fs,
     future::Future,
     process::Command,
-    task::{Context, Poll, Waker},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll, Wake, Waker},
     time::{Duration, Instant},
 };
+
+#[derive(Debug)]
+struct Completion(AtomicBool);
+
+impl Wake for Completion {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Notification {
+    Event(ReceiverEvent),
+    Name(SourceNameChange),
+}
+
+fn event(item: ReceiverItem) -> ReceiverEvent {
+    let ReceiverItem::Event(event) = item else {
+        panic!("script delivered media instead of an event")
+    };
+    event
+}
+
+fn await_condition(mut condition: impl FnMut() -> bool, reason: &str) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !condition() {
+        assert!(Instant::now() < deadline, "{reason}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+async fn replayed_notifications<R: AsyncRuntime>(ndi: &Ndi) {
+    let mut serial = 0;
+    let runtime = std::any::type_name::<R>().rsplit("::").next().unwrap();
+    for kind in 0..5 {
+        for combined in [false, true] {
+            if kind >= 3 && combined {
+                continue;
+            }
+            for completed in [false, true] {
+                serial += 1;
+                let receiver = AsyncReceiver::<R>::new(
+                    Receiver::new(ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
+                );
+                let (script, expected) = match kind {
+                    0 => (
+                        "status",
+                        Notification::Event(ReceiverEvent::StatusChanged(Default::default())),
+                    ),
+                    1 => ("source", Notification::Event(ReceiverEvent::SourceChanged)),
+                    2 => ("unknown", Notification::Event(ReceiverEvent::Unknown(987))),
+                    3 => (
+                        "renamed camera",
+                        Notification::Name(SourceNameChange::Connected("renamed camera".into())),
+                    ),
+                    _ => (
+                        "disconnected",
+                        Notification::Name(SourceNameChange::Disconnected),
+                    ),
+                };
+                let script_name = if kind >= 3 {
+                    "GRAFTON_FAKE_SOURCE_NAME_SCRIPT"
+                } else {
+                    "GRAFTON_FAKE_CAPTURE_SCRIPT"
+                };
+                // The runtime name prevents the second runtime reusing the
+                // previous one's final one-shot script.
+                std::env::set_var(script_name, format!("{runtime}-{serial}:{script}"));
+                let before = calls(kind >= 3);
+                let mut future = Box::pin(async {
+                    let budget = Duration::from_secs(30);
+                    if kind >= 3 {
+                        receiver
+                            .wait_for_source_name_change(budget)
+                            .await
+                            .unwrap()
+                            .map(Notification::Name)
+                    } else if combined {
+                        receiver
+                            .capture_any(budget)
+                            .await
+                            .unwrap()
+                            .map(event)
+                            .map(Notification::Event)
+                    } else {
+                        receiver
+                            .next_event(budget)
+                            .await
+                            .unwrap()
+                            .map(Notification::Event)
+                    }
+                });
+                let completion = Arc::new(Completion(AtomicBool::new(false)));
+                let waker = Waker::from(Arc::clone(&completion));
+                let mut context = Context::from_waker(&waker);
+                assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+                await_condition(
+                    || calls(kind >= 3) > before,
+                    "worker never entered native wait",
+                );
+                if completed {
+                    // A completion wake establishes that the worker's result
+                    // reached its runtime, without polling our future again.
+                    await_condition(
+                        || completion.0.load(Ordering::Acquire),
+                        "worker did not complete",
+                    );
+                }
+                drop(future);
+                let mut replayed = None;
+                await_condition(
+                    || {
+                        replayed = if kind >= 3 {
+                            receiver
+                                .receiver()
+                                .wait_for_source_name_change(Duration::ZERO)
+                                .unwrap()
+                                .map(Notification::Name)
+                        } else {
+                            receiver
+                                .receiver()
+                                .next_event(Duration::ZERO)
+                                .unwrap()
+                                .map(Notification::Event)
+                        };
+                        replayed.is_some()
+                    },
+                    &format!("an abandoned notification was lost: {} kind={kind} combined={combined} completed={completed}", std::any::type_name::<R>()),
+                );
+                assert_eq!(replayed, Some(expected));
+                if kind >= 3 {
+                    assert!(receiver
+                        .receiver()
+                        .wait_for_source_name_change(Duration::ZERO)
+                        .unwrap()
+                        .is_none());
+                } else {
+                    assert!(receiver
+                        .receiver()
+                        .next_event(Duration::ZERO)
+                        .unwrap()
+                        .is_none());
+                }
+
+                // Normal completion disarms the hand-off and must never replay.
+                serial += 1;
+                std::env::set_var(script_name, format!("{runtime}-{serial}:{script}"));
+                if kind >= 3 {
+                    assert!(receiver
+                        .wait_for_source_name_change(Duration::ZERO)
+                        .await
+                        .unwrap()
+                        .is_some());
+                    assert!(receiver
+                        .receiver()
+                        .wait_for_source_name_change(Duration::ZERO)
+                        .unwrap()
+                        .is_none());
+                } else {
+                    let delivered = if combined {
+                        receiver
+                            .capture_any(Duration::ZERO)
+                            .await
+                            .unwrap()
+                            .map(event)
+                    } else {
+                        receiver.next_event(Duration::ZERO).await.unwrap()
+                    };
+                    assert!(delivered.is_some());
+                    assert!(receiver
+                        .receiver()
+                        .next_event(Duration::ZERO)
+                        .unwrap()
+                        .is_none());
+                }
+            }
+        }
+    }
+    std::env::remove_var("GRAFTON_FAKE_SOURCE_NAME_SCRIPT");
+}
 
 fn log() -> String {
     fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap_or_default()
@@ -121,9 +310,15 @@ fn abandoned_waits_release_the_receiver_without_spending_their_timeout() {
         ::tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(cancelled_waits::<grafton_ndi::asynchronous::Tokio>(&ndi));
+            .block_on(async {
+                cancelled_waits::<grafton_ndi::asynchronous::Tokio>(&ndi).await;
+                replayed_notifications::<grafton_ndi::asynchronous::Tokio>(&ndi).await;
+            });
         #[cfg(feature = "smol")]
-        ::smol::block_on(cancelled_waits::<grafton_ndi::asynchronous::Smol>(&ndi));
+        ::smol::block_on(async {
+            cancelled_waits::<grafton_ndi::asynchronous::Smol>(&ndi).await;
+            replayed_notifications::<grafton_ndi::asynchronous::Smol>(&ndi).await;
+        });
         return;
     }
     let directory = fixture::FixtureDir::create("async-cancellation");
