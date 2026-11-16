@@ -49,7 +49,7 @@ use crate::{advanced::AvSyncAudioRef, capture::AvSyncAudioFree};
 /// // When matching, always include a wildcard for forward compatibility
 /// match format {
 ///     PixelFormat::Bgra | PixelFormat::Rgba => println!("Full quality RGB"),
-///     PixelFormat::Uyvy => println!("Compressed YUV"),
+///     PixelFormat::Uyvy => println!("4:2:2 YUV"),
 ///     _ => println!("Other format"),
 /// }
 /// ```
@@ -94,7 +94,7 @@ pub enum PixelFormat {
     Nb4g = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NB4G,
 }
 
-/// Category of pixel format for buffer calculation and union field access.
+/// Plane structure used by buffer sizing and plane views.
 ///
 /// This enum distinguishes between different memory layouts:
 /// - **Packed**: All pixel components are interleaved in a single buffer
@@ -152,9 +152,9 @@ impl PixelSampleWidth {
 
 /// Compile-time pixel format properties.
 ///
-/// This struct encapsulates all format-specific knowledge in one location,
-/// providing a single source of truth for buffer size calculations, stride
-/// computation, and format category detection.
+/// Records first-plane bytes per pixel, plane category, alpha presence and
+/// sample width. See [`PixelFormat::buffer_len`] for storage size and
+/// [`PixelFormat::send_tail_room`] for the SDK's extra readable send bytes.
 ///
 /// # Examples
 ///
@@ -174,7 +174,7 @@ pub struct PixelFormatInfo {
     /// Bytes per pixel for packed formats, or first-plane bytes per pixel for
     /// planar and semi-planar formats.
     bytes_per_pixel: u8,
-    /// Format category for union field access and buffer calculation.
+    /// Plane structure for buffer sizing and plane views.
     category: FormatCategory,
     has_alpha: bool,
     sample_width: PixelSampleWidth,
@@ -267,8 +267,9 @@ impl PixelFormat {
 
     /// Get compile-time format properties.
     ///
-    /// This provides a single source of truth for all format-specific knowledge,
-    /// including bytes per pixel and format category.
+    /// Returns first-plane bytes per pixel, plane category, alpha presence and
+    /// sample width. See [`Self::buffer_len`] for storage size and
+    /// [`Self::send_tail_room`] for the SDK's extra readable send bytes.
     ///
     /// # Examples
     ///
@@ -4572,7 +4573,8 @@ unsafe impl DescriptorParts<NDIlib_metadata_frame_t> for () {
 ///
 /// Only the validation functions construct one, each from the one descriptor
 /// its holder holds: [`ValidatedFrame::validate`],
-/// [`ValidatedAudio::returned_audio`] and [`ValidatedMetadata::metadata_frame`].
+/// [`ValidatedAudio::returned_audio`], [`ValidatedMetadata::metadata_frame`]
+/// and [`ValidatedMetadata::with_frame_metadata`] for sender metadata.
 /// A layout or text validated from
 /// another descriptor therefore cannot be paired with it, and every view and
 /// owned copy of a received frame takes its parts from here.
