@@ -692,10 +692,10 @@ impl ReceiverOptions {
     ///
     /// The SDK converts YUV to RGB with BT.709 limited range even when
     /// `ndi_color_info` names another matrix. This preset's RGB frames already
-    /// carry that conversion. Receive YUV with [`ReceiverColorFormat::UyvyBgra`]
-    /// or [`ReceiverColorFormat::UyvyRgba`] to let image encoding apply the
-    /// tag's matrix; [`ReceiverColorFormat::Best`] also retains high bit depth
-    /// and HDR code values. Tags still control HDR refusal and PNG tagging.
+    /// carry that conversion. See the
+    /// [image encoding color guidance](https://grantsparks.github.io/grafton-ndi/grafton_ndi/image_encoding/struct.ImageOptions.html#color)
+    /// for receiving YUV when the tag's matrix matters, including alpha and
+    /// high bit depth sources. Tags still control HDR refusal and PNG tagging.
     ///
     /// # Example
     ///
@@ -739,9 +739,10 @@ impl ReceiverOptions {
     /// RGB is convenient for untagged sources. For tagged YUV, the SDK has
     /// already converted to BT.709 limited range, ignoring `ndi_color_info`;
     /// image encoding cannot apply the tagged matrix to these RGB frames.
-    /// Use [`ReceiverColorFormat::UyvyBgra`] or [`ReceiverColorFormat::UyvyRgba`]
-    /// for that matrix, or [`ReceiverColorFormat::Best`] to retain high bit
-    /// depth and HDR code values. Tags still control HDR refusal and PNG tagging.
+    /// See the
+    /// [image encoding color guidance](https://grantsparks.github.io/grafton-ndi/grafton_ndi/image_encoding/struct.ImageOptions.html#color)
+    /// for receiving YUV when the tag's matrix matters, including alpha and
+    /// high bit depth sources. Tags still control HDR refusal and PNG tagging.
     ///
     /// # Example
     ///

@@ -155,11 +155,15 @@ impl ImageFormat {
 /// whatever the tag says. RGB-received frames already carry that conversion:
 /// encoding keeps their RGB pixels, so the tag's matrix can no longer be
 /// applied. Readable tags still decide HDR refusal and the PNG `cICP` chunk.
-/// For tagged sources, receive YUV with
-/// [`ReceiverColorFormat::UyvyBgra`](crate::ReceiverColorFormat::UyvyBgra) or
-/// [`UyvyRgba`](crate::ReceiverColorFormat::UyvyRgba); use
-/// [`ReceiverColorFormat::Best`](crate::ReceiverColorFormat::Best) to retain
-/// high bit depth and HDR code values.
+/// [`ReceiverColorFormat::UyvyBgra`](crate::ReceiverColorFormat::UyvyBgra) and
+/// [`UyvyRgba`](crate::ReceiverColorFormat::UyvyRgba) keep opaque sources in
+/// YUV, but deliver BGRA or RGBA for sources with alpha. When a tagged source
+/// may carry alpha, use
+/// [`ReceiverColorFormat::Fastest`](crate::ReceiverColorFormat::Fastest) for
+/// UYVA or [`Best`](crate::ReceiverColorFormat::Best) for UYVA or PA16. `Best`
+/// also retains high bit depth and HDR code values. Both deliver individual
+/// fields even with [`allow_video_fields(false)`](crate::ReceiverOptions::allow_video_fields),
+/// so interlaced snapshots may need field assembly.
 ///
 /// # HDR
 ///
@@ -424,10 +428,8 @@ pub enum ColorPolicy {
     /// RGB-received frames already hold the SDK's BT.709 limited-range
     /// conversion, which ignores the tag; this policy cannot apply its matrix
     /// afterward. Tags still decide HDR refusal and the PNG `cICP` chunk.
-    /// Receive YUV with
-    /// [`ReceiverColorFormat::UyvyBgra`](crate::ReceiverColorFormat::UyvyBgra),
-    /// [`UyvyRgba`](crate::ReceiverColorFormat::UyvyRgba), or
-    /// [`Best`](crate::ReceiverColorFormat::Best) when the tag's matrix matters.
+    /// See [the color guidance](ImageOptions#color) for receiving YUV when the
+    /// tag's matrix matters, including sources with alpha.
     ///
     /// A frame whose `ndi_color_info` cannot be read, including received
     /// metadata withheld as non-UTF-8 or unterminated text, is refused with
