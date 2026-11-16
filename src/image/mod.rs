@@ -5,9 +5,13 @@
 //! exposes `encode_image`, `encode_image_to` and `encode_image_data_url`.
 //! [`ImageWorkspace`] reuses conversion storage across repeated encodes.
 //!
-//! Encoding validates the frame and options before writing output. YUV input
-//! follows the SDK color conventions by default; explicit options select other
-//! color handling and HDR code values.
+//! Encoding validates the frame and options before writing output. By default,
+//! YUV input uses the matrix in readable `ndi_color_info`, or BT.709 limited
+//! range when untagged. The SDK's own YUV-to-RGB conversion always uses BT.709
+//! limited range, ignoring that tag. RGB-received frames already carry that
+//! conversion; the tag still controls HDR refusal and a PNG's `cICP` chunk.
+//! Receive YUV when its tagged matrix or original HDR code values matter; see
+//! the color and HDR guidance on [`ImageOptions`].
 
 mod color;
 mod downscale;

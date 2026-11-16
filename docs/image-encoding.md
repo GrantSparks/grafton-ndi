@@ -93,9 +93,20 @@ and unsupported output dimensions return `InvalidFrame`.
 ## Color
 
 `ColorPolicy::Sdk`, the default, converts YUV using the matrix in readable
-`ndi_color_info`, or BT.709 when absent, with limited range. RGB pixels are
-encoded directly. For an untagged source with another matrix or range, specify
+`ndi_color_info`, or BT.709 when absent, with limited range. For an untagged
+source with another matrix or range, specify
 `ColorPolicy::Override { matrix, range }`.
+
+The SDK's own YUV-to-RGB conversion always uses BT.709 limited range, whatever
+`ndi_color_info` says. RGB-received frames, including those from
+`ReceiverOptions::snapshot_preset` and `ReceiverOptions::high_quality_preset`,
+already carry that conversion. Encoding keeps those RGB pixels; it cannot
+apply the tag's matrix afterward. The tag still controls HDR refusal and a
+PNG's `cICP` chunk.
+
+When a source's tagged matrix matters, receive YUV with
+`ReceiverColorFormat::UyvyBgra` or `ReceiverColorFormat::UyvyRgba`. Use
+`ReceiverColorFormat::Best` to retain high bit depth and HDR code values.
 
 ### `ndi_color_info`
 
@@ -118,6 +129,12 @@ Use `HdrPolicy::CodeValues` to preserve their nonlinear values in a tagged PNG;
 combine it with `SampleDepth::Sixteen` for high-bit-depth sources. JPEG and WebP
 reject that HDR mode. The encoder does not tone-map; create an SDR rendering
 explicitly if that is what the consumer needs.
+
+An RGB-received HDR frame already holds the SDK's BT.709 limited-range
+conversion, whatever its passed-through `ndi_color_info` says. Increasing the
+output to 16 bits cannot recover the original code values. Receive YUV with
+`ReceiverColorFormat::Best` to keep their high bit depth; the tag still decides
+HDR refusal and the PNG `cICP` chunk for RGB as well as YUV.
 
 ### Tagging a PNG
 
