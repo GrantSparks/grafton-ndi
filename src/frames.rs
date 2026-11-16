@@ -2609,6 +2609,19 @@ audio_accessors! {
 }
 
 impl AudioFrame {
+    /// Allocate silent packed samples for a shape that is already validated.
+    /// Metadata and receive timestamp keep the ordinary outbound defaults.
+    pub(crate) fn from_validated_silence(layout: ValidatedAudioLayout, timecode: Timecode) -> Self {
+        let layout = layout.packed();
+        Self {
+            layout,
+            timecode,
+            data: vec![0.0; layout.sample_count()],
+            metadata: OwnedFrameMetadata::default(),
+            timestamp: None,
+        }
+    }
+
     /// Create a builder for a frame to send.
     ///
     /// Its defaults are 48 kHz stereo FLTP with 1024 samples per channel,
@@ -4226,7 +4239,7 @@ fn validate_audio_sample_rate(sample_rate: i64) -> LayoutResult<u32> {
 }
 
 /// Require a positive channel and sample count and widen both to `usize`.
-fn validate_positive_audio_counts(
+pub(crate) fn validate_positive_audio_counts(
     no_channels: i64,
     no_samples: i64,
 ) -> LayoutResult<(usize, usize)> {
