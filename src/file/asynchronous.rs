@@ -5534,15 +5534,13 @@ mod tests {
             let (blocked, release) = block_owner(&player.worker);
             let directory = std::path::PathBuf::from(directory);
             std::env::set_current_dir(directory.join("submitted")).unwrap();
+            let submitted_path = std::env::current_dir().unwrap().join("clip.mkv");
             let starting = player.start("clip.mkv").submit();
             std::env::set_current_dir(directory.join("running")).unwrap();
             release.send(()).unwrap();
             block_on(blocked).unwrap();
             block_on(starting).unwrap();
-            assert_eq!(
-                lock(&STARTED_PATH).as_deref(),
-                directory.join("submitted").join("clip.mkv").to_str()
-            );
+            assert_eq!(lock(&STARTED_PATH).as_deref(), submitted_path.to_str());
             block_on(player.close()).unwrap();
             return;
         }
