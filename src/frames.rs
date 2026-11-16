@@ -3941,6 +3941,18 @@ impl ValidatedAudioLayout {
         )
     }
 
+    /// Replace the stride through the same rule used for delivered audio.
+    #[cfg(feature = "advanced")]
+    pub(crate) fn with_channel_stride_bytes(self, stride: usize) -> LayoutResult<Self> {
+        Self::checked(
+            self.format,
+            self.sample_rate.into(),
+            self.no_channels as i64,
+            self.no_samples as i64,
+            Some(stride),
+        )
+    }
+
     fn checked(
         format: AudioFormat,
         sample_rate: i64,
@@ -4015,7 +4027,7 @@ impl ValidatedAudioLayout {
     }
 
     /// The SDK's `channel_stride_in_bytes`.
-    fn sdk_channel_stride(self) -> i32 {
+    pub(crate) fn sdk_channel_stride(self) -> i32 {
         self.channel_stride_bytes() as i32
     }
 

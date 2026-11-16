@@ -632,9 +632,6 @@ pub enum InputDefect {
     /// max_bytes is less than max_concurrent_calls allocations of max_allocation_bytes.
     #[error("max_bytes is less than max_concurrent_calls allocations of max_allocation_bytes")]
     AllocatorByteLimit,
-    /// Audio allocator extent overflow.
-    #[error("Audio allocator extent overflow")]
-    AllocatorAudioExtentOverflow,
     /// Compressed allocations have a byte size, not a configurable stride.
     #[error("Compressed allocations have a byte size, not a configurable stride")]
     CompressedAllocationStride,
@@ -740,12 +737,6 @@ pub enum InputDefect {
         stride: usize,
         /// The minimum.
         minimum: usize,
-    },
-    /// Audio allocator stride {stride} is not a whole number of samples.
-    #[error("Audio allocator stride {stride} is not a whole number of samples")]
-    AllocatorAudioStride {
-        /// The stride.
-        stride: usize,
     },
     /// An allocation of {bytes} bytes exceeds the capacity limit of {limit} bytes.
     #[error("An allocation of {bytes} bytes exceeds the capacity limit of {limit} bytes")]
