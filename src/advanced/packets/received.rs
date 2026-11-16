@@ -15,6 +15,7 @@ pub struct ReceivedVideoPacket {
 
 impl ReceivedVideoPacket {
     frame_extras_accessors!();
+    video_envelope_accessor!();
 
     /// The complete codec bytes, including retained envelope extensions.
     pub fn data(&self) -> &[u8] {
@@ -98,6 +99,7 @@ pub struct ReceivedAudioPacket {
 
 impl ReceivedAudioPacket {
     frame_extras_accessors!();
+    audio_envelope_accessor!();
 
     /// The complete codec bytes, including retained envelope extensions.
     pub fn data(&self) -> &[u8] {
@@ -308,6 +310,11 @@ mod tests {
         let borrowed = CompressedVideoRef::new(guard).unwrap();
         let received = borrowed.to_owned();
         assert_eq!(received.data(), bytes);
+        assert_eq!(
+            borrowed.envelope(),
+            Some(PacketEnvelope::parse(&bytes).unwrap())
+        );
+        assert_eq!(received.envelope(), borrowed.envelope());
         let pointer = received.data().as_ptr();
         let refused = CompressedVideoFrame::try_from(received)
             .unwrap_err()
@@ -342,6 +349,11 @@ mod tests {
         let borrowed = CompressedAudioRef::new(guard).unwrap();
         let received = borrowed.to_owned();
         assert_eq!(received.data(), bytes);
+        assert_eq!(
+            borrowed.envelope(),
+            Some(PacketEnvelope::parse(&bytes).unwrap())
+        );
+        assert_eq!(received.envelope(), borrowed.envelope());
         let pointer = received.data().as_ptr();
         let refused = CompressedAudioFrame::try_from(received)
             .unwrap_err()

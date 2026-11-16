@@ -103,6 +103,9 @@ received storage into a sendable frame; a refusal returns the original packet.
 Borrowed packets also convert through `TryFrom<&CompressedVideoRef>` and its
 audio equivalent, checking admission before copying. Their `try_copy_into`
 methods reuse an existing sendable frame and leave it unchanged on refusal.
+Contiguous compressed frames and packets expose `envelope()` as a validated
+view of H.264, HEVC or AAC headers and payloads; SpeedHQ and Opus return `None`.
+
 `validate_for_send` is available on the lossless received packet types for
 inspection; constructed compressed frames carry the sendability guarantee.
 Protection flags describe packet conventions and do not encrypt content.

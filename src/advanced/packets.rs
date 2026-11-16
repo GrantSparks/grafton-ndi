@@ -190,7 +190,7 @@ impl TryFrom<FourCc> for EnvelopeCodec {
 }
 
 /// The fixed fields of an envelope header, read in native byte order.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct EnvelopeHeader {
     size: usize,
     codec: FourCc,
@@ -212,7 +212,13 @@ impl EnvelopeHeader {
             .ok()
             .filter(|size| *size >= ENVELOPE_HEADER_BYTES)
             .ok_or_else(|| invalid_frame(crate::FrameDefect::PacketHeaderSize))?;
-        Ok(Self {
+        Ok(Self::read_fields(bytes, size))
+    }
+
+    /// Read the fixed fields after the caller has established the header's
+    /// readable extent and size.
+    fn read_fields(bytes: &[u8], size: usize) -> Self {
+        Self {
             size,
             codec: FourCc::from_raw(u32::from_ne_bytes(field(bytes, CODEC_OFFSET))),
             pts: i64::from_ne_bytes(field(bytes, PTS_OFFSET)),
@@ -221,7 +227,7 @@ impl EnvelopeHeader {
             flags: u32::from_ne_bytes(field(bytes, FLAGS_OFFSET)),
             data_len: u32::from_ne_bytes(field(bytes, DATA_SIZE_OFFSET)) as usize,
             extra_len: u32::from_ne_bytes(field(bytes, EXTRA_DATA_SIZE_OFFSET)) as usize,
-        })
+        }
     }
 
     pub(crate) fn is_keyframe(&self) -> bool {
@@ -327,13 +333,24 @@ impl EnvelopeHeader {
 /// Parsing keeps what it does not understand. Flags, the reserved field and
 /// header bytes added by a later envelope version are all readable, so a
 /// received packet can be inspected or stored without loss.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PacketEnvelope<'a> {
     bytes: &'a [u8],
     header: EnvelopeHeader,
 }
 
 impl<'a> PacketEnvelope<'a> {
+    /// View bytes whose containing packet validated the complete envelope.
+    /// Read on each call so the SDK's current reserved value is preserved.
+    fn from_validated(bytes: &'a [u8]) -> Self {
+        debug_assert!(bytes.len() >= ENVELOPE_HEADER_BYTES);
+        let size = i32::from_ne_bytes(field(bytes, VERSION_OFFSET)) as usize;
+        let header = EnvelopeHeader::read_fields(bytes, size);
+        debug_assert!(size >= ENVELOPE_HEADER_BYTES);
+        debug_assert!(header.total_len().is_some_and(|end| end <= bytes.len()));
+        Self { bytes, header }
+    }
+
     /// Parse `bytes` as one packet envelope.
     ///
     /// # Errors
@@ -871,6 +888,32 @@ macro_rules! frame_extras_accessors {
 }
 pub(crate) use frame_extras_accessors;
 
+macro_rules! video_envelope_accessor {
+    () => {
+        /// The validated H.264 or HEVC envelope, including alpha variants.
+        /// SpeedHQ packets have no envelope and return `None`.
+        pub fn envelope(&self) -> Option<PacketEnvelope<'_>> {
+            self.format()
+                .codec()
+                .envelope_codec()
+                .map(|_| PacketEnvelope::from_validated(self.data()))
+        }
+    };
+}
+
+macro_rules! audio_envelope_accessor {
+    () => {
+        /// The validated AAC envelope. Opus packets have no envelope and
+        /// return `None`.
+        pub fn envelope(&self) -> Option<PacketEnvelope<'_>> {
+            match self.codec() {
+                AudioCodec::Aac => Some(PacketEnvelope::from_validated(self.data())),
+                AudioCodec::Opus => None,
+            }
+        }
+    };
+}
+
 /// One owned compressed video frame: a [`VideoPacketFormat`] and the codec
 /// bytes, with optional metadata.
 ///
@@ -890,6 +933,7 @@ pub struct CompressedVideoFrame {
 
 impl CompressedVideoFrame {
     frame_extras_accessors!();
+    video_envelope_accessor!();
 
     /// Take ownership of one frame's bytes: a packet envelope for H.264 and
     /// HEVC (see [`PacketEnvelope::encode`]), a SpeedHQ frame otherwise. The
@@ -1217,6 +1261,7 @@ pub struct CompressedAudioFrame {
 
 impl CompressedAudioFrame {
     frame_extras_accessors!();
+    audio_envelope_accessor!();
 
     /// Take ownership of one audio frame's bytes: a packet envelope for AAC
     /// (see [`PacketEnvelope::encode`]), one bare packet for Opus.
@@ -1943,6 +1988,79 @@ mod tests {
             }
         }
         assert!(PacketEnvelope::parse(b"Opus").is_err());
+    }
+
+    #[test]
+    fn validated_envelopes_agree_for_owned_borrowed_and_received_packets() {
+        use crate::capture::Guard;
+
+        for codec in VideoCodec::ALL {
+            for tier in [StreamTier::Program, StreamTier::Preview] {
+                for protected in [false, true] {
+                    let format = VideoPacketFormat::new(codec, 16, 16)
+                        .unwrap()
+                        .with_tier(tier)
+                        .with_protected(protected);
+                    let bytes = codec.envelope_codec().map_or_else(
+                        || vec![1, 2, 3, 4],
+                        |codec| {
+                            PacketEnvelope::encode(codec, 17, 13, true, &[1, 2], &[3, 4]).unwrap()
+                        },
+                    );
+                    let mut frame = CompressedVideoFrame::new(format, bytes).unwrap();
+                    if codec.envelope_codec().is_some() {
+                        assert_eq!(frame.envelope().unwrap().reserved(), 0);
+                        let raw = frame.raw();
+                        // SAFETY: the initialized reserved field is inside
+                        // this exclusively owned frame's validated envelope.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                123u64.to_ne_bytes().as_ptr(),
+                                raw.p_data.add(RESERVED_OFFSET),
+                                8,
+                            );
+                        }
+                        assert_eq!(frame.envelope().unwrap().reserved(), 123);
+                    }
+                    let raw = frame.raw();
+                    // SAFETY: frame retains the descriptor's initialized
+                    // bytes until the synthetic non-owning guard is dropped.
+                    let guard =
+                        unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
+                    let borrowed = CompressedVideoRef::new(guard).unwrap();
+                    let received = borrowed.to_owned();
+                    let expected = codec
+                        .envelope_codec()
+                        .map(|_| PacketEnvelope::parse(frame.data()).unwrap());
+                    assert_eq!(frame.envelope(), expected);
+                    assert_eq!(borrowed.envelope(), expected);
+                    assert_eq!(received.envelope(), expected);
+                }
+            }
+        }
+
+        for codec in AudioCodec::ALL {
+            for protected in [false, true] {
+                let (samples, bytes) = match codec {
+                    AudioCodec::Aac => (1024, testing::aac_packet(48_000, 2, &[1, 2])),
+                    AudioCodec::Opus => (960, vec![1, 2]),
+                };
+                let mut frame =
+                    CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes).unwrap();
+                frame.set_protected(protected);
+                let raw = frame.raw();
+                // SAFETY: frame retains all descriptor storage until the
+                // synthetic non-owning guard is dropped.
+                let guard = unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
+                let borrowed = CompressedAudioRef::new(guard).unwrap();
+                let received = borrowed.to_owned();
+                let expected = (codec == AudioCodec::Aac)
+                    .then(|| PacketEnvelope::parse(frame.data()).unwrap());
+                assert_eq!(frame.envelope(), expected);
+                assert_eq!(borrowed.envelope(), expected);
+                assert_eq!(received.envelope(), expected);
+            }
+        }
     }
 
     /// The dimensions of a format the caller describes are input; those of a
