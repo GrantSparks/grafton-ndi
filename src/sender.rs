@@ -2722,8 +2722,9 @@ mod tests {
         match path {
             "validation" => assert!(matches!(frame, Err(Error::InvalidUtf8(_)))),
             "unwind" => {
+                let frame = frame.unwrap();
                 let panic = std::panic::catch_unwind(|| {
-                    let _frame = frame.unwrap();
+                    let _frame = frame;
                     panic!("unwind while upstream metadata is borrowed");
                 });
                 assert!(panic.is_err());
