@@ -497,6 +497,11 @@ fn child(name: &str, fixtures: &Fixtures) {
             );
             fs::write(gates.join("queued.mkv.release"), b"").unwrap();
             wait_for(|| !Ndi::is_running());
+            // Stopping is already not running, before the native destroy
+            // callback has necessarily appended its evidence.
+            wait_for(|| {
+                fs::read_to_string(&log).is_ok_and(|log| log.lines().any(|line| line == "destroy"))
+            });
             let log = fs::read_to_string(log).unwrap();
             assert_eq!(log.lines().filter(|line| *line == "initialize").count(), 1);
             assert_eq!(log.lines().filter(|line| *line == "destroy").count(), 1);
