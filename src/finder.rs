@@ -26,7 +26,7 @@ use std::{
 
 use crate::{
     change_feed::ChangeFeed,
-    sdk_copy::{copy_sdk_string, LossyText},
+    sdk_copy::LossyText,
     sys::{self, bindings::*},
     timeout::{Deadline, NeverStop, Stop, StopResult, POLL_INTERVAL},
     Error, Ndi, ResourceKind, Result,
@@ -297,33 +297,6 @@ pub(crate) unsafe trait FinderSnapshot: snapshot_sealed::Sealed {
     ) -> Result<Option<Self::Item>>;
 }
 
-impl snapshot_sealed::Sealed for sys::Core {}
-
-// SAFETY: the v1 SDK snapshot follows FinderSnapshot's contract, and its copier
-// produces owned source names and addresses within the shared byte budget.
-unsafe impl FinderSnapshot for sys::Core {
-    type Descriptor = NDIlib_source_t;
-    type Item = Source;
-
-    unsafe fn fetch(
-        &self,
-        instance: NDIlib_find_instance_t,
-        count: &mut u32,
-    ) -> *const Self::Descriptor {
-        // SAFETY: the guard supplies a live serialized finder instance.
-        unsafe { self.NDIlib_find_get_current_sources(instance, count) }
-    }
-
-    unsafe fn copy(
-        &self,
-        source: &Self::Descriptor,
-        budget: &mut SnapshotBudget,
-    ) -> Result<Option<Self::Item>> {
-        // SAFETY: FinderSnapshot's caller keeps this snapshot's strings live.
-        unsafe { snapshot_entry(source, budget) }
-    }
-}
-
 /// The same native snapshot and copy budget, with allocation deferred until
 /// an internal selector accepts the borrowed, bounded source text.
 struct SelectingSnapshot<'a, F> {
@@ -347,7 +320,7 @@ unsafe impl<F: Fn(&BorrowedSource<'_>) -> Result<bool>> FinderSnapshot
         count: &mut u32,
     ) -> *const Self::Descriptor {
         // SAFETY: forwarded to the serialized live-instance obligation.
-        unsafe { self.core.fetch(instance, count) }
+        unsafe { self.core.NDIlib_find_get_current_sources(instance, count) }
     }
 
     unsafe fn copy(
@@ -357,7 +330,7 @@ unsafe impl<F: Fn(&BorrowedSource<'_>) -> Result<bool>> FinderSnapshot
     ) -> Result<Option<Source>> {
         let (name, address) = source_pointers(source);
         // SAFETY: the snapshot guard keeps both native strings readable.
-        unsafe { snapshot_selected_source(name, address, budget, &self.select) }
+        unsafe { decode_source(name, address, budget, &self.select) }
     }
 }
 
@@ -606,41 +579,7 @@ impl SourceWatch<'_> {
     }
 }
 
-/// One entry of a [`Finder::current_sources`] snapshot, or `None` for a
-/// descriptor the SDK should not produce, which the snapshot leaves out.
-///
-/// # Safety
-///
-/// As for [`Source::try_from_raw`].
-pub(crate) unsafe fn snapshot_entry(
-    source: &NDIlib_source_t,
-    budget: &mut SnapshotBudget,
-) -> Result<Option<Source>> {
-    let (name, address) = source_pointers(source);
-    // SAFETY: forwarded from the descriptor's bounded string contract.
-    unsafe { snapshot_source(name, address, budget) }
-}
-
-/// Copy source text through the policy shared by every finder snapshot.
-///
-/// # Safety
-/// Each non-null pointer stays readable through its first NUL or the SDK
-/// string bound, whichever comes first, until copying finishes.
-pub(crate) unsafe fn snapshot_source(
-    name: *const c_char,
-    address: *const c_char,
-    budget: &mut SnapshotBudget,
-) -> Result<Option<Source>> {
-    if name.is_null() && !address.is_null() {
-        budget.empty_source_name()?;
-    }
-    // SAFETY: the caller keeps both strings readable through their terminator
-    // or the SDK string bound. This policy skips malformed strings while
-    // retaining their scan charges in the snapshot's shared budget.
-    unsafe { decode_source(name, address, |pointer| budget.text(pointer)) }
-}
-
-struct BorrowedSource<'a> {
+pub(crate) struct BorrowedSource<'a> {
     name: LossyText<'a>,
     address: Option<LossyText<'a>>,
 }
@@ -672,27 +611,70 @@ impl BorrowedSource<'_> {
     }
 }
 
-/// Preserve scan order and every ordinary-copy charge, including rejected
-/// entries. Only allocation is conditional; no borrowed native text escapes.
+mod descriptor_sealed {
+    pub trait Sealed {}
+}
+
+/// A descriptor's bounded-text policy. The decoder alone owns null handling,
+/// selection order and source construction.
+pub(crate) trait DescriptorText: descriptor_sealed::Sealed {
+    fn empty_source_name(&mut self) -> Result<()>;
+
+    /// # Safety
+    /// The non-null pointer remains readable through its first NUL or the SDK
+    /// string bound, for the returned lifetime.
+    unsafe fn view<'a>(&mut self, pointer: *const c_char) -> Result<Option<LossyText<'a>>>;
+}
+
+impl descriptor_sealed::Sealed for SnapshotBudget {}
+impl DescriptorText for SnapshotBudget {
+    fn empty_source_name(&mut self) -> Result<()> {
+        self.charge_empty_source_name()
+    }
+
+    unsafe fn view<'a>(&mut self, pointer: *const c_char) -> Result<Option<LossyText<'a>>> {
+        // SAFETY: forwarded to the decoder's bounded string obligation.
+        unsafe { self.source_text_view(pointer) }
+    }
+}
+
+struct SingleSourceText(sys::table::Called<()>);
+impl descriptor_sealed::Sealed for SingleSourceText {}
+impl DescriptorText for SingleSourceText {
+    fn empty_source_name(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    unsafe fn view<'a>(&mut self, pointer: *const c_char) -> Result<Option<LossyText<'a>>> {
+        // SAFETY: the descriptor caller keeps each non-null string readable.
+        let text = unsafe { crate::sdk_copy::sdk_text(self.0.map(|()| pointer)) }?;
+        Ok(Some(LossyText::new(text)))
+    }
+}
+
+/// Decode a source through one view-then-build policy. Both null pointers name
+/// no source; a null name beside an address becomes the shared empty name.
+/// Rejected entries retain all text charges but allocate no source storage.
 ///
 /// # Safety
-/// Each non-null pointer stays readable through its first NUL or the SDK bound
-/// until selection and any accepted source copy have finished.
-unsafe fn snapshot_selected_source(
+/// Each non-null pointer remains readable through its first NUL or
+/// `MAX_SDK_STRING_BYTES`, whichever comes first, until selection and copying
+/// finish. The policy must preserve that lifetime.
+pub(crate) unsafe fn decode_source(
     name: *const c_char,
     address: *const c_char,
-    budget: &mut SnapshotBudget,
+    text: &mut impl DescriptorText,
     select: impl FnOnce(&BorrowedSource<'_>) -> Result<bool>,
 ) -> Result<Option<Source>> {
     if name.is_null() && address.is_null() {
         return Ok(None);
     }
     let name = if name.is_null() {
-        budget.empty_source_name()?;
-        LossyText::new(b"")
+        text.empty_source_name()?;
+        LossyText::new(c"")
     } else {
         // SAFETY: forwarded to the caller's bounded string obligation.
-        let Some(name) = (unsafe { budget.source_text_view(name) })? else {
+        let Some(name) = (unsafe { text.view(name) })? else {
             return Ok(None);
         };
         name
@@ -701,7 +683,7 @@ unsafe fn snapshot_selected_source(
         None
     } else {
         // SAFETY: forwarded to the caller's bounded string obligation.
-        let Some(address) = (unsafe { budget.source_text_view(address) })? else {
+        let Some(address) = (unsafe { text.view(address) })? else {
             return Ok(None);
         };
         Some(address)
@@ -710,17 +692,13 @@ unsafe fn snapshot_selected_source(
     if !select(&source)? {
         return Ok(None);
     }
-    // SAFETY: both classified strings came from bounded scans excluding NUL;
-    // the source copy charges were already paid, even if selection rejected it.
-    unsafe {
-        Ok(Some(Source::from_text(
-            SourceText::from_sdk(source.name)?,
-            source
-                .address
-                .map(|address| SourceText::from_sdk(address).map(SourceAddress))
-                .transpose()?,
-        )))
-    }
+    Ok(Some(Source::from_text(
+        SourceText::from_sdk(source.name)?,
+        source
+            .address
+            .map(|address| SourceText::from_sdk(address).map(SourceAddress))
+            .transpose()?,
+    )))
 }
 
 /// The descriptor's address is one pointer, whether the SDK calls it an IP
@@ -729,43 +707,6 @@ fn source_pointers(source: &NDIlib_source_t) -> (*const c_char, *const c_char) {
     // SAFETY: both union fields are pointers of the same type.
     let address = unsafe { source.__bindgen_anon_1.p_url_address };
     (source.p_ndi_name, address)
-}
-
-/// Decode a source's two strings with the caller's copy policy. A null name
-/// is allowed when an address is present; both null pointers name no source.
-/// `copy` is called only for non-null pointers, and `None` omits the source.
-///
-/// # Safety
-///
-/// Each non-null pointer must stay readable through its first NUL or
-/// [`crate::sdk_copy::MAX_SDK_STRING_BYTES`] bytes, whichever comes first,
-/// until its copy finishes. The copy policy must preserve those lifetimes.
-pub(crate) unsafe fn decode_source(
-    name: *const c_char,
-    address: *const c_char,
-    mut copy: impl FnMut(*const c_char) -> Result<Option<SourceText>>,
-) -> Result<Option<Source>> {
-    if name.is_null() && address.is_null() {
-        return Ok(None);
-    }
-    let name = if name.is_null() {
-        // SAFETY: empty bytes are NUL-free.
-        unsafe { SourceText::from_sdk(LossyText::new(b"")) }?
-    } else {
-        let Some(name) = copy(name)? else {
-            return Ok(None);
-        };
-        name
-    };
-    let address = if address.is_null() {
-        None
-    } else {
-        let Some(address) = copy(address)? else {
-            return Ok(None);
-        };
-        Some(SourceAddress(address))
-    };
-    Ok(Some(Source::from_text(name, address)))
 }
 
 impl Finder {
@@ -919,7 +860,12 @@ impl Finder {
 
     pub(crate) fn current_sources_stoppable<S: Stop>(&self, stop: S) -> StopResult<Vec<Source>, S> {
         match self.lock_snapshots(stop) {
-            Ok(guard) => guard.snapshot(&*self.sdk).map(Ok),
+            Ok(guard) => guard
+                .snapshot(&SelectingSnapshot {
+                    core: &self.sdk,
+                    select: |_: &BorrowedSource<'_>| Ok(true),
+                })
+                .map(Ok),
             Err(stopped) => Ok(Err(stopped)),
         }
     }
@@ -1610,17 +1556,12 @@ impl SourceText {
         2 * std::mem::size_of::<usize>() + std::mem::size_of::<CString>() + 1;
 
     /// Copy classified SDK text directly into its final shared native storage.
-    ///
-    /// # Safety
-    /// `source` must have been classified from bytes containing no NUL, as
-    /// guaranteed by a bounded SDK string scan.
-    pub(crate) unsafe fn from_sdk(source: LossyText<'_>) -> Result<Self> {
+    pub(crate) fn from_sdk(source: LossyText<'_>) -> Result<Self> {
         let mut text = String::new();
         text.try_reserve_exact(source.len() + 1)
             .map_err(|_| budget::allocation_failed())?;
         source.push_to(&mut text);
-        // SAFETY: the caller's bounded scan excluded NUL; UTF-8 replacement
-        // introduces none. The only terminator is appended below.
+        // SAFETY: LossyText carries the NUL-free representation invariant.
         Ok(unsafe { Self::from_nul_free_string(text) })
     }
 
@@ -1628,13 +1569,25 @@ impl SourceText {
     ///
     /// # Safety
     /// `text` must contain no NUL.
-    pub(crate) unsafe fn from_nul_free_string(text: String) -> Self {
+    unsafe fn from_nul_free_string(text: String) -> Self {
         let mut bytes = text.into_bytes();
         bytes.push(0);
         // SAFETY: the caller excludes interior NUL and we appended the sole NUL.
         Self(Arc::new(unsafe {
             CString::from_vec_with_nul_unchecked(bytes)
         }))
+    }
+
+    pub(crate) fn with_port(&self, port: u16) -> Self {
+        let address = self.as_str();
+        let endpoint = if address.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{address}]:{port}")
+        } else {
+            format!("{address}:{port}")
+        };
+        // SAFETY: SourceText contains no interior NUL, and formatting adds
+        // only brackets, a colon and decimal digits.
+        unsafe { Self::from_nul_free_string(endpoint) }
     }
 
     pub(crate) fn new(text: String) -> Result<Self> {
@@ -2010,9 +1963,12 @@ impl Source {
         // terminator or the SDK string bound. The decoder passes only non-null
         // pointers to this strict policy, which reports malformed SDK text.
         unsafe {
-            decode_source(name, address, |pointer| {
-                copy_sdk_string(source.map(|_| pointer)).map(Some)
-            })
+            decode_source(
+                name,
+                address,
+                &mut SingleSourceText(source.map(|_| ())),
+                |_| Ok(true),
+            )
         }?
         .ok_or_else(failed)
     }
@@ -3620,7 +3576,12 @@ mod tests {
                 assert!(self.finder.sources_lock.try_lock().is_none());
                 std::thread::yield_now();
                 // SAFETY: the probe's borrowed C strings remain live.
-                let owned = unsafe { snapshot_entry(source, budget) };
+                let owned = unsafe {
+                    {
+                        let (name, address) = source_pointers(source);
+                        decode_source(name, address, budget, |_| Ok(true))
+                    }
+                };
                 assert_eq!(self.active.fetch_sub(1, Ordering::SeqCst), 1);
                 owned
             }
@@ -3790,12 +3751,32 @@ mod tests {
             // SAFETY: pointers are null, live C string literals, or the live
             // buffer readable for the complete SDK string bound. Both copies
             // finish before any backing storage is dropped.
-            let (snapshot, single) = unsafe {
+            let mut accepted_budget = SnapshotBudget::new();
+            let mut rejected_budget = SnapshotBudget::new();
+            let ((snapshot, accepted_allocations), (rejected, rejected_allocations), single) = unsafe {
                 (
-                    snapshot_entry(&raw, &mut SnapshotBudget::new()),
+                    crate::test_alloc::allocation_count(|| {
+                        decode_source(name, address, &mut accepted_budget, |_| Ok(true))
+                    }),
+                    crate::test_alloc::allocation_count(|| {
+                        decode_source(name, address, &mut rejected_budget, |_| Ok(false))
+                    }),
                     source_from_raw(&raw, c"test source query"),
                 )
             };
+            assert!(rejected.unwrap().is_none(), "{label}");
+            assert_eq!(rejected_allocations, 0, "{label}");
+            assert_eq!(accepted_budget.spent(), rejected_budget.spent(), "{label}");
+            let strings = usize::from(!address.is_null()) + 1;
+            assert_eq!(
+                accepted_allocations,
+                if snapshot.as_ref().is_ok_and(Option::is_some) {
+                    2 * strings
+                } else {
+                    0
+                },
+                "{label}"
+            );
             match expected {
                 Expected::Source(expected) => {
                     assert_eq!(snapshot.unwrap().as_ref(), Some(&expected), "{label}");
@@ -3907,7 +3888,12 @@ mod tests {
                 budget: &mut SnapshotBudget,
             ) -> Result<Option<Source>> {
                 // SAFETY: all fixture strings remain live through this call.
-                unsafe { snapshot_entry(source, budget) }
+                unsafe {
+                    {
+                        let (name, address) = source_pointers(source);
+                        decode_source(name, address, budget, |_| Ok(true))
+                    }
+                }
             }
         }
         let sources = finder.snapshot(&SliceSnapshot(&snapshot));

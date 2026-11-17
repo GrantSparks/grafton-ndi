@@ -9,7 +9,7 @@ use crate::{
 };
 
 #[cfg(any(test, ndi_has_advanced_source_metadata))]
-use crate::finder::{snapshot_source, SnapshotBudget};
+use crate::finder::{decode_source, SnapshotBudget};
 
 /// A discovered source together with the metadata it advertises.
 ///
@@ -58,7 +58,7 @@ unsafe fn extended_source(
 ) -> Result<Option<ExtendedSource>> {
     // SAFETY: the caller keeps the strings readable while the snapshot policy
     // copies them, omitting malformed entries without losing their scan charges.
-    let Some(source) = (unsafe { snapshot_source(name, address, budget)? }) else {
+    let Some(source) = (unsafe { decode_source(name, address, budget, |_| Ok(true))? }) else {
         return Ok(None);
     };
     let metadata = if metadata.is_null() {
@@ -153,16 +153,13 @@ mod tests {
             (name, address),
             (std::ptr::null(), std::ptr::null()),
         ] {
-            let mut descriptor = crate::sys::bindings::NDIlib_source_t {
-                p_ndi_name: name,
-                ..Default::default()
-            };
-            descriptor.__bindgen_anon_1.p_url_address = address;
             let mut plain_budget = SnapshotBudget::new();
             let mut metadata_budget = SnapshotBudget::new();
             // SAFETY: both pointer pairs are null or live terminated literals.
-            let plain =
-                unsafe { crate::finder::snapshot_entry(&descriptor, &mut plain_budget) }.unwrap();
+            let plain = unsafe {
+                crate::finder::decode_source(name, address, &mut plain_budget, |_| Ok(true))
+            }
+            .unwrap();
             let metadata =
                 unsafe { extended_source(name, address, std::ptr::null(), &mut metadata_budget) }
                     .unwrap();

@@ -363,7 +363,7 @@ pub struct AdvertisedSender {
     id: Option<SenderId>,
     name: Option<SourceText>,
     metadata: Option<String>,
-    address: Option<String>,
+    address: Option<SourceText>,
     port: Option<u16>,
     groups: Vec<String>,
     subscribed: bool,
@@ -383,7 +383,7 @@ impl AdvertisedSender {
     }
     /// The sender's network address.
     pub fn address(&self) -> Option<&str> {
-        self.address.as_deref()
+        self.address.as_ref().map(SourceText::as_str)
     }
     /// The sender's network port, or `None` when the advertised value is not a
     /// port number.
@@ -402,14 +402,7 @@ impl AdvertisedSender {
     pub fn to_source(&self) -> Option<crate::Source> {
         let mut source = crate::Source::from_text(self.name.as_ref()?.clone(), None);
         if let (Some(address), Some(port)) = (&self.address, self.port) {
-            let endpoint = if address.parse::<std::net::Ipv6Addr>().is_ok() {
-                format!("[{address}]:{port}")
-            } else {
-                format!("{address}:{port}")
-            };
-            // SAFETY: scanned SDK address text contains no NUL, and formatting
-            // adds only brackets, a colon and decimal port digits.
-            let endpoint = unsafe { SourceText::from_nul_free_string(endpoint) };
+            let endpoint = address.with_port(port);
             source = source.with_address(crate::SourceAddress::from_text(endpoint));
         }
         Some(source)
@@ -892,7 +885,7 @@ impl SendListener {
                     id: budget.id(sender.p_uuid)?.map(SenderId::from_exact),
                     name: budget.source_text(sender.p_name)?,
                     metadata: budget.text(sender.p_metadata)?,
-                    address: budget.text(sender.p_address)?,
+                    address: budget.source_text(sender.p_address)?,
                     port: u16::try_from(sender.port).ok(),
                     groups,
                     subscribed: sender.events_subscribed,
@@ -1046,7 +1039,7 @@ mod tests {
             id: None,
             name: Some(SourceText::new("Studio (Camera)".into()).unwrap()),
             metadata: None,
-            address: Some("192.0.2.10".into()),
+            address: Some(SourceText::new("192.0.2.10".into()).unwrap()),
             port: Some(5960),
             groups: vec![],
             subscribed: false,
@@ -1060,7 +1053,7 @@ mod tests {
             ("2001:db8::10", "[2001:db8::10]:5960"),
             ("[2001:db8::10]", "[2001:db8::10]:5960"),
         ] {
-            sender.address = Some(address.into());
+            sender.address = Some(SourceText::new(address.into()).unwrap());
             let source = sender.to_source().unwrap();
             let actual = source.address().unwrap();
             assert_eq!(actual.as_str(), endpoint);

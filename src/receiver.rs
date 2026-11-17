@@ -89,7 +89,7 @@ impl RecvStringGuard<'_> {
         // SAFETY: the SDK returned a readable NUL-terminated string, which
         // this guard keeps allocated for as long as it is borrowed.
         let bytes = unsafe { crate::sdk_copy::sdk_text(self.string) }?;
-        Ok(Some(bytes))
+        Ok(Some(bytes.to_bytes()))
     }
 
     /// Copy the string, failing with [`Error::InvalidUtf8`] when it is not UTF-8.
