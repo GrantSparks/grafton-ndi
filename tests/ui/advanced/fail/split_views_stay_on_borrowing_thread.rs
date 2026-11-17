@@ -1,4 +1,7 @@
-use grafton_ndi::{advanced::ReceiverControls, FrameSyncAttached, FrameSyncCapture};
+use grafton_ndi::{
+    advanced::{FrameSyncCapture, ReceiverControls},
+    FrameSyncAttached,
+};
 fn send<T: Send>() {}
 fn sync<T: Sync>() {}
 fn main() {

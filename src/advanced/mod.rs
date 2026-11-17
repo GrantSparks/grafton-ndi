@@ -92,6 +92,7 @@ pub enum QueueAttached {}
 /// Sealed sender modes that send compressed audio: compressed and queued.
 /// Their constructors require an Advanced runtime.
 pub trait CompressedAudioSendMode: crate::sender::SenderMode {}
+pub use crate::framesync::capture::FrameSyncCapture;
 pub use allocators::*;
 pub use config::AdvancedConfig;
 pub(crate) use configured::Configurable;

@@ -119,8 +119,7 @@ pub use {
         VideoSource,
     },
     framesync::{
-        AudioInputFormat, FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncCapture,
-        FrameSyncVideoRef,
+        AudioInputFormat, FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef,
     },
     receiver::{
         AudioMode, ConnectionStats, EventMode, FrameSyncAttached, MetadataMode, Ptz, RawCapture,
