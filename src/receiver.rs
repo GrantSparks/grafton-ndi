@@ -1280,6 +1280,14 @@ pub(crate) struct RecvInstance(pub(crate) NDIlib_recv_instance_t);
 // cannot exclude remote changes inside the SDK: those depend on the native
 // locks above. tests/receiver_connect_overlap_sdk.rs exercises every available
 // shared control against captures, local changes and 6.4 remote changes.
+// Sixteen capture threads, three control threads and 1080p feeds completed
+// 120-second local connection storms on each of the five runtimes above,
+// validating frames, operation budgets, resumed progress and balanced loans.
+// Helgrind 3.19 workloads on Standard/Advanced 6.3.2 and 6.4 also completed,
+// including Advanced KVM input/capture. They report SDK allocator/state handoffs,
+// the capture polling flag and Rust synchronization; these are qualified
+// detector runs, not zero-error results. The exclusion and observed native
+// locking above supply the concurrency argument.
 // Every native use retains the core; its other fields determine its auto traits.
 unsafe impl Send for RecvInstance {}
 // SAFETY: as above; receiver modes reserve the media paths used by synchronizers.
