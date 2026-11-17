@@ -1198,7 +1198,10 @@ impl ConnectionChange<'_> {
 }
 
 /// Only a receiver's shared-control lock can issue this permit.
-struct ControlPermit;
+#[derive(Default)]
+struct ControlPermit {
+    registrations: ConnectionMetadata,
+}
 
 /// Serialized shared controls, independent of local connection changes.
 /// The native receiver lock supplies exclusion against connection changes;
@@ -1220,13 +1223,36 @@ impl Control<'_> {
         self.instance.0
     }
 
+    fn add_metadata<S: MetadataSource + ?Sized>(
+        &mut self,
+        table: &sys::ReceiverConnectionMetadata,
+        metadata: &S,
+    ) {
+        let instance = self.instance();
+        self._exclusive.registrations.add(metadata, |raw| {
+            // SAFETY: the control permit owns the descriptor and text until
+            // clear returns or after native destruction, and serializes shared
+            // controls. The native receiver lock synchronizes local changes.
+            unsafe { table.NDIlib_recv_add_connection_metadata(instance, raw) };
+        });
+    }
+
+    fn clear_metadata(&mut self, table: &sys::ReceiverConnectionMetadata) {
+        let instance = self.instance();
+        self._exclusive.registrations.clear(|| {
+            // SAFETY: registrations stay alive through this native clear under
+            // the same control permit; native locking covers local changes.
+            unsafe { table.NDIlib_recv_clear_connection_metadata(instance) };
+        });
+    }
+
     /// Exercise the real permission-shaped boundary with a synthetic identity.
     #[cfg(all(test, feature = "advanced"))]
     pub(crate) fn with_test_instance<T>(
         instance: NDIlib_recv_instance_t,
         call: impl FnOnce(&Control<'_>) -> T,
     ) -> T {
-        let gate = Mutex::new(ControlPermit);
+        let gate = Mutex::new(ControlPermit::default());
         let permission = Control {
             instance: RecvInstance(instance),
             _exclusive: gate.lock(),
@@ -1348,10 +1374,13 @@ impl AdvertiserMembership<'_> {
     }
 }
 
+/// Only this receiver's source-query lock issues this permit.
+struct SourceQueryPermit;
+
 /// One source-report consumer under the native report mutex and Rust query gate.
 struct SourceQuery<'a> {
     instance: RecvInstance,
-    _query: MutexGuard<'a, ()>,
+    _query: MutexGuard<'a, SourceQueryPermit>,
 }
 
 impl SourceQuery<'_> {
@@ -1373,7 +1402,7 @@ pub(crate) struct RecvInstance(NDIlib_recv_instance_t);
 // free_metadata                                     | contract; see CaptureLock
 // connect                                           | Change permit
 // set_tally, send_metadata, get_web_control           | Control permit; native lock against local changes
-// add_connection_metadata, clear_connection_metadata | Control + registration; native receiver lock
+// add_connection_metadata, clear_connection_metadata | Control-owned registrations; native receiver lock
 // set/get_video_delay, set/get_audio_delay           | Control permit; native lock against local changes
 // get_performance, get_queue                         | Control permit; native lock against local changes
 // get_no_connections                                | Measured native read lock
@@ -1466,9 +1495,8 @@ pub(crate) struct ReceiverCore {
     pending: PendingEvents,
     // Only native source-name queries take this permit. Replaying an abandoned
     // result takes the separate short lock, never waiting for the SDK.
-    source_query_guard: Mutex<()>,
+    source_query_guard: Mutex<SourceQueryPermit>,
     source_name: Mutex<LatestReport<SourceNameChange>>,
-    connection_metadata: Mutex<ConnectionMetadata>,
     _name: Option<CString>,
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
@@ -1589,12 +1617,11 @@ impl<M: CreatableMode> Receiver<M> {
                 instance: RecvInstance(instance),
                 sdk,
                 change_guard: Mutex::new(ChangePermit),
-                control_guard: Mutex::new(ControlPermit),
+                control_guard: Mutex::new(ControlPermit::default()),
                 target: RwLock::new(RetainedSource::new(&options.source)),
                 pending: PendingEvents::default(),
-                source_query_guard: Mutex::new(()),
+                source_query_guard: Mutex::new(SourceQueryPermit),
                 source_name: Mutex::new(LatestReport::default()),
-                connection_metadata: Mutex::new(ConnectionMetadata::default()),
                 _name,
                 #[cfg(feature = "advanced")]
                 _config: config,
@@ -1833,14 +1860,7 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_add_connection_metadata")]
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let table = self.core.connection_metadata()?;
-        let connection = self.core.lock_control();
-        let mut registrations = self.core.connection_metadata.lock();
-        registrations.add(metadata, |raw| {
-            // SAFETY: the locked collection owns this stable descriptor and its
-            // text until clear returns or after the native receiver is destroyed.
-            // The control permit provides the RecvInstance control exclusion.
-            unsafe { table.NDIlib_recv_add_connection_metadata(connection.instance(), raw) };
-        });
+        self.core.lock_control().add_metadata(table, metadata);
         Ok(())
     }
 
@@ -1853,14 +1873,7 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_clear_connection_metadata")]
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.core.connection_metadata()?;
-        let connection = self.core.lock_control();
-        let mut registrations = self.core.connection_metadata.lock();
-        registrations.clear(|| {
-            // SAFETY: the receiver and every registered descriptor remain live
-            // until the native clear returns under the same registration lock.
-            // The control permit provides the RecvInstance control exclusion.
-            unsafe { table.NDIlib_recv_clear_connection_metadata(connection.instance()) };
-        });
+        self.core.lock_control().clear_metadata(table);
         Ok(())
     }
 
@@ -2262,6 +2275,15 @@ impl ReceiverCore {
         }
     }
 
+    fn lock_source_query(&self, until: Instant) -> Option<SourceQuery<'_>> {
+        self.source_query_guard
+            .try_lock_until(until)
+            .map(|query| SourceQuery {
+                instance: self.instance,
+                _query: query,
+            })
+    }
+
     pub(crate) fn advertiser_membership(&self) -> AdvertiserMembership<'_> {
         AdvertiserMembership(self)
     }
@@ -2468,12 +2490,8 @@ impl ReceiverCore {
             if let Some(change) = self.source_name.lock().pending.take() {
                 return Ok(Some(change));
             }
-            let Some(query) = self.source_query_guard.try_lock_until(attempt.0.end()) else {
+            let Some(query) = self.lock_source_query(attempt.0.end()) else {
                 return Ok(None);
-            };
-            let query = SourceQuery {
-                instance: self.instance,
-                _query: query,
             };
             // A worker may have replayed while this poller waited for the permit.
             if let Some(change) = self.source_name.lock().pending.take() {
@@ -2888,9 +2906,11 @@ const _: () = {
 
 // A panic cannot leave a receiver's shared state half-changed: of its locks,
 // the target and pending unknown event are replaced whole; the string-query
-// lock protects complete retained changes. The rest of its mutable state is atomic, and no
-// application code runs while a
-// lock is held. The `parking_lot` locks do not poison and so do not declare
+// lock protects complete retained changes. Control-owned registrations install
+// retained storage before native add and release it only after native clear;
+// unwinding leaves that storage valid. Native connection changes can run
+// application allocator code under the independent change permit, which holds
+// no partially modified state. The remaining mutable state is atomic. The `parking_lot` locks do not poison and so do not declare
 // this themselves, which would otherwise leave `Receiver` short of
 // `RefUnwindSafe` and a `RecvAdvertiser`, which keeps registered receivers
 // alive, short of the unwind safety a `SendAdvertiser` has.
@@ -4016,6 +4036,18 @@ mod tests {
         });
         receiver.core.pending.status.publish();
         assert!(receiver.core.take_pending_status().unwrap().is_some());
+    }
+
+    #[test]
+    fn source_query_permit_excludes_another_issuer_until_drop() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        let query = receiver.core.lock_source_query(Instant::now()).unwrap();
+        assert!(receiver.core.lock_source_query(Instant::now()).is_none());
+        drop(query);
+        assert!(receiver.core.lock_source_query(Instant::now()).is_some());
     }
 
     #[test]
