@@ -167,16 +167,28 @@ pub(crate) fn list_cstring(
 ) -> Result<Option<CString>> {
     values
         .map(|values| {
-            for (index, value) in values.iter().enumerate() {
-                if value.is_empty() || value.contains([',', '\0']) {
-                    return Err(Error::InvalidInput(crate::InputDefect::ListElement {
-                        setting,
-                        index,
-                    }));
-                }
+            let invalid =
+                |index| Error::InvalidInput(crate::InputDefect::ListElement { setting, index });
+            let boundary = values
+                .iter()
+                .position(|value| value.is_empty() || value.contains(','));
+            // Only earlier elements can take precedence over a boundary error.
+            // CString supplies the sole NUL check; every comma before that NUL
+            // is a separator, so its count is the original element index.
+            let prefix = &values[..boundary.unwrap_or(values.len())];
+            let joined = CString::new(prefix.join(",")).map_err(|error| {
+                let nul = error.nul_position();
+                invalid(
+                    error.into_vec()[..nul]
+                        .iter()
+                        .filter(|&&byte| byte == b',')
+                        .count(),
+                )
+            })?;
+            if let Some(index) = boundary {
+                return Err(invalid(index));
             }
-            // Every element was checked, and the separator contains no NUL.
-            Ok(CString::new(values.join(",")).expect("validated list elements contain no NUL"))
+            Ok(joined)
         })
         .transpose()
 }
@@ -2550,6 +2562,29 @@ mod tests {
                     setting: "groups",
                     index: 1
                 }))
+            ));
+        }
+    }
+
+    #[test]
+    fn configured_lists_report_the_first_invalid_element_across_checks() {
+        for (values, expected) in [
+            (["first\0nul", "", "last,comma"], 0),
+            (["first,comma", "second\0nul", ""], 0),
+            (["", "second\0nul", "last,comma"], 0),
+            (["valid", "second\0nul", "last,comma"], 1),
+            (["valid", "second,comma", "last\0nul"], 1),
+            (["valid", "", "last\0nul"], 1),
+            (["non-ASCII café", "second\0nul", "last,comma"], 1),
+            (["valid", "second", "last\0nul"], 2),
+        ] {
+            let values = values.map(str::to_owned);
+            assert!(matches!(
+                list_cstring(Some(&values), "servers"),
+                Err(Error::InvalidInput(crate::InputDefect::ListElement {
+                    setting: "servers",
+                    index,
+                })) if index == expected
             ));
         }
     }
