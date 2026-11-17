@@ -244,8 +244,8 @@ crate::media::decoded_variants!(PixelFormat:
 impl PixelFormat {
     /// The complete readable allocation size for sending this layout.
     ///
-    /// `line_stride_bytes` is `None` for tightly packed rows, or a positive
-    /// byte distance between rows that holds the active width. The returned size includes every plane and
+    /// `line_stride_bytes` is `None` for tightly packed rows; explicit values
+    /// follow the [video stride rules](Self::buffer_len). The returned size includes every plane and
     /// the extra readable bytes required by the format and scan type. It is
     /// suitable for allocating external buffers used with
     /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`].
@@ -518,8 +518,11 @@ impl PixelFormat {
     /// using checked arithmetic.
     ///
     /// `line_stride_bytes` is `None` for tightly packed rows, or the byte
-    /// distance between row starts. Explicit strides must hold the active
-    /// width. The result includes all planes, without SDK send tail room.
+    /// distance between first-plane row starts. An explicit stride must be
+    /// positive, hold at least the active row (`width × bytes per pixel`),
+    /// and be even for YV12, I420 and UYVA. The complete layout must fit the
+    /// crate's maximum video frame size. The result includes all planes,
+    /// without SDK send tail room.
     ///
     /// # Examples
     ///
@@ -531,14 +534,24 @@ impl PixelFormat {
     ///
     /// // NV12 1920x1080: Y (1920*1080) + UV (1920*540) = 3,110,400 bytes
     /// assert_eq!(PixelFormat::Nv12.buffer_len(1920, 1080, None)?, 3_110_400);
+    ///
+    /// // Planar 4:2:0 needs an even stride; semi-planar NV12 permits an odd one.
+    /// assert!(PixelFormat::I420.buffer_len(1920, 1080, Some(1921)).is_err());
+    /// assert!(PixelFormat::Nv12.buffer_len(1920, 1080, Some(1921)).is_ok());
     /// # Ok::<(), grafton_ndi::Error>(())
     /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidFrame`] if dimensions are invalid for this
-    /// format or the result exceeds the crate's
-    /// maximum video frame size.
+    /// Returns [`Error::InvalidFrame`] for invalid dimensions, a stride that
+    /// is zero or shorter than the active row, an odd YV12/I420 or UYVA stride,
+    /// or a layout above the video byte cap. The
+    /// [`FrameDefect::Layout`](crate::FrameDefect::Layout) carries the cause:
+    /// [`VideoZeroStride`](crate::LayoutDefect::VideoZeroStride),
+    /// [`VideoShortStride`](crate::LayoutDefect::VideoShortStride),
+    /// [`VideoPlanar420`](crate::LayoutDefect::VideoPlanar420),
+    /// [`VideoUyvaStride`](crate::LayoutDefect::VideoUyvaStride), or the
+    /// corresponding dimension or byte-cap defect.
     pub fn buffer_len(
         self,
         width: u32,

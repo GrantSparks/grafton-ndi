@@ -279,8 +279,9 @@ impl AllocationRequest {
     /// # Errors
     ///
     /// [`Error::InvalidInput`](crate::Error::InvalidInput) when the stride is
-    /// not one the frame's layout allows (an audio
-    /// stride is a multiple of four bytes; a 4:2:0 or UYVA video stride is even),
+    /// not one the frame's layout allows (video follows the
+    /// [video stride rules](crate::PixelFormat::buffer_len); an audio
+    /// stride is a multiple of four bytes),
     /// a compressed frame is given a stride other than its size, or the buffer would exceed
     /// the [`capacity_limit`](Self::capacity_limit).
     pub fn with_stride_bytes(self, stride: usize) -> Result<Self> {
