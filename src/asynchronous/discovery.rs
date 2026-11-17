@@ -1,8 +1,7 @@
 //! Owned discovery adapters sharing the receivers' blocking-pool stop rule.
 use super::{discovery_result, private, with_deadline_budget, with_timeout_budget, AsyncRuntime};
 use crate::{
-    finder::{validate_source_name, HostQuery, SourceCursor},
-    timeout::Deadline,
+    finder::{checked_host_lookup, checked_name_lookup, SourceCursor},
     Finder, Result, Source, SourceCache,
 };
 use std::{marker::PhantomData, sync::Arc, time::Duration};
@@ -144,8 +143,8 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncFinder<R, D> {
     ///
     /// # Errors
     ///
-    /// Invalid timeouts and empty or NUL-containing names are refused, in that
-    /// order, before submitting work. Other errors match [`Self::find_source`].
+    /// The errors and argument validation of [`Finder::find_source_by_name`],
+    /// before submitting work, plus dispatch failure.
     #[doc(alias = "NDIlib_find_get_current_sources")]
     #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub async fn find_source_by_name(
@@ -153,15 +152,14 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncFinder<R, D> {
         name: &str,
         timeout: Duration,
     ) -> Result<Option<Source>> {
-        let deadline = Deadline::after(timeout)?;
-        validate_source_name(name)?;
-        let name = name.to_owned();
+        let (name, deadline) = checked_name_lookup(name, timeout)?;
+        let name = name.into_owned();
         let inner = Arc::clone(&self.inner);
         with_deadline_budget::<R, _, _>(deadline, move |deadline, stop| {
             discovery_result(sealed::SourceDiscovery::finder(&*inner).find_source_until(
                 deadline,
                 stop,
-                |source| source.name() == name,
+                |source| source.name() == name.as_str(),
             ))
         })
         .await
@@ -202,14 +200,12 @@ impl<R: AsyncRuntime> AsyncFinder<R, SourceCache> {
     ///
     /// # Errors
     ///
-    /// Invalid timeouts and hosts outside [`Source::matches_host`]'s grammar
-    /// are refused, in that order, before submitting work. Discovery, bounded
-    /// result-copy and dispatch errors propagate.
+    /// The errors and argument validation of [`SourceCache::find_sources_by_host`],
+    /// before submitting work. Dispatch errors also propagate.
     #[doc(alias = "NDIlib_find_get_current_sources")]
     #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub async fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
-        let deadline = Deadline::after(timeout)?;
-        let query = HostQuery::checked(host)?;
+        let (query, deadline) = checked_host_lookup(host, timeout)?;
         if let Some(sources) = self.inner.cached_sources(query)? {
             return Ok(sources);
         }
@@ -330,6 +326,9 @@ mod tests {
         fn send<T: Send>(_: T) {}
         send(finder.find_source(Duration::ZERO, |_| true));
         send(finder.find_source_by_name("camera", Duration::ZERO));
+        let name = String::from("camera");
+        send(finder.find_source_by_name(&name, Duration::ZERO));
+        send(cache.find_source_by_name(&name, Duration::ZERO));
         send(finder.find_sources(Duration::ZERO));
         send(cache.find_sources_by_host("camera", Duration::ZERO));
         send(watch.current_sources());
@@ -378,6 +377,22 @@ mod tests {
         owners_keep_their_discovery_scope::<super::super::Smol>();
     }
 
+    fn assert_ready_validation_error<T: std::fmt::Debug>(
+        actual: Poll<Result<T>>,
+        expected: &crate::Error,
+    ) {
+        use crate::Error;
+        match (actual, expected) {
+            (Poll::Ready(Err(Error::InvalidInput(actual))), Error::InvalidInput(expected)) => {
+                assert_eq!(&actual, expected)
+            }
+            (Poll::Ready(Err(Error::InvalidCString(actual))), Error::InvalidCString(expected)) => {
+                assert_eq!(&actual, expected)
+            }
+            (actual, expected) => panic!("different errors: {actual:?}, {expected:?}"),
+        }
+    }
+
     fn assert_invalid_discovery_inputs<R: AsyncRuntime>() {
         use crate::{Error, InputDefect};
         let Some(ndi) = crate::test_support::ndi() else {
@@ -399,28 +414,52 @@ mod tests {
                 .poll(&mut context),
             Poll::Ready(Err(Error::InvalidInput(InputDefect::TimeoutTooLong { .. })))
         ));
-        for name in ["", "bad\0name"] {
-            assert!(matches!(
-                Box::pin(adapter.find_source_by_name(name, Duration::ZERO))
-                    .as_mut()
-                    .poll(&mut context),
-                Poll::Ready(Err(Error::InvalidInput(InputDefect::InvalidSourceName)))
-            ));
+        for name in ["", "bad\0name", "trailing\0"] {
+            for timeout in [Duration::ZERO, excessive] {
+                let expected = adapter
+                    .finder()
+                    .find_source_by_name(name, timeout)
+                    .unwrap_err();
+                assert_ready_validation_error(
+                    Box::pin(adapter.find_source_by_name(name, timeout))
+                        .as_mut()
+                        .poll(&mut context),
+                    &expected,
+                );
+                assert_ready_validation_error(
+                    Box::pin(cache.find_source_by_name(name, timeout))
+                        .as_mut()
+                        .poll(&mut context),
+                    &expected,
+                );
+            }
         }
+        assert!(matches!(
+            Box::pin(adapter.find_source_by_name("camera", excessive))
+                .as_mut()
+                .poll(&mut context),
+            Poll::Ready(Err(Error::InvalidInput(InputDefect::TimeoutTooLong { .. })))
+        ));
         for host in ["", "http://camera", "bad\0host"] {
-            assert!(matches!(
-                Box::pin(cache.find_sources_by_host(host, excessive))
-                    .as_mut()
-                    .poll(&mut context),
-                Poll::Ready(Err(Error::InvalidInput(InputDefect::TimeoutTooLong { .. })))
-            ));
-            assert!(matches!(
-                Box::pin(cache.find_sources_by_host(host, Duration::ZERO))
-                    .as_mut()
-                    .poll(&mut context),
-                Poll::Ready(Err(Error::InvalidInput(InputDefect::InvalidHostQuery)))
-            ));
+            for timeout in [Duration::ZERO, excessive] {
+                let expected = cache
+                    .cache()
+                    .find_sources_by_host(host, timeout)
+                    .unwrap_err();
+                assert_ready_validation_error(
+                    Box::pin(cache.find_sources_by_host(host, timeout))
+                        .as_mut()
+                        .poll(&mut context),
+                    &expected,
+                );
+            }
         }
+        assert!(matches!(
+            Box::pin(cache.find_sources_by_host("camera", excessive))
+                .as_mut()
+                .poll(&mut context),
+            Poll::Ready(Err(Error::InvalidInput(InputDefect::TimeoutTooLong { .. })))
+        ));
         let mut watch = adapter.watch();
         assert!(matches!(
             Box::pin(watch.wait_for_change(excessive))

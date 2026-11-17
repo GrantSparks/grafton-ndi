@@ -365,6 +365,15 @@ struct HeldOwner {
 }
 
 impl Owner for HeldOwner {
+    type Closed = ();
+    fn shutdown(
+        &mut self,
+        _: Instant,
+        _: &EventQueue<Self::Event>,
+        _: &Control,
+        _: &mut [Job<Self>],
+    ) {
+    }
     type Finish = std::convert::Infallible;
     fn finish_request(&mut self, finish: Self::Finish) {
         match finish {}

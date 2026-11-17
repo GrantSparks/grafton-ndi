@@ -511,9 +511,6 @@ pub enum InputDefect {
     #[error(transparent)]
     Layout(LayoutDefect),
 
-    /// Source name must be nonempty and contain no NUL.
-    #[error("Source name must be nonempty and contain no NUL")]
-    InvalidSourceName,
     /// A list element is empty, contains a comma, or contains a NUL.
     #[error("{setting} element {index} must be nonempty and contain neither a comma nor a NUL")]
     ListElement {

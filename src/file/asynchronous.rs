@@ -398,16 +398,25 @@ impl<T> Drop for FileOperation<T> {
     }
 }
 
-struct Reply<T> {
+/// One response protocol; only commands retain their owner's failure source.
+struct Reply<T, F: FailureSource = NoOwner> {
     shared: Arc<Shared<T>>,
+    owner: F,
 }
 
-/// A command always retains the control that records its owner's failure.
-/// Commands left queued after unwinding must report that failure too.
-struct CommandReply<T> {
-    shared: Arc<Shared<T>>,
-    owner: Arc<Control>,
+trait FailureSource: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe {
+    fn failed(&self) -> bool;
 }
+
+struct NoOwner;
+
+impl FailureSource for NoOwner {
+    fn failed(&self) -> bool {
+        false
+    }
+}
+
+type CommandReply<T, C = RecordingReport> = Reply<T, Arc<Control<C>>>;
 
 fn operation<T>() -> (Reply<T>, Live<T>) {
     operation_with_hook(None)
@@ -415,7 +424,13 @@ fn operation<T>() -> (Reply<T>, Live<T>) {
 
 fn operation_with_hook<T>(on_take: Option<Arc<dyn OnTake>>) -> (Reply<T>, Live<T>) {
     let (shared, future) = shared_operation(on_take);
-    (Reply { shared }, future)
+    (
+        Reply {
+            shared,
+            owner: NoOwner,
+        },
+        future,
+    )
 }
 
 fn shared_operation<T>(on_take: Option<Arc<dyn OnTake>>) -> (Arc<Shared<T>>, Live<T>) {
@@ -500,35 +515,23 @@ impl<T> FileOperation<T> {
     }
 }
 
-impl<T> Reply<T> {
+impl<T, F: FailureSource> Reply<T, F> {
+    fn cancelled(&self) -> bool {
+        self.shared.cancelled.load(Ordering::Acquire)
+    }
+
     fn complete(self, value: Result<T>) {
-        if !self.shared.cancelled.load(Ordering::Acquire) {
+        if !self.cancelled() {
             deliver(&self.shared, value);
         }
     }
 }
 
-impl<T> Drop for Reply<T> {
+impl<T, F: FailureSource> Drop for Reply<T, F> {
     fn drop(&mut self) {
-        if !self.shared.cancelled.load(Ordering::Acquire) {
-            // The slot alone records whether completion was delivered. A
-            // destructor can supply the fallback only while it is Pending.
-            deliver(&self.shared, Err(stopped(std::thread::panicking())));
-        }
-    }
-}
-
-impl<T> CommandReply<T> {
-    fn complete(self, value: Result<T>) {
-        if !self.shared.cancelled.load(Ordering::Acquire) {
-            deliver(&self.shared, value);
-        }
-    }
-}
-
-impl<T> Drop for CommandReply<T> {
-    fn drop(&mut self) {
-        if !self.shared.cancelled.load(Ordering::Acquire) {
+        if !self.cancelled() {
+            // The slot records whether completion was delivered. Commands
+            // additionally retain the owner's early failure publication.
             let failed = std::thread::panicking() || self.owner.failed();
             deliver(&self.shared, Err(stopped(failed)));
         }
@@ -954,75 +957,139 @@ enum EventEnd {
     Failed,
 }
 
-/// Native cleanup completion is independent of knowing that the owner failed.
-/// A close submitted during failed cleanup still waits for destruction.
-enum CloseReply {
-    Close(Reply<()>),
-    Abandon(Reply<RecordingReport>),
+/// A close's request and successful result belong to its native owner.
+/// Players use `()` for both, so recorder abandonment is unrepresentable.
+trait CloseOutcome:
+    Clone + Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe + 'static
+{
+    type Request: Copy + Send;
+    fn initial_request() -> Self::Request;
 }
 
-impl CloseReply {
+impl CloseOutcome for () {
+    type Request = ();
+    fn initial_request() {}
+}
+
+impl CloseOutcome for RecordingReport {
+    type Request = super::recorder::CleanupRequest;
+    fn initial_request() -> Self::Request {
+        super::recorder::CleanupRequest::Close
+    }
+}
+
+/// Replies share cancellation and delivery through `Reply`, regardless of
+/// whether the caller wants the owner's result or just destruction completion.
+enum CloseReply<C> {
+    Close(Reply<()>),
+    Outcome(Reply<C>),
+}
+
+impl<C: Clone> CloseReply<C> {
     fn cancelled(&self) -> bool {
         match self {
-            Self::Close(reply) => reply.shared.cancelled.load(Ordering::Acquire),
-            Self::Abandon(reply) => reply.shared.cancelled.load(Ordering::Acquire),
+            Self::Close(reply) => reply.cancelled(),
+            Self::Outcome(reply) => reply.cancelled(),
         }
     }
 
-    fn complete(self, outcome: OwnerExit, report: Option<&RecordingReport>) {
+    fn complete(self, outcome: &std::result::Result<C, OwnerExit>) {
         match self {
-            Self::Close(reply) => reply.complete(outcome.result()),
-            Self::Abandon(reply) => reply.complete(
+            Self::Close(reply) => reply.complete(match outcome {
+                Ok(_) => Ok(()),
+                Err(exit) => exit.result(),
+            }),
+            Self::Outcome(reply) => reply.complete(
                 outcome
-                    .result()
-                    .and_then(|()| report.cloned().ok_or_else(|| stopped(true))),
+                    .clone()
+                    .map_err(|exit| stopped(exit == OwnerExit::Failed)),
             ),
         }
     }
 }
 
-enum Closing {
-    Waiting(Vec<CloseReply>),
-    Complete(OwnerExit),
+enum Closing<C: CloseOutcome> {
+    Waiting {
+        request: C::Request,
+        replies: Vec<CloseReply<C>>,
+    },
+    Complete,
 }
 
-struct Control {
+struct Control<C: CloseOutcome = ()> {
     /// Creation has returned its handle to the caller. Only a claimed handle
     /// can make its last ordinary drop wait for finalization.
     claimed: AtomicBool,
     /// The first close or last-handle drop starts the one finalization budget.
     shutdown_at: OnceLock<Instant>,
-    /// Published with shutdown under `closing`; only recorder shutdown reads it.
-    skip_cleanup: AtomicBool,
-    /// Captured after cleanup and handed out only after native destruction.
-    final_report: OnceLock<RecordingReport>,
     /// The sole owner outcome. A failure is visible before cleanup starts.
     outcome: OnceLock<OwnerExit>,
-    closing: Mutex<Closing>,
+    /// Only the close protocol depends on the owner's associated result.
+    closing: Mutex<Closing<C>>,
+    /// The typed outcome is immutable and borrowable after destruction, so
+    /// ordinary closes do not clone a recorder report just to discard it.
+    closed: OnceLock<std::result::Result<C, OwnerExit>>,
 }
 
-impl OnTake for Control {
+impl<C: CloseOutcome> OnTake for Control<C> {
     fn on_take(&self) {
         self.claimed.store(true, Ordering::Release);
     }
 }
 
+impl<C: CloseOutcome> FailureSource for Arc<Control<C>> {
+    fn failed(&self) -> bool {
+        self.as_ref().failed()
+    }
+}
+
 impl Control {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_outcome()
+    }
+}
+
+impl Control<RecordingReport> {
+    fn request_abandon(
+        self: &Arc<Self>,
+        wake: impl FnOnce() + Send + 'static,
+    ) -> FileOperation<RecordingReport> {
+        let control = Arc::clone(self);
+        FileOperation::deferred(move || {
+            let requested = Instant::now();
+            let (reply, future) = operation();
+            control.register_close(
+                requested,
+                CloseReply::Outcome(reply),
+                |request| {
+                    *request = super::recorder::CleanupRequest::Abandon;
+                },
+                wake,
+            );
+            future
+        })
+    }
+}
+
+impl<C: CloseOutcome> Control<C> {
+    fn with_outcome() -> Self {
         Self {
             claimed: AtomicBool::new(false),
             shutdown_at: OnceLock::new(),
-            skip_cleanup: AtomicBool::new(false),
-            final_report: OnceLock::new(),
             outcome: OnceLock::new(),
-            closing: Mutex::new(Closing::Waiting(Vec::new())),
+            closing: Mutex::new(Closing::Waiting {
+                request: C::initial_request(),
+                replies: Vec::new(),
+            }),
+            closed: OnceLock::new(),
         }
     }
 
-    fn command<T>(self: &Arc<Self>) -> (CommandReply<T>, Live<T>) {
+    fn command<T>(self: &Arc<Self>) -> (CommandReply<T, C>, Live<T>) {
         let (shared, future) = shared_operation(None);
         (
-            CommandReply {
+            Reply {
                 shared,
                 owner: Arc::clone(self),
             },
@@ -1050,87 +1117,72 @@ impl Control {
     }
 
     fn request_close_now(&self, wake: impl FnOnce()) -> Live<()> {
-        // Count contention while registering the close and publishing shutdown
-        // against the same budget that starts at submission.
         self.request_close_at(Instant::now(), wake)
     }
 
     fn request_close_at(&self, requested: Instant, wake: impl FnOnce()) -> Live<()> {
         let (reply, future) = operation();
-        self.register_close(requested, CloseReply::Close(reply), false, wake);
+        self.register_close(requested, CloseReply::Close(reply), |_| {}, wake);
         future
-    }
-
-    fn request_abandon(
-        self: &Arc<Self>,
-        wake: impl FnOnce() + Send + 'static,
-    ) -> FileOperation<RecordingReport> {
-        let control = Arc::clone(self);
-        FileOperation::deferred(move || {
-            let requested = Instant::now();
-            let (reply, future) = operation();
-            control.register_close(requested, CloseReply::Abandon(reply), true, wake);
-            future
-        })
     }
 
     fn register_close(
         &self,
         requested: Instant,
-        reply: CloseReply,
-        skip_cleanup: bool,
+        reply: CloseReply<C>,
+        update: impl FnOnce(&mut C::Request),
         wake: impl FnOnce(),
     ) {
         let mut closing = lock(&self.closing);
         match &mut *closing {
-            Closing::Waiting(replies) => {
+            Closing::Waiting { request, replies } => {
                 replies.retain(|reply| !reply.cancelled());
                 replies.push(reply);
-                if skip_cleanup {
-                    self.skip_cleanup.store(true, Ordering::Release);
-                }
-                // Publish admission, the skip request and the first budget
-                // together. No owner can start shutdown between those facts.
+                update(request);
+                // Publish admission, the close request and the first budget
+                // together. The owner reads its request through this same lock.
                 let first = self.shutdown_at.set(requested).is_ok();
                 drop(closing);
                 if first {
                     wake();
                 }
             }
-            Closing::Complete(outcome) => {
-                let outcome = *outcome;
+            Closing::Complete => {
                 drop(closing);
-                reply.complete(outcome, self.final_report.get());
+                reply.complete(
+                    self.closed
+                        .get()
+                        .expect("completion publishes its outcome first"),
+                );
             }
         }
     }
 
-    /// Whether a last-handle drop must observe native destruction itself.
-    /// A live close reports completion instead. Once native destruction has
-    /// completed, no join is needed even if the owner is still dropping queued
-    /// command captures.
-    fn needs_cleanup_join(&self) -> bool {
+    fn close_request(&self) -> C::Request {
         match &*lock(&self.closing) {
-            Closing::Waiting(replies) => replies.iter().all(CloseReply::cancelled),
-            Closing::Complete(_) => false,
+            Closing::Waiting { request, .. } => *request,
+            Closing::Complete => unreachable!("the owner requests cleanup before completion"),
         }
     }
 
-    /// Publish the request and its budget start as one fact. Return whether
-    /// shutdown had already been requested, to avoid redundant wake messages.
+    /// A live close reports destruction instead of the last handle joining.
+    fn needs_cleanup_join(&self) -> bool {
+        match &*lock(&self.closing) {
+            Closing::Waiting { replies, .. } => replies.iter().all(CloseReply::cancelled),
+            Closing::Complete => false,
+        }
+    }
+
     fn request_shutdown(&self) -> bool {
         self.request_shutdown_at(Instant::now())
     }
 
     fn request_shutdown_at(&self, requested: Instant) -> bool {
-        // A finish admitted before this publication must already be in the
-        // channel before the owner can begin its shutdown drain.
+        // An admitted finish is enqueued before shutdown can publish.
         let _submission = lock(&self.closing);
         self.shutdown_at.set(requested).is_err()
     }
 
-    /// Make finish acceptance and enqueue indivisible with shutdown publication,
-    /// using the same mutex that already owns close replies.
     fn submit_finish<T>(&self, enqueue: impl FnOnce() -> Live<T>) -> Live<T> {
         let _submission = lock(&self.closing);
         if let Err(error) = self.gate() {
@@ -1155,20 +1207,28 @@ impl Control {
         let _ = self.outcome.set(OwnerExit::Failed);
     }
 
-    /// Complete the exit only after native destruction. Failure may already
-    /// be recorded, so its early publication cannot complete a close early.
-    fn exit<E>(&self, outcome: OwnerExit, events: &EventQueue<E>) {
-        let outcome = *self.outcome.get_or_init(|| outcome);
-        events.close(outcome.event_end());
+    /// Complete replies only after destruction, using the value returned by
+    /// shutdown. An early failure remains authoritative over a cleanup result.
+    fn exit<E>(&self, closed: std::result::Result<C, OwnerExit>, events: &EventQueue<E>) {
+        let exit = *self
+            .outcome
+            .get_or_init(|| closed.as_ref().err().copied().unwrap_or(OwnerExit::Closed));
+        let closed = if exit == OwnerExit::Failed {
+            Err(exit)
+        } else {
+            closed
+        };
+        let closed = self.closed.get_or_init(|| closed);
+        events.close(exit.event_end());
         let replies = {
             let mut closing = lock(&self.closing);
-            match std::mem::replace(&mut *closing, Closing::Complete(outcome)) {
-                Closing::Waiting(replies) => replies,
-                Closing::Complete(_) => return,
+            match std::mem::replace(&mut *closing, Closing::Complete) {
+                Closing::Waiting { replies, .. } => replies,
+                Closing::Complete => return,
             }
         };
         for reply in replies {
-            reply.complete(outcome, self.final_report.get());
+            reply.complete(closed);
         }
     }
 }
@@ -1178,6 +1238,7 @@ impl Control {
 trait Owner: 'static {
     type Event: Send + 'static;
     type Finish: Send + 'static;
+    type Closed: CloseOutcome;
 
     /// Take the next native event without waiting.
     fn poll_native(&mut self) -> Result<Option<Self::Event>>;
@@ -1187,7 +1248,7 @@ trait Owner: 'static {
         &mut self,
         _drained: bool,
         _events: &EventQueue<Self::Event>,
-        _control: &Control,
+        _control: &Control<Self::Closed>,
     ) {
     }
 
@@ -1204,14 +1265,13 @@ trait Owner: 'static {
     /// Finish registered work and cleanup within the original close budget.
     fn shutdown(
         &mut self,
-        _requested: Instant,
-        _events: &EventQueue<Self::Event>,
-        _control: &Control,
-        _queued: &mut [Job<Self>],
-    ) where
-        Self: Sized,
-    {
-    }
+        requested: Instant,
+        events: &EventQueue<Self::Event>,
+        control: &Control<Self::Closed>,
+        queued: &mut [Job<Self>],
+    ) -> Self::Closed
+    where
+        Self: Sized;
 }
 
 /// The native operations common to the two documented async handles. Keep
@@ -1351,7 +1411,7 @@ impl Drop for Place {
 struct Worker<H: Owner> {
     sender: Sender<Job<H>>,
     admission: Arc<Admission>,
-    control: Arc<Control>,
+    control: Arc<Control<H::Closed>>,
     events: Arc<EventQueue<H::Event>>,
     // JoinHandle's shared return packet is not RefUnwindSafe. This owner
     // never examines it after unwinding: the handle is installed once, then
@@ -1414,7 +1474,7 @@ impl<H: Owner> Worker<H> {
         self.prepare_reply(
             move || {
                 let work = prepare()?;
-                Ok(move |owner: &mut H, reply: CommandReply<T>| {
+                Ok(move |owner: &mut H, reply: CommandReply<T, H::Closed>| {
                     reply.complete(work(owner));
                 })
             },
@@ -1428,7 +1488,7 @@ impl<H: Owner> Worker<H> {
         stop: bool,
     ) -> FileOperation<T>
     where
-        W: FnOnce(&mut H, CommandReply<T>) + Send + 'static,
+        W: FnOnce(&mut H, CommandReply<T, H::Closed>) + Send + 'static,
     {
         // Keep submission state, not Worker: an unpolled future must not
         // delay last-handle shutdown or make its own drop join the owner.
@@ -1452,16 +1512,15 @@ impl<H: Owner> Worker<H> {
     fn submit_now<T: Send + 'static>(
         sender: &Sender<Job<H>>,
         admission: &Arc<Admission>,
-        control: &Arc<Control>,
+        control: &Arc<Control<H::Closed>>,
         stop: bool,
-        work: impl FnOnce(&mut H, CommandReply<T>) + Send + 'static,
+        work: impl FnOnce(&mut H, CommandReply<T, H::Closed>) + Send + 'static,
     ) -> Live<T> {
         Self::enqueue(sender, admission, control, stop, move |reply, place| {
-            let shared = Arc::clone(&reply.shared);
             Job::Run(Box::new(move |owner| {
                 // The command leaves the queue as it starts.
                 drop(place);
-                if !stop && shared.cancelled.load(Ordering::Acquire) {
+                if !stop && reply.cancelled() {
                     return;
                 }
                 work(owner, reply);
@@ -1474,9 +1533,9 @@ impl<H: Owner> Worker<H> {
     fn enqueue<T>(
         sender: &Sender<Job<H>>,
         admission: &Arc<Admission>,
-        control: &Arc<Control>,
+        control: &Arc<Control<H::Closed>>,
         stop: bool,
-        build: impl FnOnce(CommandReply<T>, Place) -> Job<H>,
+        build: impl FnOnce(CommandReply<T, H::Closed>, Place) -> Job<H>,
     ) -> Live<T> {
         if let Err(error) = control.gate() {
             return Live::failed(error);
@@ -1600,7 +1659,7 @@ fn spawn_prepared_owner_now<H: Owner, T: Send + 'static>(
 ) -> Live<T> {
     let options = options.0;
     let (sender, receiver) = mpsc::channel();
-    let control = Arc::new(Control::new());
+    let control = Arc::new(Control::<H::Closed>::with_outcome());
     let events = Arc::new(EventQueue::new(options.event_capacity));
     let worker = Arc::new(Worker {
         sender,
@@ -1618,7 +1677,7 @@ fn spawn_prepared_owner_now<H: Owner, T: Send + 'static>(
         // Creation and use are separate unwind regions so the owner stays
         // alive while its failure is published and its waiters are resolved.
         let created = catch_unwind(AssertUnwindSafe(|| {
-            if ready.shared.cancelled.load(Ordering::Acquire) {
+            if ready.cancelled() {
                 return None;
             }
             match create() {
@@ -1629,40 +1688,51 @@ fn spawn_prepared_owner_now<H: Owner, T: Send + 'static>(
                 }
             }
         }));
-        let mut exit = OwnerExit::Closed;
         let mut queued = Vec::new();
-        match created {
+        let closed = match created {
             Ok(Some((ready, mut owner))) => {
                 let running = catch_unwind(AssertUnwindSafe(|| {
                     ready.complete(Ok(wrap(thread_worker)));
                     let dequeued =
                         run_owner(&mut owner, &receiver, &thread_control, &thread_events);
-                    if let Some(requested) = thread_control.shutdown_requested_at() {
-                        queued.extend(dequeued.into_iter().chain(receiver.try_iter()));
-                        owner.shutdown(requested, &thread_events, &thread_control, &mut queued);
-                    }
+                    queued.extend(dequeued.into_iter().chain(receiver.try_iter()));
+                    let closed = owner.shutdown(
+                        thread_control
+                            .shutdown_requested_at()
+                            .unwrap_or_else(Instant::now),
+                        &thread_events,
+                        &thread_control,
+                        &mut queued,
+                    );
                     thread_events.close(EventEnd::Stopped);
+                    closed
                 }));
-                if running.is_err() {
-                    exit = OwnerExit::Failed;
-                    thread_control.publish_failure();
-                    // A second failure cannot skip event closure or destruction.
-                    let _ = catch_unwind(AssertUnwindSafe(|| owner.fail_pending()));
-                    thread_events.close(EventEnd::Failed);
-                }
+                let mut closed = match running {
+                    Ok(closed) => Ok(closed),
+                    Err(_) => {
+                        thread_control.publish_failure();
+                        // A second failure cannot skip event closure or destruction.
+                        let _ = catch_unwind(AssertUnwindSafe(|| owner.fail_pending()));
+                        thread_events.close(EventEnd::Failed);
+                        Err(OwnerExit::Failed)
+                    }
+                };
                 // H need not be Send: every native operation and destruction
-                // remain on this thread, after failure notification.
+                // remain on this thread, after failure notification. The typed
+                // shutdown result is retained until native destruction returns.
                 if catch_unwind(AssertUnwindSafe(|| drop(owner))).is_err() {
-                    exit = OwnerExit::Failed;
                     thread_control.publish_failure();
+                    closed = Err(OwnerExit::Failed);
                 }
+                closed
             }
-            Ok(None) => {}
-            Err(_) => exit = OwnerExit::Failed,
-        }
+            // No native owner or public handle exists in these creation paths.
+            Ok(None) => Err(OwnerExit::Closed),
+            Err(_) => Err(OwnerExit::Failed),
+        };
         // The outcome is recorded before queued commands drop; awaited closes
         // complete here, only once the native object has been destroyed.
-        thread_control.exit(exit, &thread_events);
+        thread_control.exit(closed, &thread_events);
         drop(queued);
         drop(receiver);
     });
@@ -1671,7 +1741,7 @@ fn spawn_prepared_owner_now<H: Owner, T: Send + 'static>(
             let _ = worker.thread.set(AssertUnwindSafe(thread));
         }
         Err(error) => {
-            control.exit(OwnerExit::Failed, &events);
+            control.exit(Err(OwnerExit::Failed), &events);
             return Live::failed(Error::Io(error));
         }
     }
@@ -1681,7 +1751,7 @@ fn spawn_prepared_owner_now<H: Owner, T: Send + 'static>(
 fn run_owner<H: Owner>(
     owner: &mut H,
     receiver: &Receiver<Job<H>>,
-    control: &Control,
+    control: &Control<H::Closed>,
     events: &EventQueue<H::Event>,
 ) -> Option<Job<H>> {
     run_owner_wait(owner, control, events, |wait, timeout| {
@@ -1700,7 +1770,7 @@ fn run_owner<H: Owner>(
 /// backoff without making wall-clock scheduling assertions.
 fn run_owner_wait<H: Owner>(
     owner: &mut H,
-    control: &Control,
+    control: &Control<H::Closed>,
     events: &EventQueue<H::Event>,
     mut command: impl FnMut(bool, Duration) -> std::result::Result<Job<H>, RecvTimeoutError>,
 ) -> Option<Job<H>> {
@@ -1788,7 +1858,7 @@ impl ProbeQueue {
             // The static table keeps the module mapped; this lease separately
             // keeps NDI initialized while the probe is queued and running.
             let _api = api;
-            if !reply.shared.cancelled.load(Ordering::Acquire) {
+            if !reply.cancelled() {
                 reply.complete(FilePlayer::probe_checked(playback, &path));
             }
         });
@@ -2466,6 +2536,15 @@ mod tests {
     }
 
     impl Owner for BurstOwner {
+        type Closed = ();
+        fn shutdown(
+            &mut self,
+            _: Instant,
+            _: &EventQueue<Self::Event>,
+            _: &Control,
+            _: &mut [Job<Self>],
+        ) {
+        }
         type Finish = std::convert::Infallible;
         fn finish_request(&mut self, finish: Self::Finish) {
             match finish {}
@@ -2494,6 +2573,63 @@ mod tests {
             }
         }
         let _: fn(Job<PlayerOwner>) = require_uninhabited;
+    }
+
+    #[test]
+    fn player_close_carries_only_a_unit_request_and_outcome() {
+        fn require_unit_request(
+            request: <<PlayerOwner as Owner>::Closed as CloseOutcome>::Request,
+        ) {
+            let () = request;
+        }
+        fn require_unit_outcome(outcome: <PlayerOwner as Owner>::Closed) {
+            let () = outcome;
+        }
+        let _: fn(()) = require_unit_request;
+        let _: fn(()) = require_unit_outcome;
+    }
+
+    #[test]
+    fn cancelled_replies_never_deliver_a_result_or_drop_fallback() {
+        fn check<F: FailureSource>(reply: Reply<(), F>, future: Live<()>, complete: bool) {
+            let shared = Arc::clone(&reply.shared);
+            drop(FileOperation::live(future));
+            assert!(reply.cancelled());
+            if complete {
+                reply.complete(Ok(()));
+            } else {
+                drop(reply);
+            }
+            assert!(matches!(*lock(&shared.slot), Slot::Pending(_)));
+        }
+        for complete in [false, true] {
+            let control = Arc::new(Control::new());
+            let (reply, future) = control.command::<()>();
+            control.publish_failure();
+            check(reply, future, complete);
+            let (reply, future) = operation();
+            check(reply, future, complete);
+        }
+    }
+
+    #[test]
+    fn dropped_replies_use_only_their_actual_failure_source() {
+        for failed in [false, true] {
+            let control = Arc::new(Control::new());
+            let (plain, plain_result) = operation::<()>();
+            let (command, command_result) = control.command::<()>();
+            if failed {
+                control.publish_failure();
+            }
+            drop(plain);
+            drop(command);
+            closed(block_on(FileOperation::live(plain_result)));
+            if failed {
+                owner_failed(block_on(FileOperation::live(command_result)));
+            } else {
+                closed(block_on(FileOperation::live(command_result)));
+            }
+        }
     }
 
     #[test]
@@ -2565,7 +2701,7 @@ mod tests {
                     message
                 });
                 assert!(control.shutdown_requested());
-                control.exit(OwnerExit::Closed, &events);
+                control.exit(Ok(()), &events);
             });
         }
     }
@@ -2612,6 +2748,15 @@ mod tests {
         _not_send: Rc<()>,
     }
     impl Owner for LocalOwner {
+        type Closed = ();
+        fn shutdown(
+            &mut self,
+            _: Instant,
+            _: &EventQueue<Self::Event>,
+            _: &Control,
+            _: &mut [Job<Self>],
+        ) {
+        }
         type Finish = std::convert::Infallible;
         fn finish_request(&mut self, finish: Self::Finish) {
             match finish {}
@@ -3216,6 +3361,15 @@ mod tests {
             finished: Sender<()>,
         }
         impl Owner for HeldDrop {
+            type Closed = ();
+            fn shutdown(
+                &mut self,
+                _: Instant,
+                _: &EventQueue<Self::Event>,
+                _: &Control,
+                _: &mut [Job<Self>],
+            ) {
+            }
             type Finish = std::convert::Infallible;
             fn finish_request(&mut self, finish: Self::Finish) {
                 match finish {}
@@ -3929,7 +4083,14 @@ mod tests {
             let events = Arc::new(EventQueue::<()>::new(1));
             let (reply, command) = control.command::<()>();
             let closing = control.request_close(|| {}).submit();
-            control.exit(outcome, &events);
+            control.exit(
+                if outcome == OwnerExit::Closed {
+                    Ok(())
+                } else {
+                    Err(outcome)
+                },
+                &events,
+            );
             drop(reply);
             for result in [
                 block_on(FileOperation::live(command)),
@@ -3979,7 +4140,14 @@ mod tests {
                         });
                     }
                     barrier.wait();
-                    control.exit(outcome, &EventQueue::<()>::new(1));
+                    control.exit(
+                        if outcome == OwnerExit::Closed {
+                            Ok(())
+                        } else {
+                            Err(outcome)
+                        },
+                        &EventQueue::<()>::new(1),
+                    );
                 });
             }
         }
@@ -4013,8 +4181,14 @@ mod tests {
         let refused_immediately = refused.is_completed();
         let closing = recorder.close().submit();
         let close_waited = !closing.is_completed();
+        let abandoning = recorder.abandon().submit();
+        assert!(
+            !abandoning.is_completed(),
+            "failure completed abandon before destruction"
+        );
         device.close();
         let close_result = block_on(closing);
+        owner_failed(block_on(abandoning));
         assert_eq!(destroys_before, 0);
         assert!(refused_immediately);
         assert!(
@@ -4593,6 +4767,41 @@ mod tests {
         assert_eq!(block_on(recorder.abandon()).unwrap(), report);
         block_on(recorder.close()).unwrap();
         closed(block_on(recorder.report()));
+    }
+
+    #[test]
+    fn a_discarded_abandon_still_skips_cleanup_after_every_handle_is_dropped() {
+        let (device, recorder) = mock_recorder_with_drop_wait(
+            Closing::Never,
+            AsyncFileOptions::new(),
+            Duration::from_secs(2),
+        );
+        let (blocked, release) = block_owner(&recorder.worker);
+        let other = recorder.clone();
+        drop(recorder.abandon().submit());
+        drop(recorder);
+        let began = Instant::now();
+        release.send(()).unwrap();
+        block_on(blocked).unwrap();
+        // With no live close future, the last handle joins destruction, but
+        // the retained abandon request must still bypass its two-second wait.
+        drop(other);
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn abandon_after_owner_failure_reports_the_recorded_failure() {
+        let (device, recorder) = mock_recorder(Closing::AtStop);
+        owner_failed(block_on(
+            recorder
+                .worker
+                .call(|_| -> Result<()> { panic!("owner failed before abandon") }),
+        ));
+        owner_failed(block_on(recorder.abandon()));
+        owner_failed(block_on(recorder.abandon()));
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -5539,6 +5748,15 @@ mod tests {
     fn refused_creation_options_and_families_complete_at_submission() {
         struct NeverCreated;
         impl Owner for NeverCreated {
+            type Closed = ();
+            fn shutdown(
+                &mut self,
+                _: Instant,
+                _: &EventQueue<Self::Event>,
+                _: &Control,
+                _: &mut [Job<Self>],
+            ) {
+            }
             type Finish = std::convert::Infallible;
             fn finish_request(&mut self, finish: Self::Finish) {
                 match finish {}

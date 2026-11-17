@@ -8,6 +8,7 @@ use std::{
 };
 
 use crate::{
+    finder::SourceName,
     sys::{self, bindings::*},
     Error, FourCc, FrameRate, MediaTypes, PictureAspectRatio, Result, ScanType, SdkResultDefect,
     StreamTier, Timecode,
@@ -105,10 +106,15 @@ impl FileText {
         if value.contains('\0') {
             return Err(CString::new(value).unwrap_err().into());
         }
+        Ok(Self::from_checked(value))
+    }
+
+    // Only constructors that proved the text nonempty and NUL-free call this.
+    fn from_checked(value: &str) -> Self {
         let mut text = String::with_capacity(value.len() + 1);
         text.push_str(value);
         text.push('\0');
-        Ok(Self(text.into_boxed_str()))
+        Self(text.into_boxed_str())
     }
 
     pub(super) fn as_str(&self) -> &str {
@@ -149,8 +155,9 @@ impl SourceSpec {
     /// [`Error::InvalidInput`] when the name is empty, and
     /// [`Error::InvalidCString`] when it contains a NUL.
     pub fn new(name: impl AsRef<str>) -> Result<Self> {
+        let name = SourceName::checked(name.as_ref())?;
         Ok(Self {
-            name: Some(FileText::new(name.as_ref(), "source name")?),
+            name: Some(FileText::from_checked(name.as_str())),
             url: None,
         })
     }

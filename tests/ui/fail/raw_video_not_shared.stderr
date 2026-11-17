@@ -13,6 +13,11 @@ note: required because it appears within the type `PhantomData<Cell<()>>`
   |
   | pub struct PhantomData<T: PointeeSized>;
   |            ^^^^^^^^^^^
+note: required because it appears within the type `grafton_ndi::marker::NotSync`
+ --> src/marker.rs
+  |
+  | pub(crate) struct NotSync(PhantomData<Cell<()>>);
+  |                   ^^^^^^^
 note: required because it appears within the type `RawVideo<'_>`
  --> src/sender.rs
   |

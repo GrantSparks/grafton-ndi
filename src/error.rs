@@ -281,15 +281,17 @@ pub enum Error {
     /// capture; [`crate::FrameMetadataStatus`] reports its condition. Withheld
     /// metadata can still fail a later colour-description read.
     ///
-    /// A value that describes no one frame, such as a compressed audio or video format
-    /// or an allocation, AV sync, clock or remote-control value of the
-    /// `advanced` module, is [`Error::InvalidInput`] when it is out of range.
+    /// A value that describes no one frame, such as a compressed audio or video
+    /// format, a FrameSync or AV sync audio request, or an allocation, clock or
+    /// remote-control value of the `advanced` module, is [`Error::InvalidInput`]
+    /// when it is out of range.
     #[error("Invalid frame data: {0}")]
     InvalidFrame(FrameDefect),
 
     /// A value passed to the crate cannot be used; [`InputDefect`] identifies the cause.
-    /// Standalone aspect ratios, frame rates, compressed audio or video formats and
-    /// allocation strides use [`InputDefect::Layout`] with a [`LayoutDefect`].
+    /// Standalone aspect ratios, frame rates, compressed audio or video formats,
+    /// FrameSync and AV sync audio requests, clock requests and allocation strides
+    /// use [`InputDefect::Layout`] with a [`LayoutDefect`].
     ///
     /// It is out of range, malformed, or conflicts with another setting: for
     /// example a timeout above [`MAX_TIMEOUT`](crate::MAX_TIMEOUT), a relative
@@ -297,9 +299,9 @@ pub enum Error {
     /// its range, malformed Advanced configuration JSON, more than one
     /// Discovery Server for a listener, allocator limits that cannot all be
     /// reached, a registration handed to an advertiser that did not issue it,
-    /// a compressed audio or video format, an allocation stride or buffer, an AV sync
-    /// or clock quantity or a remote control value out of the range the SDK
-    /// accepts, or a File API name, path or option the File library cannot
+    /// a compressed audio or video format, an allocation stride or buffer, a
+    /// FrameSync or AV sync audio request, a clock quantity or a remote control
+    /// value out of the range the SDK accepts, or a File API name, path or option the File library cannot
     /// take. The message says which value and why, and nothing reaches the
     /// SDK, with one exception: the SDK creates a Discovery Server advertiser
     /// or listener for any address it can parse, so when it creates none, the

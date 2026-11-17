@@ -909,13 +909,16 @@ impl Finder {
     /// addresses select the first match in the current snapshot; use
     /// [`Self::find_source`] with an address predicate to disambiguate them.
     /// Timeout, allocation, concurrency and error behavior match that method.
-    /// An empty name or a name containing a NUL is refused with
-    /// [`Error::InvalidInput`] before inspecting a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// An empty name returns [`Error::InvalidInput`]; a name containing a NUL
+    /// returns [`Error::InvalidCString`]. The name is checked before the timeout,
+    /// including in async lookups. Other errors match [`Self::find_source`].
     pub fn find_source_by_name(&self, name: &str, timeout: Duration) -> Result<Option<Source>> {
-        let deadline = Deadline::after(timeout)?;
-        validate_source_name(name)?;
+        let (name, deadline) = checked_name_lookup(name, timeout)?;
         let Ok(source) =
-            self.find_source_until(deadline, NeverStop, |source| source.name() == name)?;
+            self.find_source_until(deadline, NeverStop, |source| source.name() == name.as_str())?;
         Ok(source)
     }
 
@@ -1007,12 +1010,73 @@ const _: () = {
     assert_send_sync::<Finder>();
 };
 
-pub(crate) fn validate_source_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.contains('\0') {
-        Err(Error::InvalidInput(crate::InputDefect::InvalidSourceName))
-    } else {
-        Ok(())
+/// An exact, nonempty NDI source name with no interior NUL. Ownership can
+/// change without checking the same text again.
+#[derive(Debug, Clone)]
+pub(crate) struct SourceName<'a>(&'a str);
+
+impl<'a> SourceName<'a> {
+    pub(crate) fn checked(name: &'a str) -> Result<Self> {
+        if name.is_empty() {
+            return Err(Error::InvalidInput(crate::InputDefect::Empty {
+                what: "source name",
+            }));
+        }
+        if name.contains('\0') {
+            return Err(CString::new(name).unwrap_err().into());
+        }
+        Ok(Self(name))
     }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0
+    }
+
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    pub(crate) fn into_owned(self) -> OwnedSourceName {
+        OwnedSourceName(self.0.to_owned())
+    }
+
+    pub(crate) fn into_c_string(self) -> CString {
+        // Reserve the terminator as well so converting a borrowed name needs
+        // one allocation, just as CString::new does.
+        let mut bytes = Vec::with_capacity(self.0.len() + 1);
+        bytes.extend_from_slice(self.0.as_bytes());
+        // SAFETY: checked excludes every NUL, and ownership changes preserve
+        // those exact bytes. CString appends the only, terminating NUL.
+        unsafe { CString::from_vec_unchecked(bytes) }
+    }
+}
+
+/// The checked name crossing async dispatch has no borrowed representation or
+/// lifetime parameter. Rust 1.88 can prove its worker future is Send directly.
+#[cfg(any(feature = "tokio", feature = "smol"))]
+#[derive(Debug, Clone)]
+pub(crate) struct OwnedSourceName(String);
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+impl OwnedSourceName {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Check lookup arguments in their public argument order, before any snapshot,
+/// cache access or async dispatch.
+pub(crate) fn checked_name_lookup(
+    name: &str,
+    timeout: Duration,
+) -> Result<(SourceName<'_>, Deadline)> {
+    let name = SourceName::checked(name)?;
+    Ok((name, Deadline::after(timeout)?))
+}
+
+pub(crate) fn checked_host_lookup(
+    host: &str,
+    timeout: Duration,
+) -> Result<(HostQuery<'_>, Deadline)> {
+    let host = HostQuery::checked(host)?;
+    Ok((host, Deadline::after(timeout)?))
 }
 
 fn accumulate_sources(
@@ -1820,14 +1884,13 @@ impl SourceCache {
     /// # Errors
     ///
     /// [`Error::InvalidInput`] for a query outside [`Source::matches_host`]'s
-    /// grammar or a timeout above [`crate::MAX_TIMEOUT`], even on a cache hit;
+    /// grammar or a timeout above [`crate::MAX_TIMEOUT`], even on a cache hit.
+    /// The host is checked before the timeout, including in async lookups;
     /// discovery/resource errors propagate without filling an entry. A completed
     /// result the cache cannot store is returned uncached. IP hints must already
     /// be configured on the finder; this method does not change its scope.
     pub fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
-        // Preserve the synchronous API's host-before-timeout validation order.
-        let query = HostQuery::checked(host)?;
-        let deadline = Deadline::after(timeout)?;
+        let (query, deadline) = checked_host_lookup(host, timeout)?;
         let Ok(sources) = self.find_sources_by_host_until(query, deadline, NeverStop)?;
         Ok(sources)
     }
@@ -2042,8 +2105,7 @@ mod tests {
             discover: impl FnOnce(HostQuery<'_>) -> Result<Vec<Source>>,
             copy: impl FnMut(&[Source]) -> Result<Vec<Source>>,
         ) -> Result<Vec<Source>> {
-            let query = HostQuery::checked(host)?;
-            let deadline = Deadline::after(timeout)?;
+            let (query, deadline) = checked_host_lookup(host, timeout)?;
             let Ok(sources) = self.find_sources_by_host_with_copy::<NeverStop>(
                 query,
                 deadline,
@@ -2063,6 +2125,122 @@ mod tests {
     }
 
     use super::*;
+
+    fn assert_same_name_error(actual: Error, expected: &Error) {
+        match (actual, expected) {
+            (Error::InvalidInput(actual), Error::InvalidInput(expected)) => {
+                assert_eq!(&actual, expected)
+            }
+            (Error::InvalidCString(actual), Error::InvalidCString(expected)) => {
+                assert_eq!(&actual, expected)
+            }
+            (actual, expected) => panic!("different errors: {actual:?}, {expected:?}"),
+        }
+    }
+
+    #[test]
+    fn source_names_preserve_checked_text_and_distinguish_empty_from_nul() {
+        assert_same_name_error(
+            SourceName::checked("").unwrap_err(),
+            &Error::InvalidInput(crate::InputDefect::Empty {
+                what: "source name",
+            }),
+        );
+        for name in ["bad\0name", "trailing\0"] {
+            let expected = Error::from(CString::new(name).unwrap_err());
+            assert_same_name_error(SourceName::checked(name).unwrap_err(), &expected);
+            #[cfg(feature = "file-io")]
+            assert_same_name_error(crate::file::SourceSpec::new(name).unwrap_err(), &expected);
+        }
+        let longest = "x".repeat(if cfg!(miri) {
+            64
+        } else {
+            crate::sdk_copy::MAX_SDK_STRING_BYTES - 1
+        });
+        for name in ["STUDIO (Camera 1)", "Caméra (映像)", longest.as_str()] {
+            let (checked, allocations) =
+                crate::test_alloc::allocation_count(|| SourceName::checked(name).unwrap());
+            assert_eq!(allocations, 0);
+            assert_eq!(checked.as_str(), name);
+            let (native, allocations) =
+                crate::test_alloc::allocation_count(|| checked.clone().into_c_string());
+            assert_eq!(allocations, 1);
+            assert_eq!(native.to_str().unwrap(), name);
+            #[cfg(any(feature = "tokio", feature = "smol"))]
+            assert_eq!(checked.into_owned().as_str(), name);
+            #[cfg(feature = "file-io")]
+            assert_eq!(
+                crate::file::SourceSpec::new(name).unwrap().name(),
+                Some(name)
+            );
+        }
+        // Address-only Source values intentionally do not use this name rule.
+        assert_eq!(Source::new("").unwrap().name(), "");
+    }
+
+    #[test]
+    fn discovery_lookup_checks_inputs_before_timeouts_without_a_runtime() {
+        let excessive = crate::MAX_TIMEOUT + Duration::from_nanos(1);
+        for timeout in [Duration::ZERO, excessive] {
+            for name in ["", "bad\0name", "trailing\0"] {
+                assert_same_name_error(
+                    checked_name_lookup(name, timeout).err().unwrap(),
+                    &SourceName::checked(name).unwrap_err(),
+                );
+            }
+            for host in ["", "bad\0host", "http://camera"] {
+                assert_same_name_error(
+                    checked_host_lookup(host, timeout).err().unwrap(),
+                    &Error::InvalidInput(crate::InputDefect::InvalidHostQuery),
+                );
+            }
+        }
+        for result in [
+            checked_name_lookup("camera", excessive).err(),
+            checked_host_lookup("camera", excessive).err(),
+        ] {
+            assert!(matches!(
+                result,
+                Some(Error::InvalidInput(
+                    crate::InputDefect::TimeoutTooLong { .. }
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn exact_source_name_entry_points_share_errors_before_native_lookup() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let finder = Finder::new(&ndi, &FinderOptions::new().show_local_sources(false)).unwrap();
+        let mut listener = crate::test_support::require_feature(
+            ndi.require_feature(crate::RuntimeFeature::ReceiverDiscovery),
+        )
+        .then(|| {
+            crate::discovery_server::RecvListener::new(
+                &ndi,
+                &crate::discovery_server::ListenerOptions::new().server("127.0.0.1:1"),
+            )
+            .unwrap()
+        });
+        let id = crate::discovery_server::ReceiverId::new("not-advertised").unwrap();
+        for name in ["", "bad\0name", "trailing\0"] {
+            let expected = SourceName::checked(name).unwrap_err();
+            assert_same_name_error(
+                finder
+                    .find_source_by_name(name, Duration::ZERO)
+                    .unwrap_err(),
+                &expected,
+            );
+            #[cfg(feature = "file-io")]
+            assert_same_name_error(crate::file::SourceSpec::new(name).unwrap_err(), &expected);
+            if let Some(listener) = &mut listener {
+                // This ID has no membership; invalid text must win before it is read.
+                assert_same_name_error(listener.request_connect(&id, name).unwrap_err(), &expected);
+            }
+        }
+    }
 
     #[test]
     fn source_cursor_commits_only_completed_observations_in_protocol_order() {

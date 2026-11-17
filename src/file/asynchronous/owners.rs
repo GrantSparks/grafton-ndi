@@ -2,7 +2,7 @@
 //! and finalization waits remain private to this module's event-pump impls.
 
 use super::*;
-use crate::file::recorder::{CleanupRequest, FinishReply, FinishWaiters, Settlement};
+use crate::file::recorder::{FinishReply, FinishWaiters, Settlement};
 
 /// Playback's native owner is private to the event-pump module. Only
 /// commands that cannot consume native events are forwarded to the handles.
@@ -59,6 +59,15 @@ impl PlayerOwner {
 }
 
 impl Owner for PlayerOwner {
+    type Closed = ();
+    fn shutdown(
+        &mut self,
+        _: Instant,
+        _: &EventQueue<Self::Event>,
+        _: &Control,
+        _: &mut [Job<Self>],
+    ) {
+    }
     type Finish = std::convert::Infallible;
     fn finish_request(&mut self, finish: Self::Finish) {
         match finish {}
@@ -93,8 +102,8 @@ pub(super) enum FinishResponse {
 impl FinishReply for FinishResponse {
     fn cancelled(&self) -> bool {
         match self {
-            Self::Finish(reply) => reply.shared.cancelled.load(Ordering::Acquire),
-            Self::Wait(reply) => reply.shared.cancelled.load(Ordering::Acquire),
+            Self::Finish(reply) => reply.cancelled(),
+            Self::Wait(reply) => reply.cancelled(),
         }
     }
     fn complete(self, result: Result<FinishStatus>) {
@@ -145,7 +154,7 @@ impl RecorderOwner {
         &mut self,
         drained: bool,
         events: &EventQueue<RecorderEvent>,
-        control: &Control,
+        control: &Control<RecordingReport>,
         cleanup_expired: bool,
         at: Instant,
     ) -> bool {
@@ -202,6 +211,7 @@ impl RecorderOwner {
 }
 
 impl Owner for RecorderOwner {
+    type Closed = RecordingReport;
     type Event = RecorderEvent;
     type Finish = RecorderFinish;
 
@@ -209,7 +219,12 @@ impl Owner for RecorderOwner {
         self.recorder.next_event(Duration::ZERO)
     }
 
-    fn after_events(&mut self, drained: bool, events: &EventQueue<Self::Event>, control: &Control) {
+    fn after_events(
+        &mut self,
+        drained: bool,
+        events: &EventQueue<Self::Event>,
+        control: &Control<RecordingReport>,
+    ) {
         self.settle_at(drained, events, control, false, Instant::now());
     }
 
@@ -229,9 +244,9 @@ impl Owner for RecorderOwner {
         &mut self,
         requested: Instant,
         events: &EventQueue<Self::Event>,
-        control: &Control,
+        control: &Control<RecordingReport>,
         queued: &mut [Job<Self>],
-    ) {
+    ) -> Self::Closed {
         self.waiters.retain();
         let notify =
             self.waiters.notifies_cleanup() || queued.iter().any(|job| job.finish().is_some());
@@ -254,15 +269,9 @@ impl Owner for RecorderOwner {
                     events.push(event);
                 }
             },
-            || {
-                if control.skip_cleanup.load(Ordering::Acquire) {
-                    CleanupRequest::Abandon
-                } else {
-                    CleanupRequest::Close
-                }
-            },
+            || control.close_request(),
         );
-        let _ = control.final_report.set(self.recorder.report());
+        self.recorder.report()
     }
 }
 
@@ -333,7 +342,7 @@ mod tests {
             )
             .unwrap();
         let mut owner = RecorderOwner::new(recorder);
-        let control = Arc::new(Control::new());
+        let control = Arc::new(Control::<RecordingReport>::with_outcome());
         let events = EventQueue::new(16);
         let (reply, future) = control.command();
         let mut finish = Some(Job::Finish {
@@ -380,14 +389,14 @@ mod tests {
             )
             .unwrap();
         let mut owner = RecorderOwner::new(recorder);
-        let (reply, finishing) = Arc::new(Control::new()).command();
+        let (reply, finishing) = Arc::new(Control::<RecordingReport>::with_outcome()).command();
         let finishing = FileOperation::live(finishing);
         owner.register_finish(
             Deadline::after(Duration::from_secs(2)).unwrap(),
             true,
             FinishResponse::Finish(reply),
         );
-        let control = Arc::new(Control::new());
+        let control = Arc::new(Control::<RecordingReport>::with_outcome());
         let mut commands = 0;
         run_owner_wait(
             &mut owner,
@@ -438,7 +447,7 @@ mod tests {
             }
             let mut owner = RecorderOwner::new(recorder);
             let events = EventQueue::new(16);
-            let control = Control::new();
+            let control = Control::<RecordingReport>::with_outcome();
             // Exclude the mock SDK's lazy native-mutex initialization while
             // retaining the wrapper's very first pump in the measurement.
             device.prepare_capture();
@@ -480,7 +489,7 @@ mod tests {
             }
             let mut owner = RecorderOwner::new(recorder);
             let events = EventQueue::new(16);
-            let control = Control::new();
+            let control = Control::<RecordingReport>::with_outcome();
             let before = device.captures.load(Ordering::Acquire);
             device.recording_queries.store(0, Ordering::Release);
             device.dropped_queries.store(0, Ordering::Release);
@@ -513,14 +522,14 @@ mod tests {
             device.push(mock::FIRST_FRAME, mock::TAKE);
         }
         let mut owner = RecorderOwner::new(recorder);
-        let (reply, finishing) = Arc::new(Control::new()).command();
+        let (reply, finishing) = Arc::new(Control::<RecordingReport>::with_outcome()).command();
         let finishing = FileOperation::live(finishing);
         owner.register_finish(
             Deadline::after(Duration::from_secs(30)).unwrap(),
             true,
             FinishResponse::Finish(reply),
         );
-        let control = Control::new();
+        let control = Control::<RecordingReport>::with_outcome();
         control.request_shutdown();
         let before = device.captures.load(Ordering::Acquire);
         owner.shutdown(Instant::now(), &EventQueue::new(16), &control, &mut []);
@@ -668,7 +677,7 @@ mod tests {
             device.push(mock::FIRST_FRAME, mock::TAKE);
         }
         let mut owner = RecorderOwner::new(recorder);
-        let (reply, finishing) = Arc::new(Control::new()).command();
+        let (reply, finishing) = Arc::new(Control::<RecordingReport>::with_outcome()).command();
         let finishing = FileOperation::live(finishing);
         owner.register_finish(
             Deadline::after(Duration::ZERO).unwrap(),
@@ -678,7 +687,7 @@ mod tests {
         owner.settle_at(
             false,
             &EventQueue::new(16),
-            &Control::new(),
+            &Control::<RecordingReport>::with_outcome(),
             false,
             Instant::now(),
         );
@@ -715,7 +724,7 @@ mod tests {
             .unwrap();
         recorder.next_event(Duration::ZERO).unwrap();
         let mut owner = RecorderOwner::new(recorder);
-        let (reply, finishing) = Arc::new(Control::new()).command();
+        let (reply, finishing) = Arc::new(Control::<RecordingReport>::with_outcome()).command();
         let finishing = FileOperation::live(finishing);
         owner.register_finish(deadline, true, FinishResponse::Finish(reply));
         (device, owner, finishing)
@@ -724,7 +733,7 @@ mod tests {
     #[test]
     fn a_close_during_reply_settlement_keeps_delivering_pending_cleanup() {
         struct CloseOnReply {
-            control: Arc<Control>,
+            control: Arc<Control<RecordingReport>>,
             device: Arc<mock::Recorder>,
         }
         impl Wake for CloseOnReply {
@@ -748,7 +757,7 @@ mod tests {
             .unwrap();
         recorder.next_event(Duration::ZERO).unwrap();
         let mut owner = RecorderOwner::new(recorder);
-        let (reply, finishing) = Arc::new(Control::new()).command();
+        let (reply, finishing) = Arc::new(Control::<RecordingReport>::with_outcome()).command();
         let finishing = FileOperation::live(finishing);
         owner.register_finish(
             Deadline::after(Duration::from_secs(30)).unwrap(),
@@ -758,7 +767,7 @@ mod tests {
         device.dropped_events.store(1, Ordering::Release);
         assert!(owner.poll_native().unwrap().is_none());
         assert_eq!(owner.recorder.state(), RecorderState::Indeterminate);
-        let control = Arc::new(Control::new());
+        let control = Arc::new(Control::<RecordingReport>::with_outcome());
         let events = EventQueue::new(16);
         let mut finishing = Box::pin(finishing);
         let waker = Waker::from(Arc::new(CloseOnReply {
@@ -797,7 +806,7 @@ mod tests {
         owner.settle_at(
             false,
             &EventQueue::new(16),
-            &Control::new(),
+            &Control::<RecordingReport>::with_outcome(),
             false,
             Instant::now(),
         );
@@ -823,7 +832,7 @@ mod tests {
         owner.settle_at(
             false,
             &EventQueue::new(16),
-            &Control::new(),
+            &Control::<RecordingReport>::with_outcome(),
             false,
             Instant::now(),
         );
@@ -833,7 +842,7 @@ mod tests {
         owner.settle_at(
             true,
             &EventQueue::new(16),
-            &Control::new(),
+            &Control::<RecordingReport>::with_outcome(),
             false,
             Instant::now(),
         );
@@ -854,7 +863,7 @@ mod tests {
         owner.settle_at(
             true,
             &EventQueue::new(16),
-            &Control::new(),
+            &Control::<RecordingReport>::with_outcome(),
             false,
             deadline.end(),
         );
@@ -893,11 +902,11 @@ mod tests {
             .as_mut()
             .poll(&mut Context::from_waker(&waker))
             .is_pending());
-        let (reply, later) = Arc::new(Control::new()).command();
+        let (reply, later) = Arc::new(Control::<RecordingReport>::with_outcome()).command();
         let later = FileOperation::live(later);
         owner.register_finish(later_deadline, false, FinishResponse::Finish(reply));
         let events = EventQueue::new(16);
-        let control = Control::new();
+        let control = Control::<RecordingReport>::with_outcome();
         owner.settle_at(false, &events, &control, false, at);
         assert!(matches!(
             block_on(first).unwrap(),

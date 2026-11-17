@@ -3,7 +3,8 @@
 
 use std::ffi::c_char;
 
-use super::{aliasable::AliasableVec, descriptors, invalid_frame, sdk_quantity};
+use super::{aliasable::AliasableVec, descriptors, invalid_frame};
+use crate::media::SdkQuantity;
 use crate::{
     frames::{FrameMetadataRef, OwnedFrameMetadata, VideoHeader},
     sys::bindings::*,
@@ -313,13 +314,13 @@ impl EnvelopeHeader {
         let bits = u16::from_be_bytes(config);
         let frequency_index = usize::from((bits >> 7) & 0xf);
         let channel_configuration = usize::from((bits >> 3) & 0xf);
-        if AAC_SAMPLE_RATES.get(frequency_index) != Some(&parameters.sample_rate) {
+        if AAC_SAMPLE_RATES.get(frequency_index) != Some(&parameters.sample_rate()) {
             return Err(invalid_frame(crate::FrameDefect::AacRateMismatch));
         }
         if channel_configuration
             .checked_sub(1)
             .and_then(|index| AAC_CHANNELS.get(index))
-            != Some(&parameters.num_channels)
+            != Some(&parameters.num_channels())
         {
             return Err(invalid_frame(crate::FrameDefect::AacChannelsMismatch));
         }
@@ -551,9 +552,8 @@ pub struct VideoPacketFormat {
     codec: VideoCodec,
     tier: StreamTier,
     protected: bool,
-    // Both in 1..=i32::MAX, the range of the SDK's signed fields.
-    width: u32,
-    height: u32,
+    width: SdkQuantity,
+    height: SdkQuantity,
     frame_rate: FrameRate,
     picture_aspect_ratio: PictureAspectRatio,
     scan_type: ScanType,
@@ -575,7 +575,7 @@ impl VideoPacketFormat {
     /// The one dimension check, for values from the API and from the SDK.
     /// The error is the reason, for the caller to report as its own variant.
     fn checked(codec: VideoCodec, width: i64, height: i64) -> crate::frames::LayoutResult<Self> {
-        match (sdk_quantity(width), sdk_quantity(height)) {
+        match (SdkQuantity::new(width), SdkQuantity::new(height)) {
             (Some(width), Some(height)) => Ok(Self {
                 codec,
                 tier: StreamTier::Program,
@@ -654,12 +654,12 @@ impl VideoPacketFormat {
 
     /// Width in pixels.
     pub fn width(self) -> u32 {
-        self.width
+        self.width.get()
     }
 
     /// Height in pixels.
     pub fn height(self) -> u32 {
-        self.height
+        self.height.get()
     }
 
     /// The frame rate.
@@ -714,7 +714,8 @@ impl VideoPacketFormat {
         header.validate(codec, total, Use::Send)?;
         header.validate_video_configuration()?;
         if self.tier == StreamTier::Preview
-            && (self.width > MAX_PREVIEW_DIMENSION || self.height > MAX_PREVIEW_DIMENSION)
+            && (self.width.get() > MAX_PREVIEW_DIMENSION
+                || self.height.get() > MAX_PREVIEW_DIMENSION)
         {
             return Err(invalid_frame(crate::FrameDefect::PreviewVideoDimensions));
         }
@@ -726,9 +727,8 @@ impl VideoPacketFormat {
     pub(crate) fn raw(self) -> NDIlib_video_frame_v2_t {
         let (numerator, denominator) = self.frame_rate.to_sdk();
         NDIlib_video_frame_v2_t {
-            // Lossless: both dimensions are at most i32::MAX.
-            xres: self.width as i32,
-            yres: self.height as i32,
+            xres: self.width.to_sdk(),
+            yres: self.height.to_sdk(),
             FourCC: self.codec.outer(self.tier, self.protected),
             frame_rate_N: numerator,
             frame_rate_D: denominator,
@@ -1139,9 +1139,9 @@ crate::media::decoded_variants!(AudioCodec: Aac, Opus);
 pub struct AudioPacketFormat {
     codec: AudioCodec,
     protected: bool,
-    sample_rate: u32,
-    num_channels: u32,
-    num_samples: u32,
+    sample_rate: SdkQuantity,
+    num_channels: SdkQuantity,
+    num_samples: SdkQuantity,
 }
 
 impl AudioPacketFormat {
@@ -1184,17 +1184,17 @@ impl AudioPacketFormat {
 
     /// Sample rate in hertz.
     pub fn sample_rate(self) -> u32 {
-        self.sample_rate
+        self.sample_rate.get()
     }
 
     /// Number of channels.
     pub fn num_channels(self) -> u32 {
-        self.num_channels
+        self.num_channels.get()
     }
 
     /// Samples per channel the frame decodes to.
     pub fn num_samples(self) -> u32 {
-        self.num_samples
+        self.num_samples.get()
     }
 
     /// The format of a frame the SDK delivered.
@@ -1226,8 +1226,8 @@ impl AudioPacketFormat {
             codec,
             protected,
             sample_rate,
-            num_channels: num_channels as u32,
-            num_samples: num_samples as u32,
+            num_channels,
+            num_samples,
         })
     }
 
@@ -1235,10 +1235,9 @@ impl AudioPacketFormat {
     pub(crate) fn descriptor(self, extras: &FrameExtras) -> NDIlib_audio_frame_v3_t {
         let (timecode, timestamp, p_metadata) = extras.to_sdk();
         NDIlib_audio_frame_v3_t {
-            // Lossless: each quantity is at most i32::MAX.
-            sample_rate: self.sample_rate as i32,
-            no_channels: self.num_channels as i32,
-            no_samples: self.num_samples as i32,
+            sample_rate: self.sample_rate.to_sdk(),
+            no_channels: self.num_channels.to_sdk(),
+            no_samples: self.num_samples.to_sdk(),
             FourCC: self.codec.outer(self.protected),
             timecode,
             timestamp,
@@ -1289,12 +1288,9 @@ impl AudioCodec {
     /// [`AudioCodec`]. An AAC frame's configuration is checked separately,
     /// against its envelope.
     fn validate_delivery(self, parameters: AudioPacketFormat) -> Result<()> {
-        let AudioPacketFormat {
-            sample_rate,
-            num_channels,
-            num_samples,
-            ..
-        } = parameters;
+        let sample_rate = parameters.sample_rate();
+        let num_channels = parameters.num_channels();
+        let num_samples = parameters.num_samples();
         match self {
             Self::Opus => {
                 if !OPUS_SAMPLE_RATES.contains(&sample_rate) {

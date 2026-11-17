@@ -2,6 +2,7 @@
 
 use std::{
     hash::{Hash, Hasher},
+    num::NonZeroU32,
     ops::{BitOr, BitOrAssign},
 };
 
@@ -33,6 +34,47 @@ macro_rules! decoded_variants {
 }
 pub(crate) use decoded_variants;
 
+/// A positive quantity that fits the SDK's signed integer fields.
+/// Construction retains the range proof until the native conversion.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SdkQuantity(NonZeroU32);
+
+// Keep the private range proof out of the public values' numeric Debug fields.
+impl std::fmt::Debug for SdkQuantity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl SdkQuantity {
+    pub(crate) const fn new(value: i64) -> Option<Self> {
+        // Explicit comparisons keep the shared predicate usable in const
+        // contexts on the minimum supported Rust version.
+        if value < 1 || value > i32::MAX as i64 {
+            return None;
+        }
+        match NonZeroU32::new(value as u32) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    pub(crate) const fn to_sdk(self) -> i32 {
+        // Lossless: construction proves the value is in 1..=i32::MAX.
+        self.get() as i32
+    }
+
+    pub(crate) const fn to_usize(self) -> usize {
+        self.get() as usize
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<Option<SdkQuantity>>() == 4);
+
 /// A frame rate in frames per second, as the fraction
 /// `numerator / denominator`.
 ///
@@ -54,9 +96,8 @@ pub(crate) use decoded_variants;
 /// ```
 #[derive(Debug, Clone, Copy, Eq)]
 pub struct FrameRate {
-    // Both in 1..=i32::MAX, the range of the SDK's signed fields.
-    numerator: u32,
-    denominator: u32,
+    numerator: SdkQuantity,
+    denominator: SdkQuantity,
 }
 
 /// The shared default for owned, borrowed and compressed video construction.
@@ -65,18 +106,18 @@ pub(crate) const DEFAULT_VIDEO_FRAME_RATE: FrameRate = FrameRate::per_second(60)
 impl PartialEq for FrameRate {
     fn eq(&self, other: &Self) -> bool {
         // Each component is at most i32::MAX, so either product fits in u64.
-        u64::from(self.numerator) * u64::from(other.denominator)
-            == u64::from(other.numerator) * u64::from(self.denominator)
+        u64::from(self.numerator.get()) * u64::from(other.denominator.get())
+            == u64::from(other.numerator.get()) * u64::from(self.denominator.get())
     }
 }
 
 impl Hash for FrameRate {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let (mut a, mut b) = (self.numerator, self.denominator);
+        let (mut a, mut b) = (self.numerator.get(), self.denominator.get());
         while b != 0 {
             (a, b) = (b, a % b);
         }
-        (self.numerator / a, self.denominator / a).hash(state);
+        (self.numerator.get() / a, self.denominator.get() / a).hash(state);
     }
 }
 
@@ -95,10 +136,15 @@ impl FrameRate {
     /// `frames` frames per second, for the builders' defaults. Call it in a
     /// `const` block, where a value outside `1..=i32::MAX` fails to compile.
     pub(crate) const fn per_second(frames: u32) -> Self {
-        assert!(frames >= 1 && frames <= i32::MAX.unsigned_abs());
         Self {
-            numerator: frames,
-            denominator: 1,
+            numerator: match SdkQuantity::new(frames as i64) {
+                Some(value) => value,
+                None => panic!("frame rate must be in 1..=i32::MAX"),
+            },
+            denominator: match SdkQuantity::new(1) {
+                Some(value) => value,
+                None => unreachable!(),
+            },
         }
     }
 
@@ -111,12 +157,7 @@ impl FrameRate {
     /// The one frame-rate check, for values from the API and from the SDK.
     /// The error is the reason, for the caller to report as its own variant.
     fn checked(numerator: i64, denominator: i64) -> crate::frames::LayoutResult<Self> {
-        let part = |value: i64| {
-            u32::try_from(value)
-                .ok()
-                .filter(|value| (1..=i32::MAX.unsigned_abs()).contains(value))
-        };
-        match (part(numerator), part(denominator)) {
+        match (SdkQuantity::new(numerator), SdkQuantity::new(denominator)) {
             (Some(numerator), Some(denominator)) => Ok(Self {
                 numerator,
                 denominator,
@@ -133,19 +174,18 @@ impl FrameRate {
     /// The number of frames in [`denominator`](Self::denominator) seconds.
     #[must_use]
     pub const fn numerator(self) -> u32 {
-        self.numerator
+        self.numerator.get()
     }
 
     /// The number of seconds that [`numerator`](Self::numerator) frames take.
     #[must_use]
     pub const fn denominator(self) -> u32 {
-        self.denominator
+        self.denominator.get()
     }
 
     /// The SDK's `frame_rate_N` and `frame_rate_D` fields.
     pub(crate) const fn to_sdk(self) -> (i32, i32) {
-        // Lossless: construction keeps both parts at or below i32::MAX.
-        (self.numerator as i32, self.denominator as i32)
+        (self.numerator.to_sdk(), self.denominator.to_sdk())
     }
 }
 
@@ -369,6 +409,99 @@ impl BitOrAssign for MediaTypes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compile the private const constructor itself, so rejection cannot be
+    /// satisfied accidentally by a visibility or non-const-call error.
+    #[test]
+    #[cfg(not(miri))]
+    fn constant_frame_rates_reject_zero() {
+        fn declaration<'a>(source: &'a str, marker: &str) -> &'a str {
+            let source = &source[source.find(marker).unwrap()..];
+            let mut depth = 0;
+            for (index, byte) in source.bytes().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &source[..=index];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unterminated declaration: {marker}")
+        }
+        let source = include_str!("media.rs");
+        let quantity = declaration(source, "impl SdkQuantity {");
+        let rate = declaration(source, "pub struct FrameRate {");
+        let per_second = declaration(source, "pub(crate) const fn per_second(");
+        let fixture = include_str!("../tests/ui/internal/fail/frame_rate_zero_const.rs");
+        let definitions = format!(
+            "#![allow(dead_code)]\nuse std::num::NonZeroU32;\n\
+             struct SdkQuantity(NonZeroU32);\n{quantity}\n{rate}\n\
+             impl FrameRate {{ {per_second} }}\n"
+        );
+        let directory =
+            std::env::temp_dir().join(format!("grafton-const-frame-rate-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        for (name, fixture, succeeds) in [
+            (
+                "positive",
+                fixture.replace("per_second(0)", "per_second(1)"),
+                true,
+            ),
+            ("zero", fixture.to_owned(), false),
+        ] {
+            let path = directory.join(format!("{name}.rs"));
+            std::fs::write(&path, format!("{definitions}\n{fixture}")).unwrap();
+            let output = std::process::Command::new("rustc")
+                .args(["--edition=2021", "--emit=metadata", "--out-dir"])
+                .arg(&directory)
+                .arg(path)
+                .output()
+                .unwrap();
+            let error = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(output.status.success(), succeeds, "{name}: {error}");
+            if !succeeds {
+                assert!(error.contains("E0080"), "{error}");
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sdk_quantities_preserve_exactly_the_signed_positive_range() {
+        const ONE: SdkQuantity = SdkQuantity::new(1).unwrap();
+        const MAX: SdkQuantity = SdkQuantity::new(i32::MAX as i64).unwrap();
+        const DEFAULT: FrameRate = FrameRate::per_second(60);
+        assert_eq!((ONE.get(), ONE.to_sdk(), ONE.to_usize()), (1, 1, 1));
+        assert_eq!(MAX.to_sdk(), i32::MAX);
+        assert_eq!(DEFAULT.to_sdk(), (60, 1));
+        assert_eq!(
+            format!("{DEFAULT:?}"),
+            "FrameRate { numerator: 60, denominator: 1 }"
+        );
+        for value in [
+            i64::MIN,
+            -1,
+            0,
+            i32::MAX as i64 + 1,
+            u32::MAX as i64,
+            i64::MAX,
+        ] {
+            assert_eq!(SdkQuantity::new(value), None, "{value}");
+        }
+        for value in [1, 48_000, i32::MAX as i64] {
+            let quantity = SdkQuantity::new(value).unwrap();
+            assert_eq!(i64::from(quantity.get()), value);
+            assert_eq!(i64::from(quantity.to_sdk()), value);
+            assert_eq!(quantity.to_usize() as u64, value as u64);
+        }
+        for value in [0, i32::MAX as u32 + 1, u32::MAX] {
+            assert!(std::panic::catch_unwind(|| FrameRate::per_second(value)).is_err());
+        }
+    }
 
     #[test]
     fn picture_aspect_ratio_accepts_only_finite_nonnegative_values() {

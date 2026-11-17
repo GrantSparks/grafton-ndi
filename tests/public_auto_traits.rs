@@ -6,7 +6,8 @@
 //! those builds fails as well: the `advanced` API has the same shape in both.
 //! A trait a type lacks is its documented design, stated beside the type:
 //! the File objects and FrameSync's frame references stay on their thread,
-//! the Discovery Server owners, a `Router`, `AvSync`, `Genlock` and its clocks
+//! the Discovery Server owners, a `Router`, `AvSync`, `Genlock` and its clocks,
+//! and the split video views `RawVideo`, `CompressedVideo` and `QueuedVideo`
 //! are `Send` but not `Sync`, and `Error` and `Rejected`
 //! may hold application values that are not unwind safe. Gaining a trait is
 //! not a breaking change; list it here when a type gains one, and list a new
@@ -116,7 +117,7 @@ fn crate_root_types_keep_their_auto_traits() {
         ResourceKind: Send, Sync, UnwindSafe, RefUnwindSafe;
         RawCapture: Send, Sync, UnwindSafe, RefUnwindSafe;
         RawSend: Send, Sync, UnwindSafe, RefUnwindSafe;
-        RawVideo<'static>: Send, UnwindSafe;
+        RawVideo<'static>: Send, UnwindSafe, RefUnwindSafe;
         Receiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         Receiver<FrameSyncAttached>: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceiverBandwidth: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -319,6 +320,7 @@ fn advanced_types_keep_their_auto_traits() {
         ReceivedAudioRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceivedVideoRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         CompressedSender: Send, Sync, UnwindSafe, RefUnwindSafe;
+        CompressedVideo<'static>: Send, RefUnwindSafe;
         CompressedVideoFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         EnvelopeCodec: Send, Sync, UnwindSafe, RefUnwindSafe;
         ExtendedSource: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -338,6 +340,7 @@ fn advanced_types_keep_their_auto_traits() {
         QualityPlan: Send, Sync, UnwindSafe, RefUnwindSafe;
         QueueLimits: Send, Sync, UnwindSafe, RefUnwindSafe;
         QueuedSender: Send, Sync, UnwindSafe, RefUnwindSafe;
+        QueuedVideo<'static>: Send, UnwindSafe, RefUnwindSafe;
         QueuedVideoFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceivedAudio: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceivedAudioPacket: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -356,7 +359,12 @@ fn advanced_types_keep_their_auto_traits() {
     lacks! {
         AudioClock<'static>: Sync;
         AvSync: Sync;
+        CompressedVideo<'static>: Sync;
+        CompressedVideo<'static>: Clone;
+        CompressedVideo<'static>: UnwindSafe;
         Genlock: Sync;
+        QueuedVideo<'static>: Sync;
+        QueuedVideo<'static>: Clone;
         VideoClock<'static>: Sync;
     }
 }
