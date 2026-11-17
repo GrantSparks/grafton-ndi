@@ -3980,6 +3980,18 @@ impl ValidatedAudioLayout {
         no_samples: u32,
         channel_stride: Option<usize>,
     ) -> Result<Self> {
+        Self::new_uncompressed_checked(format, sample_rate, no_channels, no_samples, channel_stride)
+            .map_err(Into::into)
+    }
+
+    /// As `new_uncompressed`, retaining the cause for reusable input values.
+    pub(crate) fn new_uncompressed_checked(
+        format: AudioFormat,
+        sample_rate: u32,
+        no_channels: u32,
+        no_samples: u32,
+        channel_stride: Option<usize>,
+    ) -> LayoutResult<Self> {
         Self::checked(
             format,
             sample_rate.into(),
@@ -3987,7 +3999,6 @@ impl ValidatedAudioLayout {
             no_samples.into(),
             channel_stride,
         )
-        .map_err(Into::into)
     }
 
     /// Validate signed SDK geometry. This does not examine a sample pointer;
@@ -5893,10 +5904,11 @@ mod tests {
                 expected
             );
             assert_eq!(
-                message(
-                    crate::framesync::FrameSyncAudioRequest::capture_at(rate, 2, 8).map(|_| ())
-                ),
-                expected
+                match crate::framesync::FrameSyncAudioRequest::capture_at(rate, 2, 8).unwrap_err() {
+                    Error::InvalidInput(crate::InputDefect::Layout(cause)) => cause,
+                    other => panic!("expected InvalidInput(Layout), got {other:?}"),
+                },
+                crate::LayoutDefect::AudioRate(rate.into())
             );
             assert_eq!(
                 message(

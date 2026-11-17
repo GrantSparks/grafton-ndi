@@ -220,18 +220,20 @@ impl FrameSyncAudioRequest {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidFrame`] for a sample rate outside
-    /// `1..=i32::MAX`, a zero dimension, or a sample payload exceeding 64 MiB.
+    /// Returns [`Error::InvalidInput`] with an [`crate::InputDefect::Layout`]
+    /// cause for a rate or count outside `1..=i32::MAX`, or a sample payload
+    /// exceeding 64 MiB.
     /// Validation does not allocate sample storage.
     pub fn capture_at(sample_rate: u32, num_channels: u32, num_samples: u32) -> Result<Self> {
         Ok(Self {
-            layout: ValidatedAudioLayout::new_uncompressed(
+            layout: ValidatedAudioLayout::new_uncompressed_checked(
                 crate::AudioFormat::Fltp,
                 sample_rate,
                 num_channels,
                 num_samples,
                 None,
-            )?,
+            )
+            .map_err(|cause| Error::InvalidInput(crate::InputDefect::Layout(cause)))?,
         })
     }
 
@@ -246,7 +248,7 @@ impl FrameSyncAudioRequest {
     ///
     /// # Errors
     ///
-    /// As for [`capture_at`](Self::capture_at): [`Error::InvalidFrame`] for a
+    /// As for [`capture_at`](Self::capture_at): [`Error::InvalidInput`] for a
     /// zero or oversized `num_samples`, or a payload exceeding 64 MiB.
     ///
     /// # Example
@@ -1284,6 +1286,98 @@ mod tests {
             assert!(receiver.capture_video(std::time::Duration::ZERO).is_ok());
         });
         assert_eq!(events, ["receiver"]);
+    }
+
+    #[test]
+    fn audio_request_errors_describe_reusable_input_and_keep_layout_causes() {
+        use crate::{AudioCountKind, InputDefect, LayoutDefect};
+
+        let cause = |error| match error {
+            Error::InvalidInput(InputDefect::Layout(cause)) => cause,
+            other => panic!("expected InvalidInput(Layout), got {other:?}"),
+        };
+        for rate in [0, 1 << 31, u32::MAX] {
+            assert_eq!(
+                cause(FrameSyncAudioRequest::capture_at(rate, 0, 0).unwrap_err()),
+                LayoutDefect::AudioRate(rate.into())
+            );
+        }
+        for count in [0, 1 << 31, u32::MAX] {
+            assert_eq!(
+                cause(FrameSyncAudioRequest::capture_at(48_000, count, 0).unwrap_err()),
+                LayoutDefect::AudioCount {
+                    kind: AudioCountKind::Channels,
+                    value: count.into(),
+                }
+            );
+            assert_eq!(
+                cause(FrameSyncAudioRequest::capture_at(48_000, 1, count).unwrap_err()),
+                LayoutDefect::AudioCount {
+                    kind: AudioCountKind::Samples,
+                    value: count.into(),
+                }
+            );
+        }
+        let format = AudioInputFormat::new(
+            NonZeroU32::new(48_000).unwrap(),
+            NonZeroU32::new(1).unwrap(),
+        );
+        for (samples, expected) in [
+            (
+                0,
+                LayoutDefect::AudioCount {
+                    kind: AudioCountKind::Samples,
+                    value: 0.into(),
+                },
+            ),
+            (16_777_217, LayoutDefect::AudioBytes(67_108_868u64.into())),
+        ] {
+            assert_eq!(
+                cause(FrameSyncAudioRequest::capture_at(48_000, 1, samples).unwrap_err()),
+                expected
+            );
+            assert_eq!(
+                cause(FrameSyncAudioRequest::for_input(format, samples).unwrap_err()),
+                expected
+            );
+        }
+    }
+
+    #[cfg(feature = "advanced")]
+    #[test]
+    fn synchronizer_requests_share_rate_and_sample_range_errors() {
+        use crate::advanced::{AudioClockRequest, AvSyncRequest};
+
+        let cause = |error| match error {
+            Error::InvalidInput(crate::InputDefect::Layout(cause)) => cause,
+            other => panic!("expected InvalidInput(Layout), got {other:?}"),
+        };
+
+        // These are the quantities all three requests carry. AV sync has no
+        // requested channel count, and a clock query allocates no audio payload.
+        for rate in [0, 1 << 31, u32::MAX] {
+            let expected = cause(FrameSyncAudioRequest::capture_at(rate, 1, 8).unwrap_err());
+            assert_eq!(
+                cause(AvSyncRequest::new(Some(rate), Some(8)).unwrap_err()),
+                expected
+            );
+            assert_eq!(
+                cause(AudioClockRequest::new(rate, 8).unwrap_err()),
+                expected
+            );
+        }
+        for samples in [0, 1 << 31, u32::MAX] {
+            let expected =
+                cause(FrameSyncAudioRequest::capture_at(48_000, 1, samples).unwrap_err());
+            assert_eq!(
+                cause(AvSyncRequest::new(Some(48_000), Some(samples)).unwrap_err()),
+                expected
+            );
+            assert_eq!(
+                cause(AudioClockRequest::new(48_000, samples).unwrap_err()),
+                expected
+            );
+        }
     }
 
     #[test]
