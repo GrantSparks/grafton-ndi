@@ -44,6 +44,8 @@ fn main() {
         "ndi_test_descriptor_parts",
         "ndi_test_finder_snapshot_guard",
         "ndi_test_foreign_snapshot_guard",
+        "ndi_test_file_late_drain",
+        "ndi_test_file_late_drain_without_proof",
     ] {
         println!("cargo:rustc-check-cfg=cfg({cfg})");
     }

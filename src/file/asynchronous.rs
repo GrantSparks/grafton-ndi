@@ -1268,7 +1268,6 @@ trait Owner: 'static {
     /// Settle work that is waiting for the ledger, after publishing events.
     fn after_events(
         &mut self,
-        _drained: bool,
         _events: &EventQueue<Self::Event>,
         _control: &Control<Self::Closed>,
     ) {
@@ -1866,13 +1865,11 @@ fn run_owner_wait<H: Owner>(
     while !control.shutdown_requested() {
         // Limit each drain burst so a busy source cannot starve commands.
         let mut full = true;
-        let mut drained = false;
         for _ in 0..16 {
             match owner.poll_native() {
                 Ok(Some(event)) => events.push(Ok(event)),
                 Ok(None) => {
                     full = false;
-                    drained = true;
                     break;
                 }
                 Err(error) => {
@@ -1882,7 +1879,7 @@ fn run_owner_wait<H: Owner>(
                 }
             }
         }
-        owner.after_events(drained, events, control);
+        owner.after_events(events, control);
         if control.shutdown_requested() {
             break;
         }
@@ -4142,7 +4139,7 @@ mod tests {
                     let (_, allocations) = crate::test_alloc::allocation_count(|| {
                         for _ in 0..ATTEMPTS {
                             let _ = owner.wait_timeout();
-                            owner.after_events(true, &events, &control);
+                            owner.after_events(&events, &control);
                         }
                     });
                     Ok((owner.finish_storage(), allocations, started.elapsed()))
