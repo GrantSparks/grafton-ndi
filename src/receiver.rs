@@ -472,7 +472,7 @@ fn capture_within_clock_with_stop<T, R: Into<Retry<T>>>(
         if returned < this.0.end() && (!progress || notifications >= IMMEDIATE_NOTIFICATION_RETRIES)
         {
             // Before the attempt's end, and so before the deadline's.
-            sleep(EARLY_RETURN_PAUSE.min(deadline.remaining_at(returned)));
+            sleep(EARLY_RETURN_PAUSE.min(deadline.remaining_at(returned).duration()));
             returned = now();
             notifications = 0;
         } else if progress && returned < this.0.end() {
@@ -3535,7 +3535,7 @@ mod tests {
         /// What is left of `attempt` now: the timeout its SDK call would get,
         /// for the current attempt.
         fn timeout(&self, attempt: Attempt) -> Duration {
-            attempt.0.remaining_at(self.now())
+            attempt.0.remaining_at(self.now()).duration()
         }
     }
 

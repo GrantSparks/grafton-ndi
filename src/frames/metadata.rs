@@ -14,8 +14,9 @@ use std::{
 ///
 /// `with_nul` is UTF-8 whose only NUL byte is its last, and it is at most
 /// [`MAX_METADATA_BYTES`] long. `EMPTY`, `from_cstr`, `from_terminated_bytes`,
-/// and the unsafe `reborrow` establish this invariant. Owned text is validated
-/// by `TerminatedText`; a cached SDK observation retains its measured extent.
+/// the bounded C-string observation, and the unsafe `reborrow` establish this
+/// invariant. Owned text is validated by `TerminatedText`; a cached SDK
+/// observation retains its measured extent.
 /// Absent text (a null pointer, or a
 /// standalone frame's empty null frame) is `None` of
 /// `Option<MetadataText>`; an explicit, non-null empty C string is `"\0"`.
@@ -88,6 +89,20 @@ impl<'a> MetadataText<'a> {
     /// The text's length, terminator included.
     pub(crate) fn len_with_nul(self) -> usize {
         self.with_nul.len()
+    }
+
+    /// The checked text length in the SDK's signed descriptor field.
+    pub(crate) fn sdk_len(self) -> i32 {
+        // MetadataText's constructors bound this length by MAX_METADATA_BYTES;
+        // frames asserts that the cap is smaller than i32::MAX.
+        self.with_nul.len() as i32
+    }
+
+    /// Complete the UTF-8 check after bounded_sdk_text has established the
+    /// cap and the sole terminal NUL. Used only after that bounded observation.
+    fn from_measured_bytes(bytes: &'a [u8]) -> Result<Self> {
+        let with_nul = str::from_utf8(bytes).map_err(Error::InvalidUtf8)?;
+        Ok(Self { with_nul })
     }
 }
 
@@ -188,7 +203,7 @@ fn validate_metadata_prefix(raw: &NDIlib_metadata_frame_t) -> Result<usize> {
     Ok(len_with_nul)
 }
 
-fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
+fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<()> {
     debug_assert!(len_with_nul > 0, "metadata includes its terminator");
 
     if len_with_nul > MAX_METADATA_BYTES {
@@ -197,13 +212,7 @@ fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
         }));
     }
 
-    Ok(metadata_len_to_i32(len_with_nul))
-}
-
-pub(super) fn metadata_len_to_i32(len_with_nul: usize) -> i32 {
-    debug_assert!(len_with_nul <= MAX_METADATA_BYTES);
-    // Lossless: the metadata limit is smaller than i32::MAX, asserted in frames.
-    len_with_nul as i32
+    Ok(())
 }
 
 /// Why optional metadata was withheld while retaining otherwise valid media.
@@ -544,5 +553,5 @@ pub(crate) unsafe fn validate_frame_metadata<'a>(
     // within the cap, from the non-null `p_metadata`, which the caller keeps
     // live and unchanged for `'a`; `u8` needs no alignment.
     let bytes = unsafe { slice::from_raw_parts(p_metadata.cast::<u8>(), payload.len() + 1) };
-    MetadataText::from_terminated_bytes(bytes).map(Some)
+    MetadataText::from_measured_bytes(bytes).map(Some)
 }

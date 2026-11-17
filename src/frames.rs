@@ -3157,11 +3157,11 @@ pub(crate) unsafe trait MetadataParts {
 pub(crate) trait MetadataPartsExt: MetadataParts {
     /// Canonicalize empty metadata to a non-null empty C string. The SDK
     /// reads/copies the text during the call, and the source remains borrowed
-    /// until it returns. Validation has already bounded the length to i32.
+    /// until it returns. MetadataText retains the SDK length bound.
     fn metadata_raw(&self) -> NDIlib_metadata_frame_t {
         let text = self.metadata_text_for_send();
         NDIlib_metadata_frame_t {
-            length: text.unwrap_or(MetadataText::EMPTY).len_with_nul() as i32,
+            length: text.unwrap_or(MetadataText::EMPTY).sdk_len(),
             timecode: self.metadata_timecode().ticks(),
             p_data: text.unwrap_or(MetadataText::EMPTY).as_ptr().cast_mut(),
         }
@@ -3259,8 +3259,6 @@ pub enum FrameMetadataStatus {
 }
 
 mod metadata;
-#[cfg(test)]
-use metadata::metadata_len_to_i32;
 pub(crate) use metadata::FrameMetadataState;
 #[cfg(test)]
 pub(crate) use metadata::{validate_frame_metadata, MetadataWithheld};
@@ -8343,9 +8341,11 @@ mod tests {
 
     #[test]
     fn metadata_sdk_length_uses_the_validated_metadata_bound() {
-        assert_eq!(metadata_len_to_i32(1), 1);
+        assert_eq!(MetadataText::EMPTY.sdk_len(), 1);
         assert_eq!(
-            metadata_len_to_i32(MAX_METADATA_BYTES),
+            MetadataText::from_cstr(&CString::new("x".repeat(MAX_METADATA_BYTES - 1)).unwrap())
+                .unwrap()
+                .sdk_len(),
             MAX_METADATA_BYTES as i32
         );
         let text = "x".repeat(MAX_METADATA_BYTES);
