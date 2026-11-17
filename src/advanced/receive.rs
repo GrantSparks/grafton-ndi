@@ -289,7 +289,9 @@ impl PacketReceiver {
 
     /// Borrow exclusive stream controls or start KVM, without permitting
     /// receiver replacement. This allocates nothing and makes no SDK call.
-    /// A KVM session captures packets through its own `capture_any` method.
+    /// During a KVM session, capture packets through the session's
+    /// [`receiver()`](super::KvmSession::receiver) view, with `capture_any` or
+    /// `capture_any_ref`.
     pub fn controls(&mut self) -> ReceiverControls<'_, PacketAttached> {
         ReceiverControls::new(&mut self.receiver)
     }
