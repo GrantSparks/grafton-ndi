@@ -4,14 +4,14 @@
 use std::ptr;
 
 #[cfg(doc)]
-use super::AudioCodec;
+use super::{AudioCodec, MAX_PACKET_BYTES};
 
 use super::{
     aliasable::AliasableVec,
     invalid_frame,
-    packets::{frame_extras_accessors, packet_debug, AudioPacketFormat, FrameExtras},
+    packets::{frame_extras_accessors, packet_debug, AudioPacketFormat, FrameExtras, PacketLen},
     AdvancedConfig, CompressedAttached, CompressedAudioFrame, CompressedAudioSendMode,
-    CompressedVideoFrame, VideoPacketFormat, MAX_PACKET_BYTES,
+    CompressedVideoFrame, VideoPacketFormat,
 };
 use crate::{
     marker::NotSync,
@@ -46,8 +46,11 @@ struct ScatterStorage {
     #[cfg(any(test, ndi_has_advanced_scatter_send))]
     pointers: BlockPointers,
     #[cfg(any(test, ndi_has_advanced_scatter_send))]
-    sizes: AliasableBox<[i32]>,
-    total: usize,
+    // Option preserves NonZeroU32's guaranteed niche layout: each positive
+    // PacketLen is its SDK int, and None is the terminating zero. The SDK
+    // reads this array; it writes only the packet blocks.
+    sizes: AliasableBox<[Option<PacketLen>]>,
+    total: PacketLen,
 }
 
 /// Addresses lent to the SDK, never dereferenced by Rust.
@@ -71,6 +74,8 @@ unsafe impl Send for BlockPointers {}
 unsafe impl Sync for BlockPointers {}
 
 const _: () = {
+    assert!(size_of::<Option<PacketLen>>() == size_of::<i32>());
+    assert!(std::mem::align_of::<Option<PacketLen>>() == std::mem::align_of::<i32>());
     const fn send_and_sync<T: Send + Sync>() {}
     send_and_sync::<ScatterStorage>();
 };
@@ -98,7 +103,7 @@ impl ScatterStorage {
     }
 
     /// Check a block list and return its total size in bytes.
-    fn total(blocks: &[Vec<u8>]) -> Result<usize> {
+    fn total(blocks: &[Vec<u8>]) -> Result<PacketLen> {
         if blocks.is_empty() || blocks.len() > MAX_SCATTER_BLOCKS {
             return Err(invalid_frame(crate::FrameDefect::ScatterBlockCount));
         }
@@ -109,14 +114,15 @@ impl ScatterStorage {
             }
             total = total
                 .checked_add(block.len())
-                .filter(|total| *total <= MAX_PACKET_BYTES)
-                .ok_or_else(|| invalid_frame(crate::FrameDefect::ScatterSize))?;
+                .and_then(PacketLen::new)
+                .ok_or_else(|| invalid_frame(crate::FrameDefect::ScatterSize))?
+                .to_usize();
         }
-        Ok(total)
+        PacketLen::new(total).ok_or_else(|| invalid_frame(crate::FrameDefect::ScatterSize))
     }
 
     /// Take ownership of blocks that [`total`](Self::total) accepted.
-    fn new(blocks: Vec<Vec<u8>>, total: usize) -> Self {
+    fn new(blocks: Vec<Vec<u8>>, total: PacketLen) -> Self {
         let blocks: Box<[_]> = blocks.into_iter().map(AliasableVec::new).collect();
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
         let mut blocks = blocks;
@@ -129,13 +135,17 @@ impl ScatterStorage {
                 .chain(std::iter::once(ptr::null()))
                 .collect(),
         );
-        // Each block is no larger than the total, which is below i32::MAX.
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
         let sizes = AliasableBox::new(
             blocks
                 .iter()
-                .map(|block| block.len() as i32)
-                .chain(std::iter::once(0))
+                .map(|block| {
+                    Some(
+                        PacketLen::new(block.len())
+                            .expect("the checked total bounds every nonempty block"),
+                    )
+                })
+                .chain(std::iter::once(None))
                 .collect(),
         );
         #[cfg(ndi_has_advanced_scatter_send)]
@@ -178,7 +188,7 @@ impl ScatterStorage {
     }
 
     fn copy_contiguous(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.total);
+        let mut bytes = Vec::with_capacity(self.total.to_usize());
         for block in self.blocks() {
             bytes.extend_from_slice(block);
         }
@@ -259,7 +269,10 @@ impl ScatterVideoFrame {
     ) -> std::result::Result<Self, Rejected<Vec<Vec<u8>>>> {
         let check = || {
             let total = ScatterStorage::total(&blocks)?;
-            format.validate_for_send(first_block(&blocks, format.header_bytes())?, total)?;
+            format.validate_for_send(
+                first_block(&blocks, format.header_bytes())?,
+                total.to_usize(),
+            )?;
             Ok(total)
         };
         match check() {
@@ -292,7 +305,7 @@ impl ScatterVideoFrame {
 
     /// The size of the whole frame in bytes.
     pub fn total_bytes(&self) -> usize {
-        self.storage.total
+        self.storage.total.to_usize()
     }
 
     pub(super) fn retained_bytes(&self) -> usize {
@@ -306,6 +319,7 @@ impl ScatterVideoFrame {
         CompressedVideoFrame {
             format: self.format,
             bytes: AliasableVec::new(self.storage.copy_contiguous()),
+            len: self.storage.total,
             extras: self.extras,
         }
     }
@@ -353,7 +367,9 @@ impl ScatterAudioFrame {
             let header = first_block(&blocks, format.codec().header_bytes())?;
             format
                 .codec()
-                .validate_for_send(format, header, total, |offset| bytes_at(&blocks, offset))?;
+                .validate_for_send(format, header, total.to_usize(), |offset| {
+                    bytes_at(&blocks, offset)
+                })?;
             Ok(total)
         };
         match check() {
@@ -386,7 +402,7 @@ impl ScatterAudioFrame {
 
     /// The size of the whole frame in bytes.
     pub fn total_bytes(&self) -> usize {
-        self.storage.total
+        self.storage.total.to_usize()
     }
 
     /// Join the blocks into one newly allocated contiguous frame.
@@ -394,6 +410,7 @@ impl ScatterAudioFrame {
         CompressedAudioFrame {
             format: self.format,
             bytes: AliasableVec::new(self.storage.copy_contiguous()),
+            len: self.storage.total,
             extras: self.extras,
         }
     }
@@ -535,7 +552,12 @@ impl ScatterSendable<ScatterVideoFrame> {
     #[cfg(ndi_has_advanced_scatter_send)]
     pub(super) fn completion_key(&mut self) -> (*mut u8, i32) {
         let first = &mut self.frame.storage.blocks[0];
-        (first.as_mut_ptr(), first.len() as i32)
+        (
+            first.as_mut_ptr(),
+            self.frame.storage.sizes[0]
+                .expect("the first block has a checked nonzero length")
+                .to_sdk(),
+        )
     }
 }
 
@@ -1121,7 +1143,16 @@ mod tests {
         assert_eq!(frame.total_bytes(), bytes.len());
         assert_eq!(frame.storage.pointers.array.len(), 4);
         assert!(frame.storage.pointers.array[3].is_null());
-        assert_eq!(&*frame.storage.sizes, &[44, 3, 2, 0]);
+        // SAFETY: the transparent NonZeroU32 niche and the layout assertions
+        // guarantee the SDK's int representation, including the zero terminator.
+        // The frame retains this initialized array through the borrowed read.
+        let sdk_sizes = unsafe {
+            std::slice::from_raw_parts(
+                frame.storage.sizes.as_ptr().cast::<i32>(),
+                frame.storage.sizes.len(),
+            )
+        };
+        assert_eq!(sdk_sizes, &[44, 3, 2, 0]);
         let moved = Box::new(frame);
         for (block, pointer) in moved
             .storage

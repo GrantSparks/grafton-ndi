@@ -10,6 +10,7 @@ use super::*;
 pub struct ReceivedVideoPacket {
     pub(crate) format: VideoPacketFormat,
     pub(crate) bytes: Vec<u8>,
+    pub(crate) len: PacketLen,
     pub(crate) extras: FrameExtras,
 }
 
@@ -47,7 +48,7 @@ impl ReceivedVideoPacket {
     /// [`Error::InvalidFrame`] when the envelope or codec parameters are not
     /// supported for sending. The packet remains unchanged.
     pub fn validate_for_send(&self) -> Result<()> {
-        validate_video_packet(self.format, &self.bytes, Use::Send)
+        validate_video_content(self.format, &self.bytes, self.len, Use::Send)
     }
 }
 
@@ -61,11 +62,13 @@ impl TryFrom<ReceivedVideoPacket> for CompressedVideoFrame {
         let ReceivedVideoPacket {
             format,
             bytes,
+            len,
             extras,
         } = packet;
         Ok(Self {
             format,
             bytes: AliasableVec::new(bytes),
+            len,
             extras,
         })
     }
@@ -76,11 +79,13 @@ impl From<CompressedVideoFrame> for ReceivedVideoPacket {
         let CompressedVideoFrame {
             format,
             bytes,
+            len,
             extras,
         } = frame;
         Self {
             format,
             bytes: bytes.into_vec(),
+            len,
             extras,
         }
     }
@@ -95,6 +100,7 @@ impl From<CompressedVideoFrame> for ReceivedVideoPacket {
 pub struct ReceivedAudioPacket {
     pub(crate) format: AudioPacketFormat,
     pub(crate) bytes: Vec<u8>,
+    pub(crate) len: PacketLen,
     pub(crate) extras: FrameExtras,
 }
 
@@ -132,7 +138,7 @@ impl ReceivedAudioPacket {
     /// [`Error::InvalidFrame`] for unsupported delivery parameters or envelope
     /// details. The packet remains unchanged.
     pub fn validate_for_send(&self) -> Result<()> {
-        validate_audio_for_send(self.format, &self.bytes)
+        validate_audio_content_for_send(self.format, &self.bytes, self.len)
     }
 }
 
@@ -146,11 +152,13 @@ impl TryFrom<ReceivedAudioPacket> for CompressedAudioFrame {
         let ReceivedAudioPacket {
             format,
             bytes,
+            len,
             extras,
         } = packet;
         Ok(Self {
             format,
             bytes: AliasableVec::new(bytes),
+            len,
             extras,
         })
     }
@@ -161,11 +169,13 @@ impl From<CompressedAudioFrame> for ReceivedAudioPacket {
         let CompressedAudioFrame {
             format,
             bytes,
+            len,
             extras,
         } = frame;
         Self {
             format,
             bytes: bytes.into_vec(),
+            len,
             extras,
         }
     }
@@ -271,7 +281,7 @@ mod tests {
             .unwrap()
             .raw();
         raw.p_data = bytes.as_ptr().cast_mut();
-        raw.__bindgen_anon_1.data_size_in_bytes = bytes.len() as i32;
+        raw.__bindgen_anon_1.data_size_in_bytes = PacketLen::new(bytes.len()).unwrap().to_sdk();
         raw.p_metadata = c"<received/>".as_ptr();
         // SAFETY: bytes and the terminated metadata remain live until the guard drops.
         let guard = unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
@@ -309,7 +319,7 @@ mod tests {
         let mut raw = source.raw();
         let bytes = later_header(source.into_data());
         raw.p_data = bytes.as_ptr().cast_mut();
-        raw.__bindgen_anon_1.data_size_in_bytes = bytes.len() as i32;
+        raw.__bindgen_anon_1.data_size_in_bytes = PacketLen::new(bytes.len()).unwrap().to_sdk();
         raw.no_channels = 6;
         raw.p_metadata = c"<received/>".as_ptr();
         // SAFETY: bytes and terminated metadata remain live until the guard drops.

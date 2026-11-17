@@ -23,7 +23,7 @@ use super::{
     invalid_input, PacketAttached, PacketItem, PacketItemRef, PacketReceiver, ReceiverControls,
 };
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-use super::{AudioCodec, VideoCodec};
+use super::{packets::PacketLen, AudioCodec, VideoCodec};
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use crate::sys::bindings::*;
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
@@ -40,7 +40,7 @@ use std::ffi::c_void;
 
 const MIB: usize = 1024 * 1024;
 
-const MAX_ALLOCATION: usize = 256 * MIB;
+const MAX_ALLOCATION: usize = super::packets::MAX_PACKET_BYTES;
 
 /// Process-wide limits on custom receive allocation.
 ///
@@ -1545,11 +1545,8 @@ fn install_with(
 
 /// A compressed frame's size, which the SDK passes in the stride union.
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-fn compressed_size(size: i32) -> std::result::Result<usize, AllocationDecline> {
-    usize::try_from(size)
-        .ok()
-        .filter(|size| (1..=MAX_ALLOCATION).contains(size))
-        .ok_or(AllocationDecline::RequestNotRepresentable)
+fn compressed_size(size: i32) -> std::result::Result<PacketLen, AllocationDecline> {
+    PacketLen::from_sdk(size).ok_or(AllocationDecline::RequestNotRepresentable)
 }
 
 /// A dimension of a compressed frame the SDK is about to receive.
@@ -1568,8 +1565,8 @@ fn video_request(
         // SAFETY: for a compressed frame the union holds the data size.
         let size = compressed_size(unsafe { frame.__bindgen_anon_1.data_size_in_bytes })?;
         return Ok(AllocationRequest {
-            bytes: size,
-            stride: size,
+            bytes: size.to_usize(),
+            stride: size.to_usize(),
             layout: RequestLayout::Compressed(AllocationFormat::CompressedVideo(fourcc)),
             width: compressed_dimension(frame.xres)?,
             height: compressed_dimension(frame.yres)?,
@@ -1604,8 +1601,8 @@ fn audio_request(
         // pins the AAC/Opus request format, extent and delivered application memory.
         let size = compressed_size(unsafe { frame.__bindgen_anon_1.data_size_in_bytes })?;
         return Ok(AllocationRequest {
-            bytes: size,
-            stride: size,
+            bytes: size.to_usize(),
+            stride: size.to_usize(),
             layout: RequestLayout::Compressed(AllocationFormat::CompressedAudio(FourCc::from_raw(
                 frame.FourCC,
             ))),
@@ -1726,6 +1723,50 @@ mod tests {
     use crate::Error;
     use crate::StreamTier;
     include!("allocators/cycle_cost_tests.rs");
+    #[test]
+    fn compressed_allocator_sizes_keep_the_packet_bound() {
+        for size in [-1, 0, i32::MAX] {
+            assert_eq!(
+                compressed_size(size),
+                Err(AllocationDecline::RequestNotRepresentable)
+            );
+        }
+        for size in [1, MAX_ALLOCATION] {
+            let sdk_size = i32::try_from(size).unwrap();
+            let checked = compressed_size(sdk_size).unwrap();
+            assert_eq!(checked.to_usize(), size);
+            assert_eq!(checked.to_sdk(), sdk_size);
+        }
+        assert_eq!(
+            compressed_size(i32::try_from(MAX_ALLOCATION + 1).unwrap()),
+            Err(AllocationDecline::RequestNotRepresentable)
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the full 256 MiB allocation is covered by the native test run"
+    )]
+    fn compressed_allocator_and_capture_accept_the_same_maximum_extent() {
+        let mut bytes = vec![0; MAX_ALLOCATION];
+        let size = compressed_size(i32::try_from(bytes.len()).unwrap()).unwrap();
+        let mut raw = super::super::VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16)
+            .unwrap()
+            .raw();
+        raw.p_data = bytes.as_mut_ptr();
+        raw.__bindgen_anon_1.data_size_in_bytes = size.to_sdk();
+        let request = video_request(&raw).unwrap();
+        assert_eq!(request.bytes, size.to_usize());
+        assert_eq!(request.stride, size.to_usize());
+        // SAFETY: bytes owns this initialized allocation through the borrowed
+        // frame's lifetime; the synthetic guard releases no native storage.
+        let guard =
+            unsafe { crate::capture::Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
+        let frame = super::super::CompressedVideoRef::new(guard).unwrap();
+        assert_eq!(frame.data().len(), request.bytes);
+    }
+
     /// Reusable initialized aligned blocks; the bounded free list grants one
     /// exclusive slot per claim and returns it only after lease reclamation.
     struct TestPool {

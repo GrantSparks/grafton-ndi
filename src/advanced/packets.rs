@@ -1,7 +1,7 @@
 //! Compressed frames and the packet envelope that frames H.264, HEVC and AAC
 //! payloads on the wire.
 
-use std::ffi::c_char;
+use std::{ffi::c_char, num::NonZeroU32};
 
 use super::{aliasable::AliasableVec, descriptors, invalid_frame};
 use crate::media::SdkQuantity;
@@ -14,6 +14,39 @@ use crate::{
 
 /// Maximum compressed frame size, in bytes, that this module sends or accepts.
 pub const MAX_PACKET_BYTES: usize = 256 * 1024 * 1024;
+
+const _: () = assert!(MAX_PACKET_BYTES <= i32::MAX as usize);
+
+/// A nonempty packet extent, retained until its SDK descriptor is built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct PacketLen(NonZeroU32);
+
+impl PacketLen {
+    pub(crate) fn new(bytes: usize) -> Option<Self> {
+        if !(1..=MAX_PACKET_BYTES).contains(&bytes) {
+            return None;
+        }
+        NonZeroU32::new(u32::try_from(bytes).ok()?).map(Self)
+    }
+
+    pub(crate) fn from_sdk(bytes: i32) -> Option<Self> {
+        usize::try_from(bytes).ok().and_then(Self::new)
+    }
+
+    pub(crate) fn to_usize(self) -> usize {
+        self.0.get() as usize
+    }
+
+    pub(crate) fn to_sdk(self) -> i32 {
+        // Construction and the const assertion prove this conversion lossless.
+        self.0.get().cast_signed()
+    }
+
+    fn to_u32(self) -> u32 {
+        self.0.get()
+    }
+}
 
 /// Size in bytes of the version-0 envelope header.
 pub(crate) const ENVELOPE_HEADER_BYTES: usize = 44;
@@ -378,9 +411,13 @@ impl<'a> PacketEnvelope<'a> {
     /// than [`MAX_PACKET_BYTES`], or shorter than the lengths its header
     /// declares.
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
-        if bytes.len() > MAX_PACKET_BYTES {
-            return Err(invalid_frame(crate::FrameDefect::PacketLength));
-        }
+        PacketLen::new(bytes.len()).ok_or_else(|| {
+            invalid_frame(if bytes.is_empty() {
+                crate::FrameDefect::PacketHeaderTruncated
+            } else {
+                crate::FrameDefect::PacketLength
+            })
+        })?;
         let header = EnvelopeHeader::read(bytes)?;
         let end = header
             .total_len()
@@ -429,10 +466,19 @@ impl<'a> PacketEnvelope<'a> {
             .checked_add(data.len())
             .and_then(|n| n.checked_add(extra_data.len()))
             .ok_or_else(|| invalid_frame(crate::FrameDefect::PacketSizeOverflow))?;
-        if data.is_empty() || size > MAX_PACKET_BYTES {
-            return Err(invalid_frame(crate::FrameDefect::PacketPayloadSize));
-        }
-        let mut bytes = vec![0; size];
+        let size = PacketLen::new(size)
+            .ok_or_else(|| invalid_frame(crate::FrameDefect::PacketPayloadSize))?;
+        let data_len = PacketLen::new(data.len())
+            .ok_or_else(|| invalid_frame(crate::FrameDefect::PacketPayloadSize))?;
+        let extra_len = if extra_data.is_empty() {
+            None
+        } else {
+            Some(
+                PacketLen::new(extra_data.len())
+                    .ok_or_else(|| invalid_frame(crate::FrameDefect::PacketPayloadSize))?,
+            )
+        };
+        let mut bytes = vec![0; size.to_usize()];
         let mut put = |offset: usize, value: &[u8]| {
             bytes[offset..offset + value.len()].copy_from_slice(value);
         };
@@ -449,11 +495,10 @@ impl<'a> PacketEnvelope<'a> {
             FLAGS_OFFSET,
             &(if keyframe { KEYFRAME } else { 0 }).to_ne_bytes(),
         );
-        // The size check above bounds both lengths well below u32::MAX.
-        put(DATA_SIZE_OFFSET, &(data.len() as u32).to_ne_bytes());
+        put(DATA_SIZE_OFFSET, &data_len.to_u32().to_ne_bytes());
         put(
             EXTRA_DATA_SIZE_OFFSET,
-            &(extra_data.len() as u32).to_ne_bytes(),
+            &extra_len.map_or(0, PacketLen::to_u32).to_ne_bytes(),
         );
         put(ENVELOPE_HEADER_BYTES, data);
         put(ENVELOPE_HEADER_BYTES + data.len(), extra_data);
@@ -979,6 +1024,7 @@ macro_rules! audio_envelope_accessor {
 pub struct CompressedVideoFrame {
     pub(crate) format: VideoPacketFormat,
     pub(crate) bytes: AliasableVec<u8>,
+    pub(crate) len: PacketLen,
     pub(crate) extras: FrameExtras,
 }
 
@@ -1006,8 +1052,9 @@ impl CompressedVideoFrame {
         bytes: Vec<u8>,
     ) -> std::result::Result<Self, Rejected<Vec<u8>>> {
         match validate_video_packet(format, &bytes, Use::Send) {
-            Ok(()) => Ok(Self {
+            Ok(len) => Ok(Self {
                 format,
+                len,
                 bytes: AliasableVec::new(bytes),
                 extras: FrameExtras::default(),
             }),
@@ -1046,8 +1093,7 @@ impl CompressedVideoFrame {
     /// descriptor, so the caller keeps the frame exclusively for that long.
     pub(crate) fn raw(&mut self) -> NDIlib_video_frame_v2_t {
         let mut raw = self.format.descriptor(&self.extras);
-        // Construction bounds the length by MAX_PACKET_BYTES, below i32::MAX.
-        raw.__bindgen_anon_1.data_size_in_bytes = self.bytes.len() as i32;
+        raw.__bindgen_anon_1.data_size_in_bytes = self.len.to_sdk();
         raw.p_data = self.bytes.as_mut_ptr().cast();
         raw
     }
@@ -1066,17 +1112,26 @@ pub(crate) fn validate_video_packet(
     format: VideoPacketFormat,
     bytes: &[u8],
     purpose: Use,
+) -> Result<PacketLen> {
+    let len = PacketLen::new(bytes.len())
+        .ok_or_else(|| invalid_frame(crate::FrameDefect::CompressedVideoSize))?;
+    validate_video_content(format, bytes, len, purpose)?;
+    Ok(len)
+}
+
+fn validate_video_content(
+    format: VideoPacketFormat,
+    bytes: &[u8],
+    len: PacketLen,
+    purpose: Use,
 ) -> Result<()> {
-    if bytes.is_empty() || bytes.len() > MAX_PACKET_BYTES {
-        return Err(invalid_frame(crate::FrameDefect::CompressedVideoSize));
-    }
     if format.codec.envelope_codec().is_none() && bytes.len() < SPEEDHQ_HEADER_BYTES {
         return Err(invalid_frame(crate::FrameDefect::SpeedHqTruncated));
     }
     match purpose {
-        Use::Send => format.validate_for_send(bytes, bytes.len()),
+        Use::Send => format.validate_for_send(bytes, len.to_usize()),
         Use::Receive => match format.codec.envelope_codec() {
-            Some(codec) => EnvelopeHeader::read(bytes)?.validate(codec, bytes.len(), purpose),
+            Some(codec) => EnvelopeHeader::read(bytes)?.validate(codec, len.to_usize(), purpose),
             None => Ok(()),
         },
     }
@@ -1348,6 +1403,7 @@ impl AudioCodec {
 pub struct CompressedAudioFrame {
     pub(crate) format: AudioPacketFormat,
     pub(crate) bytes: AliasableVec<u8>,
+    pub(crate) len: PacketLen,
     pub(crate) extras: FrameExtras,
 }
 
@@ -1371,14 +1427,14 @@ impl CompressedAudioFrame {
         format: AudioPacketFormat,
         bytes: Vec<u8>,
     ) -> std::result::Result<Self, Rejected<Vec<u8>>> {
-        let frame = Self {
-            format,
-            bytes: AliasableVec::new(bytes),
-            extras: FrameExtras::default(),
-        };
-        match validate_audio_for_send(frame.format, &frame.bytes) {
-            Ok(()) => Ok(frame),
-            Err(error) => Err(Rejected::new(error, frame.into_data())),
+        match validate_audio_for_send(format, &bytes) {
+            Ok(len) => Ok(Self {
+                format,
+                bytes: AliasableVec::new(bytes),
+                len,
+                extras: FrameExtras::default(),
+            }),
+            Err(error) => Err(Rejected::new(error, bytes)),
         }
     }
 
@@ -1408,32 +1464,33 @@ impl CompressedAudioFrame {
     pub(crate) fn raw(&mut self) -> NDIlib_audio_frame_v3_t {
         let mut raw = self.format.descriptor(&self.extras);
         raw.p_data = self.bytes.as_mut_ptr().cast();
-        // Validation bounds the length by MAX_PACKET_BYTES, below i32::MAX.
-        raw.__bindgen_anon_1.data_size_in_bytes = self.bytes.len() as i32;
+        raw.__bindgen_anon_1.data_size_in_bytes = self.len.to_sdk();
         raw
     }
 }
 
-fn validate_audio_for_send(format: AudioPacketFormat, bytes: &[u8]) -> Result<()> {
-    validate_audio_size(bytes)?;
+fn validate_audio_for_send(format: AudioPacketFormat, bytes: &[u8]) -> Result<PacketLen> {
+    let len = PacketLen::new(bytes.len())
+        .ok_or_else(|| invalid_frame(crate::FrameDefect::CompressedAudioSize))?;
+    validate_audio_content_for_send(format, bytes, len)?;
+    Ok(len)
+}
+
+fn validate_audio_content_for_send(
+    format: AudioPacketFormat,
+    bytes: &[u8],
+    len: PacketLen,
+) -> Result<()> {
     format
         .codec
-        .validate_for_send(format, bytes, bytes.len(), |offset| {
+        .validate_for_send(format, bytes, len.to_usize(), |offset| {
             bytes.get(offset..)?.first_chunk().copied()
         })
 }
 
-fn validate_audio_size(bytes: &[u8]) -> Result<()> {
-    if bytes.is_empty() || bytes.len() > MAX_PACKET_BYTES {
-        return Err(invalid_frame(crate::FrameDefect::CompressedAudioSize));
-    }
-    Ok(())
-}
-
-fn validate_received_audio(codec: AudioCodec, bytes: &[u8]) -> Result<()> {
-    validate_audio_size(bytes)?;
+fn validate_received_audio(codec: AudioCodec, bytes: &[u8], len: PacketLen) -> Result<()> {
     if codec == AudioCodec::Aac {
-        EnvelopeHeader::read(bytes)?.validate(EnvelopeCodec::Aac, bytes.len(), Use::Receive)?;
+        EnvelopeHeader::read(bytes)?.validate(EnvelopeCodec::Aac, len.to_usize(), Use::Receive)?;
     }
     Ok(())
 }
@@ -1451,14 +1508,16 @@ pub use borrowed::{CompressedAudioRef, CompressedVideoRef};
 /// # Safety
 ///
 /// When `data` is not null it is readable for `size` bytes.
-unsafe fn packet_bytes<'a>(data: *const u8, size: i32) -> Result<&'a [u8]> {
-    let size = usize::try_from(size)
-        .ok()
-        .filter(|size| !data.is_null() && (1..=MAX_PACKET_BYTES).contains(size))
+unsafe fn packet_bytes<'a>(data: *const u8, size: i32) -> Result<(&'a [u8], PacketLen)> {
+    let size = PacketLen::from_sdk(size)
+        .filter(|_| !data.is_null())
         .ok_or_else(|| invalid_frame(crate::FrameDefect::CompressedBuffer))?;
     // SAFETY: non-null and a positive in-range size were checked; the caller
     // guarantees readability for that size.
-    Ok(unsafe { std::slice::from_raw_parts(data, size) })
+    Ok((
+        unsafe { std::slice::from_raw_parts(data, size.to_usize()) },
+        size,
+    ))
 }
 
 /// Copy a compressed video frame the SDK delivered.
@@ -1713,6 +1772,112 @@ pub(crate) mod testing {
 mod tests {
     use super::{testing::*, *};
 
+    #[test]
+    fn packet_lengths_keep_the_sdk_bound() {
+        for bytes in [0, MAX_PACKET_BYTES + 1, usize::MAX] {
+            assert_eq!(PacketLen::new(bytes), None);
+        }
+        for bytes in [1, MAX_PACKET_BYTES] {
+            let len = PacketLen::new(bytes).unwrap();
+            assert_eq!(len.to_usize(), bytes);
+            assert_eq!(PacketLen::from_sdk(len.to_sdk()), Some(len));
+        }
+        for bytes in [
+            -1,
+            i32::MIN,
+            0,
+            i32::try_from(MAX_PACKET_BYTES + 1).unwrap(),
+            i32::MAX,
+        ] {
+            assert_eq!(PacketLen::from_sdk(bytes), None);
+        }
+    }
+
+    #[test]
+    fn empty_packet_lengths_keep_their_container_causes() {
+        let cause = |result: Result<()>| match result.unwrap_err() {
+            Error::InvalidFrame(cause) => cause,
+            error => panic!("unexpected packet error: {error:?}"),
+        };
+        assert_eq!(
+            cause(PacketEnvelope::parse(&[]).map(|_| ())),
+            crate::FrameDefect::PacketHeaderTruncated
+        );
+        assert_eq!(
+            cause(PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, false, &[], &[]).map(|_| ())),
+            crate::FrameDefect::PacketPayloadSize
+        );
+        assert_eq!(
+            cause(validate_video_packet(h264_format(), &[], Use::Send).map(|_| ())),
+            crate::FrameDefect::CompressedVideoSize
+        );
+        let audio = AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap();
+        assert_eq!(
+            cause(validate_audio_for_send(audio, &[]).map(|_| ())),
+            crate::FrameDefect::CompressedAudioSize
+        );
+        for (blocks, expected) in [
+            (vec![], crate::FrameDefect::ScatterBlockCount),
+            (vec![vec![]], crate::FrameDefect::EmptyScatterBlock),
+        ] {
+            let rejected = super::super::ScatterVideoFrame::new(h264_format(), blocks).unwrap_err();
+            assert!(matches!(rejected.error(), Error::InvalidFrame(actual) if *actual == expected));
+        }
+        // SAFETY: a zero extent is refused before a slice is formed.
+        assert_eq!(
+            cause(unsafe { packet_bytes(std::ptr::NonNull::dangling().as_ptr(), 0) }.map(|_| ())),
+            crate::FrameDefect::CompressedBuffer
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the full 256 MiB extent is covered by the native test run"
+    )]
+    fn oversized_packet_lengths_keep_their_container_causes() {
+        let bytes = vec![0; MAX_PACKET_BYTES + 1];
+        let cause = |result: Result<()>| match result.unwrap_err() {
+            Error::InvalidFrame(cause) => cause,
+            error => panic!("unexpected packet error: {error:?}"),
+        };
+        assert_eq!(
+            cause(PacketEnvelope::parse(&bytes).map(|_| ())),
+            crate::FrameDefect::PacketLength
+        );
+        assert_eq!(
+            cause(
+                PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, false, &bytes, &[]).map(|_| ())
+            ),
+            crate::FrameDefect::PacketPayloadSize
+        );
+        let rejected = CompressedVideoFrame::new(h264_format(), bytes).unwrap_err();
+        assert!(matches!(
+            rejected.error(),
+            Error::InvalidFrame(crate::FrameDefect::CompressedVideoSize)
+        ));
+        let audio = AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap();
+        let rejected = CompressedAudioFrame::new(audio, rejected.into_inner()).unwrap_err();
+        assert!(matches!(
+            rejected.error(),
+            Error::InvalidFrame(crate::FrameDefect::CompressedAudioSize)
+        ));
+        let bytes = rejected.into_inner();
+        // SAFETY: the allocation covers the declared size, which is refused
+        // before packet_bytes forms a slice or reads any byte.
+        let received = unsafe { packet_bytes(bytes.as_ptr(), i32::try_from(bytes.len()).unwrap()) };
+        assert_eq!(
+            cause(received.map(|_| ())),
+            crate::FrameDefect::CompressedBuffer
+        );
+        let rejected =
+            super::super::ScatterVideoFrame::new(h264_format(), vec![bytes]).unwrap_err();
+        assert!(matches!(
+            rejected.error(),
+            Error::InvalidFrame(crate::FrameDefect::ScatterSize)
+        ));
+    }
+
     fn h264_format() -> VideoPacketFormat {
         VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap()
     }
@@ -1960,12 +2125,14 @@ mod tests {
                             .unwrap()
                             .descriptor(&FrameExtras::default());
                         raw.p_data = bytes.as_ptr().cast_mut();
-                        raw.__bindgen_anon_1.data_size_in_bytes = bytes.len() as i32;
+                        raw.__bindgen_anon_1.data_size_in_bytes =
+                            PacketLen::new(bytes.len()).unwrap().to_sdk();
                         copy_audio_packet(&raw).map(drop)
                     } else {
                         let mut raw = h264_format().raw();
                         raw.p_data = bytes.as_ptr().cast_mut();
-                        raw.__bindgen_anon_1.data_size_in_bytes = bytes.len() as i32;
+                        raw.__bindgen_anon_1.data_size_in_bytes =
+                            PacketLen::new(bytes.len()).unwrap().to_sdk();
                         copy_video_packet(&raw).map(drop)
                     }
                 };
@@ -2709,11 +2876,15 @@ mod tests {
         let mut packet = aac_packet(48_000, 2, &[1]);
         packet[FLAGS_OFFSET..FLAGS_OFFSET + 4].copy_from_slice(&0u32.to_ne_bytes());
         let received = ReceivedAudioPacket {
+            len: PacketLen::new(packet.len()).unwrap(),
             format: AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
             bytes: packet.clone(),
             extras: FrameExtras::default(),
         };
-        assert!(validate_received_audio(received.format().codec(), received.data()).is_ok());
+        assert!(
+            validate_received_audio(received.format().codec(), received.data(), received.len)
+                .is_ok()
+        );
         assert!(matches!(
             reason(received.validate_for_send()),
             crate::FrameDefect::AacKeyframeMissing
