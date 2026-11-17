@@ -4,10 +4,13 @@
 //! Missing declaration families have uninhabited stand-ins; wrappers preserve
 //! their public API and return a typed capability error before reaching them.
 
-use super::{bindings::NDIlib_recv_color_format_e, table::Resolver, Evidence, Table};
+#[cfg(feature = "advanced")]
+use super::bindings::NDIlib_recv_color_format_e;
+use super::{table::Resolver, Evidence, Table};
+#[cfg(feature = "advanced")]
+use crate::{advanced::PassthroughPreset, capabilities::Capability};
 use crate::{
-    advanced::PassthroughPreset,
-    capabilities::{Capabilities, Capability, CapabilityRefusal, RuntimeFeature},
+    capabilities::{Capabilities, CapabilityRefusal, RuntimeFeature},
     LoadRefusal, Result,
 };
 use std::ffi::CStr;
@@ -19,6 +22,7 @@ use std::ffi::CStr;
 use super::{advanced_bindings::*, bindings::*, table::native_table};
 
 include!(concat!(env!("OUT_DIR"), "/ndi_advanced_selection.rs"));
+#[cfg(feature = "advanced")]
 pub(crate) use declared;
 
 // Stored types follow their family, rather than the presence of an umbrella
@@ -32,6 +36,7 @@ pub(crate) use super::advanced_bindings::NDIlib_genlock_instance_t as GenlockHan
 
 /// Compile a native expression only when its entire declaration family exists.
 /// Otherwise its table is uninhabited, proving the expression unreachable.
+#[cfg(feature = "advanced")]
 macro_rules! native {
     ($Family:ident, $table:expr, uses($($binding:ident),* $(,)?) => $body:expr) => {
         $crate::sys::advanced::declared! { $Family {{
@@ -49,6 +54,7 @@ macro_rules! native {
         }} else { match *$table {} }}
     };
 }
+#[cfg(feature = "advanced")]
 pub(crate) use native;
 
 /// Define the Advanced SDK's tables.
@@ -204,6 +210,7 @@ include!("advanced_tables.rs");
 /// `PassthroughPreset::ALL`. The match in `passthrough_format` is
 /// exhaustive, so the compiler refuses a list that misses a preset, and a
 /// preset listed twice is an unreachable pattern.
+#[cfg(feature = "advanced")]
 macro_rules! passthrough_presets {
     ($($Preset:ident => $constant:ident,)+) => {
         impl PassthroughPreset {
@@ -247,6 +254,7 @@ macro_rules! passthrough_presets {
     };
 }
 
+#[cfg(feature = "advanced")]
 passthrough_presets! {
     SpeedHqOnly => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v1,
     SpeedHq => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v2,
@@ -265,6 +273,7 @@ passthrough_presets! {
     ProtectedWithAudio => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_with_audio,
 }
 
+#[cfg(feature = "advanced")]
 impl Evidence<'_> {
     /// The receiver color format that selects `preset`, once the preset's
     /// gate allows it. That gate includes the configured receiver's, so the

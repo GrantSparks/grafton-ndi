@@ -41,6 +41,12 @@ pub fn cfgs() -> impl Iterator<Item = &'static str> {
     FAMILIES.iter().map(|(_, cfg, _)| *cfg)
 }
 
+/// Select no Advanced declarations without parsing or requiring `syn`.
+/// Used by every build that does not have Advanced headers.
+pub fn unavailable_selection() -> &'static str {
+    "macro_rules! declared { ($name:ident { $($yes:tt)* } else { $($no:tt)* }) => { $($no)* }; }\n"
+}
+
 /// Generate a token selector. An unavailable branch is discarded before Rust
 /// resolves its names, so wrappers keep one public API even with partial SDKs.
 #[cfg(feature = "advanced")]

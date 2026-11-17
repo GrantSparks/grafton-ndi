@@ -1,6 +1,5 @@
 // Exercise SDK discovery and static-archive contracts without an installed SDK
 // or native runtime.
-#[cfg(feature = "advanced")]
 #[path = "../build_advanced.rs"]
 mod build_advanced;
 #[path = "../build_apple.rs"]
@@ -64,6 +63,35 @@ fn advanced_availability_discards_missing_functions_types_and_constants_before_r
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(std::process::Command::new(fixture.root().join("selector"))
+        .status()
+        .unwrap()
+        .success());
+}
+
+#[test]
+fn unavailable_advanced_selection_discards_every_declaration() {
+    let fixture = Sdk::new("unavailable-advanced-selection");
+    let path = fixture.root().join("selector.rs");
+    fs::write(&path, format!(r#"{}
+        fn main() {{
+            assert!(!declared! {{ ReceiveAllocators {{ NotAType::missing() }} else {{ false }} }});
+            assert!(!declared! {{ NDIlib_recv_create_v4 {{ NotAType::missing() }} else {{ false }} }});
+        }}"#, build_advanced::unavailable_selection())).unwrap();
+    assert_eq!(build_advanced::cfgs().count(), 23);
+    let executable = fixture.root().join("selector");
+    let output = std::process::Command::new("rustc")
+        .args(["--edition=2021", "--deny=warnings"])
+        .arg(&path)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(std::process::Command::new(executable)
         .status()
         .unwrap()
         .success());

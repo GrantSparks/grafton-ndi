@@ -67,7 +67,6 @@ pub(crate) mod advanced_declarations {
 
 /// Tables of the Advanced-only entry points, and the one place that depends
 /// on whether the build has their declarations.
-#[cfg(feature = "advanced")]
 pub(crate) mod advanced;
 mod api;
 #[cfg(feature = "file-io")]

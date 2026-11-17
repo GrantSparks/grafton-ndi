@@ -8,9 +8,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::sys::ResolvedApi;
 #[cfg(feature = "advanced")]
-use crate::{advanced::PassthroughPreset, sys::advanced::ResolvedAdvancedApi};
+use crate::advanced::PassthroughPreset;
+use crate::sys::{advanced::ResolvedAdvancedApi, ResolvedApi};
 
 /// NDI 6.4.0: the first runtime with the planar 4:4:4 formats and newer
 /// receiver modes, and the first whose Discovery Server advertisers and
@@ -587,44 +587,6 @@ impl CapabilityStatus {
     }
 }
 
-// The registry names the missing declaration even in builds whose public API
-// omits Advanced wrappers. No ABI types from those headers are needed here.
-#[cfg(not(feature = "advanced"))]
-fn absent_advanced_abi(feature: RuntimeFeature) -> std::result::Result<(), CapabilityRefusal> {
-    macro_rules! advanced_tables {
-        ($( $(#[$meta:meta])* struct $Table:ident in $field:ident: $Feature:ident {
-            fn $first:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)?;
-            $($rest:tt)*
-        })+) => {{
-            const _: () = {
-                let mut index = 0;
-                while index < RuntimeFeature::UNIT.len() {
-                    let feature = RuntimeFeature::UNIT[index];
-                    let counts = [$(matches!(feature, RuntimeFeature::$Feature) as usize),+];
-                    let mut table = 0;
-                    let mut count = 0;
-                    while table < counts.len() {
-                        count += counts[table];
-                        table += 1;
-                    }
-                    assert!(
-                        count == feature.is_advanced() as usize,
-                        "every Advanced capability must have exactly one Advanced table"
-                    );
-                    index += 1;
-                }
-            };
-            match feature {
-                $(RuntimeFeature::$Feature => Err(CapabilityRefusal::BuildAbiUnavailable(crate::sys::table::symbol_name(
-                    concat!(stringify!($first), "\0"),
-                ))),)+
-                _ => Ok(()),
-            }
-        }};
-    }
-    include!("sys/advanced_tables.rs")
-}
-
 /// What the selected implementation, together with this build, provides:
 /// one recorded decision for every [`RuntimeFeature`].
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -648,7 +610,7 @@ impl Capabilities {
     /// Decide each capability once, preserving its first refusal and evidence.
     pub(crate) fn detect(
         api: &ResolvedApi,
-        #[cfg(feature = "advanced")] advanced: &ResolvedAdvancedApi,
+        advanced: &ResolvedAdvancedApi,
         version: Option<SdkVersion>,
         edition: SdkEdition,
     ) -> Self {
@@ -662,16 +624,8 @@ impl Capabilities {
             if !feature.is_advanced() {
                 return api.missing(feature).map_or_else(|| versioned(feature), Err);
             }
-            #[cfg(feature = "advanced")]
-            let missing = {
-                ResolvedAdvancedApi::declarations(feature)?;
-                advanced.missing(feature)
-            };
-            #[cfg(not(feature = "advanced"))]
-            let missing = {
-                absent_advanced_abi(feature)?;
-                None
-            };
+            ResolvedAdvancedApi::declarations(feature)?;
+            let missing = advanced.missing(feature);
             if edition != SdkEdition::Advanced {
                 return Err(CapabilityRefusal::WrongEdition(missing.and_then(
                     |refusal| match refusal {
@@ -871,7 +825,6 @@ mod tests {
                 .iter()
                 .flat_map(|(_, names, _)| names.iter().copied())
                 .collect();
-            #[cfg(feature = "advanced")]
             let symbols: Vec<_> = symbols
                 .into_iter()
                 .chain(
@@ -923,7 +876,6 @@ mod tests {
                         "{feature:?}"
                     );
                 }
-                #[cfg(feature = "advanced")]
                 for &(feature, _, gate) in crate::sys::advanced::GATES {
                     assert_eq!(
                         refusal(gate(evidence)),
@@ -1030,7 +982,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "advanced")]
     #[test]
     fn advanced_refusal_precedence_and_requirements_preserve_exact_evidence() {
         for &(feature, symbols, _) in crate::sys::advanced::GATES {
@@ -1093,6 +1044,7 @@ mod tests {
                 }
             }
         }
+        #[cfg(feature = "advanced")]
         for preset in PassthroughPreset::ALL {
             for edition in [SdkEdition::Standard, SdkEdition::Advanced] {
                 let fixture = Fixture::new(
@@ -1119,18 +1071,19 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "advanced"))]
     #[test]
-    fn disabled_advanced_feature_still_names_every_missing_declaration() {
+    fn undeclared_advanced_families_name_their_missing_declaration() {
         let fixture = Fixture::new(|_| true, Some("6.4.0.2"), SdkEdition::Advanced);
-        for feature in RuntimeFeature::UNIT
-            .into_iter()
-            .filter(|feature| feature.is_advanced())
-        {
-            assert_eq!(
-                fixture.gates.capabilities().decision(feature),
-                absent_advanced_abi(feature)
-            );
+        assert_eq!(crate::sys::advanced::GATES.len(), 23);
+        for &(feature, symbols, _) in crate::sys::advanced::GATES {
+            if let Err(refusal) = ResolvedAdvancedApi::declarations(feature) {
+                assert_eq!(fixture.gates.capabilities().decision(feature), Err(refusal));
+                assert!(
+                    matches!(refusal, CapabilityRefusal::BuildAbiUnavailable(symbol) if symbols.contains(&symbol))
+                );
+                #[cfg(not(feature = "advanced"))]
+                assert_eq!(refusal, CapabilityRefusal::BuildAbiUnavailable(symbols[0]));
+            }
         }
     }
 
@@ -1166,14 +1119,12 @@ mod tests {
                     let _ = crate::sys::Planar444Video::within(evidence);
                     let _ = crate::sys::ReceiveBest444::within(evidence);
                     let _ = crate::sys::ReceiveVideoOnly::within(evidence);
+                    for &(_, _, gate) in crate::sys::advanced::GATES {
+                        let _ = gate(evidence);
+                    }
                     #[cfg(feature = "advanced")]
-                    {
-                        for &(_, _, gate) in crate::sys::advanced::GATES {
-                            let _ = gate(evidence);
-                        }
-                        for preset in PassthroughPreset::ALL {
-                            let _ = evidence.passthrough_format(preset);
-                        }
+                    for preset in PassthroughPreset::ALL {
+                        let _ = evidence.passthrough_format(preset);
                     }
                     refused
                 });

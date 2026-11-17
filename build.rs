@@ -102,11 +102,10 @@ fn main() {
         .map(|sdk| generate_advanced_bindings(sdk, &target, &out));
     #[cfg(not(feature = "advanced"))]
     let advanced_declarations: Option<String> = None;
-    #[cfg(feature = "advanced")]
     if advanced_declarations.is_none() {
         fs::write(
             out.join("ndi_advanced_selection.rs"),
-            build_advanced::selection("", "").source,
+            build_advanced::unavailable_selection(),
         )
         .expect("Write unavailable Advanced declarations");
     }

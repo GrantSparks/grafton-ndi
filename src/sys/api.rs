@@ -158,7 +158,6 @@ version_gates!(Planar444Video, ReceiveBest444, ReceiveVideoOnly);
 #[derive(Clone, Copy)]
 pub(crate) struct Evidence<'a> {
     pub(in crate::sys) api: &'a Api,
-    #[cfg(feature = "advanced")]
     pub(in crate::sys) advanced: &'a super::advanced::AdvancedApi,
     pub(in crate::sys) capabilities: &'a Capabilities,
 }
@@ -166,7 +165,6 @@ pub(crate) struct Evidence<'a> {
 /// Resolution evidence, which cannot hand out optional tables.
 pub(crate) struct Resolved {
     api: ResolvedApi,
-    #[cfg(feature = "advanced")]
     advanced: super::advanced::ResolvedAdvancedApi,
 }
 
@@ -175,7 +173,6 @@ impl Resolved {
     pub(crate) fn load(resolver: &dyn Resolver) -> std::result::Result<Self, LoadRefusal> {
         Ok(Self {
             api: Api::load(resolver)?,
-            #[cfg(feature = "advanced")]
             advanced: super::advanced::AdvancedApi::load(resolver)?,
         })
     }
@@ -207,16 +204,9 @@ impl Resolved {
 
     /// Consume resolution evidence and construct every immutable capability gate.
     pub(crate) fn seal(self, version: Option<SdkVersion>, edition: SdkEdition) -> Gates {
-        let capabilities = Capabilities::detect(
-            &self.api,
-            #[cfg(feature = "advanced")]
-            &self.advanced,
-            version,
-            edition,
-        );
+        let capabilities = Capabilities::detect(&self.api, &self.advanced, version, edition);
         Gates {
             api: self.api.seal(&capabilities),
-            #[cfg(feature = "advanced")]
             advanced: self.advanced.seal(&capabilities),
             capabilities,
         }
@@ -226,7 +216,6 @@ impl Resolved {
 /// Tables constructed under their one recorded capability decision.
 pub(crate) struct Gates {
     api: Api,
-    #[cfg(feature = "advanced")]
     advanced: super::advanced::AdvancedApi,
     capabilities: Capabilities,
 }
@@ -244,7 +233,6 @@ impl Gates {
     pub(crate) fn evidence(&self) -> Evidence<'_> {
         Evidence {
             api: &self.api,
-            #[cfg(feature = "advanced")]
             advanced: &self.advanced,
             capabilities: &self.capabilities,
         }
