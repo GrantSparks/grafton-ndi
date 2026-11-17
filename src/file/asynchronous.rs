@@ -4181,6 +4181,9 @@ mod tests {
         await_finish(&recorder);
         let retained = recorder.wait_for_finish(Duration::from_secs(5)).submit();
         drop(cancelled);
+        // The owner may already have pruned this iteration before cancellation.
+        // Complete one command so the next inspection follows a fresh pump.
+        block_on(recorder.worker.call(|_| Ok(()))).unwrap();
         assert_eq!(
             block_on(recorder.worker.call(|owner| Ok(owner.pending_finishes()))).unwrap(),
             1
@@ -4759,8 +4762,13 @@ mod tests {
         let finishing = recorder.finish(Duration::from_secs(30)).submit();
         await_finish(&recorder);
         drop(finishing);
-        // A following command proves cancellation ended the long wait.
+        // A status command still runs if cancellation follows this iteration's
+        // pruning. Inspect after the next pump to prove the wait was released.
         assert_eq!(block_on(recorder.state()).unwrap(), RecorderState::Stopping);
+        assert_eq!(
+            block_on(recorder.worker.call(|owner| Ok(owner.pending_finishes()))).unwrap(),
+            0
+        );
         let closed = recorder.close().submit();
         assert!(!closed.is_completed());
         device.close();
