@@ -239,6 +239,16 @@ impl Runtime {
         runtime
     }
 
+    /// The core module whose identity a companion library must share.
+    #[cfg(all(feature = "file-io", not(ndi_link_static)))]
+    pub(in crate::sys) fn module(&self) -> Option<&Module> {
+        match &self.provider {
+            RuntimeProvider::Native(module) => Some(module),
+            #[cfg(test)]
+            RuntimeProvider::Synthetic => None,
+        }
+    }
+
     /// Confirm that this implementation, which is selected for the process
     /// and cannot be replaced, meets `options`.
     ///
@@ -316,6 +326,10 @@ mod shared {
         base: usize,
         path: PathBuf,
     }
+
+    /// Identity of one pinned module, independent of its symbols and path aliases.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(in crate::sys) struct ModuleId(usize);
 
     /// Why a location cannot be used, and the module it left loaded when it
     /// got as far as loading one.
@@ -396,6 +410,10 @@ mod shared {
             &self.path
         }
 
+        pub(in crate::sys) fn id(&self) -> ModuleId {
+            ModuleId(self.base)
+        }
+
         pub(super) fn library_path(&self) -> Option<PathBuf> {
             Some(self.path().to_owned())
         }
@@ -420,15 +438,15 @@ mod shared {
             Ok(Some((address, base)))
         }
 
-        /// The address this module is bound to for `name`: its own definition or,
+        /// The module this handle finds for `name`: its own definition or,
         /// where the platform's handle lookup reaches them, the one a library it
         /// depends on supplies. `None` when the lookup finds neither.
         #[cfg(feature = "file-io")]
-        pub(in crate::sys) fn binding(
+        pub(in crate::sys) fn bound_module(
             &self,
             name: &CStr,
-        ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
-            Ok(self.lookup(name)?.map(|(address, _)| address))
+        ) -> std::result::Result<Option<ModuleId>, LoadRefusal> {
+            Ok(self.lookup(name)?.map(|(_, base)| ModuleId(base)))
         }
 
         pub(super) const LINKAGE: SdkLinkage = SdkLinkage::Shared;
@@ -466,7 +484,7 @@ mod shared {
                 return Ok(None);
             };
             // Accept a symbol only when this module itself defines it.
-            if base != self.base {
+            if ModuleId(base) != self.id() {
                 return Err(LoadRefusal::EntryPointOutsideModule {
                     symbol: name,
                     module: self.path.clone(),
@@ -501,11 +519,9 @@ mod shared {
             Search {
                 kind: LibraryKind::Runtime,
                 explicit,
-                beside: None,
+                companion: None,
                 names: &names,
                 anchor: CORE_ANCHOR,
-                #[cfg(all(unix, not(target_vendor = "apple")))]
-                selected_core: None,
                 description: &description,
             }
             .open(|module| Runtime::describe(module, requested))
@@ -538,17 +554,14 @@ mod shared {
         pub(in crate::sys) kind: LibraryKind,
         /// The only acceptable location, when the caller named one.
         pub(in crate::sys) explicit: Option<ExplicitLibrary<'a>>,
-        /// The file of an already selected library this one is installed
-        /// beside; its directory is searched first.
-        pub(in crate::sys) beside: Option<&'a Path>,
+        /// The selected module this library accompanies; its directory is
+        /// searched first, and core imports must resolve to its identity.
+        pub(in crate::sys) companion: Option<&'a Module>,
         /// The library's file names on this target, tried in this order at
         /// each location.
         pub(in crate::sys) names: &'a [&'a str],
         /// A symbol the library must define; it identifies the opened module.
         pub(in crate::sys) anchor: &'static CStr,
-        /// The selected core's anchor when this search loads its File library.
-        #[cfg(all(unix, not(target_vendor = "apple")))]
-        pub(in crate::sys) selected_core: Option<*const c_void>,
         /// What is being looked for, as the error names it.
         pub(in crate::sys) description: &'a str,
     }
@@ -584,7 +597,7 @@ mod shared {
             };
             let plan = search_plan(
                 self.explicit,
-                self.beside.and_then(Path::parent),
+                self.companion.map(Module::path).and_then(Path::parent),
                 executable.as_deref().and_then(Path::parent),
                 runtime_directory.as_deref(),
                 loader_directories.as_deref(),
@@ -614,7 +627,7 @@ mod shared {
                     if self.explicit.is_some() || self.kind == LibraryKind::File {
                         return Err(Error::RuntimeConflict(SelectionFailure::foreign(
                             self.kind,
-                            self.beside,
+                            self.companion.map(Module::path),
                             self.explicit.map(ExplicitLibrary::path),
                             module,
                             &candidate.location,
@@ -639,8 +652,8 @@ mod shared {
             let Some(global) = global_definition(CORE_ANCHOR)? else {
                 return Ok(());
             };
-            let same_module = match self.selected_core {
-                Some(selected) => global.address == selected,
+            let same_module = match self.companion {
+                Some(selected) => global.module == selected.id(),
                 None => same_loaded_module(location, global.path.as_os_str()),
             };
             if same_module {
@@ -974,7 +987,7 @@ mod shared {
 
     #[cfg(all(unix, not(target_vendor = "apple")))]
     struct GlobalDefinition {
-        address: *const c_void,
+        module: ModuleId,
         path: PathBuf,
     }
 
@@ -990,10 +1003,10 @@ mod shared {
         if address.is_null() {
             return Ok(None);
         }
-        let (_, path) =
+        let (base, path) =
             containing_module(address).map_err(|detail| LoadRefusal::NotIdentifiable { detail })?;
         Ok(Some(GlobalDefinition {
-            address,
+            module: ModuleId(base),
             path: path.canonicalize().unwrap_or(path),
         }))
     }
@@ -1276,7 +1289,7 @@ mod shared {
             let search = Search {
                 kind: LibraryKind::Runtime,
                 explicit: None,
-                beside: None,
+                companion: None,
                 names: &["first", "second"],
                 anchor: CORE_ANCHOR,
                 description: "NDI runtime",
@@ -1365,11 +1378,9 @@ mod shared {
             let search = Search {
                 kind: LibraryKind::Runtime,
                 explicit: None,
-                beside: None,
+                companion: None,
                 names: &["libndi.so.6"],
                 anchor: CORE_ANCHOR,
-                #[cfg(all(unix, not(target_vendor = "apple")))]
-                selected_core: None,
                 description: "NDI runtime",
             };
             let refusal = match refused.open(&search) {

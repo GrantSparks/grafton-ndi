@@ -95,7 +95,7 @@ impl Fixtures {
         let fixtures = Self {
             root: root.to_owned(),
         };
-        for directory in ["standard", "runtime", "partial"] {
+        for directory in ["standard", "runtime", "partial", "copied"] {
             fs::create_dir(root.join(directory)).unwrap();
         }
         let paired = fixtures.build_core(&PAIRED);
@@ -106,6 +106,11 @@ impl Fixtures {
         build_file_library(&fixtures.file(OTHER.directory), &other, &[]);
         let unnamed = fixtures.build_core(&UNNAMED);
         build_file_library(&fixtures.file(UNNAMED.directory), &unnamed, &[]);
+        // A byte-identical second module still owns separate initialization
+        // state. With no SONAME the File dependency names that copy exactly.
+        let copied_core = fixtures.root.join("copied").join(ADVANCED_CORE);
+        fs::copy(&unnamed, &copied_core).unwrap();
+        build_file_library(&fixtures.file("copied"), &copied_core, &[]);
         fixtures.build_core(&LONELY);
         // A File library for the paired runtime that lacks a recording entry point.
         build_file_library(
@@ -171,6 +176,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     scenario("standard_runtime_is_refused_before_anything_is_opened"),
     scenario("library_whose_dependency_is_another_runtime_is_refused"),
+    scenario("file_dependency_on_a_second_copy_of_the_selected_core_is_refused"),
     Scenario {
         preloaded: Some(&UNNAMED),
         ..scenario("a_preloaded_foreign_runtime_is_refused_during_core_selection")
@@ -373,6 +379,25 @@ fn child(name: &str, fixtures: &Fixtures) {
                 api.library_path(),
                 Some(fixtures.file(UNNAMED.directory).as_path())
             );
+            assert_eq!(bound_runtime(&api), UNNAMED.build);
+        }
+        "file_dependency_on_a_second_copy_of_the_selected_core_is_refused" => {
+            let ndi = select(fixtures, &UNNAMED);
+            let copied_core = fixtures.root.join("copied").join(ADVANCED_CORE);
+            assert_eq!(
+                fs::read(fixtures.core(&UNNAMED)).unwrap(),
+                fs::read(&copied_core).unwrap()
+            );
+            let reason = unavailable(FileApi::new(&ndi, &explicit(fixtures.file("copied"))));
+            assert!(reason.loaded_any());
+            assert_eq!(reason.attempts().len(), 1);
+            assert_eq!(
+                reason.attempts()[0].refusal(),
+                &LoadRefusal::BoundToAnotherRuntime
+            );
+            assert!(is_loaded(copied_core.to_str().unwrap()));
+            assert!(Ndi::is_running());
+            let api = FileApi::new(&ndi, &defaults).unwrap();
             assert_eq!(bound_runtime(&api), UNNAMED.build);
         }
         "another_runtime_in_the_global_scope_is_refused_before_anything_is_opened" => {

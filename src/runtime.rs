@@ -641,12 +641,6 @@ impl RuntimeManager {
             supported_cpu,
         })
     }
-
-    /// The address imported by a companion File library must be this one.
-    #[cfg(all(feature = "file-io", not(ndi_link_static)))]
-    pub(crate) fn initialize_address(&self) -> *const std::ffi::c_void {
-        self.backend.lifecycle.NDIlib_initialize as *const std::ffi::c_void
-    }
 }
 
 /// A handle to the started NDI runtime.
