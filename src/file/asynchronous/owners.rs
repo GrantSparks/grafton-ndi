@@ -270,7 +270,7 @@ impl Owner for RecorderOwner {
         let notify =
             self.waiters.notifies_cleanup() || queued.iter().any(|job| job.finish().is_some());
         if !notify {
-            events.close(EventEnd::Stopped);
+            events.close(OwnerExit::Closed);
         }
         self.recorder.drain_cleanup(
             requested,

@@ -712,7 +712,7 @@ struct Events<E> {
     queue: VecDeque<Result<E>>,
     capacity: usize,
     dropped: u64,
-    end: Option<EventEnd>,
+    end: Option<OwnerExit>,
     waiter: Option<EventWaiter>,
 }
 
@@ -744,11 +744,11 @@ impl<E> EventQueue<E> {
 
     /// End every wait. A failed end overrides an ordinary stop, including
     /// one published before a native destructor panicked.
-    fn close(&self, end: EventEnd) {
+    fn close(&self, end: OwnerExit) {
         let wake = {
             let mut events = lock(&self.0);
             events.end = Some(match events.end {
-                Some(EventEnd::Failed) => EventEnd::Failed,
+                Some(OwnerExit::Failed) => OwnerExit::Failed,
                 _ => end,
             });
             events.waiter.take().and_then(|mut w| w.waker.take())
@@ -898,7 +898,7 @@ impl<E> Future for FileEventFuture<E> {
             let ready = if let Some(event) = events.queue.pop_front() {
                 Some(event.map(Some))
             } else if let Some(end) = events.end {
-                Some(Err(stopped(end == EventEnd::Failed)))
+                Some(Err(stopped(end == OwnerExit::Failed)))
             } else if deadline.is_expired() {
                 Some(Ok(None))
             } else {
@@ -965,19 +965,6 @@ impl OwnerExit {
             Self::Failed => Err(stopped(true)),
         }
     }
-
-    fn event_end(self) -> EventEnd {
-        match self {
-            Self::Closed => EventEnd::Stopped,
-            Self::Failed => EventEnd::Failed,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EventEnd {
-    Stopped,
-    Failed,
 }
 
 /// A close's request and successful result belong to its native owner.
@@ -1031,12 +1018,9 @@ impl<C: Clone> CloseReply<C> {
     }
 }
 
-enum Closing<C: CloseOutcome> {
-    Waiting {
-        request: C::Request,
-        replies: Vec<CloseReply<C>>,
-    },
-    Complete,
+struct CloseQueue<C: CloseOutcome> {
+    request: C::Request,
+    replies: Vec<CloseReply<C>>,
 }
 
 struct Control<C: CloseOutcome = ()> {
@@ -1045,11 +1029,13 @@ struct Control<C: CloseOutcome = ()> {
     claimed: AtomicBool,
     /// The first close or last-handle drop starts the one finalization budget.
     shutdown_at: OnceLock<Instant>,
-    /// The sole owner outcome. A failure is visible before cleanup starts.
+    /// Early failure is visible before native cleanup starts. This does not
+    /// signal destruction completion; only `closed` publishes that outcome.
     outcome: OnceLock<OwnerExit>,
     /// Only the close protocol depends on the owner's associated result.
-    closing: Mutex<Closing<C>>,
-    /// The typed outcome is immutable and borrowable after destruction, so
+    closing: Mutex<CloseQueue<C>>,
+    /// The published outcome is the only signal that cleanup completed.
+    /// It is immutable and borrowable after destruction, so
     /// ordinary closes do not clone a recorder report just to discard it.
     closed: OnceLock<std::result::Result<C, OwnerExit>>,
 }
@@ -1101,7 +1087,7 @@ impl<C: CloseOutcome> Control<C> {
             claimed: AtomicBool::new(false),
             shutdown_at: OnceLock::new(),
             outcome: OnceLock::new(),
-            closing: Mutex::new(Closing::Waiting {
+            closing: Mutex::new(CloseQueue {
                 request: C::initial_request(),
                 replies: Vec::new(),
             }),
@@ -1156,44 +1142,32 @@ impl<C: CloseOutcome> Control<C> {
         update: impl FnOnce(&mut C::Request),
         wake: impl FnOnce(),
     ) {
-        let mut closing = lock(&self.closing);
-        match &mut *closing {
-            Closing::Waiting { request, replies } => {
-                replies.retain(|reply| !reply.cancelled());
-                replies.push(reply);
-                update(request);
-                // Publish admission, the close request and the first budget
-                // together. The owner reads its request through this same lock.
-                let first = self.shutdown_at.set(requested).is_ok();
-                drop(closing);
-                if first {
-                    wake();
-                }
-            }
-            Closing::Complete => {
-                drop(closing);
-                reply.complete(
-                    self.closed
-                        .get()
-                        .expect("completion publishes its outcome first"),
-                );
+        let mut queue = lock(&self.closing);
+        if let Some(closed) = self.closed.get() {
+            drop(queue);
+            reply.complete(closed);
+        } else {
+            queue.replies.retain(|reply| !reply.cancelled());
+            queue.replies.push(reply);
+            update(&mut queue.request);
+            // Publish admission, the close request and the first budget
+            // together. The owner reads its request through this same lock.
+            let first = self.shutdown_at.set(requested).is_ok();
+            drop(queue);
+            if first {
+                wake();
             }
         }
     }
 
     fn close_request(&self) -> C::Request {
-        match &*lock(&self.closing) {
-            Closing::Waiting { request, .. } => *request,
-            Closing::Complete => unreachable!("the owner requests cleanup before completion"),
-        }
+        lock(&self.closing).request
     }
 
     /// A live close reports destruction instead of the last handle joining.
     fn needs_cleanup_join(&self) -> bool {
-        match &*lock(&self.closing) {
-            Closing::Waiting { replies, .. } => replies.iter().all(CloseReply::cancelled),
-            Closing::Complete => false,
-        }
+        let queue = lock(&self.closing);
+        self.closed.get().is_none() && queue.replies.iter().all(CloseReply::cancelled)
     }
 
     fn request_shutdown(&self) -> bool {
@@ -1232,23 +1206,21 @@ impl<C: CloseOutcome> Control<C> {
     /// Complete replies only after destruction, using the value returned by
     /// shutdown. An early failure remains authoritative over a cleanup result.
     fn exit<E>(&self, closed: std::result::Result<C, OwnerExit>, events: &EventQueue<E>) {
-        let exit = *self
-            .outcome
-            .get_or_init(|| closed.as_ref().err().copied().unwrap_or(OwnerExit::Closed));
+        let exit = *self.outcome.get_or_init(|| {
+            closed
+                .as_ref()
+                .map_or_else(|exit| *exit, |_| OwnerExit::Closed)
+        });
         let closed = if exit == OwnerExit::Failed {
             Err(exit)
         } else {
             closed
         };
         let closed = self.closed.get_or_init(|| closed);
-        events.close(exit.event_end());
-        let replies = {
-            let mut closing = lock(&self.closing);
-            match std::mem::replace(&mut *closing, Closing::Complete) {
-                Closing::Waiting { replies, .. } => replies,
-                Closing::Complete => return,
-            }
-        };
+        events.close(exit);
+        // A close either queues before this lock is acquired or observes the
+        // published outcome under the same lock and completes directly.
+        let replies = std::mem::take(&mut lock(&self.closing).replies);
         for reply in replies {
             reply.complete(closed);
         }
@@ -1792,7 +1764,7 @@ fn spawn_prepared_owner_now<H: Owner, T: Send + 'static>(
                         &thread_control,
                         &mut queued,
                     );
-                    thread_events.close(EventEnd::Stopped);
+                    thread_events.close(OwnerExit::Closed);
                     closed
                 }));
                 let mut closed = match running {
@@ -1801,7 +1773,7 @@ fn spawn_prepared_owner_now<H: Owner, T: Send + 'static>(
                         thread_control.publish_failure();
                         // A second failure cannot skip event closure or destruction.
                         let _ = catch_unwind(AssertUnwindSafe(|| owner.fail_pending()));
-                        thread_events.close(EventEnd::Failed);
+                        thread_events.close(OwnerExit::Failed);
                         Err(OwnerExit::Failed)
                     }
                 };
@@ -4388,6 +4360,139 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn published_close_outcomes_answer_late_requests_before_queued_replies_are_drained() {
+        struct PauseOnWake {
+            published: Arc<std::sync::Barrier>,
+            resume: Arc<std::sync::Barrier>,
+        }
+        impl Wake for PauseOnWake {
+            fn wake(self: Arc<Self>) {
+                self.published.wait();
+                self.resume.wait();
+            }
+        }
+        struct CountWake(AtomicUsize);
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let (_, recorder) = mock_recorder(Closing::AtStop);
+        let report = block_on(recorder.abandon()).unwrap();
+        for outcome in [OwnerExit::Closed, OwnerExit::Failed] {
+            let control = Arc::new(Control::<RecordingReport>::with_outcome());
+            let events = Arc::new(EventQueue::<()>::new(1));
+            let mut early = control.request_close(|| {}).submit();
+            let wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wakes));
+            assert!(Pin::new(&mut early)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+            let published = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            let waker = Waker::from(Arc::new(PauseOnWake {
+                published: Arc::clone(&published),
+                resume: Arc::clone(&resume),
+            }));
+            let mut event = events.wait(Duration::from_secs(60));
+            assert!(Pin::new(&mut event)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+            thread::scope(|scope| {
+                let closing = scope.spawn(|| {
+                    control.exit(
+                        if outcome == OwnerExit::Closed {
+                            Ok(report.clone())
+                        } else {
+                            Err(outcome)
+                        },
+                        &events,
+                    );
+                });
+                // EventQueue wakes after outcome publication and before exit
+                // takes the close queue lock. Hold that exact interleaving.
+                published.wait();
+                let checked = catch_unwind(AssertUnwindSafe(|| {
+                    assert!(control.closed.get().is_some());
+                    assert!(!early.is_completed());
+                    assert_eq!(lock(&control.closing).replies.len(), 1);
+                    let late_close =
+                        block_on(control.request_close(|| panic!("late close woke owner")));
+                    let late_abandon =
+                        block_on(control.request_abandon(|| panic!("late abandon woke owner")));
+                    if outcome == OwnerExit::Closed {
+                        late_close.unwrap();
+                        assert_eq!(late_abandon.unwrap(), report);
+                    } else {
+                        owner_failed(late_close);
+                        owner_failed(late_abandon);
+                    }
+                    // A completed abandon answers from the outcome, without
+                    // changing the close request that cleanup already consumed.
+                    assert!(matches!(
+                        control.close_request(),
+                        super::super::recorder::CleanupRequest::Close
+                    ));
+                    assert!(!control.needs_cleanup_join());
+                    assert_eq!(lock(&control.closing).replies.len(), 1);
+                    assert!(!early.is_completed());
+                }));
+                resume.wait();
+                closing.join().unwrap();
+                checked.unwrap();
+            });
+            let early = block_on(early);
+            if outcome == OwnerExit::Closed {
+                early.unwrap();
+            } else {
+                owner_failed(early);
+            }
+            assert_eq!(wakes.0.load(Ordering::Acquire), 1);
+            assert!(lock(&control.closing).replies.is_empty());
+            // Repeated exit does not answer the drained replies again.
+            control.exit(Err(OwnerExit::Failed), &events);
+            assert_eq!(wakes.0.load(Ordering::Acquire), 1);
+        }
+    }
+
+    #[test]
+    fn ordinary_early_and_late_closes_borrow_the_published_outcome_without_cloning() {
+        struct CountedOutcome(Arc<AtomicUsize>);
+        impl Clone for CountedOutcome {
+            fn clone(&self) -> Self {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                Self(Arc::clone(&self.0))
+            }
+        }
+        impl CloseOutcome for CountedOutcome {
+            type Request = ();
+            fn initial_request() {}
+        }
+        let clones = Arc::new(AtomicUsize::new(0));
+        let control = Arc::new(Control::<CountedOutcome>::with_outcome());
+        let early: Vec<_> = (0..4)
+            .map(|_| control.request_close(|| {}).submit())
+            .collect();
+        control.exit(
+            Ok(CountedOutcome(Arc::clone(&clones))),
+            &EventQueue::<()>::new(1),
+        );
+        for close in early {
+            block_on(close).unwrap();
+        }
+        for _ in 0..4 {
+            block_on(control.request_close(|| panic!("completed close woke owner"))).unwrap();
+        }
+        assert_eq!(clones.load(Ordering::Acquire), 0);
+        // Only a caller explicitly requesting an owned outcome needs a clone.
+        let (reply, future) = operation();
+        control.register_close(Instant::now(), CloseReply::Outcome(reply), |_| {}, || {});
+        let _outcome = block_on(FileOperation::live(future)).unwrap();
+        assert_eq!(clones.load(Ordering::Acquire), 1);
     }
 
     #[test]
