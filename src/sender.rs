@@ -177,6 +177,41 @@ impl TallyState {
     }
 }
 
+/// A sender metadata capture source obtains its table through its own owner.
+#[derive(Clone, Copy)]
+struct SenderMetadataSource<'owner> {
+    resource: &'owner ownership::SenderResource,
+    table: &'owner sys::SenderMetadata,
+}
+
+impl<'owner> SenderMetadataSource<'owner> {
+    fn new(resource: &'owner ownership::SenderResource) -> Result<Self> {
+        Ok(Self {
+            resource,
+            table: resource.ndi().table::<sys::SenderMetadata>()?,
+        })
+    }
+}
+
+impl crate::capture::source_sealed::Sealed for SenderMetadataSource<'_> {}
+
+// SAFETY: construction gets the table from this sender's own runtime. The
+// resource borrow retains the sender and bound core until matching free.
+unsafe impl<'owner> crate::capture::FrameSource<'owner, crate::capture::SenderMetadataFree>
+    for SenderMetadataSource<'owner>
+{
+    fn runtime(&self) -> &'owner Ndi {
+        self.resource.ndi()
+    }
+
+    fn instance(&self) -> crate::capture::SenderMetadataInstance {
+        crate::capture::SenderMetadataInstance {
+            instance: self.resource.instance(),
+            free: self.table.NDIlib_send_free_metadata,
+        }
+    }
+}
+
 mod ownership {
     use super::*;
 
@@ -2283,7 +2318,8 @@ impl<M: SenderMode> Sender<M> {
     /// As for [`Self::capture_metadata`].
     #[doc(alias = "NDIlib_send_capture")]
     pub fn capture_metadata_ref(&self, timeout: Duration) -> Result<Option<MetadataFrameRef<'_>>> {
-        let metadata = self.resource().ndi().table::<sys::SenderMetadata>()?;
+        let source = SenderMetadataSource::new(self.resource())?;
+        let metadata = source.table;
         let deadline = Deadline::after(timeout)?;
         let Some(lease) = self.inner.metadata_capture.acquire_until(deadline.end()) else {
             return Ok(None);
@@ -2309,14 +2345,7 @@ impl<M: SenderMode> Sender<M> {
             // bounded NUL-terminated string contract; from_sender validates
             // that contract before exposing any text.
             let guard = unsafe {
-                crate::capture::Guard::<crate::capture::SenderMetadataFree>::new(
-                    self.resource().ndi(),
-                    crate::capture::SenderMetadataInstance {
-                        instance: self.resource().instance(),
-                        free: metadata.NDIlib_send_free_metadata,
-                    },
-                    raw,
-                )
+                crate::capture::Guard::<crate::capture::SenderMetadataFree>::new(source, raw)
             };
             MetadataFrameRef::from_sender(guard, lease).map(Some)
         } else if kind == NDIlib_frame_type_e_NDIlib_frame_type_none {

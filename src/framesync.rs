@@ -456,6 +456,28 @@ enum AudioCall {
     InputFormat,
 }
 
+impl crate::capture::source_sealed::Sealed for &FrameSyncResource {}
+
+macro_rules! framesync_frame_source {
+    ($strategy:ty) => {
+        // SAFETY: this resource owns the synchronizer and retains its creating
+        // receiver/runtime. Its borrow prevents destruction until frame free.
+        unsafe impl<'owner> crate::capture::FrameSource<'owner, $strategy>
+            for &'owner FrameSyncResource
+        {
+            fn runtime(&self) -> &'owner crate::Ndi {
+                self.receiver().ndi()
+            }
+
+            fn instance(&self) -> NDIlib_framesync_instance_t {
+                self.instance.0
+            }
+        }
+    };
+}
+framesync_frame_source!(FrameSyncVideoFree);
+framesync_frame_source!(FrameSyncAudioFree);
+
 impl FrameSyncResource {
     /// Capture video for `scan_type`: the guard of the frame the SDK
     /// returned, or `None` for the documented all-zero "no video yet" state,
@@ -480,7 +502,7 @@ impl FrameSyncResource {
         // destroys the instance only when dropped, so the instance outlives
         // the guard, which frees the frame exactly once through
         // NDIlib_framesync_free_video, including when validation fails.
-        Some(unsafe { Guard::new(self.receiver().ndi(), self.instance.0, frame) })
+        Some(unsafe { Guard::new(self, frame) })
     }
 
     /// Make `call`: the guard of what the SDK returned, which it returns
@@ -527,7 +549,7 @@ impl FrameSyncResource {
         // destroys the instance only when dropped, so the instance outlives
         // the guard, which frees the frame exactly once through
         // NDIlib_framesync_free_audio_v2, including when validation fails.
-        unsafe { Guard::new(self.receiver().ndi(), self.instance.0, frame) }
+        unsafe { Guard::new(self, frame) }
     }
 }
 

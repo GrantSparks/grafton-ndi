@@ -39,6 +39,7 @@ fn main() {
         "ndi_has_advanced_header",
         "ndi_test_capture_permissions",
         "ndi_test_receiver_proofs",
+        "ndi_test_frame_source",
         "ndi_test_send_ownership",
         "ndi_test_send_ownership_control",
         "ndi_test_send_ownership_types",

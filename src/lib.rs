@@ -180,3 +180,7 @@ mod receiver_proofs;
 ))]
 #[path = "../tests/ui/internal/runtime_binding.rs"]
 mod runtime_binding_contract;
+
+#[cfg(ndi_test_frame_source)]
+#[path = "../tests/ui/internal/frame_source.rs"]
+mod frame_source_contract;

@@ -2572,16 +2572,33 @@ pub(crate) struct CaptureLock<'rx> {
     attempt: Attempt,
 }
 
-impl<'rx> CaptureLock<'rx> {
-    /// The runtime the receiver was created through, which frees the frames
-    /// a capture under this lock delivers.
-    pub(crate) fn runtime(&self) -> &'rx Ndi {
+/// The receiver owner retained by an authorized capture. Only CaptureLock
+/// mints this proof, and its private borrow keeps the instance and runtime live.
+#[derive(Clone, Copy)]
+pub(crate) struct ReceiverFrameSource<'rx> {
+    core: &'rx ReceiverCore,
+}
+
+impl crate::capture::source_sealed::Sealed for ReceiverFrameSource<'_> {}
+
+// SAFETY: CaptureLock mints this proof from the core it captures through.
+// The private core borrow retains both its instance and creating runtime.
+unsafe impl<'rx, S: crate::capture::CaptureStrategy> crate::capture::FrameSource<'rx, S>
+    for ReceiverFrameSource<'rx>
+{
+    fn runtime(&self) -> &'rx Ndi {
         self.core.ndi()
     }
 
-    /// The receiver instance a capture under this lock is made on.
-    pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
+    fn instance(&self) -> NDIlib_recv_instance_t {
         self.core.instance.0
+    }
+}
+
+impl<'rx> CaptureLock<'rx> {
+    /// Mint the owner proof for frames delivered by this capture permission.
+    pub(crate) fn source(&self) -> ReceiverFrameSource<'rx> {
+        ReceiverFrameSource { core: self.core }
     }
 
     /// The receiver's one `NDIlib_recv_capture_v3` call: wait for what is
@@ -2591,7 +2608,7 @@ impl<'rx> CaptureLock<'rx> {
     ///
     /// The SDK fills only the descriptor of the kind it returns, and only
     /// when that descriptor was given; the caller frees such a frame through
-    /// the matching `NDIlib_recv_free_*` function of [`Self::runtime`].
+    /// the matching `NDIlib_recv_free_*` function of its creating runtime.
     pub(crate) fn capture(
         &self,
         video: Option<&mut NDIlib_video_frame_v2_t>,
