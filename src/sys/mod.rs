@@ -81,7 +81,7 @@ mod coverage_tests;
 pub(crate) use api::*;
 #[cfg(feature = "file-io")]
 pub(crate) use file::{select_file, FilePlayback, FileRecording, FileRuntime, FileTable};
-pub(crate) use loader::{select, selected, Runtime};
+pub(crate) use loader::{is_running, select, Runtime};
 
 #[cfg(test)]
 pub(crate) use api::with_test_evidence;

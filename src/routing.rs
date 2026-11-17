@@ -236,16 +236,17 @@ impl Router {
         })
     }
 
-    /// The native router, for calls through an Advanced table.
-    #[cfg(all(feature = "advanced", ndi_has_advanced_router_connection_metadata))]
-    pub(crate) fn native_instance(&self) -> NDIlib_routing_instance_t {
-        self.instance.0
-    }
-
-    /// The runtime this router was created through.
+    /// Split the gated metadata table, native instance and retained registrations.
     #[cfg(feature = "advanced")]
-    pub(crate) fn runtime(&self) -> &Ndi {
-        self.routing.ndi()
+    pub(crate) fn connection_metadata_parts(
+        &mut self,
+    ) -> Result<(
+        &sys::advanced::RouterConnectionMetadata,
+        NDIlib_routing_instance_t,
+        &mut crate::connection_metadata::ConnectionMetadata,
+    )> {
+        let table = self.routing.ndi().table()?;
+        Ok((table, self.instance.0, &mut self.connection_metadata))
     }
 
     /// Route connected and future receivers to `source`.

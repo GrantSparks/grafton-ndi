@@ -708,14 +708,18 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
         timeout: Duration,
     ) -> Result<Option<SourceNameChange>> {
         let deadline = Deadline::after(timeout)?;
-        // The task owns copies of the immutable tables it validated, keeping
-        // its inputs independent of reference-lifetime inference on the MSRV.
-        let (source_name, strings) = *self.inner.core.source_name_tables()?;
+        // The task owns the gated tables together with the receiver core
+        // that keeps their runtime initialized for the entire native wait.
+        let tables = crate::runtime::Bound::<
+            (crate::sys::ReceiverSourceName, crate::sys::ReceiverStrings),
+            Arc<crate::receiver::ReceiverCore>,
+        >::with_owner(Arc::clone(&self.inner.core))?;
         let receiver = Arc::clone(&self.inner);
         Ok(R::spawn_stoppable(private::Token, move |stop| {
-            let value = receiver.core.wait_for_source_name_change_with(
-                &source_name,
-                &strings,
+            let (source_name, strings) = &*tables;
+            let value = tables.owner().wait_for_source_name_change_with(
+                source_name,
+                strings,
                 deadline,
                 stop,
             )?;

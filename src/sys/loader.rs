@@ -95,8 +95,10 @@ pub(crate) struct Runtime {
 }
 
 /// Observe the selected runtime without selecting or loading one.
-pub(crate) fn selected() -> Option<&'static Runtime> {
-    SELECTED.get()
+pub(crate) fn is_running() -> bool {
+    SELECTED
+        .get()
+        .is_some_and(|runtime| runtime.lifecycle.is_running())
 }
 
 /// Select the implementation `options` describe, or confirm that the one
@@ -189,12 +191,11 @@ impl Runtime {
             raw_version,
             version,
         };
+        let supported_cpu = resolved.core().NDIlib_is_supported_CPU;
+        let (lifecycle, gates) = resolved.seal(version, edition);
         Ok(Self {
-            lifecycle: crate::runtime::RuntimeManager::new(
-                resolved.lifecycle(),
-                resolved.core().NDIlib_is_supported_CPU,
-            ),
-            gates: resolved.seal(version, edition),
+            lifecycle: crate::runtime::RuntimeManager::new(lifecycle, supported_cpu),
+            gates,
             info,
             provider: RuntimeProvider::Native(provider),
         })
@@ -220,7 +221,7 @@ impl Runtime {
                 },
                 cpu,
             ),
-            gates: resolved.seal(version, SdkEdition::Standard),
+            gates: resolved.seal(version, SdkEdition::Standard).1,
             info: RuntimeInfo {
                 edition: SdkEdition::Standard,
                 linkage: crate::capabilities::SdkLinkage::Static,

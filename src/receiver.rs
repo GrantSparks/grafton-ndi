@@ -2466,15 +2466,9 @@ impl ReceiverCore {
         stop: impl Stop,
     ) -> Result<Option<SourceNameChange>> {
         // The query comes with the function that releases what it returns.
-        let (source_name, strings) = self.source_name_tables()?;
+        let (source_name, strings) = self.ndi().table()?;
         self.wait_for_source_name_change_with(source_name, strings, deadline, stop)
             .map(|change| change.map(ReceiverReport::into_value))
-    }
-
-    pub(crate) fn source_name_tables(
-        &self,
-    ) -> Result<&(sys::ReceiverSourceName, sys::ReceiverStrings)> {
-        self.ndi().table()
     }
 
     /// [`Self::wait_for_source_name_change_until`] through the given tables, so

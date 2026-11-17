@@ -403,11 +403,6 @@ impl Runtime {
         is_supported_cpu(&self.selected.gates.api().core)
     }
 
-    #[cfg(feature = "file-io")]
-    pub(crate) fn selected_runtime(&self) -> &'static sys::Runtime {
-        self.selected
-    }
-
     /// Start NDI and return a handle to it.
     ///
     /// NDI is started by the first handle and stays started while any handle
@@ -631,7 +626,7 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
         }
     }
 
-    fn is_running(&self) -> bool {
+    pub(crate) fn is_running(&self) -> bool {
         matches!(*Self::recover_guard(self.state.lock()), Phase::Running(_))
     }
 }
@@ -769,18 +764,20 @@ pub(crate) struct Bound<T: BoundTable, O: LiveOwner = Ndi> {
 
 impl<T: BoundTable, O: LiveOwner> Bound<T, O> {
     pub(crate) fn ndi(&self) -> &Ndi {
-        self.owner.ndi()
+        self.owner().ndi()
     }
 
-    #[cfg(feature = "advanced")]
     pub(crate) fn owner(&self) -> &O {
         &self.owner
     }
 }
 
-#[cfg(feature = "advanced")]
 impl<T: sys::Table, O: LiveOwner> Bound<T, O> {
     /// Gate through an existing live owner and move its proof into the table.
+    #[allow(
+        dead_code,
+        reason = "existing-owner bindings are used by optional receiver adapters"
+    )]
     pub(crate) fn with_owner(owner: O) -> Result<Self> {
         let table = T::of(owner.ndi().runtime.selected)?;
         Ok(Self {
@@ -947,6 +944,11 @@ impl Ndi {
         self.runtime.capabilities()
     }
 
+    #[cfg(feature = "file-io")]
+    pub(crate) fn selected(&self) -> &sys::Runtime {
+        self.runtime.selected
+    }
+
     /// The selected implementation's entry points.
     pub(crate) fn api(&self) -> &sys::Api {
         self.runtime.selected.gates.api()
@@ -1036,7 +1038,7 @@ impl Ndi {
     /// }
     /// ```
     pub fn is_running() -> bool {
-        sys::selected().is_some_and(|runtime| runtime.lifecycle.is_running())
+        sys::is_running()
     }
 }
 
@@ -1154,7 +1156,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "advanced")]
     #[test]
     fn binding_an_existing_owner_needs_no_additional_runtime_handle() {
         struct TestTable;

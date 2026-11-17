@@ -715,7 +715,7 @@ mod tests {
             let resolver = crate::sys::table::ExportsWhere(exported);
             let version = version.map(|text| SdkVersion::parse(text).unwrap());
             Self {
-                gates: Resolved::load(&resolver).unwrap().seal(version, edition),
+                gates: Resolved::load(&resolver).unwrap().seal(version, edition).1,
             }
         }
 

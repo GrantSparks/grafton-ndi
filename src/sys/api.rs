@@ -197,19 +197,22 @@ impl Resolved {
         &self.api.core
     }
 
-    /// The required start/stop table, before it is moved into its sole owner.
-    pub(in crate::sys) fn lifecycle(&self) -> Lifecycle {
-        self.api.lifecycle
-    }
-
     /// Consume resolution evidence and construct every immutable capability gate.
-    pub(crate) fn seal(self, version: Option<SdkVersion>, edition: SdkEdition) -> Gates {
+    pub(crate) fn seal(
+        self,
+        version: Option<SdkVersion>,
+        edition: SdkEdition,
+    ) -> (Lifecycle, Gates) {
         let capabilities = Capabilities::detect(&self.api, &self.advanced, version, edition);
-        Gates {
-            api: self.api.seal(&capabilities),
-            advanced: self.advanced.seal(&capabilities),
-            capabilities,
-        }
+        let (lifecycle, api) = self.api.seal(&capabilities);
+        (
+            lifecycle,
+            Gates {
+                api,
+                advanced: self.advanced.seal(&capabilities),
+                capabilities,
+            },
+        )
     }
 }
 
@@ -332,11 +335,11 @@ macro_rules! optional_tables {
 
         impl ResolvedApi {
             /// Construct each table only under its final recorded decision.
-            fn seal(self, capabilities: &Capabilities) -> Api {
-                Api {
+            fn seal(self, capabilities: &Capabilities) -> (Lifecycle, Api) {
+                (self.lifecycle, Api {
                     core: self.core,
                     $($field: capabilities.decision(RuntimeFeature::$feature).and(self.$field),)+
-                }
+                })
             }
 
             /// The first entry point behind `feature` that the implementation
@@ -535,7 +538,8 @@ pub(crate) fn with_test_evidence<T>(version: &str, run: impl FnOnce(Evidence<'_>
     let exports = super::table::ExportsWhere(|_: &str| true);
     let gates = Resolved::load(&exports)
         .unwrap()
-        .seal(SdkVersion::parse(version), SdkEdition::Advanced);
+        .seal(SdkVersion::parse(version), SdkEdition::Advanced)
+        .1;
     run(gates.evidence())
 }
 

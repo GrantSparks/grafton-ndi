@@ -726,10 +726,13 @@ mod tests {
         // An Advanced 6.3.2 runtime that exports every function the crate
         // knows, gated as the loader gates the runtime it selects.
         let exports = ExportsWhere(|_: &str| true);
-        let gates = Resolved::load(&exports).unwrap().seal(
-            SdkVersion::parse("NDI SDK TEST 6.3.2.0"),
-            SdkEdition::Advanced,
-        );
+        let gates = Resolved::load(&exports)
+            .unwrap()
+            .seal(
+                SdkVersion::parse("NDI SDK TEST 6.3.2.0"),
+                SdkEdition::Advanced,
+            )
+            .1;
         let runtime = gates.evidence();
         let capabilities = gates.capabilities();
         let too_old = |result: Result<crate::receiver::ValidatedReceiveOptions<'_>>,

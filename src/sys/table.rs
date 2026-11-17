@@ -185,7 +185,6 @@ macro_rules! native_table {
     ) => {
         $(#[$meta])*
         #[allow(non_snake_case)]
-        #[derive(Clone, Copy)]
         $vis struct $Table {
             $(pub(crate) $name: unsafe extern "C" fn($($type),*) $(-> $return)?,)+
         }

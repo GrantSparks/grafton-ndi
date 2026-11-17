@@ -202,6 +202,13 @@ export! {
 export! {
     fn NDIlib_recv_get_source_name(_p_instance: NDIlib_recv_instance_t, name: *mut *const c_char, timeout_in_ms: u32) -> bool {
         log(&format!("source-name:{timeout_in_ms}"));
+        if let Some(release) = std::env::var_os("GRAFTON_FAKE_SOURCE_NAME_RELEASE_FILE") {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !std::path::Path::new(&release).exists() {
+                assert!(std::time::Instant::now() < deadline, "source-name test gate was not released");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         let delay = std::env::var("GRAFTON_FAKE_SOURCE_NAME_DELAY_MS")
             .unwrap_or_default().parse::<u64>().unwrap_or(0);
         std::thread::sleep(std::time::Duration::from_millis(delay.min(timeout_in_ms.into())));

@@ -386,10 +386,7 @@ impl FileApi {
     ///   the [`crate::SelectionConflict`]; its `Display` gives the diagnostic text.
     /// * [`Error::InvalidInput`] when `options` names a relative path.
     pub fn new(ndi: &Ndi, options: &FileApiOptions) -> Result<Self> {
-        let runtime = sys::select_file(
-            ndi.runtime().selected_runtime(),
-            options.library_path.as_deref(),
-        )?;
+        let runtime = sys::select_file(ndi.selected(), options.library_path.as_deref())?;
         Ok(Self {
             runtime: FileBound::Native(ndi.bind_file_runtime(runtime)),
         })
