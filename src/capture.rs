@@ -18,9 +18,9 @@
 //!   the SDK capture call and its frame-type discriminant, wrapping and
 //!   freeing the matching raw frame family. The capture itself is made only through
 //!   a [`CaptureLock`], which fixes the receiver, runtime and remaining wait
-//!   after the mode's permissions have been checked. [`capture_raw`]
-//!   (one kind) and `capture_any` (a sealed set of all media slots or none)
-//!   both go through `Captured`. A delivered frame becomes a guard through
+//!   after the mode's permissions have been checked. `capture_any` selects
+//!   a sealed set of one kind, all media slots or none, and every set goes
+//!   through `Captured`. A delivered frame becomes a guard through
 //!   `Captured::take`, the one place a receiver guard is made. Mixed and
 //!   notification-only capture share a receiver kernel that handles every
 //!   notification before the caller can convert media.
@@ -57,6 +57,7 @@ mod sealed {
     impl Sealed for super::FrameSyncAudioFree {}
     #[cfg(feature = "advanced")]
     impl Sealed for super::AvSyncAudioFree {}
+    impl<K: super::CaptureKind> Sealed for super::Only<K> {}
     impl Sealed for super::AllSlots {}
     impl Sealed for super::NoSlots {}
 }
@@ -261,15 +262,15 @@ impl CaptureStrategy for MetadataKind {
 #[derive(Debug)]
 pub(crate) struct SenderMetadataFree;
 
-/// The sender and authorized optional table that produced one metadata loan.
+/// The sender and matching release function that produced one metadata loan.
 #[derive(Clone, Copy)]
 pub(crate) struct SenderMetadataInstance {
     pub(crate) instance: NDIlib_send_instance_t,
-    pub(crate) metadata: &'static sys::SenderMetadata,
+    pub(crate) free: unsafe extern "C" fn(NDIlib_send_instance_t, *const NDIlib_metadata_frame_t),
 }
 
 // SAFETY: this strategy releases only the metadata descriptor returned by
-// NDIlib_send_capture through the same sender instance and authorized table.
+// NDIlib_send_capture through the same sender instance and authorized release function.
 // That family's text is readable through the first NUL or metadata cap,
 // independently of its reported count, so its scanner uses the sender rule.
 unsafe impl FrameFree for SenderMetadataFree {
@@ -286,9 +287,7 @@ unsafe impl FrameFree for SenderMetadataFree {
     }
 
     unsafe fn free(_core: &sys::Core, instance: Self::Instance, frame: &mut Self::RawFrame) {
-        instance
-            .metadata
-            .NDIlib_send_free_metadata(instance.instance, frame);
+        (instance.free)(instance.instance, frame);
     }
 }
 
@@ -354,7 +353,7 @@ unsafe impl FrameFree for FrameSyncAudioFree {
 #[derive(Debug)]
 pub(crate) struct AvSyncAudioFree;
 
-/// The native owner and already-authorized table of one AV-sync audio loan.
+/// The native owner and authorized release function of one AV-sync audio loan.
 #[cfg(feature = "advanced")]
 #[derive(Clone, Copy)]
 pub(crate) enum AvSyncAudioInstance {
@@ -368,14 +367,18 @@ pub(crate) enum AvSyncAudioInstance {
     Native {
         #[cfg(ndi_has_advanced_av_sync)]
         handle: crate::sys::advanced::AvSyncHandle,
-        table: &'static crate::sys::advanced::AvSync,
+        #[cfg(ndi_has_advanced_av_sync)]
+        free:
+            unsafe extern "C" fn(crate::sys::advanced::AvSyncHandle, *mut NDIlib_audio_frame_v3_t),
+        #[cfg(not(ndi_has_advanced_av_sync))]
+        unavailable: std::convert::Infallible,
     },
     #[cfg(test)]
     Synthetic(*const std::cell::Cell<usize>),
 }
 
-// SAFETY: each instance carries the synchronizer and the same table that
-// returned its descriptor. The owner borrow outlives matching native release,
+// SAFETY: each instance carries the synchronizer and the release entry point
+// of the same bound table that returned its descriptor. The owner borrow outlives matching native release,
 // retaining embedded metadata through its first NUL or the metadata cap.
 #[cfg(feature = "advanced")]
 unsafe impl FrameFree for AvSyncAudioFree {
@@ -392,13 +395,17 @@ unsafe impl FrameFree for AvSyncAudioFree {
             AvSyncAudioInstance::Native {
                 #[cfg(ndi_has_advanced_av_sync)]
                 handle,
-                table,
+                #[cfg(ndi_has_advanced_av_sync)]
+                free,
+                #[cfg(not(ndi_has_advanced_av_sync))]
+                unavailable,
             } => {
-                crate::sys::advanced::native!(AvSync, table => {
-                    if !_frame.p_data.is_null() || !_frame.p_metadata.is_null() {
-                        table.NDIlib_avsync_free_audio(handle, _frame);
-                    }
-                });
+                #[cfg(ndi_has_advanced_av_sync)]
+                if !_frame.p_data.is_null() || !_frame.p_metadata.is_null() {
+                    free(handle, _frame);
+                }
+                #[cfg(not(ndi_has_advanced_av_sync))]
+                match unavailable {}
             }
             #[cfg(test)]
             AvSyncAudioInstance::Synthetic(_) => {
@@ -576,15 +583,6 @@ impl<'owner, S: FrameFree> Drop for Guard<'owner, S> {
     }
 }
 
-/// Result of a generic capture operation: the frame `NDIlib_recv_capture_v3`
-/// was asked for, or what it reported instead.
-pub(crate) enum CaptureResult<'rx, K: CaptureKind> {
-    /// Successfully captured a frame of the expected type.
-    Frame(Guard<'rx, K>),
-    /// No frame for the caller; see [`Notification`].
-    Notification(Notification),
-}
-
 /// What `NDIlib_recv_capture_v3` reports in place of a frame the caller asked
 /// for. None of these carries a frame buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -727,22 +725,6 @@ impl<'rx> Captured<'rx> {
     }
 }
 
-/// Capture a frame of kind `K` from the receiver and within the remaining
-/// attempt identified by the [`CaptureLock`] proof `lock`.
-///
-/// Gives `NDIlib_recv_capture_v3` the slot of kind `K` alone; any other
-/// result is classified by [`Notification::classify`]. The frame's guard
-/// borrows the receiver for `'rx`, as the proof does, and can outlive the proof.
-pub(crate) fn capture_raw<'rx, K: CaptureKind>(
-    lock: &CaptureLock<'rx>,
-) -> Result<CaptureResult<'rx, K>> {
-    let mut captured = Captured::capture(lock, Slots::only::<K>());
-    match captured.take::<K>() {
-        Some(guard) => Ok(CaptureResult::Frame(guard)),
-        None => captured.notification().map(CaptureResult::Notification),
-    }
-}
-
 /// A media frame delivered by a capture with all three media slots. A
 /// consumer of this type cannot receive or discard a native notification.
 pub(crate) enum Media<'rx> {
@@ -755,12 +737,28 @@ pub(crate) enum Media<'rx> {
 }
 
 /// A sealed set of media slots, paired with exactly the media it can deliver.
-/// Only [`AllSlots`] and [`NoSlots`] implement it, so every descriptor given
-/// to the SDK is taken and guarded when the SDK reports its frame kind.
+/// Only [`Only`], [`AllSlots`] and [`NoSlots`] implement it, so every
+/// descriptor given to the SDK is taken and guarded when the SDK reports its
+/// frame kind.
 pub(crate) trait SlotSet: sealed::Sealed + Sized {
     type Media<'rx>;
 
     fn capture<'rx>(lock: &CaptureLock<'rx>) -> Result<Delivered<'rx, Self>>;
+}
+
+/// Capture one media kind and notifications, giving the SDK only that kind's slot.
+pub(crate) struct Only<K: CaptureKind>(PhantomData<K>);
+
+impl<K: CaptureKind> SlotSet for Only<K> {
+    type Media<'rx> = Guard<'rx, K>;
+
+    fn capture<'rx>(lock: &CaptureLock<'rx>) -> Result<Delivered<'rx, Self>> {
+        let mut captured = Captured::capture(lock, Slots::only::<K>());
+        match captured.take::<K>() {
+            Some(guard) => Ok(Delivered::Media(guard)),
+            None => captured.notification().map(Delivered::Notification),
+        }
+    }
 }
 
 /// Capture video, audio, metadata and notifications.
@@ -809,9 +807,9 @@ pub(crate) enum Delivered<'rx, S: SlotSet> {
 /// Capture with slot set `S` from the receiver and within the remaining
 /// attempt identified by the [`CaptureLock`] proof `lock`.
 ///
-/// Any delivered media is wrapped in the guard of its kind, as
-/// [`capture_raw`] does for one kind; any other result is classified by
-/// [`Notification::classify`]. Every slot set goes through [`Captured`].
+/// Any delivered media is wrapped in the guard of its kind; any other result
+/// is classified by [`Notification::classify`]. Every slot set goes through
+/// [`Captured`].
 ///
 /// # Errors
 ///

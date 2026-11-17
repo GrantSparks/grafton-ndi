@@ -38,12 +38,18 @@ fn main() {
         "ndi_link_static",
         "ndi_has_advanced_header",
         "ndi_test_capture_permissions",
+        "ndi_test_receiver_proofs",
         "ndi_test_send_ownership",
         "ndi_test_send_ownership_control",
         "ndi_test_send_ownership_types",
         "ndi_test_descriptor_parts",
+        "ndi_test_runtime_binding",
+        "ndi_test_runtime_binding_control",
+        "ndi_test_runtime_binding_privacy",
         "ndi_test_finder_snapshot_guard",
         "ndi_test_foreign_snapshot_guard",
+        "ndi_test_file_late_drain",
+        "ndi_test_file_late_drain_without_proof",
     ] {
         println!("cargo:rustc-check-cfg=cfg({cfg})");
     }

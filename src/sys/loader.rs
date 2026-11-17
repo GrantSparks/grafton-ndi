@@ -78,6 +78,12 @@ impl<'a> ExplicitLibrary<'a> {
     }
 }
 
+enum RuntimeProvider {
+    Native(Provider),
+    #[cfg(test)]
+    Synthetic,
+}
+
 static SELECTED: Selection<Runtime> = Selection::new(crate::LibraryKind::Runtime);
 
 /// The implementation selected for this process.
@@ -85,7 +91,7 @@ pub(crate) struct Runtime {
     pub(crate) lifecycle: crate::runtime::RuntimeManager,
     pub(crate) gates: Gates,
     pub(crate) info: RuntimeInfo,
-    provider: Provider,
+    provider: RuntimeProvider,
 }
 
 /// Observe the selected runtime without selecting or loading one.
@@ -190,8 +196,46 @@ impl Runtime {
             ),
             gates: resolved.seal(version, edition),
             info,
-            provider,
+            provider: RuntimeProvider::Native(provider),
         })
+    }
+
+    /// An isolated SDK-free runtime. Only the supplied core calls are usable.
+    #[cfg(test)]
+    pub(crate) fn test_double(core: super::Core) -> &'static Self {
+        unsafe extern "C" fn initialize() -> bool {
+            true
+        }
+        unsafe extern "C" fn destroy() {}
+        unsafe extern "C" fn cpu() -> bool {
+            true
+        }
+        let version = SdkVersion::parse("6.4.0.2");
+        let resolved = Resolved::with_test_core(core);
+        let runtime = Box::leak(Box::new(Self {
+            lifecycle: crate::runtime::RuntimeManager::new(
+                super::Lifecycle {
+                    NDIlib_initialize: initialize,
+                    NDIlib_destroy: destroy,
+                },
+                cpu,
+            ),
+            gates: resolved.seal(version, SdkEdition::Standard),
+            info: RuntimeInfo {
+                edition: SdkEdition::Standard,
+                linkage: crate::capabilities::SdkLinkage::Static,
+                library_path: None,
+                raw_version: "6.4.0.2".into(),
+                version,
+            },
+            provider: RuntimeProvider::Synthetic,
+        }));
+        // Like the selected vendor runtime, isolated doubles are process-lived.
+        // Keep them reachable so interpreter leak checks observe the same policy.
+        static RUNTIMES: std::sync::Mutex<Vec<&'static Runtime>> =
+            std::sync::Mutex::new(Vec::new());
+        RUNTIMES.lock().unwrap().push(runtime);
+        runtime
     }
 
     /// Confirm that this implementation, which is selected for the process
@@ -215,7 +259,11 @@ impl Runtime {
                 explicit.map(ExplicitLibrary::path),
             )));
         }
-        self.provider.confirm_location(explicit)
+        match &self.provider {
+            RuntimeProvider::Native(provider) => provider.confirm_location(explicit),
+            #[cfg(test)]
+            RuntimeProvider::Synthetic => Ok(()),
+        }
     }
 }
 

@@ -4,7 +4,7 @@ use std::{ffi::c_char, mem::size_of};
 
 use crate::{
     finder::SourceText,
-    sdk_copy::{CopyBudget, TextError},
+    sdk_copy::{CopyBudget, LossyText, TextError},
     Error, ResourceKind, Result,
 };
 
@@ -56,6 +56,22 @@ impl SnapshotBudget {
     ) -> Result<Option<String>> {
         // SAFETY: forwarded to the caller's obligations.
         match unsafe { self.0.text(pointer) } {
+            Ok(text) => Ok(text),
+            Err(TextError::Unterminated) => Ok(None),
+            Err(TextError::Failed(error)) => Err(error),
+        }
+    }
+
+    /// Borrow classified text after charging exactly the ordinary source copy.
+    ///
+    /// # Safety
+    /// As for [`Self::text`], with storage kept live for the returned lifetime.
+    pub(super) unsafe fn source_text_view<'a>(
+        &mut self,
+        pointer: *const c_char,
+    ) -> Result<Option<LossyText<'a>>> {
+        // SAFETY: forwarded to the caller's obligations.
+        match unsafe { self.0.source_text_view(pointer) } {
             Ok(text) => Ok(text),
             Err(TextError::Unterminated) => Ok(None),
             Err(TextError::Failed(error)) => Err(error),
@@ -180,6 +196,173 @@ mod tests {
         assert_eq!(allocations, 401, "two per source string, plus the vector");
     }
 
+    fn selected_snapshot(
+        entries: &[NDIlib_source_t],
+        select: impl Fn(&super::super::BorrowedSource<'_>) -> Result<bool>,
+    ) -> Result<Vec<Source>> {
+        // SAFETY: tests keep the descriptors and all pointed-to strings live.
+        unsafe {
+            copy_snapshot(entries.as_ptr(), entries.len() as u32, |entry, budget| {
+                let (name, address) = super::super::source_pointers(entry);
+                super::super::snapshot_selected_source(name, address, budget, &select)
+            })
+        }
+    }
+
+    #[test]
+    fn selecting_names_and_hosts_allocates_only_the_matching_sources() {
+        let mut nonmatch = named(c"OTHER (Camera)".as_ptr());
+        nonmatch.__bindgen_anon_1.p_url_address = c"192.0.2.8:5961".as_ptr();
+        let mut matching = named(c"HOST (Camera)".as_ptr());
+        matching.__bindgen_anon_1.p_url_address = c"192.0.2.7:5961".as_ptr();
+        let mut entries = [nonmatch; 100];
+        entries[72] = matching;
+        for (name, expected) in [("missing", 0), ("HOST (Camera)", 1)] {
+            let (sources, allocations) = crate::test_alloc::allocation_count(|| {
+                selected_snapshot(&entries, |source| Ok(source.name.equals(name)))
+            });
+            assert_eq!(sources.unwrap().len(), expected);
+            assert_eq!(allocations, 1 + 4 * expected);
+        }
+        let query = super::super::HostQuery::checked("192.0.2.7").unwrap();
+        let (sources, allocations) = crate::test_alloc::allocation_count(|| {
+            selected_snapshot(&entries, |source| source.matches_query(query))
+        });
+        assert_eq!(sources.unwrap().len(), 1);
+        assert_eq!(allocations, 5);
+
+        let seen = snapshot(&entries)
+            .unwrap()
+            .into_iter()
+            .map(super::super::SeenSource)
+            .collect();
+        let (sources, allocations) = crate::test_alloc::allocation_count(|| {
+            selected_snapshot(&entries, |source| Ok(!source.seen_in(&seen)?))
+        });
+        assert!(sources.unwrap().is_empty());
+        assert_eq!(
+            allocations, 1,
+            "a repeated snapshot copies no source strings"
+        );
+    }
+
+    #[test]
+    fn selecting_snapshots_preserves_lossy_identity_host_rules_and_order() {
+        let mut lossy = named(c"STUDIO \xff (Camera)".as_ptr());
+        lossy.__bindgen_anon_1.p_url_address = c"http://camera.local:8080/path".as_ptr();
+        let mut addressed = named(ptr::null());
+        addressed.__bindgen_anon_1.p_url_address = c"192.0.2.7:5961".as_ptr();
+        let mut missing_address = named(c"STUDIO (Camera)".as_ptr());
+        missing_address.__bindgen_anon_1.p_url_address = ptr::null();
+        let mut ipv6 = named(c"OTHER (IPv6)".as_ptr());
+        ipv6.__bindgen_anon_1.p_url_address = c"http://[2001:db8::1]:8080/path".as_ptr();
+        let entries = [
+            lossy,
+            addressed,
+            missing_address,
+            lossy,
+            ipv6,
+            NDIlib_source_t::default(),
+        ];
+        let copied = snapshot(&entries).unwrap();
+        for name in ["STUDIO \u{fffd} (Camera)", "STUDIO (Camera)", "", "absent"] {
+            let expected = copied
+                .iter()
+                .filter(|source| source.name() == name)
+                .cloned()
+                .collect::<Vec<_>>();
+            let actual =
+                selected_snapshot(&entries, |source| Ok(source.name.equals(name))).unwrap();
+            assert_eq!(actual, expected);
+        }
+        for host in [
+            "studio",
+            "STUDIO \u{fffd}",
+            "camera.local",
+            "192.0.2.7",
+            "[2001:db8::1]",
+            "missing",
+        ] {
+            let query = super::super::HostQuery::checked(host).unwrap();
+            let expected = copied
+                .iter()
+                .filter(|source| source.matches_query(query))
+                .cloned()
+                .collect::<Vec<_>>();
+            let actual = selected_snapshot(&entries, |source| source.matches_query(query)).unwrap();
+            assert_eq!(actual, expected, "{host}");
+        }
+        let seen = copied
+            .iter()
+            .cloned()
+            .map(super::super::SeenSource)
+            .collect();
+        assert!(
+            selected_snapshot(&entries, |source| Ok(!source.seen_in(&seen)?))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn omitted_selection_keeps_ordinary_copy_charges_and_errors() {
+        let mut both = named(c"a\xff".as_ptr());
+        both.__bindgen_anon_1.p_url_address = c"http://camera.local:8080".as_ptr();
+        let mut address_only = named(ptr::null());
+        address_only.__bindgen_anon_1.p_url_address = c"192.0.2.7".as_ptr();
+        for entry in [
+            both,
+            address_only,
+            named(c"name".as_ptr()),
+            NDIlib_source_t::default(),
+        ] {
+            let (name, address) = super::super::source_pointers(&entry);
+            let mut old = SnapshotBudget::new();
+            let mut selected = SnapshotBudget::new();
+            if name.is_null() && !address.is_null() {
+                old.empty_source_name().unwrap();
+            }
+            // SAFETY: each test descriptor points to live terminated literals.
+            unsafe {
+                super::super::decode_source(name, address, |pointer| old.text(pointer)).unwrap();
+                assert!(super::super::snapshot_selected_source(
+                    name,
+                    address,
+                    &mut selected,
+                    |_| Ok(false)
+                )
+                .unwrap()
+                .is_none());
+            }
+            assert_eq!(selected.0.remaining(), old.0.remaining());
+        }
+
+        for remaining in 0..128 {
+            let mut old = SnapshotBudget(CopyBudget::new(
+                remaining,
+                ResourceKind::FinderSnapshotBytes,
+            ));
+            let mut selected = SnapshotBudget(CopyBudget::new(
+                remaining,
+                ResourceKind::FinderSnapshotBytes,
+            ));
+            let (name, address) = super::super::source_pointers(&both);
+            // SAFETY: the descriptor points to live terminated literals.
+            let (expected, actual) = unsafe {
+                (
+                    super::super::decode_source(name, address, |pointer| old.text(pointer))
+                        .map(|_| ()),
+                    super::super::snapshot_selected_source(name, address, &mut selected, |_| {
+                        Ok(false)
+                    })
+                    .map(|_| ()),
+                )
+            };
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+            assert_eq!(selected.0.remaining(), old.0.remaining());
+        }
+    }
+
     #[test]
     fn count_and_span_are_checked_before_dereferencing_or_reserving() {
         assert_eq!(descriptor_bytes(MAX_SOURCES, 16).unwrap(), MAX_SOURCES * 16);
@@ -237,6 +420,23 @@ mod tests {
             snapshot(&[both]),
             Err(Error::ResourceLimit { .. })
         ));
+
+        // Selection must also retain ordinary errors at the full SDK bounds.
+        let unterminated = vec![b'x'; MAX_SDK_STRING_BYTES];
+        let malformed = named(unterminated.as_ptr().cast());
+        let largest = CString::new(vec![b'x'; MAX_SDK_STRING_BYTES - 1]).unwrap();
+        let mut oversized = named(largest.as_ptr());
+        oversized.__bindgen_anon_1.p_url_address = largest.as_ptr();
+        for entries in [
+            vec![malformed],
+            vec![malformed; 4],
+            vec![oversized],
+            vec![named(largest.as_ptr()); 3],
+        ] {
+            let expected = snapshot(&entries).map(|_| ());
+            let actual = selected_snapshot(&entries, |_| Ok(false)).map(|_| ());
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        }
     }
 
     #[test]

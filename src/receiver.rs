@@ -52,8 +52,8 @@ use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::{
     capture::{
-        capture_any, capture_raw, AllSlots, AudioKind, CaptureKind, CaptureResult, CaptureStrategy,
-        Delivered, Media, MetadataKind, NoSlots, Notification, SlotSet, VideoKind,
+        capture_any, AllSlots, AudioKind, CaptureKind, CaptureStrategy, Delivered, Media,
+        MetadataKind, NoSlots, Notification, Only, SlotSet, VideoKind,
     },
     connection_metadata::ConnectionMetadata,
     finder::{RawSource, Source},
@@ -523,11 +523,11 @@ fn validate_ptz_preset(preset: u8) -> Result<i32> {
 /// the source `$ptz` controls.
 macro_rules! ptz_command {
     ($ptz:expr, $func:ident $(, $arg:expr)*) => {{
-        let _connection = $ptz.core.lock_connection();
+        let connection = $ptz.core.lock_connection();
         // SAFETY: the live core and connection permit cover this call; the
         // RecvInstance inventory records control/capture and remote overlap.
         // Every argument is a plain value.
-        unsafe { $ptz.core.sdk().named().$func($ptz.core.instance.0 $(, $arg)*) }.performed()
+        unsafe { $ptz.core.sdk().named().$func(connection.instance() $(, $arg)*) }.performed()
     }};
 }
 
@@ -1178,7 +1178,7 @@ struct ConnectionPermit;
 /// A connection request retains its descriptor and strings until a later
 /// request returns or native destruction. Captures may overlap the permit.
 pub(crate) struct Connection<'a> {
-    core: &'a ReceiverCore,
+    instance: RecvInstance,
     _exclusive: MutexGuard<'a, ConnectionPermit>,
 }
 
@@ -1189,48 +1189,154 @@ enum ConnectionRequest {
 }
 
 impl Connection<'_> {
-    fn connect(&self, next: RetainedSource) {
-        self.request(ConnectionRequest::Connect(next));
+    /// The native identity authorized by this connection permit.
+    pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
+        self.instance.0
     }
 
-    fn reconnect(&self) {
-        self.request(ConnectionRequest::Reconnect);
+    /// Exercise the real permission-shaped boundary with a synthetic identity.
+    #[cfg(all(test, feature = "advanced"))]
+    pub(crate) fn with_test_instance<T>(
+        instance: NDIlib_recv_instance_t,
+        call: impl FnOnce(&Connection<'_>) -> T,
+    ) -> T {
+        let gate = Mutex::new(ConnectionPermit);
+        let permission = Connection {
+            instance: RecvInstance(instance),
+            _exclusive: gate.lock(),
+        };
+        call(&permission)
     }
+}
 
-    fn disconnect(&self) {
-        self.request(ConnectionRequest::Disconnect);
-    }
-
+impl ReceiverCore {
     fn request(&self, request: ConnectionRequest) {
-        // The connection permit serializes writers. Clone only the retained
-        // allocation under the read lock; snapshots can continue throughout
-        // native work, and the write lock covers only the final replacement.
+        let connection = self.lock_connection();
+        // Clone only the retained allocation under the read lock; snapshots
+        // continue during native work and writers replace only the final value.
         let call = |source| {
-            // SAFETY: this permit fixes the live receiver and serializes native
-            // requests. RetainedSource keeps the descriptors and text alive
-            // through this call and until replacement or native destruction.
+            // SAFETY: the proof authorizes this live receiver's connection
+            // request. RetainedSource keeps the native descriptor and strings.
             unsafe {
-                self.core
-                    .sdk()
-                    .NDIlib_recv_connect(self.core.instance.0, source)
+                self.sdk()
+                    .NDIlib_recv_connect(connection.instance(), source)
             };
         };
         match request {
             ConnectionRequest::Connect(next) => {
-                let mut target = self.core.target.read().clone();
+                let mut target = self.target.read().clone();
                 target.replace(next, call);
-                *self.core.target.write() = target;
+                *self.target.write() = target;
             }
-            ConnectionRequest::Reconnect => self.core.target.read().reissue(call),
-            // Disconnect deliberately preserves the last target for reconnect.
+            ConnectionRequest::Reconnect => self.target.read().reissue(call),
             ConnectionRequest::Disconnect => call(ptr::null()),
         }
     }
 }
 
+/// Stream mutation borrowed only from an exclusive receiver/control borrow.
+/// Native advertiser operations use their independent observer-registry lock.
+#[cfg(feature = "advanced")]
+pub(crate) struct Exclusive<'a> {
+    core: &'a ReceiverCore,
+}
+
+#[cfg(feature = "advanced")]
+impl Exclusive<'_> {
+    #[cfg(any(
+        test,
+        ndi_has_advanced_receiver_bandwidth_control,
+        ndi_has_advanced_receiver_stream_control
+    ))]
+    pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
+        self.core.instance.0
+    }
+
+    pub(crate) fn ndi(&self) -> &Ndi {
+        self.core.ndi()
+    }
+}
+
+/// Owned allocator authority minted while taking exclusive receiver ownership.
+/// Only allocator registration stores it; it cannot be cloned or recovered as
+/// a receiver. Registration borrows this authority only during its exclusive
+/// install/reset operations.
+#[cfg(feature = "advanced")]
+pub(crate) struct AllocatorOwner(
+    #[cfg_attr(
+        all(not(test), not(ndi_has_advanced_receive_allocators)),
+        expect(
+            dead_code,
+            reason = "allocator authority is retained even without native declarations"
+        )
+    )]
+    Arc<ReceiverCore>,
+);
+
+#[cfg(feature = "advanced")]
+impl AllocatorOwner {
+    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
+    pub(crate) fn access(&self) -> AllocatorAccess<'_> {
+        AllocatorAccess { core: &self.0 }
+    }
+}
+
+/// Allocator installation borrows its nonclone owned authority. Native setters
+/// replace callback state under the allocator's own rwlock. Native policy calls
+/// run under its read side; keeping unrelated Rust gates across this wait would
+/// add lock-order obligations to arbitrary policy callbacks.
+#[cfg(all(feature = "advanced", any(test, ndi_has_advanced_receive_allocators)))]
+pub(crate) struct AllocatorAccess<'a> {
+    core: &'a ReceiverCore,
+}
+
+#[cfg(all(feature = "advanced", any(test, ndi_has_advanced_receive_allocators)))]
+impl AllocatorAccess<'_> {
+    pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
+        self.core.instance.0
+    }
+}
+
+#[cfg(feature = "advanced")]
+impl<M: ReceiverMode> Receiver<M> {
+    pub(crate) fn exclusive(&mut self) -> Exclusive<'_> {
+        Exclusive { core: &self.core }
+    }
+
+    pub(crate) fn allocator_owner(&mut self) -> AllocatorOwner {
+        AllocatorOwner(Arc::clone(&self.core))
+    }
+}
+
+/// Membership borrows the retained receiver and reaches only its immutable
+/// creation properties and stable observer registry. The native advertiser and
+/// observer registries serialize their mutations independently of connection
+/// state. Never take the Rust connection permit: a native connection change
+/// can hold it while joining a decoder thread whose allocator policy adds or
+/// removes this same receiver's membership.
+pub(crate) struct AdvertiserMembership<'a>(&'a ReceiverCore);
+
+impl AdvertiserMembership<'_> {
+    pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
+        self.0.instance.0
+    }
+}
+
+/// One source-report consumer under the native report mutex and Rust query gate.
+struct SourceQuery<'a> {
+    instance: RecvInstance,
+    _query: MutexGuard<'a, ()>,
+}
+
+impl SourceQuery<'_> {
+    fn instance(&self) -> NDIlib_recv_instance_t {
+        self.instance.0
+    }
+}
+
 /// A receiver's opaque native identity; ownership stays with `ReceiverCore`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RecvInstance(pub(crate) NDIlib_recv_instance_t);
+pub(crate) struct RecvInstance(NDIlib_recv_instance_t);
 
 // SAFETY: receivers have no thread affinity. Every shared native entry point
 // has one of the following concurrency bases (NDIlib_recv_ prefix omitted):
@@ -1255,11 +1361,18 @@ pub(crate) struct RecvInstance(pub(crate) NDIlib_recv_instance_t);
 // ptz_white_balance_indoor/outdoor/oneshot/manual,   |
 // ptz_exposure_auto/manual/manual_v2                 |
 // request_keyframe                                  | Connection permit
+// set_bandwidth, set_enabled_streams                 | Exclusive (&mut Receiver)
+// set_video_allocator, set_audio_allocator           | Owned allocator authority
+//                                                   | Native allocator rwlock
+// framesync_create, avsync_create (NDIlib_ prefix)    | By-value adoption
+// destroy                                           | Last owning ReceiverCore
+// recv_advertiser_add_receiver,                      | Immutable creation identity;
+// recv_advertiser_del_receiver (NDIlib_ prefix)       | native observer-registry mutex
 // kvm_is_supported, kvm_send_keyboard_press/release, | Connection permit
 // kvm_send_left/middle/right_mouse_click/release,    | (including held-input
 // kvm_send_vertical/horizontal_mouse_wheel,         | cleanup and Drop)
 // kvm_send_mouse_position/clipboard_contents,       |
-// kvm_send_touch_positions/finish                   |
+// kvm_send_touch_positions, kvm_send_touch_finish    |
 //
 // Native lock interposition and disassembly on Linux x86-64 Standard 6.1.1,
 // Standard/Advanced 6.3.2 and 6.4.0.2 provide the additional basis for controls
@@ -1274,6 +1387,24 @@ pub(crate) struct RecvInstance(pub(crate) NDIlib_recv_instance_t);
 // never dereferencing replaceable connection state. free_string takes the
 // connection read lock before releasing its owned string. Missing entry points
 // cannot be called.
+//
+// Advertiser add/del were interposed on Standard/Advanced 6.3.2 and 6.4.0.2:
+// neither takes the receiver connection rwlock. Both serialize through the
+// advertiser member-map mutex and the receiver observer-registry mutex at +0x10.
+// Their receiver virtuals read only its retained name/configuration, the stable
+// observer-registry pointer, and (for add) immutable creation capabilities.
+// They do not access replaceable connections or allocator callback fields.
+// Standard 6.1.1 has no advertiser symbols. Membership must remain independent
+// of the Rust connection permit, including unregister and Drop: a policy may
+// add/remove membership while a connection change holds that permit and joins
+// the decoder thread running the policy.
+// Allocator setters update only their separately locked callback state.
+// Advanced 6.3.2/6.4.0.2 interposition and disassembly find a native allocator
+// write lock for each setter and its read side across policy calls. The bounded
+// native regression covers policy membership add/remove during allocator reset,
+// reconnect and disconnect. Exclusive stream controls and adoption retain their
+// original &mut/by-value basis; advertiser-held Arcs are covered by the native
+// registry synchronization and field independence above.
 //
 // A Rust connection permit serializes the listed controls with one another and
 // local changes, without delaying capture attempts or source-name waits. It
@@ -1294,8 +1425,8 @@ unsafe impl Send for RecvInstance {}
 unsafe impl Sync for RecvInstance {}
 
 pub(crate) struct ReceiverCore {
-    pub(crate) instance: RecvInstance,
-    pub(crate) _ndi: Ndi,
+    instance: RecvInstance,
+    pub(crate) sdk: crate::runtime::Bound<sys::Core>,
     /// Serializes local connection changes and shared controls. Captures never
     /// take this lock; their connection overlap is measured beside CaptureLock.
     connection_guard: Mutex<ConnectionPermit>,
@@ -1411,7 +1542,7 @@ impl<M: CreatableMode> Receiver<M> {
         options: &ReceiverOptions,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
-            &'static sys::Core,
+            &sys::Core,
             &NDIlib_recv_create_v3_t,
         ) -> sys::table::Called<NDIlib_recv_instance_t>,
     ) -> Result<Self> {
@@ -1422,11 +1553,12 @@ impl<M: CreatableMode> Receiver<M> {
         } = options.to_raw(ndi)?;
         // SAFETY: the core keeps every string these settings point to until
         // after native destruction, including the target and receiver name.
-        let instance = create(&ndi.api().core, &raw).created()?.as_ptr();
+        let sdk = ndi.bind_core();
+        let instance = create(&sdk, &raw).created()?.as_ptr();
         Ok(Self {
             core: Arc::new(ReceiverCore {
                 instance: RecvInstance(instance),
-                _ndi: ndi.clone(),
+                sdk,
                 connection_guard: Mutex::new(ConnectionPermit),
                 target: RwLock::new(RetainedSource::new(&options.source)),
                 pending: PendingEvents::default(),
@@ -1603,10 +1735,10 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn set_video_delay(&self, delay: Duration) -> Result<SettingChange> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
-        let _connection = self.core.lock_connection();
+        let connection = self.core.lock_connection();
         // SAFETY: the live core and connection permit cover this call; see
         // the RecvInstance concurrency inventory.
-        let changed = unsafe { table.NDIlib_recv_set_video_delay(self.core.instance.0, millis) };
+        let changed = unsafe { table.NDIlib_recv_set_video_delay(connection.instance(), millis) };
         Ok(SettingChange::from_sdk(changed))
     }
 
@@ -1620,10 +1752,10 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_get_video_delay")]
     pub fn video_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
-        let _connection = self.core.lock_connection();
+        let connection = self.core.lock_connection();
         // SAFETY: the live core and connection permit cover this call; see
         // the RecvInstance concurrency inventory.
-        receiver_delay(unsafe { table.NDIlib_recv_get_video_delay(self.core.instance.0) })
+        receiver_delay(unsafe { table.NDIlib_recv_get_video_delay(connection.instance()) })
     }
 
     /// Set native audio buffering with the same rounding/range as [`Self::set_video_delay`].
@@ -1638,10 +1770,10 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn set_audio_delay(&self, delay: Duration) -> Result<SettingChange> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
-        let _connection = self.core.lock_connection();
+        let connection = self.core.lock_connection();
         // SAFETY: the live core and connection permit cover this call; see
         // the RecvInstance concurrency inventory.
-        let changed = unsafe { table.NDIlib_recv_set_audio_delay(self.core.instance.0, millis) };
+        let changed = unsafe { table.NDIlib_recv_set_audio_delay(connection.instance(), millis) };
         Ok(SettingChange::from_sdk(changed))
     }
 
@@ -1653,10 +1785,10 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_get_audio_delay")]
     pub fn audio_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
-        let _connection = self.core.lock_connection();
+        let connection = self.core.lock_connection();
         // SAFETY: the live core and connection permit cover this call; see
         // the RecvInstance concurrency inventory.
-        receiver_delay(unsafe { table.NDIlib_recv_get_audio_delay(self.core.instance.0) })
+        receiver_delay(unsafe { table.NDIlib_recv_get_audio_delay(connection.instance()) })
     }
 
     /// Add validated metadata sent immediately and again on each connection.
@@ -1671,13 +1803,13 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_add_connection_metadata")]
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let table = self.core.connection_metadata()?;
-        let _connection = self.core.lock_connection();
+        let connection = self.core.lock_connection();
         let mut registrations = self.core.connection_metadata.lock();
         registrations.add(metadata, |raw| {
             // SAFETY: the locked collection owns this stable descriptor and its
             // text until clear returns or after the native receiver is destroyed.
             // The connection permit provides the RecvInstance control exclusion.
-            unsafe { table.NDIlib_recv_add_connection_metadata(self.core.instance.0, raw) };
+            unsafe { table.NDIlib_recv_add_connection_metadata(connection.instance(), raw) };
         });
         Ok(())
     }
@@ -1691,13 +1823,13 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_clear_connection_metadata")]
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.core.connection_metadata()?;
-        let _connection = self.core.lock_connection();
+        let connection = self.core.lock_connection();
         let mut registrations = self.core.connection_metadata.lock();
         registrations.clear(|| {
             // SAFETY: the receiver and every registered descriptor remain live
             // until the native clear returns under the same registration lock.
             // The connection permit provides the RecvInstance control exclusion.
-            unsafe { table.NDIlib_recv_clear_connection_metadata(self.core.instance.0) };
+            unsafe { table.NDIlib_recv_clear_connection_metadata(connection.instance()) };
         });
         Ok(())
     }
@@ -1716,9 +1848,9 @@ impl<M: ReceiverMode> Receiver<M> {
         // The query comes with the function that releases what it returns.
         let (web_control, strings) = self
             .core
-            ._ndi
+            .ndi()
             .table::<(sys::ReceiverWebControl, sys::ReceiverStrings)>()?;
-        let _connection = self.core.lock_connection();
+        let connection = self.core.lock_connection();
         let guard = RecvStringGuard {
             core: &self.core,
             // SAFETY: the live core and connection permit cover this call; see
@@ -1726,7 +1858,7 @@ impl<M: ReceiverMode> Receiver<M> {
             string: unsafe {
                 web_control
                     .named()
-                    .NDIlib_recv_get_web_control(self.core.instance.0)
+                    .NDIlib_recv_get_web_control(connection.instance())
             },
             strings,
         };
@@ -1774,7 +1906,7 @@ impl<M: ReceiverMode> Receiver<M> {
 
     /// Apply an input already validated on the synchronous or async caller.
     pub(crate) fn connect_target(&self, target: RetainedSource) {
-        self.core.lock_connection().connect(target);
+        self.core.request(ConnectionRequest::Connect(target));
     }
 
     /// Disconnect while retaining the target for [`Self::reconnect`].
@@ -1783,7 +1915,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// does, while captures may continue.
     #[doc(alias = "NDIlib_recv_connect")]
     pub fn disconnect(&self) {
-        self.core.lock_connection().disconnect();
+        self.core.request(ConnectionRequest::Disconnect);
     }
 
     /// Publish this receiver's program and preview tally to its source.
@@ -1793,7 +1925,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// reconnect.
     #[doc(alias = "NDIlib_recv_set_tally")]
     pub fn set_tally(&self, tally: Tally) {
-        let _connection = self.core.lock_connection();
+        let connection = self.core.lock_connection();
         // `Processing.NDI.Recv.h`: the flag is false when nothing is
         // connected, and the state is sent the moment something connects, so
         // it reports no failure.
@@ -1803,7 +1935,7 @@ impl<M: ReceiverMode> Receiver<M> {
         unsafe {
             self.core
                 .sdk()
-                .NDIlib_recv_set_tally(self.core.instance.0, &tally.to_sdk())
+                .NDIlib_recv_set_tally(connection.instance(), &tally.to_sdk())
         };
     }
 
@@ -1819,14 +1951,14 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_send_metadata")]
     pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let raw = metadata.metadata_raw();
-        let _connection = self.core.lock_connection();
+        let connection = self.core.lock_connection();
         // SAFETY: the receiver instance is live for this borrow, and the
         // borrowed C string outlives the synchronous call. The connection permit
         // supplies the control exclusion in the RecvInstance inventory.
         let sent = unsafe {
             self.core
                 .sdk()
-                .NDIlib_recv_send_metadata(self.core.instance.0, &raw)
+                .NDIlib_recv_send_metadata(connection.instance(), &raw)
         };
         // `Processing.NDI.Recv.h`: false means nothing is connected.
         if sent {
@@ -1925,7 +2057,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// [`Self::connection_stats`].
     #[doc(alias = "NDIlib_recv_connect")]
     pub fn reconnect(&self) {
-        self.core.lock_connection().reconnect();
+        self.core.request(ConnectionRequest::Reconnect);
     }
 
     /// An owned snapshot of the latest locally requested connection target.
@@ -1991,7 +2123,7 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_get_performance")]
     #[doc(alias = "NDIlib_recv_get_queue")]
     pub fn connection_stats(&self) -> Result<ConnectionStats> {
-        let _connection = self.core.lock_connection();
+        let connection = self.core.lock_connection();
         let connections = self.core.connections()?;
 
         let mut total = NDIlib_recv_performance_t::default();
@@ -2001,7 +2133,7 @@ impl<M: ReceiverMode> Receiver<M> {
         // the control exclusion in the RecvInstance inventory.
         let performance = unsafe {
             self.core.sdk().named().NDIlib_recv_get_performance(
-                self.core.instance.0,
+                connection.instance(),
                 &mut total,
                 &mut dropped,
             )
@@ -2015,7 +2147,7 @@ impl<M: ReceiverMode> Receiver<M> {
             self.core
                 .sdk()
                 .named()
-                .NDIlib_recv_get_queue(self.core.instance.0, &mut queue)
+                .NDIlib_recv_get_queue(connection.instance(), &mut queue)
         };
 
         Ok(ConnectionStats {
@@ -2068,25 +2200,33 @@ impl<M: EventMode> Receiver<M> {
 }
 
 impl ReceiverCore {
+    pub(crate) fn ndi(&self) -> &Ndi {
+        self.sdk.ndi()
+    }
+
     /// The entry points of the runtime this receiver was created through.
-    pub(crate) fn sdk(&self) -> &'static sys::Core {
-        &self._ndi.api().core
+    pub(crate) fn sdk(&self) -> &sys::Core {
+        &self.sdk
     }
 
-    fn delay(&self) -> Result<&'static sys::ReceiveDelay> {
-        self._ndi.table()
+    fn delay(&self) -> Result<&sys::ReceiveDelay> {
+        self.ndi().table()
     }
 
-    fn connection_metadata(&self) -> Result<&'static sys::ReceiverConnectionMetadata> {
-        self._ndi.table()
+    fn connection_metadata(&self) -> Result<&sys::ReceiverConnectionMetadata> {
+        self.ndi().table()
     }
 
     /// Issue a permit tied to this receiver and its local connection lock.
     pub(crate) fn lock_connection(&self) -> Connection<'_> {
         Connection {
-            core: self,
+            instance: self.instance,
             _exclusive: self.connection_guard.lock(),
         }
+    }
+
+    pub(crate) fn advertiser_membership(&self) -> AdvertiserMembership<'_> {
+        AdvertiserMembership(self)
     }
 
     /// Bind `attempt` to this receiver and its runtime, without taking the
@@ -2115,10 +2255,10 @@ impl ReceiverCore {
     /// notification it returned instead is kept for [`Receiver::next_event`].
     fn poll_ref_until<K: CaptureKind>(&self, attempt: Attempt) -> Result<Retry<K::Ref<'_>>> {
         let lock = self.capture_lock(attempt);
-        let result = capture_raw::<K>(&lock)?;
+        let result = capture_any::<Only<K>>(&lock)?;
         // Classify the result itself, rather than inspecting pending events:
         // another consumer may take a retained event concurrently.
-        let progress = matches!(result, CaptureResult::Notification(n) if n != Notification::None);
+        let progress = matches!(result, Delivered::Notification(n) if n != Notification::None);
         Ok(match self.capture_result::<K>(result)? {
             Some(frame) => Retry::Item(frame),
             None if progress => Retry::Progress,
@@ -2128,15 +2268,15 @@ impl ReceiverCore {
 
     fn capture_result<'rx, K: CaptureKind>(
         &'rx self,
-        result: CaptureResult<'rx, K>,
+        result: Delivered<'rx, Only<K>>,
     ) -> Result<Option<K::Ref<'rx>>> {
         match result {
-            CaptureResult::Frame(guard) => {
+            Delivered::Media(guard) => {
                 // Validation (e.g. FourCC) happens during ref construction.
                 let frame_ref = K::make_ref(guard)?;
                 Ok(Some(frame_ref))
             }
-            CaptureResult::Notification(notification) => {
+            Delivered::Notification(notification) => {
                 self.retain(notification);
                 Ok(None)
             }
@@ -2274,8 +2414,8 @@ impl ReceiverCore {
 
     pub(crate) fn source_name_tables(
         &self,
-    ) -> Result<&'static (sys::ReceiverSourceName, sys::ReceiverStrings)> {
-        self._ndi.table()
+    ) -> Result<&(sys::ReceiverSourceName, sys::ReceiverStrings)> {
+        self.ndi().table()
     }
 
     /// [`Self::wait_for_source_name_change_until`] through the given tables, so
@@ -2291,8 +2431,12 @@ impl ReceiverCore {
             if let Some(change) = self.source_name.lock().pending.take() {
                 return Ok(Some(change));
             }
-            let Some(_query) = self.source_query_guard.try_lock_until(attempt.0.end()) else {
+            let Some(query) = self.source_query_guard.try_lock_until(attempt.0.end()) else {
                 return Ok(None);
+            };
+            let query = SourceQuery {
+                instance: self.instance,
+                _query: query,
             };
             // A worker may have replayed while this poller waited for the permit.
             if let Some(change) = self.source_name.lock().pending.take() {
@@ -2301,11 +2445,11 @@ impl ReceiverCore {
             let mut pointer = ptr::null();
             let remaining = attempt.0.remaining_ms();
             // SAFETY: the receiver is live and `pointer` is writable. The
-            // RecvInstance inventory records the native report mutex; `_query`
+            // RecvInstance inventory records the native report mutex; `query`
             // serializes consumers without excluding connection changes.
             let changed = unsafe {
                 source_name.named().NDIlib_recv_get_source_name(
-                    self.instance.0,
+                    query.instance(),
                     &mut pointer,
                     remaining,
                 )
@@ -2377,7 +2521,7 @@ impl<'rx> CaptureLock<'rx> {
     /// The runtime the receiver was created through, which frees the frames
     /// a capture under this lock delivers.
     pub(crate) fn runtime(&self) -> &'rx Ndi {
-        &self.core._ndi
+        self.core.ndi()
     }
 
     /// The receiver instance a capture under this lock is made on.
@@ -2476,13 +2620,13 @@ impl Ptz<'_> {
     #[must_use]
     #[doc(alias = "NDIlib_recv_ptz_is_supported")]
     pub fn is_supported(&self) -> bool {
-        let _connection = self.core.lock_connection();
+        let connection = self.core.lock_connection();
         // SAFETY: the live core and connection permit cover this call; see
         // the RecvInstance concurrency inventory.
         unsafe {
             self.core
                 .sdk()
-                .NDIlib_recv_ptz_is_supported(self.core.instance.0)
+                .NDIlib_recv_ptz_is_supported(connection.instance())
         }
     }
 
@@ -3136,7 +3280,7 @@ mod tests {
         fn check<K: CaptureKind>(receiver: &Receiver) {
             assert!(receiver
                 .core
-                .capture_result::<K>(CaptureResult::Notification(Notification::SourceChanged))
+                .capture_result::<K>(Delivered::Notification(Notification::SourceChanged))
                 .unwrap()
                 .is_none());
             assert!(matches!(
@@ -3838,6 +3982,113 @@ mod tests {
     }
 
     #[test]
+    fn receiver_permissions_do_not_add_pointer_storage() {
+        assert_eq!(
+            std::mem::size_of::<Connection<'_>>(),
+            2 * std::mem::size_of::<usize>()
+        );
+        for bytes in [
+            std::mem::size_of::<AdvertiserMembership<'_>>(),
+            std::mem::size_of::<attached::Adoption<'_>>(),
+        ] {
+            assert_eq!(bytes, std::mem::size_of::<usize>());
+        }
+        #[cfg(feature = "advanced")]
+        for bytes in [
+            std::mem::size_of::<Exclusive<'_>>(),
+            std::mem::size_of::<AllocatorAccess<'_>>(),
+        ] {
+            assert_eq!(bytes, std::mem::size_of::<usize>());
+        }
+    }
+
+    #[cfg(feature = "advanced")]
+    #[test]
+    fn advertiser_membership_is_independent_of_connection_and_allocator_permissions() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let mut receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        let allocator = receiver.allocator_owner();
+        let core = Arc::clone(&receiver.core);
+        let expected = core.instance.0 as usize;
+        {
+            let exclusive = receiver.exclusive();
+            assert_eq!(exclusive.instance() as usize, expected);
+        }
+        let permission = receiver.core.lock_connection();
+        std::thread::scope(|scope| {
+            let (started, waiting) = std::sync::mpsc::channel();
+            let (done, completed) = std::sync::mpsc::channel();
+            let member = scope.spawn(move || {
+                started.send(()).unwrap();
+                done.send(core.advertiser_membership().instance() as usize)
+                    .unwrap();
+            });
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+            let concurrent = completed.recv_timeout(Duration::from_millis(100));
+            drop(permission);
+            member.join().unwrap();
+            assert_eq!(
+                concurrent.expect("membership waited for the connection permit"),
+                expected
+            );
+        });
+        // These proofs coexist while native allocator state supplies its own lock.
+        let access = allocator.access();
+        let removal = receiver.core.advertiser_membership();
+        assert_eq!(access.instance(), removal.instance());
+    }
+
+    #[cfg(all(feature = "advanced", ndi_has_advanced_receive_allocators))]
+    #[test]
+    fn retiring_an_allocator_policy_releases_receiver_permission_before_user_drop() {
+        use crate::advanced::{AllocationBuffer, AllocatorService};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct ObserveDrop {
+            core: Arc<ReceiverCore>,
+            available: Arc<AtomicBool>,
+        }
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                // An actual advertiser destructor acquires this same permit.
+                // Use try_lock so a regression reports failure without hanging.
+                self.available.store(
+                    self.core.connection_guard.try_lock().is_some(),
+                    Ordering::Release,
+                );
+            }
+        }
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        if !crate::test_support::require_feature(
+            ndi.require_feature(crate::RuntimeFeature::ReceiveAllocators),
+        ) {
+            return;
+        }
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        let available = Arc::new(AtomicBool::new(false));
+        let observer = ObserveDrop {
+            core: Arc::clone(&receiver.core),
+            available: Arc::clone(&available),
+        };
+        let service = AllocatorService::for_test(ndi.process_lifetime());
+        let mut allocated = service.attach(receiver).unwrap();
+        allocated
+            .set_video_allocator(move |request| {
+                let _ = &observer;
+                AllocationBuffer::zeroed(request)
+            })
+            .unwrap();
+        allocated.reset_video_allocator();
+        assert!(
+            available.load(Ordering::Acquire),
+            "policy destructor ran under receiver permission"
+        );
+    }
+
+    #[test]
     fn connection_target_waits_for_neither_captures_nor_queued_connection_changes() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
@@ -3926,7 +4177,7 @@ mod tests {
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         receiver
             .core
-            .capture_result::<VideoKind>(CaptureResult::Notification(Notification::Unknown(987)))
+            .capture_result::<VideoKind>(Delivered::Notification(Notification::Unknown(987)))
             .unwrap();
         let barrier = std::sync::Barrier::new(3);
         std::thread::scope(|scope| {

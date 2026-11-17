@@ -767,7 +767,7 @@ fn metadata_constructors_select_the_capture_family_text_extent() {
             Guard::<SenderMetadataFree>::with_test_free(
                 SenderMetadataInstance {
                     instance: ptr::null_mut(),
-                    metadata,
+                    free: metadata.NDIlib_send_free_metadata,
                 },
                 raw,
                 count_free,

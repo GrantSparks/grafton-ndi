@@ -194,6 +194,48 @@ fn exercise(library: std::path::PathBuf) {
     assert_eq!(captures(), calls);
     assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
 
+    // Single-kind slot sets preserve the native request and leave retained
+    // notifications for event consumers even when media arrives next.
+    for (kind, token, slots) in [
+        (0, "video", "100"),
+        (1, "audio", "010"),
+        (2, "metadata", "001"),
+    ] {
+        script(92 + kind, &format!("source,{token}"));
+        let typed_capture = || match kind {
+            0 => receiver
+                .capture_video_ref(Duration::ZERO)
+                .map(|frame| frame.is_some()),
+            1 => receiver
+                .capture_audio_ref(Duration::ZERO)
+                .map(|frame| frame.is_some()),
+            _ => receiver
+                .capture_metadata_ref(Duration::ZERO)
+                .map(|frame| frame.is_some()),
+        };
+        assert!(!typed_capture().unwrap());
+        assert!(log()
+            .lines()
+            .last()
+            .unwrap()
+            .ends_with(&format!(":{slots}:0")));
+        let before = frees(token);
+        assert!(typed_capture().unwrap());
+        assert_eq!(frees(token), before + 1);
+        assert!(log()
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("capture:"))
+            .unwrap()
+            .ends_with(&format!(":{slots}:0")));
+        let calls = captures();
+        assert_eq!(
+            receiver.next_event(Duration::ZERO).unwrap(),
+            Some(ReceiverEvent::SourceChanged)
+        );
+        assert_eq!(captures(), calls);
+    }
+
     for (serial, token, family) in [
         (3, "bad-video", "video"),
         (4, "bad-audio", "audio"),

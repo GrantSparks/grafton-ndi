@@ -128,7 +128,7 @@ unsafe impl Send for RoutingInstance {}
 /// because the router is `Send`.
 pub struct Router {
     instance: RoutingInstance,
-    routing: &'static sys::Routing,
+    routing: crate::runtime::Bound<sys::Routing>,
     _name: CString,
     _groups: Option<CString>,
     // The SDK may retain both an effective route and its last refused request.
@@ -144,7 +144,6 @@ pub struct Router {
     pub(crate) connection_metadata: crate::connection_metadata::ConnectionMetadata,
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
-    _ndi: Ndi,
 }
 
 const _: () = {
@@ -205,18 +204,18 @@ impl Router {
         options: &RouterOptions,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
-            &'static sys::Routing,
+            &sys::Routing,
             &NDIlib_routing_create_t,
         ) -> sys::table::Called<NDIlib_routing_instance_t>,
     ) -> Result<Self> {
         // A router with a configuration gets here only once its own
         // capability, which requires routing, has been allowed, so it is
         // never refused for `Routing`.
-        let routing = ndi.table::<sys::Routing>()?;
+        let routing = ndi.bind::<sys::Routing>()?;
         let name = CString::new(options.name.as_str())?;
         let groups = crate::finder::list_cstring(options.groups.as_deref(), "groups")?;
         let instance = create(
-            routing,
+            &routing,
             &NDIlib_routing_create_t {
                 p_ndi_name: name.as_ptr(),
                 p_groups: groups.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
@@ -234,7 +233,6 @@ impl Router {
             connection_metadata: crate::connection_metadata::ConnectionMetadata::default(),
             #[cfg(feature = "advanced")]
             _config: config,
-            _ndi: ndi.clone(),
         })
     }
 
@@ -247,7 +245,7 @@ impl Router {
     /// The runtime this router was created through.
     #[cfg(feature = "advanced")]
     pub(crate) fn runtime(&self) -> &Ndi {
-        &self._ndi
+        self.routing.ndi()
     }
 
     /// Route connected and future receivers to `source`.

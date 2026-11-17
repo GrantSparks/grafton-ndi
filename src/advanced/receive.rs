@@ -267,7 +267,7 @@ impl PacketReceiver {
                 ndi,
                 &options,
                 &config,
-                |table: &'static ReceiverConfiguration, _settings, _text| native!(ReceiverConfiguration, table => table.named().NDIlib_recv_create_v4(_settings, _text)),
+                |table: &ReceiverConfiguration, _settings, _text| native!(ReceiverConfiguration, table => table.named().NDIlib_recv_create_v4(_settings, _text)),
             )
         }?;
         Ok(Self::from_receiver(receiver))

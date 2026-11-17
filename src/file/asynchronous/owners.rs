@@ -174,16 +174,14 @@ impl RecorderOwner {
 
     fn settle_at(
         &mut self,
-        drained: bool,
         events: &EventQueue<RecorderEvent>,
         control: &Control<RecordingReport>,
         cleanup_expired: bool,
         at: Instant,
-    ) -> bool {
+    ) {
         self.waiters.settle_at(
             &mut self.recorder,
             Settlement {
-                drained,
                 cleanup_expired,
                 at,
             },
@@ -243,11 +241,10 @@ impl Owner for RecorderOwner {
 
     fn after_events(
         &mut self,
-        drained: bool,
         events: &EventQueue<Self::Event>,
         control: &Control<RecordingReport>,
     ) {
-        self.settle_at(drained, events, control, false, Instant::now());
+        self.settle_at(events, control, false, Instant::now());
     }
 
     fn wait_timeout(&self) -> Duration {
@@ -273,7 +270,7 @@ impl Owner for RecorderOwner {
         let notify =
             self.waiters.notifies_cleanup() || queued.iter().any(|job| job.finish().is_some());
         if !notify {
-            events.close(EventEnd::Stopped);
+            events.close(OwnerExit::Closed);
         }
         self.recorder.drain_cleanup(
             requested,
@@ -486,7 +483,7 @@ mod tests {
             let (_, allocations) = crate::test_alloc::allocation_count(|| {
                 for _ in 0..100 {
                     assert!(owner.poll_native().unwrap().is_none());
-                    owner.after_events(true, &events, &control);
+                    owner.after_events(&events, &control);
                 }
             });
             assert_eq!(allocations, 0);
@@ -524,7 +521,7 @@ mod tests {
             device.dropped_queries.store(0, Ordering::Release);
             for _ in 0..100 {
                 assert!(owner.poll_native().unwrap().is_none());
-                owner.after_events(true, &events, &control);
+                owner.after_events(&events, &control);
             }
             assert_eq!(device.captures.load(Ordering::Acquire) - before, 100);
             assert_eq!(device.recording_queries.load(Ordering::Acquire), 100);
@@ -714,7 +711,6 @@ mod tests {
             finish_response(reply),
         );
         owner.settle_at(
-            false,
             &EventQueue::new(16),
             &Control::<RecordingReport>::with_outcome(),
             false,
@@ -807,7 +803,7 @@ mod tests {
             .as_mut()
             .poll(&mut Context::from_waker(&waker))
             .is_pending());
-        owner.after_events(true, &events, &control);
+        owner.after_events(&events, &control);
         assert!(control.shutdown_requested());
         assert!(matches!(
             block_on(finishing).unwrap(),
@@ -833,7 +829,6 @@ mod tests {
             ))
             .unwrap();
         owner.settle_at(
-            false,
             &EventQueue::new(16),
             &Control::<RecordingReport>::with_outcome(),
             false,
@@ -859,7 +854,6 @@ mod tests {
             ))
             .is_err());
         owner.settle_at(
-            false,
             &EventQueue::new(16),
             &Control::<RecordingReport>::with_outcome(),
             false,
@@ -869,7 +863,6 @@ mod tests {
         device.close();
         while owner.poll_native().unwrap().is_some() {}
         owner.settle_at(
-            true,
             &EventQueue::new(16),
             &Control::<RecordingReport>::with_outcome(),
             false,
@@ -890,7 +883,6 @@ mod tests {
         // Advance the settlement clock past the earlier empty poll. The
         // closure was queued in between, before this wait's logical expiry.
         owner.settle_at(
-            true,
             &EventQueue::new(16),
             &Control::<RecordingReport>::with_outcome(),
             false,
@@ -936,7 +928,7 @@ mod tests {
         owner.register_finish(later_deadline, false, finish_response(reply));
         let events = EventQueue::new(16);
         let control = Control::<RecordingReport>::with_outcome();
-        owner.settle_at(false, &events, &control, false, at);
+        owner.settle_at(&events, &control, false, at);
         assert!(matches!(
             block_on(first).unwrap(),
             FinishStatus::TimedOut(_)
@@ -947,7 +939,7 @@ mod tests {
         );
         // Simulate the first reply's callback taking the owner past the
         // later deadline. Its queued closure needs a new native drain.
-        owner.settle_at(true, &events, &control, false, later_deadline.end());
+        owner.settle_at(&events, &control, false, later_deadline.end());
         assert!(matches!(block_on(later).unwrap(), FinishStatus::Closed(_)));
         owner.recorder.abandon();
     }

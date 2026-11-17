@@ -266,7 +266,7 @@ fn events_and_closure_during_waker_cloning_are_observed_by_the_same_poll() {
             let events = weak.upgrade().unwrap();
             assert!(events.0.try_lock().is_ok());
             if close {
-                events.close(EventEnd::Stopped);
+                events.close(OwnerExit::Closed);
             } else {
                 events.push(Ok(7));
             }
@@ -348,7 +348,7 @@ fn expiration_and_close_wake_without_cloning_and_pending_polls_rearm() {
     assert_eq!(probe.wakes.load(Ordering::Relaxed), 1);
     assert!(poll(&mut future, &waker).is_pending());
     assert_eq!(probe.clones.load(Ordering::Relaxed), 2);
-    events.close(EventEnd::Stopped);
+    events.close(OwnerExit::Closed);
     assert_eq!(probe.wakes.load(Ordering::Relaxed), 2);
     assert_eq!(probe.clones.load(Ordering::Relaxed), 2);
     assert!(matches!(

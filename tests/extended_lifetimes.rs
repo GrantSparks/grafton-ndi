@@ -146,6 +146,7 @@ fn native_resource_ownership() {
             "queue_destroy",
             "queue_close",
             "queue_registered_sender",
+            "queue_sender_conversion",
         ]);
     }
     let mut explained = false;
@@ -1260,21 +1261,60 @@ fn child(case: &str) {
         #[cfg(feature = "advanced")]
         "queue_registered_sender" => {
             use grafton_ndi::advanced::{QueueLimits, QueuedSender};
-            let sender = sender(&ndi);
+            let mut sender = sender(&ndi);
+            let original = frame();
+            let pixels = original.data().as_ptr();
+            assert!(sender.submit_video(original).unwrap().is_none());
             let mut advertiser = SendAdvertiser::new(&ndi, &server()).unwrap();
             let registration = advertiser
                 .register(&sender, &SendAdvertisement::default())
                 .unwrap();
             // A registered sender cannot become a queue: it comes back as it was.
-            let sender = QueuedSender::from_sender(sender, &QueueLimits::default())
+            let mut sender = QueuedSender::from_sender(sender, &QueueLimits::default())
                 .expect_err("a registered sender is refused")
                 .into_inner();
-            sender.send_video(&frame()).unwrap();
-            drop(sender);
-            assert!(!log().contains("sender-destroy\n"));
+            assert!(!log().contains("sender-flush\n"));
+            assert_eq!(log().matches("sender-submit\n").count(), 1);
+            // The refusal did not reclaim or replace the original native loan.
+            assert_eq!(sender.reclaim_video().unwrap().data().as_ptr(), pixels);
+            assert!(sender.reclaim_video().is_none());
+            let retained = frame();
+            let retained_pixels = retained.data().as_ptr();
+            assert!(sender.submit_video(retained).unwrap().is_none());
             advertiser.unregister(registration).unwrap();
+            let (queue, earlier) =
+                QueuedSender::from_sender(sender, &QueueLimits::default()).unwrap();
+            assert_eq!(earlier.unwrap().data().as_ptr(), retained_pixels);
+            assert_eq!(log().matches("sender-flush\n").count(), 2);
+            drop(queue);
             drop(advertiser);
             assert_eq!(log().matches("sender-destroy\n").count(), 1);
+        }
+        #[cfg(feature = "advanced")]
+        "queue_sender_conversion" => {
+            use grafton_ndi::advanced::{QueueLimits, QueuedSender, QueuedVideoFrame};
+            let mut sender = sender(&ndi);
+            let original = frame();
+            let pixels = original.data().as_ptr();
+            assert!(sender.submit_video(original).unwrap().is_none());
+            let (mut queue, earlier) =
+                QueuedSender::from_sender(sender, &QueueLimits::default()).unwrap();
+            let earlier = earlier.unwrap();
+            assert_eq!(earlier.data().as_ptr(), pixels);
+            assert_eq!(log().matches("sender-flush\n").count(), 1);
+            assert!(!log().contains("sender-destroy\n"));
+            queue.try_submit(earlier).unwrap();
+            let events = log();
+            assert!(position(&events, "sender-flush") < events.rfind("sender-submit\n").unwrap());
+            let completed = queue.close();
+            assert_eq!(completed.len(), 1);
+            let QueuedVideoFrame::Pixels(recovered) = completed[0].frame() else {
+                panic!("the recovered frame changed type")
+            };
+            assert_eq!(recovered.data().as_ptr(), pixels);
+            let events = log();
+            assert_eq!(events.matches("sender-flush\n").count(), 1);
+            assert_eq!(events.matches("sender-destroy\n").count(), 1);
         }
         _ => panic!("unknown fixture scenario"),
     }

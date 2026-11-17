@@ -230,8 +230,7 @@ impl InterleavedAudioF32<'_> {
 /// take caller-owned output storage for reuse. For a runtime-free floating-point
 /// conversion, use [`AudioFrame::from_interleaved`].
 pub struct AudioConverter {
-    _ndi: Ndi,
-    audio: &'static sys::InterleavedAudio,
+    audio: crate::runtime::Bound<sys::InterleavedAudio>,
 }
 
 macro_rules! conversions {
@@ -295,7 +294,7 @@ macro_rules! conversions {
 impl std::fmt::Debug for AudioConverter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AudioConverter")
-            .field("runtime", self._ndi.info())
+            .field("runtime", self.audio.ndi().info())
             .finish_non_exhaustive()
     }
 }
@@ -308,10 +307,7 @@ impl AudioConverter {
     /// Returns [`Error::UnsupportedCapability`] when the runtime does not
     /// provide the complete native audio-conversion group.
     pub fn new(ndi: &Ndi) -> Result<Self> {
-        Ok(Self {
-            audio: ndi.table()?,
-            _ndi: ndi.clone(),
-        })
+        Ok(Self { audio: ndi.bind()? })
     }
 
     conversions!(
@@ -752,8 +748,7 @@ mod tests {
             NDIlib_util_audio_from_interleaved_32f_v3: from_f32,
         };
         let converter = AudioConverter {
-            _ndi: ndi,
-            audio: &TABLE,
+            audio: crate::runtime::Bound::for_test(ndi, &TABLE),
         };
         let mut frame = AudioFrame::builder()
             .sample_rate(48_000)

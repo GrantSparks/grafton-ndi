@@ -1280,3 +1280,397 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
     });
     loans.balanced(&ndi);
 }
+
+/// Membership add/remove owns an independent receiver reference. Churn its
+/// entire lifecycle while captures, connection requests and controls run.
+#[cfg(all(target_os = "linux", not(ndi_link_static)))]
+#[test]
+fn advertiser_membership_changes_overlap_capture_connect_and_controls() {
+    use grafton_ndi::{
+        discovery_server::{AdvertiserOptions, RecvAdvertisement, RecvAdvertiser},
+        RuntimeFeature,
+    };
+    let Some(ndi) = common::ndi() else { return };
+    if let Err(error) = ndi.require_feature(RuntimeFeature::ReceiverAdvertising) {
+        common::skip(common::Requirement::DiscoveryServer, &error.to_string());
+        return;
+    }
+    let Some(binary) = common::discovery_server::server_binary(&ndi) else {
+        common::skip(
+            common::Requirement::DiscoveryServer,
+            "no vendor Discovery Server",
+        );
+        return;
+    };
+    let _turn = sockets();
+    let server = common::discovery_server::Server::start(&binary);
+    let options = AdvertiserOptions::new().servers([server.endpoint()]);
+    let peers = Peers::new(&ndi);
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(peers.sources[0].clone())).unwrap();
+    let loans = Loans::default();
+    let memberships = AtomicU64::new(0);
+    peers.run(|stopped| {
+        thread::scope(|captures| {
+            let _stop = Stop(stopped);
+            let receiver = &receiver;
+            captures.spawn(|| {
+                while !stopped.load(Ordering::Acquire) {
+                    match captured(timed("membership capture", SLICE, || {
+                        receiver.capture_any_ref(SLICE)
+                    })) {
+                        Some(ReceiverItemRef::Video(frame)) => loans.video(frame, &peers),
+                        Some(ReceiverItemRef::Audio(frame)) => loans.audio(frame),
+                        Some(ReceiverItemRef::Metadata(frame)) => loans.check(frame, |_| {}),
+                        _ => {}
+                    }
+                }
+            });
+            progress(receiver);
+            loans.wait_for_media(&ndi);
+            let loading = AtomicBool::new(true);
+            thread::scope(|load| {
+                load.spawn(|| {
+                    while loading.load(Ordering::Acquire) {
+                        let mut advertiser = RecvAdvertiser::new(&ndi, &options).unwrap();
+                        let advertisement = RecvAdvertisement::new()
+                            .allow_controlling(true)
+                            .allow_monitoring(true);
+                        let registration = timed("membership add", Duration::ZERO, || {
+                            advertiser.register(receiver, &advertisement)
+                        })
+                        .unwrap();
+                        timed("membership remove", Duration::ZERO, || {
+                            advertiser.unregister(registration)
+                        })
+                        .unwrap();
+                        advertiser.register(receiver, &advertisement).unwrap();
+                        // Removes the second registration through advertiser Drop.
+                        timed("membership drop", Duration::ZERO, || drop(advertiser));
+                        memberships.fetch_add(1, Ordering::Relaxed);
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                });
+                for kind in 0..3 {
+                    let loading = &loading;
+                    load.spawn(move || {
+                        let mut round = 0;
+                        while loading.load(Ordering::Acquire) {
+                            timed("membership shared controls", Duration::ZERO, || {
+                                shared_controls(receiver, kind, round)
+                            });
+                            round += 1;
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                    });
+                }
+                load.spawn(|| {
+                    while loading.load(Ordering::Acquire) {
+                        for source in &peers.sources {
+                            timed("membership connect", Duration::ZERO, || {
+                                receiver.connect_to(source)
+                            });
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        receiver.disconnect();
+                        receiver.reconnect();
+                    }
+                });
+                thread::sleep(duration());
+                loading.store(false, Ordering::Release);
+            });
+            let before = receiver.connection_stats().unwrap().video_frames_received();
+            receiver.connect_to(&peers.sources[0]);
+            progress_after_in(receiver, before, "convergence after membership churn");
+        });
+    });
+    loans.balanced(&ndi);
+    assert!(memberships.load(Ordering::Relaxed) > 0);
+    eprintln!(
+        "completed {} advertiser lifecycle rounds on {:?}",
+        memberships.load(Ordering::Relaxed),
+        ndi.info()
+    );
+
+    // A prior registration can be removed on another thread during mutable
+    // stream controls and KVM. Its independent Arc defeats &mut-only exclusion.
+    #[cfg(feature = "advanced")]
+    {
+        let mut receiver = receiver;
+        let mut advertiser = RecvAdvertiser::new(&ndi, &options).unwrap();
+        advertiser
+            .register(&receiver, &RecvAdvertisement::new())
+            .unwrap();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                thread::sleep(Duration::from_millis(1));
+                drop(advertiser);
+            });
+            for _ in 0..16 {
+                if ndi
+                    .require_feature(RuntimeFeature::ReceiverStreamTier)
+                    .is_ok()
+                {
+                    control_result(receiver.set_stream_tier(grafton_ndi::StreamTier::Program));
+                }
+                if ndi
+                    .require_feature(RuntimeFeature::ReceiverStreamSelection)
+                    .is_ok()
+                {
+                    control_result(receiver.set_streams(grafton_ndi::MediaTypes::ALL));
+                }
+            }
+        });
+        if ndi.require_feature(RuntimeFeature::Kvm).is_ok() {
+            let mut advertiser = RecvAdvertiser::new(&ndi, &options).unwrap();
+            advertiser
+                .register(&receiver, &RecvAdvertisement::new())
+                .unwrap();
+            kvm_overlap(&mut receiver, &peers, &ndi, move |_| {
+                thread::sleep(Duration::from_millis(50));
+                drop(advertiser);
+            });
+        }
+    }
+}
+
+/// Native connection changes can join the decoder thread running a policy, and
+/// allocator reset waits on its native read lock. That policy must still be
+/// able to add or remove membership through the independent observer registry.
+#[cfg(all(feature = "advanced", target_os = "linux", not(ndi_link_static)))]
+#[test]
+fn receiver_mutation_allows_membership_changes_from_active_allocator_policies() {
+    use grafton_ndi::{
+        advanced::{AllocatedReceiver, AllocationBuffer, AllocatorLimits, AllocatorService},
+        discovery_server::{AdvertiserOptions, RecvAdvertisement, RecvAdvertiser},
+        RuntimeFeature,
+    };
+    use std::{
+        process::{Command, Stdio},
+        sync::{mpsc, Arc, OnceLock, Weak},
+    };
+    let Some(ndi) = common::ndi() else { return };
+    for (feature, requirement) in [
+        (
+            RuntimeFeature::ReceiveAllocators,
+            common::Requirement::Advanced,
+        ),
+        (
+            RuntimeFeature::ReceiverAdvertising,
+            common::Requirement::DiscoveryServer,
+        ),
+    ] {
+        if let Err(error) = ndi.require_feature(feature) {
+            common::skip(requirement, &error.to_string());
+            return;
+        }
+    }
+    let _turn = sockets();
+    if std::env::var_os("GRAFTON_NDI_ALLOCATOR_MEMBERSHIP_CHILD").is_none() {
+        for (operation, action) in [
+            ("reset", "remove"),
+            ("reconnect", "remove"),
+            ("disconnect", "remove"),
+            ("reconnect", "add"),
+            ("disconnect", "add"),
+        ] {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "receiver_mutation_allows_membership_changes_from_active_allocator_policies",
+                    "--nocapture",
+                ])
+                .env("GRAFTON_NDI_ALLOCATOR_MEMBERSHIP_CHILD", "1")
+                .env("GRAFTON_NDI_MEMBERSHIP_ACTION", action)
+                .env("GRAFTON_NDI_NATIVE_OPERATION", operation)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(45);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "{operation}/{action} did not complete:\n{}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{operation}/{action} subprocess failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+    let operation = std::env::var("GRAFTON_NDI_NATIVE_OPERATION").unwrap();
+    let adding = std::env::var("GRAFTON_NDI_MEMBERSHIP_ACTION").unwrap() == "add";
+    let Some(binary) = common::discovery_server::server_binary(&ndi) else {
+        common::skip(
+            common::Requirement::DiscoveryServer,
+            "no vendor Discovery Server",
+        );
+        return;
+    };
+    let server = common::discovery_server::Server::start(&binary);
+    let sender = Sender::new(
+        &ndi,
+        &SenderOptions::new(common::unique_name("allocator membership"))
+            .clock_video(false)
+            .clock_audio(false),
+    )
+    .unwrap();
+    let source = common::loopback_source(&ndi, &sender).unwrap();
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source)).unwrap();
+    let mut advertiser =
+        RecvAdvertiser::new(&ndi, &AdvertiserOptions::new().servers([server.endpoint()])).unwrap();
+    if !adding {
+        advertiser
+            .register(&receiver, &RecvAdvertisement::new())
+            .unwrap();
+    }
+    let advertiser = Mutex::new(Some(advertiser));
+    let entered = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+    let policy_finished = Arc::new(AtomicBool::new(false));
+    let shared_owner = Arc::new(OnceLock::<Weak<AllocatedReceiver>>::new());
+    let stopped = AtomicBool::new(false);
+    let service =
+        AllocatorService::new(ndi.process_lifetime(), &AllocatorLimits::default()).unwrap();
+    let mut allocated = service.attach(receiver).unwrap();
+    {
+        let (entered, released, policy_finished, shared_owner) = (
+            Arc::clone(&entered),
+            Arc::clone(&released),
+            Arc::clone(&policy_finished),
+            Arc::clone(&shared_owner),
+        );
+        allocated
+            .set_video_allocator(move |request| {
+                if !entered.swap(true, Ordering::AcqRel) {
+                    eprintln!("allocator policy entered");
+                    while !released.load(Ordering::Acquire) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    eprintln!("allocator policy changing membership");
+                    let mut advertiser = advertiser.lock().unwrap().take().unwrap();
+                    if adding {
+                        // Safe shared access can be published after policy setup:
+                        // the callback needs no mutable owner or application mutex.
+                        let owner = shared_owner.get().unwrap().upgrade().unwrap();
+                        advertiser
+                            .register(owner.receiver(), &RecvAdvertisement::new())
+                            .unwrap();
+                    }
+                    drop(advertiser);
+                    eprintln!("allocator policy changed membership");
+                    policy_finished.store(true, Ordering::Release);
+                }
+                AllocationBuffer::zeroed(request)
+            })
+            .unwrap();
+    }
+    enum Owner {
+        Exclusive(AllocatedReceiver),
+        Shared(Arc<AllocatedReceiver>),
+    }
+    let owner = if operation == "reset" {
+        Owner::Exclusive(allocated)
+    } else {
+        let owner = Arc::new(allocated);
+        shared_owner.set(Arc::downgrade(&owner)).unwrap();
+        Owner::Shared(owner)
+    };
+    thread::scope(|scope| {
+        let _stop = Stop(&stopped);
+        scope.spawn(|| {
+            let frame = VideoFrame::builder()
+                .resolution(64, 64)
+                .data(vec![1; 64 * 64 * 4])
+                .build()
+                .unwrap();
+            while !stopped.load(Ordering::Acquire) {
+                sender.send_video(&frame).unwrap();
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let receiver = match &owner {
+            Owner::Exclusive(owner) => owner.receiver(),
+            Owner::Shared(owner) => owner.receiver(),
+        };
+        let deadline = Instant::now() + PATIENCE;
+        while !entered.load(Ordering::Acquire) {
+            drop(receiver.capture_video_ref(Duration::ZERO));
+            assert!(
+                Instant::now() < deadline,
+                "the allocator policy never started"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Capture has returned while a native background policy remains live.
+        let (started, waiting) = mpsc::channel();
+        let (done, completed) = mpsc::channel();
+        let finished = Arc::clone(&policy_finished);
+        let resetting = operation == "reset";
+        scope.spawn(move || {
+            let mut owner = owner;
+            started.send(()).unwrap();
+            match &mut owner {
+                Owner::Exclusive(owner) => owner.reset_video_allocator(),
+                Owner::Shared(owner) if operation == "reconnect" => owner.receiver().reconnect(),
+                Owner::Shared(owner) => owner.receiver().disconnect(),
+            }
+            done.send(()).unwrap();
+            // Retain the owner until the callback has changed membership, so
+            // allocator cleanup on Drop cannot confound the operation's result.
+            while !finished.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        waiting.recv_timeout(PATIENCE).unwrap();
+        let premature = completed.recv_timeout(Duration::from_millis(100));
+        released.store(true, Ordering::Release);
+        if premature.is_err() {
+            completed
+                .recv_timeout(PATIENCE)
+                .expect("native operation did not complete after the policy returned");
+        }
+        if resetting {
+            assert!(
+                premature.is_err(),
+                "reset bypassed the still-running native policy"
+            );
+        }
+        let deadline = Instant::now() + PATIENCE;
+        while !policy_finished.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "policy could not change membership"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        stopped.store(true, Ordering::Release);
+    });
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let usage = service.usage();
+        if usage.generations() == 0
+            && usage.retained_allocations() == 0
+            && usage.in_progress_allocations() == 0
+            && usage.in_progress_reclamations() == 0
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "allocator grants/frees did not balance: {usage:?}"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}

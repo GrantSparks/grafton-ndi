@@ -37,7 +37,7 @@ use crate::{
 type Resolved<T> = std::result::Result<T, &'static CStr>;
 
 /// The table of one family of File entry points.
-pub(crate) trait FileTable: Sized + 'static {
+pub(crate) trait FileTable: crate::runtime::BoundTable + Sized + 'static {
     /// The family the table holds, under which it is gated and reported.
     const FAMILY: FileFamily;
 

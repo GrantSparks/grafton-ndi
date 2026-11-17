@@ -24,6 +24,7 @@ impl Router {
     ) -> Result<()> {
         let table = self.runtime().table::<RouterConnectionMetadata>()?;
         native!(RouterConnectionMetadata, table, uses(metadata) => {
+            let table = *table;
             let router = self.native_instance();
             self.connection_metadata.add(metadata, |metadata| {
                 // SAFETY: the router owns this stable descriptor and its text
@@ -44,6 +45,7 @@ impl Router {
     pub fn clear_connection_metadata(&mut self) -> Result<()> {
         let table = self.runtime().table::<RouterConnectionMetadata>()?;
         native!(RouterConnectionMetadata, table => {
+            let table = *table;
             let router = self.native_instance();
             self.connection_metadata.clear(|| {
                 // SAFETY: the router and its registrations remain live until

@@ -35,7 +35,7 @@ pub(crate) use super::advanced_bindings::NDIlib_genlock_instance_t as GenlockHan
 macro_rules! native {
     ($Family:ident, $table:expr, uses($($binding:ident),* $(,)?) => $body:expr) => {
         $crate::sys::advanced::declared! { $Family {{
-            let _: &'static $crate::sys::advanced::$Family = $table;
+            let _: &$crate::sys::advanced::$Family = &$table;
             $body
         }} else {{
             let _ = ($(&$binding,)*);
@@ -44,7 +44,7 @@ macro_rules! native {
     };
     ($Family:ident, $table:expr => $body:expr) => {
         $crate::sys::advanced::declared! { $Family {{
-            let _: &'static $crate::sys::advanced::$Family = $table;
+            let _: &$crate::sys::advanced::$Family = &$table;
             $body
         }} else { match *$table {} }}
     };

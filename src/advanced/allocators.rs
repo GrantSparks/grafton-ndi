@@ -23,14 +23,13 @@ use super::{
     invalid_input, PacketAttached, PacketItem, PacketItemRef, PacketReceiver, ReceiverControls,
 };
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-use super::{AudioCodec, VideoCodec};
+use super::{packets::PacketLen, AudioCodec, VideoCodec};
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use crate::sys::bindings::*;
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use crate::AudioFormat;
 use crate::{
     frames::{ValidatedAudioLayout, ValidatedVideoLayout},
-    receiver::ReceiverCore,
     runtime::ProcessLifetimeRuntime,
     sys::advanced::ReceiveAllocators,
     FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode, Rejected, Result,
@@ -40,7 +39,7 @@ use std::ffi::c_void;
 
 const MIB: usize = 1024 * 1024;
 
-const MAX_ALLOCATION: usize = 256 * MIB;
+const MAX_ALLOCATION: usize = super::packets::MAX_PACKET_BYTES;
 
 /// Process-wide limits on custom receive allocation.
 ///
@@ -1211,6 +1210,16 @@ impl AllocatorService {
         Ok(Self { runtime, registry })
     }
 
+    /// Native setter fixtures share whichever limits the process callback
+    /// fixture established first; neither fixture needs a particular limit.
+    #[cfg(all(test, ndi_has_advanced_receive_allocators))]
+    pub(crate) fn for_test(runtime: ProcessLifetimeRuntime) -> Self {
+        Self {
+            runtime,
+            registry: REGISTRY.get_or_init(|| Registry::new(AllocatorLimits::default()).unwrap()),
+        }
+    }
+
     /// A consistent snapshot of retained storage, active calls and decline
     /// counters across the process. Counter updates allocate no storage and
     /// run under the same lock that accounts for retained allocations.
@@ -1248,18 +1257,20 @@ impl AllocatorService {
     /// Take `receiver`, in any mode, with no allocator of its own set yet.
     fn allocation<M: ReceiverMode>(
         self,
-        receiver: Receiver<M>,
+        mut receiver: Receiver<M>,
     ) -> std::result::Result<AllocatedReceiver<M>, Rejected<Receiver<M>>> {
-        match self.runtime.ndi().table::<ReceiveAllocators>() {
+        let owner = AllocatorOwner {
+            authority: receiver.allocator_owner(),
+            service: self,
+        };
+        match crate::runtime::Bound::<ReceiveAllocators, _>::with_owner(owner) {
             Ok(table) => Ok(AllocatedReceiver {
                 registration: Registration {
-                    core: receiver.core.clone(),
                     table,
                     #[cfg(ndi_has_advanced_receive_allocators)]
                     video_token: None,
                     #[cfg(ndi_has_advanced_receive_allocators)]
                     audio_token: None,
-                    service: self,
                 },
                 receiver,
             }),
@@ -1404,7 +1415,13 @@ impl<M: ReceiverMode> AllocatedReceiver<M> {
         stream: Stream,
         policy: P,
     ) -> std::result::Result<(), Rejected<P>> {
-        let token = self.registration.service.registry.register(policy)?;
+        let token = self
+            .registration
+            .table
+            .owner()
+            .service
+            .registry
+            .register(policy)?;
         self.registration.install(stream, Some(token));
         Ok(())
     }
@@ -1460,9 +1477,8 @@ impl AllocatedReceiver<PacketAttached> {
     }
 }
 
-/// Owns the exact receiver and runtime needed to uninstall both callback pairs.
-/// Its own Drop keeps reset before native destruction independent of field order.
-struct Registration {
+/// The receiver authority and permanent service retained by the native capability.
+struct AllocatorOwner {
     #[cfg_attr(
         not(ndi_has_advanced_receive_allocators),
         expect(
@@ -1470,44 +1486,62 @@ struct Registration {
             reason = "the uninhabited table prevents registrations without declarations"
         )
     )]
-    core: Arc<ReceiverCore>,
-    table: &'static ReceiveAllocators,
+    authority: crate::receiver::AllocatorOwner,
+    service: AllocatorService,
+}
+
+impl crate::runtime::LiveOwner for AllocatorOwner {
+    fn ndi(&self) -> &crate::Ndi {
+        self.service.runtime.ndi()
+    }
+}
+
+/// Owns the exact receiver and runtime needed to uninstall both callback pairs.
+/// Its own Drop keeps reset before native destruction independent of field order.
+struct Registration {
+    table: crate::runtime::Bound<ReceiveAllocators, AllocatorOwner>,
     #[cfg(ndi_has_advanced_receive_allocators)]
     video_token: Option<usize>,
     #[cfg(ndi_has_advanced_receive_allocators)]
     audio_token: Option<usize>,
-    service: AllocatorService,
 }
 impl Registration {
     /// Register generation `token` (or the SDK's own allocator) for `stream`
     /// and retire the generation it replaces.
     #[cfg(ndi_has_advanced_receive_allocators)]
     fn install(&mut self, stream: Stream, token: Option<usize>) {
-        let instance = self.core.instance.0;
-        let table = self.table;
+        let table = &self.table;
         let slot = match stream {
             Stream::Video => &mut self.video_token,
             Stream::Audio => &mut self.audio_token,
         };
         let opaque = token.map_or(std::ptr::null_mut(), |token| token as *mut c_void);
-        // SAFETY: the registration owns the original receiver core, so that native
-        // instance stays live through installation and reset. The callbacks are functions of this
-        // program, which stays loaded, and the opaque value is a token they
-        // look up, never a pointer they follow.
-        install_with(self.service.registry, slot, token, || unsafe {
-            match stream {
-                Stream::Video => table.NDIlib_recv_set_video_allocator(
-                    instance,
-                    opaque,
-                    token.map(|_| video_allocate as _),
-                    token.map(|_| video_free as _),
-                ),
-                Stream::Audio => table.NDIlib_recv_set_audio_allocator(
-                    instance,
-                    opaque,
-                    token.map(|_| audio_allocate as _),
-                    token.map(|_| audio_free as _),
-                ),
+        // SAFETY: the registration retains exclusive allocator authority and
+        // borrows its separately locked native allocator state. The callbacks
+        // belong to this program; their opaque tokens are looked up, never followed.
+        install_with(table.owner().service.registry, slot, token, || {
+            // The owned proof keeps the receiver live. The native allocator
+            // rwlock excludes callback-state replacement. Keep unrelated Rust
+            // gates outside this wait for arbitrary native policy callbacks.
+            let access = table.owner().authority.access();
+            let instance = access.instance();
+            // SAFETY: exclusive allocator authority and callback storage are
+            // retained through this setter, as described above.
+            unsafe {
+                match stream {
+                    Stream::Video => table.NDIlib_recv_set_video_allocator(
+                        instance,
+                        opaque,
+                        token.map(|_| video_allocate as _),
+                        token.map(|_| video_free as _),
+                    ),
+                    Stream::Audio => table.NDIlib_recv_set_audio_allocator(
+                        instance,
+                        opaque,
+                        token.map(|_| audio_allocate as _),
+                        token.map(|_| audio_free as _),
+                    ),
+                }
             }
         });
     }
@@ -1545,11 +1579,8 @@ fn install_with(
 
 /// A compressed frame's size, which the SDK passes in the stride union.
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-fn compressed_size(size: i32) -> std::result::Result<usize, AllocationDecline> {
-    usize::try_from(size)
-        .ok()
-        .filter(|size| (1..=MAX_ALLOCATION).contains(size))
-        .ok_or(AllocationDecline::RequestNotRepresentable)
+fn compressed_size(size: i32) -> std::result::Result<PacketLen, AllocationDecline> {
+    PacketLen::from_sdk(size).ok_or(AllocationDecline::RequestNotRepresentable)
 }
 
 /// A dimension of a compressed frame the SDK is about to receive.
@@ -1568,8 +1599,8 @@ fn video_request(
         // SAFETY: for a compressed frame the union holds the data size.
         let size = compressed_size(unsafe { frame.__bindgen_anon_1.data_size_in_bytes })?;
         return Ok(AllocationRequest {
-            bytes: size,
-            stride: size,
+            bytes: size.to_usize(),
+            stride: size.to_usize(),
             layout: RequestLayout::Compressed(AllocationFormat::CompressedVideo(fourcc)),
             width: compressed_dimension(frame.xres)?,
             height: compressed_dimension(frame.yres)?,
@@ -1604,8 +1635,8 @@ fn audio_request(
         // pins the AAC/Opus request format, extent and delivered application memory.
         let size = compressed_size(unsafe { frame.__bindgen_anon_1.data_size_in_bytes })?;
         return Ok(AllocationRequest {
-            bytes: size,
-            stride: size,
+            bytes: size.to_usize(),
+            stride: size.to_usize(),
             layout: RequestLayout::Compressed(AllocationFormat::CompressedAudio(FourCc::from_raw(
                 frame.FourCC,
             ))),
@@ -1726,6 +1757,50 @@ mod tests {
     use crate::Error;
     use crate::StreamTier;
     include!("allocators/cycle_cost_tests.rs");
+    #[test]
+    fn compressed_allocator_sizes_keep_the_packet_bound() {
+        for size in [-1, 0, i32::MAX] {
+            assert_eq!(
+                compressed_size(size),
+                Err(AllocationDecline::RequestNotRepresentable)
+            );
+        }
+        for size in [1, MAX_ALLOCATION] {
+            let sdk_size = i32::try_from(size).unwrap();
+            let checked = compressed_size(sdk_size).unwrap();
+            assert_eq!(checked.to_usize(), size);
+            assert_eq!(checked.to_sdk(), sdk_size);
+        }
+        assert_eq!(
+            compressed_size(i32::try_from(MAX_ALLOCATION + 1).unwrap()),
+            Err(AllocationDecline::RequestNotRepresentable)
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the full 256 MiB allocation is covered by the native test run"
+    )]
+    fn compressed_allocator_and_capture_accept_the_same_maximum_extent() {
+        let mut bytes = vec![0; MAX_ALLOCATION];
+        let size = compressed_size(i32::try_from(bytes.len()).unwrap()).unwrap();
+        let mut raw = super::super::VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16)
+            .unwrap()
+            .raw();
+        raw.p_data = bytes.as_mut_ptr();
+        raw.__bindgen_anon_1.data_size_in_bytes = size.to_sdk();
+        let request = video_request(&raw).unwrap();
+        assert_eq!(request.bytes, size.to_usize());
+        assert_eq!(request.stride, size.to_usize());
+        // SAFETY: bytes owns this initialized allocation through the borrowed
+        // frame's lifetime; the synthetic guard releases no native storage.
+        let guard =
+            unsafe { crate::capture::Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
+        let frame = super::super::CompressedVideoRef::new(guard).unwrap();
+        assert_eq!(frame.data().len(), request.bytes);
+    }
+
     /// Reusable initialized aligned blocks; the bounded free list grants one
     /// exclusive slot per claim and returns it only after lease reclamation.
     struct TestPool {
@@ -2627,8 +2702,8 @@ mod tests {
     #[cfg(ndi_has_advanced_receive_allocators)]
     #[test]
     fn compressed_callback_declines_clear_the_data_and_size() {
-        // This is the only unit test using the process-wide registry. It drives
-        // the native callback boundary directly without creating SDK objects.
+        // Drive the process callback registry directly. Native setter fixtures
+        // may share it, but never allocate frames or alter these decline counts.
         let registry = REGISTRY.get_or_init(|| Registry::new(limits()).unwrap());
         let token = registry.register(cached_request_policy()).unwrap();
         let opaque = token as *mut c_void;

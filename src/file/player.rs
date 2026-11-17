@@ -5,7 +5,7 @@ use std::{marker::PhantomData, path::Path, ptr::NonNull, rc::Rc, time::Duration}
 #[cfg(doc)]
 use super::FileFamily;
 use super::{
-    out_param, types, FileApi, FileDuration, FileInfo, FilePlayerOptions, FilePosition,
+    out_param, types, FileApi, FileBound, FileDuration, FileInfo, FilePlayerOptions, FilePosition,
     PlayerEvent, PlayerStats, SourceFormat,
 };
 use crate::{
@@ -27,13 +27,11 @@ use crate::{
 /// [`AsyncFilePlayer`](super::AsyncFilePlayer) offers the same operations as
 /// futures.
 pub struct FilePlayer {
-    playback: &'static sys::FilePlayback,
+    playback: FileBound<sys::FilePlayback>,
     handle: NonNull<NDIlib_file_player_instance_type>,
     // Strings passed to the SDK are needed only for the call that receives
     // them; see the note in `recorder.rs`. The name is kept for `Debug`.
     name: String,
-    // Keeps the NDI runtime initialized.
-    _api: FileApi,
     // Neither the NDI File Format API documentation nor
     // Processing.NDI.Lib.File.Player.h says on which threads a player may be
     // created, used and destroyed, or whether calls on one player may
@@ -46,8 +44,7 @@ pub struct FilePlayer {
 
 /// Checked Rust data and its native family; no native player exists yet.
 pub(super) struct PreparedPlayer {
-    api: FileApi,
-    playback: &'static sys::FilePlayback,
+    playback: FileBound<sys::FilePlayback>,
     resolved: types::ResolvedPlayerOptions,
     name: String,
 }
@@ -55,7 +52,6 @@ pub(super) struct PreparedPlayer {
 impl PreparedPlayer {
     pub(super) fn create(self) -> Result<FilePlayer> {
         let Self {
-            api,
             playback,
             resolved,
             name,
@@ -73,7 +69,6 @@ impl PreparedPlayer {
             playback,
             handle,
             name,
-            _api: api,
             _thread: PhantomData,
         })
     }
@@ -108,10 +103,9 @@ impl FilePlayer {
     }
 
     pub(super) fn prepare(api: FileApi, options: &FilePlayerOptions) -> Result<PreparedPlayer> {
-        let playback = api.table::<sys::FilePlayback>()?;
+        let playback = api.into_table::<sys::FilePlayback>()?;
         let resolved = options.resolve()?;
         Ok(PreparedPlayer {
-            api,
             playback,
             resolved,
             name: options.name.clone(),

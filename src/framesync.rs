@@ -408,9 +408,17 @@ unsafe impl Sync for FrameSyncInstance {}
 
 pub(crate) struct FrameSyncKind {
     instance: FrameSyncInstance,
+    receiver: std::sync::Arc<ReceiverCore>,
 }
 
 type FrameSyncResource = Resource<FrameSyncKind>;
+
+// Moving the receiver lease into the kind adds no storage to the resource.
+const _: () = assert!(
+    std::mem::size_of::<FrameSyncResource>()
+        == std::mem::size_of::<FrameSyncInstance>()
+            + std::mem::size_of::<std::sync::Arc<ReceiverCore>>()
+);
 
 impl sealed::Sealed for FrameSyncKind {}
 
@@ -420,18 +428,17 @@ unsafe impl Synchronizer for FrameSyncKind {
     type Mode = FrameSyncAttached;
     type Capture<'a> = FrameSyncCapture<'a>;
 
-    unsafe fn destroy(&mut self, receiver: &ReceiverCore) {
+    unsafe fn destroy(&mut self) {
+        let receiver = &self.receiver;
         // SAFETY: the uniquely owned handle is live, and Resource retains its
         // creating receiver and runtime until this destruction returns.
-        unsafe {
-            receiver
-                ._ndi
-                .api()
-                .core
-                .NDIlib_framesync_destroy(self.instance.0)
-        };
+        unsafe { receiver.sdk().NDIlib_framesync_destroy(self.instance.0) };
         #[cfg(test)]
         crate::receiver::lifecycle_test_events::record("framesync");
+    }
+
+    fn receiver(&self) -> &std::sync::Arc<ReceiverCore> {
+        &self.receiver
     }
 
     fn capture(resource: &FrameSyncResource) -> FrameSyncCapture<'_> {
@@ -459,21 +466,21 @@ impl FrameSyncResource {
         // SAFETY: the FrameSync instance is live for this borrow and `frame` is
         // writable storage the SDK fills or leaves zeroed.
         unsafe {
-            self.receiver
-                ._ndi
-                .api()
-                .core
-                .NDIlib_framesync_capture_video(self.instance.0, &mut frame, scan_type.to_sdk());
+            self.receiver().sdk().NDIlib_framesync_capture_video(
+                self.instance.0,
+                &mut frame,
+                scan_type.to_sdk(),
+            );
         }
         if is_framesync_video_empty(&frame) {
             return None;
         }
         // SAFETY: the call above filled `frame` through this instance, which
-        // was created through `_ndi`. The guard borrows this resource, which
+        // was created through this receiver's runtime. The guard borrows this resource, which
         // destroys the instance only when dropped, so the instance outlives
         // the guard, which frees the frame exactly once through
         // NDIlib_framesync_free_video, including when validation fails.
-        Some(unsafe { Guard::new(&self.receiver._ndi, self.instance.0, frame) })
+        Some(unsafe { Guard::new(self.receiver().ndi(), self.instance.0, frame) })
     }
 
     /// Make `call`: the guard of what the SDK returned, which it returns
@@ -506,25 +513,21 @@ impl FrameSyncResource {
         // Either way the SDK owns what it returned until it is freed through
         // this same instance.
         unsafe {
-            self.receiver
-                ._ndi
-                .api()
-                .core
-                .NDIlib_framesync_capture_audio_v2(
-                    self.instance.0,
-                    &mut frame,
-                    sample_rate,
-                    num_channels,
-                    num_samples,
-                );
+            self.receiver().sdk().NDIlib_framesync_capture_audio_v2(
+                self.instance.0,
+                &mut frame,
+                sample_rate,
+                num_channels,
+                num_samples,
+            );
         }
 
         // SAFETY: the call above filled `frame` through this instance, which
-        // was created through `_ndi`. The guard borrows this resource, which
+        // was created through this receiver's runtime. The guard borrows this resource, which
         // destroys the instance only when dropped, so the instance outlives
         // the guard, which frees the frame exactly once through
         // NDIlib_framesync_free_audio_v2, including when validation fails.
-        unsafe { Guard::new(&self.receiver._ndi, self.instance.0, frame) }
+        unsafe { Guard::new(self.receiver().ndi(), self.instance.0, frame) }
     }
 }
 
@@ -559,17 +562,17 @@ impl FrameSync {
         // SAFETY: this call creates a uniquely owned synchronizer from the
         // supplied live receiver, through that receiver's runtime.
         unsafe {
-            Attached::adopt(receiver, |core| {
+            Attached::adopt(receiver, |adoption| {
+                let core = adoption.core();
                 let instance = core
-                    ._ndi
-                    .api()
-                    .core
+                    .sdk()
                     .named()
-                    .NDIlib_framesync_create(core.instance.0)
+                    .NDIlib_framesync_create(adoption.instance())
                     .created()?
                     .as_ptr();
                 Ok(FrameSyncKind {
                     instance: FrameSyncInstance(instance),
+                    receiver: std::sync::Arc::clone(core),
                 })
             })
         }
@@ -1061,7 +1064,7 @@ mod tests {
         let mut sync = FrameSync::new(receiver).unwrap();
         let original = (
             sync.inner.resource().instance,
-            sync.receiver().core.instance.0,
+            sync.receiver().core.lock_connection().instance(),
         );
         let (results, allocations) = crate::test_alloc::allocation_count(|| {
             let tier = sync.controls().set_stream_tier(crate::StreamTier::Preview);
@@ -1075,7 +1078,7 @@ mod tests {
         assert_eq!(
             (
                 sync.inner.resource().instance,
-                sync.receiver().core.instance.0
+                sync.receiver().core.lock_connection().instance()
             ),
             original
         );
@@ -1124,13 +1127,13 @@ mod tests {
                     &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
                 )
                 .unwrap();
-                let original = receiver.core.instance.0;
+                let original = receiver.core.lock_connection().instance();
                 drop(ndi);
                 for _ in 0..3 {
                     let fs = FrameSync::new(receiver).unwrap();
-                    assert_eq!(fs.receiver().core.instance.0, original);
+                    assert_eq!(fs.receiver().core.lock_connection().instance(), original);
                     receiver = fs.into_receiver();
-                    assert_eq!(receiver.core.instance.0, original);
+                    assert_eq!(receiver.core.lock_connection().instance(), original);
                     assert!(receiver.capture_video(std::time::Duration::ZERO).is_ok());
                 }
                 let fs = FrameSync::new(receiver).unwrap();
@@ -1161,7 +1164,7 @@ mod tests {
             drop(ndi);
             // SAFETY: this synthetic failure creates no synchronizer.
             let rejected = match unsafe {
-                Attached::<FrameSyncKind>::adopt(receiver, |_| {
+                Attached::<FrameSyncKind>::adopt(receiver, |adoption| {
                     crate::sys::table::for_test(
                         ptr::null_mut::<NDIlib_framesync_instance_type>(),
                         c"NDIlib_framesync_create",
@@ -1169,6 +1172,7 @@ mod tests {
                     .created()
                     .map(|instance| FrameSyncKind {
                         instance: FrameSyncInstance(instance.as_ptr()),
+                        receiver: std::sync::Arc::clone(adoption.core()),
                     })
                 })
             } {

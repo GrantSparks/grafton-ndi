@@ -10,8 +10,8 @@ use std::{
 use super::{
     out_param,
     types::{track_flags, FileText, NamePattern, ResolvedRecorderOptions},
-    EventText, FileApi, FileRecorderOptions, RecorderEvent, RecorderEventKind, RecorderStats,
-    RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec, StateConflict,
+    EventText, FileApi, FileBound, FileRecorderOptions, RecorderEvent, RecorderEventKind,
+    RecorderStats, RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec, StateConflict,
 };
 #[cfg(doc)]
 use super::{FileFamily, FileNaming};
@@ -365,9 +365,12 @@ impl Pumped {
     }
 }
 
+/// Proof that the due batch completed its own bounded post-deadline drain.
+/// Only the settlement kernel mints this proof, after its forced-drain loop.
+struct LateDrain;
+
 /// One fixed settlement batch. Reply callbacks cannot advance its clock.
 pub(super) struct Settlement {
-    pub(super) drained: bool,
     pub(super) cleanup_expired: bool,
     pub(super) at: Instant,
 }
@@ -466,18 +469,17 @@ impl<R: FinishReply> FinishWaiters<R> {
         sink: &mut impl FnMut(Result<RecorderEvent>),
         closing: impl Fn() -> bool,
         mut cleanup: Option<&mut DrainBudget>,
-    ) -> bool {
+    ) {
         let Settlement {
-            mut drained,
-            cleanup_expired,
+            mut cleanup_expired,
             at,
         } = batch;
         self.retain();
         if self.waiters.is_empty() {
-            return drained;
+            return;
         }
         self.notify_cleanup |= closing();
-        if self
+        let late = if self
             .waiters
             .iter()
             .any(|waiter| cleanup_expired || waiter.deadline.end() <= at)
@@ -499,8 +501,15 @@ impl<R: FinishReply> FinishWaiters<R> {
                     break;
                 }
             }
-            drained = true;
-        }
+            // Cleanup can expire during this batch's drain. Its spent budget
+            // now covers every waiter, including deadlines later than `at`.
+            cleanup_expired |= cleanup
+                .as_deref()
+                .is_some_and(|budget| matches!(budget, DrainBudget::Spent));
+            Some(LateDrain)
+        } else {
+            None
+        };
         let session = recorder.session_id();
         let mut index = 0;
         while index < self.waiters.len() {
@@ -509,7 +518,10 @@ impl<R: FinishReply> FinishWaiters<R> {
                 Some(Err(Error::InvalidState(StateConflict::Closed)))
             } else {
                 recorder
-                    .settle_wait(cleanup_expired || waiter.deadline.end() <= at, drained)
+                    .settle_wait(
+                        late.as_ref()
+                            .filter(|_| cleanup_expired || waiter.deadline.end() <= at),
+                    )
                     .map(|outcome| {
                         if matches!(outcome, FinishStatus::TimedOut(_)) && closing() {
                             Err(Error::InvalidState(StateConflict::Closed))
@@ -525,7 +537,6 @@ impl<R: FinishReply> FinishWaiters<R> {
             }
         }
         self.notify_cleanup |= closing();
-        drained
     }
 }
 
@@ -764,11 +775,11 @@ impl Ledger {
             .is_some_and(|data| !data.files.cleanup_pending() && data.report.closed_files > 0)
     }
 
-    fn settle(&self, expired: bool, drained: bool) -> Option<FinishStatus> {
+    fn settle(&self, late: Option<&LateDrain>) -> Option<FinishStatus> {
         match self.state() {
             RecorderState::Closed => Some(FinishStatus::Closed(self.report())),
             RecorderState::Indeterminate => Some(FinishStatus::Indeterminate(self.report())),
-            _ if expired && drained => Some(FinishStatus::TimedOut(self.report())),
+            _ if late.is_some() => Some(FinishStatus::TimedOut(self.report())),
             _ => None,
         }
     }
@@ -974,7 +985,7 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 /// [`AsyncFileRecorder`](super::AsyncFileRecorder) offers the same operations
 /// as futures.
 pub struct FileRecorder {
-    recording: &'static sys::FileRecording,
+    recording: FileBound<sys::FileRecording>,
     handle: NonNull<NDIlib_file_recorder_instance_type>,
     /// The configured tracks, used when starting each new session.
     tracks: MediaTypes,
@@ -985,8 +996,6 @@ pub struct FileRecorder {
     ledger: Ledger,
     generation: u64,
     cleanup: CleanupBudget,
-    // Keeps the NDI runtime initialized.
-    _api: FileApi,
     // Neither the NDI File Format API documentation nor
     // Processing.NDI.Lib.File.Recorder.h says on which threads a recorder may
     // be created, used and destroyed, or whether calls on one recorder may
@@ -1000,8 +1009,7 @@ pub struct FileRecorder {
 /// Rust-only creation state: its validation and family check require no
 /// native object, so this value can move to an owner thread before creation.
 pub(super) struct PreparedRecorder {
-    api: FileApi,
-    recording: &'static sys::FileRecording,
+    recording: FileBound<sys::FileRecording>,
     options: CheckedRecorderOptions,
 }
 
@@ -1032,11 +1040,7 @@ impl CheckedRecorderOptions {
 
 impl PreparedRecorder {
     pub(super) fn create(self) -> Result<FileRecorder> {
-        let Self {
-            api,
-            recording,
-            options,
-        } = self;
+        let Self { recording, options } = self;
         let resolved = options.resolved;
         let settings = NDIlib_file_recorder_create_t {
             source_to_connect_to: raw_source(&options.source),
@@ -1063,7 +1067,6 @@ impl PreparedRecorder {
             naming: resolved.naming,
             ledger: Ledger::idle(),
             generation: 0,
-            _api: api,
             _thread: PhantomData,
         })
     }
@@ -1102,13 +1105,9 @@ impl FileRecorder {
     }
 
     pub(super) fn prepare(api: FileApi, options: &FileRecorderOptions) -> Result<PreparedRecorder> {
-        let recording = api.table::<sys::FileRecording>()?;
+        let recording = api.into_table::<sys::FileRecording>()?;
         let options = CheckedRecorderOptions::new(options)?;
-        Ok(PreparedRecorder {
-            api,
-            recording,
-            options,
-        })
+        Ok(PreparedRecorder { recording, options })
     }
 
     /// Where the recorder is in its session.
@@ -1429,13 +1428,12 @@ impl FileRecorder {
         loop {
             // A synchronous caller already has this final ledger. Preserve
             // its queued events for next_event rather than draining again.
-            if let Some(outcome) = self.settle_wait(false, false) {
+            if let Some(outcome) = self.settle_wait(None) {
                 return Ok(outcome);
             }
             waiters.settle_at(
                 self,
                 Settlement {
-                    drained: false,
                     cleanup_expired: false,
                     at: Instant::now(),
                 },
@@ -1463,8 +1461,8 @@ impl FileRecorder {
         }
     }
 
-    pub(super) fn settle_wait(&self, expired: bool, drained: bool) -> Option<FinishStatus> {
-        self.ledger.settle(expired, drained)
+    fn settle_wait(&self, late: Option<&LateDrain>) -> Option<FinishStatus> {
+        self.ledger.settle(late)
     }
 
     /// Share abandon's cleanup policy with the async owner's shutdown driver.
@@ -1526,10 +1524,9 @@ impl FileRecorder {
                 budget = DrainBudget::Spent;
             }
             let polled = self.pump(&mut budget, waiters.wait_timeout(tick), sink);
-            let drained = waiters.settle_at(
+            waiters.settle_at(
                 self,
                 Settlement {
-                    drained: polled.drain_over(),
                     cleanup_expired: polled.expired(),
                     at: Instant::now(),
                 },
@@ -1537,7 +1534,7 @@ impl FileRecorder {
                 || !matches!(closing(), CleanupRequest::Drop),
                 Some(&mut budget),
             );
-            if polled.expired() && drained {
+            if matches!(budget, DrainBudget::Spent) {
                 break;
             }
         }
@@ -1576,7 +1573,13 @@ impl FileRecorder {
     #[doc(alias = "NDIlib_file_recorder_destroy")]
     #[doc(alias = "NDIlib_file_recorder_create")]
     pub fn reset(&mut self, options: &FileRecorderOptions) -> Result<RecordingReport> {
-        self.reset_with(|recorder| Self::new(&recorder._api, options))
+        self.reset_with(|recorder| {
+            PreparedRecorder {
+                recording: recorder.recording.clone(),
+                options: CheckedRecorderOptions::new(options)?,
+            }
+            .create()
+        })
     }
 
     pub(super) fn reset_checked(
@@ -1585,8 +1588,7 @@ impl FileRecorder {
     ) -> Result<RecordingReport> {
         self.reset_with(|recorder| {
             PreparedRecorder {
-                api: recorder._api.clone(),
-                recording: recorder.recording,
+                recording: recorder.recording.clone(),
                 options,
             }
             .create()
@@ -2139,19 +2141,14 @@ mod tests {
         let mut ledger = session();
         let _ = ledger.observe(Started, path("take.mkv"));
         let _ = ledger.stop_requested(true);
-        assert_eq!(ledger.settle(false, false), None);
-        assert_eq!(ledger.settle(false, true), None);
-        assert_eq!(ledger.settle(true, false), None);
+        assert_eq!(ledger.settle(None), None);
         assert!(matches!(
-            ledger.settle(true, true),
+            ledger.settle(Some(&LateDrain)),
             Some(FinishStatus::TimedOut(_))
         ));
         let _ = ledger.observe(FileClosed, path("take.mkv"));
         let _ = ledger.drained(false);
-        assert!(matches!(
-            ledger.settle(false, false),
-            Some(FinishStatus::Closed(_))
-        ));
+        assert!(matches!(ledger.settle(None), Some(FinishStatus::Closed(_))));
     }
 
     #[test]
@@ -2414,3 +2411,7 @@ mod tests {
 #[cfg(test)]
 #[path = "drain_budget_tests.rs"]
 mod drain_budget_tests;
+
+#[cfg(ndi_test_file_late_drain)]
+#[path = "../../tests/ui/internal/file_late_drain.rs"]
+mod late_drain_contract;

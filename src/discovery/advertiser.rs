@@ -248,11 +248,14 @@ impl AdvertiserApi for sys::ReceiverAdvertising {
         member: &Self::Member,
         options: &Self::Advertisement,
     ) -> sys::table::Called<bool> {
-        // SAFETY: forwarded to the caller's live-owner and retained-name obligation.
+        let membership = member.resource.advertiser_membership();
+        // SAFETY: membership borrows immutable receiver creation properties and
+        // its stable observer registry. Native registry mutexes cover mutation;
+        // the retained owner and input-group name cover native lifetimes.
         unsafe {
             self.named().NDIlib_recv_advertiser_add_receiver(
                 instance.0,
-                member.resource.instance.0,
+                membership.instance(),
                 options.controlling,
                 options.monitoring,
                 member
@@ -267,10 +270,13 @@ impl AdvertiserApi for sys::ReceiverAdvertising {
         instance: Self::Instance,
         member: &Self::Member,
     ) -> sys::table::Called<bool> {
-        // SAFETY: forwarded to the caller's live-owner obligation.
+        let membership = member.resource.advertiser_membership();
+        // SAFETY: removal borrows the retained receiver and reaches only its
+        // stable observer registry, protected by the native registry mutex.
+        // It can run from an allocator policy while a connection call waits.
         unsafe {
             self.named()
-                .NDIlib_recv_advertiser_del_receiver(instance.0, member.resource.instance.0)
+                .NDIlib_recv_advertiser_del_receiver(instance.0, membership.instance())
         }
     }
 }

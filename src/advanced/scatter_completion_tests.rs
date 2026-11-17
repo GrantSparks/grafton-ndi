@@ -81,7 +81,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             .unwrap();
             frame.set_timecode(Timecode::from_ticks(number));
             let key = frame.storage.blocks[0].as_mut_ptr();
-            let length = frame.storage.blocks[0].len() as i32;
+            let length = frame.storage.sizes[0].unwrap().to_sdk();
             frames.push(PendingVideo::Scatter(
                 ScatterSendable::for_test(frame, Some(scatter)).unwrap(),
             ));
@@ -95,8 +95,8 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             let (pointer, size) = frame.completion_key();
             proof.descriptor_mut().p_data = pointer;
             proof.descriptor_mut().__bindgen_anon_1.data_size_in_bytes = size;
-            let frame = proof.frame.descriptor;
-            let list = proof.frame.scatter;
+            let frame = proof.descriptor;
+            let list = proof.scatter;
             assert_eq!(frame.p_data, key);
             assert_eq!(unsafe { frame.__bindgen_anon_1.data_size_in_bytes }, length);
             expected.push((key as usize, number, length));

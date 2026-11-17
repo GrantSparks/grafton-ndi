@@ -124,10 +124,8 @@ impl<'a> FrameSyncCapture<'a> {
         // SAFETY: the view borrows a live synchronizer for the call.
         let depth = unsafe {
             self.resource
-                .receiver
-                ._ndi
-                .api()
-                .core
+                .receiver()
+                .sdk()
                 .named()
                 .NDIlib_framesync_audio_queue_depth(self.resource.instance.0)
         };

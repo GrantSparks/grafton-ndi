@@ -3,6 +3,7 @@
 use std::{ops::Deref, sync::Arc};
 
 use super::{RawCapture, Receiver, ReceiverCore, SynchronizerMode};
+use crate::sys::bindings::NDIlib_recv_instance_t;
 use crate::{Rejected, Result};
 
 pub(crate) mod sealed {
@@ -25,9 +26,13 @@ pub(crate) unsafe trait Synchronizer: sealed::Sealed + Sized + 'static {
     ///
     /// # Safety
     ///
-    /// The handle must be live, uniquely owned and created from `receiver`.
+    /// The handle must be live, uniquely owned and created from the retained receiver.
     /// It may be destroyed only once and no captured frame may remain live.
-    unsafe fn destroy(&mut self, receiver: &ReceiverCore);
+    unsafe fn destroy(&mut self);
+
+    /// The receiver retained by this native synchronizer until destruction.
+    fn receiver(&self) -> &Arc<ReceiverCore>;
+
     fn capture(resource: &Resource<Self>) -> Self::Capture<'_>;
 }
 
@@ -35,7 +40,12 @@ pub(crate) unsafe trait Synchronizer: sealed::Sealed + Sized + 'static {
 /// Construction is private to `Attached::adopt`.
 pub(crate) struct Resource<S: Synchronizer> {
     native: S,
-    pub(crate) receiver: Arc<ReceiverCore>,
+}
+
+impl<S: Synchronizer> Resource<S> {
+    pub(crate) fn receiver(&self) -> &Arc<ReceiverCore> {
+        self.native.receiver()
+    }
 }
 
 impl<S: Synchronizer> Deref for Resource<S> {
@@ -51,7 +61,23 @@ impl<S: Synchronizer> Drop for Resource<S> {
         // SAFETY: only adoption constructs this resource, pairing its unique
         // handle with this retained receiver. Views and frame guards borrow
         // the resource, so they have ended before its one destruction.
-        unsafe { self.native.destroy(&self.receiver) };
+        unsafe { self.native.destroy() };
+    }
+}
+
+/// Borrow of the by-value receiver being adopted. Only `Attached::adopt`
+/// constructs it, after reserving that receiver's raw capture mode.
+pub(crate) struct Adoption<'a> {
+    core: &'a Arc<ReceiverCore>,
+}
+
+impl Adoption<'_> {
+    pub(crate) fn core(&self) -> &Arc<ReceiverCore> {
+        self.core
+    }
+
+    pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
+        self.core.instance.0
     }
 }
 
@@ -73,17 +99,17 @@ impl<S: Synchronizer> Attached<S> {
     /// native object. The receiver is returned unchanged on failure.
     pub(crate) unsafe fn adopt(
         receiver: Receiver,
-        create: impl FnOnce(&ReceiverCore) -> Result<S>,
+        create: impl FnOnce(Adoption<'_>) -> Result<S>,
     ) -> std::result::Result<Self, Rejected<Receiver>> {
-        let native = match create(&receiver.core) {
+        let adoption = Adoption {
+            core: &receiver.core,
+        };
+        let native = match create(adoption) {
             Ok(native) => native,
             Err(error) => return Err(Rejected::new(error, receiver)),
         };
         Ok(Self {
-            resource: Resource {
-                native,
-                receiver: Arc::clone(&receiver.core),
-            },
+            resource: Resource { native },
             receiver: Receiver {
                 core: receiver.core,
                 _mode: std::marker::PhantomData,

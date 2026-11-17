@@ -9,7 +9,7 @@ fn a_finder_issued_guard_is_accepted(finder: &Finder) -> Result<Vec<Source>> {
     finder
         .lock_snapshots(crate::timeout::NeverStop)
         .unwrap()
-        .snapshot(&finder._ndi.api().core)
+        .snapshot(&*finder.sdk)
 }
 
 // The old MutexGuard<()> protocol accepted this unrelated lock. The actual

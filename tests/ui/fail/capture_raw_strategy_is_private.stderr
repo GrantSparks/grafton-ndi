@@ -1,7 +1,7 @@
 error[E0603]: module `capture` is private
  --> tests/ui/fail/capture_raw_strategy_is_private.rs:3:18
   |
-3 | use grafton_ndi::capture::{capture_raw, FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
+3 | use grafton_ndi::capture::{capture_any, FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
   |                  ^^^^^^^ private module
   |
 note: the module `capture` is defined here
@@ -13,7 +13,7 @@ note: the module `capture` is defined here
 error[E0603]: module `capture` is private
  --> tests/ui/fail/capture_raw_strategy_is_private.rs:3:18
   |
-3 | use grafton_ndi::capture::{capture_raw, FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
+3 | use grafton_ndi::capture::{capture_any, FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
   |                  ^^^^^^^ private module --------- trait `FrameFree` is not publicly re-exported
   |
 note: the module `capture` is defined here

@@ -689,6 +689,154 @@ pub struct Ndi {
     runtime: Runtime,
 }
 
+/// The initialized runtime already retained by a native resource.
+/// Binding an existing owner never acquires another runtime reference.
+pub(crate) trait LiveOwner {
+    fn ndi(&self) -> &Ndi;
+}
+
+impl LiveOwner for Ndi {
+    fn ndi(&self) -> &Ndi {
+        self
+    }
+}
+
+impl LiveOwner for std::sync::Arc<crate::receiver::ReceiverCore> {
+    fn ndi(&self) -> &Ndi {
+        self.as_ref().ndi()
+    }
+}
+
+/// How a native capability reaches its table through its retained owner.
+/// The core table is already in `Ndi`, so it needs no second pointer.
+/// Optional and File tables cache their gated pointer beside that owner.
+pub(crate) trait BoundTable: 'static {
+    type Storage: Copy;
+
+    fn store(table: &'static Self) -> Self::Storage;
+    fn borrow<'a>(table: &'a Self::Storage, ndi: &'a Ndi) -> &'a Self;
+}
+
+impl<T: sys::Table> BoundTable for T {
+    type Storage = &'static T;
+
+    fn store(table: &'static Self) -> Self::Storage {
+        table
+    }
+
+    fn borrow<'a>(table: &'a Self::Storage, _: &'a Ndi) -> &'a Self {
+        table
+    }
+}
+
+impl BoundTable for sys::Core {
+    type Storage = ();
+
+    fn store(_: &'static Self) {}
+
+    fn borrow<'a>(_: &'a (), ndi: &'a Ndi) -> &'a Self {
+        &ndi.api().core
+    }
+}
+
+#[cfg(feature = "file-io")]
+macro_rules! file_bound_tables {
+    ($($table:ty),+ $(,)?) => {$(
+        impl BoundTable for $table {
+            type Storage = &'static Self;
+
+            fn store(table: &'static Self) -> Self::Storage {
+                table
+            }
+
+            fn borrow<'a>(table: &'a Self::Storage, _: &'a Ndi) -> &'a Self {
+                table
+            }
+        }
+    )+};
+}
+
+#[cfg(feature = "file-io")]
+file_bound_tables!(sys::FileRuntime, sys::FilePlayback, sys::FileRecording);
+
+/// Native entry points paired with the initialized runtime they require.
+/// Only runtime binding paths can construct this capability. Dereferencing it
+/// borrows the table for no longer than the retained owner.
+pub(crate) struct Bound<T: BoundTable, O: LiveOwner = Ndi> {
+    table: T::Storage,
+    owner: O,
+}
+
+impl<T: BoundTable, O: LiveOwner> Bound<T, O> {
+    pub(crate) fn ndi(&self) -> &Ndi {
+        self.owner.ndi()
+    }
+
+    #[cfg(feature = "advanced")]
+    pub(crate) fn owner(&self) -> &O {
+        &self.owner
+    }
+}
+
+#[cfg(feature = "advanced")]
+impl<T: sys::Table, O: LiveOwner> Bound<T, O> {
+    /// Gate through an existing live owner and move its proof into the table.
+    pub(crate) fn with_owner(owner: O) -> Result<Self> {
+        let table = T::of(owner.ndi().runtime.selected)?;
+        Ok(Self {
+            table: T::store(table),
+            owner,
+        })
+    }
+}
+
+#[cfg(test)]
+impl<T: BoundTable> Bound<T> {
+    pub(crate) fn for_test(ndi: Ndi, table: &'static T) -> Self {
+        Self {
+            table: T::store(table),
+            owner: ndi,
+        }
+    }
+}
+
+#[cfg(feature = "file-io")]
+impl Bound<sys::FileRuntime> {
+    pub(crate) fn into_file_table<T: sys::FileTable>(self) -> Result<Bound<T>> {
+        let table = self.table.table::<T>()?;
+        Ok(Bound {
+            table: T::store(table),
+            owner: self.owner,
+        })
+    }
+
+    pub(crate) fn bind_file_table<T: sys::FileTable>(&self) -> Result<Bound<T>> {
+        // Gate before cloning, so an unsupported family does not acquire a handle.
+        let table = self.table.table::<T>()?;
+        Ok(Bound {
+            table: T::store(table),
+            owner: self.owner.clone(),
+        })
+    }
+}
+
+impl<T: BoundTable, O: LiveOwner> std::ops::Deref for Bound<T, O> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        T::borrow(&self.table, self.owner.ndi())
+    }
+}
+
+impl<T: BoundTable, O: LiveOwner + Clone> Clone for Bound<T, O> {
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table,
+            owner: self.owner.clone(),
+        }
+    }
+}
+
 impl fmt::Debug for Ndi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Ndi")
@@ -698,6 +846,15 @@ impl fmt::Debug for Ndi {
 }
 
 impl Ndi {
+    #[cfg(test)]
+    pub(crate) fn test_double(core: sys::Core) -> Self {
+        Runtime {
+            selected: sys::Runtime::test_double(core),
+        }
+        .initialize()
+        .unwrap()
+    }
+
     /// Select the default NDI runtime and start it.
     ///
     /// This is [`Runtime::select`] with the default [`RuntimeOptions`]
@@ -791,7 +948,7 @@ impl Ndi {
     }
 
     /// The selected implementation's entry points.
-    pub(crate) fn api(&self) -> &'static sys::Api {
+    pub(crate) fn api(&self) -> &sys::Api {
         self.runtime.selected.gates.api()
     }
 
@@ -810,11 +967,38 @@ impl Ndi {
     ///
     /// The table type alone selects the capability, so a table cannot be
     /// obtained without its gate or be reported as another capability.
-    pub(crate) fn table<T: sys::Table>(&self) -> Result<&'static T> {
+    pub(crate) fn table<T: sys::Table>(&self) -> Result<&T> {
         T::of(self.runtime.selected)
     }
 
-    pub(crate) fn evidence(&self) -> sys::Evidence<'static> {
+    /// Check the capability and acquire its runtime before native creation.
+    pub(crate) fn bind<T: sys::Table>(&self) -> Result<Bound<T>> {
+        let table = T::of(self.runtime.selected)?;
+        Ok(Bound {
+            table: T::store(table),
+            owner: self.clone(),
+        })
+    }
+
+    pub(crate) fn bind_core(&self) -> Bound<sys::Core> {
+        Bound {
+            table: (),
+            owner: self.clone(),
+        }
+    }
+
+    #[cfg(feature = "file-io")]
+    pub(crate) fn bind_file_runtime(
+        &self,
+        table: &'static sys::FileRuntime,
+    ) -> Bound<sys::FileRuntime> {
+        Bound {
+            table,
+            owner: self.clone(),
+        }
+    }
+
+    pub(crate) fn evidence(&self) -> sys::Evidence<'_> {
         self.runtime.selected.evidence()
     }
 
@@ -933,6 +1117,107 @@ mod tests {
                 _ => 0,
             }
         }
+    }
+
+    fn isolated_ndi() -> Ndi {
+        // No native operation is invoked by these lifecycle/binding tests.
+        let core = sys::Core::load(&sys::table::ExportsWhere(|_| true))
+            .unwrap()
+            .unwrap();
+        Ndi::test_double(core)
+    }
+
+    #[test]
+    fn a_bound_table_retains_exactly_one_runtime_reference() {
+        let ndi = isolated_ndi();
+        let manager = &ndi.runtime.selected.lifecycle;
+        let bound = ndi.bind_core();
+        assert!(
+            matches!(*manager.state.lock().unwrap(), Phase::Running(count) if count.get() == 2)
+        );
+        drop(ndi);
+        assert!(manager.is_running());
+        assert_eq!(bound.ndi().info().raw_version(), "6.4.0.2");
+        drop(bound);
+        assert!(matches!(*manager.state.lock().unwrap(), Phase::Stopped));
+        assert_eq!(
+            std::mem::size_of::<Bound<sys::Core>>(),
+            std::mem::size_of::<Ndi>()
+        );
+        assert_eq!(
+            std::mem::size_of::<Bound<sys::Routing>>(),
+            std::mem::size_of::<Ndi>() + std::mem::size_of::<&sys::Routing>()
+        );
+    }
+
+    #[cfg(feature = "advanced")]
+    #[test]
+    fn binding_an_existing_owner_needs_no_additional_runtime_handle() {
+        struct TestTable;
+        impl sys::Table for TestTable {
+            fn within(_: sys::Evidence<'_>) -> Result<&Self> {
+                static TABLE: TestTable = TestTable;
+                Ok(&TABLE)
+            }
+        }
+        struct Owner(Ndi);
+        impl LiveOwner for std::sync::Arc<Owner> {
+            fn ndi(&self) -> &Ndi {
+                &self.0
+            }
+        }
+
+        let ndi = isolated_ndi();
+        let manager = &ndi.runtime.selected.lifecycle;
+        let owner = std::sync::Arc::new(Owner(ndi));
+        *manager.state.lock().unwrap() = Phase::Running(NonZeroUsize::MAX);
+        let bound = Bound::<TestTable, _>::with_owner(owner.clone()).unwrap();
+        assert!(std::sync::Arc::ptr_eq(bound.owner(), &owner));
+        assert!(
+            matches!(*manager.state.lock().unwrap(), Phase::Running(count) if count == NonZeroUsize::MAX)
+        );
+        *manager.state.lock().unwrap() = Phase::Running(NonZeroUsize::MIN);
+        assert_eq!(
+            std::mem::size_of_val(&bound),
+            std::mem::size_of_val(&owner) + std::mem::size_of::<&TestTable>()
+        );
+        drop(owner);
+        assert!(manager.is_running());
+        drop(bound);
+        assert!(matches!(*manager.state.lock().unwrap(), Phase::Stopped));
+    }
+
+    #[test]
+    fn exhausted_binding_never_calls_native_creation() {
+        let ndi = isolated_ndi();
+        let manager = &ndi.runtime.selected.lifecycle;
+        *manager.state.lock().unwrap() = Phase::Running(NonZeroUsize::MAX);
+        let creates = AtomicUsize::new(0);
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: no native instance is returned; an exhausted bind must
+            // panic before this closure can observe the settings at all.
+            let _ = unsafe {
+                crate::Finder::create(
+                    &ndi,
+                    &crate::FinderOptions::new(),
+                    #[cfg(feature = "advanced")]
+                    None,
+                    |_, _| {
+                        creates.fetch_add(1, Ordering::Relaxed);
+                        sys::table::for_test(std::ptr::null_mut(), c"NDIlib_find_create_v2")
+                    },
+                )
+            };
+        }));
+        // An unavailable capability is still refused before the exhausted clone.
+        let unavailable = ndi.bind::<sys::Routing>();
+        *manager.state.lock().unwrap() = Phase::Running(NonZeroUsize::MIN);
+        assert!(rejected.is_err());
+        assert_eq!(creates.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            unavailable,
+            Err(Error::UnsupportedCapability { .. })
+        ));
     }
 
     #[test]

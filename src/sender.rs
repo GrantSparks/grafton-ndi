@@ -86,10 +86,17 @@ unsafe impl Sync for SendInstance {}
 /// A copy is a borrowed handle, valid while an owner of the native sender
 /// (`Shared` or `Exclusive`) keeps it alive.
 #[derive(Clone, Copy)]
-struct SendHandle<'a> {
+pub(crate) struct SendHandle<'a> {
     instance: SendInstance,
-    core: &'static sys::Core,
+    core: &'a sys::Core,
     _owner: PhantomData<&'a SenderResource>,
+}
+
+impl SendHandle<'_> {
+    #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
+    pub(crate) fn instance(self) -> NDIlib_send_instance_t {
+        self.instance.0
+    }
 }
 
 /// Sender-side bookkeeping that need not outlive the sender itself.
@@ -185,7 +192,7 @@ mod ownership {
         pub(super) failover: parking_lot::Mutex<RetainedSources>,
         #[cfg(feature = "advanced")]
         pub(super) _config: Option<crate::advanced::AdvancedConfig>,
-        pub(super) _ndi: Ndi,
+        pub(super) sdk: crate::runtime::Bound<sys::Core>,
     }
 
     // No application code runs under the failover lock. A replacement keeps
@@ -211,11 +218,11 @@ mod ownership {
     impl SenderResource {
         /// The runtime whose native instance this resource owns.
         pub(super) fn ndi(&self) -> &Ndi {
-            &self._ndi
+            self.sdk.ndi()
         }
 
-        pub(super) fn core(&self) -> &'static sys::Core {
-            &self.ndi().api().core
+        pub(super) fn core(&self) -> &sys::Core {
+            &self.sdk
         }
 
         pub(super) fn handle(&self) -> SendHandle<'_> {
@@ -250,20 +257,45 @@ mod ownership {
     /// may share, and the asynchronous video pipeline that sends through it.
     pub struct Shared {
         pub(super) video: VideoPipeline,
-        pub(super) owner: Arc<SenderResource>,
     }
 
     impl NativeOwner for Shared {
         fn resource(&self) -> &SenderResource {
-            &self.owner
+            self.video.resource()
         }
 
         fn new(resource: SenderResource) -> Self {
-            let owner = Arc::new(resource);
             Self {
-                video: VideoPipeline::new(Arc::clone(&owner)),
-                owner,
+                video: VideoPipeline::new(Arc::new(resource)),
             }
+        }
+    }
+
+    impl Shared {
+        pub(super) fn native_owner(&self) -> Arc<SenderResource> {
+            self.video.native_owner()
+        }
+
+        #[cfg(all(feature = "advanced", ndi_has_advanced_send_completion))]
+        #[allow(clippy::result_large_err)]
+        pub(super) fn into_exclusive(
+            self,
+        ) -> std::result::Result<(SenderResource, Option<VideoFrame>), Self> {
+            let this = std::mem::ManuallyDrop::new(self);
+            // SAFETY: Shared has exactly one field. Suppressing its destructor
+            // transfers that field exactly once, without flushing it. The
+            // pipeline either becomes Shared again on refusal, or synchronizes
+            // all native loans before returning its exclusive resource.
+            let video = unsafe { ptr::read(&this.video) };
+            video.into_exclusive().map_err(|video| Self { video })
+        }
+    }
+
+    impl Drop for Shared {
+        fn drop(&mut self) {
+            // Advertisements may retain the native resource, so drain this
+            // pipeline while its owner and every pointee remain live.
+            self.video.flush_on_drop();
         }
     }
 
@@ -427,7 +459,7 @@ pub(crate) mod in_flight {
     use super::Exclusive;
     use super::{async_flush_frame_ptr, PreparedVideo, SendHandle, SenderResource};
     #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
-    use crate::advanced::{ScatterSendable, ScatterVideoLoan};
+    use crate::advanced::ScatterVideoLoan;
     use crate::{frames::Sendable, sys::bindings::NDIlib_video_frame_v2_t, VideoFrame};
     use crate::{frames::VideoSource, pixels::Pixels, Result};
     use std::sync::{Arc, Mutex};
@@ -466,6 +498,14 @@ pub(crate) mod in_flight {
                 owner,
                 state: Mutex::new(VideoState::default()),
             }
+        }
+
+        pub(super) fn resource(&self) -> &SenderResource {
+            &self.owner
+        }
+
+        pub(super) fn native_owner(&self) -> Arc<SenderResource> {
+            Arc::clone(&self.owner)
         }
 
         fn synchronize<R>(&self, call: impl FnOnce(VideoPair<'_>) -> R) -> R {
@@ -522,8 +562,23 @@ pub(crate) mod in_flight {
         }
 
         #[cfg(all(feature = "advanced", ndi_has_advanced_send_completion))]
-        pub(super) fn retire(mut self) -> Option<VideoFrame> {
-            self.finish()
+        #[allow(clippy::result_large_err)]
+        pub(super) fn into_exclusive(
+            self,
+        ) -> std::result::Result<(SenderResource, Option<VideoFrame>), Self> {
+            let Self { owner, state } = self;
+            match Arc::try_unwrap(owner) {
+                Ok(resource) => {
+                    let mut state = state.into_inner().unwrap_or_else(|e| e.into_inner());
+                    let retained = state.paired(resource.handle()).finish();
+                    Ok((resource, retained))
+                }
+                Err(owner) => Err(Self { owner, state }),
+            }
+        }
+
+        pub(super) fn flush_on_drop(&mut self) {
+            self.exclusive().stream.flush();
         }
     }
 
@@ -559,14 +614,6 @@ pub(crate) mod in_flight {
             self.stream.flush();
             *self.spare = None;
             self.stream.slot.take_retained().map(Sendable::into_frame)
-        }
-    }
-
-    impl Drop for VideoPipeline {
-        fn drop(&mut self) {
-            // Advertisements may retain the native resource, so drain this
-            // pipeline while its own owner and every pointee remain live.
-            self.exclusive().stream.flush();
         }
     }
 
@@ -793,7 +840,7 @@ pub(crate) mod in_flight {
         /// frame's blocks, for `NDIlib_send_send_video_scatter_async`. No
         /// header says the SDK copies the list, so the frame owns it too.
         #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
-        Scatter(ScatterSendable<ScatterVideoLoan>),
+        Scatter(ScatterVideoLoan),
     }
 
     impl Lent {
@@ -841,7 +888,7 @@ pub(crate) mod in_flight {
                 Self::Scatter(proof) => {
                     // SAFETY: the same lifetime contract also covers the stable
                     // scatter list and the arrays and payload it names.
-                    unsafe { proof.submit(sender.instance.0, descriptor) };
+                    unsafe { proof.submit(sender, descriptor) };
                 }
             }
         }
@@ -1837,15 +1884,15 @@ impl<M: SenderMode> Sender<M> {
         options: &SenderOptions,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
-            &'static sys::Core,
+            &sys::Core,
             &NDIlib_send_create_t,
         ) -> sys::table::Called<NDIlib_send_instance_t>,
     ) -> Result<Self> {
         let name = CString::new(options.name.as_str())?;
         let groups = crate::finder::list_cstring(options.groups.as_deref(), "groups")?;
-        let core = &ndi.api().core;
+        let core = ndi.bind_core();
         let instance = create(
-            core,
+            &core,
             &NDIlib_send_create_t {
                 p_ndi_name: name.as_ptr(),
                 p_groups: groups.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
@@ -1870,7 +1917,7 @@ impl<M: SenderMode> Sender<M> {
                 failover: parking_lot::Mutex::new(RetainedSources::default()),
                 #[cfg(feature = "advanced")]
                 _config: config,
-                _ndi: ndi.clone(),
+                sdk: core,
             }),
             _mode: PhantomData,
         })
@@ -1896,7 +1943,7 @@ impl Sender {
     /// that hold a sender in another mode free what the SDK reads once their
     /// native sender is gone, so it must not outlive them.
     pub(crate) fn native_owner(&self) -> Arc<SenderResource> {
-        Arc::clone(&self.native.owner)
+        self.native.native_owner()
     }
 
     /// The same native sender in mode `T`, which owns it exclusively, and the
@@ -1920,21 +1967,19 @@ impl Sender {
     {
         let Self {
             inner,
-            native: Shared { video, owner },
+            native,
             _mode,
         } = self;
-        // Shared owns exactly two references: its owner and the pipeline's.
-        // With no other reference, no registration can create another one.
-        if Arc::strong_count(&owner) != 2 {
-            return Err(Self {
-                inner,
-                native: Shared { video, owner },
-                _mode,
-            });
-        }
-        let retained = video.retire();
-        let resource =
-            Arc::try_unwrap(owner).unwrap_or_else(|_| unreachable!("exclusive pipeline owner"));
+        let (resource, retained) = match native.into_exclusive() {
+            Ok(exclusive) => exclusive,
+            Err(native) => {
+                return Err(Self {
+                    inner,
+                    native,
+                    _mode,
+                });
+            }
+        };
         let sender = Sender {
             inner,
             native: Exclusive(resource),
@@ -2183,7 +2228,7 @@ impl<M: SenderMode> Sender<M> {
 
     /// The core entry points of the runtime that created this sender.
     #[cfg(feature = "advanced")]
-    pub(crate) fn core(&self) -> &'static sys::Core {
+    pub(crate) fn core(&self) -> &sys::Core {
         self.resource().core()
     }
 
@@ -2268,7 +2313,7 @@ impl<M: SenderMode> Sender<M> {
                     self.resource().ndi(),
                     crate::capture::SenderMetadataInstance {
                         instance: self.resource().instance(),
-                        metadata,
+                        free: metadata.NDIlib_send_free_metadata,
                     },
                     raw,
                 )
@@ -2678,6 +2723,10 @@ mod tests {
     use super::*;
     use crate::RuntimeFeature;
 
+    mod shared_ownership {
+        include!("sender_shared_tests.rs");
+    }
+
     #[test]
     fn metadata_capture_lease_moves_threads_and_retains_the_wait_budget() {
         let gate = SenderMetadataGate::default();
@@ -2775,7 +2824,7 @@ mod tests {
             Guard::<SenderMetadataFree>::with_test_free(
                 SenderMetadataInstance {
                     instance: (&observation as *const Observation).cast_mut().cast(),
-                    metadata: table,
+                    free: table.NDIlib_send_free_metadata,
                 },
                 raw,
                 observe_free,
@@ -2793,7 +2842,7 @@ mod tests {
                 assert!(panic.is_err());
             }
             "normal" => drop(frame.unwrap()),
-            _ => unreachable!(),
+            _ => panic!("unknown metadata guard test path"),
         }
         assert_eq!(observation.frees.load(Ordering::Relaxed), 1);
         assert!(!observation.released_early.load(Ordering::Relaxed));
