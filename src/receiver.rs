@@ -30,6 +30,8 @@
 
 #[cfg(test)]
 use crate::RuntimeFeature;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 
 #[cfg(feature = "advanced")]
 use crate::advanced::{AvSyncAttached, PacketAttached};
@@ -40,7 +42,7 @@ use std::{
     os::raw::c_char,
     ptr,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -64,6 +66,9 @@ use crate::{
 };
 
 pub(crate) mod attached;
+mod pending;
+
+pub(crate) use pending::PendingEvents;
 
 /// A string the receiver API returned, released when dropped.
 struct RecvStringGuard<'a> {
@@ -1244,9 +1249,7 @@ pub(crate) struct ReceiverCore {
     /// snapshots never take it and therefore never wait for a capture or a queued
     /// connection change. Writers hold this lock only to replace the value.
     target: RwLock<RetainedSource>,
-    pending_status: PendingStatus,
-    pending_source: AtomicBool,
-    pending_unknown: Mutex<LatestReport<u32>>,
+    pending: PendingEvents,
     // Only native source-name queries take this permit. Replaying an abandoned
     // result takes the separate short lock, never waiting for the SDK.
     source_query_guard: Mutex<()>,
@@ -1372,9 +1375,7 @@ impl<M: CreatableMode> Receiver<M> {
                 _ndi: ndi.clone(),
                 connection_guard: Mutex::new(ConnectionPermit),
                 target: RwLock::new(RetainedSource::new(&options.source)),
-                pending_status: PendingStatus::default(),
-                pending_source: AtomicBool::new(false),
-                pending_unknown: Mutex::new(LatestReport::default()),
+                pending: PendingEvents::default(),
                 source_query_guard: Mutex::new(()),
                 source_name: Mutex::new(LatestReport::default()),
                 connection_metadata: Mutex::new(ConnectionMetadata::default()),
@@ -2103,7 +2104,7 @@ impl ReceiverCore {
     /// The kernel's delivery boundary. Notifications always coalesce through
     /// `event`, including a native miss when a typed capture retained an event
     /// during the wait. A caller can convert only media from its slot set.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "advanced"))]
     pub(crate) fn capture_any_result_with<'rx, S: SlotSet, T>(
         &'rx self,
         delivered: Delivered<'rx, S>,
@@ -2138,7 +2139,7 @@ impl ReceiverCore {
 
     #[cfg(test)]
     fn take_pending_status(&self) -> Result<Option<ReceiverStatus>> {
-        self.pending_status.take_with(|| self.current_status())
+        self.pending.status.take_with(|| self.current_status())
     }
 
     fn connections(&self) -> Result<u32> {
@@ -2159,25 +2160,13 @@ impl ReceiverCore {
 
     /// Keep a notification a capture reported for [`Receiver::next_event`].
     fn retain(&self, notification: Notification) {
-        match notification {
-            Notification::None => {}
-            Notification::StatusChanged => self.pending_status.publish(),
-            Notification::SourceChanged => self.pending_source.store(true, Ordering::Release),
-            Notification::Unknown(value) => self.pending_unknown.lock().publish(value),
-        }
+        self.pending.publish(notification);
     }
 
     /// Return an undelivered async event without overwriting a newer report.
     #[cfg(any(feature = "tokio", feature = "smol"))]
     pub(crate) fn retain_event(&self, event: ReceiverReport<ReceiverEvent>) {
-        match event.value {
-            ReceiverEvent::StatusChanged(_) => self.pending_status.publish(),
-            ReceiverEvent::SourceChanged => self.pending_source.store(true, Ordering::Release),
-            ReceiverEvent::Unknown(value) => self.pending_unknown.lock().replay(ReceiverReport {
-                sequence: event.sequence,
-                value,
-            }),
-        }
+        self.pending.replay(event);
     }
 
     #[cfg(any(feature = "tokio", feature = "smol"))]
@@ -2185,35 +2174,8 @@ impl ReceiverCore {
         self.source_name.lock().replay(change);
     }
 
-    #[cfg(test)]
-    fn take_pending_event(&self) -> Result<Option<ReceiverEvent>> {
-        self.take_pending_event_report()
-            .map(|event| event.map(ReceiverReport::into_value))
-    }
-
     fn take_pending_event_report(&self) -> Result<Option<ReceiverReport<ReceiverEvent>>> {
-        if let Some(event) = self.pending_status.take_or_else_with(
-            || {
-                self.current_status()
-                    .map(ReceiverEvent::StatusChanged)
-                    .map(ReceiverReport::unsequenced)
-            },
-            || self.take_pending_non_status_event(),
-        )? {
-            return Ok(Some(event));
-        }
-        Ok(self.take_pending_non_status_event())
-    }
-
-    fn take_pending_non_status_event(&self) -> Option<ReceiverReport<ReceiverEvent>> {
-        if self.pending_source.swap(false, Ordering::AcqRel) {
-            return Some(ReceiverReport::unsequenced(ReceiverEvent::SourceChanged));
-        }
-        self.pending_unknown
-            .lock()
-            .pending
-            .take()
-            .map(|report| report.map(ReceiverEvent::Unknown))
+        self.pending.take(|| self.current_status())
     }
 
     /// The one implementation of [`Receiver::wait_for_source_name_change`], also
@@ -3023,7 +2985,7 @@ mod tests {
             assert_eq!(actual, expected);
         }
         assert_eq!(native_capture_calls::take(), 0);
-        assert_eq!(receiver.core.take_pending_event().unwrap(), None);
+        assert!(receiver.core.take_pending_event_report().unwrap().is_none());
     }
 
     #[test]
@@ -3085,46 +3047,25 @@ mod tests {
     }
 
     #[test]
-    fn media_source_and_unknown_events_are_retained_for_next_event() {
+    fn typed_capture_paths_publish_notifications() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        for _ in 0..3 {
+        fn check<K: CaptureKind>(receiver: &Receiver) {
             assert!(receiver
                 .core
-                .capture_result::<VideoKind>(CaptureResult::Notification(
-                    Notification::SourceChanged
-                ))
+                .capture_result::<K>(CaptureResult::Notification(Notification::SourceChanged))
                 .unwrap()
                 .is_none());
+            assert!(matches!(
+                receiver.next_event(Duration::ZERO).unwrap(),
+                Some(ReceiverEvent::SourceChanged)
+            ));
         }
-        receiver.core.retain(Notification::classify(987).unwrap());
-        assert!(matches!(
-            receiver.core.take_pending_event().unwrap(),
-            Some(ReceiverEvent::SourceChanged)
-        ));
-        assert!(matches!(
-            receiver.core.take_pending_event().unwrap(),
-            Some(ReceiverEvent::Unknown(987))
-        ));
-        assert!(receiver.core.take_pending_event().unwrap().is_none());
-        assert!(receiver
-            .core
-            .capture_result::<VideoKind>(CaptureResult::Notification(Notification::Unknown(988)))
-            .unwrap()
-            .is_none());
-        receiver.core.retain(
-            Notification::classify(NDIlib_frame_type_e_NDIlib_frame_type_source_change).unwrap(),
-        );
-        assert!(matches!(
-            receiver.core.take_pending_event().unwrap(),
-            Some(ReceiverEvent::SourceChanged)
-        ));
-        assert!(matches!(
-            receiver.core.take_pending_event().unwrap(),
-            Some(ReceiverEvent::Unknown(988))
-        ));
+        check::<VideoKind>(&receiver);
+        check::<AudioKind>(&receiver);
+        check::<MetadataKind>(&receiver);
     }
 
     #[test]
@@ -3616,41 +3557,6 @@ mod tests {
     }
 
     #[test]
-    fn media_status_is_retained_coalesced_and_consumed_once() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        fn check<K: CaptureKind>(receiver: &Receiver) {
-            let (_, allocations) = crate::test_alloc::allocation_count(|| {
-                for _ in 0..3 {
-                    assert!(receiver
-                        .core
-                        .capture_result::<K>(CaptureResult::Notification(
-                            Notification::StatusChanged
-                        ))
-                        .unwrap()
-                        .is_none());
-                }
-                assert!(receiver
-                    .core
-                    .capture_result::<K>(CaptureResult::Notification(Notification::None))
-                    .unwrap()
-                    .is_none());
-                assert!(matches!(
-                    receiver.core.take_pending_event().unwrap(),
-                    Some(ReceiverEvent::StatusChanged(_))
-                ));
-                assert!(receiver.core.take_pending_event().unwrap().is_none());
-            });
-            assert_eq!(allocations, 0);
-        }
-        check::<VideoKind>(&receiver);
-        check::<AudioKind>(&receiver);
-        check::<MetadataKind>(&receiver);
-    }
-
-    #[test]
     fn pending_status_keeps_failed_and_newer_publications() {
         let pending = PendingStatus::default();
         pending.publish();
@@ -3788,14 +3694,14 @@ mod tests {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        receiver.core.pending_status.publish();
+        receiver.core.pending.status.publish();
         assert!(receiver.next_event(Duration::MAX).is_err());
-        assert!(receiver.core.pending_status.is_pending());
+        assert!(receiver.core.pending.status.is_pending());
         assert!(matches!(
             receiver.next_event(Duration::ZERO).unwrap(),
             Some(ReceiverEvent::StatusChanged(_))
         ));
-        assert!(!receiver.core.pending_status.is_pending());
+        assert!(!receiver.core.pending.status.is_pending());
     }
 
     #[test]
@@ -3824,7 +3730,7 @@ mod tests {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        receiver.core.pending_status.publish();
+        receiver.core.pending.status.publish();
         let barrier = std::sync::Barrier::new(3);
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..2)
@@ -3846,7 +3752,7 @@ mod tests {
                 1
             );
         });
-        receiver.core.pending_status.publish();
+        receiver.core.pending.status.publish();
         assert!(receiver.core.take_pending_status().unwrap().is_some());
     }
 
@@ -3971,132 +3877,22 @@ mod tests {
     }
 
     #[test]
-    fn combined_native_notifications_coalesce_with_events_retained_during_the_wait() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        let deliver = |notification| {
-            receiver.core.capture_any_result_with::<AllSlots, _>(
-                Delivered::Notification(notification),
-                ReceiverItemRef::Event,
-                ReceiverCore::combined_result,
-            )
-        };
-        receiver.core.retain(Notification::SourceChanged);
-        assert!(matches!(
-            deliver(Notification::SourceChanged).unwrap(),
-            Some(ReceiverItemRef::Event(ReceiverEvent::SourceChanged))
-        ));
-        assert!(
-            receiver.core.take_pending_event().unwrap().is_none(),
-            "same invalidation must not replay"
-        );
-        receiver.core.retain(Notification::Unknown(987));
-        assert!(matches!(
-            deliver(Notification::None).unwrap(),
-            Some(ReceiverItemRef::Event(ReceiverEvent::Unknown(987)))
-        ));
-        assert!(receiver.core.take_pending_event().unwrap().is_none());
-    }
-
-    #[test]
-    fn mixed_native_misses_deliver_concurrently_retained_events_once_without_allocating() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-
-        fn check<S: SlotSet>(core: &ReceiverCore) {
-            let deliver = |notification| {
-                core.capture_any_result_with::<S, _>(
-                    Delivered::Notification(notification),
-                    |event| event,
-                    |_| panic!("a notification must never reach the media converter"),
-                )
-                .unwrap()
-            };
-            assert_eq!(deliver(Notification::None), None);
-            assert_eq!(
-                deliver(Notification::Unknown(987)),
-                Some(ReceiverEvent::Unknown(987))
-            );
-            assert_eq!(deliver(Notification::None), None);
-
-            // Model a typed capture retaining events after the kernel's last
-            // pending check but before its native wait returns without media.
-            std::thread::scope(|scope| {
-                scope
-                    .spawn(|| {
-                        core.retain(Notification::SourceChanged);
-                        core.retain(Notification::Unknown(988));
-                    })
-                    .join()
-                    .unwrap();
-            });
-            let (events, allocations) = crate::test_alloc::allocation_count(|| {
-                [
-                    deliver(Notification::None),
-                    deliver(Notification::None),
-                    deliver(Notification::None),
-                ]
-            });
-            assert_eq!(allocations, 0);
-            assert_eq!(
-                events,
-                [
-                    Some(ReceiverEvent::SourceChanged),
-                    Some(ReceiverEvent::Unknown(988)),
-                    None,
-                ]
-            );
-        }
-
-        check::<AllSlots>(&receiver.core);
-        check::<NoSlots>(&receiver.core);
-    }
-
-    #[test]
-    fn status_publication_is_consumed_once_and_newer_publication_survives() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        receiver
-            .core
-            .capture_result::<AudioKind>(CaptureResult::Notification(Notification::StatusChanged))
-            .unwrap();
-        assert!(receiver.core.take_pending_status().unwrap().is_some());
-
-        // Publishing a pending notification needs no local connection lock.
-        let _exclusive = receiver.core.lock_connection();
-        receiver
-            .core
-            .capture_result::<VideoKind>(CaptureResult::Notification(Notification::StatusChanged))
-            .unwrap();
-        assert!(matches!(
-            receiver.next_event(Duration::ZERO).unwrap(),
-            Some(ReceiverEvent::StatusChanged(_))
-        ));
-    }
-
-    #[test]
     fn receiver_mode_transitions_preserve_pending_status_and_core_identity() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         let original_core = Arc::as_ptr(&receiver.core);
-        receiver.core.pending_status.publish();
+        receiver.core.pending.status.publish();
         let fs = crate::FrameSync::new(receiver).unwrap();
-        assert!(fs.receiver().core.pending_status.is_pending());
+        assert!(fs.receiver().core.pending.status.is_pending());
         assert_eq!(Arc::as_ptr(&fs.receiver().core), original_core);
         let receiver = fs.into_receiver();
         assert!(matches!(
             receiver.next_event(Duration::ZERO).unwrap(),
             Some(ReceiverEvent::StatusChanged(_))
         ));
-        assert!(!receiver.core.pending_status.is_pending());
+        assert!(!receiver.core.pending.status.is_pending());
         assert_eq!(Arc::as_ptr(&receiver.core), original_core);
         assert_eq!(
             std::mem::size_of::<Receiver>(),

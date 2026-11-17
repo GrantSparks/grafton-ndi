@@ -395,6 +395,8 @@ MIRI_BATCHES = {
         'frames::metadata_tests::audio_timestamp',
         'receiver::mixed_tests',
         'receiver::latest_report_tests::',
+        'receiver::pending::tests::',
+        'asynchronous::receiver_tests::receiver_delivery_replays_only_while_armed',
         'asynchronous::scoped_tests',
         'framesync::tests::test_framesync_video_ref_uses',
         'framesync::tests::test_framesync_audio_ref_supports',

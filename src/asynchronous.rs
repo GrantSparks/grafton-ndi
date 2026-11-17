@@ -404,13 +404,13 @@ fn process_captured<V, T>(captured: Option<V>, process: impl FnOnce(&V) -> T) ->
 
 /// A completed notification is either delivered to its future or returned to
 /// the receiver when the runtime drops an abandoned worker's output.
-struct ReceiverDelivery<T: ReplayReceiverValue> {
-    receiver: Arc<Receiver>,
+struct ReceiverDelivery<T: ReplayReceiverValue<R>, R = Receiver> {
+    receiver: Arc<R>,
     value: Option<T>,
 }
 
-impl<T: ReplayReceiverValue> ReceiverDelivery<T> {
-    fn new(receiver: Arc<Receiver>, value: T) -> Self {
+impl<T: ReplayReceiverValue<R>, R> ReceiverDelivery<T, R> {
+    fn new(receiver: Arc<R>, value: T) -> Self {
         Self {
             receiver,
             value: Some(value),
@@ -425,7 +425,7 @@ impl<T: ReplayReceiverValue> ReceiverDelivery<T> {
     }
 }
 
-impl<T: ReplayReceiverValue> Drop for ReceiverDelivery<T> {
+impl<T: ReplayReceiverValue<R>, R> Drop for ReceiverDelivery<T, R> {
     fn drop(&mut self) {
         if let Some(value) = self.value.take() {
             value.replay(&self.receiver);
@@ -433,10 +433,10 @@ impl<T: ReplayReceiverValue> Drop for ReceiverDelivery<T> {
     }
 }
 
-trait ReplayReceiverValue {
+trait ReplayReceiverValue<R = Receiver> {
     type Value;
     fn into_value(self) -> Self::Value;
-    fn replay(self, receiver: &Receiver);
+    fn replay(self, receiver: &R);
 }
 
 impl ReplayReceiverValue for ReceiverReport<ReceiverEvent> {
@@ -1300,7 +1300,7 @@ mod executor_tests {
 #[cfg(test)]
 mod receiver_tests {
     use super::*;
-    use crate::{Ndi, ReceiverOptions, RuntimeFeature};
+    use crate::{receiver::PendingEvents, Ndi, ReceiverOptions, RuntimeFeature};
 
     /// An async receiver of `ndi` that stays unconnected: its source has no
     /// name and no address.
@@ -1310,24 +1310,36 @@ mod receiver_tests {
         )
     }
 
+    impl ReplayReceiverValue<PendingEvents> for ReceiverReport<ReceiverEvent> {
+        type Value = ReceiverEvent;
+        fn into_value(self) -> Self::Value {
+            self.value
+        }
+        fn replay(self, pending: &PendingEvents) {
+            pending.replay(self);
+        }
+    }
+
     #[test]
     fn receiver_delivery_replays_only_while_armed() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
+        let pending = Arc::new(PendingEvents::default());
+        let take = || {
+            pending
+                .take(|| Ok(crate::ReceiverStatus::default()))
+                .unwrap()
+                .map(ReceiverReport::into_value)
         };
-        let receiver =
-            Arc::new(Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap());
         let event = ReceiverEvent::SourceChanged;
         drop(ReceiverDelivery::new(
-            Arc::clone(&receiver),
+            Arc::clone(&pending),
             ReceiverReport::unsequenced(event),
         ));
-        assert_eq!(receiver.next_event(Duration::ZERO).unwrap(), Some(event));
+        assert_eq!(take(), Some(event));
         assert_eq!(
-            ReceiverDelivery::new(Arc::clone(&receiver), ReceiverReport::unsequenced(event)).take(),
+            ReceiverDelivery::new(Arc::clone(&pending), ReceiverReport::unsequenced(event)).take(),
             event
         );
-        assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
+        assert_eq!(take(), None);
     }
 
     // Scoped entry points keep capturing while local connection changes are
