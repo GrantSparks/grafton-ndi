@@ -501,10 +501,12 @@ fn a_server_that_cannot_bind_its_port_is_reported_and_started_elsewhere() {
     assert!(failure.contains("exited with"), "{failure}");
     assert!(failure.contains("NDI Discovery Service"), "{failure}");
 
-    // A start that is given another port to fall back on succeeds there.
-    let free = free_port();
-    let server = Server::start_on_one_of(&binary, [taken_port, free]);
-    assert_eq!(server.port, free);
+    // Keep the deliberately occupied port first, then choose each fallback
+    // only when it is attempted. A free port can still be taken before the
+    // child binds it, so allow the same bounded retries as an ordinary start.
+    let ports = std::iter::once(taken_port).chain(std::iter::repeat_with(free_port).take(5));
+    let server = Server::start_on_one_of(&binary, ports);
+    assert_ne!(server.port, taken_port);
 }
 
 /// Whether a process still runs: a killed process that nothing has reaped yet
