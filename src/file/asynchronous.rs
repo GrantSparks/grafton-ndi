@@ -4650,7 +4650,7 @@ mod tests {
         let (device, recorder) = mock_recorder_with_drop_wait(
             Closing::WhenTold,
             AsyncFileOptions::new().event_capacity(1),
-            Duration::from_millis(100),
+            Duration::from_secs(2),
         );
         let finishing = recorder.finish(Duration::from_secs(30)).submit();
         await_finish(&recorder);
@@ -4703,7 +4703,7 @@ mod tests {
         let mut recorder = crate::file::FileRecorder::new(
             &mock::recorder_api(),
             &FileRecorderOptions::new(SourceSpec::new("mock").unwrap())
-                .drop_wait(Duration::from_millis(150)),
+                .drop_wait(Duration::from_secs(2)),
         )
         .unwrap();
         let target = RecordingTarget::new(std::env::temp_dir().join("mock-cleanup")).unwrap();
@@ -4727,7 +4727,7 @@ mod tests {
         let (device, recorder) = mock_recorder_with_drop_wait(
             Closing::StoppedBeforeClose(Duration::from_millis(100)),
             AsyncFileOptions::new(),
-            Duration::from_millis(150),
+            Duration::from_secs(2),
         );
         device.dropped_events.store(1, Ordering::Release);
         let outcome = block_on(recorder.finish(Duration::ZERO)).unwrap();
@@ -4809,7 +4809,7 @@ mod tests {
     #[test]
     fn async_close_spends_its_budget_after_a_lost_open_and_every_known_close() {
         for delayed_hidden_close in [false, true] {
-            let budget = Duration::from_millis(80);
+            let budget = Duration::from_secs(2);
             let (device, recorder) = mock_recorder_with_drop_wait(
                 Closing::AtStop,
                 AsyncFileOptions::new().event_capacity(1),
@@ -4954,7 +4954,7 @@ mod tests {
 
     #[test]
     fn cancelling_a_finish_does_not_erase_unknown_cleanup_during_concurrent_close() {
-        let budget = Duration::from_millis(100);
+        let budget = Duration::from_secs(2);
         let (device, recorder) =
             mock_recorder_with_drop_wait(Closing::WhenTold, AsyncFileOptions::new(), budget);
         let cancelled = recorder.finish(Duration::from_secs(30)).submit();

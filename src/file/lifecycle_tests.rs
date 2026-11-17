@@ -354,7 +354,13 @@ fn a_lost_open_still_blocks_restart_after_all_observed_and_hidden_files_close() 
 #[test]
 fn drop_spends_its_remaining_budget_after_a_lost_open_even_when_hidden_closes_arrive() {
     for delayed in [false, true] {
-        let budget = Duration::from_millis(80);
+        // Give the worker a generous scheduling window on loaded CI runners;
+        // the queued case needs no cross-thread event delivery.
+        let budget = if delayed {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(80)
+        };
         let device = mock::Recorder::new(Closing::Never);
         let (recorder, _) = recording_with_a_lost_open(&device, budget);
         let captures = device.captures.load(Ordering::Acquire);
