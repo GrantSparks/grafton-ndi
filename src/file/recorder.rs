@@ -22,6 +22,9 @@ use crate::{
     Error, MediaTypes, MetadataSource, Result,
 };
 
+mod tracker;
+use tracker::FileTracker;
+
 /// The longest single wait for an event while finalization is pending. Short
 /// enough that a caller's interruption is noticed promptly.
 const FINISH_POLL: Duration = Duration::from_millis(25);
@@ -202,8 +205,10 @@ impl RecordingReport {
 /// `wait_for_finish` methods return `None` on timeout and `Some` for a closed or
 /// indeterminate session.
 ///
-/// A synchronous recorder stays usable whatever the outcome. An async
-/// recorder can be closed by another clone while the operation is running.
+/// A synchronous recorder stays usable whatever the outcome, but incomplete
+/// file tracking requires [`FileRecorder::reset`] before another session can
+/// start. An async recorder can be closed by another clone while the operation
+/// is running.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum FinishStatus {
@@ -220,7 +225,9 @@ pub enum FinishStatus {
     /// instead when closure cannot be established in its remaining budget.
     TimedOut(RecordingReport),
     /// The session ended, but its events do not show that every file was
-    /// finalized. Waiting longer will not change this.
+    /// finalized. Waiting longer will not change this report. Incomplete file
+    /// tracking requires [`FileRecorder::reset`] before another session starts;
+    /// cleanup still consumes its remaining budget even if all known files close.
     Indeterminate(RecordingReport),
 }
 
@@ -240,6 +247,8 @@ struct OpenFile {
     path: EventText,
     /// The SDK reported the first audio or video packet written to it.
     has_media: bool,
+    /// Opening order is independent of the tracker's path-sorted storage.
+    order: u64,
 }
 
 /// The one budget for stopping and destroying this native recorder.
@@ -590,9 +599,8 @@ struct StopOwed;
 
 struct OpenSession {
     report: SessionReport,
-    open_files: Vec<OpenFile>,
+    files: FileTracker,
     records_media: bool,
-    uncertain: bool,
     dropped_base: u64,
 }
 
@@ -612,7 +620,8 @@ enum Session {
     },
     Ended {
         report: RecordingReport,
-        pending: Vec<OpenFile>,
+        files: FileTracker,
+        dropped_base: u64,
     },
 }
 
@@ -640,9 +649,8 @@ impl Ledger {
             session: Session::Open {
                 data: OpenSession {
                     report: SessionReport::new(session),
-                    open_files: Vec::new(),
+                    files: FileTracker::new(),
                     records_media,
-                    uncertain: false,
                     dropped_base,
                 },
                 stop: StopOwed,
@@ -668,7 +676,8 @@ impl Ledger {
             SessionPhase::Closed { .. } | SessionPhase::Indeterminate { .. } => Self {
                 session: Session::Ended {
                     report: SessionReport::new(session).into_report(phase),
-                    pending: Vec::new(),
+                    files: FileTracker::new(),
+                    dropped_base,
                 },
             },
         }
@@ -725,21 +734,34 @@ impl Ledger {
         )
     }
 
-    fn files(&self) -> &[OpenFile] {
+    fn tracker(&self) -> Option<&FileTracker> {
         match &self.session {
-            Session::Open { data, .. } | Session::Stopping { data, .. } => &data.open_files,
-            Session::Ended { pending, .. } => pending,
-            Session::Idle { .. } => &[],
+            Session::Open { data, .. } | Session::Stopping { data, .. } => Some(&data.files),
+            Session::Ended { files, .. } => Some(files),
+            Session::Idle { .. } => None,
         }
     }
 
+    fn tracker_mut(&mut self) -> Option<&mut FileTracker> {
+        match &mut self.session {
+            Session::Open { data, .. } | Session::Stopping { data, .. } => Some(&mut data.files),
+            Session::Ended { files, .. } => Some(files),
+            Session::Idle { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn files(&self) -> &[OpenFile] {
+        self.tracker().map_or(&[], FileTracker::files)
+    }
+
     fn cleanup_pending(&self) -> bool {
-        self.session_open() || !self.files().is_empty()
+        self.session_open() || self.tracker().is_some_and(FileTracker::cleanup_pending)
     }
 
     fn all_closed(&self) -> bool {
         self.open()
-            .is_some_and(|data| data.open_files.is_empty() && data.report.closed_files > 0)
+            .is_some_and(|data| !data.files.cleanup_pending() && data.report.closed_files > 0)
     }
 
     fn settle(&self, expired: bool, drained: bool) -> Option<FinishStatus> {
@@ -768,67 +790,68 @@ impl Ledger {
     }
 
     fn mark_uncertain(&mut self) {
-        if let Some(data) = self.open_mut() {
-            data.uncertain = true;
+        if let Some(files) = self.tracker_mut() {
+            files.mark_incomplete();
         }
     }
 
     #[cfg(test)]
     fn is_uncertain(&self) -> bool {
-        self.open().is_some_and(|data| data.uncertain)
+        self.tracker().is_some_and(|files| !files.is_complete())
     }
 
     fn dropped(&mut self, cumulative: u64) {
-        let Some(data) = self.open_mut() else {
-            return;
-        };
-        data.report.dropped_events = cumulative.saturating_sub(data.dropped_base);
-        if cumulative != data.dropped_base {
-            data.uncertain = true;
+        match &mut self.session {
+            Session::Open { data, .. } | Session::Stopping { data, .. } => {
+                data.report.dropped_events = cumulative.saturating_sub(data.dropped_base);
+                if cumulative != data.dropped_base {
+                    data.files.mark_incomplete();
+                }
+            }
+            Session::Ended {
+                files,
+                dropped_base,
+                ..
+            } => {
+                if cumulative != *dropped_base {
+                    files.mark_incomplete();
+                }
+            }
+            Session::Idle { .. } => {}
         }
     }
 
     fn observe(&mut self, kind: RecorderEventKind, path: EventText) -> Option<StopOwed> {
-        let exact =
-            !path.as_bytes().is_empty() && path.is_terminated() && !path.is_possibly_truncated();
         let Some(data) = self.open_mut() else {
             // Cleanup evidence cannot change a report already returned.
-            if let Session::Ended { pending, .. } = &mut self.session {
-                if kind == RecorderEventKind::FileClosed && exact {
-                    if let Some(index) = pending.iter().position(|open| open.path == path) {
-                        pending.remove(index);
+            if let Some(files) = self.tracker_mut() {
+                match kind {
+                    RecorderEventKind::Started
+                    | RecorderEventKind::Rollover
+                    | RecorderEventKind::Unknown(_) => {
+                        // A late open contradicts the finalized complete set;
+                        // an unknown identifier could describe another open.
+                        files.mark_incomplete();
                     }
+                    RecorderEventKind::FirstFrame => files.first_frame(&path),
+                    RecorderEventKind::FileClosed => {
+                        files.close(&path);
+                    }
+                    _ => {}
                 }
             }
             return None;
         };
         match kind {
             RecorderEventKind::Started | RecorderEventKind::Rollover => {
-                if !exact
-                    || data.open_files.iter().any(|open| open.path == path)
-                    || (kind == RecorderEventKind::Started && !data.open_files.is_empty())
-                {
-                    data.uncertain = true;
-                }
-                data.open_files.push(OpenFile {
-                    path,
-                    has_media: false,
-                });
+                data.files.open(kind, path);
             }
             RecorderEventKind::FirstFrame => {
-                if let Some(open) = data.open_files.iter_mut().find(|open| open.path == path) {
-                    open.has_media = true;
-                }
+                data.files.first_frame(&path);
             }
             RecorderEventKind::FileClosed => {
-                match data.open_files.iter().position(|open| open.path == path) {
-                    Some(index) if exact => {
-                        let closed = data.open_files.remove(index);
-                        if data.records_media && !closed.has_media {
-                            data.report.empty_files = data.report.empty_files.saturating_add(1);
-                        }
-                    }
-                    _ => data.uncertain = true,
+                if data.files.close(&path) == Some(false) && data.records_media {
+                    data.report.empty_files = data.report.empty_files.saturating_add(1);
                 }
                 data.report.closed_files = data.report.closed_files.saturating_add(1);
                 data.report.last_closed_path = Some(path);
@@ -843,6 +866,7 @@ impl Ledger {
             RecorderEventKind::WriteFailed => {
                 data.report.write_failures = data.report.write_failures.saturating_add(1);
             }
+            RecorderEventKind::Unknown(_) => data.files.mark_incomplete(),
             _ => {}
         }
         None
@@ -859,11 +883,11 @@ impl Ledger {
             Session::Stopping { requested, .. } => requested,
             _ => false,
         };
-        let phase = if data.uncertain {
+        let phase = if !data.files.is_complete() {
             SessionPhase::Indeterminate { requested }
-        } else if data.open_files.is_empty() && data.report.closed_files > 0 {
+        } else if data.files.is_empty() && data.report.closed_files > 0 {
             SessionPhase::Closed { requested }
-        } else if matches!(self.session, Session::Stopping { .. }) && data.open_files.is_empty() {
+        } else if matches!(self.session, Session::Stopping { .. }) && data.files.is_empty() {
             SessionPhase::Indeterminate { requested }
         } else {
             return None;
@@ -876,7 +900,8 @@ impl Ledger {
         };
         self.session = Session::Ended {
             report: data.report.into_report(phase),
-            pending: data.open_files,
+            files: data.files,
+            dropped_base: data.dropped_base,
         };
         stop
     }
@@ -912,10 +937,13 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 /// event. [`finish`](Self::finish) performs both and reports the outcome;
 /// treat a recording as complete only when it returns
 /// [`FinishStatus::Closed`]. Dropping a recorder waits up to
-/// [`FileRecorderOptions::drop_wait`] while the session is open or a file it
-/// reported open has not been reported closed, including after an
-/// indeterminate outcome. This budget starts at drop and includes the native
-/// stop; synchronous `finish` starts its event wait after the stop returns.
+/// [`FileRecorderOptions::drop_wait`] while the session is open or file cleanup
+/// remains pending, including after an indeterminate outcome. Native event
+/// loss, unreadable lifecycle evidence or a tracking limit makes the file set
+/// incomplete. Even if every known file closes, drop then consumes the
+/// remaining original budget and another session requires [`reset`](Self::reset).
+/// This budget starts at drop and includes the native stop; synchronous
+/// `finish` starts its event wait after the stop returns.
 /// Drop cannot report whether cleanup succeeded;
 /// [`abandon`](Self::abandon) skips the wait.
 ///
@@ -933,6 +961,10 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 /// the session is kept in the [`report`](Self::report) either way. The SDK
 /// discards events that are not taken promptly, and a session that lost
 /// events can no longer be confirmed closed, so poll throughout a recording.
+/// File bookkeeping retains at most 16,384 entries and 16 MiB, accounting for
+/// entry storage and path capacity. Exceeding either private limit or failing
+/// to reserve storage makes tracking incomplete without dropping delivered
+/// events or changing the native dropped-event count.
 ///
 /// A recorder belongs to the thread that created it, so it is neither
 /// [`Send`] nor [`Sync`]: the File API documents no thread on which a
@@ -1127,9 +1159,10 @@ impl FileRecorder {
     /// # Errors
     ///
     /// * [`Error::InvalidState`] with [`StateConflict::PreviousSessionOpen`]
-    ///   while an earlier session is recording, stopping, or still has a
-    ///   known file awaiting its closure event after an indeterminate outcome;
-    ///   finish or poll it first, or [`reset`](Self::reset) it. With
+    ///   while an earlier session is recording, stopping, awaiting a known
+    ///   file's closure, or has incomplete file tracking. Finish or poll it
+    ///   first when tracking is complete; incomplete tracking requires
+    ///   [`reset`](Self::reset), even after every known file closes. With
     ///   [`StateConflict::EarlierSessionEvents`] when the SDK keeps reporting
     ///   events of an earlier session.
     /// * [`Error::InvalidInput`] when the resolved output path is not lossless
@@ -1165,6 +1198,13 @@ impl FileRecorder {
         self.naming.check(target)?;
         // Events left over from an earlier session must not be counted in this one.
         self.discard_stale_events(sink)?;
+        // Draining may reveal lost or inconsistent lifecycle evidence for a
+        // previously final session. Its immutable report does not release
+        // the resulting unknown native-file obligation.
+        self.ledger.dropped(self.dropped_event_count());
+        if self.ledger.cleanup_pending() {
+            return Err(Error::InvalidState(StateConflict::PreviousSessionOpen));
+        }
         let session = self
             .ledger
             .session_number()
@@ -1272,7 +1312,9 @@ impl FileRecorder {
     /// [`Error::UnexpectedSdkResult`] for a whole-event layout or type mismatch.
     fn poll_event_ms(&mut self, wait_ms: u32) -> Result<Option<RecorderEvent>> {
         let event = self.capture(wait_ms);
-        if self.ledger.session_open() {
+        if self.ledger.cleanup_pending()
+            || (self.ledger.tracker().is_some() && !matches!(&event, Ok(None)))
+        {
             self.ledger.dropped(self.dropped_event_count());
         }
         let Some(event) = event.inspect_err(|_| self.ledger.mark_uncertain())? else {
@@ -1515,7 +1557,10 @@ impl FileRecorder {
     /// Abandon this native recorder and replace it with a new idle recorder.
     ///
     /// Use this after a finalization timeout when the SDK stopped producing
-    /// events and the old session cannot be confirmed closed. The returned
+    /// events, or after native event loss, unreadable lifecycle evidence or a
+    /// tracking limit made the old session's file tracking incomplete. Incomplete
+    /// tracking requires a reset before another session, even if all known
+    /// files later close. The returned
     /// report preserves that uncertainty; the old file may be truncated.
     /// The replacement has its own event queue, so delayed events from the old
     /// session cannot affect a new recording. The last report is retained and
@@ -1642,12 +1687,14 @@ impl FileRecorder {
         self.accepted_source.as_ref()
     }
 
-    /// The file the recorder's events reported open last and not yet closed.
+    /// The most recently opened file still retained in the file tracker.
     ///
-    /// The path is as the SDK gave it, and lags the recorder by the events not
-    /// yet taken.
+    /// The path is as the SDK gave it, and can lag events not yet taken. Once
+    /// tracking is incomplete, later opens are not retained; consume
+    /// [`next_event`](Self::next_event) for their paths. `None` does not prove
+    /// that no files remain open.
     pub fn reported_current_file(&self) -> Option<&EventText> {
-        self.ledger.files().last().map(|open| &open.path)
+        self.ledger.tracker().and_then(FileTracker::current)
     }
 
     /// Close the current file and continue the session in a new one named
@@ -2009,8 +2056,82 @@ mod tests {
         let _ = ledger.observe(FileClosed, path("other.mkv"));
         assert!(ledger.cleanup_pending());
         let _ = ledger.observe(FileClosed, path("take.mkv"));
-        assert!(!ledger.cleanup_pending());
+        assert!(ledger.cleanup_pending());
+        assert!(ledger.files().is_empty());
         assert_eq!(ledger.report(), report);
+    }
+
+    #[test]
+    fn a_lost_open_retains_unknown_cleanup_after_every_known_file_closes() {
+        let mut ledger = session();
+        let _ = ledger.observe(Started, path("known.mkv"));
+        // A rollover to hidden.mkv was discarded by the native event queue.
+        ledger.dropped(1);
+        let _ = ledger.observe(FileClosed, path("known.mkv"));
+        assert!(ledger.files().is_empty());
+        let stop = ledger.drained(false);
+        assert!(stop.is_some());
+        assert!(ledger.drained(false).is_none());
+        let report = ledger.report();
+        assert_eq!(ledger.state(), RecorderState::Indeterminate);
+        assert!(ledger.cleanup_pending());
+        let _ = ledger.observe(FileClosed, path("hidden.mkv"));
+        assert!(ledger.cleanup_pending());
+        assert_eq!(ledger.report(), report);
+    }
+
+    #[test]
+    fn an_unknown_event_keeps_cleanup_incomplete_without_inventing_native_loss() {
+        let mut ledger = session();
+        let _ = ledger.observe(Started, path("known.mkv"));
+        // A newer native identifier may describe a file lifecycle transition
+        // whose meaning this version of the wrapper cannot establish.
+        let _ = ledger.observe(RecorderEventKind::Unknown(4321), path("hidden.mkv"));
+        let _ = ledger.observe(FileClosed, path("known.mkv"));
+        assert!(ledger.files().is_empty());
+        let stop = ledger.drained(false);
+        assert!(stop.is_some());
+        assert_eq!(ledger.state(), RecorderState::Indeterminate);
+        assert!(ledger.cleanup_pending());
+        assert_eq!(ledger.report().dropped_events, 0);
+        assert_eq!(ledger.report().error_events, 0);
+        assert_eq!(ledger.report().write_failures, 0);
+    }
+
+    #[test]
+    fn later_evidence_preserves_a_final_report_and_taints_its_cleanup_knowledge() {
+        for evidence in 0..6 {
+            let mut ledger = session();
+            let _ = ledger.observe(Started, path("known.mkv"));
+            let _ = ledger.observe(FileClosed, path("known.mkv"));
+            let _ = ledger.drained(false);
+            assert_eq!(ledger.state(), RecorderState::Closed);
+            assert!(!ledger.cleanup_pending());
+            let report = ledger.report();
+            match evidence {
+                0 => ledger.dropped(1),
+                1 => ledger.mark_uncertain(),
+                2 => {
+                    let _ = ledger.observe(Rollover, path("hidden.mkv"));
+                }
+                3 => {
+                    let _ = ledger.observe(RecorderEventKind::FirstFrame, path("hidden.mkv"));
+                }
+                4 => {
+                    let _ = ledger.observe(FileClosed, path("hidden.mkv"));
+                }
+                5 => {
+                    let _ = ledger.observe(RecorderEventKind::Unknown(4321), path("hidden.mkv"));
+                }
+                _ => unreachable!(),
+            }
+            assert!(ledger.cleanup_pending(), "evidence {evidence}");
+            assert!(ledger.is_uncertain());
+            assert_eq!(ledger.report(), report);
+            let replacement = Ledger::inheriting(report.clone());
+            assert!(!replacement.cleanup_pending());
+            assert_eq!(replacement.report(), report);
+        }
     }
 
     #[test]

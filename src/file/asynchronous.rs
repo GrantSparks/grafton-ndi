@@ -2232,6 +2232,11 @@ impl AsyncFilePlayer {
 /// Await [`finish`](Self::finish) and check for [`FinishStatus::Closed`] to
 /// know a recording is complete, then await [`close`](Self::close). Neither
 /// blocks the executor.
+/// Native event loss, unreadable lifecycle evidence or a file-tracking limit
+/// requires [`reset`](Self::reset) before another session can start. Closing
+/// then uses the remaining cleanup budget even if every known file closes;
+/// the indeterminate report remains unchanged. Evicted application event
+/// notifications do not make native file tracking incomplete.
 ///
 /// # Dropping blocks
 ///
@@ -2304,6 +2309,8 @@ impl AsyncFileRecorder {
     /// [`SessionTimecode`](super::SessionTimecode), validated before queuing.
     /// Events left by an earlier refused start are delivered through
     /// [`next_event`](Self::next_event) before the new session begins.
+    /// Incomplete file tracking returns [`StateConflict::PreviousSessionOpen`]
+    /// until [`reset`](Self::reset) succeeds, even if all known files closed.
     #[doc(alias = "NDIlib_file_recorder_start")]
     #[doc(alias = "NDIlib_file_recorder_start_with_timecode")]
     pub fn start(
@@ -2454,7 +2461,8 @@ impl AsyncFileRecorder {
     pub fn last_accepted_source(&self) -> FileOperation<Option<SourceSpec>> {
         self.worker.call(|r| Ok(r.last_accepted_source().cloned()))
     }
-    /// The file the recorder's events reported open last and not yet closed.
+    /// The most recently opened file still retained in the file tracker; see
+    /// [`FileRecorder::reported_current_file`] for incomplete-tracking limits.
     pub fn reported_current_file(&self) -> FileOperation<Option<EventText>> {
         self.worker.call(|r| Ok(r.reported_current_file().cloned()))
     }
@@ -2516,8 +2524,10 @@ impl AsyncFileRecorder {
     /// [`FileRecorderOptions::drop_wait`] from this close's submission to finalize
     /// its file, including the native stop and time spent in a submitted finish
     /// or wait. A finish, queued or running, keeps its own earlier deadline; destruction then uses
-    /// only the remainder of the close's budget. A known file still awaiting
-    /// closure is given that time even after an indeterminate report. The future
+    /// only the remainder of the close's budget. Pending files are given that
+    /// time even after an indeterminate report. Incomplete tracking consumes
+    /// that remainder even if every known file closes: late events cannot prove
+    /// the unknown files finalized or change the final report. The future
     /// completes when the SDK has destroyed the recorder, and does not say
     /// whether the file was finalized: await [`finish`](Self::finish) first to
     /// learn that. Nothing blocks the calling thread. Once submitted by polling
@@ -4201,7 +4211,11 @@ mod tests {
 
     #[test]
     fn condition_wait_reports_an_indeterminate_session_as_a_settled_outcome() {
-        let (device, recorder) = mock_recorder(Closing::AtStop);
+        let (device, recorder) = mock_recorder_with_drop_wait(
+            Closing::AtStop,
+            AsyncFileOptions::new(),
+            Duration::from_millis(60),
+        );
         device.dropped_events.store(1, Ordering::Release);
         block_on(recorder.request_stop()).unwrap();
         let Some(FinishStatus::Indeterminate(report)) =
@@ -4633,7 +4647,11 @@ mod tests {
 
     #[test]
     fn an_in_flight_finish_still_reports_indeterminate_closure_and_delivers_events_during_close() {
-        let (device, recorder) = mock_recorder(Closing::WhenTold);
+        let (device, recorder) = mock_recorder_with_drop_wait(
+            Closing::WhenTold,
+            AsyncFileOptions::new().event_capacity(1),
+            Duration::from_millis(100),
+        );
         let finishing = recorder.finish(Duration::from_secs(30)).submit();
         await_finish(&recorder);
         let closing = recorder.close().submit();
@@ -4684,7 +4702,8 @@ mod tests {
         device.install();
         let mut recorder = crate::file::FileRecorder::new(
             &mock::recorder_api(),
-            &FileRecorderOptions::new(SourceSpec::new("mock").unwrap()),
+            &FileRecorderOptions::new(SourceSpec::new("mock").unwrap())
+                .drop_wait(Duration::from_millis(150)),
         )
         .unwrap();
         let target = RecordingTarget::new(std::env::temp_dir().join("mock-cleanup")).unwrap();
@@ -4708,7 +4727,7 @@ mod tests {
         let (device, recorder) = mock_recorder_with_drop_wait(
             Closing::StoppedBeforeClose(Duration::from_millis(100)),
             AsyncFileOptions::new(),
-            Duration::from_secs(2),
+            Duration::from_millis(150),
         );
         device.dropped_events.store(1, Ordering::Release);
         let outcome = block_on(recorder.finish(Duration::ZERO)).unwrap();
@@ -4718,7 +4737,7 @@ mod tests {
     }
 
     #[test]
-    fn a_known_file_closed_after_an_indeterminate_report_allows_another_start() {
+    fn a_known_file_closed_after_an_indeterminate_report_still_requires_reset() {
         let device = mock::Recorder::new(Closing::Never);
         device.install();
         let mut recorder = crate::file::FileRecorder::new(
@@ -4744,6 +4763,23 @@ mod tests {
         device.close();
         recorder.next_event(Duration::ZERO).unwrap();
         assert_eq!(recorder.report(), report);
+        assert!(matches!(
+            recorder.start(&target, RecordingTimecode::Preserve),
+            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+        ));
+        assert_eq!(device.starts.load(Ordering::Acquire), 1);
+        let replacement = mock::Recorder::new(Closing::AtStop);
+        replacement.install();
+        assert_eq!(
+            recorder
+                .reset(&FileRecorderOptions::new(
+                    SourceSpec::new("replacement").unwrap()
+                ))
+                .unwrap(),
+            report
+        );
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
         assert_eq!(
             recorder
                 .start(&target, RecordingTimecode::Preserve)
@@ -4768,6 +4804,210 @@ mod tests {
         assert!(began.elapsed() >= budget);
         assert!(began.elapsed() < Duration::from_secs(1));
         assert!(!device.closed_before_destroy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn async_close_spends_its_budget_after_a_lost_open_and_every_known_close() {
+        for delayed_hidden_close in [false, true] {
+            let budget = Duration::from_millis(80);
+            let (device, recorder) = mock_recorder_with_drop_wait(
+                Closing::AtStop,
+                AsyncFileOptions::new().event_capacity(1),
+                budget,
+            );
+            let started = block_on(recorder.next_event(Duration::from_secs(1)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(started.kind(), RecorderEventKind::Started);
+            // The missing event is an open for hidden.mkv. The only known
+            // path closes at stop, leaving no known path to await.
+            device.dropped_events.store(1, Ordering::Release);
+            let FinishStatus::Indeterminate(report) =
+                block_on(recorder.finish(Duration::ZERO)).unwrap()
+            else {
+                panic!("losing an open must prevent confirmed closure");
+            };
+            assert_eq!(report.closed_files(), 1);
+            assert_eq!(report.dropped_events(), 1);
+            assert_eq!(block_on(recorder.reported_current_file()).unwrap(), None);
+            let target =
+                RecordingTarget::new(std::env::temp_dir().join("hidden-open-restart")).unwrap();
+            assert!(matches!(
+                block_on(recorder.start(&target, RecordingTimecode::Preserve)),
+                Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+            ));
+            assert_eq!(device.starts.load(Ordering::Acquire), 1);
+
+            if !delayed_hidden_close {
+                device.push(mock::FILE_CLOSED, "hidden.mkv");
+                // A following command runs after the event pump. Later
+                // cleanup evidence cannot rewrite the settled report.
+                assert_eq!(block_on(recorder.report()).unwrap(), report);
+            }
+            let captures = device.captures.load(Ordering::Acquire);
+            let waits = device.waits.load(Ordering::Acquire);
+            let (blocked, release) = block_owner(&recorder.worker);
+            // Retain a queued finish so cleanup keeps delivering native
+            // events even though the immutable report has already settled.
+            let finishing = recorder.wait_for_finish(Duration::from_secs(30)).submit();
+            let closed = recorder.close().submit();
+            let requested = recorder.worker.control.shutdown_requested_at().unwrap();
+            release.send(()).unwrap();
+            block_on(blocked).unwrap();
+            assert_eq!(
+                block_on(finishing).unwrap(),
+                Some(FinishStatus::Indeterminate(report))
+            );
+            if delayed_hidden_close {
+                let limit = Instant::now() + Duration::from_secs(5);
+                while device.waits.load(Ordering::Acquire) == waits {
+                    assert!(
+                        Instant::now() < limit,
+                        "cleanup never waited for hidden files"
+                    );
+                    assert_eq!(device.destroys.load(Ordering::Acquire), 0);
+                    thread::yield_now();
+                }
+                device.push(mock::FILE_CLOSED, "hidden.mkv");
+            }
+            block_on(closed).unwrap();
+            assert!(
+                requested.elapsed() >= budget,
+                "a known-empty incomplete tracker shortened cleanup"
+            );
+            assert!(device.captures.load(Ordering::Acquire) > captures);
+            let event = block_on(recorder.next_event(Duration::ZERO))
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.kind(), RecorderEventKind::FileClosed);
+            assert_eq!(event.path().to_str().unwrap(), "hidden.mkv");
+            assert_eq!(device.stops.load(Ordering::Acquire), 1);
+            assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+            block_on(recorder.close()).unwrap();
+            drop(recorder);
+            assert_eq!(device.stops.load(Ordering::Acquire), 1);
+            assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        }
+    }
+
+    #[test]
+    fn async_reset_retires_unknown_cleanup_only_after_replacement_succeeds() {
+        let (device, recorder) = mock_recorder_with_drop_wait(
+            Closing::AtStop,
+            AsyncFileOptions::new(),
+            Duration::from_millis(60),
+        );
+        device.dropped_events.store(1, Ordering::Release);
+        let FinishStatus::Indeterminate(report) =
+            block_on(recorder.finish(Duration::ZERO)).unwrap()
+        else {
+            panic!("lost native events must leave an indeterminate report");
+        };
+        assert_eq!(block_on(recorder.reported_current_file()).unwrap(), None);
+        let options = FileRecorderOptions::new(SourceSpec::new("replacement").unwrap());
+        let target =
+            RecordingTarget::new(std::env::temp_dir().join("unknown-cleanup-reset")).unwrap();
+        let replacement = mock::Recorder::new(Closing::AtStop);
+        replacement.refuse_creation.store(true, Ordering::Release);
+        let installed = Arc::clone(&replacement);
+        block_on(recorder.worker.call(move |_| {
+            installed.install();
+            Ok(())
+        }))
+        .unwrap();
+        assert!(matches!(
+            block_on(recorder.reset(&options)),
+            Err(Error::NativeOperationFailed { .. })
+        ));
+        assert_eq!(device.destroys.load(Ordering::Acquire), 0);
+        assert_eq!(block_on(recorder.report()).unwrap(), report);
+        assert!(matches!(
+            block_on(recorder.start(&target, RecordingTimecode::Preserve)),
+            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+        ));
+        assert_eq!(device.starts.load(Ordering::Acquire), 1);
+
+        replacement.refuse_creation.store(false, Ordering::Release);
+        let installed = Arc::clone(&replacement);
+        block_on(recorder.worker.call(move |_| {
+            installed.install();
+            Ok(())
+        }))
+        .unwrap();
+        assert_eq!(block_on(recorder.reset(&options)).unwrap(), report);
+        assert_eq!(block_on(recorder.report()).unwrap(), report);
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        assert_eq!(
+            block_on(recorder.start(&target, RecordingTimecode::Preserve)).unwrap(),
+            2
+        );
+        assert!(matches!(
+            block_on(recorder.finish(Duration::ZERO)).unwrap(),
+            FinishStatus::Closed(_)
+        ));
+        block_on(recorder.close()).unwrap();
+        assert_eq!(replacement.starts.load(Ordering::Acquire), 1);
+        assert_eq!(replacement.stops.load(Ordering::Acquire), 1);
+        assert_eq!(replacement.destroys.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn cancelling_a_finish_does_not_erase_unknown_cleanup_during_concurrent_close() {
+        let budget = Duration::from_millis(100);
+        let (device, recorder) =
+            mock_recorder_with_drop_wait(Closing::WhenTold, AsyncFileOptions::new(), budget);
+        let cancelled = recorder.finish(Duration::from_secs(30)).submit();
+        await_finish(&recorder);
+        drop(cancelled);
+        let waiting = recorder.wait_for_finish(Duration::from_secs(30)).submit();
+        await_finish(&recorder);
+        let closed = recorder.clone().close().submit();
+        let requested = recorder.worker.control.shutdown_requested_at().unwrap();
+        device.dropped_events.store(1, Ordering::Release);
+        device.close();
+        let Some(FinishStatus::Indeterminate(report)) = block_on(waiting).unwrap() else {
+            panic!("the remaining waiter must retain the loss verdict");
+        };
+        assert_eq!(report.dropped_events(), 1);
+        assert!(!report.closure_confirmed());
+        device.push(mock::FILE_CLOSED, "hidden.mkv");
+        block_on(closed).unwrap();
+        assert!(requested.elapsed() >= budget);
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        assert_eq!(recorder.worker.finish.state.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn incomplete_async_cleanup_respects_zero_wait_and_abandon() {
+        for abandon in [false, true] {
+            let (device, recorder) = mock_recorder_with_drop_wait(
+                Closing::AtStop,
+                AsyncFileOptions::new(),
+                if abandon {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::ZERO
+                },
+            );
+            device.dropped_events.store(1, Ordering::Release);
+            let FinishStatus::Indeterminate(report) =
+                block_on(recorder.finish(Duration::ZERO)).unwrap()
+            else {
+                panic!("lost events must prevent confirmation");
+            };
+            assert_eq!(block_on(recorder.reported_current_file()).unwrap(), None);
+            let waits = device.waits.load(Ordering::Acquire);
+            if abandon {
+                assert_eq!(block_on(recorder.abandon()).unwrap(), report);
+            } else {
+                block_on(recorder.close()).unwrap();
+            }
+            assert_eq!(device.waits.load(Ordering::Acquire), waits);
+            assert_eq!(device.stops.load(Ordering::Acquire), 1);
+            assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        }
     }
 
     #[test]

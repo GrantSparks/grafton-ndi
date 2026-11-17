@@ -22,11 +22,12 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
 pub enum StateConflict {
-    /// A session is recording or stopping, or an indeterminate session still
-    /// has a known file awaiting its closure event, so another cannot start.
-    /// Finish the session or take events until its files close; use
-    /// [`FileRecorder::reset`](super::FileRecorder::reset) to abandon it and
-    /// replace its native recorder.
+    /// A session is recording or stopping, has a file awaiting closure, or has
+    /// incomplete file tracking, so another cannot start.
+    /// Finish or poll a session whose tracking is complete. After native event
+    /// loss, unreadable lifecycle evidence or a tracking limit, only
+    /// [`FileRecorder::reset`](super::FileRecorder::reset) replaces the native
+    /// recorder and permits another session, even if every known file closes.
     #[error("finish the previous session before starting another")]
     PreviousSessionOpen,
     /// Events from an earlier session kept arriving, so a new session was not
@@ -470,7 +471,11 @@ impl FileRecorderOptions {
     /// closure events after it returns. Synchronous
     /// [`FileRecorder::finish`](super::FileRecorder::finish) instead starts its
     /// wait after the stop returns, giving closure its full requested wait.
-    /// Cleanup ends as soon as the file is closed. `Duration::ZERO` waits for no future events:
+    /// Cleanup ends early only when complete tracking establishes every file
+    /// closed. Native event loss, unreadable lifecycle evidence or a tracking
+    /// limit leaves an unknown cleanup obligation: even after every known file
+    /// closes, cleanup consumes the remaining original budget. The final
+    /// indeterminate report does not change. `Duration::ZERO` waits for no future events:
     /// the stop is requested and a bounded nonblocking drain takes queued
     /// events before destruction. [`FileRecorder::abandon`](super::FileRecorder::abandon)
     /// takes no events.
@@ -967,6 +972,11 @@ impl Default for EventText {
 }
 
 impl EventText {
+    /// Bytes owned by the event text, including spare capacity.
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.bytes.capacity()
+    }
+
     pub(super) fn from_buffer(buffer: &[c_char]) -> Self {
         let end = buffer.iter().position(|&b| b == 0);
         let used = end.unwrap_or(buffer.len());
@@ -1384,6 +1394,8 @@ pub enum RecorderEventKind {
     /// Expected proxy was unavailable.
     ProxyMissing,
     /// An unrecognized native event identifier.
+    /// Its lifecycle effect cannot be established, so file tracking becomes
+    /// incomplete while the event and its original identifier remain available.
     Unknown(u32),
 }
 
