@@ -3948,7 +3948,7 @@ mod tests {
 
     #[test]
     fn queued_commands_finishes_and_waits_report_owner_failure_after_a_panic() {
-        let (_, recorder) = mock_recorder(Closing::AtStop);
+        let (_, mut recorder) = mock_recorder(Closing::AtStop);
         let (blocked, release) = block_owner(&recorder.worker);
         let panic = recorder
             .worker
@@ -3966,6 +3966,17 @@ mod tests {
         owner_failed(block_on(recorder.state()));
         owner_failed(block_on(recorder.finish(Duration::ZERO)));
         owner_failed(block_on(recorder.close()));
+        // Failure and close report their outcomes before the owner drops its
+        // queued commands. A dropped reply can wake its waiter before the
+        // same response's permit drops, so join before checking reclamation.
+        Arc::get_mut(&mut recorder.worker)
+            .expect("the test owns the only recorder handle")
+            .thread
+            .take()
+            .expect("the owner thread was installed at creation")
+            .0
+            .join()
+            .expect("the owner catches its command's panic");
         assert_eq!(
             recorder
                 .worker
