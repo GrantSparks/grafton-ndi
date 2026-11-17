@@ -2669,9 +2669,15 @@ mod tests {
                 drop(lease);
             });
             let started = Instant::now();
-            assert!(gate
-                .acquire_until(started + Duration::from_millis(25))
-                .is_none());
+            // parking_lot_core 0.9.12's Linux futex ABI is rejected by Miri
+            // (Amanieu/parking_lot#542). An expired deadline still exercises
+            // occupied refusal and queue cleanup; native runs cover timed parking.
+            #[cfg(miri)]
+            let end = started;
+            #[cfg(not(miri))]
+            let end = started + Duration::from_millis(25);
+            assert!(gate.acquire_until(end).is_none());
+            #[cfg(not(miri))]
             assert!(started.elapsed() >= Duration::from_millis(20));
             release.send(()).unwrap();
             worker.join().unwrap();

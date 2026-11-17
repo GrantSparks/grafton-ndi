@@ -123,6 +123,13 @@ The pinned nightly detects a
 `Box`-owned `AliasableBox` regression; it does not yet support the Miri option
 needed to enforce `AliasableVec`'s unique-pointer contract. Miri uses one padded
 layout and one PNG encoding per format; native tests retain their full matrices.
+
+The sender metadata lease test uses an expired contended deadline under Miri
+because the pinned parking_lot_core futex arguments are rejected by its syscall
+shim ([upstream issue](https://github.com/Amanieu/parking_lot/issues/542)). It
+still checks cross-thread lease release, contended refusal and allocation-free
+reacquisition through the real gate. Native runs check the positive wait budget.
+
 Run a focused case locally with:
 
 ```sh

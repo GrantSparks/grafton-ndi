@@ -3089,6 +3089,230 @@ fn anamorphic_png_and_jpeg_tags_preserve_display_aspect() {
     }
 }
 
+/// Read the codec headers independently of the encoder's density calculation.
+/// The default density is 1:1 when PNG has no pHYs chunk.
+fn image_density(format: ImageFormat, bytes: &[u8]) -> ((u32, u32), (u32, u32)) {
+    match format {
+        ImageFormat::Png => {
+            let reader = ::png::Decoder::new(std::io::Cursor::new(bytes))
+                .read_info()
+                .unwrap();
+            let info = reader.info();
+            let density = info.pixel_dims.map_or((1, 1), |density| {
+                assert_eq!(density.unit, ::png::Unit::Unspecified);
+                (density.xppu, density.yppu)
+            });
+            ((info.width, info.height), density)
+        }
+        ImageFormat::Jpeg(_) => {
+            assert_eq!(&bytes[6..11], b"JFIF\0");
+            assert_eq!(bytes[13], 0);
+            let density = (
+                u32::from(u16::from_be_bytes(bytes[14..16].try_into().unwrap())),
+                u32::from(u16::from_be_bytes(bytes[16..18].try_into().unwrap())),
+            );
+            let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+            decoder.read_info().unwrap();
+            let info = decoder.info().unwrap();
+            ((u32::from(info.width), u32::from(info.height)), density)
+        }
+        other => panic!("{other:?} has no pixel density"),
+    }
+}
+
+fn decode_density_image(format: ImageFormat, bytes: &[u8]) -> Decoded {
+    match format {
+        ImageFormat::Png => decode_png(bytes),
+        ImageFormat::Jpeg(_) => {
+            let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+            let samples = decoder.decode().unwrap();
+            let info = decoder.info().unwrap();
+            assert_eq!(info.pixel_format, jpeg_decoder::PixelFormat::RGB24);
+            Decoded {
+                width: u32::from(info.width),
+                height: u32::from(info.height),
+                channels: 3,
+                bits: 8,
+                samples: samples.into_iter().map(u16::from).collect(),
+            }
+        }
+        other => panic!("{other:?} has no pixel density"),
+    }
+}
+
+fn assert_display_aspect(format: ImageFormat, bytes: &[u8], shape: (u32, u32), expected: f64) {
+    let (actual_shape, (x, y)) = image_density(format, bytes);
+    assert_eq!(actual_shape, shape);
+    assert!((1..=u32::from(u16::MAX)).contains(&x));
+    assert!((1..=u32::from(u16::MAX)).contains(&y));
+    let actual = f64::from(shape.0) / f64::from(shape.1) * f64::from(y) / f64::from(x);
+    assert!(
+        (actual / expected - 1.0).abs() < 0.001,
+        "{format:?} {shape:?}: display aspect {actual}, expected {expected}, density {x}:{y}"
+    );
+}
+
+#[test]
+fn reduced_square_and_near_square_sources_preserve_display_aspect_on_every_entry_point() {
+    for (width, height) in [(6, 4), (18, 10), (18, 11)] {
+        for pixel_format in [PixelFormat::Rgba, PixelFormat::Uyvy] {
+            let mut frame = VideoFrame::builder()
+                .resolution(width, height)
+                .pixel_format(pixel_format)
+                .data(any_frame_bytes(
+                    pixel_format,
+                    width as usize,
+                    height as usize,
+                    0x414,
+                ))
+                .build()
+                .unwrap();
+            let square = width as f32 / height as f32;
+            for reduction in [
+                Downscale::Off,
+                Downscale::Half,
+                Downscale::Quarter,
+                Downscale::Eighth,
+            ] {
+                let factor = match reduction {
+                    Downscale::Off => 1,
+                    Downscale::Half => 2,
+                    Downscale::Quarter => 4,
+                    Downscale::Eighth => 8,
+                };
+                let shape = (width.div_ceil(factor), height.div_ceil(factor));
+                for format in [ImageFormat::Png, ImageFormat::Jpeg(85)] {
+                    let options = options(format).downscale(reduction);
+                    // A source whose display aspect equals the output's shape
+                    // needs square output pixels. Its decoded samples provide
+                    // a reference unaffected by any density override.
+                    frame.set_picture_aspect_ratio(
+                        crate::PictureAspectRatio::new(shape.0 as f32 / shape.1 as f32).unwrap(),
+                    );
+                    let reference = frame.encode_image(&options).unwrap();
+                    assert_eq!(image_density(format, &reference).1, (1, 1));
+                    if format == ImageFormat::Png {
+                        assert!(png_chunks(&reference)
+                            .iter()
+                            .all(|(kind, _)| kind != b"pHYs"));
+                    }
+                    let reference = decode_density_image(format, &reference);
+                    for aspect in [
+                        0.0,
+                        square,
+                        square * (1.0 + f32::EPSILON / 2.0),
+                        square * (1.0 + 8.0 * f32::EPSILON),
+                        4.0 / 3.0,
+                        16.0 / 9.0,
+                        2.0,
+                    ] {
+                        frame.set_picture_aspect_ratio(
+                            crate::PictureAspectRatio::new(aspect).unwrap(),
+                        );
+                        let expected = if aspect == 0.0 {
+                            f64::from(width) / f64::from(height)
+                        } else {
+                            f64::from(aspect)
+                        };
+                        let image = frame.encode_image(&options).unwrap();
+                        assert_display_aspect(format, &image, shape, expected);
+                        assert_eq!(decode_density_image(format, &image), reference);
+
+                        let mut written = Vec::new();
+                        frame.encode_image_to(&options, &mut written).unwrap();
+                        assert_eq!(written, image);
+                        let mut workspace = super::ImageWorkspace::new();
+                        assert_eq!(workspace.encode(&frame, &options).unwrap(), image);
+                        let retained = workspace.retained_bytes();
+                        assert_eq!(workspace.encode(&frame, &options).unwrap(), image);
+                        written.clear();
+                        workspace.encode_to(&frame, &options, &mut written).unwrap();
+                        assert_eq!(written, image);
+                        assert_eq!(workspace.retained_bytes(), retained);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn small_valid_geometries_preserve_square_aspect_and_implicit_explicit_identity() {
+    // Packed RGB, packed 4:2:2 and planar 4:2:0 cover odd heights and the
+    // latter's even-height constraint without requiring a native runtime.
+    for pixel_format in [PixelFormat::Bgra, PixelFormat::Uyvy, PixelFormat::I420] {
+        for width in (2..=10u32).step_by(2) {
+            for height in 1..=6u32 {
+                if pixel_format == PixelFormat::I420 && height % 2 != 0 {
+                    continue;
+                }
+                let base = VideoFrame::builder()
+                    .resolution(width, height)
+                    .pixel_format(pixel_format)
+                    .data(any_frame_bytes(
+                        pixel_format,
+                        width as usize,
+                        height as usize,
+                        u64::from(width * 7 + height),
+                    ))
+                    .build()
+                    .unwrap();
+                let mut explicit = base.clone();
+                explicit.set_picture_aspect_ratio(
+                    crate::PictureAspectRatio::new(width as f32 / height as f32).unwrap(),
+                );
+                for (reduction, factor) in [
+                    (Downscale::Off, 1),
+                    (Downscale::Half, 2),
+                    (Downscale::Quarter, 4),
+                    (Downscale::Eighth, 8),
+                ] {
+                    let shape = (width.div_ceil(factor), height.div_ceil(factor));
+                    for format in [ImageFormat::Png, ImageFormat::Jpeg(85)] {
+                        let options = options(format).downscale(reduction);
+                        let image = base.encode_image(&options).unwrap();
+                        assert_eq!(image, explicit.encode_image(&options).unwrap());
+                        assert_display_aspect(
+                            format,
+                            &image,
+                            shape,
+                            f64::from(width) / f64::from(height),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn density_resolution_is_allocation_free_and_preserves_square_source_tolerance() {
+    let mut frame = VideoFrame::builder().resolution(6, 4).build().unwrap();
+    let source = Source::new(&frame);
+    let (implicit, allocations) =
+        crate::test_alloc::allocation_count(|| super::PixelDensity::for_source(&source, 2, 1));
+    assert_eq!(allocations, 0);
+    assert!(implicit.is_some());
+    for aspect in [1.5, f32::from_bits(1.5f32.to_bits() + 1)] {
+        frame.set_picture_aspect_ratio(crate::PictureAspectRatio::new(aspect).unwrap());
+        assert_eq!(
+            super::PixelDensity::for_source(&Source::new(&frame), 2, 1),
+            implicit
+        );
+        assert_eq!(
+            super::PixelDensity::for_source(&Source::new(&frame), 3, 2),
+            None
+        );
+    }
+    frame.set_picture_aspect_ratio(crate::PictureAspectRatio::new(1.500001).unwrap());
+    assert!(super::PixelDensity::for_source(&Source::new(&frame), 3, 2).is_some());
+    frame.set_picture_aspect_ratio(crate::PictureAspectRatio::new(2.0).unwrap());
+    assert_eq!(
+        super::PixelDensity::for_source(&Source::new(&frame), 2, 1),
+        None
+    );
+}
+
 #[test]
 fn square_pixel_encodes_stay_identical_and_extreme_aspects_remain_positive() {
     for pixel_format in PixelFormat::ALL {

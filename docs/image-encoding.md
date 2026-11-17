@@ -49,13 +49,17 @@ explains the buffering choices and measurement boundaries.
 
 ## Picture aspect
 
-PNG and JPEG carry a frame's non-square picture aspect in PNG pHYs and JPEG
+PNG and JPEG carry a frame's picture aspect in PNG pHYs and JPEG
 JFIF relative pixel-density tags. The tags preserve the displayed width/height
 ratio, including after downscaling with a partial final block. Encoders keep the
 stored pixel dimensions and samples; viewers that ignore the tags still display
-those dimensions. A zero aspect or an explicit square-pixel aspect stays
-untagged, with byte-identical output. WebP carries no pixel-shape tag; callers
-needing its display aspect retain `picture_aspect_ratio()` separately.
+those dimensions. A zero aspect and an equivalent explicit square-pixel aspect
+produce identical bytes. They receive a density correction when independently
+rounded output dimensions change the aspect: for example, a 6×4 source reduced
+to 2×1 retains display aspect 1.5. Outputs already needing square pixels keep
+their default density behavior. This correction changes encoded bytes and
+aspect-aware rendering for affected thumbnails. WebP carries no pixel-shape
+tag; callers needing its display aspect retain `picture_aspect_ratio()` separately.
 
 Both density components are positive integers no larger than 65,535. Ordinary
 ratios are approximated to that precision; extreme ratios clamp to the nearest

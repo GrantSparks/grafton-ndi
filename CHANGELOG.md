@@ -26,6 +26,16 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Fixed
 
+- PNG and JPEG preserve display aspect when partial downscale blocks change
+  the output shape, including square-pixel inputs. Required density metadata
+  changes encoded bytes without changing pixel dimensions or samples.
+- Async recorder finalization waits have a separate budget equal to
+  `AsyncFileOptions::command_capacity`. Excess waits return
+  `QueueFull(QueueLimit::FileFinishWaits)` while ordinary commands and shutdown
+  retain independent admission.
+- Source-cache invalidation and clearing release retired keys, snapshots and
+  map storage after unlocking, keeping descriptor reclamation outside the
+  shared mutex. Clearing releases map capacity; later fills allocate again.
 - Async File handles wait for native cleanup on last drop after a submitted
   close future is discarded; live closes still report cleanup without blocking
   handle drops.
@@ -311,7 +321,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   existing uncompressed audio sends.
 
 - Image encoding preserves non-square picture aspect in PNG pHYs and JPEG JFIF
-  relative density tags; square-pixel output is unchanged. WebP remains untagged.
+  relative density tags, including corrections for partial downscale blocks
+  from square-pixel sources. WebP remains untagged.
 
 - `AvSync::synchronize_ref` and `queued_audio_ref` lend matched SDK audio
   through `AvSyncOutcomeRef` and `AvSyncAudioRef`. Send and convert it in place,

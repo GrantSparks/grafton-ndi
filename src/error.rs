@@ -322,6 +322,9 @@ pub enum Error {
     /// * An operation of an async File handle, when the handle's command
     ///   queue is full ([`QueueLimit::FileCommands`]). A request to stop is
     ///   refused only when another one already waits beyond the full queue.
+    /// * A recorder's submitted `finish` and `wait_for_finish` operations,
+    ///   when their separate pending-wait budget is full
+    ///   ([`QueueLimit::FileFinishWaits`]). Ordinary commands remain available.
     /// * `file::AsyncFilePlayer::probe`, when the probes waiting for the
     ///   process's probe thread fill its queue ([`QueueLimit::FileProbes`]).
     #[error("Queue full: {0}")]
@@ -510,6 +513,11 @@ pub enum QueueLimit {
     /// stop, another request to stop waits beyond them.
     #[error("File command queue is full")]
     FileCommands,
+    /// An async recorder already has as many queued, registered or settling
+    /// finalization waits as `AsyncFileOptions::command_capacity` allows.
+    /// This budget is separate from ordinary command admission.
+    #[error("File finish-wait limit reached")]
+    FileFinishWaits,
     /// The 64 async File probes that may wait for the process's probe thread
     /// are already waiting.
     #[error("File probe queue is full")]
@@ -661,6 +669,10 @@ mod tests {
             (QueueLimit::Frames, "queued video frame limit reached"),
             (QueueLimit::Bytes, "queued video byte limit reached"),
             (QueueLimit::FileCommands, "File command queue is full"),
+            (
+                QueueLimit::FileFinishWaits,
+                "File finish-wait limit reached",
+            ),
             (QueueLimit::FileProbes, "File probe queue is full"),
         ] {
             assert_eq!(
