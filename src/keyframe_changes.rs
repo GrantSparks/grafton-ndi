@@ -2,7 +2,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError, Weak,
+    },
 };
 
 use crate::{
@@ -16,18 +19,16 @@ type SelectorKey = Option<u32>;
 #[derive(Default)]
 pub(crate) struct KeyframeChanges {
     changes: ChangeFeed,
-    selectors: Mutex<HashMap<SelectorKey, Selector>>,
+    selectors: Mutex<HashMap<SelectorKey, Weak<Selector>>>,
 }
 
 struct Selector {
     format: Option<VideoPacketFormat>,
-    observers: usize,
-    generation: u64,
-    sampled: bool,
+    generation: AtomicU64,
 }
 
 impl KeyframeChanges {
-    fn lock(&self) -> MutexGuard<'_, HashMap<SelectorKey, Selector>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<SelectorKey, Weak<Selector>>> {
         self.selectors
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -38,17 +39,22 @@ impl KeyframeChanges {
         // stream/bandwidth; geometry and timing must not split one selector.
         let key = format.map(|format| u32::from_ne_bytes(format.raw().FourCC.to_ne_bytes()));
         let mut selectors = self.lock();
-        let selector = selectors.entry(key).or_insert(Selector {
-            format,
-            observers: 0,
-            generation: 0,
-            sampled: false,
-        });
-        selector.observers += 1;
+        let selector = selectors
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let selector = Arc::new(Selector {
+                    format,
+                    generation: AtomicU64::new(0),
+                });
+                selectors.insert(key, Arc::downgrade(&selector));
+                selector
+            });
+        let observed = selector.generation.load(Ordering::Relaxed);
         Observer {
             changes: self,
-            key,
-            observed: selector.generation,
+            selector,
+            observed,
         }
     }
 
@@ -57,17 +63,23 @@ impl KeyframeChanges {
     /// can therefore send its keyframe without erasing another caller's report.
     fn publish(&self, required: &mut impl FnMut(VideoPacketFormat) -> bool) {
         let mut selectors = self.lock();
-        for selector in selectors.values_mut() {
-            selector.sampled = match selector.format {
+        let mut sampled = Vec::new();
+        selectors.retain(|_, weak| {
+            let Some(selector) = weak.upgrade() else {
+                return false;
+            };
+            let demanded = match selector.format {
                 None => true,
                 Some(format) => required(format),
             };
-        }
+            sampled.push((selector, demanded));
+            true
+        });
         // Complete all queries before publishing any counter, including when
         // an injected test query unwinds. Native queries call no application code.
-        for selector in selectors.values_mut() {
-            if selector.sampled {
-                selector.generation = selector.generation.wrapping_add(1);
+        for (selector, demanded) in sampled {
+            if demanded {
+                selector.generation.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -108,26 +120,14 @@ impl KeyframeChanges {
 
 struct Observer<'a> {
     changes: &'a KeyframeChanges,
-    key: SelectorKey,
+    selector: Arc<Selector>,
     observed: u64,
 }
 
 impl Observer<'_> {
     fn changed(&self) -> bool {
-        self.changes.lock()[&self.key].generation != self.observed
-    }
-}
-
-impl Drop for Observer<'_> {
-    fn drop(&mut self) {
-        let mut selectors = self.changes.lock();
-        let selector = selectors
-            .get_mut(&self.key)
-            .expect("live selector observer");
-        selector.observers -= 1;
-        if selector.observers == 0 {
-            selectors.remove(&self.key);
-        }
+        let _selectors = self.changes.lock();
+        self.selector.generation.load(Ordering::Relaxed) != self.observed
     }
 }
 
@@ -194,7 +194,7 @@ mod tests {
             while changes
                 .lock()
                 .values()
-                .map(|selector| selector.observers)
+                .map(Weak::strong_count)
                 .sum::<usize>()
                 != 3
             {
@@ -209,7 +209,10 @@ mod tests {
         });
         assert!(!demanded.load(Ordering::Acquire));
         assert_eq!(queries.load(Ordering::Relaxed), 1);
-        assert!(changes.lock().is_empty());
+        assert!(changes
+            .lock()
+            .values()
+            .all(|selector| selector.strong_count() == 0));
     }
 
     #[test]
@@ -228,7 +231,10 @@ mod tests {
         let later = changes.observe(Some(format));
         assert!(!later.changed());
         drop((all, program, preview, later));
-        assert!(changes.lock().is_empty());
+        assert!(changes
+            .lock()
+            .values()
+            .all(|selector| selector.strong_count() == 0));
     }
 
     #[test]
@@ -239,8 +245,35 @@ mod tests {
             changes.wait(Some(format), budget(), |_| panic!("native wait"), |_| true)
         });
         assert!(panic.is_err());
-        assert!(changes.lock().is_empty());
+        assert!(changes
+            .lock()
+            .values()
+            .all(|selector| selector.strong_count() == 0));
         assert!(changes.wait(Some(format), budget(), |_| true, |_| true));
+        assert!(changes
+            .lock()
+            .values()
+            .all(|selector| selector.strong_count() == 0));
+    }
+    #[test]
+    fn dropping_one_observer_preserves_the_shared_selector_and_generation() {
+        let changes = KeyframeChanges::default();
+        let format = VideoPacketFormat::new(VideoCodec::H264, 64, 32).unwrap();
+        let first = changes.observe(Some(format));
+        let second = changes.observe(Some(format));
+        assert!(Arc::ptr_eq(&first.selector, &second.selector));
+        changes.publish(&mut |_| true);
+        drop(first);
+        assert!(second.changed());
+        let later = changes.observe(Some(format));
+        assert!(Arc::ptr_eq(&second.selector, &later.selector));
+        assert!(!later.changed());
+        drop((second, later));
+        assert!(changes
+            .lock()
+            .values()
+            .all(|selector| selector.strong_count() == 0));
+        changes.publish(&mut |_| panic!("dead selectors must not be sampled"));
         assert!(changes.lock().is_empty());
     }
 }
