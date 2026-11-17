@@ -44,56 +44,116 @@ pub enum ImageFormat {
     WebpLossy(u8),
 }
 
-impl ImageFormat {
-    /// The codec used by this format.
-    pub(super) const fn codec(self) -> crate::ImageCodecKind {
-        match self {
-            Self::Png => crate::ImageCodecKind::Png,
-            Self::Jpeg(_) => crate::ImageCodecKind::Jpeg,
-            Self::WebpLossless | Self::WebpLossy(_) => crate::ImageCodecKind::Webp,
-        }
-    }
+/// Fixed codec capabilities, stated exhaustively for every format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ImageFormatInfo {
+    pub(super) codec: crate::ImageCodecKind,
+    pub(super) media_type: &'static str,
+    pub(super) quality: Option<std::ops::RangeInclusive<u8>>,
+    pub(super) alpha: AlphaChannel,
+    pub(super) sixteen_bit: bool,
+    pub(super) hdr_code_values: bool,
+    pub(super) aspect_tag: bool,
+}
 
-    pub(super) fn quality_bounds(self) -> Option<std::ops::RangeInclusive<u8>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AlphaChannel {
+    None,
+    Optional,
+    AlwaysRgba,
+}
+
+impl ImageFormat {
+    pub(super) const fn info(self) -> ImageFormatInfo {
         match self {
-            Self::Png | Self::WebpLossless => None,
-            Self::Jpeg(_) => Some(1..=100),
-            Self::WebpLossy(_) => Some(0..=100),
+            Self::Png => ImageFormatInfo {
+                codec: crate::ImageCodecKind::Png,
+                media_type: "image/png",
+                quality: None,
+                alpha: AlphaChannel::Optional,
+                sixteen_bit: true,
+                hdr_code_values: true,
+                aspect_tag: true,
+            },
+            Self::Jpeg(_) => ImageFormatInfo {
+                codec: crate::ImageCodecKind::Jpeg,
+                media_type: "image/jpeg",
+                quality: Some(1..=100),
+                alpha: AlphaChannel::None,
+                sixteen_bit: false,
+                hdr_code_values: false,
+                aspect_tag: true,
+            },
+            Self::WebpLossless => ImageFormatInfo {
+                codec: crate::ImageCodecKind::Webp,
+                media_type: "image/webp",
+                quality: None,
+                alpha: AlphaChannel::Optional,
+                sixteen_bit: false,
+                hdr_code_values: false,
+                aspect_tag: false,
+            },
+            Self::WebpLossy(_) => ImageFormatInfo {
+                codec: crate::ImageCodecKind::Webp,
+                media_type: "image/webp",
+                quality: Some(0..=100),
+                alpha: AlphaChannel::AlwaysRgba,
+                sixteen_bit: false,
+                hdr_code_values: false,
+                aspect_tag: false,
+            },
         }
     }
 
     pub(super) fn validate_quality(self) -> crate::Result<()> {
-        if let Some((quality, bounds)) = self.quality().zip(self.quality_bounds()) {
-            if !bounds.contains(&quality) {
-                return Err(crate::Error::InvalidInput(
-                    crate::InputDefect::ImageQuality {
-                        codec: self.codec(),
-                        quality,
-                        minimum: *bounds.start(),
-                        maximum: *bounds.end(),
-                    },
-                ));
+        let info = self.info();
+        if let Self::Jpeg(quality) | Self::WebpLossy(quality) = self {
+            if let Some(bounds) = info.quality {
+                if !bounds.contains(&quality) {
+                    return Err(crate::Error::InvalidInput(
+                        crate::InputDefect::ImageQuality {
+                            codec: info.codec,
+                            quality,
+                            minimum: *bounds.start(),
+                            maximum: *bounds.end(),
+                        },
+                    ));
+                }
             }
         }
         Ok(())
     }
-
-    pub(super) const fn quality(self) -> Option<u8> {
-        match self {
-            Self::Png | Self::WebpLossless => None,
-            Self::Jpeg(quality) | Self::WebpLossy(quality) => Some(quality),
-        }
-    }
-
-    /// The format's media type, for a data URL.
-    pub(super) const fn media_type(self) -> &'static str {
-        match self {
-            Self::Png => "image/png",
-            Self::Jpeg(_) => "image/jpeg",
-            Self::WebpLossless | Self::WebpLossy(_) => "image/webp",
-        }
-    }
 }
+
+// One list supplies representative formats and an exhaustive coverage check,
+// just as decoded_variants does for pixel formats.
+#[cfg(test)]
+macro_rules! image_format_variants {
+    ($($variant:ident $(($argument:pat))? => $sample:expr),+ $(,)?) => {
+        impl ImageFormat {
+            pub(super) const ALL: [Self; [$(stringify!($variant)),+].len()] = [$($sample),+];
+
+            const fn variant_index(self) -> usize {
+                enum Index { $($variant),+ }
+                match self { $(Self::$variant $(($argument))? => Index::$variant as usize),+ }
+            }
+        }
+        const _: () = {
+            let mut index = 0;
+            while index < ImageFormat::ALL.len() {
+                assert!(ImageFormat::ALL[index].variant_index() == index);
+                index += 1;
+            }
+        };
+    };
+}
+#[cfg(test)]
+image_format_variants!(
+    Png => ImageFormat::Png,
+    Jpeg(_) => ImageFormat::Jpeg(85),
+    WebpLossless => ImageFormat::WebpLossless,
+    WebpLossy(_) => ImageFormat::WebpLossy(75),
+);
 
 /// How a video frame is encoded as a still image: its format, color
 /// handling, bit depth, alpha, HDR policy, size and codec effort.
