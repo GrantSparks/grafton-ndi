@@ -77,6 +77,7 @@ mod sealed {
 ///
 /// Implementors must ensure [`free`](Self::free) releases a frame that was
 /// populated by the matching SDK capture call through the same `instance`.
+/// Its metadata scanner must use precisely that family's readable text extent.
 pub(crate) unsafe trait FrameFree: sealed::Sealed + 'static {
     /// The SDK instance handle that owns the frame buffers (and through which
     /// they must be freed).
@@ -93,6 +94,20 @@ pub(crate) unsafe trait FrameFree: sealed::Sealed + 'static {
     /// Additional unknown-timestamp marker for audio from this capture family.
     /// Receiver capture uses the header marker; FrameSync also reports zero.
     const AUDIO_TIMESTAMP_UNDEFINED: i64 = NDIlib_recv_timestamp_undefined;
+
+    /// The descriptor's natural metadata rule, overridden by capture families
+    /// with a stronger text guarantee (notably upstream sender metadata).
+    ///
+    /// # Safety
+    /// The descriptor must retain this family's readable metadata extent,
+    /// initialized and unchanged until matching release.
+    unsafe fn scan_metadata(frame: &Self::RawFrame) -> Result<crate::frames::FrameMetadataState>
+    where
+        Self::RawFrame: crate::frames::SdkDescriptor,
+    {
+        // SAFETY: the caller retains the natural descriptor extent.
+        unsafe { crate::frames::SdkDescriptor::scan_metadata(frame) }
+    }
 
     /// Free a single captured frame through its owning instance.
     ///
@@ -148,7 +163,8 @@ pub(crate) trait CaptureStrategy:
 pub(crate) struct VideoKind;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
-// matching NDIlib_recv_free_video_v2 release through the owning runtime.
+// matching NDIlib_recv_free_video_v2 release through the owning runtime. Its
+// embedded metadata retains the bounded first-NUL extent until that release.
 unsafe impl FrameFree for VideoKind {
     type Instance = NDIlib_recv_instance_t;
     type RawFrame = NDIlib_video_frame_v2_t;
@@ -180,7 +196,8 @@ impl CaptureStrategy for VideoKind {
 pub(crate) struct AudioKind;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
-// matching NDIlib_recv_free_audio_v3 release through the owning runtime.
+// matching NDIlib_recv_free_audio_v3 release through the owning runtime. Its
+// embedded metadata retains the bounded first-NUL extent until that release.
 unsafe impl FrameFree for AudioKind {
     type Instance = NDIlib_recv_instance_t;
     type RawFrame = NDIlib_audio_frame_v3_t;
@@ -212,7 +229,8 @@ impl CaptureStrategy for AudioKind {
 pub(crate) struct MetadataKind;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
-// matching NDIlib_recv_free_metadata release through the owning runtime.
+// matching NDIlib_recv_free_metadata release through the owning runtime. Its
+// text retains the declared extent, or a bounded C string when length is zero.
 unsafe impl FrameFree for MetadataKind {
     type Instance = NDIlib_recv_instance_t;
     type RawFrame = NDIlib_metadata_frame_t;
@@ -252,10 +270,20 @@ pub(crate) struct SenderMetadataInstance {
 
 // SAFETY: this strategy releases only the metadata descriptor returned by
 // NDIlib_send_capture through the same sender instance and authorized table.
+// That family's text is readable through the first NUL or metadata cap,
+// independently of its reported count, so its scanner uses the sender rule.
 unsafe impl FrameFree for SenderMetadataFree {
     type Instance = SenderMetadataInstance;
     type RawFrame = NDIlib_metadata_frame_t;
     const REF_DEBUG_NAME: &'static str = "MetadataFrameRef";
+
+    unsafe fn scan_metadata(frame: &Self::RawFrame) -> Result<crate::frames::FrameMetadataState> {
+        // SAFETY: sender captures retain the bounded C string even when their
+        // positive count excludes its terminator.
+        Ok(crate::frames::FrameMetadataState::from_text(unsafe {
+            crate::frames::validate_sender_metadata(frame)?
+        }))
+    }
 
     unsafe fn free(_core: &sys::Core, instance: Self::Instance, frame: &mut Self::RawFrame) {
         instance
@@ -287,7 +315,8 @@ pub(crate) use capture_method_kinds;
 pub(crate) struct FrameSyncVideoFree;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
-// matching NDIlib_framesync_free_video release through the owning runtime.
+// matching NDIlib_framesync_free_video release through the owning runtime. Its
+// embedded metadata retains the bounded first-NUL extent until that release.
 unsafe impl FrameFree for FrameSyncVideoFree {
     type Instance = NDIlib_framesync_instance_t;
     type RawFrame = NDIlib_video_frame_v2_t;
@@ -305,7 +334,8 @@ unsafe impl FrameFree for FrameSyncVideoFree {
 pub(crate) struct FrameSyncAudioFree;
 
 // SAFETY: This strategy pairs its raw frame and instance types with the
-// matching NDIlib_framesync_free_audio_v2 release through the owning runtime.
+// matching NDIlib_framesync_free_audio_v2 release through the owning runtime. Its
+// embedded metadata retains the bounded first-NUL extent until that release.
 unsafe impl FrameFree for FrameSyncAudioFree {
     type Instance = NDIlib_framesync_instance_t;
     type RawFrame = NDIlib_audio_frame_v3_t;
@@ -345,7 +375,8 @@ pub(crate) enum AvSyncAudioInstance {
 }
 
 // SAFETY: each instance carries the synchronizer and the same table that
-// returned its descriptor. The owner borrow outlives matching native release.
+// returned its descriptor. The owner borrow outlives matching native release,
+// retaining embedded metadata through its first NUL or the metadata cap.
 #[cfg(feature = "advanced")]
 unsafe impl FrameFree for AvSyncAudioFree {
     type Instance = AvSyncAudioInstance;

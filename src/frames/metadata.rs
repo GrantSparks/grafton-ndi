@@ -259,7 +259,7 @@ impl<'a> FrameMetadataRef<'a> {
 /// Cached validation of one optional metadata pointer. Only readable text
 /// carries a length; the other states cannot accidentally reborrow bytes.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct FrameMetadataState(MetadataScan);
+pub(crate) struct FrameMetadataState(MetadataScan);
 
 #[derive(Debug, Clone, Copy)]
 enum MetadataScan {
@@ -293,7 +293,7 @@ impl FrameMetadataState {
     }
 
     /// Cache text that was already validated, including standalone metadata.
-    pub(super) fn from_text(text: Option<MetadataText<'_>>) -> Self {
+    pub(crate) fn from_text(text: Option<MetadataText<'_>>) -> Self {
         Self(
             text.map_or(MetadataScan::Absent, |text| MetadataScan::Text {
                 len_with_nul: text.len_with_nul(),
