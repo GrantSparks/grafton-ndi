@@ -38,6 +38,11 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - `FrameSyncAudioRequest` rejects invalid rates, counts and payload extents with
   `InvalidInput(InputDefect::Layout(..))`, matching reusable audio requests.
   Frame construction continues to report `InvalidFrame(FrameDefect::Layout(..))`.
+- Exact source-name inputs share `InvalidInput(Empty { what: "source name" })`
+  for empty names and `InvalidCString` for NUL bytes. Discovery lookups check
+  names and hosts before timeouts in both synchronous and async APIs;
+  listener connect requests refuse empty names.
+
 - All relative environment library directories use `LoadRefusal::RelativeSearchDirectory`;
   `LoadAttempt::origin()` identifies the variable that supplied the directory.
 - Allocator strides use the frame layout's causes for every uncompressed

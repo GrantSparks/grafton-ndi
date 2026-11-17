@@ -3,7 +3,7 @@
 
 use super::{Retained, ServerApi, ServerObject};
 use crate::{
-    finder::SourceText,
+    finder::{SourceName, SourceText},
     sdk_copy::{
         bounded_sdk_text, copy_lossy, CopyBudget, SpanError, COPY_LIMIT, MAX_SDK_STRING_BYTES,
     },
@@ -983,7 +983,9 @@ impl RecvListener {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCString`] when `source_name` contains a NUL byte;
+    /// Returns [`Error::InvalidInput`] when `source_name` is empty, and
+    /// [`Error::InvalidCString`] when it contains a NUL byte, before reading
+    /// listener membership;
     /// [`Error::ReceiverRequestNotAccepted`] when no receiver the listener
     /// lists has this identifier (`advertised` is false: the listener may not
     /// have connected yet, the receiver may not be registered, or its entry
@@ -997,7 +999,7 @@ impl RecvListener {
     /// neither scanned nor copied and cannot spend that budget.
     #[doc(alias = "NDIlib_recv_listener_send_connect")]
     pub fn request_connect(&mut self, id: &ReceiverId, source_name: &str) -> Result<()> {
-        self.request(id, Some(source_name))
+        self.request(id, Some(SourceName::checked(source_name)?))
     }
     /// Ask the receiver `id` names to disconnect from its current source.
     ///
@@ -1008,13 +1010,13 @@ impl RecvListener {
     ///
     /// # Errors
     ///
-    /// As for [`Self::request_connect`], without the NUL check.
+    /// As for [`Self::request_connect`], without source-name validation.
     #[doc(alias = "NDIlib_recv_listener_send_connect")]
     pub fn request_disconnect(&mut self, id: &ReceiverId) -> Result<()> {
         self.request(id, None)
     }
-    fn request(&mut self, id: &ReceiverId, source: Option<&str>) -> Result<()> {
-        let source = source.map(CString::new).transpose()?;
+    fn request(&mut self, id: &ReceiverId, source: Option<SourceName<'_>>) -> Result<()> {
+        let source = source.map(SourceName::into_c_string);
         // The SDK accepts this command only for a receiver that advertises it.
         // Read current membership rather than trust what the caller last saw.
         let mut budget = copy_budget();

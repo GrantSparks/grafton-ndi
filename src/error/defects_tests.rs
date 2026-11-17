@@ -175,7 +175,6 @@ fn frame_defect_diagnostics_preserve_their_text() {
 fn input_defect_diagnostics_preserve_their_text() {
     let cases = [
         ("Layout", InputDefect::Layout(LayoutDefect::VideoZeroStride), "Video line stride must be positive, got 0"),
-        ("InvalidSourceName", InputDefect::InvalidSourceName, "Source name must be nonempty and contain no NUL"),
         ("ListElement", InputDefect::ListElement { setting: "groups", index: 2 }, "groups element 2 must be nonempty and contain neither a comma nor a NUL"),
         ("InvalidHostQuery", InputDefect::InvalidHostQuery, "Host must be a bare hostname, IP address or NDI machine name"),
         ("PtzPreset", InputDefect::PtzPreset, "PTZ preset must be within 0..=99"),

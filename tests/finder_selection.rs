@@ -149,12 +149,14 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
             .find_source_by_name("camera 2", Duration::ZERO)
             .unwrap()
             .is_none());
-        for name in ["", "bad\0name"] {
-            assert!(matches!(
-                studio.find_source_by_name(name, Duration::ZERO),
-                Err(Error::InvalidInput(_))
-            ));
-        }
+        assert!(matches!(
+            studio.find_source_by_name("", Duration::ZERO),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            studio.find_source_by_name("bad\0name", Duration::ZERO),
+            Err(Error::InvalidCString(_))
+        ));
         assert!(matches!(
             studio.find_source_by_name(selected.name(), Duration::MAX),
             Err(Error::InvalidInput(_))
