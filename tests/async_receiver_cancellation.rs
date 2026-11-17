@@ -375,6 +375,12 @@ async fn source_name_worker_retains_runtime<R: AsyncRuntime>(ndi: Ndi) {
         || !Ndi::is_running(),
         "worker retained the runtime after its query",
     );
+    // Stopping already reports not running, before the native destroy has
+    // necessarily finished writing its lifecycle evidence.
+    await_condition(
+        || log().lines().any(|line| line == "destroy"),
+        "runtime destruction did not complete",
+    );
     let events = log();
     assert_eq!(destroyed(), 1);
     assert_eq!(events.lines().filter(|line| *line == "destroy").count(), 1);
