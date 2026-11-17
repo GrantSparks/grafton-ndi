@@ -326,21 +326,22 @@ fn captured<T>(result: Result<Option<T>, Error>) -> Option<T> {
 }
 
 fn progress<M: ReceiverMode>(receiver: &Receiver<M>) {
-    progress_after(receiver, 0);
+    progress_after_in(receiver, 0, "initial video progress");
 }
 
-fn progress_after<M: ReceiverMode>(receiver: &Receiver<M>, before: u64) {
+fn progress_after_in<M: ReceiverMode>(receiver: &Receiver<M>, before: u64, phase: &str) {
     let deadline = Instant::now() + PATIENCE;
     loop {
-        let received = receiver.connection_stats().unwrap().video_frames_received();
+        let stats = receiver.connection_stats().unwrap();
+        let received = stats.video_frames_received();
         if received > 0 && received != before {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "no progress after source change: {:?}; stats {:?}",
+            "no progress during {phase}; video count before={before}; target {:?}; stats {:?}",
             receiver.connection_target(),
-            receiver.connection_stats().unwrap()
+            stats,
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -350,22 +351,25 @@ fn storm<M: ReceiverMode>(receiver: &Receiver<M>, peers: &Peers, stopped: &Atomi
     let deadline = Instant::now() + duration();
     let mut round = 0u64;
     while Instant::now() < deadline && !stopped.load(Ordering::Acquire) {
-        for source in &peers.sources {
-            let before = receiver.connection_stats().unwrap().video_frames_received();
-            timed("connect_to", Duration::ZERO, || receiver.connect_to(source));
-            progress_after(receiver, before);
+        for (index, source) in peers.sources.iter().enumerate() {
+            let before = receiver.connection_stats().unwrap();
+            let phase = format!("round {round} connect_to peer {index} (before: {before:?})");
+            timed(&phase, Duration::ZERO, || receiver.connect_to(source));
+            progress_after_in(receiver, before.video_frames_received(), &phase);
             thread::sleep(Duration::from_millis(round % 21));
         }
         timed("disconnect", Duration::ZERO, || receiver.disconnect());
         thread::sleep(Duration::from_millis(round % 21));
-        let before = receiver.connection_stats().unwrap().video_frames_received();
-        timed("reconnect", Duration::ZERO, || receiver.reconnect());
-        progress_after(receiver, before);
+        let before = receiver.connection_stats().unwrap();
+        let phase = format!("round {round} reconnect (before: {before:?})");
+        timed(&phase, Duration::ZERO, || receiver.reconnect());
+        progress_after_in(receiver, before.video_frames_received(), &phase);
         round += 1;
     }
-    let before = receiver.connection_stats().unwrap().video_frames_received();
+    let before = receiver.connection_stats().unwrap();
+    let phase = format!("final connect_to peer 0 after {round} rounds (before: {before:?})");
     receiver.connect_to(&peers.sources[0]);
-    progress_after(receiver, before);
+    progress_after_in(receiver, before.video_frames_received(), &phase);
     eprintln!("completed {round} connect/disconnect/reconnect rounds");
 }
 
@@ -501,8 +505,47 @@ fn shared_controls<M: ReceiverMode>(receiver: &Receiver<M>, kind: usize, round: 
     }
 }
 
+const CONTROL_FAMILIES: [&str; 3] = [
+    "PTZ",
+    "tally/metadata/registration/web",
+    "delay/statistics/keyframe",
+];
+
+#[derive(Default)]
+struct ControlProgress([AtomicU64; 3]);
+
+impl Drop for ControlProgress {
+    fn drop(&mut self) {
+        for (family, count) in CONTROL_FAMILIES.iter().zip(&self.0) {
+            eprintln!(
+                "{family}: {} completed control groups",
+                count.load(Ordering::Relaxed)
+            );
+        }
+    }
+}
+
+#[test]
+fn ptz_controls_capture_and_connect_complete_without_torn_frames() {
+    shared_control_overlap(&[0]);
+}
+
+#[test]
+fn metadata_controls_capture_and_connect_complete_without_torn_frames() {
+    shared_control_overlap(&[1]);
+}
+
+#[test]
+fn delay_and_statistics_capture_and_connect_complete_without_torn_frames() {
+    shared_control_overlap(&[2]);
+}
+
 #[test]
 fn shared_controls_capture_and_connect_complete_without_torn_frames() {
+    shared_control_overlap(&[0, 1, 2]);
+}
+
+fn shared_control_overlap(kinds: &[usize]) {
     let Some(ndi) = common::ndi() else {
         return;
     };
@@ -510,12 +553,17 @@ fn shared_controls_capture_and_connect_complete_without_torn_frames() {
     let peers = Peers::new(&ndi);
     let receiver = Receiver::new(&ndi, &ReceiverOptions::new(peers.sources[0].clone())).unwrap();
     let loans = Loans::default();
-    let controls = AtomicU64::new(0);
+    let controls = ControlProgress::default();
+    eprintln!(
+        "control overlap runtime {:?}; peers {:?}",
+        ndi.info(),
+        peers.sources
+    );
     let upstream = peers.run(|stopped| {
         thread::scope(|scope| {
             let _stop = Stop(stopped);
-            for kind in 0..3 {
-                let (receiver, controls) = (&receiver, &controls);
+            for &kind in kinds {
+                let (receiver, controls) = (&receiver, &controls.0[kind]);
                 scope.spawn(move || {
                     let mut round = 0;
                     while !stopped.load(Ordering::Acquire) {
@@ -570,13 +618,17 @@ fn shared_controls_capture_and_connect_complete_without_torn_frames() {
             storm(&receiver, &peers, stopped);
         });
     });
-    assert!(controls.load(Ordering::Relaxed) > 0);
-    assert!(upstream > 0, "source handled no upstream controls");
+    for &kind in kinds {
+        assert!(
+            controls.0[kind].load(Ordering::Relaxed) > 0,
+            "{} made no calls",
+            CONTROL_FAMILIES[kind]
+        );
+    }
+    if kinds.contains(&0) || kinds.contains(&1) {
+        assert!(upstream > 0, "source handled no upstream controls");
+    }
     loans.balanced(&ndi);
-    eprintln!(
-        "completed {} shared-control groups",
-        controls.load(Ordering::Relaxed)
-    );
 }
 
 #[cfg(feature = "advanced")]
@@ -950,7 +1002,7 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
                 observe(SourceNameChange::Connected(
                     peers.sources[index].name().to_owned(),
                 ));
-                progress_after(&receiver, before);
+                progress_after_in(&receiver, before, "remote request_connect");
                 loans.wait_for_media(&ndi);
                 assert_eq!(
                     receiver.connection_target(),
