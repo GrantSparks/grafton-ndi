@@ -4706,7 +4706,9 @@ mod tests {
 
     #[test]
     fn creation_settings_borrow_the_retained_targets_own_pointers() {
-        let source = test_source();
+        let source = Source::new("creation target")
+            .unwrap()
+            .with_address(crate::SourceAddress::new("192.0.2.19:5960").unwrap());
         let target = RetainedSource::new(&source);
         let options = ReceiverOptions::new(source).name("retained receiver");
         let name = CString::new("retained receiver").unwrap();
