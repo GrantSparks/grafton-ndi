@@ -107,6 +107,10 @@ impl FileText {
             return Err(Error::InvalidInput(crate::InputDefect::Empty { what }));
         }
         if value.contains('\0') {
+            #[expect(
+                clippy::unwrap_used,
+                reason = "contains proved an interior NUL; NulError has no public constructor"
+            )]
             return Err(CString::new(value).unwrap_err().into());
         }
         Ok(Self::from_checked(value))
@@ -918,6 +922,10 @@ pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<(PathBuf, 
     // Windows path resolution rejects NULs as an I/O error. Keep the SDK
     // string error consistent with absolute paths and the other platforms.
     if text.contains('\0') {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "contains proved an interior NUL; NulError has no public constructor"
+        )]
         return Err(CString::new(text).unwrap_err().into());
     }
     let absolute = if path.is_absolute() {

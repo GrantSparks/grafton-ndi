@@ -432,6 +432,10 @@ impl<'a, P: Sample> Reader<'a, P> {
 }
 
 /// Row `y` of a plane, which the validated layout guarantees exists.
+#[expect(
+    clippy::expect_used,
+    reason = "reader loops and repeated final JPEG rows stay inside the validated plane height"
+)]
 fn row(plane: VideoPlane<'_>, y: usize) -> &[u8] {
     plane
         .row(y)

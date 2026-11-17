@@ -87,6 +87,10 @@ pub(crate) struct AliasableVec<T> {
 impl<T> AliasableVec<T> {
     pub(crate) fn new(value: Vec<T>) -> Self {
         let mut value = ManuallyDrop::new(value);
+        #[expect(
+            clippy::expect_used,
+            reason = "Vec::as_mut_ptr guarantees a non-null pointer, including for zero capacity"
+        )]
         Self {
             pointer: NonNull::new(value.as_mut_ptr()).expect("Vec pointers are non-null"),
             len: value.len(),

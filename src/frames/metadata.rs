@@ -351,6 +351,10 @@ impl TerminatedText {
         let len_with_nul = text.len() + 1;
         validate_metadata_len_with_nul(len_with_nul)?;
         if let Some(position) = text.as_bytes().iter().position(|&byte| byte == 0) {
+            #[expect(
+                clippy::expect_used,
+                reason = "the searched prefix includes its first NUL; NulError has no public constructor"
+            )]
             return Err(Error::InvalidCString(
                 CString::new(&text.as_bytes()[..=position])
                     .expect_err("the prefix includes its first NUL"),

@@ -386,6 +386,10 @@ pub(crate) fn encode_data_url(source: Source<'_>, options: &ImageOptions) -> Res
 fn data_url(image: &[u8], format: ImageFormat) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine};
     let media_type = format.media_type();
+    #[expect(
+        clippy::expect_used,
+        reason = "a Vec's length is bounded by isize::MAX, so its padded base64 length fits usize"
+    )]
     let encoded_len =
         base64::encoded_len(image.len(), true).expect("the base64 of a Vec's bytes fits in usize");
     let mut url = String::with_capacity("data:;base64,".len() + media_type.len() + encoded_len);

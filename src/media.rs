@@ -139,10 +139,18 @@ impl FrameRate {
         Self {
             numerator: match SdkQuantity::new(frames as i64) {
                 Some(value) => value,
+                #[expect(
+                    clippy::panic,
+                    reason = "invalid frame-rate constants must fail during const evaluation"
+                )]
                 None => panic!("frame rate must be in 1..=i32::MAX"),
             },
             denominator: match SdkQuantity::new(1) {
                 Some(value) => value,
+                #[expect(
+                    clippy::unreachable,
+                    reason = "one is in the checked SDK quantity range"
+                )]
                 None => unreachable!(),
             },
         }

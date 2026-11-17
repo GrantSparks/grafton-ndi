@@ -372,11 +372,19 @@ impl<T> Future for FileOperation<T> {
                 let value = WakerSlot::poll(&shared.slot, cx.waker(), |slot, _| match slot {
                     Slot::Pending(waker) => WakerPoll::Pending(Some(waker)),
                     Slot::Ready(_) => {
+                        #[expect(
+                            clippy::unreachable,
+                            reason = "the locked slot was matched Ready and no application code runs before replacement"
+                        )]
                         let Slot::Ready(value) = std::mem::replace(slot, Slot::Taken) else {
                             unreachable!()
                         };
                         WakerPoll::Ready(value, None)
                     }
+                    #[expect(
+                        clippy::unreachable,
+                        reason = "only this operation takes the response and marks its stage Done before another poll"
+                    )]
                     Slot::Taken => unreachable!("a response is taken only by its operation"),
                 });
                 if value.as_ref().is_some_and(Result::is_ok) {
@@ -387,13 +395,24 @@ impl<T> Future for FileOperation<T> {
                 value
             }
             Stage::Live(Live::Immediate(_)) => {
-                let Stage::Live(Live::Immediate(value)) = std::mem::replace(stage, Stage::Done)
-                else {
+                #[expect(
+                    clippy::unreachable,
+                    reason = "the exclusively borrowed stage was matched Immediate and cannot change before replacement"
+                )]
+                let Stage::Live(Live::Immediate(value)) = std::mem::replace(stage, Stage::Done) else {
                     unreachable!()
                 };
                 Some(value)
             }
+            #[expect(
+                clippy::panic,
+                reason = "polling a completed FileOperation violates its documented Future contract"
+            )]
             Stage::Done => panic!("a completed FileOperation was polled again"),
+            #[expect(
+                clippy::unreachable,
+                reason = "start replaces Deferred with Live; a panicking submission leaves Done for cancellation"
+            )]
             Stage::Deferred(_) => unreachable!("start resolves the one deferral"),
         };
         if let Some(value) = value {

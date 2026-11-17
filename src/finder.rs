@@ -1229,6 +1229,10 @@ impl<'a> SourceName<'a> {
             }));
         }
         if name.contains('\0') {
+            #[expect(
+                clippy::unwrap_used,
+                reason = "contains proved an interior NUL; NulError has no public constructor"
+            )]
             return Err(CString::new(name).unwrap_err().into());
         }
         Ok(Self(name))

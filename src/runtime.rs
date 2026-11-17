@@ -1047,6 +1047,10 @@ impl Clone for Ndi {
     ///
     /// Panics if the runtime handle reference count is exhausted. The original
     /// handle and runtime remain valid.
+    #[expect(
+        clippy::expect_used,
+        reason = "Clone cannot report handle-count exhaustion; its documented panic preserves the original handle"
+    )]
     fn clone(&self) -> Self {
         self.runtime
             .selected
