@@ -99,8 +99,9 @@
 //! file bookkeeping makes tracking incomplete. Cleanup then consumes its
 //! remaining original budget even if every known file closes. Neither an empty
 //! known file set nor a stopped recorder proves that unknown files finalized.
-//! The indeterminate report stays unchanged, and a new session requires
-//! [`FileRecorder::reset`]. Async application-notification eviction does not
+//! The indeterminate report stays unchanged. Starting another session returns
+//! [`StateConflict::IncompleteFileTracking`] until [`FileRecorder::reset`]
+//! succeeds. Async application-notification eviction does not
 //! affect the separately maintained native file tracking.
 //!
 //! After a finalization timeout, [`FileRecorder::reset`] explicitly abandons

@@ -820,6 +820,23 @@ impl Ledger {
         self.session_open() || self.tracker().is_some_and(FileTracker::cleanup_pending)
     }
 
+    fn admit_start(&self) -> Result<()> {
+        let conflict = if self.session_open() {
+            Some(StateConflict::PreviousSessionOpen)
+        } else {
+            self.tracker().and_then(|files| {
+                if !files.is_complete() {
+                    Some(StateConflict::IncompleteFileTracking)
+                } else if !files.is_empty() {
+                    Some(StateConflict::PreviousSessionOpen)
+                } else {
+                    None
+                }
+            })
+        };
+        conflict.map_or(Ok(()), |state| Err(Error::InvalidState(state)))
+    }
+
     fn all_closed(&self) -> bool {
         self.open()
             .is_some_and(|data| !data.files.cleanup_pending() && data.report.closed_files > 0)
@@ -1179,11 +1196,11 @@ impl FileRecorder {
     ///
     /// * [`Error::InvalidState`] with [`StateConflict::PreviousSessionOpen`]
     ///   while an earlier session is recording, stopping, awaiting a known
-    ///   file's closure, or has incomplete file tracking. Finish or poll it
-    ///   first when tracking is complete; incomplete tracking requires
-    ///   [`reset`](Self::reset), even after every known file closes. With
-    ///   [`StateConflict::EarlierSessionEvents`] when the SDK keeps reporting
-    ///   events of an earlier session.
+    ///   file's closure under complete tracking; finish or poll it first.
+    ///   [`StateConflict::IncompleteFileTracking`] after a session ends with
+    ///   incomplete tracking; [`reset`](Self::reset) is required even after
+    ///   every known file closes. [`StateConflict::EarlierSessionEvents`]
+    ///   when the SDK keeps reporting events of an earlier session.
     /// * [`Error::InvalidInput`] when the resolved output path is not lossless
     ///   UTF-8, or its longest form exceeds the recorder event's exact path
     ///   limit (4094 UTF-8 bytes with the current SDK), reserving at least
@@ -1211,9 +1228,7 @@ impl FileRecorder {
         timecode: RecordingTimecode,
         sink: &mut impl FnMut(Result<RecorderEvent>),
     ) -> Result<u64> {
-        if self.ledger.cleanup_pending() {
-            return Err(Error::InvalidState(StateConflict::PreviousSessionOpen));
-        }
+        self.ledger.admit_start()?;
         self.naming.check(target)?;
         // Events left over from an earlier session must not be counted in this one.
         self.discard_stale_events(sink)?;
@@ -1221,9 +1236,7 @@ impl FileRecorder {
         // previously final session. Its immutable report does not release
         // the resulting unknown native-file obligation.
         self.ledger.dropped(self.dropped_event_count());
-        if self.ledger.cleanup_pending() {
-            return Err(Error::InvalidState(StateConflict::PreviousSessionOpen));
-        }
+        self.ledger.admit_start()?;
         let session = self
             .ledger
             .session_number()
@@ -1576,8 +1589,9 @@ impl FileRecorder {
     /// Use this after a finalization timeout when the SDK stopped producing
     /// events, or after native event loss, unreadable lifecycle evidence or a
     /// tracking limit made the old session's file tracking incomplete. Incomplete
-    /// tracking requires a reset before another session, even if all known
-    /// files later close. The returned
+    /// tracking causes [`StateConflict::IncompleteFileTracking`] on another
+    /// start after the session ends, even if all known files later close. A
+    /// successful reset clears that refusal. The returned
     /// report preserves that uncertainty; the old file may be truncated.
     /// The replacement has its own event queue, so delayed events from the old
     /// session cannot affect a new recording. The last report is retained and

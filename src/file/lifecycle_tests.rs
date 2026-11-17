@@ -33,6 +33,26 @@ fn target(name: &str) -> RecordingTarget {
 }
 
 #[test]
+fn an_active_or_stopping_session_refuses_start_until_its_known_file_closes() {
+    let device = mock::Recorder::new(Closing::Never);
+    let mut recorder = recording_on(&device);
+    for stopping in [false, true] {
+        if stopping {
+            recorder.request_stop();
+        }
+        assert!(matches!(
+            recorder.start(&target("active-start"), RecordingTimecode::Preserve),
+            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+        ));
+    }
+    device.close();
+    assert!(matches!(
+        recorder.finish(Duration::ZERO).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+}
+
+#[test]
 fn generated_session_timecodes_reach_the_native_start_unchanged() {
     for ticks in [0, 360_000_000_000] {
         let device = mock::Recorder::new(Closing::AtStop);
@@ -277,7 +297,7 @@ fn lost_sdk_events_end_the_session_as_indeterminate() {
     // file closed. Only a new native recorder can start another session.
     assert!(matches!(
         recorder.start(&target("again"), RecordingTimecode::Preserve),
-        Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+        Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
     ));
     assert_eq!(device.starts.load(Ordering::Acquire), 1);
     let replacement = mock::Recorder::new(Closing::AtStop);
@@ -342,7 +362,7 @@ fn a_lost_open_still_blocks_restart_after_all_observed_and_hidden_files_close() 
         assert_eq!(recorder.report(), report);
         assert!(matches!(
             recorder.start(&target("restart-after-loss"), RecordingTimecode::Preserve),
-            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+            Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
         ));
         assert_eq!(device.starts.load(Ordering::Acquire), 1);
     }
@@ -428,7 +448,7 @@ fn a_failed_reset_preserves_the_unknown_file_cleanup_obligation() {
             &target("restart-after-failed-reset"),
             RecordingTimecode::Preserve
         ),
-        Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+        Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
     ));
     assert_eq!(device.starts.load(Ordering::Acquire), 1);
     assert_eq!(recorder.abandon(), report);
@@ -518,10 +538,18 @@ fn evidence_lost_during_the_stale_event_drain_refuses_the_next_native_start() {
                 &target("restart-after-late-evidence"),
                 RecordingTimecode::Preserve
             ),
-            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+            Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
         ));
         assert_eq!(device.starts.load(Ordering::Acquire), 1);
         assert_eq!(recorder.report(), report, "final reports stay immutable");
+        assert_eq!(
+            recorder.finish(Duration::ZERO).unwrap(),
+            FinishStatus::Closed(report.clone())
+        );
+        assert!(matches!(
+            recorder.start(&target("restart-after-finish"), RecordingTimecode::Preserve),
+            Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
+        ));
         let replacement = mock::Recorder::new(Closing::AtStop);
         replacement.install();
         assert_eq!(

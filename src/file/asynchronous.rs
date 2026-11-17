@@ -2272,7 +2272,7 @@ impl AsyncFileRecorder {
     /// [`SessionTimecode`](super::SessionTimecode), validated before queuing.
     /// Events left by an earlier refused start are delivered through
     /// [`next_event`](Self::next_event) before the new session begins.
-    /// Incomplete file tracking returns [`StateConflict::PreviousSessionOpen`]
+    /// Incomplete file tracking returns [`StateConflict::IncompleteFileTracking`]
     /// until [`reset`](Self::reset) succeeds, even if all known files closed.
     #[doc(alias = "NDIlib_file_recorder_start")]
     #[doc(alias = "NDIlib_file_recorder_start_with_timecode")]
@@ -4812,7 +4812,7 @@ mod tests {
         assert!(matches!(outcome, FinishStatus::Indeterminate(_)));
         assert!(matches!(
             recorder.start(&target, RecordingTimecode::Preserve),
-            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+            Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
         ));
         drop(recorder);
         assert!(device.closed_before_destroy.load(Ordering::Acquire));
@@ -4854,14 +4854,14 @@ mod tests {
         let report = recorder.report();
         assert!(matches!(
             recorder.start(&target, RecordingTimecode::Preserve),
-            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+            Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
         ));
         device.close();
         recorder.next_event(Duration::ZERO).unwrap();
         assert_eq!(recorder.report(), report);
         assert!(matches!(
             recorder.start(&target, RecordingTimecode::Preserve),
-            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+            Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
         ));
         assert_eq!(device.starts.load(Ordering::Acquire), 1);
         let replacement = mock::Recorder::new(Closing::AtStop);
@@ -4930,7 +4930,7 @@ mod tests {
                 RecordingTarget::new(std::env::temp_dir().join("hidden-open-restart")).unwrap();
             assert!(matches!(
                 block_on(recorder.start(&target, RecordingTimecode::Preserve)),
-                Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+                Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
             ));
             assert_eq!(device.starts.load(Ordering::Acquire), 1);
 
@@ -4987,6 +4987,58 @@ mod tests {
     }
 
     #[test]
+    fn async_start_distinguishes_active_sessions_from_incomplete_tracking() {
+        let (device, recorder) =
+            mock_recorder_with_drop_wait(Closing::Never, AsyncFileOptions::new(), Duration::ZERO);
+        let target = RecordingTarget::new(std::env::temp_dir().join("async-admission")).unwrap();
+        for stopping in [false, true] {
+            if stopping {
+                block_on(recorder.request_stop()).unwrap();
+            }
+            assert!(matches!(
+                block_on(recorder.start(&target, RecordingTimecode::Preserve)),
+                Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+            ));
+        }
+        device.close();
+        let FinishStatus::Closed(report) =
+            block_on(recorder.finish(Duration::from_secs(1))).unwrap()
+        else {
+            panic!("the known file closed");
+        };
+        device.dropped_events.store(1, Ordering::Release);
+        for _ in 0..2 {
+            assert!(matches!(
+                block_on(recorder.start(&target, RecordingTimecode::Preserve)),
+                Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
+            ));
+            assert_eq!(
+                block_on(recorder.finish(Duration::ZERO)).unwrap(),
+                FinishStatus::Closed(report.clone())
+            );
+        }
+        let replacement = mock::Recorder::new(Closing::AtStop);
+        let installed = Arc::clone(&replacement);
+        block_on(recorder.worker.call(move |_| {
+            installed.install();
+            Ok(())
+        }))
+        .unwrap();
+        assert_eq!(
+            block_on(recorder.reset(&FileRecorderOptions::new(
+                SourceSpec::new("replacement").unwrap()
+            )))
+            .unwrap(),
+            report
+        );
+        assert_eq!(
+            block_on(recorder.start(&target, RecordingTimecode::Preserve)).unwrap(),
+            2
+        );
+        block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
     fn async_reset_retires_unknown_cleanup_only_after_replacement_succeeds() {
         let (device, recorder) = mock_recorder_with_drop_wait(
             Closing::AtStop,
@@ -5019,7 +5071,7 @@ mod tests {
         assert_eq!(block_on(recorder.report()).unwrap(), report);
         assert!(matches!(
             block_on(recorder.start(&target, RecordingTimecode::Preserve)),
-            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+            Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
         ));
         assert_eq!(device.starts.load(Ordering::Acquire), 1);
 

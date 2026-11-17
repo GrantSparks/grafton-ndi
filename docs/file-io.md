@@ -144,7 +144,7 @@ loss, unreadable lifecycle evidence or exhaustion of file bookkeeping makes
 tracking incomplete. A final indeterminate report stays unchanged as later
 events arrive. Even if every known file closes and the SDK stops recording,
 unknown files can still need finalization; another `start` returns
-`PreviousSessionOpen` until `reset` succeeds. A failed reset keeps the original
+`IncompleteFileTracking` until `reset` succeeds. A failed reset keeps the original
 recorder and its cleanup obligation. `reset` replaces the native
 recorder and returns the old session's report; `abandon` destroys it without
 waiting. Async callers await `AsyncFileRecorder::abandon()` for the same
@@ -167,7 +167,8 @@ measures its event wait from the stop's return, giving closure its full
 requested wait. Complete tracking allows cleanup to end early once all files
 close; while a file remains open, a new start returns `PreviousSessionOpen`.
 Incomplete tracking consumes the remaining original cleanup budget even after
-every known file closes, and requires `reset` before another session. Use
+every known file closes, and returns `IncompleteFileTracking` until `reset`
+succeeds before another session. Use
 `abandon` for immediate teardown without the cleanup wait.
 Use explicit finishing when the result matters. See
 [`FileRecorder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorder.html)
