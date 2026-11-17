@@ -150,6 +150,13 @@ impl PixelSampleWidth {
     }
 }
 
+/// Memory order of the two separate chroma planes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ChromaOrder {
+    CbCr,
+    CrCb,
+}
+
 /// Compile-time pixel format properties.
 ///
 /// Records first-plane bytes per pixel, plane category, alpha presence and
@@ -178,6 +185,7 @@ pub struct PixelFormatInfo {
     category: FormatCategory,
     has_alpha: bool,
     sample_width: PixelSampleWidth,
+    chroma_order: ChromaOrder,
 }
 
 impl PixelFormatInfo {
@@ -205,6 +213,11 @@ impl PixelFormatInfo {
     #[cfg(feature = "image-encoding")]
     pub(crate) const fn sample_width(self) -> PixelSampleWidth {
         self.sample_width
+    }
+
+    #[cfg(feature = "image-encoding")]
+    const fn chroma_order(self) -> ChromaOrder {
+        self.chroma_order
     }
 
     pub(crate) const fn plane_count(self) -> usize {
@@ -290,72 +303,91 @@ impl PixelFormat {
     pub const fn info(self) -> PixelFormatInfo {
         match self {
             Self::Bgra | Self::Rgba => PixelFormatInfo {
+                chroma_order: ChromaOrder::CbCr,
                 has_alpha: true,
                 sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 4,
                 category: FormatCategory::Packed,
             },
             Self::Bgrx | Self::Rgbx => PixelFormatInfo {
+                chroma_order: ChromaOrder::CbCr,
                 has_alpha: false,
                 sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 4,
                 category: FormatCategory::Packed,
             },
             Self::Uyvy => PixelFormatInfo {
+                chroma_order: ChromaOrder::CbCr,
                 has_alpha: false,
                 sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 2,
                 category: FormatCategory::Packed,
             },
             Self::Uyva => PixelFormatInfo {
+                chroma_order: ChromaOrder::CbCr,
                 has_alpha: true,
                 sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 2,
                 category: FormatCategory::PackedAlpha,
             },
             Self::P216 => PixelFormatInfo {
+                chroma_order: ChromaOrder::CbCr,
                 has_alpha: false,
                 sample_width: PixelSampleWidth::Sixteen,
                 bytes_per_pixel: 2,
                 category: FormatCategory::SemiPlanar422,
             },
             Self::Pa16 => PixelFormatInfo {
+                chroma_order: ChromaOrder::CbCr,
                 has_alpha: true,
                 sample_width: PixelSampleWidth::Sixteen,
                 bytes_per_pixel: 2,
                 category: FormatCategory::SemiPlanar422Alpha,
             },
-            Self::Yv12 | Self::I420 => PixelFormatInfo {
+            Self::Yv12 => PixelFormatInfo {
+                chroma_order: ChromaOrder::CrCb,
+                has_alpha: false,
+                sample_width: PixelSampleWidth::Eight,
+                bytes_per_pixel: 1,
+                category: FormatCategory::Planar420,
+            },
+            Self::I420 => PixelFormatInfo {
+                chroma_order: ChromaOrder::CbCr,
                 has_alpha: false,
                 sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 1,
                 category: FormatCategory::Planar420,
             },
             Self::Nv12 => PixelFormatInfo {
+                chroma_order: ChromaOrder::CbCr,
                 has_alpha: false,
                 sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 1,
                 category: FormatCategory::SemiPlanar420,
             },
             Self::Na48 => PixelFormatInfo {
+                chroma_order: ChromaOrder::CbCr,
                 has_alpha: false,
                 sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 1,
                 category: FormatCategory::Planar444,
             },
             Self::Nb48 => PixelFormatInfo {
+                chroma_order: ChromaOrder::CbCr,
                 has_alpha: true,
                 sample_width: PixelSampleWidth::Eight,
                 bytes_per_pixel: 1,
                 category: FormatCategory::Planar444Alpha,
             },
             Self::Na4g => PixelFormatInfo {
+                chroma_order: ChromaOrder::CbCr,
                 has_alpha: false,
                 sample_width: PixelSampleWidth::Sixteen,
                 bytes_per_pixel: 2,
                 category: FormatCategory::Planar444,
             },
             Self::Nb4g => PixelFormatInfo {
+                chroma_order: ChromaOrder::CbCr,
                 has_alpha: true,
                 sample_width: PixelSampleWidth::Sixteen,
                 bytes_per_pixel: 2,
@@ -799,6 +831,13 @@ pub(crate) trait VideoPartsExt: VideoParts {
     fn plane_views(&self) -> VideoPlanes<'_> {
         // SAFETY: as for `plane_view`.
         unsafe { self.layout().view_planes(self.pixels()) }
+    }
+
+    /// The frame's planes identified by their component roles.
+    #[cfg(feature = "image-encoding")]
+    fn plane_roles(&self) -> PlaneRoles<'_> {
+        // SAFETY: as for `plane_view`.
+        unsafe { self.layout().plane_roles(self.pixels()) }
     }
 
     /// Every active byte in SDK plane order, or `None` when padding
@@ -3404,6 +3443,39 @@ const _: () = {
     assert!(MAX_METADATA_BYTES < i32::MAX as usize);
 };
 
+/// Plane views whose names carry the format's component ordering.
+#[cfg(feature = "image-encoding")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PlaneRoles<'a> {
+    Packed {
+        pixels: VideoPlane<'a>,
+    },
+    PackedAlpha {
+        pixels: VideoPlane<'a>,
+        alpha: VideoPlane<'a>,
+    },
+    SemiPlanar420 {
+        luma: VideoPlane<'a>,
+        chroma: VideoPlane<'a>,
+    },
+    Planar420 {
+        luma: VideoPlane<'a>,
+        cb: VideoPlane<'a>,
+        cr: VideoPlane<'a>,
+    },
+    SemiPlanar422 {
+        luma: VideoPlane<'a>,
+        chroma: VideoPlane<'a>,
+        alpha: Option<VideoPlane<'a>>,
+    },
+    Planar444 {
+        luma: VideoPlane<'a>,
+        cb: VideoPlane<'a>,
+        cr: VideoPlane<'a>,
+        alpha: Option<VideoPlane<'a>>,
+    },
+}
+
 impl ValidatedVideoLayout {
     /// Initialized active payload, excluding padding.
     pub(crate) const fn payload_len_bytes(&self) -> usize {
@@ -3609,6 +3681,55 @@ impl ValidatedVideoLayout {
         VideoPlanes {
             data,
             layouts: self.planes().iter(),
+        }
+    }
+
+    /// Every plane identified by its component role, including YV12's Cr/Cb order.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::view_plane`].
+    #[cfg(feature = "image-encoding")]
+    unsafe fn plane_roles<'a>(&'a self, data: *const u8) -> PlaneRoles<'a> {
+        let info = self.pixel_format.info();
+        // SAFETY: validation constructs the complete fixed plane table for the
+        // category; each constant index below names one of its active planes.
+        // The caller retains and initializes its storage for the returned borrow.
+        let plane = |index| unsafe { VideoPlane::new(data, self.plane_layouts[index]) };
+        match info.category() {
+            FormatCategory::Packed => PlaneRoles::Packed { pixels: plane(0) },
+            FormatCategory::PackedAlpha => PlaneRoles::PackedAlpha {
+                pixels: plane(0),
+                alpha: plane(1),
+            },
+            FormatCategory::SemiPlanar420 => PlaneRoles::SemiPlanar420 {
+                luma: plane(0),
+                chroma: plane(1),
+            },
+            FormatCategory::Planar420 => {
+                let (cb, cr) = match info.chroma_order() {
+                    ChromaOrder::CbCr => (plane(1), plane(2)),
+                    ChromaOrder::CrCb => (plane(2), plane(1)),
+                };
+                PlaneRoles::Planar420 {
+                    luma: plane(0),
+                    cb,
+                    cr,
+                }
+            }
+            FormatCategory::SemiPlanar422 | FormatCategory::SemiPlanar422Alpha => {
+                PlaneRoles::SemiPlanar422 {
+                    luma: plane(0),
+                    chroma: plane(1),
+                    alpha: info.has_alpha().then(|| plane(2)),
+                }
+            }
+            FormatCategory::Planar444 | FormatCategory::Planar444Alpha => PlaneRoles::Planar444 {
+                luma: plane(0),
+                cb: plane(1),
+                cr: plane(2),
+                alpha: info.has_alpha().then(|| plane(3)),
+            },
         }
     }
 
