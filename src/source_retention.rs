@@ -28,6 +28,10 @@ impl RetainedSource {
         &self.source
     }
 
+    pub(crate) fn descriptor(&self) -> &NDIlib_source_t {
+        self.descriptor.as_raw()
+    }
+
     /// Reissue this exact descriptor without allocating or converting it.
     pub(crate) fn reissue<R>(&self, call: impl FnOnce(*const NDIlib_source_t) -> R) -> R {
         call(ptr::from_ref(self.descriptor.as_raw()))

@@ -767,12 +767,12 @@ mod tests {
                 continue;
             };
             let packets = creation_options(&best, color_format);
+            let target = crate::source_retention::RetainedSource::new(&Source::new("").unwrap());
             let settings = packets
                 .validate_runtime(runtime)
                 .unwrap()
-                .to_raw()
-                .unwrap()
-                .raw;
+                .settings(&target, None);
+            let settings = settings.raw();
             assert_eq!(settings.color_format, color_format, "{preset:?}");
             assert!(settings.allow_video_fields);
 

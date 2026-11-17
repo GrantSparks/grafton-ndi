@@ -37,7 +37,7 @@ use std::sync::atomic::AtomicBool;
 use crate::advanced::{AvSyncAttached, PacketAttached};
 
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString},
     marker::PhantomData,
     os::raw::c_char,
     ptr,
@@ -56,7 +56,7 @@ use crate::{
         MetadataKind, NoSlots, Notification, Only, SlotSet, VideoKind,
     },
     connection_metadata::ConnectionMetadata,
-    finder::{RawSource, Source},
+    finder::Source,
     frames::MetadataPartsExt,
     source_retention::RetainedSource,
     sys::{self, bindings::*},
@@ -672,11 +672,16 @@ pub struct ReceiverOptions {
     passthrough: Option<NDIlib_recv_color_format_e>,
 }
 
-#[repr(C)]
-pub(crate) struct RawRecvCreateV3 {
-    _source: RawSource,
-    _name: Option<CString>,
-    pub raw: NDIlib_recv_create_v3_t,
+/// Creation settings borrow exactly the storage retained by the receiver.
+pub(crate) struct ReceiveSettings<'a> {
+    raw: NDIlib_recv_create_v3_t,
+    _storage: PhantomData<(&'a RetainedSource, Option<&'a CStr>)>,
+}
+
+impl ReceiveSettings<'_> {
+    pub(crate) fn raw(&self) -> &NDIlib_recv_create_v3_t {
+        &self.raw
+    }
 }
 
 impl ReceiverOptions {
@@ -968,11 +973,6 @@ impl ReceiverOptions {
             _video_only: video_only,
         })
     }
-
-    /// The native creation settings, with the strings they point to.
-    pub(crate) fn to_raw(&self, ndi: &Ndi) -> Result<RawRecvCreateV3> {
-        self.validate_runtime(ndi.evidence())?.to_raw()
-    }
 }
 
 pub(crate) struct ValidatedReceiveOptions<'a> {
@@ -982,22 +982,21 @@ pub(crate) struct ValidatedReceiveOptions<'a> {
 }
 
 impl ValidatedReceiveOptions<'_> {
-    pub(crate) fn to_raw(&self) -> Result<RawRecvCreateV3> {
-        let source = self.options.source.to_raw();
-        let name = self.options.name.as_deref().map(CString::new).transpose()?;
-        let p_ndi_recv_name = name.as_ref().map_or(ptr::null(), |n| n.as_ptr());
-        let source_raw = *source.as_raw();
-        Ok(RawRecvCreateV3 {
+    pub(crate) fn settings<'a>(
+        &self,
+        target: &'a RetainedSource,
+        name: Option<&'a CStr>,
+    ) -> ReceiveSettings<'a> {
+        ReceiveSettings {
             raw: NDIlib_recv_create_v3_t {
-                source_to_connect_to: source_raw,
+                source_to_connect_to: *target.descriptor(),
                 color_format: self.options.sdk_color_format(),
                 bandwidth: self.options.bandwidth.to_sdk(),
                 allow_video_fields: self.options.allow_video_fields,
-                p_ndi_recv_name,
+                p_ndi_recv_name: name.map_or(ptr::null(), CStr::as_ptr),
             },
-            _source: source,
-            _name: name,
-        })
+            _storage: PhantomData,
+        }
     }
 }
 
@@ -1603,26 +1602,25 @@ impl<M: CreatableMode> Receiver<M> {
             &NDIlib_recv_create_v3_t,
         ) -> sys::table::Called<NDIlib_recv_instance_t>,
     ) -> Result<Self> {
-        let RawRecvCreateV3 {
-            _source: _,
-            _name,
-            raw,
-        } = options.to_raw(ndi)?;
-        // SAFETY: the core keeps every string these settings point to until
-        // after native destruction, including the target and receiver name.
+        let validated = options.validate_runtime(ndi.evidence())?;
+        let target = RetainedSource::new(&options.source);
+        let name = options.name.as_deref().map(CString::new).transpose()?;
+        let settings = validated.settings(&target, name.as_deref());
         let sdk = ndi.bind_core();
-        let instance = create(&sdk, &raw).created()?.as_ptr();
+        // The settings borrow the target's own descriptor and name. Both
+        // owners move into the core after creation without moving their buffers.
+        let instance = create(&sdk, settings.raw()).created()?.as_ptr();
         Ok(Self {
             core: Arc::new(ReceiverCore {
                 instance: RecvInstance(instance),
                 sdk,
                 change_guard: Mutex::new(ChangePermit),
                 control_guard: Mutex::new(ControlPermit::default()),
-                target: RwLock::new(RetainedSource::new(&options.source)),
+                target: RwLock::new(target),
                 pending: PendingEvents::default(),
                 source_query_guard: Mutex::new(SourceQueryPermit),
                 source_name: Mutex::new(LatestReport::default()),
-                _name,
+                _name: name,
                 #[cfg(feature = "advanced")]
                 _config: config,
             }),
@@ -3320,7 +3318,13 @@ mod tests {
                 assert_eq!(validated.is_ok(), supported);
                 if let Ok(validated) = validated {
                     assert!(validated._best444.is_some());
-                    assert_eq!(validated.to_raw().unwrap().raw.color_format, 102);
+                    assert_eq!(
+                        validated
+                            .settings(&RetainedSource::new(&best.source), None)
+                            .raw()
+                            .color_format,
+                        102
+                    );
                 }
                 for (bandwidth, value) in [
                     (ReceiverBandwidth::VideoOnlyLowest, 1),
@@ -3331,7 +3335,13 @@ mod tests {
                     assert_eq!(validated.is_ok(), supported);
                     if let Ok(validated) = validated {
                         assert!(validated._video_only.is_some());
-                        assert_eq!(validated.to_raw().unwrap().raw.bandwidth, value);
+                        assert_eq!(
+                            validated
+                                .settings(&RetainedSource::new(&options.source), None)
+                                .raw()
+                                .bandwidth,
+                            value
+                        );
                     }
                 }
                 assert!(unconnected().validate_runtime(evidence).is_ok());
@@ -3833,7 +3843,7 @@ mod tests {
     }
 
     fn assert_raw_receiver_modes(
-        raw: &RawRecvCreateV3,
+        raw: &TestSettings,
         expected_color_format: NDIlib_recv_color_format_e,
         expected_bandwidth: NDIlib_recv_bandwidth_e,
     ) {
@@ -4666,14 +4676,55 @@ mod tests {
         );
     }
 
-    fn raw_settings(options: &ReceiverOptions) -> RawRecvCreateV3 {
+    struct TestSettings {
+        raw: NDIlib_recv_create_v3_t,
+        _target: RetainedSource,
+        _name: Option<CString>,
+    }
+
+    fn raw_settings(options: &ReceiverOptions) -> TestSettings {
         sys::with_test_evidence("6.4.0.2", |evidence| {
-            options
+            let target = RetainedSource::new(&options.source);
+            let name = options
+                .name
+                .as_deref()
+                .map(CString::new)
+                .transpose()
+                .unwrap();
+            let raw = *options
                 .validate_runtime(evidence)
                 .unwrap()
-                .to_raw()
-                .unwrap()
+                .settings(&target, name.as_deref())
+                .raw();
+            TestSettings {
+                raw,
+                _target: target,
+                _name: name,
+            }
         })
+    }
+
+    #[test]
+    fn creation_settings_borrow_the_retained_targets_own_pointers() {
+        let source = test_source();
+        let target = RetainedSource::new(&source);
+        let options = ReceiverOptions::new(source).name("retained receiver");
+        let name = CString::new("retained receiver").unwrap();
+        sys::with_test_evidence("6.4.0.2", |evidence| {
+            let validated = options.validate_runtime(evidence).unwrap();
+            let settings = validated.settings(&target, Some(&name));
+            let raw = settings.raw();
+            assert_eq!(
+                raw.source_to_connect_to.p_ndi_name,
+                target.descriptor().p_ndi_name
+            );
+            // SAFETY: both descriptors use the URL member of their union.
+            assert_eq!(
+                unsafe { raw.source_to_connect_to.__bindgen_anon_1.p_url_address },
+                unsafe { target.descriptor().__bindgen_anon_1.p_url_address }
+            );
+            assert_eq!(raw.p_ndi_recv_name, name.as_ptr());
+        });
     }
 
     #[test]

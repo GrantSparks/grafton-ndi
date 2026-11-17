@@ -459,6 +459,7 @@ mod objects {
 
     struct Receiver {
         source: RetainedSource,
+        _creation_source: Box<NDIlib_source_t>,
         name: *const c_char,
         metadata: RetainedMetadata,
     }
@@ -555,8 +556,18 @@ mod objects {
                 let settings = unsafe { &*_p_create_settings };
                 log(&format!("receiver-settings:{}:{}", settings.color_format, settings.bandwidth));
             }
+            let creation_source = Box::new(unsafe { (*_p_create_settings).source_to_connect_to });
+            let source = if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_some()
+                && (!unsafe { CStr::from_ptr(creation_source.p_ndi_name) }.to_bytes().is_empty()
+                    || !unsafe { creation_source.__bindgen_anon_1.p_url_address }.is_null())
+            {
+                RetainedSource(std::ptr::from_ref(&*creation_source))
+            } else {
+                RetainedSource::default()
+            };
             Box::into_raw(Box::new(Receiver {
-                source: RetainedSource::default(),
+                source,
+                _creation_source: creation_source,
                 name: unsafe { (*_p_create_settings).p_ndi_recv_name },
                 metadata: RetainedMetadata::default(),
             })).cast()

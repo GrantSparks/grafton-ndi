@@ -2024,17 +2024,19 @@ impl Source {
     /// Retain the source's validated storage and lend its native descriptor.
     /// No strings are allocated or validated again.
     pub(crate) fn to_raw(&self) -> RawSource {
-        RawSource {
-            _source: self.clone(),
-            raw: NDIlib_source_t {
-                p_ndi_name: self.name.as_ptr(),
-                __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
-                    p_url_address: self
-                        .address
-                        .as_ref()
-                        .map_or(ptr::null(), |address| address.0.as_ptr()),
-                },
+        let source = self.clone();
+        let raw = NDIlib_source_t {
+            p_ndi_name: source.name.as_ptr(),
+            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                p_url_address: source
+                    .address
+                    .as_ref()
+                    .map_or(ptr::null(), |address| address.0.as_ptr()),
             },
+        };
+        RawSource {
+            _source: source,
+            raw,
         }
     }
 }

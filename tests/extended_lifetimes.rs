@@ -113,6 +113,7 @@ fn native_resource_ownership() {
         "retained_concurrent_failover",
         "retained_routes",
         "retained_connection_targets",
+        "retained_creation_target",
         "retained_receiver_name",
         "retained_receiver_metadata",
         "retained_registered_receiver_name",
@@ -353,6 +354,17 @@ fn child(case: &str) {
                     ("refused D", "http://refused.example/ndi"),
                 ],
             );
+        }
+        "retained_creation_target" => {
+            let receiver = Receiver::new(
+                &ndi,
+                &ReceiverOptions::new(retained_source("creation target", "192.0.2.19:5960")),
+            )
+            .unwrap();
+            // Every caller-side source/options value is gone before destroy
+            // asks the fake SDK to read the exact creation strings again.
+            drop(receiver);
+            assert_retained_reads("receiver", &[("creation target", "192.0.2.19:5960")]);
         }
         "retained_connection_targets" => {
             let receiver =
