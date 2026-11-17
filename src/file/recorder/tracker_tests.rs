@@ -288,3 +288,16 @@ fn failed_reservation_preserves_known_files_and_permanently_closes_admission() {
         assert_storage_accounting(&tracker);
     }
 }
+
+#[test]
+fn an_exhausted_open_order_marks_tracking_incomplete_without_retaining_another_file() {
+    let mut tracker = FileTracker::new();
+    tracker.open(RecorderEventKind::Started, path(1));
+    tracker.data_mut().next_order = u64::MAX;
+    tracker.open(RecorderEventKind::Rollover, path(2));
+    assert!(!tracker.is_complete());
+    assert_eq!(tracker.files().len(), 1);
+    assert_eq!(tracker.current(), Some(&path(1)));
+    assert!(tracker.cleanup_pending());
+    assert_storage_accounting(&tracker);
+}

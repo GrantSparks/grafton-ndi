@@ -615,6 +615,29 @@ struct OpenSession {
     dropped_base: u64,
 }
 
+impl OpenSession {
+    fn final_phase(&self, stopping: Option<bool>) -> Option<SessionPhase> {
+        let requested = stopping.unwrap_or(false);
+        if !self.files.is_complete() {
+            Some(SessionPhase::Indeterminate { requested })
+        } else if self.files.is_empty() && self.report.closed_files > 0 {
+            Some(SessionPhase::Closed { requested })
+        } else if stopping.is_some() && self.files.is_empty() {
+            Some(SessionPhase::Indeterminate { requested })
+        } else {
+            None
+        }
+    }
+
+    fn end(self, phase: SessionPhase) -> Session {
+        Session::Ended {
+            report: self.report.into_report(phase),
+            files: self.files,
+            dropped_base: self.dropped_base,
+        }
+    }
+}
+
 /// Each state owns only the data it can use. A stopping session has already
 /// issued its stop; a final session retains only its report and cleanup files.
 enum Session {
@@ -634,6 +657,33 @@ enum Session {
         files: FileTracker,
         dropped_base: u64,
     },
+}
+
+impl Session {
+    /// Moving out of Open transfers its only native-stop obligation.
+    fn stop_requested(self, requested: bool) -> (Self, Option<StopOwed>) {
+        match self {
+            Self::Open { data, stop } => (Self::Stopping { data, requested }, Some(stop)),
+            previous => (previous, None),
+        }
+    }
+
+    fn drained(self, native_recording: bool) -> (Self, Option<StopOwed>) {
+        if native_recording {
+            return (self, None);
+        }
+        match self {
+            Self::Open { data, stop } => match data.final_phase(None) {
+                Some(phase) => (data.end(phase), Some(stop)),
+                None => (Self::Open { data, stop }, None),
+            },
+            Self::Stopping { data, requested } => match data.final_phase(Some(requested)) {
+                Some(phase) => (data.end(phase), None),
+                None => (Self::Stopping { data, requested }, None),
+            },
+            previous => (previous, None),
+        }
+    }
 }
 
 /// The record of one session, built from the recorder's events.
@@ -784,20 +834,18 @@ impl Ledger {
         }
     }
 
-    /// Moving out of Open transfers the only native-stop obligation to its
-    /// caller; repeating the transition cannot mint another one.
-    fn stop_requested(&mut self, requested: bool) -> Option<StopOwed> {
+    fn transition(
+        &mut self,
+        transition: impl FnOnce(Session) -> (Session, Option<StopOwed>),
+    ) -> Option<StopOwed> {
         let previous = std::mem::replace(&mut self.session, Session::Idle { last: None });
-        match previous {
-            Session::Open { data, stop } => {
-                self.session = Session::Stopping { data, requested };
-                Some(stop)
-            }
-            previous => {
-                self.session = previous;
-                None
-            }
-        }
+        let (next, stop) = transition(previous);
+        self.session = next;
+        stop
+    }
+
+    fn stop_requested(&mut self, requested: bool) -> Option<StopOwed> {
+        self.transition(|session| session.stop_requested(requested))
     }
 
     fn mark_uncertain(&mut self) {
@@ -886,35 +934,7 @@ impl Ledger {
     /// Finality relies on open-before-close rollover events, pinned by the
     /// native rollover-order test. Every exit transfers any owed native stop.
     fn drained(&mut self, native_recording: bool) -> Option<StopOwed> {
-        if native_recording {
-            return None;
-        }
-        let data = self.open()?;
-        let requested = match self.session {
-            Session::Stopping { requested, .. } => requested,
-            _ => false,
-        };
-        let phase = if !data.files.is_complete() {
-            SessionPhase::Indeterminate { requested }
-        } else if data.files.is_empty() && data.report.closed_files > 0 {
-            SessionPhase::Closed { requested }
-        } else if matches!(self.session, Session::Stopping { .. }) && data.files.is_empty() {
-            SessionPhase::Indeterminate { requested }
-        } else {
-            return None;
-        };
-        let previous = std::mem::replace(&mut self.session, Session::Idle { last: None });
-        let (data, stop) = match previous {
-            Session::Open { data, stop } => (data, Some(stop)),
-            Session::Stopping { data, .. } => (data, None),
-            _ => unreachable!("only an open session can finish"),
-        };
-        self.session = Session::Ended {
-            report: data.report.into_report(phase),
-            files: data.files,
-            dropped_base: data.dropped_base,
-        };
-        stop
+        self.transition(|session| session.drained(native_recording))
     }
 }
 
@@ -1943,6 +1963,26 @@ mod tests {
     use RecorderEventKind::{
         Error, FileClosed, FormatChanged, OpenFailed, Rollover, Started, WriteFailed,
     };
+
+    #[test]
+    fn idle_and_ended_session_transitions_preserve_their_reports_and_owe_no_stop() {
+        let mut closed = session();
+        let _ = closed.observe(Started, path("take.mkv"));
+        let _ = closed.observe(FileClosed, path("take.mkv"));
+        assert!(closed.drained(false).is_some());
+        for mut ledger in [Ledger::idle(), closed] {
+            let state = ledger.state();
+            let report = ledger.report();
+            for requested in [false, true] {
+                assert!(ledger.stop_requested(requested).is_none());
+                for native_recording in [false, true] {
+                    assert!(ledger.drained(native_recording).is_none());
+                    assert_eq!(ledger.state(), state);
+                    assert_eq!(ledger.report(), report);
+                }
+            }
+        }
+    }
 
     #[test]
     fn every_drain_uses_one_expiry_read_and_one_bounded_late_phase() {
