@@ -326,6 +326,9 @@ mod tests {
         fn send<T: Send>(_: T) {}
         send(finder.find_source(Duration::ZERO, |_| true));
         send(finder.find_source_by_name("camera", Duration::ZERO));
+        let name = String::from("camera");
+        send(finder.find_source_by_name(&name, Duration::ZERO));
+        send(cache.find_source_by_name(&name, Duration::ZERO));
         send(finder.find_sources(Duration::ZERO));
         send(cache.find_sources_by_host("camera", Duration::ZERO));
         send(watch.current_sources());

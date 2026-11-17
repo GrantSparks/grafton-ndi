@@ -9,7 +9,6 @@ mod snapshot_guard_contract;
 pub(crate) use budget::SnapshotBudget;
 
 use std::{
-    borrow::Cow,
     cell::Cell,
     collections::{HashMap, HashSet},
     ffi::{c_char, CString},
@@ -1014,7 +1013,7 @@ const _: () = {
 /// An exact, nonempty NDI source name with no interior NUL. Ownership can
 /// change without checking the same text again.
 #[derive(Debug, Clone)]
-pub(crate) struct SourceName<'a>(Cow<'a, str>);
+pub(crate) struct SourceName<'a>(&'a str);
 
 impl<'a> SourceName<'a> {
     pub(crate) fn checked(name: &'a str) -> Result<Self> {
@@ -1026,16 +1025,16 @@ impl<'a> SourceName<'a> {
         if name.contains('\0') {
             return Err(CString::new(name).unwrap_err().into());
         }
-        Ok(Self(Cow::Borrowed(name)))
+        Ok(Self(name))
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        self.0
     }
 
     #[cfg(any(feature = "tokio", feature = "smol"))]
-    pub(crate) fn into_owned(self) -> SourceName<'static> {
-        SourceName(Cow::Owned(self.0.into_owned()))
+    pub(crate) fn into_owned(self) -> OwnedSourceName {
+        OwnedSourceName(self.0.to_owned())
     }
 
     pub(crate) fn into_c_string(self) -> CString {
@@ -1046,6 +1045,19 @@ impl<'a> SourceName<'a> {
         // SAFETY: checked excludes every NUL, and ownership changes preserve
         // those exact bytes. CString appends the only, terminating NUL.
         unsafe { CString::from_vec_unchecked(bytes) }
+    }
+}
+
+/// The checked name crossing async dispatch has no borrowed representation or
+/// lifetime parameter. Rust 1.88 can prove its worker future is Send directly.
+#[cfg(any(feature = "tokio", feature = "smol"))]
+#[derive(Debug, Clone)]
+pub(crate) struct OwnedSourceName(String);
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+impl OwnedSourceName {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
