@@ -3169,6 +3169,76 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_host_identity_preserves_map_laws_without_allocating_for_edge_spellings() {
+        use std::hash::DefaultHasher;
+        let spellings = [
+            "camera",
+            "Camera.",
+            "camera..",
+            "CAMERA..",
+            "camera...",
+            "Étage A",
+            "ÉTAGE a.",
+            "étage a",
+            "E\u{301}tage A",
+            "İS",
+            "İs.",
+            "is",
+            "K",
+            "K",
+            "k.",
+            "192.0.2.1",
+            "[192.0.2.1]",
+            "::ffff:192.0.2.1",
+            "[::ffff:192.0.2.1]",
+            "[2001:db8::1]",
+            "2001:DB8::1",
+        ];
+        let queries: Vec<_> = spellings
+            .iter()
+            .map(|text| HostQuery::checked(text).unwrap())
+            .collect();
+        let keys: Vec<_> = queries
+            .iter()
+            .map(|&query| HostKey::try_from(query).unwrap())
+            .collect();
+        let hash = |value: &dyn HostIdentity| {
+            let mut state = DefaultHasher::new();
+            value.hash(&mut state);
+            state.finish()
+        };
+        for (i, &query) in queries.iter().enumerate() {
+            let mut map = HashMap::from([(HostKey::try_from(query).unwrap(), ())]);
+            let ((), allocations) = crate::test_alloc::allocation_count(|| {
+                for (j, other) in queries.iter().enumerate() {
+                    let equal = keys[i] == keys[j];
+                    assert_eq!(
+                        (&query as &dyn HostIdentity) == (other as &dyn HostIdentity),
+                        equal
+                    );
+                    assert_eq!(hash(&keys[j]), hash(other));
+                    if equal {
+                        assert_eq!(hash(&query), hash(other));
+                    }
+                    assert_eq!(
+                        map.contains_key(other as &dyn HostIdentity),
+                        equal,
+                        "{} versus {}",
+                        spellings[i],
+                        spellings[j]
+                    );
+                    let removed = map.remove_entry(other as &dyn HostIdentity);
+                    assert_eq!(removed.is_some(), equal);
+                    if let Some((key, value)) = removed {
+                        map.insert(key, value);
+                    }
+                }
+            });
+            assert_eq!(allocations, 0, "{}", spellings[i]);
+        }
+    }
+
+    #[test]
     fn equivalent_cache_hits_and_invalidation_share_one_identity() {
         for (a, b) in [
             ("CAMERA.LOCAL", "camera.local"),
@@ -3879,6 +3949,38 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn descriptor_selector_errors_preserve_text_charges_without_building_storage() {
+        for (name, address) in [
+            (c"Camera".as_ptr(), c"192.0.2.1:5960".as_ptr()),
+            (c"Cam\xff".as_ptr(), c"ndi://host\xfe:5960".as_ptr()),
+            (ptr::null(), c"[2001:db8::1]:5960".as_ptr()),
+            (c"".as_ptr(), ptr::null()),
+        ] {
+            let mut rejected_budget = SnapshotBudget::new();
+            let mut failed_budget = SnapshotBudget::new();
+            // SAFETY: the null pointers and complete C literals stay live for
+            // both decodes; neither selector retains its borrowed source.
+            let rejected =
+                unsafe { decode_source(name, address, &mut rejected_budget, |_| Ok(false)) };
+            assert!(rejected.unwrap().is_none());
+            let (failed, allocations) = crate::test_alloc::allocation_count(|| {
+                // SAFETY: the same descriptor and lifetime obligations as above.
+                unsafe {
+                    decode_source(name, address, &mut failed_budget, |_| {
+                        Err(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))
+                    })
+                }
+            });
+            assert!(matches!(
+                failed,
+                Err(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))
+            ));
+            assert_eq!(allocations, 0);
+            assert_eq!(failed_budget.spent(), rejected_budget.spent());
         }
     }
 
