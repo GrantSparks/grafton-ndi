@@ -42,6 +42,8 @@ fn main() {
         "ndi_test_send_ownership",
         "ndi_test_send_ownership_control",
         "ndi_test_send_ownership_types",
+        "ndi_test_packet_payload",
+        "ndi_test_packet_payload_mutation",
         "ndi_test_descriptor_parts",
         "ndi_test_runtime_binding",
         "ndi_test_runtime_binding_control",

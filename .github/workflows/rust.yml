@@ -294,6 +294,7 @@ jobs:
                 advanced::reserved_map::tests::
                 advanced::send_slots::tests::
                 advanced::aliasable::tests::
+                advanced::packets::payload::tests::
                 advanced::packets::received::tests::
                 advanced::queued::boundary_tests::
                 sender::in_flight::tests::
