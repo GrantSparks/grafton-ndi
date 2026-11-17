@@ -46,6 +46,15 @@
 
 #![deny(missing_debug_implementations)]
 #![warn(clippy::return_self_not_must_use)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::unreachable,
+        clippy::panic
+    )
+)]
 // Android has no native thread-locals, so std expands `thread_local!` through
 // its OS-key implementation, which wraps even a `const { .. }` initializer in
 // an ordinary function; clippy then asks for the `const` the test-only
