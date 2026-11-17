@@ -25,3 +25,10 @@ when tracking is incomplete, including after all known files close. They do not
 restart that budget or change an already-final indeterminate report. Normal
 sessions with complete tracking still finish cleanup early after all files close.
 Async application-notification eviction alone does not make tracking incomplete.
+
+## Borrowed video frame module
+
+Import `BorrowedVideoFrame` and `BorrowedVideoFrameBuilder` from
+`grafton_ndi::frames` instead of `grafton_ndi::sender`. Both frame families now
+keep their checked layouts and borrowed storage in the same private module.
+Existing imports from the crate root remain available.

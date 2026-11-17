@@ -347,4 +347,4 @@ change the picture. Direct external sending requires enough initialized space
 and `allow_send_from_padding_and_tail(true)`. Include all trailing room in the
 slice passed to the builder; padding/tail bytes may affect encoded output once
 opted in. Allocate with `PixelFormat::send_buffer_len` and follow the
-[`BorrowedVideoFrameBuilder` padding policy](https://grantsparks.github.io/grafton-ndi/grafton_ndi/sender/struct.BorrowedVideoFrameBuilder.html).
+[`BorrowedVideoFrameBuilder` padding policy](https://grantsparks.github.io/grafton-ndi/grafton_ndi/frames/struct.BorrowedVideoFrameBuilder.html).

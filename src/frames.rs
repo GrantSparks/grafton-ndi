@@ -248,7 +248,7 @@ impl PixelFormat {
     /// byte distance between rows that holds the active width. The returned size includes every plane and
     /// the extra readable bytes required by the format and scan type. It is
     /// suitable for allocating external buffers used with
-    /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`](crate::BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail).
+    /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`].
     /// Padding and tail bytes must be initialized before direct sending;
     /// the visible picture still occupies [`Self::buffer_len`] bytes for a
     /// packed layout. Owned frames initialize their own tail as needed.
@@ -418,14 +418,14 @@ impl PixelFormat {
     ///   changes grow its allocation when necessary, so sending it needs
     ///   no wrapper pixel copy or reallocation.
     /// - [`Sender::send_video`](crate::Sender::send_video) sends a
-    ///   [`BorrowedVideoFrame`](crate::BorrowedVideoFrame) through a packed,
+    ///   [`BorrowedVideoFrame`] through a packed,
     ///   zero-tailed copy by default when this room is nonzero. Direct sending
     ///   requires both sufficient room and explicit opt-in through
-    ///   [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`](crate::BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail).
-    ///   [`BorrowedVideoFrame::sends_in_place`](crate::BorrowedVideoFrame::sends_in_place)
+    ///   [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`].
+    ///   [`BorrowedVideoFrame::sends_in_place`]
     ///   tells which.
     /// - Include any initialized trailing room in the slice passed to
-    ///   [`BorrowedVideoFrame::builder`](crate::BorrowedVideoFrame::builder),
+    ///   [`BorrowedVideoFrame::builder`],
     ///   so the frame borrows those bytes along with its pixels.
     ///
     /// One kind of frame needs two rows more, twice the line stride: an
@@ -684,7 +684,7 @@ impl VideoHeader {
 /// The parts of a video frame that its shared accessors and owned copies
 /// read.
 ///
-/// [`VideoFrame`], [`BorrowedVideoFrame`](crate::BorrowedVideoFrame), internal
+/// [`VideoFrame`], [`BorrowedVideoFrame`], internal
 /// validated video, and the borrowed [`VideoFrameRef`] and
 /// [`FrameSyncVideoRef`](crate::FrameSyncVideoRef) views lend their validated
 /// layout, header, pixels and metadata through it. [`video_accessors!`]
@@ -2078,184 +2078,6 @@ pub trait AudioSource: AudioParts {
     fn copy_into(&self, destination: &mut AudioFrame);
 }
 
-/// Validated planar floating-point audio borrowed from application storage.
-///
-/// Samples and optional NUL-terminated metadata are borrowed for the frame's
-/// lifetime. Synchronous sending and [`crate::audio_conversion::AudioConverter`]
-/// use the original channel stride without copying samples or allocating.
-/// Inspect channels with [`Self::channel_data`] or [`Self::channels`]; those
-/// slices exclude inter-channel padding.
-#[derive(Clone, Copy)]
-pub struct BorrowedAudioFrame<'buf> {
-    layout: ValidatedAudioLayout,
-    timecode: Timecode,
-    data: &'buf [f32],
-    metadata: Option<MetadataText<'buf>>,
-}
-
-// SAFETY: Construction checks the f32 slice covers the validated layout, with
-// initialized samples. Its borrow keeps the slice and validated terminated
-// metadata alive and unchanged; the default descriptor uses only those parts.
-unsafe impl AudioParts for BorrowedAudioFrame<'_> {
-    fn layout(&self) -> &ValidatedAudioLayout {
-        &self.layout
-    }
-    fn audio_timecode(&self) -> Timecode {
-        self.timecode
-    }
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
-        None
-    }
-    fn samples(&self) -> *const f32 {
-        self.data.as_ptr()
-    }
-    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
-        FrameMetadataRef::from_text(self.metadata)
-    }
-}
-
-impl<'buf> BorrowedAudioFrame<'buf> {
-    /// Configure a borrowed planar frame with explicit sample rate and shape.
-    ///
-    /// Defaults to tightly packed channels, [`Timecode::SYNTHESIZE`] and no
-    /// metadata. A larger input slice is permitted; only the checked frame
-    /// extent is retained. All validation occurs in the builder's `build`.
-    ///
-    /// ```
-    /// use grafton_ndi::{AudioSource, BorrowedAudioFrame};
-    /// let samples = [1.0, 2.0, 99.0, 3.0, 4.0];
-    /// let frame = BorrowedAudioFrame::builder(&samples, 48_000, 2, 2)
-    ///     .channel_stride_bytes(12)
-    ///     .build()?;
-    /// let source: &dyn AudioSource = &frame;
-    /// assert_eq!(source.channels().collect::<Vec<_>>(), [&[1.0, 2.0][..], &[3.0, 4.0][..]]);
-    /// assert!(source.data().is_none());
-    /// # Ok::<(), grafton_ndi::Error>(())
-    /// ```
-    pub fn builder(
-        data: &'buf [f32],
-        sample_rate: u32,
-        num_channels: u32,
-        num_samples: u32,
-    ) -> BorrowedAudioFrameBuilder<'buf> {
-        BorrowedAudioFrameBuilder {
-            data,
-            sample_rate,
-            num_channels,
-            num_samples,
-            channel_stride_bytes: None,
-            timecode: Timecode::SYNTHESIZE,
-            metadata: None,
-        }
-    }
-
-    /// Return this frame with the supplied timecode; no samples are copied.
-    #[must_use]
-    pub fn with_timecode(mut self, timecode: Timecode) -> Self {
-        self.timecode = timecode;
-        self
-    }
-}
-
-/// Builder for [`BorrowedAudioFrame`]; no sample or metadata copies are made.
-#[derive(Clone, Copy)]
-pub struct BorrowedAudioFrameBuilder<'buf> {
-    data: &'buf [f32],
-    sample_rate: u32,
-    num_channels: u32,
-    num_samples: u32,
-    channel_stride_bytes: Option<usize>,
-    timecode: Timecode,
-    metadata: Option<&'buf CStr>,
-}
-
-impl fmt::Debug for BorrowedAudioFrameBuilder<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BorrowedAudioFrameBuilder")
-            .field("sample_rate", &self.sample_rate)
-            .field("num_channels", &self.num_channels)
-            .field("num_samples", &self.num_samples)
-            .field("channel_stride_bytes", &self.channel_stride_bytes)
-            .field("timecode", &self.timecode)
-            .field("metadata", &self.metadata.map(CStr::to_string_lossy))
-            .field("data (samples)", &self.data.len())
-            .finish()
-    }
-}
-
-impl<'buf> BorrowedAudioFrameBuilder<'buf> {
-    /// Set the distance in bytes between consecutive channel starts.
-    /// Must be a positive multiple of `size_of::<f32>()`, at least one channel's
-    /// samples, and fit the SDK's signed 32-bit stride field.
-    #[must_use]
-    pub fn channel_stride_bytes(mut self, bytes: usize) -> Self {
-        self.channel_stride_bytes = Some(bytes);
-        self
-    }
-
-    /// Reset the stride override to tightly packed channels.
-    #[must_use]
-    pub fn clear_channel_stride_bytes(mut self) -> Self {
-        self.channel_stride_bytes = None;
-        self
-    }
-
-    /// Set the frame timecode; defaults to [`Timecode::SYNTHESIZE`].
-    #[must_use]
-    pub fn timecode(mut self, timecode: Timecode) -> Self {
-        self.timecode = timecode;
-        self
-    }
-
-    /// Borrow NUL-terminated UTF-8 metadata, validated when built.
-    /// An explicit empty C string differs from absent metadata.
-    #[must_use]
-    pub fn metadata(mut self, metadata: &'buf CStr) -> Self {
-        self.metadata = Some(metadata);
-        self
-    }
-
-    /// Remove the optional metadata override.
-    #[must_use]
-    pub fn clear_metadata(mut self) -> Self {
-        self.metadata = None;
-        self
-    }
-
-    /// Validate the rate, positive channel/sample counts, stride, sample extent
-    /// and optional UTF-8 metadata without allocating sample storage.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidFrame`] for an invalid layout, insufficient storage,
-    /// exceeding the 64 MiB audio limit or the 4 MiB metadata cap;
-    /// [`Error::InvalidUtf8`] for metadata that is not UTF-8.
-    pub fn build(self) -> Result<BorrowedAudioFrame<'buf>> {
-        let layout = ValidatedAudioLayout::new_uncompressed(
-            AudioFormat::Fltp,
-            self.sample_rate,
-            self.num_channels,
-            self.num_samples,
-            self.channel_stride_bytes,
-        )?;
-        // The slice supplies alignment; the layout's extent establishes that
-        // every active channel is initialized and borrowed for 'buf.
-        let data = self.data.get(..layout.sample_count()).ok_or({
-            Error::InvalidFrame(crate::FrameDefect::AudioBufferTooSmall {
-                actual: self.data.len(),
-                minimum: layout.sample_count(),
-            })
-        })?;
-        let metadata = self.metadata.map(MetadataText::from_cstr).transpose()?;
-        Ok(BorrowedAudioFrame {
-            layout,
-            timecode: self.timecode,
-            data,
-            metadata,
-        })
-    }
-}
-
 /// Generate an audio frame type's shared public accessors and its `Debug`
 /// from its [`AudioParts`], so that each accessor is written, and
 /// documented, once. Every generated method delegates to the frame's
@@ -2401,37 +2223,10 @@ macro_rules! audio_accessors {
     };
 }
 
-audio_accessors! {
-    impl['buf] BorrowedAudioFrame<'buf>;
-    debug("BorrowedAudioFrame", "data (samples)" = sample_count);
-    timecode {}
-    timestamp {
-        /// Application input has no SDK submission timestamp.
-    }
-    channel_stride_bytes {
-        /// Includes any configured inter-channel padding.
-    }
-    channel_data {
-        /// Borrows the caller's active samples without reading padding.
-    }
-    data(self -> Option<&[f32]>) {
-        /// Contiguous active samples, or `None` when padding separates channels.
-    } {
-        self.contiguous_samples()
-    }
-    to_owned(self) {
-        /// Copy initialized samples and metadata into a new tightly packed frame.
-        /// The returned frame retains no borrow; padding is omitted.
-    } {
-        self.owned_copy()
-    }
-    copy_into {
-        /// Copy into an existing packed frame, reusing its sample and metadata
-        /// allocations when their capacity and lengths permit. A copy without
-        /// metadata retains the destination's text allocation.
-    }
-
-}
+mod borrowed;
+pub use borrowed::{
+    BorrowedAudioFrame, BorrowedAudioFrameBuilder, BorrowedVideoFrame, BorrowedVideoFrameBuilder,
+};
 
 /// Owned, tightly packed planar floating-point audio with a validated layout.
 ///

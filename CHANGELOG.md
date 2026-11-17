@@ -64,6 +64,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Discovery Server creation from SDK configuration reports
   `InputDefect::DiscoveryConfigurationRejected` when no usable server was
   resolved, covering both absent and unusable configured servers.
+- `BorrowedVideoFrame` and `BorrowedVideoFrameBuilder` now live alongside
+  borrowed audio in `frames`; their crate-root imports remain available.
 
 - Starting another recording after incomplete file tracking now requires a
   successful `reset`, even after all known files close; otherwise `start`
