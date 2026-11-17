@@ -256,6 +256,50 @@ mod tests {
             .all(|selector| selector.strong_count() == 0));
     }
     #[test]
+    fn an_unwinding_demand_query_publishes_no_partial_generation_and_recovers() {
+        let changes = KeyframeChanges::default();
+        let format = VideoPacketFormat::new(VideoCodec::H264, 64, 32).unwrap();
+        let all = changes.observe(None);
+        let program = changes.observe(Some(format));
+        let preview = changes.observe(Some(format.with_tier(StreamTier::Preview)));
+        let queries = AtomicUsize::new(0);
+        let panic = std::panic::catch_unwind(|| {
+            changes.publish(&mut |_| {
+                if queries.fetch_add(1, Ordering::Relaxed) == 1 {
+                    panic!("second demand query");
+                }
+                true
+            });
+        });
+        assert!(panic.is_err());
+        assert_eq!(queries.load(Ordering::Relaxed), 2);
+        assert!(changes.selectors.is_poisoned());
+        for observer in [&all, &program, &preview] {
+            assert!(
+                !observer.changed(),
+                "no selector publishes before all queries finish"
+            );
+            assert_eq!(
+                Arc::strong_count(&observer.selector),
+                1,
+                "unwinding releases sampled owners"
+            );
+        }
+        // Recovering the poisoned registry must retain selector sharing and
+        // permit a later successful update without replaying a partial one.
+        let later = changes.observe(Some(format));
+        assert!(Arc::ptr_eq(&program.selector, &later.selector));
+        changes.publish(&mut |_| true);
+        for observer in [&all, &program, &preview, &later] {
+            assert!(observer.changed());
+            assert_eq!(observer.selector.generation.load(Ordering::Relaxed), 1);
+        }
+        drop((all, program, preview, later));
+        changes.publish(&mut |_| panic!("unwinding retained a dead selector"));
+        assert!(changes.lock().is_empty());
+    }
+
+    #[test]
     fn dropping_one_observer_preserves_the_shared_selector_and_generation() {
         let changes = KeyframeChanges::default();
         let format = VideoPacketFormat::new(VideoCodec::H264, 64, 32).unwrap();
