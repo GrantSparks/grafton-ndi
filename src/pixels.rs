@@ -80,7 +80,7 @@ impl<L: PackedLayout> PackedStorage<L> {
     }
 
     pub(crate) fn zeroed(layout: L, tail: usize) -> Self {
-        let mut elements = vec![L::Element::default(); layout.len() + tail];
+        let mut elements = vec![L::Element::default(); layout.len().saturating_add(tail)];
         elements.truncate(layout.len());
         Self {
             layout,
@@ -117,7 +117,7 @@ impl<L: PackedLayout> PackedStorage<L> {
     pub(crate) fn copied(source: impl PackedSource<Layout = L>) -> Self {
         let layout = source.layout();
         let tail = source.tail();
-        let mut elements = Vec::with_capacity(layout.len() + tail);
+        let mut elements = Vec::with_capacity(layout.len().saturating_add(tail));
         refill(
             &mut elements,
             layout.len(),
@@ -140,7 +140,7 @@ impl<L: PackedLayout> PackedStorage<L> {
     pub(crate) fn refill_from(&mut self, source: impl PackedSource<Layout = L>) {
         let layout = source.layout();
         let tail = source.tail();
-        if self.elements.capacity() < layout.len() + tail {
+        if self.elements.capacity() < layout.len().saturating_add(tail) {
             *self = Self::copied(source);
         } else {
             let previous_tail = self.tail;
@@ -199,7 +199,7 @@ impl<L: PackedLayout> PackedStorage<L> {
 
 impl<L: PackedLayout> Clone for PackedStorage<L> {
     fn clone(&self) -> Self {
-        let mut elements = Vec::with_capacity(self.elements.len() + self.tail);
+        let mut elements = Vec::with_capacity(self.elements.len().saturating_add(self.tail));
         elements.extend_from_slice(&self.elements);
         seal(&mut elements, self.tail);
         Self {
@@ -337,7 +337,7 @@ fn staged<L: PackedLayout>(
     copy: impl PackedSource<Layout = L>,
     staging: &mut Option<PackedStorage<L>>,
 ) -> &PackedStorage<L> {
-    let required = copy.layout().len() + copy.tail();
+    let required = copy.layout().len().saturating_add(copy.tail());
     if staging
         .as_ref()
         .is_some_and(|storage| storage.elements.capacity() < required)
@@ -449,6 +449,25 @@ mod tests {
         fn write(self, elements: &mut Vec<L::Element>) {
             (self.write)(elements)
         }
+    }
+
+    #[test]
+    fn overflowing_tail_sizes_never_create_or_damage_paired_storage() {
+        let layout = video(4);
+        assert!(std::panic::catch_unwind(|| PackedStorage::zeroed(layout, usize::MAX)).is_err());
+        let mut storage = PackedStorage::zeroed(layout, 64);
+        let pointer = storage.as_ptr();
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            storage.refill_from(Fill {
+                layout: video(2),
+                tail: usize::MAX,
+                write: |bytes: &mut Vec<_>| bytes.resize(video(2).len(), 0),
+            });
+        }));
+        assert!(failed.is_err());
+        assert_eq!(storage.as_ptr(), pointer);
+        assert_eq!(storage.len(), layout.len());
+        assert_eq!(storage.room_bytes(), vec![0; 64]);
     }
 
     #[test]
