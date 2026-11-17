@@ -1234,12 +1234,11 @@ impl ReceiverCore {
     }
 }
 
-/// Exclusive stream/allocator authority, also excluding advertiser membership
-/// changes retained through independent receiver owners.
+/// Stream mutation borrowed only from an exclusive receiver/control borrow.
+/// Native advertiser operations use their independent observer-registry lock.
 #[cfg(feature = "advanced")]
 pub(crate) struct Exclusive<'a> {
     core: &'a ReceiverCore,
-    _exclusive: MutexGuard<'a, ConnectionPermit>,
 }
 
 #[cfg(feature = "advanced")]
@@ -1247,8 +1246,7 @@ impl Exclusive<'_> {
     #[cfg(any(
         test,
         ndi_has_advanced_receiver_bandwidth_control,
-        ndi_has_advanced_receiver_stream_control,
-        ndi_has_advanced_receive_allocators
+        ndi_has_advanced_receiver_stream_control
     ))]
     pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
         self.core.instance.0
@@ -1261,7 +1259,8 @@ impl Exclusive<'_> {
 
 /// Owned allocator authority minted while taking exclusive receiver ownership.
 /// Only allocator registration stores it; it cannot be cloned or recovered as
-/// a receiver. Registration alone borrows this authority, during its exclusive install/reset operations.
+/// a receiver. Registration borrows this authority only during its exclusive
+/// install/reset operations.
 #[cfg(feature = "advanced")]
 pub(crate) struct AllocatorOwner(
     #[cfg_attr(
@@ -1277,21 +1276,31 @@ pub(crate) struct AllocatorOwner(
 #[cfg(feature = "advanced")]
 impl AllocatorOwner {
     #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-    pub(crate) fn exclusive(&self) -> Exclusive<'_> {
-        Exclusive {
-            core: &self.0,
-            _exclusive: self.0.connection_guard.lock(),
-        }
+    pub(crate) fn access(&self) -> AllocatorAccess<'_> {
+        AllocatorAccess { core: &self.0 }
+    }
+}
+
+/// Allocator installation borrows its nonclone owned authority. Native setters
+/// replace callback state under the allocator's own rwlock. Native policy calls
+/// run under its read side; keeping unrelated Rust gates across this wait would
+/// add lock-order obligations to arbitrary policy callbacks.
+#[cfg(all(feature = "advanced", any(test, ndi_has_advanced_receive_allocators)))]
+pub(crate) struct AllocatorAccess<'a> {
+    core: &'a ReceiverCore,
+}
+
+#[cfg(all(feature = "advanced", any(test, ndi_has_advanced_receive_allocators)))]
+impl AllocatorAccess<'_> {
+    pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
+        self.core.instance.0
     }
 }
 
 #[cfg(feature = "advanced")]
 impl<M: ReceiverMode> Receiver<M> {
     pub(crate) fn exclusive(&mut self) -> Exclusive<'_> {
-        Exclusive {
-            core: &self.core,
-            _exclusive: self.core.connection_guard.lock(),
-        }
+        Exclusive { core: &self.core }
     }
 
     pub(crate) fn allocator_owner(&mut self) -> AllocatorOwner {
@@ -1299,13 +1308,17 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 }
 
-/// An advertiser's permission to add/remove this receiver. Membership mutation
-/// takes the same permit as local connections, controls and exclusive setters.
-pub(crate) struct AdvertiserMembership<'a>(Connection<'a>);
+/// Membership borrows the retained receiver and reaches only its immutable
+/// creation properties and stable observer registry. The native advertiser and
+/// observer registries serialize their mutations independently of connection
+/// state. Never take the Rust connection permit: a native connection change
+/// can hold it while joining a decoder thread whose allocator policy adds or
+/// removes this same receiver's membership.
+pub(crate) struct AdvertiserMembership<'a>(&'a ReceiverCore);
 
 impl AdvertiserMembership<'_> {
     pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
-        self.0.instance()
+        self.0.instance.0
     }
 }
 
@@ -1349,13 +1362,12 @@ pub(crate) struct RecvInstance(NDIlib_recv_instance_t);
 // ptz_exposure_auto/manual/manual_v2                 |
 // request_keyframe                                  | Connection permit
 // set_bandwidth, set_enabled_streams                 | Exclusive (&mut Receiver)
-//                                                   | + connection permit
 // set_video_allocator, set_audio_allocator           | Owned allocator authority
-//                                                   | + connection permit
-// framesync_create, avsync_create (NDIlib_ prefix)    | By-value adoption + permit
+//                                                   | Native allocator rwlock
+// framesync_create, avsync_create (NDIlib_ prefix)    | By-value adoption
 // destroy                                           | Last owning ReceiverCore
-// recv_advertiser_add_receiver,                      | Advertiser membership
-// recv_advertiser_del_receiver (NDIlib_ prefix)       | + connection permit
+// recv_advertiser_add_receiver,                      | Immutable creation identity;
+// recv_advertiser_del_receiver (NDIlib_ prefix)       | native observer-registry mutex
 // kvm_is_supported, kvm_send_keyboard_press/release, | Connection permit
 // kvm_send_left/middle/right_mouse_click/release,    | (including held-input
 // kvm_send_vertical/horizontal_mouse_wheel,         | cleanup and Drop)
@@ -1377,14 +1389,22 @@ pub(crate) struct RecvInstance(NDIlib_recv_instance_t);
 // cannot be called.
 //
 // Advertiser add/del were interposed on Standard/Advanced 6.3.2 and 6.4.0.2:
-// neither takes the receiver connection rwlock; they use advertiser/registry
-// mutexes. Standard 6.1.1 has no such symbols. Membership operations therefore
-// take the Rust connection permit, including unregister and advertiser Drop.
-// Exclusive stream/allocator operations take it too: an advertiser retains an
-// independent Arc, so &mut Receiver alone cannot exclude membership removal.
-// Native advertiser operations may still overlap captures and remote changes;
-// the overlap fixture churns add/del and advertiser destruction during both
-// capture and local connection/control storms against the vendor server.
+// neither takes the receiver connection rwlock. Both serialize through the
+// advertiser member-map mutex and the receiver observer-registry mutex at +0x10.
+// Their receiver virtuals read only its retained name/configuration, the stable
+// observer-registry pointer, and (for add) immutable creation capabilities.
+// They do not access replaceable connections or allocator callback fields.
+// Standard 6.1.1 has no advertiser symbols. Membership must remain independent
+// of the Rust connection permit, including unregister and Drop: a policy may
+// add/remove membership while a connection change holds that permit and joins
+// the decoder thread running the policy.
+// Allocator setters update only their separately locked callback state.
+// Advanced 6.3.2/6.4.0.2 interposition and disassembly find a native allocator
+// write lock for each setter and its read side across policy calls. The bounded
+// native regression covers policy membership add/remove during allocator reset,
+// reconnect and disconnect. Exclusive stream controls and adoption retain their
+// original &mut/by-value basis; advertiser-held Arcs are covered by the native
+// registry synchronization and field independence above.
 //
 // A Rust connection permit serializes the listed controls with one another and
 // local changes, without delaying capture attempts or source-name waits. It
@@ -2206,7 +2226,7 @@ impl ReceiverCore {
     }
 
     pub(crate) fn advertiser_membership(&self) -> AdvertiserMembership<'_> {
-        AdvertiserMembership(self.lock_connection())
+        AdvertiserMembership(self)
     }
 
     /// Bind `attempt` to this receiver and its runtime, without taking the
@@ -3967,51 +3987,57 @@ mod tests {
             std::mem::size_of::<Connection<'_>>(),
             2 * std::mem::size_of::<usize>()
         );
+        for bytes in [
+            std::mem::size_of::<AdvertiserMembership<'_>>(),
+            std::mem::size_of::<attached::Adoption<'_>>(),
+        ] {
+            assert_eq!(bytes, std::mem::size_of::<usize>());
+        }
         #[cfg(feature = "advanced")]
-        assert_eq!(
+        for bytes in [
             std::mem::size_of::<Exclusive<'_>>(),
-            std::mem::size_of::<Connection<'_>>()
-        );
+            std::mem::size_of::<AllocatorAccess<'_>>(),
+        ] {
+            assert_eq!(bytes, std::mem::size_of::<usize>());
+        }
     }
 
     #[cfg(feature = "advanced")]
     #[test]
-    fn advertiser_membership_waits_for_exclusive_stream_and_allocator_authority() {
+    fn advertiser_membership_is_independent_of_connection_and_allocator_permissions() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         let mut receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         let allocator = receiver.allocator_owner();
-        for allocator_authority in [false, true] {
-            let core = Arc::clone(&receiver.core);
-            let expected = core.instance.0 as usize;
-            let permission = if allocator_authority {
-                allocator.exclusive()
-            } else {
-                receiver.exclusive()
-            };
-            assert_eq!(permission.instance() as usize, expected);
-            std::thread::scope(|scope| {
-                let (started, waiting) = std::sync::mpsc::channel();
-                let (done, completed) = std::sync::mpsc::channel();
-                let member = scope.spawn(move || {
-                    started.send(()).unwrap();
-                    let membership = core.advertiser_membership();
-                    done.send(membership.instance() as usize).unwrap();
-                });
-                waiting.recv_timeout(Duration::from_secs(2)).unwrap();
-                let blocked = completed.recv_timeout(Duration::from_millis(20));
-                drop(permission);
-                let instance = completed.recv_timeout(Duration::from_secs(2));
-                member.join().unwrap();
-                assert!(blocked.is_err(), "membership bypassed exclusive authority");
-                assert_eq!(instance.unwrap(), expected);
-            });
+        let core = Arc::clone(&receiver.core);
+        let expected = core.instance.0 as usize;
+        {
+            let exclusive = receiver.exclusive();
+            assert_eq!(exclusive.instance() as usize, expected);
         }
-        // The owned registration authority stays useful after moving the
-        // receiver value, while preserving its original native identity.
-        #[cfg(ndi_has_advanced_receive_allocators)]
-        assert_eq!(allocator.exclusive().instance(), receiver.core.instance.0);
+        let permission = receiver.core.lock_connection();
+        std::thread::scope(|scope| {
+            let (started, waiting) = std::sync::mpsc::channel();
+            let (done, completed) = std::sync::mpsc::channel();
+            let member = scope.spawn(move || {
+                started.send(()).unwrap();
+                done.send(core.advertiser_membership().instance() as usize)
+                    .unwrap();
+            });
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+            let concurrent = completed.recv_timeout(Duration::from_millis(100));
+            drop(permission);
+            member.join().unwrap();
+            assert_eq!(
+                concurrent.expect("membership waited for the connection permit"),
+                expected
+            );
+        });
+        // These proofs coexist while native allocator state supplies its own lock.
+        let access = allocator.access();
+        let removal = receiver.core.advertiser_membership();
+        assert_eq!(access.instance(), removal.instance());
     }
 
     #[cfg(all(feature = "advanced", ndi_has_advanced_receive_allocators))]

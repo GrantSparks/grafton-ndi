@@ -1517,14 +1517,14 @@ impl Registration {
         };
         let opaque = token.map_or(std::ptr::null_mut(), |token| token as *mut c_void);
         // SAFETY: the registration retains exclusive allocator authority and
-        // excludes membership changes through installation and reset. The callbacks
+        // borrows its separately locked native allocator state. The callbacks
         // belong to this program; their opaque tokens are looked up, never followed.
         install_with(table.owner().service.registry, slot, token, || {
-            // Hold the permission only around the native setter. Retirement
-            // below can run user policy destructors, which may unregister this
-            // same receiver from an advertiser and acquire its permit again.
-            let exclusive = table.owner().authority.exclusive();
-            let instance = exclusive.instance();
+            // The owned proof keeps the receiver live. The native allocator
+            // rwlock excludes callback-state replacement. Keep unrelated Rust
+            // gates outside this wait for arbitrary native policy callbacks.
+            let access = table.owner().authority.access();
+            let instance = access.instance();
             // SAFETY: exclusive allocator authority and callback storage are
             // retained through this setter, as described above.
             unsafe {

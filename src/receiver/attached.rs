@@ -69,7 +69,6 @@ impl<S: Synchronizer> Drop for Resource<S> {
 /// constructs it, after reserving that receiver's raw capture mode.
 pub(crate) struct Adoption<'a> {
     core: &'a Arc<ReceiverCore>,
-    _exclusive: parking_lot::MutexGuard<'a, super::ConnectionPermit>,
 }
 
 impl Adoption<'_> {
@@ -104,7 +103,6 @@ impl<S: Synchronizer> Attached<S> {
     ) -> std::result::Result<Self, Rejected<Receiver>> {
         let adoption = Adoption {
             core: &receiver.core,
-            _exclusive: receiver.core.connection_guard.lock(),
         };
         let native = match create(adoption) {
             Ok(native) => native,
