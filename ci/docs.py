@@ -12,7 +12,8 @@ against the same item and member names.
 Documented dependency features and the README feature table are checked against
 Cargo.toml so removed or renamed features cannot remain in install instructions.
 Native table entry points need public SDK search aliases or an explicit internal
-classification. Generated declarations also reject underscore-prefixed parameters.
+classification. Shared receiver controls keep KVM forwards and their attributes
+in step. Generated declarations also reject underscore-prefixed parameters.
 """
 import argparse
 from collections import Counter
@@ -67,6 +68,15 @@ INTERNAL_SDK_ENTRY_POINTS = {
     'NDIlib_avsync_free_audio': 'the AV sync audio guard releases its frame on drop',
     'NDIlib_send_listener_free_events': 'the internal sender event-batch guard releases its array',
     'NDIlib_recv_listener_free_events': 'the internal receiver event-batch guard releases its array',
+}
+
+
+# A KVM session reserves the connection, so its receiver view deliberately
+# withholds these operations even though the ordinary receiver shares them.
+KVM_CONTROL_EXCLUSIONS = {
+    'connect_to': 'a KVM session must keep its negotiated receiver connection',
+    'disconnect': 'disconnecting would invalidate the live KVM session',
+    'reconnect': 'reconnecting would replace the live KVM session connection',
 }
 
 
@@ -325,6 +335,128 @@ def sdk_alias_violations(root):
         if name not in aliases and name not in INTERNAL_SDK_ENTRY_POINTS:
             found.append(f'{path.relative_to(root)}:{line}: SDK entry point {name} '
                          'needs a public doc(alias) or an explicit internal reason')
+    return found
+
+
+@dataclass(frozen=True)
+class SharedReceiverMethod:
+    line: int
+    aliases: frozenset
+    must_use: frozenset
+
+
+def token_angle_end(words, start):
+    """Skip a Rust generic parameter/argument list before an impl or function."""
+    depth, index = 0, start
+    while index < len(words):
+        if words[index] in {'(', '[', '{'}:
+            index = token_group_end(words, index)
+            continue
+        depth += (words[index] == '<')
+        depth -= (words[index] == '>' and words[index - 1:index] != ['-'])
+        index += 1
+        if depth == 0:
+            return index
+    return len(words)
+
+
+def shared_receiver_methods(text, owner):
+    """Collect literal shared controls from generic inherent receiver impls.
+
+    Capture methods already share an inventory macro. This checks handwritten
+    controls on ReceiverMode and EventMode, excluding private methods, consuming
+    or mutable receivers, trait impls, examples, test modules and method bodies.
+    """
+    tokens = rust_tokens(text)
+    words, indices = production_words([word for word, _ in tokens], with_indices=True)
+    methods, cursor = {}, 0
+    while cursor < len(words):
+        if words[cursor] != 'impl':
+            cursor += 1
+            continue
+        declaration = cursor + 1
+        if words[declaration:declaration + 1] == ['<']:
+            declaration = token_angle_end(words, declaration)
+        body = declaration
+        while body < len(words) and words[body] not in {'{', ';'}:
+            body += 1
+        if body == len(words) or words[body] != '{':
+            cursor = body + 1
+            continue
+        end = token_group_end(words, body)
+        header = words[cursor + 1:body]
+        if (words[declaration:declaration + 1] != [owner]
+                or not {'ReceiverMode', 'EventMode'}.intersection(header)):
+            cursor = end
+            continue
+        member = body + 1
+        while member < end - 1:
+            attributes, after = token_attributes(words, member)
+            if public_function_at(words, after):
+                function = after + 1
+                while words[function] != 'fn':
+                    function += 1
+                name = words[function + 1]
+                arguments = function + 2
+                if words[arguments:arguments + 1] == ['<']:
+                    arguments = token_angle_end(words, arguments)
+                if words[arguments:arguments + 1] == ['(']:
+                    arguments_end = token_group_end(words, arguments)
+                    inputs = token_arguments(words[arguments + 1:arguments_end - 1])
+                    receiver = inputs[0] if inputs else []
+                    if receiver[:1] == ['&'] and receiver[1:2] == ["'"]:
+                        receiver = receiver[:1] + receiver[3:]
+                    if receiver == ['&', 'self']:
+                        # Compare every alias, not only NDIlib aliases: a future
+                        # additional search term must reach the KVM view too.
+                        aliases = frozenset(
+                            word for attribute in attributes
+                            if attribute[:3] == ['doc', '(', 'alias']
+                            for word in attribute[3:]
+                            if RUST_QUOTED_STRING.match(word) or RUST_RAW_STRING.match(word)
+                        )
+                        must_use = frozenset(tuple(attribute) for attribute in attributes
+                                             if attribute[:1] == ['must_use'])
+                        offset = tokens[indices[function + 1]][1]
+                        methods[name] = SharedReceiverMethod(
+                            text.count('\n', 0, offset) + 1, aliases, must_use)
+                    member = arguments_end
+                    continue
+            member = after if after > member else member
+            if words[member] in {'{', '(', '['}:
+                member = token_group_end(words, member)
+            else:
+                member += 1
+        cursor = end
+    return methods
+
+
+def kvm_forward_violations(root):
+    """Every shared Receiver control retains its KVM forward and attributes."""
+    controls = {}
+    for relative in ('src/receiver.rs', 'src/advanced/controls.rs'):
+        path = root / relative
+        if path.exists():
+            for name, method in shared_receiver_methods(path.read_text(encoding='utf-8'), 'Receiver').items():
+                controls[name] = (relative, method)
+    relative = 'src/advanced/kvm_receiver.rs'
+    path = root / relative
+    forwards = (shared_receiver_methods(path.read_text(encoding='utf-8'), 'KvmReceiver')
+                if path.exists() else {})
+    found = []
+    for name, (source, method) in sorted(controls.items()):
+        if name in KVM_CONTROL_EXCLUSIONS:
+            continue
+        if name not in forwards:
+            found.append(f'{source}:{method.line}: shared Receiver::{name} needs a KvmReceiver forward')
+            continue
+        forward = forwards[name]
+        for attribute in ('must_use', 'aliases'):
+            expected, actual = getattr(method, attribute), getattr(forward, attribute)
+            if expected != actual:
+                label = 'doc(alias)' if attribute == 'aliases' else attribute
+                found.append(f'{relative}:{forward.line}: KvmReceiver::{name} {label} attributes '
+                             f'differ from Receiver::{name} at {source}:{method.line}')
     return found
 
 
@@ -876,6 +1008,7 @@ def main():
     found, snippets = check(ROOT)
     found.extend(readme_link_violations(ROOT))
     found.extend(sdk_alias_violations(ROOT))
+    found.extend(kvm_forward_violations(ROOT))
     if args.rustdoc:
         found.extend(rustdoc_violations(ROOT, args.rustdoc))
         found.extend(parameter_name_violations(ROOT, args.rustdoc))

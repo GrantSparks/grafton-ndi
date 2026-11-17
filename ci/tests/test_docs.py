@@ -305,6 +305,92 @@ class Documentation(unittest.TestCase):
         self.assertIn('missing target', errors[0])
         self.assertEqual(snippets, [])
 
+    def receiver_forwards(self, receiver, kvm, advanced=''):
+        self.write('src/receiver.rs', receiver)
+        self.write('src/advanced/controls.rs', advanced)
+        self.write('src/advanced/kvm_receiver.rs', kvm)
+        return docs.kvm_forward_violations(self.root)
+
+    def test_shared_receiver_controls_require_kvm_forwards(self):
+        receiver = 'impl<M: ReceiverMode> Receiver<M> { pub fn control(&self) {} }'
+        errors = self.receiver_forwards(receiver, 'impl<M: ReceiverMode> KvmReceiver<M> {}')
+        self.assertEqual(len(errors), 1)
+        self.assertIn('src/receiver.rs:1: shared Receiver::control needs a KvmReceiver forward', errors[0])
+
+    def test_shared_receiver_forwards_preserve_must_use_and_alias_sets(self):
+        attributes = ('#[must_use = "call a command"] '
+                      '#[doc(alias = "NDIlib_one")] #[doc(alias = "control")] ')
+        receiver = f'impl<M: ReceiverMode> Receiver<M> {{ {attributes} pub fn control(&self) {{}} }}'
+        matching = f'impl<M: ReceiverMode> KvmReceiver<M> {{ {attributes} pub fn control(&self) {{}} }}'
+        self.assertEqual(self.receiver_forwards(receiver, matching), [])
+        for before, after, message in (
+                ('#[must_use = "call a command"]', '', 'must_use'),
+                ('call a command', 'a different message', 'must_use'),
+                ('#[doc(alias = "NDIlib_one")]', '', 'doc(alias)'),
+                ('#[doc(alias = "control")]', '', 'doc(alias)')):
+            with self.subTest(attribute=before, replacement=after):
+                errors = self.receiver_forwards(receiver, matching.replace(before, after))
+                self.assertEqual(len(errors), 1)
+                self.assertIn(f'KvmReceiver::control {message} attributes differ', errors[0])
+        receiver = receiver.replace(attributes, '#[must_use] ')
+        matching = matching.replace(attributes, '#[must_use] ')
+        self.assertEqual(self.receiver_forwards(receiver, matching), [])
+
+    def test_receiver_forwards_cover_event_and_advanced_controls_with_locations(self):
+        receiver = 'impl<M: EventMode> Receiver<M> { pub fn event(&self) {} }'
+        advanced = '\nimpl<M: ReceiverMode> Receiver<M> {\n pub fn keyframe(&self) {}\n}'
+        kvm = ("impl<'a, M: EventMode> KvmReceiver<'a, M> { pub fn event(&self) {} }")
+        errors = self.receiver_forwards(receiver, kvm, advanced)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('src/advanced/controls.rs:3: shared Receiver::keyframe', errors[0])
+
+    def test_receiver_forwards_exclude_connection_changes_with_explicit_reasons(self):
+        receiver = ('impl<M: ReceiverMode> Receiver<M> {'
+                    + ''.join(f'pub fn {name}(&self) {{}}' for name in docs.KVM_CONTROL_EXCLUSIONS)
+                    + '}')
+        self.assertEqual(self.receiver_forwards(receiver, ''), [])
+        self.assertEqual(set(docs.KVM_CONTROL_EXCLUSIONS), {'connect_to', 'disconnect', 'reconnect'})
+        self.assertTrue(all(docs.KVM_CONTROL_EXCLUSIONS.values()))
+
+    def test_receiver_forward_inventory_ignores_non_controls_and_fake_declarations(self):
+        receiver = r'''// impl<M: ReceiverMode> Receiver<M> { pub fn commented(&self) {} }
+            const EXAMPLE: &str = r#"impl<M: ReceiverMode> Receiver<M> { pub fn example(&self) {} }"#;
+            impl<M: ReceiverMode> Debug for Receiver<M> { pub fn trait_method(&self) {} }
+            impl<M: OtherMode> Receiver<M> { pub fn other_mode(&self) {} }
+            impl<M: ReceiverMode> Receiver<M> {
+                fn private(&self) {}
+                pub(crate) fn restricted(&self) {}
+                pub fn mutable(&mut self) {}
+                pub fn consume(self) {}
+                pub fn constructor() {}
+                #[cfg(test)] pub fn test_only(&self) {}
+                pub fn control(&self) {
+                    fn nested() {}
+                    let fake = "pub fn fake(&self) {}";
+                }
+            }
+            #[cfg(test)] mod tests {
+                impl<M: ReceiverMode> Receiver<M> { pub fn test_impl(&self) {} }
+            }
+        '''
+        kvm = 'impl<M: ReceiverMode> KvmReceiver<M> { pub fn control(&self) {} }'
+        self.assertEqual(self.receiver_forwards(receiver, kvm), [])
+
+    def test_receiver_forward_inventory_handles_generic_arrows_groups_and_higher_ranked_bounds(self):
+        receiver = """impl<M: ReceiverMode, F: for<'a> Fn(&'a [u8; 4]) -> ()> Receiver<M> {
+            pub fn control<G: Fn() -> Option<Vec<u8>>>(&self) {}
+            pub fn other<const LIMIT: usize = { 1 << 2 }>(&'a self) {}
+        }"""
+        kvm = """impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
+            pub fn control(&self) {}
+            pub fn other(&self) {}
+        }"""
+        self.assertEqual(self.receiver_forwards(receiver, kvm), [])
+        errors = self.receiver_forwards(receiver, '')
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(any('Receiver::control' in error for error in errors))
+        self.assertTrue(any('Receiver::other' in error for error in errors))
+
     def test_native_alias_coverage_follows_every_registry_and_new_files(self):
         forms = ['native_table', 'optional_tables', 'advanced_tables', 'file_families']
         for index, form in enumerate(forms):

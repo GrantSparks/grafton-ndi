@@ -142,6 +142,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     }
 
     /// Borrow PTZ controls; see [`Receiver::ptz`].
+    #[must_use = "the Ptz handle does nothing until a command is called"]
     pub fn ptz(&self) -> Ptz<'a> {
         self.receiver.ptz()
     }
