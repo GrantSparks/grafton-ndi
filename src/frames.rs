@@ -4085,11 +4085,8 @@ impl ValidatedAudioLayout {
     ) -> LayoutResult<Self> {
         let minimum = u64::from(no_samples.get()) * size_of::<f32>() as u64;
         let stride = channel_stride.map_or(minimum, |stride| stride as u64);
-        let sample_count = checked_audio_extent(
-            no_channels.to_usize(),
-            no_samples.to_usize(),
-            stride / size_of::<f32>() as u64,
-        )?;
+        let sample_count =
+            checked_audio_extent(no_channels, no_samples, stride / size_of::<f32>() as u64)?;
         // The extent bounds the packed minimum even for a single channel.
         let minimum = minimum as usize;
         let stride = stride as usize;
@@ -4261,6 +4258,19 @@ pub(crate) fn validate_audio_count(
     })
 }
 
+/// A zero SDK field means the source quantity is not known yet. Every known
+/// quantity follows the same rule as a frame that contains samples.
+fn optional_audio_quantity(
+    value: i64,
+    check: impl FnOnce(i64) -> LayoutResult<SdkQuantity>,
+) -> LayoutResult<Option<SdkQuantity>> {
+    if value == 0 {
+        Ok(None)
+    } else {
+        check(value).map(Some)
+    }
+}
+
 /// Retain the signed-range proof for channel and sample counts.
 pub(crate) fn validate_positive_audio_counts(
     no_channels: i64,
@@ -4277,13 +4287,14 @@ pub(crate) fn validate_positive_audio_counts(
 /// when channels start `stride_samples` apart, enforcing `MAX_AUDIO_BYTES`.
 /// Packed audio is the case `stride_samples == no_samples`.
 pub(crate) fn checked_audio_extent(
-    no_channels: usize,
-    no_samples: usize,
+    no_channels: SdkQuantity,
+    no_samples: SdkQuantity,
     stride_samples: u64,
 ) -> LayoutResult<usize> {
-    let sample_count = (no_channels as u64 - 1)
+    // The retained nonzero count proof makes this subtraction infallible.
+    let sample_count = u64::from(no_channels.get() - 1)
         .saturating_mul(stride_samples)
-        .saturating_add(no_samples as u64);
+        .saturating_add(u64::from(no_samples.get()));
     let byte_size = sample_count.saturating_mul(size_of::<f32>() as u64);
     if byte_size > MAX_AUDIO_BYTES as u64 {
         return Err(crate::LayoutDefect::AudioBytes(byte_size.into()));
@@ -4311,12 +4322,9 @@ pub(crate) fn checked_audio_extent(
 /// [`validate_returned_audio`] accepts one.
 pub(crate) fn validate_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<ValidatedAudioLayout> {
     if raw.no_samples == 0 {
-        return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
-            crate::LayoutDefect::AudioCount {
-                value: 0.into(),
-                kind: crate::AudioCountKind::Samples,
-            },
-        )));
+        // Empty captured audio is rejected before inspecting the pointer;
+        // other count failures keep their existing place after format checks.
+        validate_audio_count(raw.no_samples.into(), crate::AudioCountKind::Samples)?;
     }
 
     if raw.p_data.is_null() {
@@ -4376,22 +4384,10 @@ pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<R
         return Err(Error::InvalidFrame(crate::FrameDefect::EmptyAudioHasData));
     }
 
-    let sample_rate = SdkQuantity::new(raw.sample_rate.into());
-    if sample_rate.is_none() && raw.sample_rate != 0 {
-        return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
-            crate::LayoutDefect::AudioRate(raw.sample_rate.into()),
-        )));
-    }
-
-    let num_channels = SdkQuantity::new(raw.no_channels.into());
-    if num_channels.is_none() && raw.no_channels != 0 {
-        return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
-            crate::LayoutDefect::AudioCount {
-                value: raw.no_channels.into(),
-                kind: crate::AudioCountKind::Channels,
-            },
-        )));
-    }
+    let sample_rate = optional_audio_quantity(raw.sample_rate.into(), validate_audio_sample_rate)?;
+    let num_channels = optional_audio_quantity(raw.no_channels.into(), |value| {
+        validate_audio_count(value, crate::AudioCountKind::Channels)
+    })?;
 
     // SAFETY: both members of the descriptor's union are `int`s at the same
     // offset, so reading either one reads the four bytes the SDK wrote as a
@@ -5557,6 +5553,10 @@ metadata_source!(impl['a] MetadataFrameRef<'a>);
 mod accessor_tests;
 
 #[cfg(test)]
+#[path = "frames/audio_validation_tests.rs"]
+mod audio_validation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -5977,18 +5977,22 @@ mod tests {
     /// and size cap.
     #[test]
     fn audio_extent_is_shared_by_packed_and_strided_layouts() {
+        let quantity = |value: usize| SdkQuantity::new(value as i64).unwrap();
+        let extent = |channels, samples, stride| {
+            checked_audio_extent(quantity(channels), quantity(samples), stride)
+        };
         let packed =
             ValidatedAudioLayout::new_uncompressed(AudioFormat::Fltp, 48_000, 3, 5, None).unwrap();
         assert_eq!(packed.sample_count(), 15);
-        assert_eq!(checked_audio_extent(3, 5, 5).unwrap(), 15);
+        assert_eq!(extent(3, 5, 5).unwrap(), 15);
         // Padding between channels counts, trailing padding does not.
-        assert_eq!(checked_audio_extent(3, 5, 8).unwrap(), 2 * 8 + 5);
+        assert_eq!(extent(3, 5, 8).unwrap(), 2 * 8 + 5);
         let limit = MAX_AUDIO_BYTES / 4;
-        assert_eq!(checked_audio_extent(1, limit, limit as u64).unwrap(), limit);
-        assert!(checked_audio_extent(1, limit + 1, (limit + 1) as u64).is_err());
-        assert!(checked_audio_extent(2, limit, limit as u64).is_err());
-        assert!(checked_audio_extent(2, 1, limit as u64).is_err());
-        assert!(checked_audio_extent(2, 1, usize::MAX as u64).is_err());
+        assert_eq!(extent(1, limit, limit as u64).unwrap(), limit);
+        assert!(extent(1, limit + 1, (limit + 1) as u64).is_err());
+        assert!(extent(2, limit, limit as u64).is_err());
+        assert!(extent(2, 1, limit as u64).is_err());
+        assert!(extent(2, 1, usize::MAX as u64).is_err());
     }
 
     #[test]

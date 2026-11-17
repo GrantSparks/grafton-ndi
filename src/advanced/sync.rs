@@ -86,8 +86,8 @@ impl AvSyncRequest {
         };
         // A frame has at least one channel.
         if let Some(samples) = request.num_samples {
-            let count = samples.to_usize();
-            checked_audio_extent(1, count, u64::from(samples.get()))
+            const ONE_CHANNEL: SdkQuantity = SdkQuantity::new(1).unwrap();
+            checked_audio_extent(ONE_CHANNEL, samples, u64::from(samples.get()))
                 .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?;
         }
         Ok(request)
