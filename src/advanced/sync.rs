@@ -25,6 +25,7 @@ use crate::{
     VideoFrame, VideoFrameRef,
 };
 
+#[cfg(any(test, ndi_has_advanced_av_sync, ndi_has_advanced_genlock))]
 use super::descriptors;
 #[cfg(ndi_has_advanced_av_sync)]
 use crate::sys::advanced::AvSyncHandle;
@@ -1177,21 +1178,13 @@ impl std::fmt::Debug for AudioClock<'_> {
 
 /// A reusable, validated request for an [`AudioClock`].
 ///
-/// Construct this once and pass it to each pacing call. Its timing descriptor
-/// contains no sample or metadata storage.
-#[derive(Clone, Copy)]
+/// Construct this once and pass it to each pacing call. Each call builds a
+/// timing descriptor containing no sample or metadata storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AudioClockRequest {
     sample_rate: SdkQuantity,
     num_samples: SdkQuantity,
-    #[cfg_attr(not(any(test, ndi_has_advanced_genlock)), allow(dead_code))]
-    timing: NDIlib_audio_frame_v3_t,
 }
-
-// SAFETY: construction fixes both pointers to null. The descriptor is private,
-// immutable, and passed only as a shared reference to a native timing query.
-unsafe impl Send for AudioClockRequest {}
-// SAFETY: as for Send; sharing this value cannot expose mutable storage.
-unsafe impl Sync for AudioClockRequest {}
 
 impl AudioClockRequest {
     /// Ask for `num_samples` per channel at `sample_rate` hertz.
@@ -1209,11 +1202,6 @@ impl AudioClockRequest {
         Ok(Self {
             sample_rate,
             num_samples,
-            timing: NDIlib_audio_frame_v3_t {
-                sample_rate: sample_rate.to_sdk(),
-                no_samples: num_samples.to_sdk(),
-                ..descriptors::audio_frame()
-            },
         })
     }
 
@@ -1228,40 +1216,31 @@ impl AudioClockRequest {
     }
 }
 
-impl std::fmt::Debug for AudioClockRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AudioClockRequest")
-            .field("sample_rate", &self.sample_rate())
-            .field("num_samples", &self.num_samples())
-            .finish()
-    }
-}
-impl PartialEq for AudioClockRequest {
-    fn eq(&self, other: &Self) -> bool {
-        self.sample_rate() == other.sample_rate() && self.num_samples() == other.num_samples()
-    }
-}
-impl Eq for AudioClockRequest {}
-impl std::hash::Hash for AudioClockRequest {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.sample_rate().hash(state);
-        self.num_samples().hash(state);
-    }
-}
-
 impl AudioClock<'_> {
     /// Block until the validated request's samples are due and report which
     /// clock timed them.
     #[doc(alias = "NDIlib_genlock_wait_audio")]
     pub fn wait(&mut self, request: AudioClockRequest) -> ClockSource {
         native!(Genlock, self.resource.table, uses(request) => {
+            let timing = audio_timing(request);
             let GenResource { handle, table, .. } = *self.resource;
             // SAFETY: the genlock outlives this clock, and only this clock waits
-            // for audio. Construction validated the immutable timing descriptor.
+            // for audio. The validated request supplies the stack descriptor's
+            // timing, and its pointers are null.
             ClockSource::from_active(unsafe {
-                table.NDIlib_genlock_wait_audio(handle.0, &request.timing)
+                table.NDIlib_genlock_wait_audio(handle.0, &timing)
             })
         })
+    }
+}
+
+/// The descriptor an audio clock reads its timing from.
+#[cfg(any(test, ndi_has_advanced_genlock))]
+fn audio_timing(request: AudioClockRequest) -> NDIlib_audio_frame_v3_t {
+    NDIlib_audio_frame_v3_t {
+        sample_rate: request.sample_rate.to_sdk(),
+        no_samples: request.num_samples.to_sdk(),
+        ..descriptors::audio_frame()
     }
 }
 
@@ -1492,9 +1471,17 @@ mod tests {
     }
 
     #[test]
-    fn audio_clock_requests_validate_once_and_keep_native_timing() {
+    fn audio_clock_requests_validate_once_and_keep_value_traits() {
+        use std::hash::{Hash, Hasher};
+
         fn value_traits<T: Copy + Eq + std::hash::Hash + Send + Sync>() {}
+        fn hash(value: impl Hash) -> u64 {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
         value_traits::<AudioClockRequest>();
+        let mut distinct = std::collections::HashSet::new();
         for rate in [1, 48_000, i32::MAX as u32] {
             for samples in [1, 800, i32::MAX as u32] {
                 let request = AudioClockRequest::new(rate, samples).unwrap();
@@ -1503,10 +1490,15 @@ mod tests {
                     (rate, samples)
                 );
                 assert_eq!(request, AudioClockRequest::new(rate, samples).unwrap());
-                assert!(request.timing.p_data.is_null());
-                assert!(request.timing.p_metadata.is_null());
+                assert_eq!(hash(request), hash((rate, samples)));
+                assert!(distinct.insert(request));
+                assert_eq!(
+                    format!("{request:?}"),
+                    format!("AudioClockRequest {{ sample_rate: {rate}, num_samples: {samples} }}")
+                );
             }
         }
+        assert_eq!(distinct.len(), 9);
         for value in [0, i32::MAX as u32 + 1, u32::MAX] {
             assert!(matches!(AudioClockRequest::new(value, 800),
                 Err(Error::InvalidInput(crate::InputDefect::Layout(crate::LayoutDefect::AudioRate(n))))
@@ -1563,9 +1555,10 @@ mod tests {
             video.frame_format_type,
             NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved
         );
-        let audio = AudioClockRequest::new(48_000, 1600).unwrap().timing;
+        let audio = audio_timing(AudioClockRequest::new(48_000, 1600).unwrap());
         assert_eq!(audio.FourCC, planar_float);
         assert_eq!((audio.sample_rate, audio.no_samples), (48_000, 1600));
+        assert!(audio.p_data.is_null() && audio.p_metadata.is_null());
     }
 
     /// A captured 64x32 UYVY frame with `timestamp`, over `pixels`.
