@@ -287,6 +287,43 @@ fn events_and_closure_during_waker_cloning_are_observed_by_the_same_poll() {
 }
 
 #[test]
+fn a_panicking_command_waker_clone_preserves_retry_and_drop_cancellation() {
+    for retry in [false, true] {
+        let (reply, waiting) = operation::<u32>();
+        let shared = Arc::clone(&reply.shared);
+        let mut future = FileOperation::live(waiting);
+        let owners = Arc::strong_count(&shared);
+        let probe = CloneProbe::new(|| panic!("executor clone panicked"));
+        assert!(catch_unwind(AssertUnwindSafe(|| poll(&mut future, &probe.waker()))).is_err());
+        assert!(!shared.slot.is_poisoned());
+        assert!(!shared.cancelled.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&shared), owners);
+        if retry {
+            let (result, allocations) =
+                crate::test_alloc::allocation_count(|| poll(&mut future, Waker::noop()));
+            assert!(result.is_pending());
+            assert_eq!(allocations, 0);
+            assert_eq!(Arc::strong_count(&shared), owners);
+            reply.complete(Ok(7));
+            assert!(matches!(
+                poll(&mut future, Waker::noop()),
+                Poll::Ready(Ok(7))
+            ));
+            drop(future);
+            assert!(!shared.cancelled.load(Ordering::Acquire));
+        } else {
+            drop(future);
+            assert!(shared.cancelled.load(Ordering::Acquire));
+            reply.complete(Ok(7));
+            assert!(
+                matches!(*lock(&shared.slot), Slot::Pending(_)),
+                "a cancelled response is not delivered"
+            );
+        }
+    }
+}
+
+#[test]
 fn ready_and_same_waker_command_polls_do_not_clone() {
     let (reply, future) = operation::<()>();
     let mut future = FileOperation::live(future);

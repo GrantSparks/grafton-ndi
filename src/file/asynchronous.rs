@@ -374,7 +374,7 @@ impl<T> Future for FileOperation<T> {
                     Slot::Ready(_) => {
                         #[expect(
                             clippy::unreachable,
-                            reason = "the locked slot was matched Ready and no application code runs before replacement"
+                            reason = "Pending must stay borrowed for waker registration; the locked Ready slot cannot change before replacement"
                         )]
                         let Slot::Ready(value) = std::mem::replace(slot, Slot::Taken) else {
                             unreachable!()
@@ -397,7 +397,7 @@ impl<T> Future for FileOperation<T> {
             Stage::Live(Live::Immediate(_)) => {
                 #[expect(
                     clippy::unreachable,
-                    reason = "the exclusively borrowed stage was matched Immediate and cannot change before replacement"
+                    reason = "Waiting must stay stored for cancellation if waker cloning unwinds; the exclusively matched Immediate stage cannot change"
                 )]
                 let Stage::Live(Live::Immediate(value)) = std::mem::replace(stage, Stage::Done) else {
                     unreachable!()
