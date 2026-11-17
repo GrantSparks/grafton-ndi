@@ -2558,6 +2558,7 @@ impl<M: SenderMode> Sender<M> {
     /// descriptor, or one that names neither a source nor an address, and
     /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
     /// the 4 MiB one SDK string may be.
+    /// [`Error::AllocationFailed`] when source descriptor storage cannot be reserved.
     ///
     /// # Examples
     ///

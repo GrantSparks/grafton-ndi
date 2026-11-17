@@ -279,7 +279,10 @@ impl CopyBudget {
     ) -> TextResult<Option<crate::finder::SourceText>> {
         // SAFETY: forwarded to the caller's obligations.
         unsafe { self.source_text_view(value)? }
-            .map(|text| crate::finder::SourceText::from_sdk(text).map_err(Into::into))
+            .map(|text| {
+                crate::finder::SourceText::from_sdk(text, crate::AllocationKind::DiscoveryResults)
+                    .map_err(Into::into)
+            })
             .transpose()
     }
 

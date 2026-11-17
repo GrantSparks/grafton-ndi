@@ -130,7 +130,7 @@ mod tests {
     ) -> Result<Option<SourceText>> {
         // SAFETY: tests keep the bounded string readable.
         unsafe { budget.source_text_view(pointer) }?
-            .map(SourceText::from_sdk)
+            .map(|text| SourceText::from_sdk(text, crate::AllocationKind::DiscoveryResults))
             .transpose()
     }
 

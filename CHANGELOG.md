@@ -31,6 +31,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Receiver shared controls use a separate permit from local connection changes,
   allowing allocator callbacks to use controls without deadlocking a connect,
   disconnect or reconnect. Getters no longer wait for the connection permit.
+- Single-source descriptor allocation failures identify `SourceDescriptor`
+  storage and its requested byte count; sender, router and File player getters
+  document that failure.
 
 - Recorder file tracking stays bounded after native event loss and preserves
   unknown cleanup obligations even after all known files close. Drop and async

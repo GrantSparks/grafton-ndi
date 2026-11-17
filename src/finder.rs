@@ -618,6 +618,8 @@ mod descriptor_sealed {
 /// A descriptor's bounded-text policy. The decoder alone owns null handling,
 /// selection order and source construction.
 pub(crate) trait DescriptorText: descriptor_sealed::Sealed {
+    const ALLOCATION_KIND: crate::AllocationKind;
+
     fn empty_source_name(&mut self) -> Result<()>;
 
     /// # Safety
@@ -628,6 +630,8 @@ pub(crate) trait DescriptorText: descriptor_sealed::Sealed {
 
 impl descriptor_sealed::Sealed for SnapshotBudget {}
 impl DescriptorText for SnapshotBudget {
+    const ALLOCATION_KIND: crate::AllocationKind = crate::AllocationKind::DiscoveryResults;
+
     fn empty_source_name(&mut self) -> Result<()> {
         self.charge_empty_source_name()
     }
@@ -641,6 +645,8 @@ impl DescriptorText for SnapshotBudget {
 struct SingleSourceText(sys::table::Called<()>);
 impl descriptor_sealed::Sealed for SingleSourceText {}
 impl DescriptorText for SingleSourceText {
+    const ALLOCATION_KIND: crate::AllocationKind = crate::AllocationKind::SourceDescriptor;
+
     fn empty_source_name(&mut self) -> Result<()> {
         Ok(())
     }
@@ -660,10 +666,10 @@ impl DescriptorText for SingleSourceText {
 /// Each non-null pointer remains readable through its first NUL or
 /// `MAX_SDK_STRING_BYTES`, whichever comes first, until selection and copying
 /// finish. The policy must preserve that lifetime.
-pub(crate) unsafe fn decode_source(
+pub(crate) unsafe fn decode_source<T: DescriptorText>(
     name: *const c_char,
     address: *const c_char,
-    text: &mut impl DescriptorText,
+    text: &mut T,
     select: impl FnOnce(&BorrowedSource<'_>) -> Result<bool>,
 ) -> Result<Option<Source>> {
     if name.is_null() && address.is_null() {
@@ -693,10 +699,10 @@ pub(crate) unsafe fn decode_source(
         return Ok(None);
     }
     Ok(Some(Source::from_text(
-        SourceText::from_sdk(source.name)?,
+        SourceText::from_sdk(source.name, T::ALLOCATION_KIND)?,
         source
             .address
-            .map(|address| SourceText::from_sdk(address).map(SourceAddress))
+            .map(|address| SourceText::from_sdk(address, T::ALLOCATION_KIND).map(SourceAddress))
             .transpose()?,
     )))
 }
@@ -1556,10 +1562,11 @@ impl SourceText {
         2 * std::mem::size_of::<usize>() + std::mem::size_of::<CString>() + 1;
 
     /// Copy classified SDK text directly into its final shared native storage.
-    pub(crate) fn from_sdk(source: LossyText<'_>) -> Result<Self> {
+    pub(crate) fn from_sdk(source: LossyText<'_>, kind: crate::AllocationKind) -> Result<Self> {
         let mut text = String::new();
-        text.try_reserve_exact(source.len() + 1)
-            .map_err(|_| budget::allocation_failed())?;
+        let bytes = source.len() + 1;
+        text.try_reserve_exact(bytes)
+            .map_err(|_| crate::error::allocation_failed(kind, Some(bytes)))?;
         source.push_to(&mut text);
         // SAFETY: LossyText carries the NUL-free representation invariant.
         Ok(unsafe { Self::from_nul_free_string(text) })
@@ -3802,6 +3809,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn source_descriptor_and_snapshot_allocations_name_their_storage() {
+        let name = CString::new(vec![b'x'; 1 << 20]).unwrap();
+        let raw = NDIlib_source_t {
+            p_ndi_name: name.as_ptr(),
+            ..Default::default()
+        };
+        let single = crate::test_alloc::fail_allocations_at_least(1 << 20, || {
+            // SAFETY: the descriptor and its complete terminated name stay live.
+            unsafe { source_from_raw(&raw, c"test source query") }
+        });
+        assert!(matches!(
+            single,
+            Err(Error::AllocationFailed(crate::AllocationFailure {
+                kind: crate::AllocationKind::SourceDescriptor,
+                bytes: Some(1_048_577),
+            }))
+        ));
+        let snapshot = crate::test_alloc::fail_allocations_at_least(1 << 20, || {
+            // SAFETY: the descriptor and its complete terminated name stay live.
+            unsafe {
+                decode_source(
+                    name.as_ptr(),
+                    ptr::null(),
+                    &mut SnapshotBudget::new(),
+                    |_| Ok(true),
+                )
+            }
+        });
+        assert!(matches!(
+            snapshot,
+            Err(Error::AllocationFailed(crate::AllocationFailure {
+                kind: crate::AllocationKind::DiscoveryResults,
+                bytes: Some(1_048_577),
+            }))
+        ));
     }
 
     #[test]

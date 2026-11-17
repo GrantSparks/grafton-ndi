@@ -16,6 +16,11 @@ fn allocation_kinds_describe_storage_without_misclassifying_the_input() {
             "discovery results",
         ),
         (
+            "SourceDescriptor",
+            AllocationKind::SourceDescriptor,
+            "source descriptor storage",
+        ),
+        (
             "ImageScratch",
             AllocationKind::ImageScratch,
             "image scratch storage",

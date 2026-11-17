@@ -325,6 +325,7 @@ impl Router {
     /// descriptor, or one that names neither a source nor an address, and
     /// [`crate::Error::UnexpectedSdkResult`] when its name or address is longer than
     /// the 4 MiB one SDK string may be.
+    /// [`crate::Error::AllocationFailed`] when source descriptor storage cannot be reserved.
     #[doc(alias = "NDIlib_routing_get_source_name")]
     pub fn source(&self) -> Result<Source> {
         // SAFETY: the router is live, and the descriptor the SDK returns stays

@@ -60,6 +60,9 @@ pub enum AllocationKind {
     /// Finder or Discovery Server snapshot and discovery-result storage.
     #[error("discovery results")]
     DiscoveryResults,
+    /// A source descriptor copied from a single SDK query.
+    #[error("source descriptor storage")]
+    SourceDescriptor,
     /// Reusable image encoder scratch storage.
     #[error("image scratch storage")]
     ImageScratch,
