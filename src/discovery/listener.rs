@@ -127,7 +127,8 @@ listener_api!(
 /// The Discovery Server a listener connects to.
 ///
 /// Without an explicit server the SDK uses the Discovery Server from the NDI
-/// configuration. If that names none either, the listener cannot be created.
+/// configuration. Creation fails when it names no server or one the SDK
+/// cannot use.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ListenerOptions {
     server: Option<String>,
@@ -841,9 +842,10 @@ impl SendListener {
     /// options carry an Advanced configuration that the runtime or this build
     /// cannot take; [`Error::InvalidCString`] when the endpoint contains a NUL
     /// byte; and [`Error::InvalidInput`] when the options name more than one
-    /// endpoint, or the SDK creates no listener. It creates none for an
-    /// address it cannot parse, and none when `options` name no server and the
-    /// NDI configuration supplies none.
+    /// endpoint, or the SDK creates no listener. Without an explicit server the
+    /// SDK uses its configuration; creation fails when it names no server or
+    /// one the SDK cannot use. An explicit address the SDK cannot parse is also
+    /// refused.
     ///
     /// [sender discovery]: crate::capabilities::RuntimeFeature::SenderDiscovery
     #[doc(alias = "NDIlib_send_listener_create")]
@@ -903,9 +905,10 @@ impl RecvListener {
     /// options carry an Advanced configuration that the runtime or this build
     /// cannot take; [`Error::InvalidCString`] when the endpoint contains a NUL
     /// byte; and [`Error::InvalidInput`] when the options name more than one
-    /// endpoint, or the SDK creates no listener. It creates none for an
-    /// address it cannot parse, and none when `options` name no server and the
-    /// NDI configuration supplies none.
+    /// endpoint, or the SDK creates no listener. Without an explicit server the
+    /// SDK uses its configuration; creation fails when it names no server or
+    /// one the SDK cannot use. An explicit address the SDK cannot parse is also
+    /// refused.
     ///
     /// [receiver discovery]: crate::capabilities::RuntimeFeature::ReceiverDiscovery
     #[doc(alias = "NDIlib_recv_listener_create")]

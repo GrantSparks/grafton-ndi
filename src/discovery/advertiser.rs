@@ -19,7 +19,8 @@ use std::{
 /// The Discovery Server an advertiser registers with.
 ///
 /// Without explicit servers the SDK uses the Discovery Server from the NDI
-/// configuration. If that names none either, the advertiser cannot be created.
+/// configuration. Creation fails when it names no server or one the SDK
+/// cannot use.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct AdvertiserOptions {
     servers: Option<Vec<String>>,
@@ -519,8 +520,9 @@ impl SendAdvertiser {
     /// the options carry an Advanced configuration that the runtime or this
     /// build cannot take; [`Error::InvalidInput`] when a server element is
     /// empty or contains a comma or NUL, or when the SDK creates
-    /// no advertiser. It creates none for an address it cannot parse, and none
-    /// when `options` name no server and the NDI configuration supplies none.
+    /// no advertiser. Without an explicit server the SDK uses its configuration;
+    /// creation fails when it names no server or one the SDK cannot use. An
+    /// explicit address the SDK cannot parse is also refused.
     ///
     /// [sender advertising]: crate::capabilities::RuntimeFeature::SenderAdvertising
     #[doc(alias = "NDIlib_send_advertiser_create")]
@@ -598,8 +600,9 @@ impl RecvAdvertiser {
     /// or the options carry an Advanced configuration that the runtime or this
     /// build cannot take; [`Error::InvalidInput`] when a server element is
     /// empty or contains a comma or NUL, or when the SDK creates
-    /// no advertiser. It creates none for an address it cannot parse, and none
-    /// when `options` name no server and the NDI configuration supplies none.
+    /// no advertiser. Without an explicit server the SDK uses its configuration;
+    /// creation fails when it names no server or one the SDK cannot use. An
+    /// explicit address the SDK cannot parse is also refused.
     ///
     /// [receiver advertising]: crate::capabilities::RuntimeFeature::ReceiverAdvertising
     #[doc(alias = "NDIlib_recv_advertiser_create")]

@@ -325,7 +325,7 @@ fn child(scenario: &str) {
                 assert!(
                     matches!(
                         reason,
-                        grafton_ndi::InputDefect::DiscoveryAddressMissing { .. }
+                        grafton_ndi::InputDefect::DiscoveryConfigurationRejected { .. }
                     ),
                     "{name}: {reason}"
                 );

@@ -61,6 +61,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- Discovery Server creation from SDK configuration reports
+  `InputDefect::DiscoveryConfigurationRejected` when no usable server was
+  resolved, covering both absent and unusable configured servers.
+
 - Starting another recording after incomplete file tracking now requires a
   successful `reset`, even after all known files close; otherwise `start`
   returns `InvalidState(StateConflict::IncompleteFileTracking)`. See the

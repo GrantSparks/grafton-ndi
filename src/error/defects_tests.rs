@@ -233,7 +233,7 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("HdrNeedsPng", InputDefect::HdrNeedsPng { codec: ImageCodecKind::Jpeg, transfer: TransferFunction::Pq }, "JPEG cannot say that its values are PQ code values; HdrPolicy::CodeValues needs ImageFormat::Png"),
         ("RecordingPathTooLong", InputDefect::RecordingPathTooLong { maximum_bytes: 4094, longest_bytes: 4095, index_digits_reserved: 17 }, "recording file path may reach 4095 UTF-8 bytes, exceeding the 4094-byte event path limit (17 digits reserved for index growth)"),
         ("DiscoveryAddressRejected", InputDefect::DiscoveryAddressRejected(Box::new(DiscoveryAddressFailure { object: "advertiser", address: "server:5960".into() })), "the SDK created no advertiser: it does not accept \"server:5960\" as a Discovery Server address"),
-        ("DiscoveryAddressMissing", InputDefect::DiscoveryAddressMissing { object: "advertiser" }, "the SDK created no advertiser: no Discovery Server was named and the NDI configuration supplies none"),
+        ("DiscoveryConfigurationRejected", InputDefect::DiscoveryConfigurationRejected { object: "advertiser" }, "the SDK created no advertiser: no Discovery Server was named, and the configuration names none it accepts"),
         #[cfg(feature = "advanced")]
         ("SpeedHqCodec", InputDefect::SpeedHqCodec { codec: crate::advanced::VideoCodec::H264 }, "SpeedHQ quality guidance does not apply to H264"),
     ];
