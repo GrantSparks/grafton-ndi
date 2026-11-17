@@ -122,3 +122,82 @@ fn video_layout_stores_no_derived_geometry() {
     let expected = if size_of::<usize>() == 8 { 144 } else { 76 };
     assert_eq!(size_of::<ValidatedVideoLayout>(), expected);
 }
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn plane_roles_name_the_documented_planes_for_every_format() {
+    for format in PixelFormat::ALL {
+        for padding in [0, 2, 64] {
+            let stride = 4 * usize::from(format.info().bytes_per_pixel()) + padding;
+            let layout =
+                ValidatedVideoLayout::new_uncompressed(format, 4, 4, Some(stride)).unwrap();
+            let data: Vec<_> = (0..layout.data_len_bytes()).map(|i| i as u8).collect();
+            // SAFETY: the initialized buffer covers this layout for both borrows.
+            let roles = unsafe { layout.plane_roles(data.as_ptr()) };
+            let planes: Vec<_> = unsafe { layout.view_planes(data.as_ptr()) }.collect();
+            let equal = |role: VideoPlane<'_>, index: usize| {
+                let expected = planes[index];
+                assert_eq!(
+                    role.row_stride_bytes(),
+                    expected.row_stride_bytes(),
+                    "{format:?}"
+                );
+                assert_eq!(
+                    role.active_row_bytes(),
+                    expected.active_row_bytes(),
+                    "{format:?}"
+                );
+                assert_eq!(role.row_count(), expected.row_count(), "{format:?}");
+                for (actual, expected) in role.rows().zip(expected.rows()) {
+                    assert_eq!(actual.as_ptr(), expected.as_ptr(), "{format:?}");
+                    assert_eq!(actual, expected, "{format:?}");
+                }
+            };
+            match roles {
+                PlaneRoles::Packed { pixels } => equal(pixels, 0),
+                PlaneRoles::PackedAlpha { pixels, alpha } => {
+                    equal(pixels, 0);
+                    equal(alpha, 1);
+                }
+                PlaneRoles::SemiPlanar420 { luma, chroma } => {
+                    equal(luma, 0);
+                    equal(chroma, 1);
+                }
+                PlaneRoles::Planar420 { luma, cb, cr } => {
+                    equal(luma, 0);
+                    if format == PixelFormat::Yv12 {
+                        equal(cr, 1);
+                        equal(cb, 2);
+                    } else {
+                        equal(cb, 1);
+                        equal(cr, 2);
+                    }
+                }
+                PlaneRoles::SemiPlanar422 {
+                    luma,
+                    chroma,
+                    alpha,
+                } => {
+                    equal(luma, 0);
+                    equal(chroma, 1);
+                    if let Some(alpha) = alpha {
+                        equal(alpha, 2);
+                    }
+                }
+                PlaneRoles::Planar444 {
+                    luma,
+                    cb,
+                    cr,
+                    alpha,
+                } => {
+                    equal(luma, 0);
+                    equal(cb, 1);
+                    equal(cr, 2);
+                    if let Some(alpha) = alpha {
+                        equal(alpha, 3);
+                    }
+                }
+            }
+        }
+    }
+}

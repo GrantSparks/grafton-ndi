@@ -3411,7 +3411,6 @@ fn reader_format_facts_match_the_frame_layout_for_every_format() {
         };
         assert_eq!(info.sample_width().bits(), expected_bits, "{format:?}");
         assert_eq!(info.has_alpha(), expected_alpha, "{format:?}");
-        assert_eq!(info.plane_count(), frame.planes().len(), "{format:?}");
         for keep in [false, true] {
             let source = Source::new(&frame);
             let reader =

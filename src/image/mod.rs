@@ -39,10 +39,10 @@ use self::{
     downscale::{reduced, Downscaler},
     read::{Reader, Sink},
 };
-use crate::frames::VideoPartsExt;
+use crate::frames::{PlaneRoles, VideoPartsExt};
 use crate::{
     color_info, frames::VideoParts, ColorInfo, ColorPrimaries, Error, PixelFormat, Result,
-    TransferFunction, VideoPlane, VideoPlanes, YuvMatrix,
+    TransferFunction, VideoPlane, YuvMatrix,
 };
 
 /// The parts of a video frame an encode reads, borrowed from any frame type.
@@ -50,7 +50,7 @@ pub(crate) struct Source<'a> {
     width: u32,
     height: u32,
     format: PixelFormat,
-    planes: VideoPlanes<'a>,
+    planes: PlaneRoles<'a>,
     aspect: crate::PictureAspectRatio,
     metadata: color_info::Metadata<'a>,
 }
@@ -62,7 +62,7 @@ impl<'a> Source<'a> {
             width: layout.width(),
             height: layout.height(),
             format: layout.pixel_format(),
-            planes: frame.plane_views(),
+            planes: frame.plane_roles(),
             aspect: frame.header().picture_aspect_ratio(),
             metadata: frame.color_metadata(),
         }
