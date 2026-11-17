@@ -152,10 +152,10 @@ immediate teardown and last session report. It bypasses a full command queue
 and ends an existing close's cleanup wait. Either recovery can leave an
 unfinished file.
 
-An indeterminate report alone does not imply incomplete tracking. For example,
-a session stopped before any file opens can have an indeterminate report with
-no pending file obligation. The reset requirement applies when file tracking
-became incomplete.
+An indeterminate report alone does not imply incomplete tracking. See
+[`RecordingReport::closure_confirmed`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.RecordingReport.html#method.closure_confirmed)
+for the closure rule, including sessions that report no file. The reset
+requirement applies when file tracking became incomplete.
 
 Drop requests a stop and waits for closure events within one `drop_wait`
 budget (five seconds by default), including cleanup after an indeterminate

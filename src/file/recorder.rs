@@ -50,8 +50,11 @@ pub enum RecorderState {
     Stopping,
     /// The session ended and every file it opened was reported closed.
     Closed,
-    /// The session ended, but events were lost or inconsistent, so it cannot
-    /// be said whether every file was finalized.
+    /// The session ended without [`RecordingReport::closure_confirmed`].
+    /// Events were lost, unreadable or inconsistent, or the session ended
+    /// before reporting any file. Incomplete tracking requires
+    /// [`FileRecorder::reset`] before starting another session; see
+    /// [`StateConflict::IncompleteFileTracking`].
     Indeterminate,
 }
 
@@ -128,7 +131,11 @@ impl RecordingReport {
     pub fn session(&self) -> u64 {
         self.session
     }
-    /// Whether every file the session opened was reported closed.
+    /// Whether at least one file was reported closed, every reported open
+    /// was matched by its close, and file tracking stayed complete.
+    ///
+    /// A session that ends before reporting any file has no confirmed
+    /// closure, even when no event was lost and no cleanup remains pending.
     pub fn closure_confirmed(&self) -> bool {
         matches!(self.phase, SessionPhase::Closed { .. })
     }
@@ -2329,6 +2336,9 @@ mod tests {
         let _ = ledger.stop_requested(true);
         let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
+        assert!(!ledger.report().closure_confirmed());
+        assert_eq!(ledger.report().dropped_events(), 0);
+        assert!(!ledger.cleanup_pending());
     }
 
     #[test]
