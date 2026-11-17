@@ -1529,7 +1529,6 @@ impl Hash for dyn HostIdentity + '_ {
                 ip.hash(state);
             }
             HostQuery::Host(name) | HostQuery::Machine(name) => {
-                let name = name.strip_suffix('.').unwrap_or(name);
                 1u8.hash(state);
                 name.len().hash(state);
                 for byte in name.bytes() {
@@ -1547,10 +1546,7 @@ impl PartialEq for dyn HostIdentity + '_ {
             (
                 HostQuery::Host(a) | HostQuery::Machine(a),
                 HostQuery::Host(b) | HostQuery::Machine(b),
-            ) => a
-                .strip_suffix('.')
-                .unwrap_or(a)
-                .eq_ignore_ascii_case(b.strip_suffix('.').unwrap_or(b)),
+            ) => a.eq_ignore_ascii_case(b),
             _ => false,
         }
     }
@@ -1576,7 +1572,7 @@ impl TryFrom<HostQuery<'_>> for HostKey {
         Ok(match query {
             HostQuery::Ip(ip) => Self::Ip(ip),
             HostQuery::Host(name) | HostQuery::Machine(name) => {
-                let mut name = budget::copy_string(name.strip_suffix('.').unwrap_or(name))?;
+                let mut name = budget::copy_string(name)?;
                 name.make_ascii_lowercase();
                 Self::Name(name.into_boxed_str())
             }
@@ -3151,6 +3147,7 @@ mod tests {
             ("Camera.Local.", "camera.local", true),
             ("MY MACHINE", "my machine", true),
             ("Ä", "ä", false),
+            ("camera..", "camera", false),
         ] {
             let a = HostQuery::checked(a).unwrap();
             let b = HostQuery::checked(b).unwrap();
