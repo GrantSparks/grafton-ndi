@@ -11,17 +11,24 @@ use crate::{capture::Notification, Result};
 #[derive(Clone, Copy)]
 enum EventKind<T = u32> {
     Status,
+    Later(LaterKind<T>),
+}
+
+#[derive(Clone, Copy)]
+enum LaterKind<T = u32> {
     Source,
     Unknown(T),
 }
 
-impl<T> EventKind<T> {
-    /// The exhaustive successor rule owns delivery priority. Unit payloads
-    /// select slots without inventing an unknown notification value.
-    fn next(self) -> Option<EventKind<()>> {
+impl LaterKind<()> {
+    const FIRST: Self = Self::Source;
+}
+
+impl<T> LaterKind<T> {
+    /// Exhaustive successors own priority among the non-status slots.
+    fn next(self) -> Option<LaterKind<()>> {
         match self {
-            Self::Status => Some(EventKind::Source),
-            Self::Source => Some(EventKind::Unknown(())),
+            Self::Source => Some(LaterKind::Unknown(())),
             Self::Unknown(_) => None,
         }
     }
@@ -31,8 +38,8 @@ impl From<&ReceiverEvent> for EventKind {
     fn from(event: &ReceiverEvent) -> Self {
         match *event {
             ReceiverEvent::StatusChanged(_) => Self::Status,
-            ReceiverEvent::SourceChanged => Self::Source,
-            ReceiverEvent::Unknown(value) => Self::Unknown(value),
+            ReceiverEvent::SourceChanged => Self::Later(LaterKind::Source),
+            ReceiverEvent::Unknown(value) => Self::Later(LaterKind::Unknown(value)),
         }
     }
 }
@@ -42,8 +49,8 @@ impl From<Notification> for Option<EventKind> {
         match notification {
             Notification::None => None,
             Notification::StatusChanged => Some(EventKind::Status),
-            Notification::SourceChanged => Some(EventKind::Source),
-            Notification::Unknown(value) => Some(EventKind::Unknown(value)),
+            Notification::SourceChanged => Some(EventKind::Later(LaterKind::Source)),
+            Notification::Unknown(value) => Some(EventKind::Later(LaterKind::Unknown(value))),
         }
     }
 }
@@ -72,15 +79,17 @@ impl PendingEvents {
     fn retain(&self, kind: EventKind, sequence: Option<u64>) {
         match kind {
             EventKind::Status => self.status.publish(),
-            EventKind::Source => self.source.store(true, Ordering::Release),
-            EventKind::Unknown(value) => {
-                let mut unknown = self.unknown.lock();
-                match sequence {
-                    #[cfg(any(test, feature = "tokio", feature = "smol"))]
-                    Some(sequence) => unknown.replay(ReceiverReport { sequence, value }),
-                    _ => unknown.publish(value),
+            EventKind::Later(later) => match later {
+                LaterKind::Source => self.source.store(true, Ordering::Release),
+                LaterKind::Unknown(value) => {
+                    let mut unknown = self.unknown.lock();
+                    match sequence {
+                        #[cfg(any(test, feature = "tokio", feature = "smol"))]
+                        Some(sequence) => unknown.replay(ReceiverReport { sequence, value }),
+                        _ => unknown.publish(value),
+                    }
                 }
-            }
+            },
         }
     }
 
@@ -102,17 +111,16 @@ impl PendingEvents {
     }
 
     fn take_non_status(&self) -> Option<ReceiverReport<ReceiverEvent>> {
-        let mut next = EventKind::<()>::Status.next();
+        let mut next = Some(LaterKind::FIRST);
         while let Some(kind) = next {
             // Both retention and taking must handle every kind. Together with
             // `next`, these exhaustive matches prevent an undeliverable slot.
             let event = match kind {
-                EventKind::Status => unreachable!("status is taken before its successors"),
-                EventKind::Source => self
+                LaterKind::Source => self
                     .source
                     .swap(false, Ordering::AcqRel)
                     .then(|| ReceiverReport::unsequenced(ReceiverEvent::SourceChanged)),
-                EventKind::Unknown(_) => self
+                LaterKind::Unknown(_) => self
                     .unknown
                     .lock()
                     .pending

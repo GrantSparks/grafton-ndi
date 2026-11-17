@@ -412,18 +412,12 @@ struct ReceiverDelivery<T: ReplayReceiverValue<R>, R = Receiver> {
 }
 
 impl<T: ReplayReceiverValue<R>, R> ReceiverDelivery<T, R> {
-    fn new(receiver: Arc<R>, value: T) -> Self {
-        Self {
-            receiver,
-            value: Some(value),
-        }
+    fn new(receiver: Arc<R>, value: Option<T>) -> Self {
+        Self { receiver, value }
     }
 
-    fn take(mut self) -> T::Value {
-        self.value
-            .take()
-            .expect("delivery is consumed once")
-            .into_value()
+    fn take(mut self) -> Option<T::Value> {
+        self.value.take().map(ReplayReceiverValue::into_value)
     }
 }
 
@@ -567,10 +561,10 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
                             .map(|item| ReceiverReport::unsequenced(item.to_owned()))
                     },
                 )?;
-                Ok(value.map(|value| ReceiverDelivery::new(receiver, value)))
+                Ok(ReceiverDelivery::new(receiver, value))
             })
             .await?
-            .map(ReceiverDelivery::take),
+            .take(),
         )
     }
 
@@ -669,10 +663,10 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
                     |report| report,
                     |media| match media {},
                 )?;
-                Ok(value.map(|value| ReceiverDelivery::new(receiver, value)))
+                Ok(ReceiverDelivery::new(receiver, value))
             })
             .await?
-            .map(ReceiverDelivery::take),
+            .take(),
         )
     }
 
@@ -725,10 +719,10 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
                 deadline,
                 stop,
             )?;
-            Ok::<_, Error>(value.map(|value| ReceiverDelivery::new(receiver, value)))
+            Ok::<_, Error>(ReceiverDelivery::new(receiver, value))
         })
         .await??
-        .map(ReceiverDelivery::take))
+        .take())
     }
 
     /// Point the underlying receiver at a different source and remember it as
@@ -1334,12 +1328,26 @@ mod receiver_tests {
         let event = ReceiverEvent::SourceChanged;
         drop(ReceiverDelivery::new(
             Arc::clone(&pending),
-            ReceiverReport::unsequenced(event),
+            Some(ReceiverReport::unsequenced(event)),
         ));
         assert_eq!(take(), Some(event));
         assert_eq!(
-            ReceiverDelivery::new(Arc::clone(&pending), ReceiverReport::unsequenced(event)).take(),
-            event
+            ReceiverDelivery::new(
+                Arc::clone(&pending),
+                Some(ReceiverReport::unsequenced(event))
+            )
+            .take(),
+            Some(event)
+        );
+        assert_eq!(take(), None);
+        drop(ReceiverDelivery::<ReceiverReport<ReceiverEvent>, _>::new(
+            Arc::clone(&pending),
+            None,
+        ));
+        assert_eq!(
+            ReceiverDelivery::<ReceiverReport<ReceiverEvent>, _>::new(Arc::clone(&pending), None)
+                .take(),
+            None
         );
         assert_eq!(take(), None);
     }
