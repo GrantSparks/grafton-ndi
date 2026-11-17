@@ -608,21 +608,17 @@ impl<A: ListenerApi> Listener<A> {
     }
     fn subscription(&mut self, id: &A::Id, subscribe: bool) {
         if subscribe {
-            if !self.0.retained().contains(id) {
-                self.0.retained_mut().insert(id.clone());
-            }
-            let retained = self
-                .0
-                .retained()
-                .get(id)
-                .expect("subscribed identifier was retained");
+            let pointer = if let Some(retained) = self.0.retained().get(id) {
+                retained.as_c_str().as_ptr()
+            } else {
+                let retained = id.clone();
+                let pointer = retained.as_c_str().as_ptr();
+                self.0.retained_mut().insert(retained);
+                pointer
+            };
             // SAFETY: the listener and its stable identifier allocation stay
             // live until unsubscribe returns or after native destruction.
-            unsafe {
-                self.0
-                    .api
-                    .subscribe(self.0.instance(), retained.as_c_str().as_ptr())
-            };
+            unsafe { self.0.api.subscribe(self.0.instance(), pointer) };
         } else {
             let retained = self.0.retained().get(id).unwrap_or(id);
             // SAFETY: a retained identifier stays live through unsubscribe;

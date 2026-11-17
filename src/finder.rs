@@ -1490,56 +1490,93 @@ impl OwnedHostQuery {
     }
 }
 
-/// Canonical retained cache identity. IPs use their numeric display spelling;
-/// names use the parser's final-dot policy and ASCII lowercase. Those domains
-/// are disjoint: text that parses as an IP is always an IP query, and names
-/// cannot equal the dotted-numeric or colon-containing display of an IP.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct HostKey(String);
+/// A retained cache identity keeps numeric addresses separate from names.
+#[derive(Debug, PartialEq, Eq)]
+enum HostKey {
+    Ip(IpAddr),
+    Name(Box<str>),
+}
 
-impl std::borrow::Borrow<str> for HostKey {
-    fn borrow(&self) -> &str {
-        &self.0
+/// Owned keys and borrowed queries share identity without allocating a key.
+pub(crate) trait HostIdentity {
+    fn identity(&self) -> HostQuery<'_>;
+}
+
+impl HostIdentity for HostQuery<'_> {
+    fn identity(&self) -> HostQuery<'_> {
+        *self
     }
 }
 
-/// Bounded normalization keeps lookups and eviction free of key allocations.
-/// Only a published entry needs an owned string.
-struct HostKeyBuffer {
-    bytes: [u8; 253],
-    len: usize,
+impl HostIdentity for HostKey {
+    fn identity(&self) -> HostQuery<'_> {
+        match self {
+            Self::Ip(ip) => HostQuery::Ip(*ip),
+            Self::Name(name) => HostQuery::Host(name),
+        }
+    }
 }
 
-impl HostKeyBuffer {
-    fn new(query: HostQuery<'_>) -> Self {
-        let mut key = Self {
-            bytes: [0; 253],
-            len: 0,
-        };
-        match query {
+impl Hash for dyn HostIdentity + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self.identity() {
             HostQuery::Ip(ip) => {
-                use std::io::Write;
-                let mut cursor = std::io::Cursor::new(key.bytes.as_mut_slice());
-                // The longest numeric IP spelling is shorter than 253 bytes.
-                write!(cursor, "{ip}").expect("IP fits in host key buffer");
-                key.len = cursor.position() as usize;
+                0u8.hash(state);
+                ip.hash(state);
             }
             HostQuery::Host(name) | HostQuery::Machine(name) => {
-                key.len = name.len();
-                key.bytes[..key.len].copy_from_slice(name.as_bytes());
-                key.bytes[..key.len].make_ascii_lowercase();
+                let name = name.strip_suffix('.').unwrap_or(name);
+                1u8.hash(state);
+                name.len().hash(state);
+                for byte in name.bytes() {
+                    byte.to_ascii_lowercase().hash(state);
+                }
             }
         }
-        key
     }
+}
 
-    fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.bytes[..self.len])
-            .expect("ASCII lowercase preserves a host key's UTF-8")
+impl PartialEq for dyn HostIdentity + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.identity(), other.identity()) {
+            (HostQuery::Ip(a), HostQuery::Ip(b)) => a == b,
+            (
+                HostQuery::Host(a) | HostQuery::Machine(a),
+                HostQuery::Host(b) | HostQuery::Machine(b),
+            ) => a
+                .strip_suffix('.')
+                .unwrap_or(a)
+                .eq_ignore_ascii_case(b.strip_suffix('.').unwrap_or(b)),
+            _ => false,
+        }
     }
+}
+impl Eq for dyn HostIdentity + '_ {}
 
-    fn into_owned(self) -> Result<HostKey> {
-        budget::copy_string(self.as_str()).map(HostKey)
+impl Hash for HostKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self as &dyn HostIdentity).hash(state);
+    }
+}
+
+impl<'a> Borrow<dyn HostIdentity + 'a> for HostKey {
+    fn borrow(&self) -> &(dyn HostIdentity + 'a) {
+        self
+    }
+}
+
+impl TryFrom<HostQuery<'_>> for HostKey {
+    type Error = Error;
+
+    fn try_from(query: HostQuery<'_>) -> Result<Self> {
+        Ok(match query {
+            HostQuery::Ip(ip) => Self::Ip(ip),
+            HostQuery::Host(name) | HostQuery::Machine(name) => {
+                let mut name = budget::copy_string(name.strip_suffix('.').unwrap_or(name))?;
+                name.make_ascii_lowercase();
+                Self::Name(name.into_boxed_str())
+            }
+        })
     }
 }
 
@@ -2103,9 +2140,7 @@ impl SourceCache {
 
     #[cfg(all(test, any(feature = "tokio", feature = "smol")))]
     pub(crate) fn seed_for_test(&self, host: &str, sources: Vec<Source>) {
-        let key = HostKeyBuffer::new(HostQuery::checked(host).unwrap())
-            .into_owned()
-            .unwrap();
+        let key = HostKey::try_from(HostQuery::checked(host).unwrap()).unwrap();
         self.entries.publish(Some(0), key, Arc::new(sources));
     }
 
@@ -2239,21 +2274,23 @@ fn copy_sources(sources: &[Source]) -> Result<Vec<Source>> {
 impl CachedSources {
     /// Clone the map entry under the short lock, then copy descriptors outside it.
     /// The miss generation belongs to the same lookup used for publication.
-    fn probe(
+    fn probe<'a>(
         &self,
-        query: HostQuery<'_>,
+        query: HostQuery<'a>,
         copy: impl FnOnce(&[Source]) -> Result<Vec<Source>>,
-    ) -> Result<(HostKeyBuffer, Option<Vec<Source>>, Option<u64>)> {
-        let key = HostKeyBuffer::new(query);
+    ) -> Result<(HostQuery<'a>, Option<Vec<Source>>, Option<u64>)> {
         let (snapshot, generation) = {
             let cache = self
                 .cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (cache.entries.get(key.as_str()).cloned(), cache.generation)
+            (
+                cache.entries.get(&query as &dyn HostIdentity).cloned(),
+                cache.generation,
+            )
         };
         let sources = snapshot.map(|snapshot| copy(&snapshot)).transpose()?;
-        Ok((key, sources, generation))
+        Ok((query, sources, generation))
     }
 
     fn find_sources_by_host_with<S: Stop>(
@@ -2290,7 +2327,7 @@ impl CachedSources {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if generation.is_none()
                     || cache.generation != generation
-                    || cache.entries.contains_key(key.as_str())
+                    || cache.entries.contains_key(&key as &dyn HostIdentity)
                 {
                     return Ok(Ok(sources));
                 }
@@ -2301,7 +2338,7 @@ impl CachedSources {
             let Ok(snapshot) = copy(&sources) else {
                 return Ok(Ok(sources));
             };
-            let Ok(key) = key.into_owned() else {
+            let Ok(key) = HostKey::try_from(key) else {
                 return Ok(Ok(sources));
             };
             self.publish(generation, key, Arc::new(snapshot));
@@ -2318,7 +2355,7 @@ impl CachedSources {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if generation.is_some()
             && cache.generation == generation
-            && !cache.entries.contains_key(key.0.as_str())
+            && !cache.entries.contains_key(&key)
             && cache.entries.try_reserve(1).is_ok()
         {
             cache.entries.insert(key, snapshot);
@@ -2332,11 +2369,8 @@ impl CachedSources {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             cache.invalidate_pending();
-            HostQuery::parse(host).and_then(|query| {
-                cache
-                    .entries
-                    .remove_entry(HostKeyBuffer::new(query).as_str())
-            })
+            HostQuery::parse(host)
+                .and_then(|query| cache.entries.remove_entry(&query as &dyn HostIdentity))
         };
         // Transfer the complete entry, including its key, before reclaiming
         // strings or the final snapshot owner. Readers only wait for removal.
@@ -2665,7 +2699,7 @@ mod tests {
         ] {
             let text = host.to_owned();
             let parsed = HostQuery::checked(&text).unwrap();
-            let expected = HostKeyBuffer::new(parsed).into_owned().unwrap();
+            let expected = HostKey::try_from(parsed).unwrap();
             let owned = parsed.into_owned();
             drop(text);
             let query = owned.as_query();
@@ -2673,7 +2707,7 @@ mod tests {
                 (kind, query),
                 (0, HostQuery::Ip(_)) | (1, HostQuery::Host(_)) | (2, HostQuery::Machine(_)),
             ));
-            assert_eq!(HostKeyBuffer::new(query).into_owned().unwrap(), expected);
+            assert_eq!(HostKey::try_from(query).unwrap(), expected);
         }
     }
 
@@ -2873,19 +2907,20 @@ mod tests {
 
     #[test]
     fn successful_cache_publication_keeps_its_allocation_count() {
-        let cache = CachedSources::default();
-        // Apple pthread mutexes allocate their native storage on the first
-        // lock. Initialize it before measuring publication into the empty map.
-        assert!(cache.is_empty());
-        let sources = vec![Source::new("camera (Program)").unwrap()];
-        let (result, allocations) = crate::test_alloc::allocation_count(|| {
-            cache.lookup("camera", Duration::ZERO, |_| Ok(sources))
-        });
-        assert_eq!(result.unwrap().len(), 1);
-        // One vector, its Arc header, host key and map storage. The validated
-        // source name is shared with the caller rather than allocated again.
-        assert_eq!(allocations, 4);
-        assert_eq!(cache.len(), 1);
+        for (host, expected) in [("camera", 4), ("192.0.2.1", 3)] {
+            let cache = CachedSources::default();
+            // Initialize native mutex storage before measuring publication.
+            assert!(cache.is_empty());
+            let sources = vec![Source::new("camera (Program)").unwrap()];
+            let (result, allocations) = crate::test_alloc::allocation_count(|| {
+                cache.lookup(host, Duration::ZERO, |_| Ok(sources))
+            });
+            assert_eq!(result.unwrap().len(), 1);
+            // One vector, its Arc header and map storage; only names need an
+            // allocated key. Source strings remain shared with the caller.
+            assert_eq!(allocations, expected, "{host}");
+            assert_eq!(cache.len(), 1);
+        }
     }
 
     #[cfg(any(feature = "tokio", feature = "smol"))]
@@ -3006,9 +3041,7 @@ mod tests {
     }
 
     fn host_key(host: &str) -> HostKey {
-        HostKeyBuffer::new(HostQuery::parse(host).unwrap())
-            .into_owned()
-            .unwrap()
+        HostKey::try_from(HostQuery::parse(host).unwrap()).unwrap()
     }
 
     #[test]
@@ -3019,7 +3052,7 @@ mod tests {
             key.hash(&mut state);
             let owned_hash = state.finish();
             let mut borrowed_state = DefaultHasher::new();
-            std::borrow::Borrow::<str>::borrow(key).hash(&mut borrowed_state);
+            std::borrow::Borrow::<dyn HostIdentity>::borrow(key).hash(&mut borrowed_state);
             assert_eq!(owned_hash, borrowed_state.finish());
             owned_hash
         };
@@ -3096,6 +3129,40 @@ mod tests {
                 .len(),
             distinct.len()
         );
+    }
+
+    #[test]
+    fn typed_host_keys_match_borrowed_identity_and_hashes() {
+        use std::hash::DefaultHasher;
+        fn hash(key: &dyn HostIdentity) -> u64 {
+            let mut state = DefaultHasher::new();
+            key.hash(&mut state);
+            state.finish()
+        }
+        for (a, b, equal) in [
+            ("192.0.2.1", "[::ffff:192.0.2.1]", false),
+            ("[2001:db8::1]", "2001:DB8::1", true),
+            ("Camera.Local.", "camera.local", true),
+            ("MY MACHINE", "my machine", true),
+            ("Ä", "ä", false),
+        ] {
+            let a = HostQuery::checked(a).unwrap();
+            let b = HostQuery::checked(b).unwrap();
+            let key_a = HostKey::try_from(a).unwrap();
+            let key_b = HostKey::try_from(b).unwrap();
+            assert_eq!(key_a == key_b, equal);
+            assert_eq!(hash(&a) == hash(&b), equal);
+            assert_eq!(hash(&key_a), hash(&a));
+            assert_eq!(hash(&key_b), hash(&b));
+            let map = HashMap::from([(key_a, ())]);
+            assert_eq!(map.contains_key(&b as &dyn HostIdentity), equal);
+        }
+        // The type keeps an IP and an identically spelled future name disjoint.
+        let ip = HostKey::try_from(HostQuery::Ip("192.0.2.1".parse().unwrap())).unwrap();
+        let name = HostKey::try_from(HostQuery::Machine("192.0.2.1")).unwrap();
+        assert_ne!(ip, name);
+        let map = HashMap::from([(ip, ())]);
+        assert!(!map.contains_key(&HostQuery::Machine("192.0.2.1") as &dyn HostIdentity));
     }
 
     #[test]
@@ -3224,8 +3291,11 @@ mod tests {
                 assert!(ipv6.matches_host("2001:db8::1"));
                 assert!(studio.matches_host("STUDIO A."));
                 assert!(unicode.matches_host("Étage a"));
-                let key = HostKeyBuffer::new(HostQuery::parse("Studio A").unwrap());
-                assert_eq!(key.as_str(), "studio a");
+                let query = HostQuery::parse("Studio A").unwrap();
+                assert!(
+                    (&query as &dyn HostIdentity)
+                        == (&HostQuery::Machine("studio a") as &dyn HostIdentity)
+                );
             }
         });
         assert_eq!(allocations, 0);
@@ -3522,9 +3592,7 @@ mod tests {
     fn cache_validates_timeout_before_returning_cached_source() {
         let cache = CachedSources::default();
         cache.cache.lock().unwrap().entries.insert(
-            HostKeyBuffer::new(HostQuery::parse("camera").unwrap())
-                .into_owned()
-                .unwrap(),
+            HostKey::try_from(HostQuery::parse("camera").unwrap()).unwrap(),
             Arc::new(vec![Source::new("camera").unwrap()]),
         );
         for host in ["camera", "not_cached"] {

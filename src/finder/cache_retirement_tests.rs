@@ -59,9 +59,7 @@ fn seed(cache: &CachedSources, host: &str, count: usize) {
                 .with_address(SourceAddress::new(format!("192.0.2.1:{}", 5960 + index)).unwrap())
         })
         .collect();
-    let key = HostKeyBuffer::new(HostQuery::checked(host).unwrap())
-        .into_owned()
-        .unwrap();
+    let key = HostKey::try_from(HostQuery::checked(host).unwrap()).unwrap();
     let generation = state(cache).generation;
     cache.publish(generation, key, Arc::new(sources));
 }
@@ -289,7 +287,9 @@ fn measure_cache_retirement_contention() {
                                 {
                                     let mut locked = state(&cache);
                                     locked.invalidate_pending();
-                                    locked.entries.remove(host);
+                                    locked.entries.remove(
+                                        &HostQuery::checked(host).unwrap() as &dyn HostIdentity
+                                    );
                                 }
                             }
                         }
