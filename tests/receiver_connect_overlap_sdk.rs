@@ -1674,3 +1674,246 @@ fn receiver_mutation_allows_membership_changes_from_active_allocator_policies() 
         thread::sleep(Duration::from_millis(1));
     }
 }
+
+/// Policies and external-buffer releases may use shared controls even while a
+/// native connection change waits for that application code to return.
+#[cfg(all(feature = "advanced", target_os = "linux", not(ndi_link_static)))]
+#[test]
+fn allocator_code_uses_shared_controls_during_connection_changes() {
+    use grafton_ndi::{
+        advanced::{
+            AllocatedReceiver, AllocationBuffer, AllocatorLimits, AllocatorService,
+            ExternalAllocation,
+        },
+        RuntimeFeature, Tally,
+    };
+    use std::{
+        process::{Command, Stdio},
+        ptr::NonNull,
+        sync::{mpsc, Arc, OnceLock, Weak},
+    };
+    let Some(ndi) = common::ndi() else { return };
+    if let Err(error) = ndi.require_feature(RuntimeFeature::ReceiveAllocators) {
+        common::skip(common::Requirement::Advanced, &error.to_string());
+        return;
+    }
+    let _turn = sockets();
+    if std::env::var_os("GRAFTON_NDI_ALLOCATOR_CONTROLS_CHILD").is_none() {
+        for operation in ["connect_to", "disconnect", "reconnect"] {
+            for callback in ["policy", "release"] {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "allocator_code_uses_shared_controls_during_connection_changes",
+                        "--nocapture",
+                    ])
+                    .env("GRAFTON_NDI_ALLOCATOR_CONTROLS_CHILD", "1")
+                    .env("GRAFTON_NDI_NATIVE_OPERATION", operation)
+                    .env("GRAFTON_NDI_ALLOCATOR_CALLBACK", callback)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(45);
+                while child.try_wait().unwrap().is_none() {
+                    if Instant::now() >= deadline {
+                        child.kill().unwrap();
+                        let output = child.wait_with_output().unwrap();
+                        panic!(
+                            "{operation}/{callback} did not complete:\n{}\n{}",
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{operation}/{callback} failed:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                eprintln!("{operation}/{callback} completed");
+            }
+        }
+        return;
+    }
+
+    fn controls(receiver: &Receiver) {
+        receiver.set_tally(Tally::new(true, false));
+        receiver.connection_stats().unwrap();
+        let _ = receiver.web_control_url();
+        let _ = receiver.video_delay();
+        let _ = receiver.audio_delay();
+        let metadata = MetadataFrame::new("<allocator-controls/>").unwrap();
+        let _ = receiver.add_connection_metadata(&metadata);
+        let _ = receiver.clear_connection_metadata();
+        let _ = receiver.ptz().is_supported();
+        let _ = receiver.request_keyframe();
+        // KVM session creation requires an exclusive receiver borrow, which
+        // allocator callbacks intentionally do not have. Its shared-control
+        // permit is covered by the independent KVM overlap storm.
+    }
+
+    #[repr(align(64))]
+    struct Block([u8; 64]);
+    struct External {
+        memory: Vec<Block>,
+        owner: Arc<OnceLock<Weak<AllocatedReceiver>>>,
+        armed: Arc<AtomicBool>,
+        changing_thread: Arc<Mutex<Option<thread::ThreadId>>>,
+        on_change: Arc<AtomicU64>,
+    }
+    // SAFETY: the vector owns initialized, aligned memory exclusively until
+    // this handle drops; the SDK has relinquished it before Drop runs.
+    unsafe impl ExternalAllocation for External {
+        fn pointer(&self) -> NonNull<u8> {
+            NonNull::from(&self.memory[0].0).cast()
+        }
+        fn capacity(&self) -> usize {
+            self.memory.len() * 64
+        }
+    }
+    impl Drop for External {
+        fn drop(&mut self) {
+            if self.armed.load(Ordering::Acquire) {
+                let owner = self.owner.get().unwrap().upgrade().unwrap();
+                controls(owner.receiver());
+                if self.changing_thread.lock().unwrap().as_ref() == Some(&thread::current().id()) {
+                    self.on_change.fetch_add(1, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    let operation = std::env::var("GRAFTON_NDI_NATIVE_OPERATION").unwrap();
+    let policy_case = std::env::var("GRAFTON_NDI_ALLOCATOR_CALLBACK").unwrap() == "policy";
+    let sender = Sender::new(
+        &ndi,
+        &SenderOptions::new(common::unique_name("allocator controls"))
+            .clock_video(false)
+            .clock_audio(false),
+    )
+    .unwrap();
+    let source = common::loopback_source(&ndi, &sender).unwrap();
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source.clone())).unwrap();
+    let service =
+        AllocatorService::new(ndi.process_lifetime(), &AllocatorLimits::default()).unwrap();
+    let mut allocated = service.attach(receiver).unwrap();
+    let owner = Arc::new(OnceLock::<Weak<AllocatedReceiver>>::new());
+    let entered = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let armed = Arc::new(AtomicBool::new(false));
+    let changing_thread = Arc::new(Mutex::new(None));
+    let on_change = Arc::new(AtomicU64::new(0));
+    let allocations = Arc::new(AtomicU64::new(0));
+    {
+        let (owner, entered, released, finished, armed, changing_thread, on_change, allocations) = (
+            Arc::clone(&owner),
+            Arc::clone(&entered),
+            Arc::clone(&released),
+            Arc::clone(&finished),
+            Arc::clone(&armed),
+            Arc::clone(&changing_thread),
+            Arc::clone(&on_change),
+            Arc::clone(&allocations),
+        );
+        allocated
+            .set_video_allocator(move |request| {
+                if policy_case && !entered.swap(true, Ordering::AcqRel) {
+                    while !released.load(Ordering::Acquire) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    let owner = owner.get().unwrap().upgrade().unwrap();
+                    controls(owner.receiver());
+                    finished.store(true, Ordering::Release);
+                }
+                let buffer = AllocationBuffer::from_external(
+                    request,
+                    External {
+                        memory: (0..request.minimum_bytes().div_ceil(64))
+                            .map(|_| Block([0; 64]))
+                            .collect(),
+                        owner: Arc::clone(&owner),
+                        armed: Arc::clone(&armed),
+                        changing_thread: Arc::clone(&changing_thread),
+                        on_change: Arc::clone(&on_change),
+                    },
+                )
+                .unwrap();
+                allocations.fetch_add(1, Ordering::Release);
+                Ok(buffer)
+            })
+            .unwrap();
+    }
+    let allocated = Arc::new(allocated);
+    owner.set(Arc::downgrade(&allocated)).unwrap();
+    let stopped = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let _stop = Stop(&stopped);
+        scope.spawn(|| {
+            let frame = VideoFrame::builder()
+                .resolution(64, 64)
+                .data(vec![1; 64 * 64 * 4])
+                .build()
+                .unwrap();
+            while !stopped.load(Ordering::Acquire) {
+                sender.send_video(&frame).unwrap();
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let deadline = Instant::now() + PATIENCE;
+        while if policy_case {
+            !entered.load(Ordering::Acquire)
+        } else {
+            allocations.load(Ordering::Acquire) < 8 || service.usage().retained_allocations() == 0
+        } {
+            if policy_case {
+                drop(allocated.receiver().capture_video_ref(Duration::ZERO));
+            }
+            assert!(
+                Instant::now() < deadline,
+                "allocator callback did not become ready"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let (started, waiting) = mpsc::channel();
+        let (done, completed) = mpsc::channel();
+        let allocated = &allocated;
+        let changing_thread = &changing_thread;
+        let armed = &armed;
+        scope.spawn(move || {
+            *changing_thread.lock().unwrap() = Some(thread::current().id());
+            armed.store(true, Ordering::Release);
+            started.send(()).unwrap();
+            match operation.as_str() {
+                "connect_to" => allocated.receiver().connect_to(&source),
+                "disconnect" => allocated.receiver().disconnect(),
+                "reconnect" => allocated.receiver().reconnect(),
+                _ => unreachable!(),
+            }
+            armed.store(false, Ordering::Release);
+            done.send(()).unwrap();
+        });
+        waiting.recv_timeout(PATIENCE).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        released.store(true, Ordering::Release);
+        completed
+            .recv_timeout(PATIENCE)
+            .expect("connection change waited for allocator controls");
+        if policy_case {
+            assert!(
+                finished.load(Ordering::Acquire),
+                "policy did not finish its controls"
+            );
+        } else {
+            assert!(
+                on_change.load(Ordering::Acquire) > 0,
+                "no external allocation was released on the changing thread"
+            );
+        }
+        stopped.store(true, Ordering::Release);
+    });
+}

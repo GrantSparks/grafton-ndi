@@ -327,8 +327,10 @@ callback, copy media for retention across awaits.
 [`mixed_media_async`](../examples/mixed_media_async.rs) shows both runtimes.
 Use async reconnect/event methods for waits; waiting through the synchronous
 `receiver()` blocks the calling thread.
-Use that same `receiver()` view for non-blocking controls and diagnostics,
-including `is_connected`, `connection_stats`, tally and PTZ.
+Use that same `receiver()` view for controls and diagnostics, including
+`is_connected`, `connection_stats`, tally and PTZ. See the
+[`Receiver` waiting contract](https://grantsparks.github.io/grafton-ndi/grafton_ndi/receiver/struct.Receiver.html#waiting),
+which also covers destruction on the thread dropping the last owner.
 
 ## Optional workflows
 

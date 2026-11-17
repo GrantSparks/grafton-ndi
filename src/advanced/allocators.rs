@@ -331,7 +331,8 @@ impl AllocationRequest {
 /// Memory from the application's own pool, lent to the SDK for one frame.
 ///
 /// The value is dropped, on whichever thread the SDK frees the frame from,
-/// when the SDK no longer needs the memory.
+/// when the SDK no longer needs the memory. See the
+/// [`ReceiveAllocator` callback contract](ReceiveAllocator#callback-contract).
 ///
 /// # Safety
 ///
@@ -400,6 +401,8 @@ unsafe impl Sync for PoolBlock {}
 /// with no other access, remapping or reclamation. Release must not panic. It and
 /// the pool's last destructor may run on any SDK free thread, or on the SDK's
 /// allocating thread when publication refuses a block, without registry locks.
+/// The [`ReceiveAllocator` callback contract](ReceiveAllocator#callback-contract)
+/// also covers release during a connection change.
 /// See [`ExternalAllocation`] for the equivalent arbitrary-handle contract.
 pub unsafe trait ExternalPool: Send + Sync + 'static {
     /// Return a block after the SDK's exclusive access has ended, or after
@@ -645,6 +648,17 @@ fn external_problem(
 /// including distinct policy-error and contained-panic counts.
 /// Invalid media layouts are declined before calling the policy, including
 /// planar audio requests above capture's 64 MiB frame limit.
+///
+/// # Callback contract
+///
+/// Allocator code, including policy calls, allocation destructors and pool
+/// releases, can run on SDK decoder/free threads or on the thread inside
+/// [`Receiver::connect_to`], [`Receiver::disconnect`] or [`Receiver::reconnect`].
+/// Connection changes and allocator replacement wait for running policies.
+/// Allocator code may capture and use shared controls on its own receiver.
+/// It must not change that receiver's connection or release the last
+/// [`AllocatedReceiver`] owner: either operation can wait for the callback
+/// itself and deadlock.
 ///
 /// A replaced policy is destroyed only after its replacement is installed.
 /// With no outstanding allocations or policy calls, the replacing call drops
@@ -1344,6 +1358,9 @@ enum Stream {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// Application allocator code follows the
+/// [`ReceiveAllocator` callback contract](ReceiveAllocator#callback-contract).
 pub struct AllocatedReceiver<M: ReceiverMode = RawCapture> {
     registration: Registration,
     receiver: Receiver<M>,

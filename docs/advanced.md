@@ -281,9 +281,12 @@ valid, exclusively claimed, and belongs to that pool. `release` is also unsafe
 to prevent safe early release of a copied descriptor. Do not infer memory
 validity from address, capacity or alignment checks alone.
 
-Release and the pool's final destructor can run on any SDK free thread, outside
-the registry lock. They can also run on the allocating thread when publication
-refuses a pool buffer. Release must not panic. A panic while reclaiming a
+Allocator callbacks and release follow the
+[`ReceiveAllocator` callback contract](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/trait.ReceiveAllocator.html#callback-contract),
+including execution on a thread changing the receiver's connection. Shared
+controls and captures are permitted; changing that connection or dropping its
+last allocated owner from allocator code can deadlock. Release and the pool's
+final destructor run outside the registry lock. Release must not panic. A panic while reclaiming a
 published block is contained and leaves that block's count and bytes charged,
 since cleanup may be incomplete. A refused buffer has never been charged; its
 release panic is contained by the allocation callback.
@@ -333,7 +336,7 @@ matched sender timestamps read as `Some`.
 
 `AvSync` is `Send` but not `Sync`; synchronization runs on one thread at a
 time. Its shared receiver permits concurrent compatible capture/control work;
-shared controls serialize with local connection changes while capture continues.
+see the [`Receiver` waiting contract](https://grantsparks.github.io/grafton-ndi/grafton_ndi/receiver/struct.Receiver.html#waiting).
 `split()` separates synchronization and exclusive controls for KVM;
 `into_receiver()` restores audio capture. See
 [`advanced_avsync`](../examples/advanced_avsync.rs).

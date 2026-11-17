@@ -33,8 +33,9 @@
 //! [`connect_to`](AsyncReceiver::connect_to),
 //! [`disconnect`](AsyncReceiver::disconnect) and
 //! [`reconnect`](AsyncReceiver::reconnect). It lends the [`Receiver`] itself,
-//! through [`receiver`](AsyncReceiver::receiver), for the controls that do not
-//! wait.
+//! through [`receiver`](AsyncReceiver::receiver), for shared controls. See
+//! [`Receiver`'s waiting contract](Receiver#waiting), including native destruction
+//! on the thread dropping the last owner.
 //!
 //! For owned/scoped captures, `next_event` and `wait_for_source_name_change`, the timeout
 //! budget starts when the future is first polled, rather than when it is
@@ -320,7 +321,8 @@ impl private::Spawn for Smol {
 /// a frame keeps that change for [`next_event`](Self::next_event), as the
 /// synchronous captures keep it for [`Receiver::next_event`]: both read the
 /// same pending events. [`receiver`](Self::receiver) lends the receiver for
-/// its controls that do not wait, such as tally, PTZ and upstream metadata.
+/// shared controls, such as tally, PTZ and upstream metadata; see
+/// [`Receiver`'s waiting contract](Receiver#waiting).
 ///
 /// # Error Handling
 ///

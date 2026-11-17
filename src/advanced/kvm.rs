@@ -6,7 +6,7 @@ use std::ffi::CString;
 
 use super::{invalid_input, KvmReceiver};
 #[cfg(any(test, ndi_has_advanced_kvm, ndi_test_receiver_proofs))]
-use crate::receiver::Connection;
+use crate::receiver::Control;
 #[cfg(any(doc, test))]
 use crate::Error;
 use crate::{
@@ -45,17 +45,17 @@ struct HeldInputs {
 
 #[cfg(any(test, ndi_has_advanced_kvm, ndi_test_receiver_proofs))]
 trait InputSender {
-    fn key(&self, connection: &Connection<'_>, key: i32, down: bool) -> Result<()>;
-    fn mouse(&self, connection: &Connection<'_>, button: MouseButton, down: bool) -> Result<()>;
-    fn touch(&self, connection: &Connection<'_>, count: i32, points: &[[f32; 2]]) -> Result<()>;
-    fn finish_touch(&self, connection: &Connection<'_>) -> Result<()>;
+    fn key(&self, connection: &Control<'_>, key: i32, down: bool) -> Result<()>;
+    fn mouse(&self, connection: &Control<'_>, button: MouseButton, down: bool) -> Result<()>;
+    fn touch(&self, connection: &Control<'_>, count: i32, points: &[[f32; 2]]) -> Result<()>;
+    fn finish_touch(&self, connection: &Control<'_>) -> Result<()>;
 }
 
 #[cfg(any(test, ndi_has_advanced_kvm, ndi_test_receiver_proofs))]
 impl HeldInputs {
     fn key(
         &mut self,
-        connection: &Connection<'_>,
+        connection: &Control<'_>,
         sender: &impl InputSender,
         key: i32,
         down: bool,
@@ -71,7 +71,7 @@ impl HeldInputs {
 
     fn mouse(
         &mut self,
-        connection: &Connection<'_>,
+        connection: &Control<'_>,
         sender: &impl InputSender,
         button: MouseButton,
         down: bool,
@@ -87,7 +87,7 @@ impl HeldInputs {
 
     fn touch(
         &mut self,
-        connection: &Connection<'_>,
+        connection: &Control<'_>,
         sender: &impl InputSender,
         points: &[[f32; 2]],
     ) -> Result<()> {
@@ -107,21 +107,13 @@ impl HeldInputs {
         Ok(())
     }
 
-    fn finish_touch(
-        &mut self,
-        connection: &Connection<'_>,
-        sender: &impl InputSender,
-    ) -> Result<()> {
+    fn finish_touch(&mut self, connection: &Control<'_>, sender: &impl InputSender) -> Result<()> {
         sender.finish_touch(connection)?;
         self.touching = false;
         Ok(())
     }
 
-    fn release_all(
-        &mut self,
-        connection: &Connection<'_>,
-        sender: &impl InputSender,
-    ) -> Result<()> {
+    fn release_all(&mut self, connection: &Control<'_>, sender: &impl InputSender) -> Result<()> {
         let mut released = Ok(());
         for key in std::mem::take(&mut self.keys) {
             if let Err(error) = self.key(connection, sender, key, false) {
@@ -141,7 +133,7 @@ impl HeldInputs {
         released
     }
 
-    fn release_on_drop(&mut self, connection: &Connection<'_>, sender: &impl InputSender) {
+    fn release_on_drop(&mut self, connection: &Control<'_>, sender: &impl InputSender) {
         // Best effort: a source that has disconnected cannot be told.
         let _ = self.release_all(connection, sender);
     }
@@ -220,12 +212,12 @@ impl<M: ReceiverMode> Receiver<M> {
 #[cfg(ndi_has_advanced_kvm)]
 macro_rules! kvm_send {
     ($session:expr, $func:ident $(, $arg:expr)*) => {{
-        let connection = $session.receiver.core.lock_connection();
+        let connection = $session.receiver.core.lock_control();
         kvm_send!(table $session.kvm, &connection, $func $(, $arg)*)
     }};
     (table $table:expr, $connection:expr, $func:ident $(, $arg:expr)*) => {{
         // SAFETY: the session retains the live receiver, and the caller holds
-        // its connection permit (including HeldInputs cleanup). Arguments
+        // its control permit (including HeldInputs cleanup). Arguments
         // outlive this synchronous call. See the RecvInstance inventory for
         // control/capture and SDK-internal connection changes.
         unsafe { $table.named().$func($connection.instance() $(, $arg)*) }.performed()
@@ -234,7 +226,7 @@ macro_rules! kvm_send {
 
 #[cfg(ndi_has_advanced_kvm)]
 impl InputSender for Kvm {
-    fn key(&self, connection: &Connection<'_>, key: i32, down: bool) -> Result<()> {
+    fn key(&self, connection: &Control<'_>, key: i32, down: bool) -> Result<()> {
         if down {
             kvm_send!(table self, connection, NDIlib_recv_kvm_send_keyboard_press, key)
         } else {
@@ -242,7 +234,7 @@ impl InputSender for Kvm {
         }
     }
 
-    fn mouse(&self, connection: &Connection<'_>, button: MouseButton, down: bool) -> Result<()> {
+    fn mouse(&self, connection: &Control<'_>, button: MouseButton, down: bool) -> Result<()> {
         match (button, down) {
             (MouseButton::Left, true) => {
                 kvm_send!(table self, connection, NDIlib_recv_kvm_send_left_mouse_click)
@@ -265,13 +257,13 @@ impl InputSender for Kvm {
         }
     }
 
-    fn touch(&self, connection: &Connection<'_>, count: i32, points: &[[f32; 2]]) -> Result<()> {
+    fn touch(&self, connection: &Control<'_>, count: i32, points: &[[f32; 2]]) -> Result<()> {
         // HeldInputs validated `count` and all coordinates; the slice lends
         // that many consecutive coordinate pairs through this native call.
         kvm_send!(table self, connection, NDIlib_recv_kvm_send_touch_positions, count, points.as_ptr().cast())
     }
 
-    fn finish_touch(&self, connection: &Connection<'_>) -> Result<()> {
+    fn finish_touch(&self, connection: &Control<'_>) -> Result<()> {
         kvm_send!(table self, connection, NDIlib_recv_kvm_send_touch_finish)
     }
 }
@@ -308,7 +300,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     #[doc(alias = "NDIlib_recv_kvm_is_supported")]
     pub fn is_supported(&self) -> bool {
         native!(Kvm, self.kvm => {
-            let connection = self.receiver.core.lock_connection();
+            let connection = self.receiver.core.lock_control();
             // SAFETY: the live core and permit cover the call; see the
             // RecvInstance concurrency inventory.
             unsafe { self.kvm.NDIlib_recv_kvm_is_supported(connection.instance()) }
@@ -325,7 +317,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     #[doc(alias = "NDIlib_recv_kvm_send_right_mouse_click")]
     pub fn mouse_down(&mut self, button: MouseButton) -> Result<()> {
         native!(Kvm, self.kvm, uses(button) => {
-            let connection = self.receiver.core.lock_connection();
+            let connection = self.receiver.core.lock_control();
             self.held.mouse(&connection, self.kvm, button, true)
         })
     }
@@ -341,7 +333,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     #[doc(alias = "NDIlib_recv_kvm_send_right_mouse_release")]
     pub fn mouse_up(&mut self, button: MouseButton) -> Result<()> {
         native!(Kvm, self.kvm, uses(button) => {
-            let connection = self.receiver.core.lock_connection();
+            let connection = self.receiver.core.lock_control();
             self.held.mouse(&connection, self.kvm, button, false)
         })
     }
@@ -373,14 +365,14 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
 
     fn press(&mut self, _key: i32) -> Result<()> {
         native!(Kvm, self.kvm => {
-            let connection = self.receiver.core.lock_connection();
+            let connection = self.receiver.core.lock_control();
             self.held.key(&connection, self.kvm, _key, true)
         })
     }
 
     fn release(&mut self, _key: i32) -> Result<()> {
         native!(Kvm, self.kvm => {
-            let connection = self.receiver.core.lock_connection();
+            let connection = self.receiver.core.lock_control();
             self.held.key(&connection, self.kvm, _key, false)
         })
     }
@@ -460,7 +452,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     #[doc(alias = "NDIlib_recv_kvm_send_touch_positions")]
     pub fn touch(&mut self, points: &[[f32; 2]]) -> Result<()> {
         native!(Kvm, self.kvm, uses(points) => {
-            let connection = self.receiver.core.lock_connection();
+            let connection = self.receiver.core.lock_control();
             self.held.touch(&connection, self.kvm, points)
         })
     }
@@ -474,7 +466,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     #[doc(alias = "NDIlib_recv_kvm_send_touch_finish")]
     pub fn finish_touch(&mut self) -> Result<()> {
         native!(Kvm, self.kvm => {
-            let connection = self.receiver.core.lock_connection();
+            let connection = self.receiver.core.lock_control();
             self.held.finish_touch(&connection, self.kvm)
         })
     }
@@ -488,7 +480,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     /// stay recorded as pressed, and a later call tries them again.
     pub fn release_all(&mut self) -> Result<()> {
         native!(Kvm, self.kvm => {
-            let connection = self.receiver.core.lock_connection();
+            let connection = self.receiver.core.lock_control();
             self.held.release_all(&connection, self.kvm)
         })
     }
@@ -497,7 +489,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
 impl<M: ReceiverMode> Drop for KvmSession<'_, M> {
     fn drop(&mut self) {
         native!(Kvm, self.kvm => {
-            let connection = self.receiver.core.lock_connection();
+            let connection = self.receiver.core.lock_control();
             self.held.release_on_drop(&connection, self.kvm);
         })
     }

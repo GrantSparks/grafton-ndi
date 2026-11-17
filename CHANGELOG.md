@@ -28,6 +28,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 - Queued senders publish unknown-completion failures in the admission lock,
   so a racing submission cannot enter after failure is detected.
+- Receiver shared controls use a separate permit from local connection changes,
+  allowing allocator callbacks to use controls without deadlocking a connect,
+  disconnect or reconnect. Getters no longer wait for the connection permit.
 
 - Recorder file tracking stays bounded after native event loss and preserves
   unknown cleanup obligations even after all known files close. Drop and async
