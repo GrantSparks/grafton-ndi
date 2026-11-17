@@ -503,8 +503,8 @@ impl<'owner, S: FrameFree> Guard<'owner, S> {
     /// # Safety
     ///
     /// The caller must ensure that:
-    /// - `frame` belongs to the matching capture/free family `S` and has not
-    ///   been freed. Until this guard releases it, every non-null pointer
+    /// - `frame` was delivered by `source` through the matching capture/free
+    ///   family `S` and has not been freed. Until this guard releases it, every non-null pointer
     ///   describes live storage valid for that descriptor: active pixel rows
     ///   or channel samples are initialized, and metadata is readable through
     ///   its first NUL or `MAX_METADATA_BYTES`. Standalone metadata with a
@@ -717,8 +717,8 @@ impl<'rx> Captured<'rx> {
         let frame = K::slot(&mut self.slots).take()?;
         // SAFETY: the SDK reported a frame of kind `K` and was given `K`'s
         // descriptor, so it wrote that frame there (Processing.NDI.Recv.h:
-        // it fills only the descriptor of the kind it returns). Taking the descriptor out of its slot wraps the frame once. The
-        // capture proof pairs its owning receiver with the matching free.
+        // it fills only the descriptor of the kind it returns). Taking the
+        // descriptor out of its slot wraps the frame once. The capture proof pairs its owning receiver with the matching free.
         Some(unsafe { Guard::new(self.source, frame) })
     }
 
