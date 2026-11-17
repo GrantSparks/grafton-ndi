@@ -44,11 +44,11 @@ fn complete_tracking_matches_out_of_order_paths_and_preserves_opening_order() {
     tracker.open(RecorderEventKind::Rollover, path(5));
     assert_eq!(tracker.current(), Some(&path(5)));
     tracker.first_frame(&path(2));
-    assert_eq!(tracker.close(&path(5)), Some(false));
+    assert_eq!(tracker.close(&path(5)), FileClose::ConfirmedEmpty);
     // The current file follows opening order, not the path's sort order.
     assert_eq!(tracker.current(), Some(&path(2)));
-    assert_eq!(tracker.close(&path(8)), Some(false));
-    assert_eq!(tracker.close(&path(2)), Some(true));
+    assert_eq!(tracker.close(&path(8)), FileClose::ConfirmedEmpty);
+    assert_eq!(tracker.close(&path(2)), FileClose::HadMedia);
     assert!(tracker.is_complete());
     assert!(tracker.is_empty());
     assert!(!tracker.cleanup_pending());
@@ -84,10 +84,10 @@ fn malformed_or_missing_lifecycle_evidence_keeps_unknown_cleanup_after_known_clo
                 EventText::from_buffer(&[b't' as c_char, 0]),
             ),
             6 => {
-                assert_eq!(tracker.close(&path(99)), None);
+                assert_eq!(tracker.close(&path(99)), FileClose::Unconfirmed);
             }
             7 => {
-                assert_eq!(tracker.close(&EventText::default()), None);
+                assert_eq!(tracker.close(&EventText::default()), FileClose::Unconfirmed);
             }
             8 => tracker.first_frame(&path(99)),
             9 => tracker.first_frame(&EventText::default()),
@@ -143,7 +143,16 @@ fn generated_mixed_traces_preserve_known_media_and_irreversible_incompleteness()
                     media[index] = true;
                 }
                 2 if known[index] => {
-                    assert_eq!(tracker.close(&path(index)), Some(media[index]));
+                    assert_eq!(
+                        tracker.close(&path(index)),
+                        if media[index] {
+                            FileClose::HadMedia
+                        } else if incomplete {
+                            FileClose::Unconfirmed
+                        } else {
+                            FileClose::ConfirmedEmpty
+                        }
+                    );
                     known[index] = false;
                 }
                 3 => {
@@ -156,7 +165,7 @@ fn generated_mixed_traces_preserve_known_media_and_irreversible_incompleteness()
                     tracker.open(RecorderEventKind::Rollover, path(1000 + step));
                 }
                 5 => {
-                    assert_eq!(tracker.close(&path(2000 + step)), None);
+                    assert_eq!(tracker.close(&path(2000 + step)), FileClose::Unconfirmed);
                     incomplete = true;
                 }
                 _ => {}
@@ -170,7 +179,16 @@ fn generated_mixed_traces_preserve_known_media_and_irreversible_incompleteness()
         }
         for (index, present) in known.into_iter().enumerate() {
             if present {
-                assert_eq!(tracker.close(&path(index)), Some(media[index]));
+                assert_eq!(
+                    tracker.close(&path(index)),
+                    if media[index] {
+                        FileClose::HadMedia
+                    } else if incomplete {
+                        FileClose::Unconfirmed
+                    } else {
+                        FileClose::ConfirmedEmpty
+                    }
+                );
             }
         }
         assert!(tracker.is_empty());
@@ -281,7 +299,7 @@ fn failed_reservation_preserves_known_files_and_permanently_closes_admission() {
         tracker.open(RecorderEventKind::Rollover, path(capacity + 1));
         assert_eq!(tracker.files().len(), before.0);
         for index in 0..capacity {
-            assert_eq!(tracker.close(&path(index)), Some(false));
+            assert_eq!(tracker.close(&path(index)), FileClose::Unconfirmed);
         }
         assert!(tracker.is_empty());
         assert!(tracker.cleanup_pending());

@@ -12,6 +12,14 @@ pub(super) enum FileTracker {
     Incomplete(Files),
 }
 
+/// What the available lifecycle evidence proves about a closed file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FileClose {
+    ConfirmedEmpty,
+    HadMedia,
+    Unconfirmed,
+}
+
 #[derive(Default)]
 pub(super) struct Files {
     // Sorted by exact path bytes, so an unmatched open does not compare its
@@ -160,9 +168,10 @@ impl FileTracker {
         self.mark_incomplete();
     }
 
-    /// Remove a matching known file, reporting whether it had media. This
-    /// releases known storage even after the public report has become final.
-    pub(super) fn close(&mut self, path: &EventText) -> Option<bool> {
+    /// Release a matching known file, even after the report has become final.
+    /// Absence of a first frame proves emptiness only under complete tracking.
+    pub(super) fn close(&mut self, path: &EventText) -> FileClose {
+        let complete = self.is_complete();
         if Self::exact(path) {
             let files = self.data_mut();
             if let Ok(index) = files
@@ -171,11 +180,17 @@ impl FileTracker {
             {
                 let closed = files.entries.remove(index);
                 files.path_bytes -= closed.path.retained_bytes();
-                return Some(closed.has_media);
+                return if closed.has_media {
+                    FileClose::HadMedia
+                } else if complete {
+                    FileClose::ConfirmedEmpty
+                } else {
+                    FileClose::Unconfirmed
+                };
             }
         }
         self.mark_incomplete();
-        None
+        FileClose::Unconfirmed
     }
 }
 

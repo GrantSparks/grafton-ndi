@@ -126,7 +126,7 @@ Call `finish(timeout)` and inspect both its status and `RecordingReport`:
 | --- | --- |
 | `Closed` | The SDK reported every opened file finalized. Check errors, write failures, empty files and `stopped_by_sdk` for an early end. |
 | `TimedOut` | Use `wait_for_finish` to continue waiting. |
-| `Indeterminate` | Closure could not be established from the events; waiting longer does not repair the report. Reset before restarting when file tracking is incomplete. |
+| `Indeterminate` | Closure could not be established from the events; waiting longer does not repair the report. `empty_files` is a lower bound counting files confirmed empty under complete tracking. Reset before restarting when file tracking is incomplete. |
 
 `finish(timeout)` requests the stop and reports that bounded completion attempt,
 including `FinishStatus::TimedOut(report)`. A later

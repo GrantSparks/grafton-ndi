@@ -23,7 +23,7 @@ use crate::{
 };
 
 mod tracker;
-use tracker::FileTracker;
+use tracker::{FileClose, FileTracker};
 
 /// The longest single wait for an event while finalization is pending. Short
 /// enough that a caller's interruption is noticed promptly.
@@ -139,14 +139,19 @@ impl RecordingReport {
     pub fn closed_files(&self) -> u64 {
         self.closed_files
     }
-    /// How many of the closed files had no audio or video written to them.
+    /// How many closed files were confirmed to contain no audio or video.
     ///
     /// The SDK opens a file as soon as a session or a rollover starts, and
     /// closes it as finalized even if no frame ever reached it: a stop before
     /// the source delivered anything, a switch to a source that is not there,
     /// a rollover while the source is lost. Such a file is empty or holds
     /// only a header, and may not open in a player. A file counts here when
-    /// it was closed without the SDK having reported its first frame.
+    /// it closed under complete tracking without a reported first frame.
+    ///
+    /// The count is exact when [`closure_confirmed`](Self::closure_confirmed)
+    /// is true. Otherwise it is a lower bound: files confirmed empty before
+    /// tracking became incomplete remain counted, while later closes cannot
+    /// establish that a missing first-frame event was never delivered.
     ///
     /// Always zero for a recorder that records neither audio nor video,
     /// because the SDK reports no first frame for metadata.
@@ -926,7 +931,7 @@ impl Ledger {
                 data.files.first_frame(&path);
             }
             RecorderEventKind::FileClosed => {
-                if data.files.close(&path) == Some(false) && data.records_media {
+                if data.files.close(&path) == FileClose::ConfirmedEmpty && data.records_media {
                     data.report.empty_files = data.report.empty_files.saturating_add(1);
                 }
                 data.report.closed_files = data.report.closed_files.saturating_add(1);
@@ -2086,6 +2091,33 @@ mod tests {
         let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
         assert!(!ledger.report().closure_confirmed());
+    }
+
+    #[test]
+    fn empty_file_counts_use_only_evidence_observed_under_complete_tracking() {
+        for empty_before_loss in [false, true] {
+            let mut ledger = session();
+            let _ = ledger.observe(Started, path("known.mkv"));
+            if empty_before_loss {
+                let _ = ledger.observe(FileClosed, path("known.mkv"));
+                assert_eq!(ledger.report().empty_files(), 1);
+            }
+            ledger.dropped(1);
+            if !empty_before_loss {
+                // The lost event could have been this file's first frame.
+                let _ = ledger.observe(FileClosed, path("known.mkv"));
+            }
+            // Opens after lost evidence are deliberately not retained, and
+            // neither they nor their closes can prove another empty file.
+            let _ = ledger.observe(Rollover, path("hidden.mkv"));
+            let _ = ledger.observe(FileClosed, path("hidden.mkv"));
+            let _ = ledger.drained(false);
+            let report = ledger.report();
+            assert_eq!(report.empty_files(), u64::from(empty_before_loss));
+            assert_eq!(report.closed_files(), 2);
+            assert!(!report.closure_confirmed());
+            assert_eq!(report.dropped_events(), 1);
+        }
     }
 
     #[test]

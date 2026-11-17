@@ -4987,6 +4987,48 @@ mod tests {
     }
 
     #[test]
+    fn async_indeterminate_reports_count_only_files_confirmed_empty_before_loss() {
+        for empty_before_loss in [false, true] {
+            let (device, recorder) = mock_recorder_with_drop_wait(
+                Closing::Never,
+                AsyncFileOptions::new(),
+                Duration::ZERO,
+            );
+            block_on(recorder.next_event(Duration::from_secs(1))).unwrap();
+            if empty_before_loss {
+                device.push(mock::FILE_CLOSED, mock::TAKE);
+                let limit = Instant::now() + Duration::from_secs(1);
+                loop {
+                    let report = block_on(recorder.report()).unwrap();
+                    if report.closed_files() == 1 {
+                        assert_eq!(report.empty_files(), 1);
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < limit,
+                        "the complete close was never observed"
+                    );
+                }
+            }
+            device.dropped_events.store(1, Ordering::Release);
+            if !empty_before_loss {
+                device.push(mock::FILE_CLOSED, mock::TAKE);
+            }
+            device.push(mock::ROLLOVER, "hidden.mkv");
+            device.push(mock::FILE_CLOSED, "hidden.mkv");
+            let FinishStatus::Indeterminate(report) =
+                block_on(recorder.finish(Duration::ZERO)).unwrap()
+            else {
+                panic!("lost file evidence prevents confirmed closure");
+            };
+            assert_eq!(report.empty_files(), u64::from(empty_before_loss));
+            assert_eq!(report.closed_files(), 2);
+            assert_eq!(report.dropped_events(), 1);
+            block_on(recorder.abandon()).unwrap();
+        }
+    }
+
+    #[test]
     fn async_start_distinguishes_active_sessions_from_incomplete_tracking() {
         let (device, recorder) =
             mock_recorder_with_drop_wait(Closing::Never, AsyncFileOptions::new(), Duration::ZERO);

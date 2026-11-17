@@ -34,6 +34,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Single-source descriptor allocation failures identify `SourceDescriptor`
   storage and its requested byte count; sender, router and File player getters
   document that failure.
+- Recorder reports count only files confirmed empty under complete tracking;
+  after lost lifecycle evidence, `empty_files` is a lower bound.
 
 - Recorder file tracking stays bounded after native event loss and preserves
   unknown cleanup obligations even after all known files close. Drop and async

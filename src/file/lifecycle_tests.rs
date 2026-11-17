@@ -275,6 +275,37 @@ fn a_failed_reset_keeps_the_old_recorder_and_its_finalization_pending() {
 }
 
 #[test]
+fn an_indeterminate_report_counts_only_files_confirmed_empty_before_loss() {
+    for empty_before_loss in [false, true] {
+        let device = mock::Recorder::new(Closing::Never);
+        let mut recorder = recording_with(
+            &device,
+            FileRecorderOptions::new(SourceSpec::new("empty-count").unwrap())
+                .drop_wait(Duration::ZERO),
+        );
+        recorder.next_event(Duration::ZERO).unwrap();
+        if empty_before_loss {
+            device.push(FILE_CLOSED, TAKE);
+            recorder.next_event(Duration::ZERO).unwrap();
+            assert_eq!(recorder.report().empty_files(), 1);
+        }
+        device.dropped_events.store(1, Ordering::Release);
+        if !empty_before_loss {
+            device.push(FILE_CLOSED, TAKE);
+        }
+        device.push(ROLLOVER, "hidden.mkv");
+        device.push(FILE_CLOSED, "hidden.mkv");
+        let FinishStatus::Indeterminate(report) = recorder.finish(Duration::ZERO).unwrap() else {
+            panic!("lost file evidence prevents confirmed closure");
+        };
+        assert_eq!(report.empty_files(), u64::from(empty_before_loss));
+        assert_eq!(report.closed_files(), 2);
+        assert_eq!(report.dropped_events(), 1);
+        recorder.abandon();
+    }
+}
+
+#[test]
 fn lost_sdk_events_end_the_session_as_indeterminate() {
     let device = mock::Recorder::new(Closing::AtStop);
     let mut recorder = recording_on(&device);

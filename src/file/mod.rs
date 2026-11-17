@@ -135,7 +135,9 @@
 //!   soon as a session or a rollover starts, and reports it closed even if no
 //!   frame arrived: after a stop before the source delivered anything, a
 //!   switch to a source that is not there, or a rollover while the source is
-//!   lost. [`RecordingReport::empty_files`] counts these files.
+//!   lost. [`RecordingReport::empty_files`] counts confirmed empty files:
+//!   exactly under confirmed closure, and as a lower bound after incomplete
+//!   tracking.
 //! * **On Linux with the NDI 6.4 File library, a rollover the library cannot
 //!   carry out ends the session.** It accepts
 //!   the request, fails to open the new file, closes the old one and stops.
