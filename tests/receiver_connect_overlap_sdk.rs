@@ -255,6 +255,22 @@ struct Loans {
     returned: AtomicU64,
     videos: AtomicU64,
     audio: AtomicU64,
+    latest_video_timecode: AtomicU64,
+}
+
+impl Drop for Loans {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            eprintln!(
+                "capture progress at failure: {} actual video loans, {} actual audio loans, {} total loan checks, {} validated loans returned, latest video timecode {}",
+                self.videos.load(Ordering::Relaxed),
+                self.audio.load(Ordering::Relaxed),
+                self.taken.load(Ordering::Relaxed),
+                self.returned.load(Ordering::Relaxed),
+                self.latest_video_timecode.load(Ordering::Relaxed),
+            );
+        }
+    }
 }
 
 impl Loans {
@@ -267,7 +283,11 @@ impl Loans {
     }
 
     fn video<T: VideoSource>(&self, frame: T, peers: &Peers) {
+        let timecode = frame.timecode().ticks();
         self.check(frame, |frame| check_video(frame, peers));
+        // check_video validated the fixture's nonnegative sequence timecode.
+        self.latest_video_timecode
+            .fetch_max(timecode as u64, Ordering::Relaxed);
         self.videos.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -443,43 +463,62 @@ fn control_result<T: std::fmt::Debug>(result: Result<T, Error>) {
 
 fn shared_controls<M: ReceiverMode>(receiver: &Receiver<M>, kind: usize, round: u64) {
     use grafton_ndi::Tally;
-    match kind % 3 {
-        0 => {
+    match kind {
+        0 | 3..=7 => {
             let ptz = receiver.ptz();
-            let _ = ptz.is_supported();
-            control_result(ptz.recall_preset(0, 0.5));
-            control_result(ptz.store_preset(0));
-            control_result(ptz.zoom(0.5));
-            control_result(ptz.zoom_speed(0.0));
-            control_result(ptz.pan_tilt(0.0, 0.0));
-            control_result(ptz.pan_tilt_speed(0.0, 0.0));
-            control_result(ptz.auto_focus());
-            control_result(ptz.focus(0.5));
-            control_result(ptz.focus_speed(0.0));
-            control_result(ptz.white_balance_auto());
-            control_result(ptz.white_balance_indoor());
-            control_result(ptz.white_balance_outdoor());
-            control_result(ptz.white_balance_oneshot());
-            control_result(ptz.white_balance_manual(0.5, 0.5));
-            control_result(ptz.exposure_auto());
-            control_result(ptz.exposure_manual(0.5));
-            control_result(ptz.exposure_manual_detailed(1.0, 0.5, 0.5));
+            if matches!(kind, 0 | 3) {
+                let _ = ptz.is_supported();
+            }
+            if matches!(kind, 0 | 4) {
+                control_result(ptz.recall_preset(0, 0.5));
+                control_result(ptz.store_preset(0));
+            }
+            if matches!(kind, 0 | 5) {
+                control_result(ptz.zoom(0.5));
+                control_result(ptz.zoom_speed(0.0));
+                control_result(ptz.pan_tilt(0.0, 0.0));
+                control_result(ptz.pan_tilt_speed(0.0, 0.0));
+            }
+            if matches!(kind, 0 | 6) {
+                control_result(ptz.auto_focus());
+                control_result(ptz.focus(0.5));
+                control_result(ptz.focus_speed(0.0));
+            }
+            if matches!(kind, 0 | 7) {
+                control_result(ptz.white_balance_auto());
+                control_result(ptz.white_balance_indoor());
+                control_result(ptz.white_balance_outdoor());
+                control_result(ptz.white_balance_oneshot());
+                control_result(ptz.white_balance_manual(0.5, 0.5));
+                control_result(ptz.exposure_auto());
+                control_result(ptz.exposure_manual(0.5));
+                control_result(ptz.exposure_manual_detailed(1.0, 0.5, 0.5));
+            }
         }
-        1 => {
-            receiver.set_tally(Tally::new(
-                round.is_multiple_of(2),
-                !round.is_multiple_of(2),
-            ));
-            let metadata = MetadataFrame::new("<control-overlap/>").unwrap();
-            control_result(receiver.send_metadata(&metadata));
-            control_result(receiver.add_connection_metadata(&metadata));
-            control_result(receiver.clear_connection_metadata());
-            control_result(receiver.web_control_url());
+        1 | 8..=11 => {
+            if matches!(kind, 1 | 8) {
+                receiver.set_tally(Tally::new(
+                    round.is_multiple_of(2),
+                    !round.is_multiple_of(2),
+                ));
+            }
+            if matches!(kind, 1 | 9 | 10) {
+                let metadata = MetadataFrame::new("<control-overlap/>").unwrap();
+                if matches!(kind, 1 | 9) {
+                    control_result(receiver.send_metadata(&metadata));
+                }
+                if matches!(kind, 1 | 10) {
+                    control_result(receiver.add_connection_metadata(&metadata));
+                    control_result(receiver.clear_connection_metadata());
+                }
+            }
+            if matches!(kind, 1 | 11) {
+                control_result(receiver.web_control_url());
+            }
         }
-        _ => {
+        2 => {
             control_result(receiver.connection_stats());
             let _ = receiver.is_connected();
-            // The capability was selected once by the owner before spawning.
             // Older runtimes may lack the delay or keyframe families entirely.
             for result in [
                 receiver.set_video_delay(Duration::from_millis(round % 2)),
@@ -502,17 +541,27 @@ fn shared_controls<M: ReceiverMode>(receiver: &Receiver<M>, kind: usize, round: 
                 }
             }
         }
+        _ => unreachable!("unknown control fixture {kind}"),
     }
 }
 
-const CONTROL_FAMILIES: [&str; 3] = [
+const CONTROL_FAMILIES: [&str; 12] = [
     "PTZ",
     "tally/metadata/registration/web",
     "delay/statistics/keyframe",
+    "PTZ support query",
+    "PTZ presets",
+    "PTZ zoom/motion",
+    "PTZ focus",
+    "PTZ color/exposure",
+    "tally",
+    "upstream metadata",
+    "connection metadata registration",
+    "web control query",
 ];
 
 #[derive(Default)]
-struct ControlProgress([AtomicU64; 3]);
+struct ControlProgress([AtomicU64; CONTROL_FAMILIES.len()]);
 
 impl Drop for ControlProgress {
     fn drop(&mut self) {
@@ -545,7 +594,61 @@ fn shared_controls_capture_and_connect_complete_without_torn_frames() {
     shared_control_overlap(&[0, 1, 2]);
 }
 
+#[test]
+fn ptz_support_query_capture_and_connect_preserves_media() {
+    shared_control_overlap(&[3]);
+}
+
+#[test]
+fn ptz_presets_capture_and_connect_preserves_media() {
+    shared_control_overlap(&[4]);
+}
+
+#[test]
+fn ptz_zoom_and_motion_capture_and_connect_preserves_media() {
+    shared_control_overlap(&[5]);
+}
+
+#[test]
+fn ptz_focus_capture_and_connect_preserves_media() {
+    shared_control_overlap(&[6]);
+}
+
+#[test]
+fn ptz_color_and_exposure_capture_and_connect_preserves_media() {
+    shared_control_overlap(&[7]);
+}
+
+#[test]
+fn tally_capture_and_connect_preserves_media() {
+    shared_control_overlap(&[8]);
+}
+
+#[test]
+fn upstream_metadata_capture_and_connect_preserves_media() {
+    shared_control_overlap(&[9]);
+}
+
+#[test]
+fn connection_metadata_registration_capture_and_connect_preserves_media() {
+    shared_control_overlap(&[10]);
+}
+
+#[test]
+fn web_control_query_capture_and_connect_preserves_media() {
+    shared_control_overlap(&[11]);
+}
+
+#[test]
+fn established_media_controls_and_same_source_connect_preserve_progress() {
+    shared_control_overlap_with_start(&[0, 1, 2], true);
+}
+
 fn shared_control_overlap(kinds: &[usize]) {
+    shared_control_overlap_with_start(kinds, false);
+}
+
+fn shared_control_overlap_with_start(kinds: &[usize], controls_after_media: bool) {
     let Some(ndi) = common::ndi() else {
         return;
     };
@@ -554,6 +657,7 @@ fn shared_control_overlap(kinds: &[usize]) {
     let receiver = Receiver::new(&ndi, &ReceiverOptions::new(peers.sources[0].clone())).unwrap();
     let loans = Loans::default();
     let controls = ControlProgress::default();
+    let enabled = AtomicBool::new(!controls_after_media);
     eprintln!(
         "control overlap runtime {:?}; peers {:?}",
         ndi.info(),
@@ -563,10 +667,14 @@ fn shared_control_overlap(kinds: &[usize]) {
         thread::scope(|scope| {
             let _stop = Stop(stopped);
             for &kind in kinds {
-                let (receiver, controls) = (&receiver, &controls.0[kind]);
+                let (receiver, controls, enabled) = (&receiver, &controls.0[kind], &enabled);
                 scope.spawn(move || {
                     let mut round = 0;
                     while !stopped.load(Ordering::Acquire) {
+                        if !enabled.load(Ordering::Acquire) {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
                         timed("shared controls", Duration::ZERO, || {
                             shared_controls(receiver, kind, round)
                         });
@@ -615,6 +723,28 @@ fn shared_control_overlap(kinds: &[usize]) {
             }
             progress(&receiver);
             loans.wait_for_media(&ndi);
+            if controls_after_media {
+                // This separate case tests a settled input. The original cases
+                // continue issuing controls throughout initial establishment.
+                let deadline = Instant::now() + PATIENCE;
+                while loans.videos.load(Ordering::Relaxed) < 3
+                    || loans.audio.load(Ordering::Relaxed) < 3
+                {
+                    assert!(Instant::now() < deadline, "initial media did not continue");
+                    thread::sleep(Duration::from_millis(2));
+                }
+                enabled.store(true, Ordering::Release);
+                while kinds
+                    .iter()
+                    .any(|&kind| controls.0[kind].load(Ordering::Relaxed) == 0)
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "controls did not start on settled media"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
             storm(&receiver, &peers, stopped);
         });
     });
@@ -625,7 +755,10 @@ fn shared_control_overlap(kinds: &[usize]) {
             CONTROL_FAMILIES[kind]
         );
     }
-    if kinds.contains(&0) || kinds.contains(&1) {
+    if kinds
+        .iter()
+        .any(|kind| matches!(kind, 0 | 1 | 4..=7 | 9 | 10))
+    {
         assert!(upstream > 0, "source handled no upstream controls");
     }
     loans.balanced(&ndi);
