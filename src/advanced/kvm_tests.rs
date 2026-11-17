@@ -169,9 +169,9 @@ impl InputSender for TestSender {
         crate::sys::table::for_test(accepted, operation).performed()
     }
 
-    fn touch(&self, connection: &Control<'_>, count: i32, points: &[[f32; 2]]) -> Result<()> {
-        // SAFETY: HeldInputs lends this validated count of initialized pairs.
-        let accepted = unsafe { touch(connection.instance(), count, points.as_ptr().cast()) };
+    fn touch(&self, connection: &Control<'_>, points: TouchPoints<'_>) -> Result<()> {
+        // SAFETY: TouchPoints lends its exact validated count of initialized pairs.
+        let accepted = unsafe { touch(connection.instance(), points.count(), points.as_ptr()) };
         crate::sys::table::for_test(accepted, c"NDIlib_recv_kvm_send_touch_positions").performed()
     }
 
@@ -370,4 +370,16 @@ fn every_held_input_combination_retries_only_failed_releases() {
             });
         }
     }
+}
+
+#[test]
+fn touch_points_carry_their_count() {
+    let coordinates = [[0.0, 1.0], [0.25, 0.5], [1.0, 0.0]];
+    let points = TouchPoints::new(&coordinates).unwrap().unwrap();
+    assert_eq!(points.count(), 3);
+    // SAFETY: TouchPoints pairs its exact count with this initialized slice.
+    let scalars =
+        unsafe { std::slice::from_raw_parts(points.as_ptr(), points.count() as usize * 2) };
+    assert_eq!(scalars, &[0.0, 1.0, 0.25, 0.5, 1.0, 0.0]);
+    assert!(TouchPoints::new(&[]).unwrap().is_none());
 }

@@ -43,11 +43,44 @@ struct HeldInputs {
     touching: bool,
 }
 
+/// Nonempty validated coordinates with the exact count the SDK may read.
+#[cfg(any(test, ndi_has_advanced_kvm, ndi_test_receiver_proofs))]
+struct TouchPoints<'a> {
+    points: &'a [[f32; 2]],
+    count: i32,
+}
+
+#[cfg(any(test, ndi_has_advanced_kvm, ndi_test_receiver_proofs))]
+impl<'a> TouchPoints<'a> {
+    fn new(points: &'a [[f32; 2]]) -> Result<Option<Self>> {
+        if points.is_empty() {
+            return Ok(None);
+        }
+        let count = i32::try_from(points.len()).map_err(|_| {
+            invalid_input(crate::InputDefect::KvmTouchCount {
+                count: points.len(),
+            })
+        })?;
+        for [x, y] in points {
+            validate_position(*x, *y)?;
+        }
+        Ok(Some(Self { points, count }))
+    }
+
+    fn count(&self) -> i32 {
+        self.count
+    }
+
+    fn as_ptr(&self) -> *const f32 {
+        self.points.as_ptr().cast()
+    }
+}
+
 #[cfg(any(test, ndi_has_advanced_kvm, ndi_test_receiver_proofs))]
 trait InputSender {
     fn key(&self, connection: &Control<'_>, key: i32, down: bool) -> Result<()>;
     fn mouse(&self, connection: &Control<'_>, button: MouseButton, down: bool) -> Result<()>;
-    fn touch(&self, connection: &Control<'_>, count: i32, points: &[[f32; 2]]) -> Result<()>;
+    fn touch(&self, connection: &Control<'_>, points: TouchPoints<'_>) -> Result<()>;
     fn finish_touch(&self, connection: &Control<'_>) -> Result<()>;
 }
 
@@ -91,18 +124,10 @@ impl HeldInputs {
         sender: &impl InputSender,
         points: &[[f32; 2]],
     ) -> Result<()> {
-        if points.is_empty() {
+        let Some(points) = TouchPoints::new(points)? else {
             return self.finish_touch(connection, sender);
-        }
-        let count = i32::try_from(points.len()).map_err(|_| {
-            invalid_input(crate::InputDefect::KvmTouchCount {
-                count: points.len(),
-            })
-        })?;
-        for [x, y] in points {
-            validate_position(*x, *y)?;
-        }
-        sender.touch(connection, count, points)?;
+        };
+        sender.touch(connection, points)?;
         self.touching = true;
         Ok(())
     }
@@ -257,10 +282,10 @@ impl InputSender for Kvm {
         }
     }
 
-    fn touch(&self, connection: &Control<'_>, count: i32, points: &[[f32; 2]]) -> Result<()> {
-        // HeldInputs validated `count` and all coordinates; the slice lends
-        // that many consecutive coordinate pairs through this native call.
-        kvm_send!(table self, connection, NDIlib_recv_kvm_send_touch_positions, count, points.as_ptr().cast())
+    fn touch(&self, connection: &Control<'_>, points: TouchPoints<'_>) -> Result<()> {
+        // TouchPoints carries validated coordinates and their exact SDK count;
+        // its borrowed slice remains valid through the synchronous call.
+        kvm_send!(table self, connection, NDIlib_recv_kvm_send_touch_positions, points.count(), points.as_ptr())
     }
 
     fn finish_touch(&self, connection: &Control<'_>) -> Result<()> {
