@@ -52,8 +52,8 @@ use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::{
     capture::{
-        capture_any, capture_raw, AllSlots, AudioKind, CaptureKind, CaptureResult, CaptureStrategy,
-        Delivered, Media, MetadataKind, NoSlots, Notification, SlotSet, VideoKind,
+        capture_any, AllSlots, AudioKind, CaptureKind, CaptureStrategy, Delivered, Media,
+        MetadataKind, NoSlots, Notification, Only, SlotSet, VideoKind,
     },
     connection_metadata::ConnectionMetadata,
     finder::{RawSource, Source},
@@ -2115,10 +2115,10 @@ impl ReceiverCore {
     /// notification it returned instead is kept for [`Receiver::next_event`].
     fn poll_ref_until<K: CaptureKind>(&self, attempt: Attempt) -> Result<Retry<K::Ref<'_>>> {
         let lock = self.capture_lock(attempt);
-        let result = capture_raw::<K>(&lock)?;
+        let result = capture_any::<Only<K>>(&lock)?;
         // Classify the result itself, rather than inspecting pending events:
         // another consumer may take a retained event concurrently.
-        let progress = matches!(result, CaptureResult::Notification(n) if n != Notification::None);
+        let progress = matches!(result, Delivered::Notification(n) if n != Notification::None);
         Ok(match self.capture_result::<K>(result)? {
             Some(frame) => Retry::Item(frame),
             None if progress => Retry::Progress,
@@ -2128,15 +2128,15 @@ impl ReceiverCore {
 
     fn capture_result<'rx, K: CaptureKind>(
         &'rx self,
-        result: CaptureResult<'rx, K>,
+        result: Delivered<'rx, Only<K>>,
     ) -> Result<Option<K::Ref<'rx>>> {
         match result {
-            CaptureResult::Frame(guard) => {
+            Delivered::Media(guard) => {
                 // Validation (e.g. FourCC) happens during ref construction.
                 let frame_ref = K::make_ref(guard)?;
                 Ok(Some(frame_ref))
             }
-            CaptureResult::Notification(notification) => {
+            Delivered::Notification(notification) => {
                 self.retain(notification);
                 Ok(None)
             }
@@ -3136,7 +3136,7 @@ mod tests {
         fn check<K: CaptureKind>(receiver: &Receiver) {
             assert!(receiver
                 .core
-                .capture_result::<K>(CaptureResult::Notification(Notification::SourceChanged))
+                .capture_result::<K>(Delivered::Notification(Notification::SourceChanged))
                 .unwrap()
                 .is_none());
             assert!(matches!(
@@ -3926,7 +3926,7 @@ mod tests {
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         receiver
             .core
-            .capture_result::<VideoKind>(CaptureResult::Notification(Notification::Unknown(987)))
+            .capture_result::<VideoKind>(Delivered::Notification(Notification::Unknown(987)))
             .unwrap();
         let barrier = std::sync::Barrier::new(3);
         std::thread::scope(|scope| {

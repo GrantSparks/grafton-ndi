@@ -18,9 +18,9 @@
 //!   the SDK capture call and its frame-type discriminant, wrapping and
 //!   freeing the matching raw frame family. The capture itself is made only through
 //!   a [`CaptureLock`], which fixes the receiver, runtime and remaining wait
-//!   after the mode's permissions have been checked. [`capture_raw`]
-//!   (one kind) and `capture_any` (a sealed set of all media slots or none)
-//!   both go through `Captured`. A delivered frame becomes a guard through
+//!   after the mode's permissions have been checked. `capture_any` selects
+//!   a sealed set of one kind, all media slots or none, and every set goes
+//!   through `Captured`. A delivered frame becomes a guard through
 //!   `Captured::take`, the one place a receiver guard is made. Mixed and
 //!   notification-only capture share a receiver kernel that handles every
 //!   notification before the caller can convert media.
@@ -57,6 +57,7 @@ mod sealed {
     impl Sealed for super::FrameSyncAudioFree {}
     #[cfg(feature = "advanced")]
     impl Sealed for super::AvSyncAudioFree {}
+    impl<K: super::CaptureKind> Sealed for super::Only<K> {}
     impl Sealed for super::AllSlots {}
     impl Sealed for super::NoSlots {}
 }
@@ -576,15 +577,6 @@ impl<'owner, S: FrameFree> Drop for Guard<'owner, S> {
     }
 }
 
-/// Result of a generic capture operation: the frame `NDIlib_recv_capture_v3`
-/// was asked for, or what it reported instead.
-pub(crate) enum CaptureResult<'rx, K: CaptureKind> {
-    /// Successfully captured a frame of the expected type.
-    Frame(Guard<'rx, K>),
-    /// No frame for the caller; see [`Notification`].
-    Notification(Notification),
-}
-
 /// What `NDIlib_recv_capture_v3` reports in place of a frame the caller asked
 /// for. None of these carries a frame buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -727,22 +719,6 @@ impl<'rx> Captured<'rx> {
     }
 }
 
-/// Capture a frame of kind `K` from the receiver and within the remaining
-/// attempt identified by the [`CaptureLock`] proof `lock`.
-///
-/// Gives `NDIlib_recv_capture_v3` the slot of kind `K` alone; any other
-/// result is classified by [`Notification::classify`]. The frame's guard
-/// borrows the receiver for `'rx`, as the proof does, and can outlive the proof.
-pub(crate) fn capture_raw<'rx, K: CaptureKind>(
-    lock: &CaptureLock<'rx>,
-) -> Result<CaptureResult<'rx, K>> {
-    let mut captured = Captured::capture(lock, Slots::only::<K>());
-    match captured.take::<K>() {
-        Some(guard) => Ok(CaptureResult::Frame(guard)),
-        None => captured.notification().map(CaptureResult::Notification),
-    }
-}
-
 /// A media frame delivered by a capture with all three media slots. A
 /// consumer of this type cannot receive or discard a native notification.
 pub(crate) enum Media<'rx> {
@@ -755,12 +731,28 @@ pub(crate) enum Media<'rx> {
 }
 
 /// A sealed set of media slots, paired with exactly the media it can deliver.
-/// Only [`AllSlots`] and [`NoSlots`] implement it, so every descriptor given
-/// to the SDK is taken and guarded when the SDK reports its frame kind.
+/// Only [`Only`], [`AllSlots`] and [`NoSlots`] implement it, so every
+/// descriptor given to the SDK is taken and guarded when the SDK reports its
+/// frame kind.
 pub(crate) trait SlotSet: sealed::Sealed + Sized {
     type Media<'rx>;
 
     fn capture<'rx>(lock: &CaptureLock<'rx>) -> Result<Delivered<'rx, Self>>;
+}
+
+/// Capture one media kind and notifications, giving the SDK only that kind's slot.
+pub(crate) struct Only<K: CaptureKind>(PhantomData<K>);
+
+impl<K: CaptureKind> SlotSet for Only<K> {
+    type Media<'rx> = Guard<'rx, K>;
+
+    fn capture<'rx>(lock: &CaptureLock<'rx>) -> Result<Delivered<'rx, Self>> {
+        let mut captured = Captured::capture(lock, Slots::only::<K>());
+        match captured.take::<K>() {
+            Some(guard) => Ok(Delivered::Media(guard)),
+            None => captured.notification().map(Delivered::Notification),
+        }
+    }
 }
 
 /// Capture video, audio, metadata and notifications.
@@ -809,9 +801,9 @@ pub(crate) enum Delivered<'rx, S: SlotSet> {
 /// Capture with slot set `S` from the receiver and within the remaining
 /// attempt identified by the [`CaptureLock`] proof `lock`.
 ///
-/// Any delivered media is wrapped in the guard of its kind, as
-/// [`capture_raw`] does for one kind; any other result is classified by
-/// [`Notification::classify`]. Every slot set goes through [`Captured`].
+/// Any delivered media is wrapped in the guard of its kind; any other result
+/// is classified by [`Notification::classify`]. Every slot set goes through
+/// [`Captured`].
 ///
 /// # Errors
 ///
