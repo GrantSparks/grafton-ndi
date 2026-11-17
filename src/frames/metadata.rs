@@ -455,6 +455,13 @@ impl Default for OwnedFrameMetadata {
 }
 
 impl OwnedFrameMetadata {
+    pub(super) fn into_supplied_text(self) -> Option<String> {
+        match self {
+            Self::Text(text) => Some(text.into_string()),
+            Self::Absent(_) | Self::Withheld { .. } => None,
+        }
+    }
+
     pub(crate) fn new(metadata: impl Into<String>) -> std::result::Result<Self, Rejected<String>> {
         Ok(Self::Text(TerminatedText::new(metadata)?))
     }

@@ -19,7 +19,7 @@ use crate::{
     },
     framesync::{AudioInputFormat, FrameSyncAudioRef, FrameSyncVideoRef},
     media::SdkQuantity,
-    pixels::Pixels,
+    pixels::{AudioCopy, PackedStorage, PackedVideo, VideoCopy},
     sys::{self, bindings::*},
     Error, FourCc, FrameRate, PictureAspectRatio, Rejected, Result, SdkTimestamp, Timecode,
 };
@@ -714,7 +714,7 @@ impl VideoHeader {
 /// counts towards that room.
 /// Copying, views and descriptors are non-overridable helpers.
 pub(crate) unsafe trait VideoParts {
-    /// The validated layout of the frame's pixels.
+    /// The validated layout of the frame's pixels; stable for the borrow.
     fn layout(&self) -> &ValidatedVideoLayout;
 
     /// The validated header.
@@ -848,123 +848,35 @@ pub(crate) trait VideoPartsExt: VideoParts {
         unsafe { self.layout().view_data(self.pixels()) }
     }
 
-    /// Copy the frame into a new owned frame: one pixel allocation, and one
-    /// metadata allocation when there is metadata.
+    /// Copy active pixels using a single snapshot of the source layout.
     fn owned_copy(&self) -> VideoFrame {
-        let packed = self.layout().packed();
+        let header = *self.header();
         let metadata = OwnedFrameMetadata::copied(self.frame_metadata());
-        let room = crate::pixels::send_room(&packed, self.header().scan_type);
-        packed_video(
-            self,
-            Pixels::with_room(packed.data_len_bytes(), room),
-            metadata,
-        )
-    }
-
-    /// Copy the frame into `destination`, reusing its pixel and metadata
-    /// allocations.
-    ///
-    /// `destination` becomes exactly the frame [`Self::owned_copy`] returns,
-    /// whatever it held before. Its pixel buffer is reused when its capacity
-    /// holds the packed frame and its scan-dependent SDK
-    /// [room](PixelFormat::send_tail_room), and otherwise replaced without
-    /// copying its old contents; its metadata string is reused as
-    /// [`OwnedFrameMetadata::copy_from`] describes.
-    ///
-    /// Any allocation happens while `destination` is still a whole frame.
-    /// If the packed-copy check panics, its previous layout still covers its
-    /// storage; pixel contents are unspecified, and its SDK room stays zero.
-    fn copy_into_owned(&self, destination: &mut VideoFrame) {
-        let packed = self.layout().packed();
-        let len = packed.data_len_bytes();
-        let room = crate::pixels::send_room(&packed, self.header().scan_type);
-        let replacement =
-            (!destination.data.holds(len, room)).then(|| Pixels::with_room(len, room));
-        destination.metadata.copy_from(self.frame_metadata());
-        if let Some(data) = replacement {
-            let frame = packed_video(self, data, OwnedFrameMetadata::default());
-            *destination = VideoFrame {
-                metadata: std::mem::take(&mut destination.metadata),
-                ..frame
-            };
-        } else {
-            let VideoFrame {
-                layout,
-                header,
-                data,
-                metadata: _,
-                timestamp,
-            } = destination;
-            let copied = self.copy_active_pixels(data);
-            *layout = *copied.layout();
-            *header = *copied.header();
-            *timestamp = copied.sdk_timestamp();
-        }
-    }
-
-    /// Fill packed rows and SDK tail room derived only from this frame.
-    fn copy_active_pixels<'a>(&'a self, data: &'a mut Pixels) -> PackedVideo<'a> {
-        let layout = self.layout().packed();
-        // Read every accessor before changing reused storage, so an accessor
-        // panic cannot leave the destination's old layout over a shorter copy.
-        let header = self.header();
-        let metadata = self.frame_metadata();
         let timestamp = self.sdk_timestamp();
-        let room = crate::pixels::send_room(&layout, header.scan_type);
-        data.fill(layout.data_len_bytes(), room, |bytes| {
-            for plane in self.plane_views() {
-                match plane.data() {
-                    Some(active) => bytes.extend_from_slice(active),
-                    None => plane.rows().for_each(|row| bytes.extend_from_slice(row)),
-                }
-            }
-        });
-        PackedVideo {
-            layout,
-            pixels: data,
+        let data = PackedStorage::copied(VideoCopy::new(self, header.scan_type));
+        VideoFrame {
+            data,
             header,
             metadata,
             timestamp,
         }
     }
+
+    /// Copy pixels and metadata, reusing their allocations when sufficient.
+    /// The storage kernel preserves the previous layout/storage pairing on unwind.
+    fn copy_into_owned(&self, destination: &mut VideoFrame) {
+        let header = *self.header();
+        let timestamp = self.sdk_timestamp();
+        destination.metadata.copy_from(self.frame_metadata());
+        destination
+            .data
+            .refill_from(VideoCopy::new(self, header.scan_type));
+        destination.header = header;
+        destination.timestamp = timestamp;
+    }
 }
 
 impl<T: VideoParts + ?Sized> VideoPartsExt for T {}
-
-/// The exact packed storage initialized by `copy_active_pixels`.
-pub(crate) struct PackedVideo<'a> {
-    layout: ValidatedVideoLayout,
-    pixels: &'a Pixels,
-    header: &'a VideoHeader,
-    metadata: FrameMetadataRef<'a>,
-    timestamp: Option<SdkTimestamp>,
-}
-
-// SAFETY: only the copy kernel constructs this view, after filling its own
-// computed layout and zeroed tail. Pixels::as_ptr derives from the owning Vec,
-// covering the complete allocation, tail included. Other fields borrow the source.
-unsafe impl VideoParts for PackedVideo<'_> {
-    fn layout(&self) -> &ValidatedVideoLayout {
-        &self.layout
-    }
-    fn header(&self) -> &VideoHeader {
-        self.header
-    }
-    fn pixels(&self) -> *const u8 {
-        self.pixels.as_ptr()
-    }
-    fn frame_metadata(&self) -> FrameMetadataRef<'_> {
-        self.metadata
-    }
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
-        self.timestamp
-    }
-    fn initialized(&self) -> Initialized {
-        Initialized::Storage {
-            room_after: self.pixels.room(),
-        }
-    }
-}
 
 /// A validated uncompressed video input for synchronous sending and owned copies.
 ///
@@ -1069,29 +981,6 @@ pub trait VideoSource: VideoParts {
         &self,
         options: &crate::image_encoding::ImageOptions,
     ) -> Result<String>;
-}
-
-/// The owned copy of `source`: `packed`, its packed layout, with `data`,
-/// which holds `packed` and its scan-dependent [room](PixelFormat::send_tail_room),
-/// filled with every plane's active rows. Every owned video copy is made
-/// here. A failed packed-copy check restores the storage's previous length
-/// and zeroed SDK room before unwinding.
-fn packed_video<P: VideoParts + ?Sized>(
-    source: &P,
-    mut data: Pixels,
-    metadata: OwnedFrameMetadata,
-) -> VideoFrame {
-    let packed = source.copy_active_pixels(&mut data);
-    let layout = *packed.layout();
-    let header = *packed.header();
-    let timestamp = packed.sdk_timestamp();
-    VideoFrame {
-        layout,
-        header,
-        data,
-        metadata,
-        timestamp,
-    }
 }
 
 // One accessor list defines the inherent surface and the sealed trait impl.
@@ -1503,10 +1392,9 @@ pub(crate) use video_accessors;
 /// sending requires no pixel copy or allocation growth.
 #[derive(Clone)]
 pub struct VideoFrame {
-    layout: ValidatedVideoLayout,
     header: VideoHeader,
-    /// The pixels, followed by the room required by the layout and scan type.
-    data: Pixels,
+    /// The layout and pixels, followed by their scan-dependent SDK room.
+    data: PackedStorage<ValidatedVideoLayout>,
     metadata: OwnedFrameMetadata,
     timestamp: Option<SdkTimestamp>,
 }
@@ -1519,7 +1407,7 @@ pub struct VideoFrame {
 unsafe impl VideoParts for VideoFrame {
     #[inline]
     fn layout(&self) -> &ValidatedVideoLayout {
-        &self.layout
+        self.data.layout()
     }
     #[inline]
     fn header(&self) -> &VideoHeader {
@@ -1644,7 +1532,7 @@ impl VideoFrame {
     /// among scan types allocates at most once after construction.
     pub fn set_scan_type(&mut self, scan_type: ScanType) {
         self.data
-            .reserve_room(crate::pixels::send_room(&self.layout, scan_type));
+            .reserve_tail(crate::pixels::send_room(self.data.layout(), scan_type));
         self.header.scan_type = scan_type;
     }
 
@@ -1678,14 +1566,10 @@ impl VideoFrame {
     /// Returns `data` unchanged with [`Error::InvalidFrame`] when its length
     /// differs from the validated layout. The frame is unchanged.
     pub fn swap_data(&mut self, data: Vec<u8>) -> std::result::Result<Vec<u8>, Rejected<Vec<u8>>> {
-        if let Err(error) = check_video_data_len(&self.layout, data.len()) {
-            return Err(Rejected::new(error, data));
-        }
-        let replacement = Pixels::adopt(
+        self.data.swap(
             data,
-            crate::pixels::send_room(&self.layout, self.header.scan_type),
-        );
-        Ok(std::mem::replace(&mut self.data, replacement).into_vec())
+            crate::pixels::send_room(self.data.layout(), self.header.scan_type),
+        )
     }
 
     /// Get mutable access to the frame data without changing the validated
@@ -1704,7 +1588,8 @@ impl VideoFrame {
     /// Deliberately omit the owned-send room to exercise loan-boundary repair.
     #[cfg(test)]
     pub(crate) fn without_send_room_for_test(mut self) -> Self {
-        self.data = Pixels::adopt(self.data.as_slice().to_vec(), 0);
+        self.data =
+            PackedStorage::adopt(*self.data.layout(), self.data.as_slice().to_vec(), 0).unwrap();
         self
     }
 
@@ -1785,17 +1670,18 @@ impl VideoFrame {
                 .unwrap();
         assert_eq!(data.len(), layout.data_len_bytes());
         Self {
-            layout,
             header: VideoHeader::new(
                 FrameRate::new(60, 1).unwrap(),
                 PictureAspectRatio::SQUARE_PIXELS,
                 ScanType::Progressive,
                 Timecode::from_ticks(0),
             ),
-            data: Pixels::adopt(
+            data: PackedStorage::adopt(
+                layout,
                 data,
                 crate::pixels::send_room(&layout, ScanType::Progressive),
-            ),
+            )
+            .unwrap(),
             metadata: metadata
                 .map(|text| OwnedFrameMetadata::new(text).unwrap())
                 .unwrap_or_default(),
@@ -1990,7 +1876,7 @@ impl VideoFrameBuilder {
                 None,
             )?;
             if let Some(data) = &self.data {
-                check_video_data_len(&layout, data.len())?;
+                PackedStorage::check_len(layout, data.len())?;
             }
             // The last fallible check transfers metadata only on success,
             // preserving the complete builder on every rejected input.
@@ -2002,13 +1888,20 @@ impl VideoFrameBuilder {
             Err(error) => return Err(Rejected::new(error, self)),
         };
         let room = crate::pixels::send_room(&layout, self.scan_type);
-        let data = match self.data {
-            Some(data) => Pixels::adopt(data, room),
-            None => Pixels::zeroed(layout.data_len_bytes(), room),
+        let data = match self.data.take() {
+            Some(data) => match PackedStorage::adopt(layout, data, room) {
+                Ok(data) => data,
+                Err(rejected) => {
+                    let (error, data) = rejected.into_parts();
+                    self.data = Some(data);
+                    self.metadata = metadata.into_supplied_text();
+                    return Err(Rejected::new(error, self));
+                }
+            },
+            None => PackedStorage::zeroed(layout, room),
         };
 
         Ok(VideoFrame {
-            layout,
             header: VideoHeader::new(
                 self.frame_rate,
                 picture_aspect_ratio,
@@ -2042,7 +1935,7 @@ impl VideoFrameBuilder {
 /// must remain a bounded NUL-terminated UTF-8 string for the borrow.
 /// Views, copying and descriptors are non-overridable helpers.
 pub(crate) unsafe trait AudioParts {
-    /// The validated layout of the frame's samples.
+    /// The validated layout of the frame's samples; stable for the borrow.
     fn layout(&self) -> &ValidatedAudioLayout;
 
     /// The frame's timecode.
@@ -2104,49 +1997,29 @@ pub(crate) trait AudioPartsExt: AudioParts {
         unsafe { self.layout().view_samples(self.samples()) }
     }
 
-    /// Copy the frame into a new owned frame: one sample allocation, and one
-    /// metadata allocation when there is metadata.
+    /// Copy active samples using a single snapshot of the source layout.
     fn owned_copy(&self) -> AudioFrame {
-        let packed = self.layout().packed();
+        let timecode = self.audio_timecode();
+        let timestamp = self.sdk_timestamp();
         let metadata = OwnedFrameMetadata::copied(self.frame_metadata());
-        packed_audio(self, Vec::with_capacity(packed.sample_count), metadata)
+        let data = PackedStorage::copied(AudioCopy::new(self));
+        AudioFrame {
+            data,
+            timecode,
+            metadata,
+            timestamp,
+        }
     }
 
-    /// Copy the frame into `destination`, reusing its sample and metadata
-    /// allocations.
-    ///
-    /// `destination` becomes exactly the frame [`Self::owned_copy`] returns,
-    /// whatever it held before. Its sample buffer is reused when its capacity
-    /// holds the packed samples, and otherwise replaced without copying its
-    /// old contents; its metadata string is reused as
-    /// [`OwnedFrameMetadata::copy_from`] describes. As for video, any allocation
-    /// happens while `destination` is still a whole frame. If the packed-copy
-    /// check panics, its previous layout still covers initialized storage;
-    /// sample contents are unspecified.
+    /// Copy samples and metadata, reusing their allocations when sufficient.
+    /// The storage kernel preserves the previous layout/storage pairing on unwind.
     fn copy_into_owned(&self, destination: &mut AudioFrame) {
-        let packed = self.layout().packed();
-        let len = packed.sample_count();
-        let replacement = (destination.data.capacity() < len).then(|| Vec::with_capacity(len));
+        let timecode = self.audio_timecode();
+        let timestamp = self.sdk_timestamp();
         destination.metadata.copy_from(self.frame_metadata());
-        if let Some(data) = replacement {
-            let frame = packed_audio(self, data, OwnedFrameMetadata::default());
-            *destination = AudioFrame {
-                metadata: std::mem::take(&mut destination.metadata),
-                ..frame
-            };
-        } else {
-            let AudioFrame {
-                layout,
-                timecode,
-                data,
-                metadata: _,
-                timestamp,
-            } = destination;
-            let copied = copy_audio_samples(self, data);
-            *layout = copied;
-            *timecode = self.audio_timecode();
-            *timestamp = self.sdk_timestamp();
-        }
+        destination.data.refill_from(AudioCopy::new(self));
+        destination.timecode = timecode;
+        destination.timestamp = timestamp;
     }
 }
 
@@ -2390,45 +2263,6 @@ impl<'buf> BorrowedAudioFrameBuilder<'buf> {
     }
 }
 
-/// Fill exactly the packed samples derived from `source`, restoring the
-/// previous initialized length if filling or its check panics.
-fn copy_audio_samples<P: AudioParts + ?Sized>(
-    source: &P,
-    data: &mut Vec<f32>,
-) -> ValidatedAudioLayout {
-    let packed = source.layout().packed();
-    crate::pixels::refill(
-        data,
-        packed.sample_count(),
-        0.0,
-        |_| {},
-        |data| {
-            // The views read channel samples only, never inter-channel padding.
-            for samples in source.channel_views() {
-                data.extend_from_slice(samples);
-            }
-        },
-    );
-    packed
-}
-
-/// The owned copy of `source`, with its own packed layout checked against the
-/// initialized samples before an owned frame is constructed.
-fn packed_audio<P: AudioParts + ?Sized>(
-    source: &P,
-    mut data: Vec<f32>,
-    metadata: OwnedFrameMetadata,
-) -> AudioFrame {
-    let layout = copy_audio_samples(source, &mut data);
-    AudioFrame {
-        layout,
-        timecode: source.audio_timecode(),
-        data,
-        metadata,
-        timestamp: source.sdk_timestamp(),
-    }
-}
-
 /// Generate an audio frame type's shared public accessors and its `Debug`
 /// from its [`AudioParts`], so that each accessor is written, and
 /// documented, once. Every generated method delegates to the frame's
@@ -2614,20 +2448,19 @@ audio_accessors! {
 /// received text was withheld.
 #[derive(Clone)]
 pub struct AudioFrame {
-    layout: ValidatedAudioLayout,
     timecode: Timecode,
-    data: Vec<f32>,
+    data: PackedStorage<ValidatedAudioLayout>,
     metadata: OwnedFrameMetadata,
     timestamp: Option<SdkTimestamp>,
 }
 
-// SAFETY: The owned f32 vector covers and initializes the packed layout;
+// SAFETY: PackedStorage privately pairs its layout with initialized samples;
 // OwnedFrameMetadata owns bounded terminated text. Both stay unchanged for the
 // borrow, and the default descriptor addresses only those live allocations.
 unsafe impl AudioParts for AudioFrame {
     #[inline]
     fn layout(&self) -> &ValidatedAudioLayout {
-        &self.layout
+        self.data.layout()
     }
     #[inline]
     fn audio_timecode(&self) -> Timecode {
@@ -2668,7 +2501,7 @@ audio_accessors! {
         /// Get tightly packed planar audio as 32-bit floats.
         /// Each channel's samples are contiguous; channels follow one another.
     } {
-        &self.data
+        self.data.as_slice()
     }
     to_owned(self) {
         /// Copy this frame, its readable metadata and its metadata status into
@@ -2692,11 +2525,16 @@ impl AudioFrame {
     /// SDK timestamp is `None`. Use [`Self::set_metadata`] to attach metadata.
     pub fn from_interleaved(source: &crate::audio_conversion::InterleavedAudioF32<'_>) -> Self {
         let mut frame = Self::from_validated_silence(source.layout(), source.timecode());
-        let channels = frame.layout.no_channels();
-        let samples = frame.layout.no_samples();
+        let channels = frame.data.layout().no_channels();
+        let samples = frame.data.layout().no_samples();
         // The input's validated shape proves it contains exactly `samples`
         // groups of `channels` initialized interleaved values.
-        for (channel, output) in frame.data.chunks_exact_mut(samples).enumerate() {
+        for (channel, output) in frame
+            .data
+            .as_mut_slice()
+            .chunks_exact_mut(samples)
+            .enumerate()
+        {
             for (destination, &sample) in output
                 .iter_mut()
                 .zip(source.data()[channel..].iter().step_by(channels))
@@ -2712,9 +2550,8 @@ impl AudioFrame {
     pub(crate) fn from_validated_silence(layout: ValidatedAudioLayout, timecode: Timecode) -> Self {
         let layout = layout.packed();
         Self {
-            layout,
             timecode,
-            data: vec![0.0; layout.sample_count()],
+            data: PackedStorage::zeroed(layout, 0),
             metadata: OwnedFrameMetadata::default(),
             timestamp: None,
         }
@@ -2753,7 +2590,7 @@ impl AudioFrame {
 
     /// Recover tightly packed planar samples, retaining their allocation and capacity.
     pub fn into_data(self) -> Vec<f32> {
-        self.data
+        self.data.into_vec()
     }
 
     /// Replace samples and return the previous vector for allocation reuse.
@@ -2766,15 +2603,12 @@ impl AudioFrame {
         &mut self,
         data: Vec<f32>,
     ) -> std::result::Result<Vec<f32>, Rejected<Vec<f32>>> {
-        if let Err(error) = check_audio_data_len(&self.layout, data.len()) {
-            return Err(Rejected::new(error, data));
-        }
-        Ok(std::mem::replace(&mut self.data, data))
+        self.data.swap(data, 0)
     }
 
     /// Get mutable audio sample data without changing the validated layout.
     pub fn data_mut(&mut self) -> &mut [f32] {
-        &mut self.data
+        self.data.as_mut_slice()
     }
 
     /// Replace the owned audio data while preserving the validated layout.
@@ -2816,8 +2650,8 @@ impl AudioFrame {
 
     /// Get mutable samples for one channel without allocating.
     pub fn channel_data_mut(&mut self, channel: usize) -> Option<&mut [f32]> {
-        let range = self.layout.channel_range(channel)?;
-        Some(&mut self.data[range])
+        let range = self.data.layout().channel_range(channel)?;
+        Some(&mut self.data.as_mut_slice()[range])
     }
 }
 
@@ -2965,7 +2799,7 @@ impl AudioFrameBuilder {
                 AudioFormat::Fltp,
             )?;
             if let Some(data) = &self.data {
-                check_audio_data_len(&layout, data.len())?;
+                PackedStorage::check_len(layout, data.len())?;
             }
             // Transfer metadata only after every rejection check, before
             // changing sample storage.
@@ -2976,12 +2810,20 @@ impl AudioFrameBuilder {
             Ok(parts) => parts,
             Err(error) => return Err(Rejected::new(error, self)),
         };
-        let sample_count = audio_layout.sample_count;
-
-        let data = self.data.unwrap_or_else(|| vec![0.0; sample_count]);
+        let data = match self.data.take() {
+            Some(data) => match PackedStorage::adopt(audio_layout, data, 0) {
+                Ok(data) => data,
+                Err(rejected) => {
+                    let (error, data) = rejected.into_parts();
+                    self.data = Some(data);
+                    self.metadata = metadata.into_supplied_text();
+                    return Err(Rejected::new(error, self));
+                }
+            },
+            None => PackedStorage::zeroed(audio_layout, 0),
+        };
 
         Ok(AudioFrame {
-            layout: audio_layout,
             timecode: self.timecode,
             data,
             metadata,
@@ -3384,9 +3226,12 @@ impl<F: VideoParts> Sendable<F> {
         }
     }
 
-    pub(crate) fn packed<'a>(&'a self, pixels: &'a mut Pixels) -> Sendable<PackedVideo<'a>> {
+    pub(crate) fn packed<'a>(
+        &'a self,
+        pixels: &'a mut Option<PackedStorage<ValidatedVideoLayout>>,
+    ) -> Sendable<PackedVideo<'a>> {
         Sendable {
-            frame: self.frame.copy_active_pixels(pixels),
+            frame: crate::pixels::stage_video(&self.frame, pixels),
             _planar444: self._planar444,
         }
     }
@@ -3422,8 +3267,8 @@ impl Sendable<VideoFrame> {
     /// comparison in `reserve_room` and never grows the allocation.
     pub(crate) fn owned_video_descriptor(&mut self) -> NDIlib_video_frame_v2_t {
         let frame = &mut self.frame;
-        frame.data.reserve_room(crate::pixels::send_room(
-            &frame.layout,
+        frame.data.reserve_tail(crate::pixels::send_room(
+            frame.data.layout(),
             frame.header.scan_type,
         ));
         self.video_descriptor()
@@ -3677,7 +3522,7 @@ impl ValidatedVideoLayout {
     /// # Safety
     ///
     /// As for [`Self::view_plane`].
-    unsafe fn view_planes<'a>(&'a self, data: *const u8) -> VideoPlanes<'a> {
+    pub(crate) unsafe fn view_planes<'a>(&'a self, data: *const u8) -> VideoPlanes<'a> {
         VideoPlanes {
             data,
             layouts: self.planes().iter(),
@@ -3811,17 +3656,6 @@ fn validate_video_width(width: i64) -> LayoutResult<()> {
         return Err(crate::LayoutDefect::VideoOddWidth(width.into()));
     }
 
-    Ok(())
-}
-
-/// Require supplied pixels to fill `layout` exactly.
-fn check_video_data_len(layout: &ValidatedVideoLayout, len: usize) -> Result<()> {
-    if len != layout.data_len_bytes() {
-        return Err(Error::InvalidFrame(crate::FrameDefect::VideoDataLength {
-            actual: len,
-            expected: layout.data_len_bytes(),
-        }));
-    }
     Ok(())
 }
 
@@ -4327,7 +4161,7 @@ impl ValidatedAudioLayout {
     /// # Safety
     ///
     /// As for [`Self::channel`].
-    unsafe fn channels<'a>(self, data: *const f32) -> AudioChannels<'a> {
+    pub(crate) unsafe fn channels<'a>(self, data: *const f32) -> AudioChannels<'a> {
         AudioChannels {
             data,
             layout: self,
@@ -4363,21 +4197,6 @@ fn validate_outbound_audio_layout(
     format: AudioFormat,
 ) -> Result<ValidatedAudioLayout> {
     ValidatedAudioLayout::new_uncompressed(format, sample_rate, no_channels, no_samples, None)
-}
-
-/// Require supplied samples to fill the packed `layout` exactly.
-fn check_audio_data_len(layout: &ValidatedAudioLayout, len: usize) -> Result<()> {
-    if len != layout.sample_count {
-        return Err(Error::InvalidFrame(crate::FrameDefect::AudioDataLength {
-            detail: crate::CompactDiagnostic::new(crate::AudioLengthDefect {
-                actual: len,
-                expected: layout.sample_count,
-                channels: layout.no_channels.get(),
-                samples: layout.no_samples.get(),
-            }),
-        }));
-    }
-    Ok(())
 }
 
 /// The one sample-rate check for every audio path, for values from the API
@@ -10389,7 +10208,7 @@ mod tests {
             };
             for scan in ScanType::ALL {
                 frame.set_scan_type(scan);
-                let needed = crate::pixels::send_room(&frame.layout, scan);
+                let needed = crate::pixels::send_room(frame.layout(), scan);
                 let more = scan != ScanType::Progressive;
                 assert_eq!(
                     needed,
@@ -10471,19 +10290,19 @@ mod tests {
         }
         fn assert_same(&self, expected: &Self) {
             let Self {
-                layout,
                 header,
                 data,
                 metadata,
                 timestamp,
             } = self;
             let Self {
-                layout: expected_layout,
                 header: expected_header,
                 data: expected_data,
                 metadata: expected_metadata,
                 timestamp: expected_timestamp,
             } = expected;
+            let layout = data.layout();
+            let expected_layout = expected_data.layout();
             assert_eq!(data.len(), layout.data_len_bytes());
             let room = crate::pixels::send_room(layout, header.scan_type);
             assert_eq!(data.room_bytes(), vec![0; room]);
@@ -10518,23 +10337,23 @@ mod tests {
         }
         fn assert_same(&self, expected: &Self) {
             let Self {
-                layout,
                 timecode,
                 data,
                 metadata,
                 timestamp,
             } = self;
             let Self {
-                layout: expected_layout,
                 timecode: expected_timecode,
                 data: expected_data,
                 metadata: expected_metadata,
                 timestamp: expected_timestamp,
             } = expected;
+            let layout = data.layout();
+            let expected_layout = expected_data.layout();
             assert_eq!(data.len(), layout.sample_count);
             assert_eq!(format!("{layout:?}"), format!("{expected_layout:?}"));
             assert_eq!(timecode, expected_timecode);
-            assert_eq!(data, expected_data);
+            assert_eq!(data.as_slice(), expected_data.as_slice());
             assert_eq!(metadata.view().status(), expected_metadata.view().status());
             assert_eq!(
                 metadata.view().text().map(MetadataText::as_str),

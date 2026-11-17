@@ -37,6 +37,8 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 - Recorder reports count only files confirmed empty under complete tracking;
   after lost lifecycle evidence, `empty_files` is a lower bound.
 
+- Owned video and audio keep validated layouts with their storage and copy from
+  one layout observation, preserving valid frames when a copy unwinds.
 - Recorder file tracking stays bounded after native event loss and preserves
   unknown cleanup obligations even after all known files close. Drop and async
   close consume the remaining original cleanup budget; final reports stay fixed.

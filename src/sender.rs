@@ -25,7 +25,7 @@ use crate::{
         VideoHeader, VideoParts, VideoPartsExt, VideoSource,
     },
     marker::NotSync,
-    pixels::Pixels,
+    pixels::PackedStorage,
     receiver::Tally,
     source_retention::RetainedSources,
     sys::{self, bindings::*},
@@ -492,11 +492,12 @@ pub(crate) mod in_flight {
 
     #[cfg(feature = "advanced")]
     use super::Exclusive;
+    use super::VideoStaging;
     use super::{async_flush_frame_ptr, PreparedVideo, SendHandle, SenderResource};
     #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
     use crate::advanced::ScatterVideoLoan;
     use crate::{frames::Sendable, sys::bindings::NDIlib_video_frame_v2_t, VideoFrame};
-    use crate::{frames::VideoSource, pixels::Pixels, Result};
+    use crate::{frames::VideoSource, Result};
     use std::sync::{Arc, Mutex};
 
     /// A slot paired by its owning pipeline or loan owner with its sender.
@@ -517,13 +518,13 @@ pub(crate) mod in_flight {
     #[derive(Default)]
     pub(super) struct VideoState {
         pub(super) in_flight: InFlight<Sendable<VideoFrame>>,
-        pub(super) staging: Pixels,
+        pub(super) staging: VideoStaging,
         pub(super) spare: Option<VideoFrame>,
     }
 
     struct VideoPair<'a> {
         stream: Stream<'a, Sendable<VideoFrame>>,
-        staging: &'a mut Pixels,
+        staging: &'a mut VideoStaging,
         spare: &'a mut Option<VideoFrame>,
     }
 
@@ -1472,6 +1473,40 @@ unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
     }
 }
 
+#[cfg(test)]
+trait StagingTestAccess {
+    fn as_ptr(&self) -> *const u8;
+    fn bytes(&self) -> &[u8];
+    fn len(&self) -> usize;
+    fn room(&self) -> usize;
+    fn capacity(&self) -> usize;
+    fn room_bytes(&self) -> &[u8];
+}
+#[cfg(test)]
+impl StagingTestAccess for VideoStaging {
+    fn as_ptr(&self) -> *const u8 {
+        self.as_ref()
+            .map_or(std::ptr::null(), PackedStorage::as_ptr)
+    }
+    fn bytes(&self) -> &[u8] {
+        self.as_ref().map_or(&[], PackedStorage::as_slice)
+    }
+    fn len(&self) -> usize {
+        self.bytes().len()
+    }
+    fn room(&self) -> usize {
+        self.as_ref().map_or(0, PackedStorage::room)
+    }
+    fn capacity(&self) -> usize {
+        self.as_ref().map_or(0, PackedStorage::capacity)
+    }
+    fn room_bytes(&self) -> &[u8] {
+        self.as_ref().map_or(&[], PackedStorage::room_bytes)
+    }
+}
+
+type VideoStaging = Option<PackedStorage<ValidatedVideoLayout>>;
+
 /// A descriptor borrowing either a proven direct input or initialized packed
 /// staging. Its lifetime keeps both input metadata and staging alive until the
 /// synchronous native call returns. It never forms slices over capture padding.
@@ -1482,13 +1517,13 @@ pub(crate) struct PreparedVideo<'a> {
 
 impl<'a> PreparedVideo<'a> {
     #[cfg(test)]
-    fn new(frame: &'a (impl VideoParts + ?Sized), staging: &'a mut Pixels) -> Self {
+    fn new(frame: &'a (impl VideoParts + ?Sized), staging: &'a mut VideoStaging) -> Self {
         Self::authorized(Sendable::for_test(frame), staging)
     }
 
     fn authorized(
         frame: Sendable<&'a (impl VideoParts + ?Sized)>,
-        staging: &'a mut Pixels,
+        staging: &'a mut VideoStaging,
     ) -> Self {
         let raw = if frame.frame().can_send_direct() {
             frame.video_descriptor()
@@ -2948,8 +2983,8 @@ mod tests {
                                     ),
                                     borrowed.initialized()
                                 );
-                                let mut storage = Pixels::default();
-                                let packed = borrowed.copy_active_pixels(&mut storage);
+                                let mut storage = VideoStaging::default();
+                                let packed = crate::pixels::stage_video(&borrowed, &mut storage);
                                 assert!(packed.can_send_direct(), "staging {format:?} {scan:?}");
                             }
                         }
@@ -2975,7 +3010,7 @@ mod tests {
             .without_send_room_for_test();
         assert_eq!(frame.tail_room(), 0);
         assert!(!frame.sends_in_place());
-        let mut staging = Pixels::default();
+        let mut staging = VideoStaging::default();
         let raw = PreparedVideo::new(&frame, &mut staging).raw;
         assert_ne!(raw.p_data.cast_const(), frame.data().as_ptr());
         assert_extent(&raw, staging.as_ptr(), staging.len() + staging.room());
@@ -3004,7 +3039,7 @@ mod tests {
 
         fn verify(source: &(impl VideoSource + ?Sized), original: &NDIlib_video_frame_v2_t) {
             let expected = source.owned_copy();
-            let mut staging = Pixels::default();
+            let mut staging = VideoStaging::default();
             let (raw, allocations) = crate::test_alloc::allocation_count(|| {
                 PreparedVideo::new(source, &mut staging).raw
             });
@@ -3025,11 +3060,11 @@ mod tests {
             );
             if direct {
                 assert_eq!(raw.p_data, original.p_data);
-                assert!(staging.as_slice().is_empty());
+                assert!(staging.bytes().is_empty());
             } else {
                 assert_eq!(raw.p_data, staging.as_ptr().cast_mut());
                 assert_ne!(raw.p_data, original.p_data);
-                assert_eq!(staging.as_slice(), expected.data());
+                assert_eq!(staging.bytes(), expected.data());
                 assert!(staging.room_bytes().iter().all(|&byte| byte == 0));
                 assert_eq!(
                     staging.room(),
@@ -3151,7 +3186,7 @@ mod tests {
                 ))
             }
             .unwrap();
-            let mut staging = Pixels::default();
+            let mut staging = VideoStaging::default();
             let prepared = PreparedVideo::authorized(Sendable::for_test(&captured), &mut staging);
             let raw = prepared.raw;
             assert_ne!(raw.p_data.cast_const(), storage.as_ptr());
@@ -3464,7 +3499,7 @@ mod tests {
                         .metadata("<owned/>")
                         .build()
                         .unwrap();
-                    let mut staging = Pixels::default();
+                    let mut staging = VideoStaging::default();
                     let (raw, allocations) = crate::test_alloc::allocation_count(|| {
                         PreparedVideo::new(&frame, &mut staging).raw
                     });
@@ -3472,7 +3507,7 @@ mod tests {
                     assert_eq!(raw.p_data.cast_const(), frame.data().as_ptr());
                     assert_eq!(raw.p_metadata, frame.as_test_raw().p_metadata);
                     assert_eq!(raw.frame_format_type, scan.to_sdk());
-                    assert!(staging.as_slice().is_empty());
+                    assert!(staging.bytes().is_empty());
                 }
             }
         }
@@ -3495,7 +3530,7 @@ mod tests {
                             .unwrap();
                     let len = layout.data_len_bytes();
                     let room = send_room(&layout, scan);
-                    let mut staging = Pixels::default();
+                    let mut staging = VideoStaging::default();
                     let mut expected = None;
                     for extra in [0, room] {
                         for offered in [0, room] {
@@ -3534,11 +3569,11 @@ mod tests {
                                     36
                                 );
                                 assert_eq!(raw.frame_format_type, scan.to_sdk());
-                                assert_eq!(staging.as_slice(), frame.to_owned().data());
+                                assert_eq!(staging.bytes(), frame.to_owned().data());
                                 if let Some(expected) = &expected {
-                                    assert_eq!(staging.as_slice(), expected);
+                                    assert_eq!(staging.bytes(), expected);
                                 } else {
-                                    expected = Some(staging.as_slice().to_vec());
+                                    expected = Some(staging.bytes().to_vec());
                                 }
                                 assert_eq!(staging.room(), send_room(&layout.packed(), scan));
                                 assert!(staging.room_bytes().iter().all(|&byte| byte == 0));
@@ -3652,14 +3687,14 @@ mod tests {
             assert!(frame.sends_in_place());
             assert_eq!(frame.storage(), &buffer[..data_len]);
             assert_eq!(frame.data(), Some(&buffer[..data_len]));
-            let mut staging = Pixels::default();
+            let mut staging = VideoStaging::default();
             let raw = PreparedVideo::new(&frame, &mut staging).raw;
             assert_eq!(raw.p_data.cast_const(), buffer.as_ptr());
             // SAFETY: the frame's whole buffer borrow covers the layout and
             // reported send room. This models the native SDK's actual read.
             let read = unsafe { std::slice::from_raw_parts(raw.p_data, read_len) };
             assert_eq!(read, buffer);
-            assert!(staging.as_slice().is_empty());
+            assert!(staging.bytes().is_empty());
         }
     }
 
@@ -3686,11 +3721,11 @@ mod tests {
         }
         let original = frame.to_raw();
 
-        let mut staging = Pixels::default();
+        let mut staging = VideoStaging::default();
         let raw = PreparedVideo::new(&frame, &mut staging).raw;
         assert_eq!(raw.p_data, staging.as_ptr().cast_mut());
         assert_ne!(raw.p_data, original.p_data);
-        assert_eq!(staging.as_slice(), frame.to_owned().data());
+        assert_eq!(staging.bytes(), frame.to_owned().data());
         assert_eq!(staging.room_bytes(), [0; 64]);
         assert_eq!(staging.capacity(), 144 + 64);
         // Everything but the pixel pointer describes the caller's frame.
@@ -3734,7 +3769,7 @@ mod tests {
         });
         assert_eq!(allocations, 0);
         assert_eq!(
-            (staging.as_ptr(), staging.as_slice()),
+            (staging.as_ptr(), staging.bytes()),
             (address, next.to_owned().data())
         );
 
@@ -3750,7 +3785,7 @@ mod tests {
             assert_eq!(raw.p_data.cast_const(), roomy.as_ptr());
         });
         assert_eq!(allocations, 0);
-        assert_eq!(staging.as_slice(), next.to_owned().data());
+        assert_eq!(staging.bytes(), next.to_owned().data());
     }
 
     /// A UYVY frame over a buffer that ends with it reaches the SDK from the
@@ -3764,7 +3799,7 @@ mod tests {
             let state = sender.native.video.test_state();
             (
                 state.staging.as_ptr(),
-                state.staging.as_slice().to_vec(),
+                state.staging.bytes().to_vec(),
                 state.staging.room_bytes().to_vec(),
             )
         };
@@ -3827,7 +3862,7 @@ mod tests {
     #[test]
     fn synchronous_send_describes_an_owned_frame_as_the_frame_itself() {
         let owned = test_owned_frame(8);
-        let mut staging = Pixels::default();
+        let mut staging = VideoStaging::default();
         let (expected, lent) = (
             owned.as_test_raw(),
             PreparedVideo::new(&owned, &mut staging).raw,
@@ -4087,7 +4122,7 @@ mod tests {
                     (Timecode::from_ticks(0), None)
                 );
                 assert_eq!(owned.metadata(), borrowed.metadata());
-                let mut staging = Pixels::default();
+                let mut staging = VideoStaging::default();
                 let (raw, allocations) = crate::test_alloc::allocation_count(|| {
                     PreparedVideo::new(&owned, &mut staging).raw
                 });

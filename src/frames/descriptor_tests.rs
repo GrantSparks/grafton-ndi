@@ -57,6 +57,7 @@ fn descriptor_uses_only_the_frame_bound_to_its_authorization() {
 /// Compile the actual private trait against a deliberately forbidden helper.
 /// Stubs replace only accessor data types; method membership comes from the
 /// declaration in frames.rs, so moving a helper back there breaks this check.
+#[cfg(not(miri))]
 #[test]
 fn video_parts_implementations_cannot_override_shared_helpers() {
     let source = include_str!("../frames.rs");
@@ -148,6 +149,7 @@ mod pixels { pub fn send_room(_: &super::ValidatedVideoLayout, _: ()) -> usize {
 }
 
 /// Pin the accessor boundary against the declarations compiled by the crate.
+#[cfg(not(miri))]
 #[test]
 fn audio_and_metadata_parts_implementations_cannot_override_shared_helpers() {
     let source = include_str!("../frames.rs");
@@ -263,9 +265,9 @@ struct Timecode;
 }
 
 /// Every pointer returned by these deliberately inconsistent test doubles is
-/// readable for either layout. Only their packed-copy length changes.
+/// readable for either layout. A copy must use only its first layout observation.
 #[test]
-fn a_failed_copy_check_leaves_the_destination_consistent() {
+fn a_growing_video_layout_is_read_once_and_keeps_the_destination_paired() {
     use std::{
         cell::Cell,
         panic::{catch_unwind, AssertUnwindSafe},
@@ -280,10 +282,10 @@ fn a_failed_copy_check_leaves_the_destination_consistent() {
         fn layout(&self) -> &ValidatedVideoLayout {
             let count = self.calls.get();
             self.calls.set(count + 1);
-            if count < 2 {
-                &self.frame.layout
-            } else {
+            if count == 0 {
                 &self.smaller
+            } else {
+                self.frame.layout()
             }
         }
         fn header(&self) -> &VideoHeader {
@@ -308,14 +310,15 @@ fn a_failed_copy_check_leaves_the_destination_consistent() {
     };
     let source = ChangingVideo {
         frame: build(32),
-        smaller: build(16).layout,
+        smaller: *build(16).layout(),
         calls: Cell::new(0),
     };
-    let mut destination = build(32);
-    assert!(catch_unwind(AssertUnwindSafe(|| source.copy_into_owned(&mut destination))).is_err());
+    let mut destination = build(16);
+    assert!(catch_unwind(AssertUnwindSafe(|| source.copy_into_owned(&mut destination))).is_ok());
+    assert_eq!(source.calls.get(), 1);
     assert_eq!(
         destination.data().len(),
-        destination.layout.data_len_bytes()
+        destination.layout().data_len_bytes()
     );
     assert!(destination.data.room_bytes().iter().all(|&byte| byte == 0));
     assert_eq!(
@@ -325,7 +328,7 @@ fn a_failed_copy_check_leaves_the_destination_consistent() {
 }
 
 #[test]
-fn an_incomplete_packed_audio_fill_preserves_a_reused_destination_in_every_build() {
+fn a_growing_audio_layout_is_read_once_and_keeps_the_destination_paired() {
     use std::{
         cell::Cell,
         panic::{catch_unwind, AssertUnwindSafe},
@@ -340,10 +343,10 @@ fn an_incomplete_packed_audio_fill_preserves_a_reused_destination_in_every_build
         fn layout(&self) -> &ValidatedAudioLayout {
             let count = self.calls.get();
             self.calls.set(count + 1);
-            if count < 2 {
-                &self.frame.layout
-            } else {
+            if count == 0 {
                 &self.smaller
+            } else {
+                self.frame.layout()
             }
         }
         fn audio_timecode(&self) -> Timecode {
@@ -368,12 +371,16 @@ fn an_incomplete_packed_audio_fill_preserves_a_reused_destination_in_every_build
     };
     let source = ChangingAudio {
         frame: build(32),
-        smaller: build(16).layout,
+        smaller: *build(16).layout(),
         calls: Cell::new(0),
     };
-    let mut destination = build(32);
-    assert!(catch_unwind(AssertUnwindSafe(|| source.copy_into_owned(&mut destination))).is_err());
-    assert_eq!(destination.data().len(), destination.layout.sample_count());
+    let mut destination = build(16);
+    assert!(catch_unwind(AssertUnwindSafe(|| source.copy_into_owned(&mut destination))).is_ok());
+    assert_eq!(source.calls.get(), 1);
+    assert_eq!(
+        destination.data().len(),
+        destination.layout().sample_count()
+    );
     assert_eq!(
         destination.to_owned().data().len(),
         destination.data().len()
@@ -393,7 +400,7 @@ fn a_video_accessor_panic_leaves_the_reused_destination_whole() {
     // SAFETY: every successful accessor lends this owned frame's valid parts.
     unsafe impl VideoParts for PanickingMetadata {
         fn layout(&self) -> &ValidatedVideoLayout {
-            &self.frame.layout
+            self.frame.layout()
         }
         fn header(&self) -> &VideoHeader {
             &self.frame.header
@@ -404,7 +411,7 @@ fn a_video_accessor_panic_leaves_the_reused_destination_whole() {
         fn frame_metadata(&self) -> FrameMetadataRef<'_> {
             let count = self.reads.get();
             self.reads.set(count + 1);
-            assert_eq!(count, 0, "test accessor panic");
+            assert_ne!(count, 0, "test accessor panic");
             self.frame.metadata.view()
         }
         fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
@@ -426,7 +433,7 @@ fn a_video_accessor_panic_leaves_the_reused_destination_whole() {
     assert!(catch_unwind(AssertUnwindSafe(|| source.copy_into_owned(&mut destination))).is_err());
     assert_eq!(
         destination.data().len(),
-        destination.layout.data_len_bytes()
+        destination.layout().data_len_bytes()
     );
     assert!(destination.data.room_bytes().iter().all(|&byte| byte == 0));
     assert_eq!(

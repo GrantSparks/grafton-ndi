@@ -387,6 +387,8 @@ MIRI_BATCHES = {
         'file::out_param::tests::',
     ],
     'media': [
+        'frames::descriptor_tests::',
+        'pixels::tests::',
         'frames::tests::video_padding_all_formats',
         'frames::tests::video_padding_single_rows',
         'frames::tests::video_padding_encoders',
