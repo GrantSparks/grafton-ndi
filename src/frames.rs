@@ -3870,8 +3870,9 @@ pub(crate) struct ValidatedAudioLayout {
     sample_rate: SdkQuantity,
     no_channels: SdkQuantity,
     no_samples: SdkQuantity,
-    /// The validated channel stride in `f32` samples.
-    channel_stride_samples: usize,
+    /// An explicit padded stride in bytes, checked against the SDK range.
+    /// `None` stores channels back to back.
+    padded_stride: Option<SdkQuantity>,
     /// The validated backing sample count. For strided planar audio this may be
     /// larger than `no_channels * no_samples` because it includes inter-channel
     /// padding up to the last channel's final sample.
@@ -3951,9 +3952,9 @@ impl DoubleEndedIterator for AudioChannels<'_> {
 impl ExactSizeIterator for AudioChannels<'_> {}
 impl std::iter::FusedIterator for AudioChannels<'_> {}
 
-// The channel count, sample count and channel stride in bytes of a valid
-// layout are each at most its byte extent, and the sample rate is checked
-// against i32::MAX, so every one of them fits the SDK's signed 32-bit fields.
+// Packed channel strides are bounded by the audio byte cap. Explicit padded
+// strides retain their own SDK-range proof, including for a single channel
+// whose stride does not contribute to its byte extent.
 const _: () = assert!(MAX_AUDIO_BYTES <= i32::MAX as usize);
 
 impl ValidatedAudioLayout {
@@ -3978,8 +3979,8 @@ impl ValidatedAudioLayout {
     }
 
     /// The validated `channel_stride_samples` value.
-    pub(crate) const fn channel_stride_samples(&self) -> usize {
-        self.channel_stride_samples
+    pub(crate) fn channel_stride_samples(&self) -> usize {
+        self.channel_stride_bytes() / size_of::<f32>()
     }
 
     /// Initialized samples only, excluding inter-channel padding.
@@ -4096,25 +4097,29 @@ impl ValidatedAudioLayout {
         // The extent bounds the packed minimum even for a single channel.
         let minimum = minimum as usize;
         let stride = stride as usize;
-        if i32::try_from(stride).is_err() {
-            return Err(crate::LayoutDefect::AudioStrideRange);
-        }
-        if stride == 0 {
-            return Err(crate::LayoutDefect::AudioStride(0.into()));
-        }
+        let checked_stride = i64::try_from(stride)
+            .ok()
+            .and_then(SdkQuantity::new)
+            .ok_or_else(|| {
+                if stride == 0 {
+                    crate::LayoutDefect::AudioStride(0.into())
+                } else {
+                    crate::LayoutDefect::AudioStrideRange
+                }
+            })?;
         if !stride.is_multiple_of(size_of::<f32>()) {
             return Err(crate::LayoutDefect::AudioStrideAlignment(stride));
         }
         if stride < minimum {
             return Err(crate::LayoutDefect::AudioShortStride { stride, minimum });
         }
-        let channel_stride_samples = stride / size_of::<f32>();
+        let padded_stride = (stride != minimum).then_some(checked_stride);
         Ok(Self {
             format,
             sample_rate,
             no_channels,
             no_samples,
-            channel_stride_samples,
+            padded_stride,
             sample_count,
         })
     }
@@ -4122,7 +4127,7 @@ impl ValidatedAudioLayout {
     /// The same frame with channels stored back to back, without padding.
     pub(crate) fn packed(self) -> Self {
         Self {
-            channel_stride_samples: self.no_samples(),
+            padded_stride: None,
             sample_count: self.no_channels() * self.no_samples(),
             ..self
         }
@@ -4137,7 +4142,10 @@ impl ValidatedAudioLayout {
     }
 
     pub(crate) fn channel_stride_bytes(self) -> usize {
-        self.channel_stride_samples() * std::mem::size_of::<f32>()
+        self.padded_stride.map_or_else(
+            || self.no_samples() * size_of::<f32>(),
+            SdkQuantity::to_usize,
+        )
     }
 
     /// The SDK's `sample_rate`.
@@ -4157,7 +4165,11 @@ impl ValidatedAudioLayout {
 
     /// The SDK's `channel_stride_in_bytes`.
     pub(crate) fn sdk_channel_stride(self) -> i32 {
-        self.channel_stride_bytes() as i32
+        self.padded_stride.map_or_else(
+            // Packed stride fits the audio byte cap, which is at most i32::MAX.
+            || (self.no_samples() * size_of::<f32>()) as i32,
+            SdkQuantity::to_sdk,
+        )
     }
 
     pub(crate) fn channel_range(self, channel: usize) -> Option<std::ops::Range<usize>> {
@@ -4168,7 +4180,7 @@ impl ValidatedAudioLayout {
         // checked_audio_extent proved the last channel's offset plus its
         // samples fits usize and sample_count; every earlier channel fits too.
         // packed() preserves that proof when removing inter-channel padding.
-        let start = channel * self.channel_stride_samples;
+        let start = channel * self.channel_stride_samples();
         let end = start + self.no_samples();
         debug_assert!(end <= self.sample_count);
         Some(start..end)
@@ -4212,7 +4224,7 @@ impl ValidatedAudioLayout {
     ///
     /// As for [`Self::channel`].
     unsafe fn view_samples<'a>(self, data: *const f32) -> Option<&'a [f32]> {
-        if self.no_channels() > 1 && self.channel_stride_samples != self.no_samples() {
+        if self.no_channels() > 1 && self.padded_stride.is_some() {
             return None;
         }
         // SAFETY: with one channel, or channels back to back, the
@@ -6067,7 +6079,7 @@ mod tests {
                     for layout in [layout, layout.packed()] {
                         checked += 1;
                         for channel in 0..channels as usize {
-                            let start = channel as i128 * layout.channel_stride_samples as i128;
+                            let start = channel as i128 * layout.channel_stride_samples() as i128;
                             let end = start + samples as i128;
                             let actual = layout.channel_range(channel).unwrap();
                             assert_eq!((actual.start as i128, actual.end as i128), (start, end));
@@ -9485,6 +9497,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn explicit_audio_stride_keeps_its_sdk_range_proof_for_one_channel() {
+        let layout = ValidatedAudioLayout::new_uncompressed_checked(
+            AudioFormat::Fltp,
+            48_000,
+            1,
+            1,
+            Some(1 << 30),
+        )
+        .unwrap();
+        assert_eq!(layout.sample_count(), 1);
+        assert_eq!(layout.channel_stride_bytes(), 1 << 30);
+        assert_eq!(layout.sdk_channel_stride(), 1 << 30);
+        assert!(layout.padded_stride.is_some());
+        assert_eq!(
+            ValidatedAudioLayout::new_uncompressed_checked(
+                AudioFormat::Fltp,
+                48_000,
+                1,
+                1,
+                Some(i32::MAX as usize + 1),
+            ),
+            Err(crate::LayoutDefect::AudioStrideRange)
+        );
+        assert_eq!(
+            ValidatedAudioLayout::new_uncompressed_checked(
+                AudioFormat::Fltp,
+                48_000,
+                1,
+                1,
+                Some(0),
+            ),
+            Err(crate::LayoutDefect::AudioStride(0.into()))
+        );
+    }
+
+    #[test]
+    fn an_explicit_packed_audio_stride_has_the_same_identity_as_implicit() {
+        let implicit =
+            ValidatedAudioLayout::new_uncompressed_checked(AudioFormat::Fltp, 48_000, 2, 4, None)
+                .unwrap();
+        let explicit = ValidatedAudioLayout::new_uncompressed_checked(
+            AudioFormat::Fltp,
+            48_000,
+            2,
+            4,
+            Some(16),
+        )
+        .unwrap();
+        assert_eq!(implicit, explicit);
+        assert_eq!(implicit, explicit.packed());
+        assert!(explicit.padded_stride.is_none());
+    }
+
     /// Test validate_audio_layout with valid frame
     #[test]
     fn test_validate_audio_layout_valid() {
@@ -9617,7 +9683,7 @@ mod tests {
 
         let layout = validate_audio_layout(&raw).expect("strided FLTP should validate");
         assert_eq!(layout.sample_count, backing_samples);
-        assert_eq!(layout.channel_stride_samples, stride_samples as usize);
+        assert_eq!(layout.channel_stride_samples(), stride_samples as usize);
         assert_eq!(layout.channel_range(1), Some(6..10));
     }
 
