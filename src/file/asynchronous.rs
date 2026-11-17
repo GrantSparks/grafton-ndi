@@ -439,7 +439,7 @@ impl FailureSource for NoOwner {
     }
 }
 
-type CommandReply<T, C = RecordingReport> = Reply<T, Arc<Control<C>>>;
+type CommandReply<T, C> = Reply<T, Arc<Control<C>>>;
 
 fn operation<T>() -> (Reply<T>, Live<T>) {
     operation_with_hook(None)
@@ -1208,9 +1208,8 @@ impl<C: CloseOutcome> Control<C> {
 
     fn submit_finish<T>(&self, enqueue: impl FnOnce() -> Live<T>) -> Live<T> {
         let _submission = lock(&self.closing);
-        if let Err(error) = self.gate() {
-            return Live::failed(error);
-        }
+        // Worker::enqueue checks the owner gate while this lock excludes
+        // close publication, then retains it through command delivery.
         enqueue()
     }
 
@@ -1260,7 +1259,7 @@ impl<C: CloseOutcome> Control<C> {
 /// its native cleanup.
 trait Owner: 'static {
     type Event: Send + 'static;
-    type Finish: Send + 'static;
+    type Finish: FinishRequest;
     type Closed: CloseOutcome;
 
     /// Take the next native event without waiting.
@@ -1295,6 +1294,20 @@ trait Owner: 'static {
     ) -> Self::Closed
     where
         Self: Sized;
+}
+
+/// Submission state follows the finish family: players have no finish request
+/// and need no waiter budget, while recorders retain one shared budget.
+trait FinishRequest: Send + 'static {
+    type Admission: Send + Sync + 'static;
+
+    fn admission(capacity: usize) -> Self::Admission;
+}
+
+impl FinishRequest for std::convert::Infallible {
+    type Admission = ();
+
+    fn admission(_: usize) {}
 }
 
 /// The native operations common to the two documented async handles. Keep
@@ -1440,9 +1453,8 @@ impl Drop for Place {
 struct Worker<H: Owner> {
     sender: Sender<Job<H>>,
     admission: Arc<Admission>,
-    // Independent from queued commands: registered recorder waits must not
-    // consume the places that keep status, controls and shutdown responsive.
-    finish_admission: Arc<Admission>,
+    // Only recorder finish requests carry a separate waiter budget.
+    finish: <H::Finish as FinishRequest>::Admission,
     control: Arc<Control<H::Closed>>,
     events: Arc<EventQueue<H::Event>>,
     // JoinHandle's shared return packet is not RefUnwindSafe. This owner
@@ -1528,47 +1540,50 @@ impl<H: Owner> Worker<H> {
         let admission = Arc::clone(&self.admission);
         let control = Arc::clone(&self.control);
         FileOperation::deferred(move || {
-            // A dead owner takes precedence over argument validation, exactly
-            // as a command submitted directly to it does.
-            if let Err(error) = control.gate() {
-                return Live::failed(error);
-            }
-            let work = match prepare() {
-                Ok(work) => work,
-                Err(error) => return Live::failed(error),
-            };
-            Self::submit_now(&sender, &admission, &control, stop, work)
+            Self::enqueue(
+                &sender,
+                &admission,
+                &control,
+                stop,
+                prepare,
+                || Ok(()),
+                |work, (), reply, place| {
+                    Job::Run(Box::new(move |owner| {
+                        // The command leaves the queue as it starts.
+                        drop(place);
+                        if !stop && reply.cancelled() {
+                            return;
+                        }
+                        work(owner, reply);
+                    }))
+                },
+            )
         })
     }
 
-    fn submit_now<T: Send + 'static>(
+    /// Gate, validate, admit and deliver every command through the same
+    /// owner-bound reply. Recorder finish calls hold Control::submit_finish's
+    /// `closing` lock across this kernel, so close cannot overtake delivery.
+    /// The optional extra admission runs after the command place is taken and
+    /// before the reply is allocated; either refusal releases earlier places.
+    fn enqueue<T, P, A>(
         sender: &Sender<Job<H>>,
         admission: &Arc<Admission>,
         control: &Arc<Control<H::Closed>>,
         stop: bool,
-        work: impl FnOnce(&mut H, CommandReply<T, H::Closed>) + Send + 'static,
+        prepare: impl FnOnce() -> Result<P>,
+        extra: impl FnOnce() -> Result<A>,
+        build: impl FnOnce(P, A, CommandReply<T, H::Closed>, Place) -> Job<H>,
     ) -> Live<T> {
-        Self::enqueue(sender, admission, control, stop, move |reply, place| {
-            Job::Run(Box::new(move |owner| {
-                // The command leaves the queue as it starts.
-                drop(place);
-                if !stop && reply.cancelled() {
-                    return;
-                }
-                work(owner, reply);
-            }))
-        })
-    }
-
-    /// Admit and deliver every command through the same owner-bound reply.
-    /// This kernel never locks `closing`: finish holds it across this call.
-    fn enqueue<T>(
-        sender: &Sender<Job<H>>,
-        admission: &Arc<Admission>,
-        control: &Arc<Control<H::Closed>>,
-        stop: bool,
-        build: impl FnOnce(CommandReply<T, H::Closed>, Place) -> Job<H>,
-    ) -> Live<T> {
+        if let Err(error) = control.gate() {
+            return Live::failed(error);
+        }
+        let prepared = match prepare() {
+            Ok(prepared) => prepared,
+            Err(error) => return Live::failed(error),
+        };
+        // Preparation may race shutdown. Preserve the prepared-command path's
+        // recheck before queue admission; finish still holds `closing` here.
         if let Err(error) = control.gate() {
             return Live::failed(error);
         }
@@ -1576,19 +1591,12 @@ impl<H: Owner> Worker<H> {
             Ok(place) => place,
             Err(error) => return Live::failed(error),
         };
-        Self::deliver(sender, control, place, build)
-    }
-
-    /// Deliver an admitted command. Finish requests reserve their independent
-    /// waiter place before allocating the reply or entering the command queue.
-    fn deliver<T>(
-        sender: &Sender<Job<H>>,
-        control: &Arc<Control<H::Closed>>,
-        place: Place,
-        build: impl FnOnce(CommandReply<T, H::Closed>, Place) -> Job<H>,
-    ) -> Live<T> {
+        let extra = match extra() {
+            Ok(extra) => extra,
+            Err(error) => return Live::failed(error),
+        };
         let (reply, future) = control.command();
-        if sender.send(build(reply, place)).is_err() {
+        if sender.send(build(prepared, extra, reply, place)).is_err() {
             return Live::failed(stopped(control.failed()));
         }
         future
@@ -1607,6 +1615,43 @@ impl<H: Owner> Worker<H> {
             // This no-op wake bypasses queue admission, so even a full queue
             // cannot delay shutdown until the next tick.
             let _ = sender.send(Job::Wake);
+        })
+    }
+}
+
+impl Worker<RecorderOwner> {
+    fn finish<T: Send + 'static>(
+        &self,
+        timeout: Duration,
+        stop: bool,
+        finish_response: fn(CommandReply<T, RecordingReport>, Place) -> FinishResponse,
+    ) -> FileOperation<T> {
+        let sender = self.sender.clone();
+        let admission = Arc::clone(&self.admission);
+        let finish = Arc::clone(&self.finish);
+        let control = Arc::clone(&self.control);
+        FileOperation::deferred(move || {
+            // Start at submission, including contention with another close or
+            // finish. The kernel checks this result after the owner gate.
+            let deadline = Deadline::after(timeout);
+            control.submit_finish(|| {
+                Self::enqueue(
+                    &sender,
+                    &admission,
+                    &control,
+                    stop,
+                    || deadline,
+                    || finish.admit_for(false, QueueLimit::FileFinishWaits),
+                    |deadline, waiter, reply, place| Job::Finish {
+                        finish: RecorderFinish {
+                            deadline,
+                            stop,
+                            reply: finish_response(reply, waiter),
+                        },
+                        place,
+                    },
+                )
+            })
         })
     }
 }
@@ -1707,7 +1752,7 @@ fn spawn_prepared_owner_now<H: Owner, T: Send + 'static>(
     let worker = Arc::new(Worker {
         sender,
         admission: Arc::new(Admission::new(options.command_capacity)),
-        finish_admission: Arc::new(Admission::new(options.command_capacity)),
+        finish: H::Finish::admission(options.command_capacity),
         control: Arc::clone(&control),
         events: Arc::clone(&events),
         thread: OnceLock::new(),
@@ -2360,42 +2405,9 @@ impl AsyncFileRecorder {
         &self,
         timeout: Duration,
         stop: bool,
-        finish_response: fn(CommandReply<T>, Place) -> FinishResponse,
+        finish_response: fn(CommandReply<T, RecordingReport>, Place) -> FinishResponse,
     ) -> FileOperation<T> {
-        let sender = self.worker.sender.clone();
-        let admission = Arc::clone(&self.worker.admission);
-        let finish_admission = Arc::clone(&self.worker.finish_admission);
-        let control = Arc::clone(&self.worker.control);
-        FileOperation::deferred(move || {
-            // Start at submission, including contention with another close or
-            // finish. Validate the result inside the gate to preserve the
-            // precedence of an already closed or failed owner.
-            let deadline = Deadline::after(timeout);
-            control.submit_finish(|| {
-                let deadline = match deadline {
-                    Ok(deadline) => deadline,
-                    Err(error) => return Live::failed(error),
-                };
-                // Preserve command-refusal precedence when both budgets are
-                // full. Neither refusal allocates a reply or queues work.
-                let place = match admission.admit(stop) {
-                    Ok(place) => place,
-                    Err(error) => return Live::failed(error),
-                };
-                let waiter = match finish_admission.admit_for(false, QueueLimit::FileFinishWaits) {
-                    Ok(waiter) => waiter,
-                    Err(error) => return Live::failed(error),
-                };
-                Worker::deliver(&sender, &control, place, |reply, place| Job::Finish {
-                    finish: RecorderFinish {
-                        deadline,
-                        stop,
-                        reply: finish_response(reply, waiter),
-                    },
-                    place,
-                })
-            })
-        })
+        self.worker.finish(timeout, stop, finish_response)
     }
 
     /// Wait up to `timeout` for the recorder's next event. Dropping the
@@ -2647,6 +2659,61 @@ mod tests {
     }
 
     #[test]
+    fn player_commands_gate_closed_and_failed_owners_before_admission() {
+        for failed in [false, true] {
+            for during_preparation in [false, true] {
+                let (sender, receiver) = mpsc::channel();
+                let control = Arc::new(Control::new());
+                let admission = Arc::new(Admission::new(1));
+                let place = admission.admit(false).unwrap();
+                let worker = Worker::<PlayerOwner> {
+                    sender,
+                    admission: Arc::clone(&admission),
+                    finish: (),
+                    control: Arc::clone(&control),
+                    events: Arc::new(EventQueue::new(1)),
+                    thread: OnceLock::new(),
+                };
+                let stop = move || {
+                    if failed {
+                        control.publish_failure();
+                    } else {
+                        control.request_shutdown();
+                    }
+                };
+                let prepare = if during_preparation {
+                    Some(stop)
+                } else {
+                    stop();
+                    None
+                };
+                let refused = worker.prepare(
+                    move || {
+                        if let Some(stop) = prepare {
+                            stop();
+                        } else {
+                            panic!("closed player ran argument preparation");
+                        }
+                        Ok(|_: &mut PlayerOwner| Ok(()))
+                    },
+                    false,
+                );
+                if failed {
+                    owner_failed(block_on(refused));
+                } else {
+                    closed(block_on(refused));
+                }
+                assert_eq!(admission.state.load(Ordering::Acquire), 2);
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                drop(place);
+            }
+        }
+    }
+
+    #[test]
     fn player_close_carries_only_a_unit_request_and_outcome() {
         fn require_unit_request(
             request: <<PlayerOwner as Owner>::Closed as CloseOutcome>::Request,
@@ -2743,7 +2810,7 @@ mod tests {
             let worker = Arc::new(Worker::<BurstOwner> {
                 sender,
                 admission: Arc::new(Admission::new(1)),
-                finish_admission: Arc::new(Admission::new(1)),
+                finish: (),
                 control: Arc::clone(&control),
                 events: Arc::clone(&events),
                 thread: OnceLock::new(),
@@ -3747,7 +3814,7 @@ mod tests {
                 let waiting = recorder.wait_for_finish(Duration::from_secs(30)).submit();
                 let ordinary = recorder.is_recording().submit();
                 let admission = Arc::clone(&recorder.worker.admission);
-                let finish_admission = Arc::clone(&recorder.worker.finish_admission);
+                let finish_admission = Arc::clone(&recorder.worker.finish);
                 let control = Arc::clone(&recorder.worker.control);
                 let started = Instant::now();
                 if last_drop {
@@ -3898,7 +3965,7 @@ mod tests {
         let control = Arc::clone(&recorder.worker.control);
         let sender = recorder.worker.sender.clone();
         let place = recorder.worker.admission.admit(true).unwrap();
-        let waiter = recorder.worker.finish_admission.admit(false).unwrap();
+        let waiter = recorder.worker.finish.admit(false).unwrap();
         let (reply, finishing) = control.command();
         let (entered, admitted) = mpsc::channel();
         let (release_submission, proceed) = mpsc::channel();
@@ -3987,14 +4054,7 @@ mod tests {
             .0
             .join()
             .expect("the owner catches its command's panic");
-        assert_eq!(
-            recorder
-                .worker
-                .finish_admission
-                .state
-                .load(Ordering::Acquire),
-            0
-        );
+        assert_eq!(recorder.worker.finish.state.load(Ordering::Acquire), 0);
     }
 
     /// Wait until the owner thread has stopped `device`'s session.
@@ -4076,14 +4136,7 @@ mod tests {
                 .unwrap();
             assert_eq!(storage, before, "saturation must not grow registry storage");
             assert_eq!(storage.0, 1);
-            assert_eq!(
-                recorder
-                    .worker
-                    .finish_admission
-                    .state
-                    .load(Ordering::Acquire),
-                2
-            );
+            assert_eq!(recorder.worker.finish.state.load(Ordering::Acquire), 2);
             assert_eq!(device.waits.load(Ordering::Acquire), 0);
             println!(
                 "finish saturation batch={batch} attempts={ATTEMPTS} registry_len={} registry_capacity={} submission_allocations={allocations} submission_peak_bytes={peak} submission_time_us={} bookkeeping_allocations={bookkeeping_allocations} bookkeeping_time_us={}",
@@ -4095,14 +4148,7 @@ mod tests {
         }
         drop(pending);
         block_on(recorder.close()).unwrap();
-        assert_eq!(
-            recorder
-                .worker
-                .finish_admission
-                .state
-                .load(Ordering::Acquire),
-            0
-        );
+        assert_eq!(recorder.worker.finish.state.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -4222,14 +4268,7 @@ mod tests {
         let options = FileRecorderOptions::new(SourceSpec::new("replacement").unwrap());
         assert!(block_on(recorder.reset(&options)).is_err());
         assert!(!finishing.is_completed());
-        assert_eq!(
-            recorder
-                .worker
-                .finish_admission
-                .state
-                .load(Ordering::Acquire),
-            2
-        );
+        assert_eq!(recorder.worker.finish.state.load(Ordering::Acquire), 2);
         replacement.refuse_creation.store(false, Ordering::Release);
         let installed = Arc::clone(&replacement);
         block_on(recorder.worker.call(move |_| {
@@ -4238,14 +4277,7 @@ mod tests {
         }))
         .unwrap();
         block_on(recorder.reset(&options)).unwrap();
-        assert_eq!(
-            recorder
-                .worker
-                .finish_admission
-                .state
-                .load(Ordering::Acquire),
-            0
-        );
+        assert_eq!(recorder.worker.finish.state.load(Ordering::Acquire), 0);
         assert!(matches!(
             block_on(finishing),
             Err(Error::InvalidState(StateConflict::Closed))
@@ -4492,14 +4524,7 @@ mod tests {
             block_on(recorder.close()),
             Err(Error::InvalidState(StateConflict::OwnerFailed))
         ));
-        assert_eq!(
-            recorder
-                .worker
-                .finish_admission
-                .state
-                .load(Ordering::Acquire),
-            0
-        );
+        assert_eq!(recorder.worker.finish.state.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -5063,14 +5088,7 @@ mod tests {
         assert_eq!(device.stops.load(Ordering::Acquire), 1);
         assert_eq!(device.destroys.load(Ordering::Acquire), 1);
         assert_eq!(recorder.worker.admission.state.load(Ordering::Acquire), 0);
-        assert_eq!(
-            recorder
-                .worker
-                .finish_admission
-                .state
-                .load(Ordering::Acquire),
-            0
-        );
+        assert_eq!(recorder.worker.finish.state.load(Ordering::Acquire), 0);
     }
 
     #[test]
