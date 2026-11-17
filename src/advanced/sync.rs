@@ -9,8 +9,7 @@ use std::ptr;
 use super::{invalid_input, AdvancedConfig, AvSyncAttached, ReceiverControls};
 use crate::{
     capture::{AvSyncAudioFree, Guard},
-    frames::MAX_AUDIO_BYTES,
-    frames::{ValidatedAudio, VideoPartsExt},
+    frames::{checked_audio_extent, ValidatedAudio, VideoPartsExt},
     marker::NotSync,
     media::SdkQuantity,
     receiver::{
@@ -65,8 +64,9 @@ impl AvSyncRequest {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when a value is zero, exceeds `i32::MAX`, or
-    /// asks for more audio than one frame can hold.
+    /// [`Error::InvalidInput`] with a shared [`crate::InputDefect::Layout`]
+    /// cause when a value is outside `1..=i32::MAX`, or a single channel's
+    /// sample payload exceeds 64 MiB.
     pub fn new(sample_rate: Option<u32>, num_samples: Option<u32>) -> Result<Self> {
         let request = Self {
             sample_rate: sample_rate
@@ -84,13 +84,10 @@ impl AvSyncRequest {
                 .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?,
         };
         // A frame has at least one channel.
-        if request.num_samples.is_some_and(|samples| {
-            samples
-                .to_usize()
-                .checked_mul(size_of::<f32>())
-                .is_none_or(|bytes| bytes > MAX_AUDIO_BYTES)
-        }) {
-            return Err(invalid_input(crate::InputDefect::AvSyncStorageLimit));
+        if let Some(samples) = request.num_samples {
+            let count = samples.to_usize();
+            checked_audio_extent(1, count, u64::from(samples.get()))
+                .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?;
         }
         Ok(request)
     }
@@ -1283,7 +1280,35 @@ fn video_timing(frame_rate: FrameRate, scan_type: ScanType) -> NDIlib_video_fram
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::AudioPartsExt;
+    use crate::frames::{AudioPartsExt, MAX_AUDIO_BYTES};
+
+    #[test]
+    fn avsync_requests_share_the_audio_extent_limit_and_cause() {
+        let limit = (MAX_AUDIO_BYTES / size_of::<f32>()) as u32;
+        let expected = crate::LayoutDefect::AudioBytes(67_108_868_u64.into());
+        let cause = |error| match error {
+            Error::InvalidInput(crate::InputDefect::Layout(cause)) => cause,
+            other => panic!("expected the shared audio layout cause, got {other:?}"),
+        };
+        for rate in [None, Some(48_000)] {
+            assert!(AvSyncRequest::new(rate, Some(limit)).is_ok());
+            assert_eq!(
+                cause(AvSyncRequest::new(rate, Some(limit + 1)).unwrap_err()),
+                expected
+            );
+            assert!(matches!(
+                AvSyncRequest::new(rate, Some(i32::MAX as u32 + 1)),
+                Err(Error::InvalidInput(crate::InputDefect::Layout(
+                    crate::LayoutDefect::AudioCount {
+                        kind: crate::AudioCountKind::Samples,
+                        ..
+                    }
+                )))
+            ));
+        }
+        let framesync = crate::FrameSyncAudioRequest::capture_at(48_000, 1, limit + 1).unwrap_err();
+        assert_eq!(cause(framesync), expected);
+    }
 
     #[test]
     fn genlock_options_roundtrip_and_clear_without_a_runtime() {

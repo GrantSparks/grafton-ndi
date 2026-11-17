@@ -4273,7 +4273,7 @@ pub(crate) fn validate_positive_audio_counts(
 /// first sample of the first channel to the last sample of the last channel
 /// when channels start `stride_samples` apart, enforcing `MAX_AUDIO_BYTES`.
 /// Packed audio is the case `stride_samples == no_samples`.
-fn checked_audio_extent(
+pub(crate) fn checked_audio_extent(
     no_channels: usize,
     no_samples: usize,
     stride_samples: u64,
