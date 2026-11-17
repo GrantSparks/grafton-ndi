@@ -4036,10 +4036,9 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        if ndi
-            .require_feature(crate::RuntimeFeature::ReceiveAllocators)
-            .is_err()
-        {
+        if !crate::test_support::require_feature(
+            ndi.require_feature(crate::RuntimeFeature::ReceiveAllocators),
+        ) {
             return;
         }
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
