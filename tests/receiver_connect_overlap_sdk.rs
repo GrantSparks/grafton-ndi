@@ -83,6 +83,26 @@ struct Peers {
     height: u32,
 }
 
+/// Count complete feed iterations and upstream messages, including on a failed
+/// connection-progress assertion after the scoped workers have stopped.
+#[derive(Default)]
+struct PeerTraffic {
+    sent: [AtomicU64; 2],
+    upstream: [AtomicU64; 2],
+}
+
+impl Drop for PeerTraffic {
+    fn drop(&mut self) {
+        for index in 0..2 {
+            eprintln!(
+                "peer {index}: {} video/audio/metadata groups sent, {} upstream messages handled",
+                self.sent[index].load(Ordering::Relaxed),
+                self.upstream[index].load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
 impl Peers {
     fn new(ndi: &Ndi) -> Self {
         let senders = ["overlap BGRA", "overlap UYVY"].map(|name| {
@@ -111,7 +131,7 @@ impl Peers {
         }
     }
 
-    fn feed(&self, index: usize, stopped: &AtomicBool) {
+    fn feed(&self, index: usize, stopped: &AtomicBool, sent: &AtomicU64) {
         let format = if index == 0 {
             PixelFormat::Bgra
         } else {
@@ -153,19 +173,43 @@ impl Peers {
             self.senders[index].send_video(video).unwrap();
             self.senders[index].send_audio(&audio);
             self.senders[index].send_metadata(&metadata);
+            sent.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    fn run(&self, work: impl FnOnce(&AtomicBool)) {
+    fn run(&self, work: impl FnOnce(&AtomicBool)) -> u64 {
         let stopped = AtomicBool::new(false);
+        let traffic = PeerTraffic::default();
         thread::scope(|scope| {
             for index in 0..2 {
                 let stopped = &stopped;
-                scope.spawn(move || self.feed(index, stopped));
+                let sent = &traffic.sent[index];
+                scope.spawn(move || self.feed(index, stopped, sent));
+                let upstream = &traffic.upstream[index];
+                // PTZ, connection metadata and explicit metadata travel back
+                // to the source. Service that direction independently: a
+                // synchronous media send must not hold up its own consumer.
+                scope.spawn(move || {
+                    while !stopped.load(Ordering::Acquire) {
+                        if let Some(message) = timed("sender upstream metadata", SLICE, || {
+                            self.senders[index].capture_metadata_ref(SLICE)
+                        })
+                        .unwrap()
+                        {
+                            upstream.fetch_add(1, Ordering::Relaxed);
+                            drop(message);
+                        }
+                    }
+                });
             }
             let _stop = Stop(&stopped);
             work(&stopped);
         });
+        traffic
+            .upstream
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum()
     }
 }
 
@@ -467,7 +511,7 @@ fn shared_controls_capture_and_connect_complete_without_torn_frames() {
     let receiver = Receiver::new(&ndi, &ReceiverOptions::new(peers.sources[0].clone())).unwrap();
     let loans = Loans::default();
     let controls = AtomicU64::new(0);
-    peers.run(|stopped| {
+    let upstream = peers.run(|stopped| {
         thread::scope(|scope| {
             let _stop = Stop(stopped);
             for kind in 0..3 {
@@ -527,6 +571,7 @@ fn shared_controls_capture_and_connect_complete_without_torn_frames() {
         });
     });
     assert!(controls.load(Ordering::Relaxed) > 0);
+    assert!(upstream > 0, "source handled no upstream controls");
     loans.balanced(&ndi);
     eprintln!(
         "completed {} shared-control groups",
