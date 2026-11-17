@@ -4017,7 +4017,7 @@ mod tests {
     #[cfg(all(feature = "advanced", ndi_has_advanced_receive_allocators))]
     #[test]
     fn retiring_an_allocator_policy_releases_receiver_permission_before_user_drop() {
-        use crate::advanced::{AllocationBuffer, AllocatorLimits, AllocatorService};
+        use crate::advanced::{AllocationBuffer, AllocatorService};
         use std::sync::atomic::{AtomicBool, Ordering};
         struct ObserveDrop {
             core: Arc<ReceiverCore>,
@@ -4048,8 +4048,7 @@ mod tests {
             core: Arc::clone(&receiver.core),
             available: Arc::clone(&available),
         };
-        let service =
-            AllocatorService::new(ndi.process_lifetime(), &AllocatorLimits::default()).unwrap();
+        let service = AllocatorService::for_test(ndi.process_lifetime());
         let mut allocated = service.attach(receiver).unwrap();
         allocated
             .set_video_allocator(move |request| {

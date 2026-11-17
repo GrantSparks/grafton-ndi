@@ -1210,6 +1210,16 @@ impl AllocatorService {
         Ok(Self { runtime, registry })
     }
 
+    /// Native setter fixtures share whichever limits the process callback
+    /// fixture established first; neither fixture needs a particular limit.
+    #[cfg(all(test, ndi_has_advanced_receive_allocators))]
+    pub(crate) fn for_test(runtime: ProcessLifetimeRuntime) -> Self {
+        Self {
+            runtime,
+            registry: REGISTRY.get_or_init(|| Registry::new(AllocatorLimits::default()).unwrap()),
+        }
+    }
+
     /// A consistent snapshot of retained storage, active calls and decline
     /// counters across the process. Counter updates allocate no storage and
     /// run under the same lock that accounts for retained allocations.
@@ -2692,8 +2702,8 @@ mod tests {
     #[cfg(ndi_has_advanced_receive_allocators)]
     #[test]
     fn compressed_callback_declines_clear_the_data_and_size() {
-        // This is the only unit test using the process-wide registry. It drives
-        // the native callback boundary directly without creating SDK objects.
+        // Drive the process callback registry directly. Native setter fixtures
+        // may share it, but never allocate frames or alter these decline counts.
         let registry = REGISTRY.get_or_init(|| Registry::new(limits()).unwrap());
         let token = registry.register(cached_request_policy()).unwrap();
         let opaque = token as *mut c_void;
