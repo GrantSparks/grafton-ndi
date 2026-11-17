@@ -59,7 +59,11 @@ fn generated_session_timecodes_reach_the_native_start_unchanged() {
 fn every_session_exit_issues_exactly_one_native_stop() {
     for ending in 0..4 {
         let device = mock::Recorder::new(Closing::AtStop);
-        let mut recorder = recording_on(&device);
+        let mut recorder = recording_with(
+            &device,
+            FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
+                .drop_wait(Duration::ZERO),
+        );
         recorder.next_event(Duration::ZERO).unwrap();
         match ending {
             0 => {
@@ -269,11 +273,284 @@ fn lost_sdk_events_end_the_session_as_indeterminate() {
     };
     assert_eq!(report, recorder.report());
     assert_eq!(recorder.request_stop(), StopRequest::AlreadyEnded);
-    // The session is over, so another can begin.
-    device.dropped_events.store(1, Ordering::Release);
+    // Lost lifecycle events can hide an open file, even after every known
+    // file closed. Only a new native recorder can start another session.
+    assert!(matches!(
+        recorder.start(&target("again"), RecordingTimecode::Preserve),
+        Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+    ));
+    assert_eq!(device.starts.load(Ordering::Acquire), 1);
+    let replacement = mock::Recorder::new(Closing::AtStop);
+    replacement.install();
+    assert_eq!(
+        recorder
+            .reset(&FileRecorderOptions::new(
+                SourceSpec::new("replacement").unwrap(),
+            ))
+            .unwrap(),
+        report
+    );
+    assert_eq!(device.stops.load(Ordering::Acquire), 1);
+    assert_eq!(device.destroys.load(Ordering::Acquire), 1);
     recorder
         .start(&target("again"), RecordingTimecode::Preserve)
         .unwrap();
+    assert!(matches!(
+        recorder.finish(Duration::ZERO).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    drop(recorder);
+    assert_eq!(replacement.stops.load(Ordering::Acquire), 1);
+    assert_eq!(replacement.destroys.load(Ordering::Acquire), 1);
+}
+
+/// Lose a rollover's open event and close the one file the wrapper observed.
+fn recording_with_a_lost_open(
+    device: &Arc<mock::Recorder>,
+    wait: Duration,
+) -> (FileRecorder, RecordingReport) {
+    let mut recorder = recording_with(
+        device,
+        FileRecorderOptions::new(SourceSpec::new("lost open source").unwrap()).drop_wait(wait),
+    );
+    assert_eq!(
+        recorder.next_event(Duration::ZERO).unwrap().unwrap().kind(),
+        RecorderEventKind::Started
+    );
+    device.dropped_events.store(1, Ordering::Release);
+    device.push(FILE_CLOSED, TAKE);
+    let FinishStatus::Indeterminate(report) = recorder.finish(Duration::ZERO).unwrap() else {
+        panic!("the lost open event prevents confirmation of closure");
+    };
+    assert_eq!(report.closed_files(), 1);
+    assert_eq!(report.dropped_events(), 1);
+    assert!(recorder.reported_current_file().is_none());
+    assert!(!recorder.is_recording());
+    (recorder, report)
+}
+
+#[test]
+fn a_lost_open_still_blocks_restart_after_all_observed_and_hidden_files_close() {
+    let device = mock::Recorder::new(Closing::Never);
+    let (mut recorder, report) = recording_with_a_lost_open(&device, Duration::ZERO);
+    for path in ["hidden.mkv", "another-hidden.mkv"] {
+        device.push(FILE_CLOSED, path);
+        let event = recorder.next_event(Duration::ZERO).unwrap().unwrap();
+        assert_eq!(event.kind(), RecorderEventKind::FileClosed);
+        assert_eq!(event.path().as_bytes(), path.as_bytes());
+        assert!(recorder.next_event(Duration::ZERO).unwrap().is_none());
+        assert_eq!(recorder.report(), report);
+        assert!(matches!(
+            recorder.start(&target("restart-after-loss"), RecordingTimecode::Preserve),
+            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+        ));
+        assert_eq!(device.starts.load(Ordering::Acquire), 1);
+    }
+    assert_eq!(recorder.abandon(), report);
+    assert_eq!(device.stops.load(Ordering::Acquire), 1);
+    assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn drop_spends_its_remaining_budget_after_a_lost_open_even_when_hidden_closes_arrive() {
+    for delayed in [false, true] {
+        // Give the worker a generous scheduling window on loaded CI runners;
+        // the queued case needs no cross-thread event delivery.
+        let budget = if delayed {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(80)
+        };
+        let device = mock::Recorder::new(Closing::Never);
+        let (recorder, _) = recording_with_a_lost_open(&device, budget);
+        let captures = device.captures.load(Ordering::Acquire);
+        let waits = device.waits.load(Ordering::Acquire);
+        let closer = if delayed {
+            let device = Arc::clone(&device);
+            let (ready, started) = std::sync::mpsc::channel();
+            let closer = std::thread::spawn(move || {
+                ready.send(()).unwrap();
+                // Wait until cleanup is actually polling, rather than relying
+                // on the scheduler to deliver a close after a fixed sleep.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while device.waits.load(Ordering::Acquire) == waits
+                    && device.destroys.load(Ordering::Acquire) == 0
+                {
+                    assert!(Instant::now() < deadline, "cleanup never began waiting");
+                    std::thread::yield_now();
+                }
+                assert_eq!(device.destroys.load(Ordering::Acquire), 0);
+                device.push(FILE_CLOSED, "hidden.mkv");
+            });
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            Some(closer)
+        } else {
+            device.push(FILE_CLOSED, "hidden.mkv");
+            None
+        };
+        let began = Instant::now();
+        drop(recorder);
+        assert!(
+            began.elapsed() >= budget,
+            "known-empty incomplete tracking skipped the cleanup budget"
+        );
+        if let Some(closer) = closer {
+            closer.join().unwrap();
+        }
+        assert!(device.captures.load(Ordering::Acquire) > captures);
+        assert!(device.waits.load(Ordering::Acquire) > waits);
+        assert_eq!(device.starts.load(Ordering::Acquire), 1);
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    }
+}
+
+#[test]
+fn a_failed_reset_preserves_the_unknown_file_cleanup_obligation() {
+    let device = mock::Recorder::new(Closing::Never);
+    let (mut recorder, report) = recording_with_a_lost_open(&device, Duration::ZERO);
+    let replacement = mock::Recorder::new(Closing::AtStop);
+    replacement.refuse_creation.store(true, Ordering::Release);
+    replacement.install();
+    assert!(matches!(
+        recorder.reset(&FileRecorderOptions::new(
+            SourceSpec::new("replacement").unwrap(),
+        )),
+        Err(Error::NativeOperationFailed { operation })
+            if operation.name() == c"NDIlib_file_recorder_create"
+    ));
+    assert_eq!(device.destroys.load(Ordering::Acquire), 0);
+    device.push(FILE_CLOSED, "hidden.mkv");
+    recorder.next_event(Duration::ZERO).unwrap().unwrap();
+    assert_eq!(recorder.report(), report);
+    assert!(matches!(
+        recorder.start(
+            &target("restart-after-failed-reset"),
+            RecordingTimecode::Preserve
+        ),
+        Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+    ));
+    assert_eq!(device.starts.load(Ordering::Acquire), 1);
+    assert_eq!(recorder.abandon(), report);
+    assert_eq!(device.stops.load(Ordering::Acquire), 1);
+    assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn zero_budget_drop_drains_hidden_closes_but_abandon_does_not_capture_them() {
+    for abandon in [false, true] {
+        let device = mock::Recorder::new(Closing::Never);
+        let (recorder, report) = recording_with_a_lost_open(&device, Duration::ZERO);
+        device.push(FILE_CLOSED, "hidden.mkv");
+        let captures = device.captures.load(Ordering::Acquire);
+        let waits = device.waits.load(Ordering::Acquire);
+        if abandon {
+            assert_eq!(recorder.abandon(), report);
+            assert_eq!(device.captures.load(Ordering::Acquire), captures);
+        } else {
+            drop(recorder);
+            assert!(device.captures.load(Ordering::Acquire) > captures);
+        }
+        assert_eq!(device.waits.load(Ordering::Acquire), waits);
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    }
+}
+
+#[test]
+fn incomplete_tracking_uses_the_original_drop_budget_even_when_native_stop_is_slow() {
+    let device = mock::Recorder::new(Closing::DuringSlowStop(Duration::from_millis(80)));
+    let mut recorder = recording_with(
+        &device,
+        FileRecorderOptions::new(SourceSpec::new("lost open source").unwrap())
+            .drop_wait(Duration::from_millis(40)),
+    );
+    recorder.next_event(Duration::ZERO).unwrap().unwrap();
+    device.dropped_events.store(1, Ordering::Release);
+    // Observe the loss while recording is still active. Drop must count its
+    // subsequent native stop against the same cleanup budget as event waits.
+    assert!(recorder.next_event(Duration::ZERO).unwrap().is_none());
+    let waits = device.waits.load(Ordering::Acquire);
+    drop(recorder);
+    assert_eq!(device.waits.load(Ordering::Acquire), waits);
+    assert_eq!(device.stops.load(Ordering::Acquire), 1);
+    assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    assert!(device.closed_before_destroy.load(Ordering::Acquire));
+}
+
+#[test]
+fn complete_tracking_needs_no_cleanup_after_every_file_is_confirmed_closed() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    let mut recorder = recording_on(&device);
+    assert!(matches!(
+        recorder.finish(Duration::ZERO).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    device.push(mock::OPEN_FAILED, "outside-the-session.mkv");
+    let captures = device.captures.load(Ordering::Acquire);
+    drop(recorder);
+    assert_eq!(device.captures.load(Ordering::Acquire), captures);
+    assert_eq!(device.stops.load(Ordering::Acquire), 1);
+    assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn evidence_lost_during_the_stale_event_drain_refuses_the_next_native_start() {
+    for evidence in 0..3 {
+        let device = mock::Recorder::new(Closing::AtStop);
+        let mut recorder = recording_on(&device);
+        assert!(matches!(
+            recorder.finish(Duration::ZERO).unwrap(),
+            FinishStatus::Closed(_)
+        ));
+        let report = recorder.report();
+        match evidence {
+            0 => device.push(ROLLOVER, "late-open.mkv"),
+            1 => device.dropped_events.store(1, Ordering::Release),
+            2 => {
+                device.push(ROLLOVER, "unreadable-open.mkv");
+                device.oversize_next_event.store(true, Ordering::Release);
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            recorder.start(
+                &target("restart-after-late-evidence"),
+                RecordingTimecode::Preserve
+            ),
+            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+        ));
+        assert_eq!(device.starts.load(Ordering::Acquire), 1);
+        assert_eq!(recorder.report(), report, "final reports stay immutable");
+        let replacement = mock::Recorder::new(Closing::AtStop);
+        replacement.install();
+        assert_eq!(
+            recorder
+                .reset(&FileRecorderOptions::new(
+                    SourceSpec::new("replacement").unwrap(),
+                ))
+                .unwrap(),
+            report
+        );
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        assert_eq!(
+            recorder
+                .start(
+                    &target("recovered-after-late-evidence"),
+                    RecordingTimecode::Preserve
+                )
+                .unwrap(),
+            2
+        );
+        assert!(matches!(
+            recorder.finish(Duration::ZERO).unwrap(),
+            FinishStatus::Closed(_)
+        ));
+        drop(recorder);
+        assert_eq!(replacement.stops.load(Ordering::Acquire), 1);
+        assert_eq!(replacement.destroys.load(Ordering::Acquire), 1);
+    }
 }
 
 #[test]
@@ -352,6 +629,7 @@ fn an_event_larger_than_this_crate_expects_is_rejected_and_taints_the_session() 
         matches!(outcome, FinishStatus::Indeterminate(_)),
         "{outcome:?}"
     );
+    recorder.abandon();
 }
 
 /// An event of `kind` for the session's file whose format payload this crate
@@ -406,6 +684,7 @@ fn an_unreadable_event_during_finish_makes_the_outcome_indeterminate() {
         "{outcome:?}"
     );
     assert!(!recorder.report().closure_confirmed());
+    recorder.abandon();
 }
 
 #[test]
@@ -834,7 +1113,7 @@ fn the_source_can_be_changed_after_a_session_that_ended_unconfirmed() {
         recorder.finish(Duration::from_secs(1)).unwrap(),
         FinishStatus::Indeterminate(_)
     ));
-    // The session is over, as it is for `start`.
+    // Source selection is still allowed, although another start requires reset.
     recorder
         .set_source(&SourceSpec::new("another source").unwrap())
         .unwrap();
@@ -842,6 +1121,7 @@ fn the_source_can_be_changed_after_a_session_that_ended_unconfirmed() {
         recorder.last_accepted_source().unwrap().name(),
         Some("another source")
     );
+    recorder.abandon();
 }
 
 #[test]

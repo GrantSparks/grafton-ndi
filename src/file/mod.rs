@@ -95,6 +95,13 @@
 //! stop; after it returns, only the remaining budget is available for events.
 //! Synchronous [`FileRecorder::finish`] instead measures its event wait from
 //! the stop's return, giving finalization the full requested wait.
+//! Native event loss, unreadable lifecycle evidence or exhaustion of bounded
+//! file bookkeeping makes tracking incomplete. Cleanup then consumes its
+//! remaining original budget even if every known file closes. Neither an empty
+//! known file set nor a stopped recorder proves that unknown files finalized.
+//! The indeterminate report stays unchanged, and a new session requires
+//! [`FileRecorder::reset`]. Async application-notification eviction does not
+//! affect the separately maintained native file tracking.
 //!
 //! After a finalization timeout, [`FileRecorder::reset`] explicitly abandons
 //! the uncertain session and replaces its native instance. The old report is

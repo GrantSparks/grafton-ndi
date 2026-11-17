@@ -26,6 +26,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Fixed
 
+- Recorder file tracking stays bounded after native event loss and preserves
+  unknown cleanup obligations even after all known files close. Drop and async
+  close consume the remaining original cleanup budget; final reports stay fixed.
 - PNG and JPEG preserve display aspect when partial downscale blocks change
   the output shape, including square-pixel inputs. Required density metadata
   changes encoded bytes without changing pixel dimensions or samples.
@@ -45,6 +48,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- Starting another recording after incomplete file tracking now requires a
+  successful `reset`, even after all known files close; otherwise `start`
+  returns `InvalidState(StateConflict::PreviousSessionOpen)`. See the
+  [migration notes](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/migration/unreleased.md#restarting-a-recorder-after-incomplete-file-tracking).
 - `FrameSyncAudioRequest` rejects invalid rates, counts and payload extents with
   `InvalidInput(InputDefect::Layout(..))`, matching reusable audio requests.
   Frame construction continues to report `InvalidFrame(FrameDefect::Layout(..))`.
