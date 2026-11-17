@@ -211,6 +211,17 @@ calls, including the initial stop, can still block the owner. A successful
 `reset` abandons the old native recorder and ends its pending finish waits with
 `InvalidState(Closed)`; a failed reset preserves those waits.
 
+Submitted `finish` and `wait_for_finish` operations share an independent limit
+of `AsyncFileOptions::command_capacity` waits per recorder, across all clones.
+The limit includes queued waits, registered waits and replies being settled.
+Excess submissions return `QueueFull(QueueLimit::FileFinishWaits)` before
+queueing or requesting a stop. Waiter places are released when outcomes are
+delivered or the owner removes cancelled waits. An accepted finish still
+requests its stop after its future is dropped. Ordinary commands and explicit
+stop requests use their separate command budget; close and abandon bypass both
+budgets. Closed/failed owners and invalid timeouts retain their precedence over
+capacity errors; when both budgets are full, `FileCommands` takes precedence.
+
 Async `wait_for_finish` returns `FileOperation<Option<FinishStatus>>`, with the
 same `None`/`Some` distinction. After an expired wait, await
 `recorder.report()` to inspect the current report. Async `finish` retains

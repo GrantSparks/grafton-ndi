@@ -94,22 +94,31 @@ pub(super) struct RecorderFinish {
 
 /// Preserve the finish driver's single registry while condition waits expose
 /// only settled outcomes. Mapping a reply never starts or queues another job.
+/// Every async response owns its independent waiter place from submission
+/// through settlement or cancellation cleanup. The registry cannot retain an
+/// async response without that admission proof.
 pub(super) enum FinishResponse {
-    Finish(CommandReply<FinishStatus>),
-    Wait(CommandReply<Option<FinishStatus>>),
+    Finish(CommandReply<FinishStatus>, Place),
+    Wait(CommandReply<Option<FinishStatus>>, Place),
 }
 
 impl FinishReply for FinishResponse {
     fn cancelled(&self) -> bool {
         match self {
-            Self::Finish(reply) => reply.cancelled(),
-            Self::Wait(reply) => reply.cancelled(),
+            Self::Finish(reply, _) => reply.cancelled(),
+            Self::Wait(reply, _) => reply.cancelled(),
         }
     }
     fn complete(self, result: Result<FinishStatus>) {
         match self {
-            Self::Finish(reply) => reply.complete(result),
-            Self::Wait(reply) => reply.complete(result.map(FinishStatus::into_wait_outcome)),
+            Self::Finish(reply, place) => {
+                reply.complete(result);
+                drop(place);
+            }
+            Self::Wait(reply, place) => {
+                reply.complete(result.map(FinishStatus::into_wait_outcome));
+                drop(place);
+            }
         }
     }
 }
@@ -118,6 +127,11 @@ impl RecorderOwner {
     #[cfg(test)]
     pub(super) fn pending_finishes(&self) -> usize {
         self.waiters.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish_storage(&self) -> (usize, usize) {
+        (self.waiters.len(), self.waiters.capacity())
     }
 
     pub(super) fn new(recorder: FileRecorder) -> Self {
@@ -326,6 +340,13 @@ mod tests {
     use crate::file::mock::{self, Closing};
     use std::task::Wake;
 
+    fn finish_response(reply: CommandReply<FinishStatus>) -> FinishResponse {
+        let place = Arc::new(Admission::new(1))
+            .admit_for(false, QueueLimit::FileFinishWaits)
+            .unwrap();
+        FinishResponse::Finish(reply, place)
+    }
+
     #[test]
     fn a_dequeued_finish_is_preserved_when_close_wins_the_command_wakeup() {
         let device = mock::Recorder::new(Closing::AtStop);
@@ -349,7 +370,7 @@ mod tests {
             finish: RecorderFinish {
                 deadline: Deadline::after(Duration::from_secs(5)).unwrap(),
                 stop: true,
-                reply: FinishResponse::Finish(reply),
+                reply: finish_response(reply),
             },
             place: Arc::new(Admission::new(1)).admit(true).unwrap(),
         });
@@ -394,7 +415,7 @@ mod tests {
         owner.register_finish(
             Deadline::after(Duration::from_secs(2)).unwrap(),
             true,
-            FinishResponse::Finish(reply),
+            finish_response(reply),
         );
         let control = Arc::new(Control::<RecordingReport>::with_outcome());
         let mut commands = 0;
@@ -527,7 +548,7 @@ mod tests {
         owner.register_finish(
             Deadline::after(Duration::from_secs(30)).unwrap(),
             true,
-            FinishResponse::Finish(reply),
+            finish_response(reply),
         );
         let control = Control::<RecordingReport>::with_outcome();
         control.request_shutdown();
@@ -682,7 +703,7 @@ mod tests {
         owner.register_finish(
             Deadline::after(Duration::ZERO).unwrap(),
             true,
-            FinishResponse::Finish(reply),
+            finish_response(reply),
         );
         owner.settle_at(
             false,
@@ -726,7 +747,7 @@ mod tests {
         let mut owner = RecorderOwner::new(recorder);
         let (reply, finishing) = Arc::new(Control::<RecordingReport>::with_outcome()).command();
         let finishing = FileOperation::live(finishing);
-        owner.register_finish(deadline, true, FinishResponse::Finish(reply));
+        owner.register_finish(deadline, true, finish_response(reply));
         (device, owner, finishing)
     }
 
@@ -762,7 +783,7 @@ mod tests {
         owner.register_finish(
             Deadline::after(Duration::from_secs(30)).unwrap(),
             true,
-            FinishResponse::Finish(reply),
+            finish_response(reply),
         );
         device.dropped_events.store(1, Ordering::Release);
         assert!(owner.poll_native().unwrap().is_none());
@@ -904,7 +925,7 @@ mod tests {
             .is_pending());
         let (reply, later) = Arc::new(Control::<RecordingReport>::with_outcome()).command();
         let later = FileOperation::live(later);
-        owner.register_finish(later_deadline, false, FinishResponse::Finish(reply));
+        owner.register_finish(later_deadline, false, finish_response(reply));
         let events = EventQueue::new(16);
         let control = Control::<RecordingReport>::with_outcome();
         owner.settle_at(false, &events, &control, false, at);

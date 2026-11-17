@@ -4,6 +4,7 @@ std::thread_local! {
     static TEST_ALLOCATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static FAIL_ALLOCATIONS_AT_LEAST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static TEST_BYTES: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+    static DEALLOCATION_OBSERVER: std::cell::Cell<Option<fn(std::alloc::Layout)>> = const { std::cell::Cell::new(None) };
 }
 fn record_bytes(added: usize, removed: usize) {
     let _ = TEST_BYTES.try_with(|bytes| {
@@ -53,6 +54,11 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
     }
     unsafe fn dealloc(&self, p: *mut u8, layout: std::alloc::Layout) {
         record_bytes(0, layout.size());
+        let _ = DEALLOCATION_OBSERVER.try_with(|observer| {
+            if let Some(observe) = observer.get() {
+                observe(layout);
+            }
+        });
         unsafe { std::alloc::System.dealloc(p, layout) }
     }
 }
@@ -91,6 +97,24 @@ pub(crate) fn allocation_count<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let count = TEST_ALLOCATIONS.with(|count| count.get().unwrap());
     drop(reset);
     (value, count)
+}
+
+/// Observe this thread's deallocations during `f`, restoring an outer observer
+/// even on unwind. The callback must neither allocate nor deallocate or panic.
+pub(crate) fn observe_deallocations<T>(
+    observe: fn(std::alloc::Layout),
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<fn(std::alloc::Layout)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DEALLOCATION_OBSERVER.with(|observer| observer.set(self.0));
+        }
+    }
+    let reset = Reset(DEALLOCATION_OBSERVER.with(|observer| observer.replace(Some(observe))));
+    let result = f();
+    drop(reset);
+    result
 }
 
 /// Refuse large allocations only on this test thread, restoring the previous

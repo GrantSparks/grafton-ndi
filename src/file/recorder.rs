@@ -411,6 +411,11 @@ impl<R: FinishReply> FinishWaiters<R> {
     pub(super) fn len(&self) -> usize {
         self.waiters.len()
     }
+
+    #[cfg(test)]
+    pub(super) fn capacity(&self) -> usize {
+        self.waiters.capacity()
+    }
     pub(super) fn is_empty(&self) -> bool {
         self.waiters.is_empty()
     }

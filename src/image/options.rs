@@ -124,10 +124,14 @@ impl ImageFormat {
 /// # Ok::<(), grafton_ndi::Error>(())
 /// ```
 ///
-/// PNG and JPEG preserve a non-square picture aspect in relative pixel-density
-/// tags (PNG pHYs and JPEG JFIF). Viewers may ignore these tags. Pixel dimensions
-/// and samples are unchanged; square-pixel frames stay untagged. WebP carries no
-/// pixel-shape tag. Extreme ratios use the nearest positive u16 density pair.
+/// PNG and JPEG preserve picture aspect in relative pixel-density tags (PNG
+/// pHYs and JPEG JFIF) whenever the output needs non-square pixels. This includes
+/// square-pixel sources whose partial downscale blocks change the stored
+/// width/height ratio. Pixel dimensions and samples are unchanged. Outputs
+/// needing square pixels retain their default density behavior; equivalent
+/// implicit and explicit square-pixel sources produce identical bytes. Viewers
+/// may ignore these tags. WebP carries no pixel-shape tag. Extreme ratios use
+/// the nearest positive u16 density pair.
 ///
 /// # Formats
 ///

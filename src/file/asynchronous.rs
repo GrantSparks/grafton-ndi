@@ -38,6 +38,9 @@ use std::{
 mod owners;
 use owners::{FinishResponse, PlayerOwner, RecorderFinish, RecorderOwner};
 
+#[cfg(test)]
+mod finish_admission_tests;
+
 /// How long the owner thread waits for a command between event pumps.
 const TICK: Duration = Duration::from_millis(10);
 
@@ -70,7 +73,8 @@ fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// The sizes of the queues between an async handle and its owner thread.
 ///
-/// The default holds 64 pending commands and 256 undelivered events. Each
+/// The default holds 64 pending commands and 256 undelivered events. A recorder
+/// separately admits up to 64 pending finalization waits. Each
 /// capacity must be from 1 through 4096; the `create_with_options`
 /// functions of [`AsyncFilePlayer`] and [`AsyncFileRecorder`] refuse any
 /// other with [`Error::InvalidInput`].
@@ -112,6 +116,15 @@ impl AsyncFileOptions {
     /// [`QueueLimit::FileCommands`]. A request to stop is the exception: one
     /// is accepted beyond a full queue, so that a stop is not lost for want of
     /// room; see [`FileOperation`].
+    ///
+    /// For recorders, this also sets an independent limit on submitted
+    /// [`finish`](AsyncFileRecorder::finish) and
+    /// [`wait_for_finish`](AsyncFileRecorder::wait_for_finish) waits, including
+    /// queued, registered and settling waits. A full wait budget reports
+    /// [`QueueLimit::FileFinishWaits`], while ordinary commands, stop requests,
+    /// close and abandon keep their own admission rules. Cancelling a submitted
+    /// wait restores its place when the owner removes it; an accepted finish
+    /// still requests the stop.
     #[must_use]
     pub fn command_capacity(mut self, capacity: usize) -> Self {
         self.command_capacity = capacity;
@@ -285,6 +298,16 @@ enum Stage<T> {
 /// refused like any other command, so the queue never holds more than its
 /// capacity and one. [`close`](AsyncFileRecorder::close) does not use the
 /// queue.
+///
+/// Recorder `finish` and `wait_for_finish` submissions also share an independent
+/// budget of `command_capacity` pending waits. Their waiter place lasts through
+/// queueing, registration and settlement; their command place is released when
+/// the command starts. A full waiter budget refuses the submission with
+/// [`QueueLimit::FileFinishWaits`] before it enters the queue. It does not use
+/// command places, including the reserved stop place. Closed/failed owners and
+/// invalid timeouts take precedence; when both budgets are full,
+/// [`QueueLimit::FileCommands`] takes precedence. Close and abandon bypass both
+/// budgets.
 ///
 /// # Errors
 ///
@@ -1331,14 +1354,15 @@ impl<H: Owner> Job<H> {
     }
 }
 
-/// Admission to an owner thread's command queue: how many commands wait, and
-/// how many may.
+/// A bounded budget whose places move with the work that owns them. Command
+/// queues release places when commands start; finish replies retain separate
+/// places until settlement or cancellation cleanup.
 ///
-/// Every queued command counts, requests to stop included. When the queue is
+/// For command admission, every queued command counts, requests to stop included. When the queue is
 /// full, one request to stop is admitted beyond it, so that a stop is not
 /// lost for want of room; while it waits, a further request to stop is
 /// refused like any other command. The queue therefore never holds more than
-/// `capacity + 1` commands.
+/// `capacity + 1` commands. Waiter admission never uses this reserved stop place.
 struct Admission {
     // The low bit owns the extra stop place; the remaining bits count normal
     // places. One atomic word makes admission and release of either kind
@@ -1362,6 +1386,10 @@ impl Admission {
     /// [`Error::QueueFull`] with [`QueueLimit::FileCommands`] when the queue
     /// is full and, for a request to stop, another one already waits beyond it.
     fn admit(self: &Arc<Self>, stop: bool) -> Result<Place> {
+        self.admit_for(stop, QueueLimit::FileCommands)
+    }
+
+    fn admit_for(self: &Arc<Self>, stop: bool, limit: QueueLimit) -> Result<Place> {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
             let (next, reserve) = if state >> 1 < self.capacity {
@@ -1369,7 +1397,7 @@ impl Admission {
             } else if stop && state & 1 == 0 {
                 (state | 1, true)
             } else {
-                return Err(Error::QueueFull(QueueLimit::FileCommands));
+                return Err(Error::QueueFull(limit));
             };
             match self
                 .state
@@ -1387,8 +1415,9 @@ impl Admission {
     }
 }
 
-/// A command's place in the queue. It is given up when the command starts, or
-/// when the command is dropped without running.
+/// A move-only place in one admission budget. Queued commands give theirs up
+/// when they start or are dropped; finish replies keep theirs through queueing,
+/// registration and settlement, or until cancelled work is removed.
 struct Place {
     admission: Arc<Admission>,
     /// The place is the one beyond the capacity.
@@ -1411,6 +1440,9 @@ impl Drop for Place {
 struct Worker<H: Owner> {
     sender: Sender<Job<H>>,
     admission: Arc<Admission>,
+    // Independent from queued commands: registered recorder waits must not
+    // consume the places that keep status, controls and shutdown responsive.
+    finish_admission: Arc<Admission>,
     control: Arc<Control<H::Closed>>,
     events: Arc<EventQueue<H::Event>>,
     // JoinHandle's shared return packet is not RefUnwindSafe. This owner
@@ -1544,6 +1576,17 @@ impl<H: Owner> Worker<H> {
             Ok(place) => place,
             Err(error) => return Live::failed(error),
         };
+        Self::deliver(sender, control, place, build)
+    }
+
+    /// Deliver an admitted command. Finish requests reserve their independent
+    /// waiter place before allocating the reply or entering the command queue.
+    fn deliver<T>(
+        sender: &Sender<Job<H>>,
+        control: &Arc<Control<H::Closed>>,
+        place: Place,
+        build: impl FnOnce(CommandReply<T, H::Closed>, Place) -> Job<H>,
+    ) -> Live<T> {
         let (reply, future) = control.command();
         if sender.send(build(reply, place)).is_err() {
             return Live::failed(stopped(control.failed()));
@@ -1664,6 +1707,7 @@ fn spawn_prepared_owner_now<H: Owner, T: Send + 'static>(
     let worker = Arc::new(Worker {
         sender,
         admission: Arc::new(Admission::new(options.command_capacity)),
+        finish_admission: Arc::new(Admission::new(options.command_capacity)),
         control: Arc::clone(&control),
         events: Arc::clone(&events),
         thread: OnceLock::new(),
@@ -2231,6 +2275,12 @@ impl AsyncFileRecorder {
     /// and waits from every clone between event bursts. A native call such as
     /// the stop itself may still block that thread. Each concurrent wait keeps
     /// its own submission deadline and observes the same session report.
+    /// Submitted finish and condition waits share a separate budget of
+    /// [`AsyncFileOptions::command_capacity`] places. When it is full, a new
+    /// submission fails with [`Error::QueueFull`] and
+    /// [`QueueLimit::FileFinishWaits`] before requesting a stop. Drop or await
+    /// existing waits to restore admission; cancellation is reclaimed by the
+    /// owner. Ordinary commands and explicit stop requests remain available.
     ///
     /// If another clone closes the recorder during the wait, this wait ends
     /// at [`FileRecorderOptions::drop_wait`] from that close's
@@ -2265,6 +2315,8 @@ impl AsyncFileRecorder {
     /// [`finish`](Self::finish); other commands and waits continue running.
     /// A concurrent close bounds the wait and can
     /// return [`StateConflict::Closed`] on the same terms as `finish`.
+    /// It shares `finish`'s independent pending-wait limit and can report
+    /// [`Error::QueueFull`] with [`QueueLimit::FileFinishWaits`].
     ///
     /// # Errors
     ///
@@ -2298,10 +2350,11 @@ impl AsyncFileRecorder {
         &self,
         timeout: Duration,
         stop: bool,
-        finish_response: fn(CommandReply<T>) -> FinishResponse,
+        finish_response: fn(CommandReply<T>, Place) -> FinishResponse,
     ) -> FileOperation<T> {
         let sender = self.worker.sender.clone();
         let admission = Arc::clone(&self.worker.admission);
+        let finish_admission = Arc::clone(&self.worker.finish_admission);
         let control = Arc::clone(&self.worker.control);
         FileOperation::deferred(move || {
             // Start at submission, including contention with another close or
@@ -2313,15 +2366,23 @@ impl AsyncFileRecorder {
                     Ok(deadline) => deadline,
                     Err(error) => return Live::failed(error),
                 };
-                Worker::enqueue(&sender, &admission, &control, stop, |reply, place| {
-                    Job::Finish {
-                        finish: RecorderFinish {
-                            deadline,
-                            stop,
-                            reply: finish_response(reply),
-                        },
-                        place,
-                    }
+                // Preserve command-refusal precedence when both budgets are
+                // full. Neither refusal allocates a reply or queues work.
+                let place = match admission.admit(stop) {
+                    Ok(place) => place,
+                    Err(error) => return Live::failed(error),
+                };
+                let waiter = match finish_admission.admit_for(false, QueueLimit::FileFinishWaits) {
+                    Ok(waiter) => waiter,
+                    Err(error) => return Live::failed(error),
+                };
+                Worker::deliver(&sender, &control, place, |reply, place| Job::Finish {
+                    finish: RecorderFinish {
+                        deadline,
+                        stop,
+                        reply: finish_response(reply, waiter),
+                    },
+                    place,
                 })
             })
         })
@@ -2672,6 +2733,7 @@ mod tests {
             let worker = Arc::new(Worker::<BurstOwner> {
                 sender,
                 admission: Arc::new(Admission::new(1)),
+                finish_admission: Arc::new(Admission::new(1)),
                 control: Arc::clone(&control),
                 events: Arc::clone(&events),
                 thread: OnceLock::new(),
@@ -2797,7 +2859,7 @@ mod tests {
     }
 
     /// Hold the owner until the test has registered its futures' wakers.
-    fn block_owner<H: Owner>(worker: &Worker<H>) -> (FileOperation<()>, Sender<()>) {
+    pub(super) fn block_owner<H: Owner>(worker: &Worker<H>) -> (FileOperation<()>, Sender<()>) {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let blocked = worker
@@ -3484,7 +3546,7 @@ mod tests {
         mock_recorder_with_drop_wait(closing, options, Duration::from_secs(5))
     }
 
-    fn mock_recorder_with_drop_wait(
+    pub(super) fn mock_recorder_with_drop_wait(
         closing: Closing,
         options: AsyncFileOptions,
         drop_wait: Duration,
@@ -3675,6 +3737,7 @@ mod tests {
                 let waiting = recorder.wait_for_finish(Duration::from_secs(30)).submit();
                 let ordinary = recorder.is_recording().submit();
                 let admission = Arc::clone(&recorder.worker.admission);
+                let finish_admission = Arc::clone(&recorder.worker.finish_admission);
                 let control = Arc::clone(&recorder.worker.control);
                 let started = Instant::now();
                 if last_drop {
@@ -3712,6 +3775,7 @@ mod tests {
                 }
                 closed(block_on(ordinary));
                 assert_eq!(admission.state.load(Ordering::Acquire), 0);
+                assert_eq!(finish_admission.state.load(Ordering::Acquire), 0);
                 assert_eq!(device.stops.load(Ordering::Acquire), 1);
                 assert_eq!(device.destroys.load(Ordering::Acquire), 1);
             }
@@ -3824,6 +3888,7 @@ mod tests {
         let control = Arc::clone(&recorder.worker.control);
         let sender = recorder.worker.sender.clone();
         let place = recorder.worker.admission.admit(true).unwrap();
+        let waiter = recorder.worker.finish_admission.admit(false).unwrap();
         let (reply, finishing) = control.command();
         let (entered, admitted) = mpsc::channel();
         let (release_submission, proceed) = mpsc::channel();
@@ -3840,7 +3905,7 @@ mod tests {
                             finish: RecorderFinish {
                                 deadline: Deadline::after(Duration::from_secs(5)).unwrap(),
                                 stop: true,
-                                reply: FinishResponse::Finish(reply),
+                                reply: FinishResponse::Finish(reply, waiter),
                             },
                             place,
                         })
@@ -3901,6 +3966,14 @@ mod tests {
         owner_failed(block_on(recorder.state()));
         owner_failed(block_on(recorder.finish(Duration::ZERO)));
         owner_failed(block_on(recorder.close()));
+        assert_eq!(
+            recorder
+                .worker
+                .finish_admission
+                .state
+                .load(Ordering::Acquire),
+            0
+        );
     }
 
     /// Wait until the owner thread has stopped `device`'s session.
@@ -3912,7 +3985,14 @@ mod tests {
         }
     }
 
-    fn await_finish(recorder: &AsyncFileRecorder) {
+    pub(super) fn await_finish(recorder: &AsyncFileRecorder) {
+        // A one-place command queue may still hold the finish itself. Wait
+        // for its command place before enqueueing this registration barrier.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while recorder.worker.admission.state.load(Ordering::Acquire) != 0 {
+            assert!(Instant::now() < deadline, "finish command never started");
+            thread::yield_now();
+        }
         // A following command proves registration returned to the pump. No
         // native blocking capture is needed to keep a finish pending.
         assert!(block_on(recorder.worker.call(|owner| Ok(owner.pending_finishes()))).unwrap() > 0);
@@ -3932,6 +4012,76 @@ mod tests {
         assert_eq!(device.waits.load(Ordering::Acquire), 0);
         drop(finishing);
         block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual saturated finish-wait allocation and bookkeeping measurement"]
+    fn finish_wait_saturation_measurement() {
+        const ATTEMPTS: usize = 16_384;
+        let (device, recorder) = mock_recorder_with_drop_wait(
+            Closing::Never,
+            AsyncFileOptions::new().command_capacity(1),
+            Duration::ZERO,
+        );
+        let pending = recorder.finish(crate::MAX_TIMEOUT).submit();
+        await_finish(&recorder);
+        let before = block_on(recorder.worker.call(|owner| Ok(owner.finish_storage()))).unwrap();
+        for batch in 0..4 {
+            let started = Instant::now();
+            let (((), allocations), peak) = crate::test_alloc::peak_bytes(|| {
+                crate::test_alloc::allocation_count(|| {
+                    for _ in 0..ATTEMPTS {
+                        assert!(matches!(
+                            block_on(recorder.wait_for_finish(crate::MAX_TIMEOUT)),
+                            Err(Error::QueueFull(QueueLimit::FileFinishWaits))
+                        ));
+                    }
+                })
+            });
+            let elapsed = started.elapsed();
+            let events = Arc::clone(&recorder.worker.events);
+            let control = Arc::clone(&recorder.worker.control);
+            let (storage, bookkeeping_allocations, bookkeeping_time) =
+                block_on(recorder.worker.call(move |owner| {
+                    let started = Instant::now();
+                    let (_, allocations) = crate::test_alloc::allocation_count(|| {
+                        for _ in 0..ATTEMPTS {
+                            let _ = owner.wait_timeout();
+                            owner.after_events(true, &events, &control);
+                        }
+                    });
+                    Ok((owner.finish_storage(), allocations, started.elapsed()))
+                }))
+                .unwrap();
+            assert_eq!(storage, before, "saturation must not grow registry storage");
+            assert_eq!(storage.0, 1);
+            assert_eq!(
+                recorder
+                    .worker
+                    .finish_admission
+                    .state
+                    .load(Ordering::Acquire),
+                2
+            );
+            assert_eq!(device.waits.load(Ordering::Acquire), 0);
+            println!(
+                "finish saturation batch={batch} attempts={ATTEMPTS} registry_len={} registry_capacity={} submission_allocations={allocations} submission_peak_bytes={peak} submission_time_us={} bookkeeping_allocations={bookkeeping_allocations} bookkeeping_time_us={}",
+                storage.0,
+                storage.1,
+                elapsed.as_micros(),
+                bookkeeping_time.as_micros(),
+            );
+        }
+        drop(pending);
+        block_on(recorder.close()).unwrap();
+        assert_eq!(
+            recorder
+                .worker
+                .finish_admission
+                .state
+                .load(Ordering::Acquire),
+            0
+        );
     }
 
     #[test]
@@ -4048,6 +4198,14 @@ mod tests {
         let options = FileRecorderOptions::new(SourceSpec::new("replacement").unwrap());
         assert!(block_on(recorder.reset(&options)).is_err());
         assert!(!finishing.is_completed());
+        assert_eq!(
+            recorder
+                .worker
+                .finish_admission
+                .state
+                .load(Ordering::Acquire),
+            2
+        );
         replacement.refuse_creation.store(false, Ordering::Release);
         let installed = Arc::clone(&replacement);
         block_on(recorder.worker.call(move |_| {
@@ -4056,6 +4214,14 @@ mod tests {
         }))
         .unwrap();
         block_on(recorder.reset(&options)).unwrap();
+        assert_eq!(
+            recorder
+                .worker
+                .finish_admission
+                .state
+                .load(Ordering::Acquire),
+            0
+        );
         assert!(matches!(
             block_on(finishing),
             Err(Error::InvalidState(StateConflict::Closed))
@@ -4302,6 +4468,14 @@ mod tests {
             block_on(recorder.close()),
             Err(Error::InvalidState(StateConflict::OwnerFailed))
         ));
+        assert_eq!(
+            recorder
+                .worker
+                .finish_admission
+                .state
+                .load(Ordering::Acquire),
+            0
+        );
     }
 
     #[test]
@@ -4860,6 +5034,14 @@ mod tests {
         assert_eq!(device.stops.load(Ordering::Acquire), 1);
         assert_eq!(device.destroys.load(Ordering::Acquire), 1);
         assert_eq!(recorder.worker.admission.state.load(Ordering::Acquire), 0);
+        assert_eq!(
+            recorder
+                .worker
+                .finish_admission
+                .state
+                .load(Ordering::Acquire),
+            0
+        );
     }
 
     #[test]

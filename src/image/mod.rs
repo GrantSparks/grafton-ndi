@@ -486,15 +486,22 @@ struct PixelDensity {
 impl PixelDensity {
     fn for_source(source: &Source<'_>, width: u32, height: u32) -> Option<Self> {
         let aspect = f64::from(source.aspect.get());
-        // Zero explicitly requests square pixels. Explicit square-pixel ratios
-        // also stay untagged, including rounding from the SDK's f32 field.
+        // Normalize the square-pixel sentinel and equivalent explicit ratios,
+        // including rounding from the SDK's f32 field, to one display aspect.
         let source_pixel_aspect = aspect * source.height as f64 / source.width as f64;
-        if aspect == 0.0 || (source_pixel_aspect - 1.0).abs() <= f64::from(f32::EPSILON) {
+        let aspect =
+            if aspect == 0.0 || (source_pixel_aspect - 1.0).abs() <= f64::from(f32::EPSILON) {
+                source.width as f64 / source.height as f64
+            } else {
+                aspect
+            };
+        // Use the actual reduced shape: ceil division can change the stored
+        // width/height ratio even for a square-pixel source. Only a square
+        // output can omit the density correction.
+        let pixel_aspect = aspect * height as f64 / width as f64;
+        if (pixel_aspect - 1.0).abs() <= f64::from(f32::EPSILON) {
             return None;
         }
-        // Use the actual reduced shape: ceil division can change the stored
-        // width/height ratio when the final reduction block is partial.
-        let pixel_aspect = aspect * height as f64 / width as f64;
         let maximum = f64::from(u16::MAX);
         let (x, y) = if pixel_aspect >= 1.0 {
             (

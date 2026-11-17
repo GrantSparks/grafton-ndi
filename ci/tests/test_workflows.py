@@ -404,6 +404,9 @@ MIRI_BATCHES = {
         'advanced::sync::tests::borrowed_avsync_audio',
     ],
     'ownership': [
+        'finder::cache_retirement_tests::retirement_',
+        'finder::cache_retirement_tests::snapshot_remains_live_',
+        'finder::tests::invalidation_prevents_pending_lookup_',
         'advanced::kvm::ownership_tests::',
         'advanced::reserved_map::tests::',
         'advanced::send_slots::tests::',

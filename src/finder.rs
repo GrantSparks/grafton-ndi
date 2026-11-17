@@ -2,6 +2,9 @@
 
 mod budget;
 
+#[cfg(test)]
+mod cache_retirement_tests;
+
 #[cfg(ndi_test_finder_snapshot_guard)]
 #[path = "../tests/ui/internal/finder_snapshot_guard.rs"]
 mod snapshot_guard_contract;
@@ -1750,8 +1753,9 @@ impl Display for Source {
 /// spellings share an entry. Other spellings, including DNS aliases, remain
 /// distinct identities.
 ///
-/// The cache is `Send + Sync`. Discovery runs outside its mutex so unrelated
-/// lookups and invalidation remain available; SDK snapshots retain their normal
+/// The cache is `Send + Sync`. Discovery, descriptor copies and retired entry
+/// destruction run outside its mutex so unrelated lookups and invalidation
+/// remain available; SDK snapshots retain their normal
 /// per-finder serialization. Returned vectors own copies of the descriptors.
 /// Concurrent discovery waits share change reports through that finder, so
 /// one lookup cannot consume another lookup's notification.
@@ -2052,23 +2056,35 @@ impl CachedSources {
     }
 
     fn invalidate(&self, host: &str) {
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.invalidate_pending();
-        if let Some(query) = HostQuery::parse(host) {
-            cache.entries.remove(HostKeyBuffer::new(query).as_str());
-        }
+        let retired = {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.invalidate_pending();
+            HostQuery::parse(host).and_then(|query| {
+                cache
+                    .entries
+                    .remove_entry(HostKeyBuffer::new(query).as_str())
+            })
+        };
+        // Transfer the complete entry, including its key, before reclaiming
+        // strings or the final snapshot owner. Readers only wait for removal.
+        drop(retired);
     }
 
     fn clear(&self) {
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.invalidate_pending();
-        cache.entries.clear();
+        let retired = {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.invalidate_pending();
+            std::mem::take(&mut cache.entries)
+        };
+        // Detaching the map is constant-sized and allocation-free. Reclaim its
+        // entries and high-water bucket storage after releasing the mutex.
+        drop(retired);
     }
 
     fn len(&self) -> usize {
