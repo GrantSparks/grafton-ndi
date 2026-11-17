@@ -250,20 +250,45 @@ mod ownership {
     /// may share, and the asynchronous video pipeline that sends through it.
     pub struct Shared {
         pub(super) video: VideoPipeline,
-        pub(super) owner: Arc<SenderResource>,
     }
 
     impl NativeOwner for Shared {
         fn resource(&self) -> &SenderResource {
-            &self.owner
+            self.video.resource()
         }
 
         fn new(resource: SenderResource) -> Self {
-            let owner = Arc::new(resource);
             Self {
-                video: VideoPipeline::new(Arc::clone(&owner)),
-                owner,
+                video: VideoPipeline::new(Arc::new(resource)),
             }
+        }
+    }
+
+    impl Shared {
+        pub(super) fn native_owner(&self) -> Arc<SenderResource> {
+            self.video.native_owner()
+        }
+
+        #[cfg(all(feature = "advanced", ndi_has_advanced_send_completion))]
+        #[allow(clippy::result_large_err)]
+        pub(super) fn into_exclusive(
+            self,
+        ) -> std::result::Result<(SenderResource, Option<VideoFrame>), Self> {
+            let this = std::mem::ManuallyDrop::new(self);
+            // SAFETY: Shared has exactly one field. Suppressing its destructor
+            // transfers that field exactly once, without flushing it. The
+            // pipeline either becomes Shared again on refusal, or synchronizes
+            // all native loans before returning its exclusive resource.
+            let video = unsafe { ptr::read(&this.video) };
+            video.into_exclusive().map_err(|video| Self { video })
+        }
+    }
+
+    impl Drop for Shared {
+        fn drop(&mut self) {
+            // Advertisements may retain the native resource, so drain this
+            // pipeline while its owner and every pointee remain live.
+            self.video.flush_on_drop();
         }
     }
 
@@ -468,6 +493,14 @@ pub(crate) mod in_flight {
             }
         }
 
+        pub(super) fn resource(&self) -> &SenderResource {
+            &self.owner
+        }
+
+        pub(super) fn native_owner(&self) -> Arc<SenderResource> {
+            Arc::clone(&self.owner)
+        }
+
         fn synchronize<R>(&self, call: impl FnOnce(VideoPair<'_>) -> R) -> R {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             call(state.paired(self.owner.handle()))
@@ -522,8 +555,23 @@ pub(crate) mod in_flight {
         }
 
         #[cfg(all(feature = "advanced", ndi_has_advanced_send_completion))]
-        pub(super) fn retire(mut self) -> Option<VideoFrame> {
-            self.finish()
+        #[allow(clippy::result_large_err)]
+        pub(super) fn into_exclusive(
+            self,
+        ) -> std::result::Result<(SenderResource, Option<VideoFrame>), Self> {
+            let Self { owner, state } = self;
+            match Arc::try_unwrap(owner) {
+                Ok(resource) => {
+                    let mut state = state.into_inner().unwrap_or_else(|e| e.into_inner());
+                    let retained = state.paired(resource.handle()).finish();
+                    Ok((resource, retained))
+                }
+                Err(owner) => Err(Self { owner, state }),
+            }
+        }
+
+        pub(super) fn flush_on_drop(&mut self) {
+            self.exclusive().stream.flush();
         }
     }
 
@@ -559,14 +607,6 @@ pub(crate) mod in_flight {
             self.stream.flush();
             *self.spare = None;
             self.stream.slot.take_retained().map(Sendable::into_frame)
-        }
-    }
-
-    impl Drop for VideoPipeline {
-        fn drop(&mut self) {
-            // Advertisements may retain the native resource, so drain this
-            // pipeline while its own owner and every pointee remain live.
-            self.exclusive().stream.flush();
         }
     }
 
@@ -1896,7 +1936,7 @@ impl Sender {
     /// that hold a sender in another mode free what the SDK reads once their
     /// native sender is gone, so it must not outlive them.
     pub(crate) fn native_owner(&self) -> Arc<SenderResource> {
-        Arc::clone(&self.native.owner)
+        self.native.native_owner()
     }
 
     /// The same native sender in mode `T`, which owns it exclusively, and the
@@ -1920,21 +1960,19 @@ impl Sender {
     {
         let Self {
             inner,
-            native: Shared { video, owner },
+            native,
             _mode,
         } = self;
-        // Shared owns exactly two references: its owner and the pipeline's.
-        // With no other reference, no registration can create another one.
-        if Arc::strong_count(&owner) != 2 {
-            return Err(Self {
-                inner,
-                native: Shared { video, owner },
-                _mode,
-            });
-        }
-        let retained = video.retire();
-        let resource =
-            Arc::try_unwrap(owner).unwrap_or_else(|_| unreachable!("exclusive pipeline owner"));
+        let (resource, retained) = match native.into_exclusive() {
+            Ok(exclusive) => exclusive,
+            Err(native) => {
+                return Err(Self {
+                    inner,
+                    native,
+                    _mode,
+                });
+            }
+        };
         let sender = Sender {
             inner,
             native: Exclusive(resource),
@@ -2793,7 +2831,7 @@ mod tests {
                 assert!(panic.is_err());
             }
             "normal" => drop(frame.unwrap()),
-            _ => unreachable!(),
+            _ => panic!("unknown metadata guard test path"),
         }
         assert_eq!(observation.frees.load(Ordering::Relaxed), 1);
         assert!(!observation.released_early.load(Ordering::Relaxed));
