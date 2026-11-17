@@ -23,7 +23,7 @@ mod build_apple;
 #[allow(dead_code)]
 mod build_support;
 
-use build_support::{Edition, Sdk, StaticTarget};
+use build_support::{Sdk, StaticTarget};
 
 fn main() {
     for path in [
@@ -112,19 +112,13 @@ fn main() {
         let sdk = sdk.as_ref().unwrap_or_else(|| {
             panic!("{target} links the NDI SDK statically; set NDI_SDK_DIR to the Apple SDK")
         });
-        let edition = link_static(sdk, static_target, advanced_declarations.as_deref(), &out);
-        println!("cargo:rustc-env=GRAFTON_NDI_EDITION={}", edition.as_str());
+        link_static(sdk, static_target, advanced_declarations.as_deref(), &out);
     }
 }
 
 /// Select, validate and link the vendor archive, and write the static
-/// provider's symbol map. Returns the archive's edition.
-fn link_static(
-    sdk: &Sdk,
-    target: &StaticTarget,
-    advanced_declarations: Option<&str>,
-    out: &Path,
-) -> Edition {
+/// provider's symbol map and edition.
+fn link_static(sdk: &Sdk, target: &StaticTarget, advanced_declarations: Option<&str>, out: &Path) {
     let library =
         build_support::static_library(sdk, target, env::var_os("CARGO_FEATURE_FILE_IO").is_some())
             .unwrap_or_else(|error| panic!("{error}"));
@@ -188,10 +182,10 @@ fn link_static(
     if let Some(advanced) = advanced_declarations {
         declarations.push(("crate::sys::advanced_declarations", advanced));
     }
-    let symbols = build_support::static_symbol_map(&declarations, &archive.symbols)
-        .unwrap_or_else(|error| panic!("{error}"));
+    let symbols =
+        build_support::static_symbol_map(&declarations, &archive.symbols, library.edition)
+            .unwrap_or_else(|error| panic!("{error}"));
     fs::write(out.join("ndi_static_symbols.rs"), symbols).expect("Write static symbol map");
-    library.edition
 }
 
 /// Whether `value` (`major[.minor[.patch]]`) is a valid version at or above

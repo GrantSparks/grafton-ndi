@@ -122,9 +122,25 @@ fn an_sdk_is_optional_but_an_explicit_root_must_be_one() {
 }
 
 #[test]
-fn a_static_edition_is_embedded_in_the_spelling_the_loader_reads() {
-    assert_eq!(Edition::Standard.as_str(), "standard");
-    assert_eq!(Edition::Advanced.as_str(), "advanced");
+fn the_selected_static_archives_generate_typed_runtime_editions() {
+    let sdk = Sdk::new("generated-edition");
+    let declarations = [("crate::sys", "pub fn NDIlib_initialize() -> bool;")];
+    let exports = HashSet::from(["NDIlib_initialize".to_owned()]);
+    for (archive, variant) in [
+        ("lib/iOS/libndi_ios.a", "Standard"),
+        ("lib/iOS/libndi_advanced_ios.a", "Advanced"),
+    ] {
+        sdk.artifact(archive);
+        let selected =
+            build_support::static_library(&sdk.located(), apple_target("ios", "aarch64"), false)
+                .unwrap();
+        let source =
+            build_support::static_symbol_map(&declarations, &exports, selected.edition).unwrap();
+        assert!(source.contains(&format!(
+            "const LINKED_EDITION: SdkEdition = SdkEdition::{variant};"
+        )));
+        syn::parse_file(&source).unwrap();
+    }
 }
 
 #[test]
@@ -493,6 +509,7 @@ fn static_map_requires_both_a_declaration_and_an_actual_archive_export() {
             "NDIlib_advanced",
             "NDIlib_not_declared",
         ]),
+        Edition::Standard,
     )
     .unwrap();
     assert!(map.contains("b\"NDIlib_initialize\" => Some(crate::a::NDIlib_initialize as"));
@@ -500,8 +517,12 @@ fn static_map_requires_both_a_declaration_and_an_actual_archive_export() {
     assert!(!map.contains("NDIlib_optional"));
     assert!(!map.contains("NDIlib_not_declared"));
 
-    let error = build_support::static_symbol_map(&declarations, &exports(&["NDIlib_advanced"]))
-        .unwrap_err();
+    let error = build_support::static_symbol_map(
+        &declarations,
+        &exports(&["NDIlib_advanced"]),
+        Edition::Standard,
+    )
+    .unwrap_err();
     assert!(error.contains("NDIlib_initialize"), "{error}");
 }
 

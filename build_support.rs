@@ -83,16 +83,6 @@ pub enum Edition {
     Advanced,
 }
 
-impl Edition {
-    /// The spelling embedded into the crate.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::Advanced => "advanced",
-        }
-    }
-}
-
 /// Find the one directory named `lowercase` or `uppercase` under `root`.
 ///
 /// Casing belongs to the installation layout, not to the target operating
@@ -355,7 +345,7 @@ pub fn declared_functions(bindings: &str) -> BTreeSet<&str> {
         .collect()
 }
 
-/// Rust source for `linked_address`, the static provider's name-to-address map.
+/// Rust source for the static provider's edition and name-to-address map.
 ///
 /// `declarations` pairs a module path with that module's bindgen output. Only
 /// functions the linked archive actually defines are referenced, so an older
@@ -363,7 +353,12 @@ pub fn declared_functions(bindings: &str) -> BTreeSet<&str> {
 pub fn static_symbol_map(
     declarations: &[(&str, &str)],
     exports: &HashSet<String>,
+    edition: Edition,
 ) -> Result<String, String> {
+    let edition = match edition {
+        Edition::Standard => "SdkEdition::Standard",
+        Edition::Advanced => "SdkEdition::Advanced",
+    };
     let mut mapped = BTreeSet::new();
     let mut arms = String::new();
     for (module, bindings) in declarations {
@@ -379,6 +374,6 @@ pub fn static_symbol_map(
         return Err("the static NDI archive does not define NDIlib_initialize".into());
     }
     Ok(format!(
-        "fn linked_address(name: &[u8]) -> Option<*const c_void> {{\n    match name {{\n{arms}        _ => None,\n    }}\n}}\n"
+        "const LINKED_EDITION: SdkEdition = {edition};\n\nfn linked_address(name: &[u8]) -> Option<*const c_void> {{\n    match name {{\n{arms}        _ => None,\n    }}\n}}\n"
     ))
 }
