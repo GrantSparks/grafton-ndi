@@ -377,6 +377,12 @@ impl State {
         protocol_error: &AtomicBool,
         lend: impl FnOnce(&mut QueuedStorage) -> Lent,
     ) -> std::result::Result<Admitted, Rejected<QueuedVideoFrame>> {
+        if protocol_error.load(Ordering::Acquire) {
+            return Err(Rejected::new(
+                Error::UnexpectedSdkResult(crate::SdkResultDefect::UnknownCompletion),
+                frame.into_frame(),
+            ));
+        }
         let Some(total) = self
             .bytes
             .checked_add(bytes)
@@ -483,12 +489,6 @@ impl CallbackState {
         if let Err(error) = self.validate_frame_size(bytes) {
             return Err(failure(error, frame.into_frame()));
         }
-        if self.protocol_error.load(Ordering::Acquire) {
-            return Err(failure(
-                Error::UnexpectedSdkResult(crate::SdkResultDefect::UnknownCompletion),
-                frame.into_frame(),
-            ));
-        }
         {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             state.admit(frame, bytes, &self.protocol_error)
@@ -551,8 +551,9 @@ impl CallbackState {
         Ok(())
     }
 
-    /// Publish failure under the same lock that orders a waiter's check and
-    /// park. Recover poison because a bookkeeping panic also reaches here.
+    /// Publish failure under the same lock that orders admission and a waiter's
+    /// check and park. Every flag check gating admission or waiting holds this
+    /// lock. Recover poison because a bookkeeping panic also reaches here.
     #[cfg(any(test, ndi_has_advanced_send_completion))]
     fn publish_protocol_failure(&self) {
         let _state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1536,6 +1537,90 @@ mod tests {
     }
 
     #[test]
+    fn failure_published_before_admission_preserves_the_frame_and_queue() {
+        let callback = CallbackState::new(QueueLimits::default()).unwrap();
+        callback.publish_protocol_failure();
+        let frame = VideoFrame::builder().resolution(2, 2).build().unwrap();
+        let pointer = frame.data().as_ptr();
+        let bytes = frame.retained_bytes();
+        let mut state = callback.state.lock().unwrap();
+        let before = (state.free.len(), state.retained(), state.next, state.bytes);
+        let rejected = state
+            .admit(
+                QueuedVideoFrame::from(frame).authorize_for_test(None),
+                bytes,
+                &callback.protocol_error,
+            )
+            .err()
+            .expect("a published completion failure prevents admission");
+        assert!(matches!(
+            rejected.error(),
+            Error::UnexpectedSdkResult(crate::SdkResultDefect::UnknownCompletion)
+        ));
+        let QueuedVideoFrame::Pixels(frame) = rejected.into_inner() else {
+            panic!("the refused frame keeps its storage");
+        };
+        assert_eq!(frame.data().as_ptr(), pointer);
+        assert_eq!(
+            (state.free.len(), state.retained(), state.next, state.bytes),
+            before
+        );
+    }
+
+    #[test]
+    fn concurrent_admissions_stop_after_failure_publication() {
+        let callback = CallbackState::new(QueueLimits::default()).unwrap();
+        let published = AtomicBool::new(false);
+        let start = std::sync::Barrier::new(4);
+        let attempts = if cfg!(miri) { 4 } else { 64 };
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    start.wait();
+                    for _ in 0..attempts {
+                        let frame = VideoFrame::builder().resolution(2, 2).build().unwrap();
+                        let bytes = frame.retained_bytes();
+                        let mut state = callback.state.lock().unwrap();
+                        let publication_observed = published.load(Ordering::Acquire);
+                        let admission = state.admit(
+                            QueuedVideoFrame::from(frame).authorize_for_test(None),
+                            bytes,
+                            &callback.protocol_error,
+                        );
+                        match admission {
+                            Ok(admitted) => {
+                                assert!(!publication_observed);
+                                let key = admitted.lent.descriptor().p_data as usize;
+                                drop(state);
+                                // No native call occurs: report the synthetic
+                                // loan complete before returning its storage.
+                                callback.complete(key);
+                                let mut state = callback.state.lock().unwrap();
+                                assert!(take_completed(&mut state).is_some());
+                            }
+                            Err(rejected) => assert!(matches!(
+                                rejected.error(),
+                                Error::UnexpectedSdkResult(
+                                    crate::SdkResultDefect::UnknownCompletion
+                                )
+                            )),
+                        }
+                        std::thread::yield_now();
+                    }
+                });
+            }
+            start.wait();
+            callback.publish_protocol_failure();
+            published.store(true, Ordering::Release);
+        });
+        assert!(published.load(Ordering::Acquire));
+        let state = callback.state.lock().unwrap();
+        assert_eq!(state.retained(), 0);
+        assert_eq!(state.bytes, 0);
+        assert_eq!(state.free.len(), QueueLimits::default().frames);
+    }
+
+    #[test]
     fn retired_slots_preserve_byte_frame_and_identifier_refusal_order() {
         let callback = CallbackState::new(QueueLimits::default().max_frames(1)).unwrap();
         let frame = || VideoFrame::builder().resolution(2, 2).build().unwrap();
@@ -1557,8 +1642,14 @@ mod tests {
                 .into_parts()
                 .0
         };
+        callback.protocol_error.store(true, Ordering::Release);
         assert!(matches!(
             reject(&mut state, input),
+            Error::UnexpectedSdkResult(crate::SdkResultDefect::UnknownCompletion)
+        ));
+        callback.protocol_error.store(false, Ordering::Release);
+        assert!(matches!(
+            reject(&mut state, frame()),
             Error::QueueFull(QueueLimit::Bytes)
         ));
         state.options.bytes = original_bytes;
