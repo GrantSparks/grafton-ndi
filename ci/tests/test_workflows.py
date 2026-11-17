@@ -382,6 +382,7 @@ MIRI_BATCHES = {
     'reads': [
         'sdk_copy::tests::',
         'source_retention::tests::',
+        'connection_metadata::tests::',
         'finder::budget::tests::',
         'file::out_param::tests::',
     ],

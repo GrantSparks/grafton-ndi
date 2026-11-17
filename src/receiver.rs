@@ -1609,10 +1609,11 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let table = self.core.connection_metadata()?;
         let mut registrations = self.core.connection_metadata.lock();
-        let raw = registrations.add(metadata);
-        // SAFETY: the locked collection owns this stable descriptor and its
-        // text until clear returns or after the native receiver is destroyed.
-        unsafe { table.NDIlib_recv_add_connection_metadata(self.core.instance.0, raw) };
+        registrations.add(metadata, |raw| {
+            // SAFETY: the locked collection owns this stable descriptor and its
+            // text until clear returns or after the native receiver is destroyed.
+            unsafe { table.NDIlib_recv_add_connection_metadata(self.core.instance.0, raw) };
+        });
         Ok(())
     }
 
@@ -1626,10 +1627,11 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.core.connection_metadata()?;
         let mut registrations = self.core.connection_metadata.lock();
-        // SAFETY: the receiver and every registered descriptor remain live
-        // until the native clear returns under the same registration lock.
-        unsafe { table.NDIlib_recv_clear_connection_metadata(self.core.instance.0) };
-        registrations.clear();
+        registrations.clear(|| {
+            // SAFETY: the receiver and every registered descriptor remain live
+            // until the native clear returns under the same registration lock.
+            unsafe { table.NDIlib_recv_clear_connection_metadata(self.core.instance.0) };
+        });
         Ok(())
     }
 

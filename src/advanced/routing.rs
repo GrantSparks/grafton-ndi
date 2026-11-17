@@ -25,10 +25,11 @@ impl Router {
         let table = self.runtime().table::<RouterConnectionMetadata>()?;
         native!(RouterConnectionMetadata, table, uses(metadata) => {
             let router = self.native_instance();
-            let metadata = self.connection_metadata.add(metadata);
-            // SAFETY: the router owns this stable descriptor and its text
-            // until native clear returns or after native destruction.
-            unsafe { table.NDIlib_routing_add_connection_metadata(router, metadata) };
+            self.connection_metadata.add(metadata, |metadata| {
+                // SAFETY: the router owns this stable descriptor and its text
+                // until native clear returns or after native destruction.
+                unsafe { table.NDIlib_routing_add_connection_metadata(router, metadata) };
+            });
             Ok(())
         })
     }
@@ -44,9 +45,11 @@ impl Router {
         let table = self.runtime().table::<RouterConnectionMetadata>()?;
         native!(RouterConnectionMetadata, table => {
             let router = self.native_instance();
-            // SAFETY: the router is live for this borrow.
-            unsafe { table.NDIlib_routing_clear_connection_metadata(router) };
-            self.connection_metadata.clear();
+            self.connection_metadata.clear(|| {
+                // SAFETY: the router and its registrations remain live until
+                // this native clear returns.
+                unsafe { table.NDIlib_routing_clear_connection_metadata(router) };
+            });
             Ok(())
         })
     }
