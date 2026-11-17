@@ -332,7 +332,8 @@ borrowed until released. AV-sync's zero unknown timestamp reads as `None`;
 matched sender timestamps read as `Some`.
 
 `AvSync` is `Send` but not `Sync`; synchronization runs on one thread at a
-time. Its shared receiver permits concurrent compatible capture/control work.
+time. Its shared receiver permits concurrent compatible capture/control work;
+shared controls serialize with local connection changes while capture continues.
 `split()` separates synchronization and exclusive controls for KVM;
 `into_receiver()` restores audio capture. See
 [`advanced_avsync`](../examples/advanced_avsync.rs).

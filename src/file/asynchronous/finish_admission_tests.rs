@@ -14,11 +14,7 @@ fn recorder(capacity: usize) -> (Arc<mock::Recorder>, AsyncFileRecorder) {
 }
 
 fn permits(recorder: &AsyncFileRecorder) -> usize {
-    let state = recorder
-        .worker
-        .finish_admission
-        .state
-        .load(Ordering::Acquire);
+    let state = recorder.worker.finish.state.load(Ordering::Acquire);
     assert_eq!(state & 1, 0, "finish waits never borrow the stop reserve");
     state >> 1
 }

@@ -961,6 +961,10 @@ fn an_async_player_runs_on_its_own_thread_and_closes_every_clone() {
         &FilePlayerOptions::new(&name),
     ))
     .unwrap();
+    let debug = format!("{player:?}");
+    assert!(debug.contains(&name));
+    assert!(debug.ends_with(", .. }"));
+    assert_eq!(format!("{:?}", player.clone()), debug);
     assert!(block_on(player.advertised_source())
         .unwrap()
         .name()

@@ -741,3 +741,67 @@ fn rejected_owned_builders_expose_metadata_for_repair_without_copying() {
         Some("badtext")
     );
 }
+
+#[test]
+fn metadata_constructors_select_the_capture_family_text_extent() {
+    use crate::capture::SenderMetadataInstance;
+    use std::sync::OnceLock;
+
+    static TABLE: OnceLock<crate::sys::SenderMetadata> = OnceLock::new();
+    let metadata = TABLE.get_or_init(|| {
+        // The synthetic free callback never calls these table entries.
+        crate::sys::SenderMetadata::load(&crate::sys::table::ExportsWhere(|_| true))
+            .unwrap()
+            .unwrap()
+    });
+    let mut text = *b"<x/>\0";
+    let raw = NDIlib_metadata_frame_t {
+        length: 4, // Sender captures may omit the terminating NUL from the count.
+        p_data: text.as_mut_ptr().cast(),
+        ..Default::default()
+    };
+    for generic in [false, true] {
+        // SAFETY: the complete C string stays live and unchanged until release;
+        // the callback only counts releases and never calls the fake table.
+        let guard = unsafe {
+            Guard::<SenderMetadataFree>::with_test_free(
+                SenderMetadataInstance {
+                    instance: ptr::null_mut(),
+                    metadata,
+                },
+                raw,
+                count_free,
+            )
+        };
+        let frame = if generic {
+            ValidatedMetadata::validate(guard)
+        } else {
+            ValidatedMetadata::metadata_frame(guard)
+        }
+        .unwrap();
+        assert_eq!(frame.metadata().unwrap().as_str(), "<x/>");
+    }
+
+    // This allocation ends at the declared extent. Selecting a bounded C-string
+    // rule for a receiver would read beyond it, which Miri must reject.
+    let mut unterminated = *b"<x/>";
+    let raw = NDIlib_metadata_frame_t {
+        length: 4,
+        p_data: unterminated.as_mut_ptr().cast(),
+        ..Default::default()
+    };
+    // SAFETY: exactly the four declared standalone bytes remain readable;
+    // received standalone metadata promises no terminator beyond that extent.
+    let guard = unsafe {
+        Guard::<crate::capture::MetadataKind>::with_test_free(ptr::null_mut(), raw, count_free)
+    };
+    assert!(matches!(
+        ValidatedMetadata::metadata_frame(guard),
+        Err(Error::InvalidFrame(
+            crate::FrameDefect::MetadataMissingTerminator
+        ))
+    ));
+
+    // Existing video/audio constructor cases exercise the embedded first-NUL
+    // rule, including retaining media when optional metadata is malformed.
+}

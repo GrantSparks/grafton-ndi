@@ -114,3 +114,35 @@ fn synchronous_and_registered_waits_redrain_a_closure_queued_after_an_earlier_em
         assert_eq!(device.stops.load(Ordering::Acquire), 1, "{path:?}");
     }
 }
+
+#[test]
+fn a_relative_drain_keeps_checked_remainders_when_its_end_cannot_be_represented() {
+    // Find a representable instant near the platform's upper edge without
+    // assuming the representation or its epoch.
+    let mut last = Instant::now();
+    for bit in (0..64).rev() {
+        if let Some(next) = last.checked_add(Duration::from_secs(1u64 << bit)) {
+            last = next;
+        }
+    }
+    for bit in (0..30).rev() {
+        if let Some(next) = last.checked_add(Duration::from_nanos(1u64 << bit)) {
+            last = next;
+        }
+    }
+    let start = last - Duration::from_secs(1);
+    let wait = Timeout::new(Duration::from_secs(2)).unwrap();
+    assert!(start.checked_add(wait.duration()).is_none());
+    let mut budget = DrainBudget::Relative { start, wait };
+    let at = start + Duration::from_millis(250);
+    let mut waits = Vec::new();
+    budget.poll_at(Duration::MAX, at, |millis| {
+        waits.push(millis);
+        false
+    });
+    budget.poll_at(Duration::from_millis(100), at, |millis| {
+        waits.push(millis);
+        false
+    });
+    assert_eq!(waits, [1750, 100]);
+}

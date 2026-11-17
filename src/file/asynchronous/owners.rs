@@ -92,14 +92,22 @@ pub(super) struct RecorderFinish {
     pub(super) reply: FinishResponse,
 }
 
+impl FinishRequest for RecorderFinish {
+    type Admission = Arc<Admission>;
+
+    fn admission(capacity: usize) -> Self::Admission {
+        Arc::new(Admission::new(capacity))
+    }
+}
+
 /// Preserve the finish driver's single registry while condition waits expose
 /// only settled outcomes. Mapping a reply never starts or queues another job.
 /// Every async response owns its independent waiter place from submission
 /// through settlement or cancellation cleanup. The registry cannot retain an
 /// async response without that admission proof.
 pub(super) enum FinishResponse {
-    Finish(CommandReply<FinishStatus>, Place),
-    Wait(CommandReply<Option<FinishStatus>>, Place),
+    Finish(CommandReply<FinishStatus, RecordingReport>, Place),
+    Wait(CommandReply<Option<FinishStatus>, RecordingReport>, Place),
 }
 
 impl FinishReply for FinishResponse {
@@ -340,7 +348,7 @@ mod tests {
     use crate::file::mock::{self, Closing};
     use std::task::Wake;
 
-    fn finish_response(reply: CommandReply<FinishStatus>) -> FinishResponse {
+    fn finish_response(reply: CommandReply<FinishStatus, RecordingReport>) -> FinishResponse {
         let place = Arc::new(Admission::new(1))
             .admit_for(false, QueueLimit::FileFinishWaits)
             .unwrap();

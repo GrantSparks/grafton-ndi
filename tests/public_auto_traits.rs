@@ -42,19 +42,21 @@ macro_rules! lacks {
 
 #[test]
 fn split_views_stay_on_the_borrowing_thread() {
-    use grafton_ndi::{FrameSyncCapture, SourceWatch};
+    use grafton_ndi::SourceWatch;
     lacks! {
-        FrameSyncCapture<'static>: Send;
-        FrameSyncCapture<'static>: Sync;
         SourceWatch<'static>: Sync;
     }
     #[cfg(feature = "advanced")]
     {
         use grafton_ndi::{
-            advanced::{AvSyncAudioRef, AvSyncCapture, AvSyncOutcomeRef, ReceiverControls},
+            advanced::{
+                AvSyncAudioRef, AvSyncCapture, AvSyncOutcomeRef, FrameSyncCapture, ReceiverControls,
+            },
             RawCapture,
         };
         lacks! {
+            FrameSyncCapture<'static>: Send;
+            FrameSyncCapture<'static>: Sync;
             AvSyncCapture<'static>: Send;
             AvSyncCapture<'static>: Sync;
             AvSyncAudioRef<'static>: Send;
@@ -102,7 +104,6 @@ fn crate_root_types_keep_their_auto_traits() {
         FrameSyncAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameSyncAudioRef<'static>: UnwindSafe, RefUnwindSafe;
         FrameSyncAudioRequest: Send, Sync, UnwindSafe, RefUnwindSafe;
-        FrameSyncCapture<'static>: UnwindSafe, RefUnwindSafe;
         FrameSyncVideoRef<'static>: UnwindSafe, RefUnwindSafe;
         MediaTypes: Send, Sync, UnwindSafe, RefUnwindSafe;
         MetadataFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -303,6 +304,7 @@ fn advanced_types_keep_their_auto_traits() {
         AudioPacketFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSync: Send, UnwindSafe, RefUnwindSafe;
         AvSyncCapture<'static>: UnwindSafe, RefUnwindSafe;
+        FrameSyncCapture<'static>: UnwindSafe, RefUnwindSafe;
         ReceiverControls<'static, RawCapture>: RefUnwindSafe;
         AvSyncAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSyncOutcome: Send, Sync, UnwindSafe, RefUnwindSafe;

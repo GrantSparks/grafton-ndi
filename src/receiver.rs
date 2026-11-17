@@ -114,7 +114,8 @@ impl Drop for RecvStringGuard<'_> {
     fn drop(&mut self) {
         if !self.string.value().is_null() {
             // SAFETY: the SDK returned this string for this instance and it is
-            // released exactly once.
+            // released exactly once. The RecvInstance inventory records its
+            // native connection read lock, including source-name query cleanup.
             unsafe {
                 self.strings
                     .NDIlib_recv_free_string(self.core.instance.0, self.string.into_value())
@@ -472,7 +473,7 @@ fn capture_within_clock_with_stop<T, R: Into<Retry<T>>>(
         if returned < this.0.end() && (!progress || notifications >= IMMEDIATE_NOTIFICATION_RETRIES)
         {
             // Before the attempt's end, and so before the deadline's.
-            sleep(EARLY_RETURN_PAUSE.min(deadline.remaining_at(returned)));
+            sleep(EARLY_RETURN_PAUSE.min(deadline.remaining_at(returned).duration()));
             returned = now();
             notifications = 0;
         } else if progress && returned < this.0.end() {
@@ -522,8 +523,10 @@ fn validate_ptz_preset(preset: u8) -> Result<i32> {
 /// the source `$ptz` controls.
 macro_rules! ptz_command {
     ($ptz:expr, $func:ident $(, $arg:expr)*) => {{
-        // SAFETY: the receiver instance is live for the handle's borrow, and
-        // every argument is a plain value.
+        let _connection = $ptz.core.lock_connection();
+        // SAFETY: the live core and connection permit cover this call; the
+        // RecvInstance inventory records control/capture and remote overlap.
+        // Every argument is a plain value.
         unsafe { $ptz.core.sdk().named().$func($ptz.core.instance.0 $(, $arg)*) }.performed()
     }};
 }
@@ -1171,10 +1174,10 @@ impl<M: ReceiverMode> std::fmt::Debug for Receiver<M> {
 /// Only a receiver's connection lock can issue this permit.
 struct ConnectionPermit;
 
-/// One local connection request, with this receiver's exclusive permit.
-/// It keeps the passed descriptor and its strings until a later request has
-/// returned or the native receiver is destroyed. Captures may overlap it.
-struct Connection<'a> {
+/// Exclusive permission for local connection changes and shared controls.
+/// A connection request retains its descriptor and strings until a later
+/// request returns or native destruction. Captures may overlap the permit.
+pub(crate) struct Connection<'a> {
     core: &'a ReceiverCore,
     _exclusive: MutexGuard<'a, ConnectionPermit>,
 }
@@ -1229,11 +1232,62 @@ impl Connection<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RecvInstance(pub(crate) NDIlib_recv_instance_t);
 
-// SAFETY: the SDK gives receivers no thread affinity and permits concurrent
-// captures (Processing.NDI.Recv.h). CaptureLock records the native implementation
-// observations and tests supporting concurrent connection changes. The core
-// serializes local connection changes with one another, and source-name waits
-// with one another.
+// SAFETY: receivers have no thread affinity. Every shared native entry point
+// has one of the following concurrency bases (NDIlib_recv_ prefix omitted):
+//
+// Entry points                                      | Local connection exclusion
+// --------------------------------------------------|---------------------------
+// capture_v3; free_video_v2, free_audio_v3,           | SDK concurrent-capture/free
+// free_metadata                                     | contract; see CaptureLock
+// connect                                           | Connection permit
+// set_tally, send_metadata, get_web_control           | Connection permit
+// add_connection_metadata, clear_connection_metadata | Connection + registration
+// set/get_video_delay, set/get_audio_delay           | Connection permit
+// get_performance, get_queue                         | Connection permit
+// get_no_connections                                | Measured native read lock
+// get_source_name                                   | Native report mutex +
+//                                                   | Rust source-query permit
+// free_string                                       | Measured native read lock
+// ptz_is_supported, ptz_recall_preset,               | Connection permit
+// ptz_store_preset, ptz_zoom, ptz_zoom_speed,         | (each PTZ entry point)
+// ptz_pan_tilt, ptz_pan_tilt_speed, ptz_auto_focus,   |
+// ptz_focus, ptz_focus_speed, ptz_white_balance_auto, |
+// ptz_white_balance_indoor/outdoor/oneshot/manual,   |
+// ptz_exposure_auto/manual/manual_v2                 |
+// request_keyframe                                  | Connection permit
+// kvm_is_supported, kvm_send_keyboard_press/release, | Connection permit
+// kvm_send_left/middle/right_mouse_click/release,    | (including held-input
+// kvm_send_vertical/horizontal_mouse_wheel,         | cleanup and Drop)
+// kvm_send_mouse_position/clipboard_contents,       |
+// kvm_send_touch_positions/finish                   |
+//
+// Native lock interposition and disassembly on Linux x86-64 Standard 6.1.1,
+// Standard/Advanced 6.3.2 and 6.4.0.2 provide the additional basis for controls
+// overlapping captures and SDK-internal (Discovery Server) connection changes:
+// all available connection-facing controls, including PTZ and KVM message
+// sends, take the same receiver read lock at +0x108 as capture. Local changes
+// take it exclusively, as recorded beside CaptureLock. Connection-metadata
+// registration additionally uses its own lock at +0x158. The 6.4 delay getters
+// read receiver-owned delay state under that state's lock, independent of the
+// replaceable connection; setters also take the connection read lock.
+// get_source_name (6.3.2/6.4) copies a report under the report mutex at +0x218,
+// never dereferencing replaceable connection state. free_string takes the
+// connection read lock before releasing its owned string. Missing entry points
+// cannot be called.
+//
+// A Rust connection permit serializes the listed controls with one another and
+// local changes, without delaying capture attempts or source-name waits. It
+// cannot exclude remote changes inside the SDK: those depend on the native
+// locks above. tests/receiver_connect_overlap_sdk.rs exercises every available
+// shared control against captures, local changes and 6.4 remote changes.
+// Sixteen capture threads, three control threads and 1080p feeds completed
+// 120-second local connection storms on each of the five runtimes above,
+// validating frames, operation budgets, resumed progress and balanced loans.
+// Helgrind 3.19 workloads on Standard/Advanced 6.3.2 and 6.4 also completed,
+// including Advanced KVM input/capture. They report SDK allocator/state handoffs,
+// the capture polling flag and Rust synchronization; these are qualified
+// detector runs, not zero-error results. The exclusion and observed native
+// locking above supply the concurrency argument.
 // Every native use retains the core; its other fields determine its auto traits.
 unsafe impl Send for RecvInstance {}
 // SAFETY: as above; receiver modes reserve the media paths used by synchronizers.
@@ -1242,8 +1296,8 @@ unsafe impl Sync for RecvInstance {}
 pub(crate) struct ReceiverCore {
     pub(crate) instance: RecvInstance,
     pub(crate) _ndi: Ndi,
-    /// Serializes local connection changes. Captures never take this lock;
-    /// their overlap with connection changes is measured beside CaptureLock.
+    /// Serializes local connection changes and shared controls. Captures never
+    /// take this lock; their connection overlap is measured beside CaptureLock.
     connection_guard: Mutex<ConnectionPermit>,
     /// The latest requested target. Connection serializes its writers;
     /// snapshots never take it and therefore never wait for a capture or a queued
@@ -1549,7 +1603,9 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn set_video_delay(&self, delay: Duration) -> Result<SettingChange> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
-        // SAFETY: the receiver instance is live for this borrow.
+        let _connection = self.core.lock_connection();
+        // SAFETY: the live core and connection permit cover this call; see
+        // the RecvInstance concurrency inventory.
         let changed = unsafe { table.NDIlib_recv_set_video_delay(self.core.instance.0, millis) };
         Ok(SettingChange::from_sdk(changed))
     }
@@ -1564,7 +1620,9 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_get_video_delay")]
     pub fn video_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
-        // SAFETY: the receiver instance is live for this borrow.
+        let _connection = self.core.lock_connection();
+        // SAFETY: the live core and connection permit cover this call; see
+        // the RecvInstance concurrency inventory.
         receiver_delay(unsafe { table.NDIlib_recv_get_video_delay(self.core.instance.0) })
     }
 
@@ -1580,7 +1638,9 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn set_audio_delay(&self, delay: Duration) -> Result<SettingChange> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
-        // SAFETY: the receiver instance is live for this borrow.
+        let _connection = self.core.lock_connection();
+        // SAFETY: the live core and connection permit cover this call; see
+        // the RecvInstance concurrency inventory.
         let changed = unsafe { table.NDIlib_recv_set_audio_delay(self.core.instance.0, millis) };
         Ok(SettingChange::from_sdk(changed))
     }
@@ -1593,7 +1653,9 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_get_audio_delay")]
     pub fn audio_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
-        // SAFETY: the receiver instance is live for this borrow.
+        let _connection = self.core.lock_connection();
+        // SAFETY: the live core and connection permit cover this call; see
+        // the RecvInstance concurrency inventory.
         receiver_delay(unsafe { table.NDIlib_recv_get_audio_delay(self.core.instance.0) })
     }
 
@@ -1609,10 +1671,12 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_add_connection_metadata")]
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let table = self.core.connection_metadata()?;
+        let _connection = self.core.lock_connection();
         let mut registrations = self.core.connection_metadata.lock();
         registrations.add(metadata, |raw| {
             // SAFETY: the locked collection owns this stable descriptor and its
             // text until clear returns or after the native receiver is destroyed.
+            // The connection permit provides the RecvInstance control exclusion.
             unsafe { table.NDIlib_recv_add_connection_metadata(self.core.instance.0, raw) };
         });
         Ok(())
@@ -1627,10 +1691,12 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_clear_connection_metadata")]
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.core.connection_metadata()?;
+        let _connection = self.core.lock_connection();
         let mut registrations = self.core.connection_metadata.lock();
         registrations.clear(|| {
             // SAFETY: the receiver and every registered descriptor remain live
             // until the native clear returns under the same registration lock.
+            // The connection permit provides the RecvInstance control exclusion.
             unsafe { table.NDIlib_recv_clear_connection_metadata(self.core.instance.0) };
         });
         Ok(())
@@ -1652,9 +1718,11 @@ impl<M: ReceiverMode> Receiver<M> {
             .core
             ._ndi
             .table::<(sys::ReceiverWebControl, sys::ReceiverStrings)>()?;
+        let _connection = self.core.lock_connection();
         let guard = RecvStringGuard {
             core: &self.core,
-            // SAFETY: the receiver instance is live for this borrow.
+            // SAFETY: the live core and connection permit cover this call; see
+            // the RecvInstance concurrency inventory.
             string: unsafe {
                 web_control
                     .named()
@@ -1725,11 +1793,13 @@ impl<M: ReceiverMode> Receiver<M> {
     /// reconnect.
     #[doc(alias = "NDIlib_recv_set_tally")]
     pub fn set_tally(&self, tally: Tally) {
+        let _connection = self.core.lock_connection();
         // `Processing.NDI.Recv.h`: the flag is false when nothing is
         // connected, and the state is sent the moment something connects, so
         // it reports no failure.
         // SAFETY: the receiver instance is live for this borrow, and the
-        // tally outlives the synchronous call.
+        // tally outlives the synchronous call. The connection permit supplies
+        // the control exclusion in the RecvInstance inventory.
         unsafe {
             self.core
                 .sdk()
@@ -1749,8 +1819,10 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_send_metadata")]
     pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let raw = metadata.metadata_raw();
+        let _connection = self.core.lock_connection();
         // SAFETY: the receiver instance is live for this borrow, and the
-        // borrowed C string outlives the synchronous call.
+        // borrowed C string outlives the synchronous call. The connection permit
+        // supplies the control exclusion in the RecvInstance inventory.
         let sent = unsafe {
             self.core
                 .sdk()
@@ -1919,12 +1991,14 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_get_performance")]
     #[doc(alias = "NDIlib_recv_get_queue")]
     pub fn connection_stats(&self) -> Result<ConnectionStats> {
+        let _connection = self.core.lock_connection();
         let connections = self.core.connections()?;
 
         let mut total = NDIlib_recv_performance_t::default();
         let mut dropped = NDIlib_recv_performance_t::default();
         // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
+        // passed outlives the synchronous call. The connection permit supplies
+        // the control exclusion in the RecvInstance inventory.
         let performance = unsafe {
             self.core.sdk().named().NDIlib_recv_get_performance(
                 self.core.instance.0,
@@ -1935,7 +2009,8 @@ impl<M: ReceiverMode> Receiver<M> {
 
         let mut queue = NDIlib_recv_queue_t::default();
         // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
+        // passed outlives the synchronous call. The connection permit supplies
+        // the control exclusion in the RecvInstance inventory.
         let queued = unsafe {
             self.core
                 .sdk()
@@ -2007,7 +2082,7 @@ impl ReceiverCore {
     }
 
     /// Issue a permit tied to this receiver and its local connection lock.
-    fn lock_connection(&self) -> Connection<'_> {
+    pub(crate) fn lock_connection(&self) -> Connection<'_> {
         Connection {
             core: self,
             _exclusive: self.connection_guard.lock(),
@@ -2143,7 +2218,9 @@ impl ReceiverCore {
     }
 
     fn connections(&self) -> Result<u32> {
-        // SAFETY: the receiver is live for this nonblocking native query.
+        // SAFETY: the receiver is live; the RecvInstance inventory records the
+        // native connection read lock. This query also serves capture events,
+        // so it deliberately does not take the Rust connection permit.
         unsafe {
             self.sdk()
                 .named()
@@ -2223,8 +2300,9 @@ impl ReceiverCore {
             }
             let mut pointer = ptr::null();
             let remaining = attempt.0.remaining_ms();
-            // SAFETY: the receiver instance is live for this borrow and `pointer` is
-            // writable storage for the returned string.
+            // SAFETY: the receiver is live and `pointer` is writable. The
+            // RecvInstance inventory records the native report mutex; `_query`
+            // serializes consumers without excluding connection changes.
             let changed = unsafe {
                 source_name.named().NDIlib_recv_get_source_name(
                     self.instance.0,
@@ -2398,7 +2476,9 @@ impl Ptz<'_> {
     #[must_use]
     #[doc(alias = "NDIlib_recv_ptz_is_supported")]
     pub fn is_supported(&self) -> bool {
-        // SAFETY: the receiver instance is live for the handle's borrow.
+        let _connection = self.core.lock_connection();
+        // SAFETY: the live core and connection permit cover this call; see
+        // the RecvInstance concurrency inventory.
         unsafe {
             self.core
                 .sdk()
@@ -2609,8 +2689,9 @@ impl Ptz<'_> {
 
 impl Drop for ReceiverCore {
     fn drop(&mut self) {
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
+        // SAFETY: exclusive ownership of the last core excludes every native
+        // use and outstanding frame borrow. The runtime remains live through
+        // native destruction, before retained descriptors and text are dropped.
         unsafe {
             self.sdk().NDIlib_recv_destroy(self.instance.0);
         }
@@ -3535,7 +3616,7 @@ mod tests {
         /// What is left of `attempt` now: the timeout its SDK call would get,
         /// for the current attempt.
         fn timeout(&self, attempt: Attempt) -> Duration {
-            attempt.0.remaining_at(self.now())
+            attempt.0.remaining_at(self.now()).duration()
         }
     }
 
@@ -4004,6 +4085,47 @@ mod tests {
                 "{sent:?}"
             );
             assert_eq!(frame.metadata_raw().p_data, pointer);
+        }
+    }
+
+    #[test]
+    fn shared_controls_wait_for_local_connection_changes() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        // These families do not need optional runtime entry points. Each must
+        // wait for the same permit, while the adjacent capture test proves
+        // the capture/event paths remain independent of it.
+        for control in [
+            |receiver: &Receiver| receiver.set_tally(Tally::new(false, false)),
+            |receiver: &Receiver| {
+                let _ = receiver.ptz().is_supported();
+            },
+            |receiver: &Receiver| {
+                receiver.connection_stats().unwrap();
+            },
+        ] {
+            let exclusive = receiver.core.lock_connection();
+            std::thread::scope(|scope| {
+                let (started, entering) = std::sync::mpsc::channel();
+                let (done, completed) = std::sync::mpsc::channel();
+                let receiver = &receiver;
+                let worker = scope.spawn(move || {
+                    started.send(()).unwrap();
+                    control(receiver);
+                    done.send(()).unwrap();
+                });
+                entering.recv_timeout(Duration::from_secs(2)).unwrap();
+                let early = completed.recv_timeout(Duration::from_millis(20));
+                drop(exclusive);
+                worker.join().unwrap();
+                assert!(matches!(
+                    early,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ));
+                completed.recv_timeout(Duration::from_secs(2)).unwrap();
+            });
         }
     }
 

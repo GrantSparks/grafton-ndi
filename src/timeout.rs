@@ -72,12 +72,7 @@ const _: () = assert!(MAX_TIMEOUT.as_millis() == MAX_MILLIS as u128);
 /// The SDK's millisecond count for a finite wait, rounded up, or `None` when
 /// the wait exceeds [`MAX_TIMEOUT`].
 pub(crate) fn sdk_millis(wait: Duration) -> Option<u32> {
-    if wait > MAX_TIMEOUT {
-        return None;
-    }
-    // At most MAX_MILLIS once rounded up, because MAX_TIMEOUT is whole
-    // milliseconds, so the conversion cannot fail.
-    u32::try_from(wait.as_nanos().div_ceil(1_000_000)).ok()
+    Timeout::checked(wait).map(Timeout::millis)
 }
 
 /// [`sdk_millis`], failing with [`Error::InvalidInput`] for a wait
@@ -88,28 +83,44 @@ pub(crate) fn to_ms_checked(wait: Duration) -> Result<u32> {
 
 /// A finite SDK wait checked before the clock that will spend it starts.
 /// Retaining the duration preserves sub-millisecond precision for deadlines.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Timeout(Duration);
 
 impl Timeout {
     pub(crate) fn new(wait: Duration) -> Result<Self> {
-        if wait > MAX_TIMEOUT {
-            return Err(Error::InvalidInput(crate::InputDefect::TimeoutTooLong {
-                requested: wait.into(),
-            }));
-        }
-        Ok(Self(wait))
+        Self::checked(wait).ok_or(Error::InvalidInput(crate::InputDefect::TimeoutTooLong {
+            requested: wait.into(),
+        }))
+    }
+
+    fn checked(wait: Duration) -> Option<Self> {
+        (wait <= MAX_TIMEOUT).then_some(Self(wait))
+    }
+
+    /// The original precision, for Rust waits that do not take SDK milliseconds.
+    pub(crate) fn duration(self) -> Duration {
+        self.0
+    }
+
+    pub(crate) fn is_zero(self) -> bool {
+        self.0.is_zero()
+    }
+
+    /// Restrict an already checked wait without validating it again.
+    pub(crate) fn min(self, step: Duration) -> Self {
+        Self(self.0.min(step))
     }
 
     pub(crate) fn millis(self) -> u32 {
-        // The constructor bounds this rounded value by MAX_MILLIS.
+        // The checked constructor and narrowing operations bound this rounded
+        // value by MAX_MILLIS, as the MAX_TIMEOUT assertion above establishes.
         self.0.as_nanos().div_ceil(1_000_000) as u32
     }
 
     /// Spend a checked wait without needing to represent its ending instant.
     #[cfg(any(feature = "file-io", test))]
-    pub(crate) fn remaining_at(self, start: Instant, now: Instant) -> Duration {
-        self.0.saturating_sub(now.saturating_duration_since(start))
+    pub(crate) fn remaining_at(self, start: Instant, now: Instant) -> Self {
+        Self(self.0.saturating_sub(now.saturating_duration_since(start)))
     }
 }
 
@@ -164,12 +175,14 @@ impl Deadline {
 
     /// The time left, zero once the budget is spent.
     pub(crate) fn remaining(self) -> Duration {
-        self.remaining_at(Instant::now())
+        self.remaining_at(Instant::now()).duration()
     }
 
     /// The time left at `now`, zero once the budget is spent.
-    pub(crate) fn remaining_at(self, now: Instant) -> Duration {
-        self.end.saturating_duration_since(now)
+    pub(crate) fn remaining_at(self, now: Instant) -> Timeout {
+        // Normal observations follow the budget's start. Also keep an injected
+        // earlier clock bounded by the checked SDK range.
+        Timeout(self.end.saturating_duration_since(now).min(MAX_TIMEOUT))
     }
 
     /// The time left as the SDK's millisecond timeout.
@@ -184,7 +197,7 @@ impl Deadline {
 
     /// One bounded step of the budget, rounded up in SDK milliseconds.
     pub(crate) fn step_ms_at(self, now: Instant, step: Duration) -> u32 {
-        sdk_millis(self.remaining_at(now).min(step)).unwrap_or(MAX_MILLIS)
+        self.remaining_at(now).min(step).millis()
     }
 
     /// Whether the budget is spent.
@@ -234,8 +247,11 @@ mod tests {
                 (Ok(timeout), Some(millis)) => {
                     assert_eq!(timeout.millis(), millis);
                     let start = Instant::now();
-                    assert_eq!(timeout.remaining_at(start, start), wait);
-                    assert_eq!(timeout.remaining_at(start, start + wait), Duration::ZERO);
+                    assert_eq!(timeout.remaining_at(start, start).duration(), wait);
+                    assert_eq!(
+                        timeout.remaining_at(start, start + wait).duration(),
+                        Duration::ZERO
+                    );
                 }
                 (
                     Err(Error::InvalidInput(crate::InputDefect::TimeoutTooLong { requested })),
@@ -246,6 +262,33 @@ mod tests {
                 (other, _) => panic!("{wait:?} checked as {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn checked_remainders_keep_their_bound_when_narrowed() {
+        assert!(Timeout::checked(MAX_TIMEOUT).is_some());
+        assert!(Timeout::checked(MAX_TIMEOUT + Duration::from_nanos(1)).is_none());
+        let start = Instant::now();
+        for wait in [Duration::ZERO, Duration::from_nanos(1), MAX_TIMEOUT] {
+            let timeout = Timeout::checked(wait).unwrap();
+            for elapsed in [Duration::ZERO, Duration::from_nanos(1), MAX_TIMEOUT] {
+                let remaining = timeout.remaining_at(start, start + elapsed);
+                for step in [Duration::ZERO, Duration::from_nanos(1), Duration::MAX] {
+                    let bounded = remaining.min(step);
+                    assert!(bounded.duration() <= remaining.duration());
+                    assert!(bounded.duration() <= step);
+                    assert!(bounded.millis() <= MAX_MILLIS);
+                }
+            }
+        }
+        let deadline = Deadline::starting(start, Timeout::checked(MAX_TIMEOUT).unwrap()).unwrap();
+        // A synthetic observation before the start also preserves the SDK bound.
+        assert_eq!(
+            deadline
+                .remaining_at(start - Duration::from_secs(1))
+                .millis(),
+            MAX_MILLIS
+        );
     }
 
     #[test]
@@ -297,7 +340,7 @@ mod tests {
         assert!(!longest.is_expired());
         assert_eq!(longest.end(), start + MAX_TIMEOUT);
         // Rounded up, the time left is still the full budget, never u32::MAX.
-        assert_eq!(sdk_millis(longest.remaining_at(start)), Some(u32::MAX - 1));
+        assert_eq!(longest.remaining_at(start).millis(), u32::MAX - 1);
 
         // A sub-millisecond remainder waits a whole millisecond.
         let short = Deadline::after(Duration::from_nanos(1)).unwrap();
@@ -328,7 +371,7 @@ mod tests {
             short.within_at(later, Duration::from_millis(100)).end(),
             short.end()
         );
-        assert_eq!(short.remaining_at(later), Duration::ZERO);
+        assert_eq!(short.remaining_at(later).duration(), Duration::ZERO);
     }
 
     #[test]
@@ -337,9 +380,14 @@ mod tests {
         let deadline =
             Deadline::starting(start, Timeout::new(Duration::from_millis(50)).unwrap()).unwrap();
         assert_eq!(deadline.end(), start + Duration::from_millis(50));
-        assert_eq!(deadline.remaining_at(start), Duration::from_millis(50));
         assert_eq!(
-            deadline.remaining_at(start + Duration::from_millis(30)),
+            deadline.remaining_at(start).duration(),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            deadline
+                .remaining_at(start + Duration::from_millis(30))
+                .duration(),
             Duration::from_millis(20)
         );
         for (wait, millis) in rounding_table() {

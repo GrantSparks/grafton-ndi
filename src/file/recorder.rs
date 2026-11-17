@@ -314,13 +314,9 @@ impl DrainBudget {
         }
         let (wait, late) = match self {
             Self::Ahead(deadline) => (deadline.step_ms_at(at, step), false),
-            Self::Relative { start, wait } => (
-                // The remainder is bounded by a checked Timeout even when
-                // the clock cannot represent its end.
-                crate::timeout::sdk_millis(wait.remaining_at(*start, at).min(step))
-                    .unwrap_or(wait.millis()),
-                false,
-            ),
+            Self::Relative { start, wait } => {
+                (wait.remaining_at(*start, at).min(step).millis(), false)
+            }
             Self::Late { .. } => (0, true),
             Self::Spent => return Pumped::Exhausted,
         };

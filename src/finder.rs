@@ -167,16 +167,28 @@ pub(crate) fn list_cstring(
 ) -> Result<Option<CString>> {
     values
         .map(|values| {
-            for (index, value) in values.iter().enumerate() {
-                if value.is_empty() || value.contains([',', '\0']) {
-                    return Err(Error::InvalidInput(crate::InputDefect::ListElement {
-                        setting,
-                        index,
-                    }));
-                }
+            let invalid =
+                |index| Error::InvalidInput(crate::InputDefect::ListElement { setting, index });
+            let boundary = values
+                .iter()
+                .position(|value| value.is_empty() || value.contains(','));
+            // Only earlier elements can take precedence over a boundary error.
+            // CString supplies the sole NUL check; every comma before that NUL
+            // is a separator, so its count is the original element index.
+            let prefix = &values[..boundary.unwrap_or(values.len())];
+            let joined = CString::new(prefix.join(",")).map_err(|error| {
+                let nul = error.nul_position();
+                invalid(
+                    error.into_vec()[..nul]
+                        .iter()
+                        .filter(|&&byte| byte == b',')
+                        .count(),
+                )
+            })?;
+            if let Some(index) = boundary {
+                return Err(invalid(index));
             }
-            // Every element was checked, and the separator contains no NUL.
-            Ok(CString::new(values.join(",")).expect("validated list elements contain no NUL"))
+            Ok(joined)
         })
         .transpose()
 }
@@ -316,6 +328,60 @@ struct SnapshotGuard<'finder> {
     instance: parking_lot::MutexGuard<'finder, FindInstance>,
 }
 
+/// A snapshot wait's expiry is part of its type: an unbounded wait cannot
+/// expire, while a lookup deadline can. Both use the same cancellation kernel.
+trait SnapshotWait: Copy {
+    type Expired;
+
+    fn remaining(self) -> Duration;
+    fn expiration(self) -> Option<Self::Expired>;
+    fn lock(
+        self,
+        mutex: &parking_lot::Mutex<FindInstance>,
+    ) -> std::result::Result<parking_lot::MutexGuard<'_, FindInstance>, Self::Expired>;
+}
+
+#[derive(Clone, Copy)]
+struct UnboundedSnapshot;
+
+impl SnapshotWait for UnboundedSnapshot {
+    type Expired = std::convert::Infallible;
+
+    fn remaining(self) -> Duration {
+        POLL_INTERVAL
+    }
+
+    fn expiration(self) -> Option<Self::Expired> {
+        None
+    }
+
+    fn lock(
+        self,
+        mutex: &parking_lot::Mutex<FindInstance>,
+    ) -> std::result::Result<parking_lot::MutexGuard<'_, FindInstance>, Self::Expired> {
+        Ok(mutex.lock())
+    }
+}
+
+impl SnapshotWait for Deadline {
+    type Expired = ();
+
+    fn remaining(self) -> Duration {
+        Deadline::remaining(self).min(POLL_INTERVAL)
+    }
+
+    fn expiration(self) -> Option<Self::Expired> {
+        self.is_expired().then_some(())
+    }
+
+    fn lock(
+        self,
+        mutex: &parking_lot::Mutex<FindInstance>,
+    ) -> std::result::Result<parking_lot::MutexGuard<'_, FindInstance>, Self::Expired> {
+        mutex.try_lock_until(self.end()).ok_or(())
+    }
+}
+
 impl SnapshotGuard<'_> {
     fn snapshot<S: FinderSnapshot>(&self, snapshot: &S) -> Result<Vec<S::Item>> {
         let mut count = 0;
@@ -445,6 +511,13 @@ impl SourceWatch<'_> {
     /// Copy the currently known sources and record the generation before
     /// copying, preserving any report that arrives during the snapshot.
     /// A failed snapshot leaves the cursor unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the snapshot errors of [`Finder::current_sources`]:
+    /// [`Error::UnexpectedSdkResult`] for a malformed top-level descriptor array,
+    /// [`Error::AllocationFailed`] when result or text storage cannot be reserved,
+    /// or [`Error::ResourceLimit`] when a snapshot exceeds its copy budgets.
     pub fn current_sources(&mut self) -> Result<Vec<Source>> {
         self.snapshot(Finder::current_sources, |_| true)
     }
@@ -656,59 +729,63 @@ impl Finder {
     /// Copy one snapshot through the entry point's shared lifetime contract.
     /// The guard carries the handle it protects, so fetching cannot pair a
     /// different finder's instance with this lock.
+    #[cfg(any(test, all(feature = "advanced", ndi_has_advanced_source_metadata)))]
     pub(crate) fn snapshot<S: FinderSnapshot>(&self, snapshot: &S) -> Result<Vec<S::Item>> {
-        loop {
-            let Ok(guard) = self.lock_snapshots(None, NeverStop);
-            if let Some(guard) = guard {
-                return guard.snapshot(snapshot);
-            }
-        }
+        let Ok(guard) = self.lock_snapshots(NeverStop);
+        guard.snapshot(snapshot)
     }
 
-    fn lock_snapshots<'finder, S: Stop>(
-        &'finder self,
-        deadline: Option<Deadline>,
+    fn lock_snapshots<S: Stop>(
+        &self,
         stop: S,
-    ) -> std::result::Result<Option<SnapshotGuard<'finder>>, S::Stopped> {
+    ) -> std::result::Result<SnapshotGuard<'_>, S::Stopped> {
+        let Ok(guard) = self.lock_snapshots_with(UnboundedSnapshot, stop, |remaining| {
+            self.sources_lock.try_lock_for(remaining)
+        })?;
+        Ok(guard)
+    }
+
+    fn lock_snapshots_until<S: Stop>(
+        &self,
+        deadline: Deadline,
+        stop: S,
+    ) -> std::result::Result<Option<SnapshotGuard<'_>>, S::Stopped> {
         self.lock_snapshots_with(deadline, stop, |remaining| {
             self.sources_lock.try_lock_for(remaining)
         })
+        .map(std::result::Result::ok)
     }
 
     // The acquisition is injectable so cancellation can be tested exactly
     // when a contended lock becomes available, without scheduler timing.
-    fn lock_snapshots_with<'finder, S: Stop>(
+    fn lock_snapshots_with<'finder, W: SnapshotWait, S: Stop>(
         &'finder self,
-        deadline: Option<Deadline>,
+        wait: W,
         stop: S,
         mut acquire: impl FnMut(Duration) -> Option<parking_lot::MutexGuard<'finder, FindInstance>>,
-    ) -> std::result::Result<Option<SnapshotGuard<'finder>>, S::Stopped> {
+    ) -> std::result::Result<std::result::Result<SnapshotGuard<'finder>, W::Expired>, S::Stopped>
+    {
         let instance = if S::CAN_STOP {
             loop {
                 stop.check()?;
-                let remaining =
-                    deadline.map_or(POLL_INTERVAL, |end| end.remaining().min(POLL_INTERVAL));
-                if let Some(instance) = acquire(remaining) {
+                if let Some(instance) = acquire(wait.remaining()) {
                     // Cancellation may arrive while the lock is waiting. Do
                     // not start a new native snapshot after that wait succeeds.
                     stop.check()?;
                     break instance;
                 }
                 stop.check()?;
-                if deadline.is_some_and(Deadline::is_expired) {
-                    return Ok(None);
+                if let Some(expired) = wait.expiration() {
+                    return Ok(Err(expired));
                 }
             }
         } else {
-            match deadline {
-                Some(deadline) => match self.sources_lock.try_lock_until(deadline.end()) {
-                    Some(instance) => instance,
-                    None => return Ok(None),
-                },
-                None => self.sources_lock.lock(),
+            match wait.lock(&self.sources_lock) {
+                Ok(instance) => instance,
+                Err(expired) => return Ok(Err(expired)),
             }
         };
-        Ok(Some(SnapshotGuard { instance }))
+        Ok(Ok(SnapshotGuard { instance }))
     }
 
     #[cfg(any(feature = "tokio", feature = "smol"))]
@@ -717,15 +794,9 @@ impl Finder {
     }
 
     pub(crate) fn current_sources_stoppable<S: Stop>(&self, stop: S) -> StopResult<Vec<Source>, S> {
-        if !S::CAN_STOP {
-            return self.snapshot(&self._ndi.api().core).map(Ok);
-        }
-        loop {
-            match self.lock_snapshots(None, stop) {
-                Ok(Some(guard)) => return guard.snapshot(&self._ndi.api().core).map(Ok),
-                Err(stopped) => return Ok(Err(stopped)),
-                Ok(None) => {}
-            }
+        match self.lock_snapshots(stop) {
+            Ok(guard) => guard.snapshot(&self._ndi.api().core).map(Ok),
+            Err(stopped) => Ok(Err(stopped)),
         }
     }
 
@@ -783,6 +854,14 @@ impl Finder {
     ///
     /// A vector of currently known sources. May be empty if no sources are found.
     ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedSdkResult`] with
+    /// [`crate::SdkResultDefect::MalformedDiscoveryData`] for a malformed top-level
+    /// descriptor array, [`Error::AllocationFailed`] when result or text storage
+    /// cannot be reserved, or [`Error::ResourceLimit`] when a snapshot exceeds
+    /// its copy budgets. An isolated malformed descriptor is skipped.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -811,7 +890,7 @@ impl Finder {
         deadline: Deadline,
         stop: S,
     ) -> StopResult<Option<Vec<Source>>, S> {
-        match self.lock_snapshots(Some(deadline), stop) {
+        match self.lock_snapshots_until(deadline, stop) {
             Ok(Some(guard)) => guard
                 .snapshot(&self._ndi.api().core)
                 .map(|sources| Ok(Some(sources))),
@@ -961,6 +1040,9 @@ impl Finder {
     /// whole window exceed 16,384 entries or 16 MiB. The retained byte budget
     /// counts shared source strings once, plus the storage of both the result
     /// vector and the deduplication set, including container capacity.
+    /// Returns [`Error::UnexpectedSdkResult`] for a malformed top-level snapshot
+    /// array, or [`Error::AllocationFailed`] when result or text storage cannot
+    /// be reserved. An isolated malformed descriptor is skipped.
     ///
     /// # Examples
     ///
@@ -2485,6 +2567,29 @@ mod tests {
     }
 
     #[test]
+    fn configured_lists_report_the_first_invalid_element_across_checks() {
+        for (values, expected) in [
+            (["first\0nul", "", "last,comma"], 0),
+            (["first,comma", "second\0nul", ""], 0),
+            (["", "second\0nul", "last,comma"], 0),
+            (["valid", "second\0nul", "last,comma"], 1),
+            (["valid", "second,comma", "last\0nul"], 1),
+            (["valid", "", "last\0nul"], 1),
+            (["non-ASCII café", "second\0nul", "last,comma"], 1),
+            (["valid", "second", "last\0nul"], 2),
+        ] {
+            let values = values.map(str::to_owned);
+            assert!(matches!(
+                list_cstring(Some(&values), "servers"),
+                Err(Error::InvalidInput(crate::InputDefect::ListElement {
+                    setting: "servers",
+                    index,
+                })) if index == expected
+            ));
+        }
+    }
+
+    #[test]
     fn cache_descriptor_copies_release_the_global_mutex_and_recheck_publication() {
         let cache = CachedSources::default();
         let sources = vec![Source::new("camera (Program)").unwrap()];
@@ -2603,11 +2708,11 @@ mod tests {
             return;
         };
         let finder = Finder::new(&ndi, &FinderOptions::new()).unwrap();
-        for deadline in [None, Some(Deadline::after(Duration::from_secs(3)).unwrap())] {
+        fn check<W: SnapshotWait>(finder: &Finder, wait: W) {
             let stop = AtomicBool::new(false);
             let mut held = Some(finder.sources_lock.lock());
             let mut acquired = false;
-            let result = finder.lock_snapshots_with(deadline, &stop, |remaining| {
+            let result = finder.lock_snapshots_with(wait, &stop, |remaining| {
                 assert!(!stop.load(Ordering::Acquire));
                 assert!(remaining > Duration::ZERO && remaining <= POLL_INTERVAL);
                 // Model cancellation arriving while the acquisition waits,
@@ -2631,6 +2736,8 @@ mod tests {
                 "the cancelled acquisition must release its lock"
             );
         }
+        check(&finder, UnboundedSnapshot);
+        check(&finder, Deadline::after(Duration::from_secs(3)).unwrap());
     }
 
     #[cfg(any(feature = "tokio", feature = "smol"))]
@@ -2658,7 +2765,7 @@ mod tests {
             let worker = scope.spawn(move || {
                 let mut ready = Some(ready);
                 let stopped = finder
-                    .lock_snapshots_with(None, stop, |remaining| {
+                    .lock_snapshots_with(UnboundedSnapshot, stop, |remaining| {
                         assert!(remaining > Duration::ZERO && remaining <= POLL_INTERVAL);
                         if let Some(ready) = ready.take() {
                             ready.send(()).unwrap();

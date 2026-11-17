@@ -122,8 +122,10 @@
 //! beyond its individual bound, or an entry with a malformed nested array,
 //! is omitted while the other entries are returned. Rejected string scans
 //! remain charged, so several malformed entries can still exhaust the budget.
-//! A malformed top-level array or allocation failure returns
-//! [`Error::UnexpectedSdkResult`](crate::Error::UnexpectedSdkResult). A rejected
+//! A malformed top-level array returns
+//! [`Error::UnexpectedSdkResult`](crate::Error::UnexpectedSdkResult); allocation
+//! failure returns [`Error::AllocationFailed`](crate::Error::AllocationFailed).
+//! A rejected
 //! event batch is freed and its events are lost.
 //!
 //! # Example
@@ -170,12 +172,15 @@ pub use listener::{
 /// The SDK creates these objects for any address it can parse, reachable or
 /// not, so a refusal is about the configuration: `server` is the address that
 /// was given.
-fn not_created(object: &'static str, server: Option<&str>) -> crate::Error {
+fn not_created(object: &'static str, server: Option<&ServerEndpoint<'_>>) -> crate::Error {
     crate::Error::InvalidInput(match server {
         Some(server) => {
             crate::InputDefect::DiscoveryAddressRejected(Box::new(crate::DiscoveryAddressFailure {
                 object,
-                address: server.into(),
+                address: match server.input {
+                    EndpointInput::Single(text) => text.into(),
+                    EndpointInput::List(values) => values.join(",").into(),
+                },
             }))
         }
         None => crate::InputDefect::DiscoveryAddressMissing { object },
@@ -188,15 +193,35 @@ trait Handle: Copy + Send {
     fn is_null(self) -> bool;
 }
 
+/// The native string plus the original UTF-8 input, retained only during
+/// creation so a native refusal can describe it without decoding the CString.
+struct ServerEndpoint<'options> {
+    url: std::ffi::CString,
+    input: EndpointInput<'options>,
+}
+
+enum EndpointInput<'options> {
+    Single(&'options str),
+    List(&'options [String]),
+}
+
 trait ServerOptions {
-    fn server(&self) -> crate::Result<Option<std::ffi::CString>>;
+    fn server(&self) -> crate::Result<Option<ServerEndpoint<'_>>>;
     #[cfg(feature = "advanced")]
     fn config(&self) -> Option<&crate::advanced::AdvancedConfig>;
 }
 
 impl ServerOptions for AdvertiserOptions {
-    fn server(&self) -> crate::Result<Option<std::ffi::CString>> {
-        crate::finder::list_cstring(self.configured_servers(), "servers")
+    fn server(&self) -> crate::Result<Option<ServerEndpoint<'_>>> {
+        let Some(values) = self.configured_servers() else {
+            return Ok(None);
+        };
+        crate::finder::list_cstring(Some(values), "servers").map(|url| {
+            url.map(|url| ServerEndpoint {
+                url,
+                input: EndpointInput::List(values),
+            })
+        })
     }
     #[cfg(feature = "advanced")]
     fn config(&self) -> Option<&crate::advanced::AdvancedConfig> {
@@ -205,11 +230,22 @@ impl ServerOptions for AdvertiserOptions {
 }
 
 impl ServerOptions for ListenerOptions {
-    fn server(&self) -> crate::Result<Option<std::ffi::CString>> {
+    fn server(&self) -> crate::Result<Option<ServerEndpoint<'_>>> {
         self.configured_server()
-            .map(std::ffi::CString::new)
+            .map(|text| {
+                // Preserve the public refusal order: NUL before a server list.
+                let url = std::ffi::CString::new(text)?;
+                if text.contains(',') {
+                    return Err(crate::Error::InvalidInput(
+                        crate::InputDefect::MultipleDiscoveryServers,
+                    ));
+                }
+                Ok(ServerEndpoint {
+                    url,
+                    input: EndpointInput::Single(text),
+                })
+            })
             .transpose()
-            .map_err(Into::into)
     }
     #[cfg(feature = "advanced")]
     fn config(&self) -> Option<&crate::advanced::AdvancedConfig> {
@@ -223,7 +259,6 @@ trait ServerApi: crate::sys::Table + Sync {
     type Settings;
     type Options: ServerOptions;
     const OBJECT: &'static str;
-    const SINGLE_ENDPOINT: bool;
     #[cfg(feature = "advanced")]
     type Configured: crate::sys::Table;
 
@@ -249,7 +284,7 @@ trait ServerApi: crate::sys::Table + Sync {
 
 macro_rules! server_api {
     ($Table:ty, $Handle:ident, $Raw:ty, $Settings:ident, $Options:ty,
-     $object:literal, $single:literal, $create:ident, $destroy:ident,
+     $object:literal, $create:ident, $destroy:ident,
      $Configured:ident::$configured:ident) => {
         #[derive(Clone, Copy)]
         struct $Handle($Raw);
@@ -271,7 +306,6 @@ macro_rules! server_api {
             type Settings = $Settings;
             type Options = $Options;
             const OBJECT: &'static str = $object;
-            const SINGLE_ENDPOINT: bool = $single;
             #[cfg(feature = "advanced")]
             type Configured = crate::sys::advanced::$Configured;
             fn settings(url: *const std::ffi::c_char) -> Self::Settings {
@@ -308,7 +342,6 @@ server_api!(
     NDIlib_send_advertiser_create_t,
     AdvertiserOptions,
     "advertiser",
-    false,
     NDIlib_send_advertiser_create,
     NDIlib_send_advertiser_destroy,
     SenderAdvertiserConfiguration::NDIlib_send_advertiser_create_ex
@@ -320,7 +353,6 @@ server_api!(
     NDIlib_recv_advertiser_create_t,
     AdvertiserOptions,
     "advertiser",
-    false,
     NDIlib_recv_advertiser_create,
     NDIlib_recv_advertiser_destroy,
     ReceiverAdvertiserConfiguration::NDIlib_recv_advertiser_create_ex
@@ -332,7 +364,6 @@ server_api!(
     NDIlib_send_listener_create_t,
     ListenerOptions,
     "listener",
-    true,
     NDIlib_send_listener_create,
     NDIlib_send_listener_destroy,
     SenderListenerConfiguration::NDIlib_send_listener_create_ex
@@ -344,7 +375,6 @@ server_api!(
     NDIlib_recv_listener_create_t,
     ListenerOptions,
     "listener",
-    true,
     NDIlib_recv_listener_create,
     NDIlib_recv_listener_destroy,
     ReceiverListenerConfiguration::NDIlib_recv_listener_create_ex
@@ -421,25 +451,21 @@ impl<A: ServerApi, R: Retained<A>> ServerObject<A, R> {
     ) -> crate::Result<Self> {
         // Configured gates run first and include this table's own capability.
         let api = ndi.table::<A>()?;
-        let url = options.server()?;
-        let server = url
-            .as_ref()
-            .map(|url| url.to_str().expect("options came from UTF-8"));
-        if A::SINGLE_ENDPOINT && server.is_some_and(|s| s.contains(',')) {
-            return Err(crate::Error::InvalidInput(
-                crate::InputDefect::MultipleDiscoveryServers,
-            ));
-        }
-        let settings = A::settings(url.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()));
+        let endpoint = options.server()?;
+        let settings = A::settings(
+            endpoint
+                .as_ref()
+                .map_or(std::ptr::null(), |endpoint| endpoint.url.as_ptr()),
+        );
         let instance = create(api, &settings).into_value();
         if instance.is_null() {
-            return Err(not_created(A::OBJECT, server));
+            return Err(not_created(A::OBJECT, endpoint.as_ref()));
         }
         Ok(Self {
             instance,
             retained,
             api,
-            _url: url,
+            _url: endpoint.map(|endpoint| endpoint.url),
             #[cfg(feature = "advanced")]
             _config: config,
             _ndi: ndi.clone(),
@@ -493,5 +519,65 @@ impl<A: ServerApi, R: Retained<A>> Drop for ServerObject<A, R> {
         // throughout destruction. Fields are dropped only after this returns,
         // so retained state never depends on field order for native teardown.
         unsafe { self.api.destroy(self.instance) };
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn listener_endpoint_checks_preserve_nul_before_multiple_servers() {
+        assert!(ServerOptions::server(&ListenerOptions::new())
+            .unwrap()
+            .is_none());
+        for text in ["", "café.local:5959", "127.0.0.1"] {
+            let options = ListenerOptions::new().server(text);
+            let endpoint = ServerOptions::server(&options).unwrap().unwrap();
+            assert_eq!(endpoint.url.to_bytes(), text.as_bytes());
+            assert!(matches!(endpoint.input, EndpointInput::Single(value) if value == text));
+        }
+        for text in ["a\0,b", "a,b\0"] {
+            let options = ListenerOptions::new().server(text);
+            assert!(matches!(
+                ServerOptions::server(&options),
+                Err(crate::Error::InvalidCString(_))
+            ));
+        }
+        assert!(matches!(
+            ServerOptions::server(&ListenerOptions::new().server("a,b")),
+            Err(crate::Error::InvalidInput(
+                crate::InputDefect::MultipleDiscoveryServers
+            ))
+        ));
+    }
+
+    #[test]
+    fn checked_endpoint_refusals_keep_original_utf8_and_list_text() {
+        let listener = ListenerOptions::new().server("café.local:5959");
+        let advertisers = AdvertiserOptions::new().servers(["café.local:5959", "127.0.0.1"]);
+        for (endpoint, expected) in [
+            (ServerOptions::server(&listener).unwrap(), "café.local:5959"),
+            (
+                ServerOptions::server(&advertisers).unwrap(),
+                "café.local:5959,127.0.0.1",
+            ),
+        ] {
+            let error = not_created("test", endpoint.as_ref());
+            assert!(matches!(
+                error,
+                crate::Error::InvalidInput(crate::InputDefect::DiscoveryAddressRejected(failure))
+                    if &*failure.address == expected
+            ));
+        }
+        assert!(ServerOptions::server(&AdvertiserOptions::new())
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            ServerOptions::server(&AdvertiserOptions::new().servers([""])),
+            Err(crate::Error::InvalidInput(
+                crate::InputDefect::ListElement { index: 0, .. }
+            ))
+        ));
     }
 }

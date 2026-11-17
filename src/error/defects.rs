@@ -616,9 +616,6 @@ pub enum InputDefect {
     /// queued conversion requires a sender without advertiser registrations.
     #[error("queued conversion requires a sender without advertiser registrations")]
     QueuedSenderRegistered,
-    /// AVSync request exceeds the supported audio storage limit.
-    #[error("AVSync request exceeds the supported audio storage limit")]
-    AvSyncStorageLimit,
     /// timeout {requested:?} exceeds MAX_TIMEOUT (4294967294 ms, about 49.7 days).
     #[error("timeout {requested:?} exceeds MAX_TIMEOUT (4294967294 ms, about 49.7 days)")]
     TimeoutTooLong {

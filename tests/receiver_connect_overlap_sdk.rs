@@ -83,6 +83,26 @@ struct Peers {
     height: u32,
 }
 
+/// Count complete feed iterations and upstream messages, including on a failed
+/// connection-progress assertion after the scoped workers have stopped.
+#[derive(Default)]
+struct PeerTraffic {
+    sent: [AtomicU64; 2],
+    upstream: [AtomicU64; 2],
+}
+
+impl Drop for PeerTraffic {
+    fn drop(&mut self) {
+        for index in 0..2 {
+            eprintln!(
+                "peer {index}: {} video/audio/metadata groups sent, {} upstream messages handled",
+                self.sent[index].load(Ordering::Relaxed),
+                self.upstream[index].load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
 impl Peers {
     fn new(ndi: &Ndi) -> Self {
         let senders = ["overlap BGRA", "overlap UYVY"].map(|name| {
@@ -111,7 +131,7 @@ impl Peers {
         }
     }
 
-    fn feed(&self, index: usize, stopped: &AtomicBool) {
+    fn feed(&self, index: usize, stopped: &AtomicBool, sent: &AtomicU64, stamp_audio: bool) {
         let format = if index == 0 {
             PixelFormat::Bgra
         } else {
@@ -136,7 +156,7 @@ impl Peers {
                 .build()
                 .unwrap()
         });
-        let audio = AudioFrame::builder()
+        let mut audio = AudioFrame::builder()
             .sample_rate(48_000)
             .num_channels(2)
             .num_samples(800)
@@ -151,21 +171,58 @@ impl Peers {
             let video = &mut videos[sequence as usize % videos.len()];
             video.set_timecode(Timecode::from_ticks(sequence * 2 + index as i64));
             self.senders[index].send_video(video).unwrap();
+            if stamp_audio {
+                // Match video's source/sequence epoch for the quiet recovery
+                // checks; strict capture/synchronizer fixtures keep synthesis.
+                audio.set_timecode(Timecode::from_ticks(sequence * 2 + index as i64));
+            }
             self.senders[index].send_audio(&audio);
             self.senders[index].send_metadata(&metadata);
+            sent.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    fn run(&self, work: impl FnOnce(&AtomicBool)) {
+    fn run(&self, work: impl FnOnce(&AtomicBool)) -> u64 {
+        self.run_with_traffic(false, |stopped, _traffic| work(stopped))
+    }
+
+    fn run_with_traffic(
+        &self,
+        stamp_audio: bool,
+        work: impl FnOnce(&AtomicBool, &PeerTraffic),
+    ) -> u64 {
         let stopped = AtomicBool::new(false);
+        let traffic = PeerTraffic::default();
         thread::scope(|scope| {
             for index in 0..2 {
                 let stopped = &stopped;
-                scope.spawn(move || self.feed(index, stopped));
+                let sent = &traffic.sent[index];
+                scope.spawn(move || self.feed(index, stopped, sent, stamp_audio));
+                let upstream = &traffic.upstream[index];
+                // PTZ, connection metadata and explicit metadata travel back
+                // to the source. Service that direction independently: a
+                // synchronous media send must not hold up its own consumer.
+                scope.spawn(move || {
+                    while !stopped.load(Ordering::Acquire) {
+                        if let Some(message) = timed("sender upstream metadata", SLICE, || {
+                            self.senders[index].capture_metadata_ref(SLICE)
+                        })
+                        .unwrap()
+                        {
+                            upstream.fetch_add(1, Ordering::Relaxed);
+                            drop(message);
+                        }
+                    }
+                });
             }
             let _stop = Stop(&stopped);
-            work(&stopped);
+            work(&stopped, &traffic);
         });
+        traffic
+            .upstream
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum()
     }
 }
 
@@ -211,6 +268,22 @@ struct Loans {
     returned: AtomicU64,
     videos: AtomicU64,
     audio: AtomicU64,
+    latest_video_timecode: AtomicU64,
+}
+
+impl Drop for Loans {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            eprintln!(
+                "capture progress at failure: {} actual video loans, {} actual audio loans, {} total loan checks, {} validated loans returned, latest video timecode {}",
+                self.videos.load(Ordering::Relaxed),
+                self.audio.load(Ordering::Relaxed),
+                self.taken.load(Ordering::Relaxed),
+                self.returned.load(Ordering::Relaxed),
+                self.latest_video_timecode.load(Ordering::Relaxed),
+            );
+        }
+    }
 }
 
 impl Loans {
@@ -223,7 +296,11 @@ impl Loans {
     }
 
     fn video<T: VideoSource>(&self, frame: T, peers: &Peers) {
+        let timecode = frame.timecode().ticks();
         self.check(frame, |frame| check_video(frame, peers));
+        // check_video validated the fixture's nonnegative sequence timecode.
+        self.latest_video_timecode
+            .fetch_max(timecode as u64, Ordering::Relaxed);
         self.videos.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -282,21 +359,22 @@ fn captured<T>(result: Result<Option<T>, Error>) -> Option<T> {
 }
 
 fn progress<M: ReceiverMode>(receiver: &Receiver<M>) {
-    progress_after(receiver, 0);
+    progress_after_in(receiver, 0, "initial video progress");
 }
 
-fn progress_after<M: ReceiverMode>(receiver: &Receiver<M>, before: u64) {
+fn progress_after_in<M: ReceiverMode>(receiver: &Receiver<M>, before: u64, phase: &str) {
     let deadline = Instant::now() + PATIENCE;
     loop {
-        let received = receiver.connection_stats().unwrap().video_frames_received();
+        let stats = receiver.connection_stats().unwrap();
+        let received = stats.video_frames_received();
         if received > 0 && received != before {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "no progress after source change: {:?}; stats {:?}",
+            "no progress during {phase}; video count before={before}; target {:?}; stats {:?}",
             receiver.connection_target(),
-            receiver.connection_stats().unwrap()
+            stats,
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -306,22 +384,25 @@ fn storm<M: ReceiverMode>(receiver: &Receiver<M>, peers: &Peers, stopped: &Atomi
     let deadline = Instant::now() + duration();
     let mut round = 0u64;
     while Instant::now() < deadline && !stopped.load(Ordering::Acquire) {
-        for source in &peers.sources {
-            let before = receiver.connection_stats().unwrap().video_frames_received();
-            timed("connect_to", Duration::ZERO, || receiver.connect_to(source));
-            progress_after(receiver, before);
+        for (index, source) in peers.sources.iter().enumerate() {
+            let before = receiver.connection_stats().unwrap();
+            let phase = format!("round {round} connect_to peer {index} (before: {before:?})");
+            timed(&phase, Duration::ZERO, || receiver.connect_to(source));
+            progress_after_in(receiver, before.video_frames_received(), &phase);
             thread::sleep(Duration::from_millis(round % 21));
         }
         timed("disconnect", Duration::ZERO, || receiver.disconnect());
         thread::sleep(Duration::from_millis(round % 21));
-        let before = receiver.connection_stats().unwrap().video_frames_received();
-        timed("reconnect", Duration::ZERO, || receiver.reconnect());
-        progress_after(receiver, before);
+        let before = receiver.connection_stats().unwrap();
+        let phase = format!("round {round} reconnect (before: {before:?})");
+        timed(&phase, Duration::ZERO, || receiver.reconnect());
+        progress_after_in(receiver, before.video_frames_received(), &phase);
         round += 1;
     }
-    let before = receiver.connection_stats().unwrap().video_frames_received();
+    let before = receiver.connection_stats().unwrap();
+    let phase = format!("final connect_to peer 0 after {round} rounds (before: {before:?})");
     receiver.connect_to(&peers.sources[0]);
-    progress_after(receiver, before);
+    progress_after_in(receiver, before.video_frames_received(), &phase);
     eprintln!("completed {round} connect/disconnect/reconnect rounds");
 }
 
@@ -379,6 +460,497 @@ fn native_capture_and_connect_overlap_without_torn_frames() {
         });
     });
     loans.balanced(&ndi);
+}
+
+// Refusals caused by an absent source are part of the control contract.
+// PTZ and KVM report NativeOperationFailed when their message was not sent.
+fn control_result<T: std::fmt::Debug>(result: Result<T, Error>) {
+    assert!(
+        matches!(
+            result,
+            Ok(_) | Err(Error::NotConnected | Error::NativeOperationFailed { .. })
+        ),
+        "unexpected shared-control refusal: {result:?}"
+    );
+}
+
+fn shared_controls<M: ReceiverMode>(receiver: &Receiver<M>, kind: usize, round: u64) {
+    use grafton_ndi::Tally;
+    match kind % 3 {
+        0 => {
+            let ptz = receiver.ptz();
+            let _ = ptz.is_supported();
+            control_result(ptz.recall_preset(0, 0.5));
+            control_result(ptz.store_preset(0));
+            control_result(ptz.zoom(0.5));
+            control_result(ptz.zoom_speed(0.0));
+            control_result(ptz.pan_tilt(0.0, 0.0));
+            control_result(ptz.pan_tilt_speed(0.0, 0.0));
+            control_result(ptz.auto_focus());
+            control_result(ptz.focus(0.5));
+            control_result(ptz.focus_speed(0.0));
+            control_result(ptz.white_balance_auto());
+            control_result(ptz.white_balance_indoor());
+            control_result(ptz.white_balance_outdoor());
+            control_result(ptz.white_balance_oneshot());
+            control_result(ptz.white_balance_manual(0.5, 0.5));
+            control_result(ptz.exposure_auto());
+            control_result(ptz.exposure_manual(0.5));
+            control_result(ptz.exposure_manual_detailed(1.0, 0.5, 0.5));
+        }
+        1 => {
+            receiver.set_tally(Tally::new(
+                round.is_multiple_of(2),
+                !round.is_multiple_of(2),
+            ));
+            let metadata = MetadataFrame::new("<control-overlap/>").unwrap();
+            control_result(receiver.send_metadata(&metadata));
+            control_result(receiver.add_connection_metadata(&metadata));
+            control_result(receiver.clear_connection_metadata());
+            control_result(receiver.web_control_url());
+        }
+        _ => {
+            control_result(receiver.connection_stats());
+            let _ = receiver.is_connected();
+            // Older runtimes may lack the delay or keyframe families entirely.
+            for result in [
+                receiver.set_video_delay(Duration::from_millis(round % 2)),
+                receiver.set_audio_delay(Duration::from_millis(round % 2)),
+            ] {
+                if !matches!(result, Err(Error::UnsupportedCapability { .. })) {
+                    control_result(result);
+                }
+            }
+            for result in [receiver.video_delay(), receiver.audio_delay()] {
+                if !matches!(result, Err(Error::UnsupportedCapability { .. })) {
+                    control_result(result);
+                }
+            }
+            #[cfg(feature = "advanced")]
+            {
+                let result = receiver.request_keyframe();
+                if !matches!(result, Err(Error::UnsupportedCapability { .. })) {
+                    control_result(result);
+                }
+            }
+        }
+    }
+}
+
+const CONTROL_FAMILIES: [&str; 3] = [
+    "PTZ",
+    "tally/metadata/registration/web",
+    "delay/statistics/keyframe",
+];
+
+#[derive(Default)]
+struct ControlProgress([AtomicU64; 3]);
+
+impl Drop for ControlProgress {
+    fn drop(&mut self) {
+        for (family, count) in CONTROL_FAMILIES.iter().zip(&self.0) {
+            eprintln!(
+                "{family}: {} completed control groups",
+                count.load(Ordering::Relaxed)
+            );
+        }
+    }
+}
+
+#[test]
+fn ptz_controls_capture_and_connect_complete_without_torn_frames() {
+    control_load_then_settle(&[0]);
+}
+
+#[test]
+fn metadata_controls_capture_and_connect_complete_without_torn_frames() {
+    control_load_then_settle(&[1]);
+}
+
+#[test]
+fn delay_and_statistics_capture_and_connect_complete_without_torn_frames() {
+    control_load_then_settle(&[2]);
+}
+
+#[test]
+fn shared_controls_capture_and_connect_complete_without_torn_frames() {
+    control_load_then_settle(&[0, 1, 2]);
+}
+
+/// Manual throughput/liveness measurement, stronger than the SDK request contract.
+#[test]
+#[ignore = "manual liveness characterization: continuous metadata pressure does not guarantee fresh media after every asynchronous switch"]
+fn continuous_control_pressure_and_per_change_media_liveness() {
+    characterize_per_change_control_liveness();
+}
+
+fn characterize_per_change_control_liveness() {
+    let kinds = &[0, 1, 2];
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let peers = Peers::new(&ndi);
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(peers.sources[0].clone())).unwrap();
+    let loans = Loans::default();
+    let controls = ControlProgress::default();
+    eprintln!(
+        "control overlap runtime {:?}; peers {:?}",
+        ndi.info(),
+        peers.sources
+    );
+    let upstream = peers.run(|stopped| {
+        thread::scope(|scope| {
+            let _stop = Stop(stopped);
+            for &kind in kinds {
+                let (receiver, controls) = (&receiver, &controls.0[kind]);
+                scope.spawn(move || {
+                    let mut round = 0;
+                    while !stopped.load(Ordering::Acquire) {
+                        timed("shared controls", Duration::ZERO, || {
+                            shared_controls(receiver, kind, round)
+                        });
+                        controls.fetch_add(1, Ordering::Relaxed);
+                        round += 1;
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                });
+            }
+            let workers = std::env::var("GRAFTON_NDI_OVERLAP_THREADS")
+                .map(|value| value.parse::<usize>().unwrap())
+                .unwrap_or(3);
+            for kind in 0..workers {
+                let (receiver, peers, loans) = (&receiver, &peers, &loans);
+                scope.spawn(move || {
+                    while !stopped.load(Ordering::Acquire) {
+                        match kind % 3 {
+                            0 => {
+                                if let Some(frame) =
+                                    captured(timed("control overlap video", SLICE, || {
+                                        receiver.capture_video_ref(SLICE)
+                                    }))
+                                {
+                                    loans.video(frame, peers);
+                                }
+                            }
+                            1 => {
+                                if let Some(frame) =
+                                    captured(timed("control overlap audio", SLICE, || {
+                                        receiver.capture_audio_ref(SLICE)
+                                    }))
+                                {
+                                    loans.audio(frame);
+                                }
+                            }
+                            _ => match captured(timed("control overlap mixed", SLICE, || {
+                                receiver.capture_any_ref(SLICE)
+                            })) {
+                                Some(ReceiverItemRef::Video(frame)) => loans.video(frame, peers),
+                                Some(ReceiverItemRef::Audio(frame)) => loans.audio(frame),
+                                _ => {}
+                            },
+                        }
+                    }
+                });
+            }
+            progress(&receiver);
+            loans.wait_for_media(&ndi);
+            storm(&receiver, &peers, stopped);
+        });
+    });
+    for &kind in kinds {
+        assert!(
+            controls.0[kind].load(Ordering::Relaxed) > 0,
+            "{} made no calls",
+            CONTROL_FAMILIES[kind]
+        );
+    }
+    assert!(upstream > 0, "source handled no upstream controls");
+    loans.balanced(&ndi);
+}
+
+// Connection methods submit asynchronous SDK requests. Concurrent controls do
+// not promise uninterrupted media after every request: require bounded calls,
+// valid delivered frames, and convergence after load stops instead. The manual
+// characterization above retains the stronger per-change measurement.
+fn control_load_then_settle(kinds: &[usize]) {
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let peers = Peers::new(&ndi);
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(peers.sources[0].clone())).unwrap();
+    let loans = Loans::default();
+    let controls = ControlProgress::default();
+    let workers = std::env::var("GRAFTON_NDI_OVERLAP_THREADS")
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(3);
+    assert!(workers >= 3);
+    let latest_final_video = AtomicU64::new(0);
+    let latest_final_audio = AtomicU64::new(0);
+    eprintln!("convergence runtime {:?}", ndi.info());
+    let wait_until = |phase: &str, deadline: Instant, complete: &dyn Fn() -> bool| {
+        while !complete() {
+            assert!(
+                Instant::now() < deadline,
+                "{phase}: video {}, audio {}, stats {:?}",
+                latest_final_video.load(Ordering::Relaxed),
+                latest_final_audio.load(Ordering::Relaxed),
+                receiver.connection_stats().unwrap()
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    };
+    let upstream = peers.run_with_traffic(true, |stopped, traffic| {
+        thread::scope(|captures| {
+            let _stop = Stop(stopped);
+            for kind in 0..workers {
+                let (receiver, peers, loans, latest_video, audio) = (
+                    &receiver,
+                    &peers,
+                    &loans,
+                    &latest_final_video,
+                    &latest_final_audio,
+                );
+                captures.spawn(move || {
+                    let video = |frame: grafton_ndi::VideoFrameRef<'_>| {
+                        let timecode = frame.timecode().ticks();
+                        loans.video(frame, peers);
+                        if timecode % 2 == 1 {
+                            latest_video.fetch_max(timecode as u64, Ordering::Relaxed);
+                        }
+                    };
+                    let sound = |frame: grafton_ndi::AudioFrameRef<'_>| {
+                        let timecode = frame.timecode().ticks();
+                        let peer1 = frame
+                            .channels()
+                            .flatten()
+                            .next()
+                            .is_some_and(|v| v.is_sign_negative() && v.abs() > 0.0);
+                        loans.audio(frame);
+                        if peer1 {
+                            assert!(
+                                timecode >= 0 && timecode % 2 == 1,
+                                "final-target audio lost its sequence timecode: {timecode}"
+                            );
+                            audio.fetch_max(timecode as u64, Ordering::Relaxed);
+                        }
+                    };
+                    while !stopped.load(Ordering::Acquire) {
+                        match kind % 3 {
+                            0 => {
+                                if let Some(frame) =
+                                    captured(timed("convergence video", SLICE, || {
+                                        receiver.capture_video_ref(SLICE)
+                                    }))
+                                {
+                                    video(frame);
+                                }
+                            }
+                            1 => {
+                                if let Some(frame) =
+                                    captured(timed("convergence audio", SLICE, || {
+                                        receiver.capture_audio_ref(SLICE)
+                                    }))
+                                {
+                                    sound(frame);
+                                }
+                            }
+                            _ => match captured(timed("convergence mixed", SLICE, || {
+                                receiver.capture_any_ref(SLICE)
+                            })) {
+                                Some(ReceiverItemRef::Video(frame)) => video(frame),
+                                Some(ReceiverItemRef::Audio(frame)) => sound(frame),
+                                _ => {}
+                            },
+                        }
+                    }
+                });
+            }
+            wait_until(
+                "initial continuous media",
+                Instant::now() + PATIENCE,
+                &|| {
+                    loans.videos.load(Ordering::Relaxed) >= 3
+                        && loans.audio.load(Ordering::Relaxed) >= 3
+                },
+            );
+            let stop_controls = AtomicBool::new(false);
+            thread::scope(|control_scope| {
+                let _stop_controls = Stop(&stop_controls);
+                for &kind in kinds {
+                    let (receiver, count, stopped) = (&receiver, &controls.0[kind], &stop_controls);
+                    control_scope.spawn(move || {
+                        let mut round = 0;
+                        while !stopped.load(Ordering::Acquire) {
+                            timed("convergence controls", Duration::ZERO, || {
+                                shared_controls(receiver, kind, round)
+                            });
+                            count.fetch_add(1, Ordering::Relaxed);
+                            round += 1;
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                    });
+                }
+                let steady_deadline = Instant::now() + PATIENCE;
+                wait_until("controls start", steady_deadline, &|| {
+                    kinds
+                        .iter()
+                        .all(|&kind| controls.0[kind].load(Ordering::Relaxed) > 0)
+                });
+                // Observe steady control/capture load before changing source.
+                // A video pause under load must not skip the later recovery check.
+                thread::sleep(SLICE);
+                eprintln!(
+                    "steady load before connection changes: video {}, audio {}, stats {:?}",
+                    latest_final_video.load(Ordering::Relaxed),
+                    latest_final_audio.load(Ordering::Relaxed),
+                    receiver.connection_stats().unwrap()
+                );
+                let before_controls = controls
+                    .0
+                    .each_ref()
+                    .map(|count| count.load(Ordering::Relaxed));
+                let deadline = Instant::now() + duration();
+                let mut round = 0;
+                while Instant::now() < deadline {
+                    for (index, source) in peers.sources.iter().enumerate() {
+                        timed(
+                            &format!("load round {round} connect_to peer {index}"),
+                            Duration::ZERO,
+                            || receiver.connect_to(source),
+                        );
+                        thread::sleep(Duration::from_millis(round % 21));
+                    }
+                    timed("load disconnect", Duration::ZERO, || receiver.disconnect());
+                    thread::sleep(Duration::from_millis(round % 21));
+                    timed("load reconnect", Duration::ZERO, || receiver.reconnect());
+                    thread::sleep(Duration::from_millis(round % 21));
+                    round += 1;
+                }
+                timed(
+                    "final target request under control load",
+                    Duration::ZERO,
+                    || receiver.connect_to(&peers.sources[1]),
+                );
+                for &kind in kinds {
+                    assert!(
+                        controls.0[kind].load(Ordering::Relaxed) > before_controls[kind],
+                        "{} made no calls during connection load",
+                        CONTROL_FAMILIES[kind]
+                    );
+                }
+                eprintln!(
+                    "final peer1 target issued after {round} load rounds; stopping only controls"
+                );
+            });
+            // No request follows this point. Feed count n completes sequence
+            // n-1; at most one following synchronous video send is in progress.
+            // Require a peer1 sequence >n+1 to exclude pre-stop queued video.
+            let deadline = Instant::now() + PATIENCE;
+            let cutoff = traffic.sent[1]
+                .load(Ordering::Relaxed)
+                .saturating_add(1)
+                .saturating_mul(2)
+                .saturating_add(1);
+            wait_until(
+                "fresh final-target video after controls stop",
+                deadline,
+                &|| latest_final_video.load(Ordering::Relaxed) > cutoff,
+            );
+            wait_until(
+                "fresh final-target audio after controls stop",
+                deadline,
+                &|| latest_final_audio.load(Ordering::Relaxed) > cutoff,
+            );
+            eprintln!(
+                "converged without another request: peer1 video {} > {cutoff}; audio {}",
+                latest_final_video.load(Ordering::Relaxed),
+                latest_final_audio.load(Ordering::Relaxed)
+            );
+        });
+    });
+    if kinds.iter().any(|&kind| kind == 0 || kind == 1) {
+        assert!(upstream > 0, "source handled no upstream controls");
+    }
+    loans.balanced(&ndi);
+}
+
+#[cfg(feature = "advanced")]
+fn kvm_overlap(
+    receiver: &mut Receiver,
+    peers: &Peers,
+    ndi: &Ndi,
+    changes: impl FnOnce(&AtomicBool) + Send,
+) {
+    use grafton_ndi::advanced::{MouseButton, WheelAxis};
+    let loans = Loans::default();
+    peers.run(|stopped| {
+        progress(receiver);
+        let mut session = receiver.kvm().unwrap();
+        let view = session.receiver();
+        thread::scope(|scope| {
+            let _stop = Stop(stopped);
+            scope.spawn(|| changes(stopped));
+            scope.spawn(|| {
+                while !stopped.load(Ordering::Acquire) {
+                    match captured(timed("KVM overlap capture", SLICE, || {
+                        view.capture_any_ref(SLICE)
+                    })) {
+                        Some(ReceiverItemRef::Video(frame)) => loans.video(frame, peers),
+                        Some(ReceiverItemRef::Audio(frame)) => loans.audio(frame),
+                        _ => {}
+                    }
+                }
+            });
+            loans.wait_for_media(ndi);
+            let deadline = Instant::now() + duration();
+            let mut groups = 0;
+            while Instant::now() < deadline {
+                timed("KVM controls", Duration::ZERO, || {
+                    let _ = session.is_supported();
+                    for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+                        control_result(session.mouse_down(button));
+                        control_result(session.mouse_up(button));
+                    }
+                    for axis in [WheelAxis::Vertical, WheelAxis::Horizontal] {
+                        control_result(session.wheel(axis, 0.5));
+                    }
+                    control_result(session.move_pointer(0.5, 0.5));
+                    control_result(session.set_clipboard_text("overlap"));
+                    control_result(session.key_down(0xff0d));
+                    control_result(session.key_up(0xff0d));
+                    control_result(session.touch(&[[0.2, 0.3]]));
+                    control_result(session.finish_touch());
+                    control_result(session.release_all());
+                    view.set_tally(grafton_ndi::Tally::new(false, true));
+                    control_result(view.request_keyframe());
+                    control_result(view.connection_stats());
+                });
+                groups += 1;
+                thread::sleep(Duration::from_millis(2));
+            }
+            eprintln!("completed {groups} KVM control groups");
+        });
+    });
+    loans.balanced(ndi);
+}
+
+#[cfg(feature = "advanced")]
+#[test]
+fn kvm_controls_and_shared_capture_complete_without_torn_frames() {
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    if let Err(error) = ndi.require_feature(grafton_ndi::RuntimeFeature::Kvm) {
+        common::skip(common::Requirement::Advanced, &error.to_string());
+        return;
+    }
+    let _turn = sockets();
+    let peers = Peers::new(&ndi);
+    let mut receiver =
+        Receiver::new(&ndi, &ReceiverOptions::new(peers.sources[0].clone())).unwrap();
+    kvm_overlap(&mut receiver, &peers, &ndi, |_| {});
 }
 
 #[test]
@@ -602,10 +1174,42 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
     // records an SDK unsubscribe/connect deadlock. Listener destruction happens
     // only after every capture/control worker below has joined.
     listener.subscribe(&id);
+    #[cfg(feature = "advanced")]
+    let mut receiver = receiver;
+    #[cfg(feature = "advanced")]
+    if ndi.require_feature(RuntimeFeature::Kvm).is_ok() {
+        kvm_overlap(&mut receiver, &peers, &ndi, |stopped| {
+            while !stopped.load(Ordering::Acquire) {
+                listener
+                    .request_connect(&id, peers.sources[1].name())
+                    .unwrap();
+                thread::sleep(Duration::from_millis(25));
+                listener.request_disconnect(&id).unwrap();
+                thread::sleep(Duration::from_millis(25));
+                listener
+                    .request_connect(&id, peers.sources[0].name())
+                    .unwrap();
+                thread::sleep(Duration::from_millis(250));
+            }
+        });
+    }
     let loans = Loans::default();
     peers.run(|stopped| {
         thread::scope(|scope| {
             let _stop = Stop(stopped);
+            for kind in 0..3 {
+                let receiver = &receiver;
+                scope.spawn(move || {
+                    let mut round = 0;
+                    while !stopped.load(Ordering::Acquire) {
+                        timed("remote shared controls", Duration::ZERO, || {
+                            shared_controls(receiver, kind, round)
+                        });
+                        round += 1;
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                });
+            }
             scope.spawn(|| {
                 while !stopped.load(Ordering::Acquire) {
                     match captured(timed("remote mixed capture", SLICE, || {
@@ -643,7 +1247,7 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
                 observe(SourceNameChange::Connected(
                     peers.sources[index].name().to_owned(),
                 ));
-                progress_after(&receiver, before);
+                progress_after_in(&receiver, before, "remote request_connect");
                 loans.wait_for_media(&ndi);
                 assert_eq!(
                     receiver.connection_target(),

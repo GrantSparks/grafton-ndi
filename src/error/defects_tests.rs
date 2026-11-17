@@ -207,7 +207,6 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("QueueLimits", InputDefect::QueueLimits, "queue requires 1..=65536 frames and a positive addressable byte limit"),
         ("QueueIdentifiersExhausted", InputDefect::QueueIdentifiersExhausted, "queue submission identifiers exhausted"),
         ("QueuedSenderRegistered", InputDefect::QueuedSenderRegistered, "queued conversion requires a sender without advertiser registrations"),
-        ("AvSyncStorageLimit", InputDefect::AvSyncStorageLimit, "AVSync request exceeds the supported audio storage limit"),
         ("TimeoutTooLong", InputDefect::TimeoutTooLong { requested: Duration::from_millis(4_294_967_295).into() }, "timeout 4294967.295s exceeds MAX_TIMEOUT (4294967294 ms, about 49.7 days)"),
         ("TimeoutInstantOverflow", InputDefect::TimeoutInstantOverflow { requested: Duration::from_millis(4_294_967_295).into() }, "timeout 4294967.295s ends at an instant this platform cannot represent"),
         ("ReceiveDelayTooLong", InputDefect::ReceiveDelayTooLong { requested: Duration::from_millis(4_294_967_295).into() }, "receive delay 4294967.295s exceeds 2000 ms"),

@@ -342,7 +342,7 @@ including `is_connected`, `connection_stats`, tally and PTZ.
 UYVY/UYVA sends use sanitized staging on targets needing SDK tail room. Active
 rows are packed and tail bytes zeroed by default, so caller padding cannot
 change the picture. Direct external sending requires enough initialized space
-and `allow_send_from_padding_and_tail(true)`. The unsafe `readable_after`
-declaration alone does not opt in; padding/tail bytes may affect encoded output
-once opted in. Allocate with `PixelFormat::send_buffer_len` and follow the
-[`BorrowedVideoFrameBuilder` safety contract](https://grantsparks.github.io/grafton-ndi/grafton_ndi/sender/struct.BorrowedVideoFrameBuilder.html).
+and `allow_send_from_padding_and_tail(true)`. Include all trailing room in the
+slice passed to the builder; padding/tail bytes may affect encoded output once
+opted in. Allocate with `PixelFormat::send_buffer_len` and follow the
+[`BorrowedVideoFrameBuilder` padding policy](https://grantsparks.github.io/grafton-ndi/grafton_ndi/sender/struct.BorrowedVideoFrameBuilder.html).

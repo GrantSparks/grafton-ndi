@@ -51,7 +51,7 @@ AUDITED = {
     'tests/build_configuration.rs': (
         'advanced_availability_discards_missing_functions_types_and_constants_before_resolution',
         'an_sdk_is_optional_but_an_explicit_root_must_be_one',
-        'a_static_edition_is_embedded_in_the_spelling_the_loader_reads',
+        'the_selected_static_archives_generate_typed_runtime_editions',
         'an_installation_is_advanced_when_it_has_the_advanced_header',
         'only_headers_without_the_mit_grant_are_generated_locally',
         'header_patterns_escape_every_separator',
