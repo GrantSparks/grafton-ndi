@@ -213,7 +213,9 @@ must also remain loaded for the process lifetime because the SDK retains
 callback pointers. Applications that do not opt in keep ordinary lifetimes.
 
 Attach an ordinary or packet receiver, then install video/audio allocation
-policies. Policies execute on SDK threads, potentially concurrently; return
+policies. Follow the
+[`ReceiveAllocator` callback contract](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/trait.ReceiveAllocator.html#callback-contract)
+for threading, permitted shared operations and ownership restrictions. Return
 quickly. An error or contained panic declines the allocation. Replacing a policy
 installs the replacement before retiring the old policy, so allocations begun
 by the setter can still use it. Only calls of the old policy still running

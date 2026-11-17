@@ -4120,7 +4120,7 @@ mod tests {
             drop(permission);
             member.join().unwrap();
             assert_eq!(
-                concurrent.expect("membership waited for the control permit"),
+                concurrent.expect("membership waited for the change permit"),
                 expected
             );
         });
@@ -4141,7 +4141,7 @@ mod tests {
         }
         impl Drop for ObserveDrop {
             fn drop(&mut self) {
-                // An actual advertiser destructor acquires this same permit.
+                // A policy destructor may use shared controls through this permit.
                 // Use try_lock so a regression reports failure without hanging.
                 self.available.store(
                     self.core.control_guard.try_lock().is_some(),
