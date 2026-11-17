@@ -729,7 +729,7 @@ impl Finder {
     /// Copy one snapshot through the entry point's shared lifetime contract.
     /// The guard carries the handle it protects, so fetching cannot pair a
     /// different finder's instance with this lock.
-    #[cfg(any(feature = "advanced", test))]
+    #[cfg(any(test, all(feature = "advanced", ndi_has_advanced_source_metadata)))]
     pub(crate) fn snapshot<S: FinderSnapshot>(&self, snapshot: &S) -> Result<Vec<S::Item>> {
         let Ok(guard) = self.lock_snapshots(NeverStop);
         guard.snapshot(snapshot)
