@@ -8669,7 +8669,7 @@ mod tests {
             ));
             assert!(matches!(
                 crate::FrameSyncAudioRequest::capture_at(48_000, 2, samples),
-                Err(Error::InvalidFrame(crate::FrameDefect::Layout(cause))) if cause == expected
+                Err(Error::InvalidInput(crate::InputDefect::Layout(cause))) if cause == expected
             ));
         }
         for (width, height, bytes) in [
