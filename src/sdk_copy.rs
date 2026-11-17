@@ -296,14 +296,31 @@ impl CopyBudget {
         value: *const c_char,
     ) -> TextResult<Option<crate::finder::SourceText>> {
         // SAFETY: forwarded to the caller's obligations.
-        let text = unsafe { self.c_str(value)? };
-        text.map(|text| {
-            let text = LossyText::new(text.to_bytes());
-            self.take(text.len() + crate::finder::SourceText::STORAGE_OVERHEAD)?;
-            // SAFETY: the bounded C string scan excludes its first NUL.
-            unsafe { crate::finder::SourceText::from_sdk(text) }.map_err(Into::into)
-        })
-        .transpose()
+        unsafe { self.source_text_view(value)? }
+            .map(|text| {
+                // SAFETY: the bounded C string scan excludes its first NUL.
+                unsafe { crate::finder::SourceText::from_sdk(text) }.map_err(Into::into)
+            })
+            .transpose()
+    }
+
+    /// Charge the complete source copy while lending its classified text.
+    /// Selection may omit the allocation, but never its scan or storage charge.
+    ///
+    /// # Safety
+    /// As for [`Self::c_str`], including the borrowed text's lifetime.
+    pub(crate) unsafe fn source_text_view<'a>(
+        &mut self,
+        value: *const c_char,
+    ) -> TextResult<Option<LossyText<'a>>> {
+        // SAFETY: forwarded to the caller's obligations.
+        unsafe { self.c_str(value)? }
+            .map(|text| {
+                let text = LossyText::new(text.to_bytes());
+                self.take(text.len() + crate::finder::SourceText::STORAGE_OVERHEAD)?;
+                Ok(text)
+            })
+            .transpose()
     }
 
     /// Copy exact identifier bytes, including their sole trailing NUL.
@@ -376,6 +393,35 @@ impl<'a> LossyText<'a> {
                 ClassifiedText::Invalid { bytes, len }
             }
         })
+    }
+
+    pub(crate) fn as_str(&self) -> Option<&'a str> {
+        match self.0 {
+            ClassifiedText::Valid(text) => Some(text),
+            ClassifiedText::Invalid { .. } => None,
+        }
+    }
+
+    /// Compare the lossy representation without constructing a temporary copy.
+    pub(crate) fn equals(&self, mut other: &str) -> bool {
+        match &self.0 {
+            ClassifiedText::Valid(text) => *text == other,
+            ClassifiedText::Invalid { bytes, .. } => {
+                for chunk in bytes.utf8_chunks() {
+                    let Some(rest) = other.strip_prefix(chunk.valid()) else {
+                        return false;
+                    };
+                    other = rest;
+                    if !chunk.invalid().is_empty() {
+                        let Some(rest) = other.strip_prefix('\u{fffd}') else {
+                            return false;
+                        };
+                        other = rest;
+                    }
+                }
+                other.is_empty()
+            }
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -730,6 +776,26 @@ mod tests {
         // SAFETY: each byte within the remaining scan bound is readable.
         limit_error(unsafe { short.c_str(unterminated.as_ptr().cast()) });
         assert_eq!(short.remaining(), 0);
+    }
+
+    #[test]
+    fn borrowed_lossy_comparison_matches_the_owned_representation() {
+        for bytes in [
+            &b""[..],
+            b"ASCII",
+            b"a\xff\xe2\x82\xac\xe2\x82",
+            b"\xff\xfe",
+            "é\u{fffd}".as_bytes(),
+        ] {
+            let text = LossyText::new(bytes);
+            let expected = String::from_utf8_lossy(bytes);
+            let (matches, allocations) =
+                crate::test_alloc::allocation_count(|| text.equals(&expected));
+            assert!(matches);
+            assert_eq!(allocations, 0);
+            assert!(!text.equals(&format!("{expected}x")));
+            assert!(!text.equals(&format!("x{expected}")));
+        }
     }
 
     #[test]

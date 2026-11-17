@@ -12,10 +12,12 @@ mod snapshot_guard_contract;
 pub(crate) use budget::SnapshotBudget;
 
 use std::{
+    borrow::{Borrow, Cow},
     cell::Cell,
     collections::{HashMap, HashSet},
     ffi::{c_char, CString},
     fmt::{self, Display, Formatter},
+    hash::{Hash, Hasher},
     net::IpAddr,
     ptr,
     sync::{Arc, Mutex},
@@ -322,6 +324,43 @@ unsafe impl FinderSnapshot for sys::Core {
     }
 }
 
+/// The same native snapshot and copy budget, with allocation deferred until
+/// an internal selector accepts the borrowed, bounded source text.
+struct SelectingSnapshot<'a, F> {
+    core: &'a sys::Core,
+    select: F,
+}
+
+impl<F> snapshot_sealed::Sealed for SelectingSnapshot<'_, F> {}
+
+// SAFETY: this delegates fetch to Core and never lets borrowed text escape
+// copy; accepted entries become the same owned Sources as an ordinary snapshot.
+unsafe impl<F: Fn(&BorrowedSource<'_>) -> Result<bool>> FinderSnapshot
+    for SelectingSnapshot<'_, F>
+{
+    type Descriptor = NDIlib_source_t;
+    type Item = Source;
+
+    unsafe fn fetch(
+        &self,
+        instance: NDIlib_find_instance_t,
+        count: &mut u32,
+    ) -> *const Self::Descriptor {
+        // SAFETY: forwarded to the serialized live-instance obligation.
+        unsafe { self.core.fetch(instance, count) }
+    }
+
+    unsafe fn copy(
+        &self,
+        source: &Self::Descriptor,
+        budget: &mut SnapshotBudget,
+    ) -> Result<Option<Source>> {
+        let (name, address) = source_pointers(source);
+        // SAFETY: the snapshot guard keeps both native strings readable.
+        unsafe { snapshot_selected_source(name, address, budget, &self.select) }
+    }
+}
+
 /// An acquired snapshot lock and the exact native handle it guards. Fetching
 /// gets its instance from this guard, never from a separate Finder argument.
 struct SnapshotGuard<'finder> {
@@ -541,9 +580,10 @@ impl SourceWatch<'_> {
         &mut self,
         deadline: Deadline,
         stop: S,
+        select: impl Fn(&BorrowedSource<'_>) -> Result<bool>,
     ) -> StopResult<Option<Vec<Source>>, S> {
         self.snapshot(
-            |finder| finder.current_sources_until(deadline, stop),
+            |finder| finder.current_sources_until(deadline, stop, select),
             |sources| matches!(sources, Ok(Some(_))),
         )
     }
@@ -598,6 +638,89 @@ pub(crate) unsafe fn snapshot_source(
     // or the SDK string bound. This policy skips malformed strings while
     // retaining their scan charges in the snapshot's shared budget.
     unsafe { decode_source(name, address, |pointer| budget.text(pointer)) }
+}
+
+struct BorrowedSource<'a> {
+    name: LossyText<'a>,
+    address: Option<LossyText<'a>>,
+}
+
+impl BorrowedSource<'_> {
+    fn with_key<T>(&self, inspect: impl FnOnce((&str, Option<&str>)) -> T) -> Result<T> {
+        fn text<'a>(value: &LossyText<'a>) -> Result<Cow<'a, str>> {
+            value.as_str().map_or_else(
+                || {
+                    value
+                        .copy()
+                        .map(Cow::Owned)
+                        .map_err(|_| budget::allocation_failed())
+                },
+                |text| Ok(Cow::Borrowed(text)),
+            )
+        }
+        let name = text(&self.name)?;
+        let address = self.address.as_ref().map(text).transpose()?;
+        Ok(inspect((&name, address.as_deref())))
+    }
+
+    fn matches_query(&self, query: HostQuery<'_>) -> Result<bool> {
+        self.with_key(|(name, address)| source_matches_query(name, address, query))
+    }
+
+    fn seen_in(&self, seen: &HashSet<Source>) -> Result<bool> {
+        self.with_key(|key| seen.contains(&key as &dyn SourceIdentity))
+    }
+}
+
+/// Preserve scan order and every ordinary-copy charge, including rejected
+/// entries. Only allocation is conditional; no borrowed native text escapes.
+///
+/// # Safety
+/// Each non-null pointer stays readable through its first NUL or the SDK bound
+/// until selection and any accepted source copy have finished.
+unsafe fn snapshot_selected_source(
+    name: *const c_char,
+    address: *const c_char,
+    budget: &mut SnapshotBudget,
+    select: impl FnOnce(&BorrowedSource<'_>) -> Result<bool>,
+) -> Result<Option<Source>> {
+    if name.is_null() && address.is_null() {
+        return Ok(None);
+    }
+    let name = if name.is_null() {
+        budget.empty_source_name()?;
+        LossyText::new(b"")
+    } else {
+        // SAFETY: forwarded to the caller's bounded string obligation.
+        let Some(name) = (unsafe { budget.source_text_view(name) })? else {
+            return Ok(None);
+        };
+        name
+    };
+    let address = if address.is_null() {
+        None
+    } else {
+        // SAFETY: forwarded to the caller's bounded string obligation.
+        let Some(address) = (unsafe { budget.source_text_view(address) })? else {
+            return Ok(None);
+        };
+        Some(address)
+    };
+    let source = BorrowedSource { name, address };
+    if !select(&source)? {
+        return Ok(None);
+    }
+    // SAFETY: both classified strings came from bounded scans excluding NUL;
+    // the source copy charges were already paid, even if selection rejected it.
+    unsafe {
+        Ok(Some(Source::from_text(
+            SourceText::from_sdk(source.name)?,
+            source
+                .address
+                .map(|address| SourceText::from_sdk(address).map(SourceAddress))
+                .transpose()?,
+        )))
+    }
 }
 
 /// The descriptor's address is one pointer, whether the SDK calls it an IP
@@ -889,10 +1012,14 @@ impl Finder {
         &self,
         deadline: Deadline,
         stop: S,
+        select: impl Fn(&BorrowedSource<'_>) -> Result<bool>,
     ) -> StopResult<Option<Vec<Source>>, S> {
         match self.lock_snapshots_until(deadline, stop) {
             Ok(Some(guard)) => guard
-                .snapshot(&self._ndi.api().core)
+                .snapshot(&SelectingSnapshot {
+                    core: &self._ndi.api().core,
+                    select,
+                })
                 .map(|sources| Ok(Some(sources))),
             Ok(None) => Ok(Ok(None)),
             Err(stopped) => Ok(Err(stopped)),
@@ -912,23 +1039,27 @@ impl Finder {
     ///
     /// Returns `Ok(None)` if the deadline passes without `accept` selecting a
     /// value.
-    fn poll_until_deadline<T, S: Stop>(
+    fn poll_until_deadline<T, S: Stop, A>(
         &self,
         deadline: Deadline,
         stop: S,
-        mut accept: impl FnMut(Vec<Source>) -> Result<Option<T>>,
+        state: &mut A,
+        select: impl Fn(&A, &BorrowedSource<'_>) -> Result<bool>,
+        mut accept: impl FnMut(&mut A, Vec<Source>) -> Result<Option<T>>,
     ) -> StopResult<Option<T>, S> {
         let mut watch = self.watch();
         loop {
             if let Err(stopped) = stop.check() {
                 return Ok(Err(stopped));
             }
-            let sources = match watch.current_sources_until(deadline, stop)? {
+            let sources = match watch
+                .current_sources_until(deadline, stop, |source| select(state, source))?
+            {
                 Ok(Some(sources)) => sources,
                 Ok(None) => return Ok(Ok(None)),
                 Err(stopped) => return Ok(Err(stopped)),
             };
-            if let Some(selected) = accept(sources)? {
+            if let Some(selected) = accept(state, sources)? {
                 return Ok(Ok(Some(selected)));
             }
             if deadline.is_expired() {
@@ -980,9 +1111,13 @@ impl Finder {
         stop: S,
         mut select: impl FnMut(&Source) -> bool,
     ) -> StopResult<Option<Source>, S> {
-        self.poll_until_deadline(deadline, stop, |sources| {
-            Ok(sources.into_iter().find(|source| select(source)))
-        })
+        self.poll_until_deadline(
+            deadline,
+            stop,
+            &mut (),
+            |_, _| Ok(true),
+            |_, sources| Ok(sources.into_iter().find(|source| select(source))),
+        )
     }
 
     /// Wait for an exact, case-sensitive complete NDI source name.
@@ -990,7 +1125,8 @@ impl Finder {
     /// Names normally look like `"STUDIO (Camera 2)"`. Duplicate names at different
     /// addresses select the first match in the current snapshot; use
     /// [`Self::find_source`] with an address predicate to disambiguate them.
-    /// Timeout, allocation, concurrency and error behavior match that method.
+    /// Timeout, concurrency and error behavior match that method. Only matching
+    /// descriptors are copied from each bounded snapshot.
     ///
     /// # Errors
     ///
@@ -999,9 +1135,23 @@ impl Finder {
     /// including in async lookups. Other errors match [`Self::find_source`].
     pub fn find_source_by_name(&self, name: &str, timeout: Duration) -> Result<Option<Source>> {
         let (name, deadline) = checked_name_lookup(name, timeout)?;
-        let Ok(source) =
-            self.find_source_until(deadline, NeverStop, |source| source.name() == name.as_str())?;
+        let Ok(source) = self.find_source_by_name_until(name.as_str(), deadline, NeverStop)?;
         Ok(source)
+    }
+
+    pub(crate) fn find_source_by_name_until<S: Stop>(
+        &self,
+        name: &str,
+        deadline: Deadline,
+        stop: S,
+    ) -> StopResult<Option<Source>, S> {
+        self.poll_until_deadline(
+            deadline,
+            stop,
+            &mut (),
+            |_, source| Ok(source.name.equals(name)),
+            |_, sources| Ok(sources.into_iter().next()),
+        )
     }
 
     /// Discovers sources for up to `timeout`, returning the complete set.
@@ -1071,15 +1221,35 @@ impl Finder {
         deadline: Deadline,
         stop: S,
     ) -> StopResult<Vec<Source>, S> {
+        self.find_selected_sources_until(deadline, stop, None)
+    }
+
+    fn find_selected_sources_until<S: Stop>(
+        &self,
+        deadline: Deadline,
+        stop: S,
+        query: Option<HostQuery<'_>>,
+    ) -> StopResult<Vec<Source>, S> {
         // Preserve first-observed order and deduplicate by complete descriptor.
-        let mut seen = HashSet::new();
-        let mut discovered = Vec::new();
-        let mut retained_bytes = 0;
-        let outcome = self.poll_until_deadline(deadline, stop, |sources| {
-            accumulate_sources(&mut discovered, &mut seen, &mut retained_bytes, sources)?;
-            Ok(None::<()>)
-        })?;
-        Ok(outcome.map(|_| discovered))
+        let mut state = (Vec::new(), HashSet::new(), 0);
+        let outcome = self.poll_until_deadline(
+            deadline,
+            stop,
+            &mut state,
+            |(_, seen, _), source| {
+                if let Some(query) = query {
+                    if !source.matches_query(query)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(!source.seen_in(seen)?)
+            },
+            |(discovered, seen, retained_bytes), sources| {
+                accumulate_sources(discovered, seen, retained_bytes, sources)?;
+                Ok(None::<()>)
+            },
+        )?;
+        Ok(outcome.map(|_| state.0))
     }
 }
 
@@ -1331,6 +1501,24 @@ impl<'a> HostQuery<'a> {
     }
 }
 
+fn address_matches_query(address: &str, query: HostQuery<'_>) -> bool {
+    !matches!(query, HostQuery::Machine(_))
+        && parse_authority(address).is_some_and(|authority| query.matches(authority.host))
+}
+
+fn source_matches_query(name: &str, address: Option<&str>, query: HostQuery<'_>) -> bool {
+    if address.is_some_and(|address| address_matches_query(address, query)) {
+        return true;
+    }
+    match query {
+        HostQuery::Ip(_) => false,
+        HostQuery::Host(_) | HostQuery::Machine(_) => name
+            .split_once(" (")
+            .filter(|(_, source)| source.ends_with(')'))
+            .is_some_and(|(machine, _)| query.matches(machine)),
+    }
+}
+
 /// A parsed query that can cross a blocking-pool dispatch without reparsing
 /// text or borrowing the async caller's string.
 #[cfg(any(feature = "tokio", feature = "smol"))]
@@ -1526,10 +1714,7 @@ impl SourceAddress {
     }
 
     fn matches_query(&self, query: HostQuery<'_>) -> bool {
-        !matches!(query, HostQuery::Machine(_))
-            && self
-                .authority()
-                .is_some_and(|authority| query.matches(authority.host))
+        address_matches_query(self.as_str(), query)
     }
 
     /// Extract an explicit port from conventional host/port or URL syntax.
@@ -1587,10 +1772,57 @@ impl SourceAddress {
 /// assert_eq!(source.to_string(), "LAPTOP (Camera 1)@192.168.1.100:5960");
 /// assert!(Source::new("LAPTOP (Camera 1)").unwrap().address().is_none());
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     name: SourceText,
     address: Option<SourceAddress>,
+}
+
+/// Owned and borrowed source keys use the same complete textual identity.
+/// Trait-object borrowing permits a HashSet lookup without allocating a Source.
+trait SourceIdentity {
+    fn key(&self) -> (&str, Option<&str>);
+}
+
+impl SourceIdentity for Source {
+    fn key(&self) -> (&str, Option<&str>) {
+        (
+            self.name(),
+            self.address.as_ref().map(SourceAddress::as_str),
+        )
+    }
+}
+
+impl SourceIdentity for (&str, Option<&str>) {
+    fn key(&self) -> (&str, Option<&str>) {
+        *self
+    }
+}
+
+impl Hash for Source {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
+}
+
+impl Hash for dyn SourceIdentity + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
+}
+
+impl PartialEq for dyn SourceIdentity + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for dyn SourceIdentity + '_ {}
+
+impl<'a> Borrow<dyn SourceIdentity + 'a> for Source {
+    fn borrow(&self) -> &(dyn SourceIdentity + 'a) {
+        self
+    }
 }
 
 #[repr(C)]
@@ -1692,21 +1924,11 @@ impl Source {
     }
 
     fn matches_query(&self, query: HostQuery<'_>) -> bool {
-        if self
-            .address
-            .as_ref()
-            .is_some_and(|address| address.matches_query(query))
-        {
-            return true;
-        }
-        match query {
-            HostQuery::Ip(_) => false,
-            HostQuery::Host(_) | HostQuery::Machine(_) => self
-                .name()
-                .split_once(" (")
-                .filter(|(_, source)| source.ends_with(')'))
-                .is_some_and(|(machine, _)| query.matches(machine)),
-        }
+        source_matches_query(
+            self.name(),
+            self.address.as_ref().map(SourceAddress::as_str),
+            query,
+        )
     }
 
     /// Extract the host from conventional host/port or URL syntax.
@@ -1999,18 +2221,8 @@ impl SourceCache {
         deadline: Deadline,
         stop: S,
     ) -> StopResult<Vec<Source>, S> {
-        let mut seen = HashSet::new();
-        let mut discovered = Vec::new();
-        let mut retained_bytes = 0;
-        let outcome = self
-            .finder()
-            .poll_until_deadline(deadline, stop, |mut sources| {
-                sources.retain(|source| source.matches_query(query));
-                accumulate_sources(&mut discovered, &mut seen, &mut retained_bytes, sources)?;
-                Ok(None::<()>)
-            })?;
-        // Only the kernel can distinguish a completed window from a stop.
-        Ok(outcome.map(|_| discovered))
+        self.finder()
+            .find_selected_sources_until(deadline, stop, Some(query))
     }
 
     /// Remove a host's complete result set and suppress pending fills.

@@ -156,11 +156,13 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncFinder<R, D> {
         let name = name.into_owned();
         let inner = Arc::clone(&self.inner);
         with_deadline_budget::<R, _, _>(deadline, move |deadline, stop| {
-            discovery_result(sealed::SourceDiscovery::finder(&*inner).find_source_until(
-                deadline,
-                stop,
-                |source| source.name() == name.as_str(),
-            ))
+            discovery_result(
+                sealed::SourceDiscovery::finder(&*inner).find_source_by_name_until(
+                    name.as_str(),
+                    deadline,
+                    stop,
+                ),
+            )
         })
         .await
     }
