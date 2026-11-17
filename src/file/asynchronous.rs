@@ -2020,12 +2020,13 @@ impl ProbeQueue {
 #[derive(Clone)]
 pub struct AsyncFilePlayer {
     worker: Arc<Worker<PlayerOwner>>,
+    name: Arc<str>,
 }
 
 impl std::fmt::Debug for AsyncFilePlayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncFilePlayer")
-            .field("mode", &"playback")
+            .field("name", &self.name)
             .finish_non_exhaustive()
     }
 }
@@ -2044,7 +2045,8 @@ impl AsyncFilePlayer {
     /// cannot be started.
     #[doc(alias = "NDIlib_file_player_create")]
     pub fn create(api: &FileApi, options: &FilePlayerOptions) -> FileOperation<Self> {
-        Worker::<PlayerOwner>::create(api, options, |worker| Self { worker })
+        let name = Arc::from(options.name.as_str());
+        Worker::<PlayerOwner>::create(api, options, move |worker| Self { worker, name })
     }
 
     /// Create a player and advertise its source, with the given queue sizes.
@@ -2059,8 +2061,10 @@ impl AsyncFilePlayer {
         options: &FilePlayerOptions,
         asynchronous: &AsyncFileOptions,
     ) -> FileOperation<Self> {
-        Worker::<PlayerOwner>::create_with_options(api, options, asynchronous, |worker| Self {
+        let name = Arc::from(options.name.as_str());
+        Worker::<PlayerOwner>::create_with_options(api, options, asynchronous, move |worker| Self {
             worker,
+            name,
         })
     }
 
@@ -4916,10 +4920,25 @@ mod tests {
                 .map(PlayerOwner::new)
             },
             AsyncFileOptions::new(),
-            |worker| AsyncFilePlayer { worker },
+            |worker| AsyncFilePlayer {
+                worker,
+                name: Arc::from("mock player"),
+            },
         ))
         .unwrap();
         (count, player)
+    }
+
+    #[test]
+    fn async_player_debug_retains_its_name_across_clones() {
+        let (_, player) = mock_player();
+        assert_eq!(
+            format!("{player:?}"),
+            "AsyncFilePlayer { name: \"mock player\", .. }"
+        );
+        let other = player.clone();
+        assert!(Arc::ptr_eq(&player.name, &other.name));
+        assert_eq!(format!("{player:?}"), format!("{other:?}"));
     }
 
     #[test]
