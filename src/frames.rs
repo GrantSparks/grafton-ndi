@@ -262,7 +262,7 @@ impl PixelFormat {
             ValidatedVideoLayout::new_uncompressed(self, width, height, line_stride_bytes)?;
         // The validated data and the maximum send room fit usize on every
         // supported target; the bound is asserted beside ValidatedVideoLayout.
-        Ok(layout.data_len_bytes + crate::pixels::send_room(&layout, scan_type))
+        Ok(layout.data_len_bytes() + crate::pixels::send_room(&layout, scan_type))
     }
 
     /// Get compile-time format properties.
@@ -522,7 +522,7 @@ impl PixelFormat {
     ) -> Result<usize> {
         let layout =
             ValidatedVideoLayout::new_uncompressed(self, width, height, line_stride_bytes)?;
-        Ok(layout.data_len_bytes)
+        Ok(layout.data_len_bytes())
     }
 
     /// Whether sending this format needs the runtime to support it: the
@@ -773,7 +773,7 @@ pub(crate) trait VideoPartsExt: VideoParts {
         match self.initialized() {
             Initialized::Storage { room_after } => room_after >= room,
             Initialized::ActiveRows => {
-                layout.payload_len_bytes == layout.data_len_bytes && room == 0
+                layout.payload_len_bytes() == layout.data_len_bytes() && room == 0
             }
         }
     }
@@ -817,7 +817,7 @@ pub(crate) trait VideoPartsExt: VideoParts {
         let room = crate::pixels::send_room(&packed, self.header().scan_type);
         packed_video(
             self,
-            Pixels::with_room(packed.data_len_bytes, room),
+            Pixels::with_room(packed.data_len_bytes(), room),
             metadata,
         )
     }
@@ -837,7 +837,7 @@ pub(crate) trait VideoPartsExt: VideoParts {
     /// storage; pixel contents are unspecified, and its SDK room stays zero.
     fn copy_into_owned(&self, destination: &mut VideoFrame) {
         let packed = self.layout().packed();
-        let len = packed.data_len_bytes;
+        let len = packed.data_len_bytes();
         let room = crate::pixels::send_room(&packed, self.header().scan_type);
         let replacement =
             (!destination.data.holds(len, room)).then(|| Pixels::with_room(len, room));
@@ -872,7 +872,7 @@ pub(crate) trait VideoPartsExt: VideoParts {
         let metadata = self.frame_metadata();
         let timestamp = self.sdk_timestamp();
         let room = crate::pixels::send_room(&layout, header.scan_type);
-        data.fill(layout.data_len_bytes, room, |bytes| {
+        data.fill(layout.data_len_bytes(), room, |bytes| {
             for plane in self.plane_views() {
                 match plane.data() {
                     Some(active) => bytes.extend_from_slice(active),
@@ -1744,7 +1744,7 @@ impl VideoFrame {
         let layout =
             ValidatedVideoLayout::new_uncompressed(pixel_format, width, height, Some(line_stride))
                 .unwrap();
-        assert_eq!(data.len(), layout.data_len_bytes);
+        assert_eq!(data.len(), layout.data_len_bytes());
         Self {
             layout,
             header: VideoHeader::new(
@@ -1965,7 +1965,7 @@ impl VideoFrameBuilder {
         let room = crate::pixels::send_room(&layout, self.scan_type);
         let data = match self.data {
             Some(data) => Pixels::adopt(data, room),
-            None => Pixels::zeroed(layout.data_len_bytes, room),
+            None => Pixels::zeroed(layout.data_len_bytes(), room),
         };
 
         Ok(VideoFrame {
@@ -3274,9 +3274,9 @@ pub(crate) use metadata::{
 /// Validated video frame layout information.
 ///
 /// This struct holds pre-validated layout information for a video frame,
-/// including the computed buffer length and stride/size information.
+/// with a plane table that determines every storage and payload quantity.
 /// Creating this struct performs all necessary bounds checking, so
-/// consumers can safely use the cached values without re-validation.
+/// consumers can derive those quantities without re-validation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValidatedVideoLayout {
     /// The validated width in pixels.
@@ -3285,14 +3285,9 @@ pub(crate) struct ValidatedVideoLayout {
     height: u32,
     /// The validated pixel format.
     pixel_format: PixelFormat,
-    /// Complete storage extent in bytes; SDK padding need not be initialized.
-    data_len_bytes: usize,
-    /// Initialized active payload, excluding all row padding.
-    payload_len_bytes: usize,
+    /// The authority for plane offsets, active rows and storage strides.
+    /// Unused trailing entries are zero; every extent and sum is validated.
     plane_layouts: [VideoPlaneLayout; MAX_VIDEO_PLANES],
-    plane_count: usize,
-    /// The validated first-plane line stride in bytes.
-    line_stride_bytes: usize,
 }
 
 /// A frame together with the capability proof obtained for that frame.
@@ -3408,7 +3403,14 @@ const _: () = {
 impl ValidatedVideoLayout {
     /// Initialized active payload, excluding padding.
     pub(crate) const fn payload_len_bytes(&self) -> usize {
-        self.payload_len_bytes
+        let mut payload = 0;
+        let mut index = 0;
+        while index < self.plane_count() {
+            let plane = self.plane_layouts[index];
+            payload += plane.active_row_bytes * plane.row_count;
+            index += 1;
+        }
+        payload
     }
 
     /// The validated `width` value.
@@ -3426,14 +3428,19 @@ impl ValidatedVideoLayout {
         self.pixel_format
     }
 
-    /// The validated `data_len_bytes` value.
+    /// Complete storage extent in bytes; SDK padding need not be initialized.
     pub(crate) const fn data_len_bytes(&self) -> usize {
-        self.data_len_bytes
+        let last = self.plane_layouts[self.plane_count() - 1];
+        last.offset + last.row_stride * last.row_count
     }
 
-    /// The validated `line_stride_bytes` value.
+    /// The validated first-plane line stride in bytes.
     pub(crate) const fn line_stride_bytes(&self) -> usize {
-        self.line_stride_bytes
+        self.plane_layouts[0].row_stride
+    }
+
+    const fn plane_count(&self) -> usize {
+        self.pixel_format.info().plane_count()
     }
 
     /// Validate an uncompressed layout. Only `None` selects the packed stride;
@@ -3478,7 +3485,7 @@ impl ValidatedVideoLayout {
             Some(stride) => stride,
         };
 
-        let (plane_layouts, plane_count, data_len_bytes, payload_len_bytes) = video_plane_layouts(
+        let plane_layouts = video_plane_layouts(
             pixel_format.info(),
             line_stride as u64,
             minimum,
@@ -3489,11 +3496,7 @@ impl ValidatedVideoLayout {
             width,
             height,
             pixel_format,
-            data_len_bytes,
-            payload_len_bytes,
             plane_layouts,
-            plane_count,
-            line_stride_bytes: line_stride,
         })
     }
 
@@ -3536,24 +3539,20 @@ impl ValidatedVideoLayout {
     /// plane's stride becomes its active row and its offset the payload of
     /// the planes before it, so the storage is exactly the active payload.
     /// Nothing is computed that validation did not already bound: every
-    /// partial sum is at most the payload, which validation summed without
-    /// overflow and which is at most the storage it checked against
+    /// partial payload sum is at most the storage extent validation checked against
     /// [`MAX_VIDEO_BYTES`]. It is the layout [`video_plane_layouts`] gives
     /// the packed stride, `width` times the bytes per pixel, which a test
     /// checks for every format.
     pub(crate) fn packed(&self) -> Self {
         let mut plane_layouts = self.plane_layouts;
         let mut offset = 0;
-        for plane in &mut plane_layouts[..self.plane_count] {
+        for plane in &mut plane_layouts[..self.plane_count()] {
             plane.offset = offset;
             plane.row_stride = plane.active_row_bytes;
             offset += plane.active_row_bytes * plane.row_count;
         }
-        debug_assert_eq!(offset, self.payload_len_bytes);
         Self {
-            data_len_bytes: self.payload_len_bytes,
             plane_layouts,
-            line_stride_bytes: self.plane_layouts[0].active_row_bytes,
             ..*self
         }
     }
@@ -3570,18 +3569,18 @@ impl ValidatedVideoLayout {
 
     /// The SDK's `line_stride_in_bytes`.
     pub(crate) fn sdk_line_stride(&self) -> i32 {
-        self.line_stride_bytes as i32
+        self.line_stride_bytes() as i32
     }
 
     /// The storage after the frame's last active byte: the padding of the
     /// last row of the last plane, where the storage ends.
     pub(crate) fn trailing_padding(&self) -> usize {
-        let last = self.plane_layouts[self.plane_count - 1];
+        let last = self.plane_layouts[self.plane_count() - 1];
         last.row_stride - last.active_row_bytes
     }
 
     fn planes(&self) -> &[VideoPlaneLayout] {
-        &self.plane_layouts[..self.plane_count]
+        &self.plane_layouts[..self.plane_count()]
     }
 
     /// One plane of the frame stored at `data`, or `None` for an invalid
@@ -3692,10 +3691,10 @@ fn validate_video_width(width: i64) -> LayoutResult<()> {
 
 /// Require supplied pixels to fill `layout` exactly.
 fn check_video_data_len(layout: &ValidatedVideoLayout, len: usize) -> Result<()> {
-    if len != layout.data_len_bytes {
+    if len != layout.data_len_bytes() {
         return Err(Error::InvalidFrame(crate::FrameDefect::VideoDataLength {
             actual: len,
-            expected: layout.data_len_bytes,
+            expected: layout.data_len_bytes(),
         }));
     }
     Ok(())
@@ -3733,7 +3732,10 @@ fn calculate_buffer_len_for_info_checked(
     height: usize,
 ) -> Result<usize> {
     video_plane_layouts(info, y_stride as u64, y_stride as u64, height as u64)
-        .map(|(_, _, storage, _)| storage)
+        .map(|planes| {
+            let last = planes[info.plane_count() - 1];
+            last.offset + last.row_stride * last.row_count
+        })
         .map_err(Into::into)
 }
 
@@ -3781,7 +3783,7 @@ fn video_plane_layouts(
     stride: u64,
     active: u64,
     height: u64,
-) -> LayoutResult<([VideoPlaneLayout; MAX_VIDEO_PLANES], usize, usize, usize)> {
+) -> LayoutResult<[VideoPlaneLayout; MAX_VIDEO_PLANES]> {
     let mut dimensions = [(stride, active, height); MAX_VIDEO_PLANES];
     match info.category() {
         FormatCategory::Packed => {}
@@ -3822,7 +3824,6 @@ fn video_plane_layouts(
     validate_video_data_len(storage)?;
     let mut planes = [VideoPlaneLayout::default(); MAX_VIDEO_PLANES];
     let mut offset = 0usize;
-    let mut payload = 0usize;
     for (plane, &(row_stride, active_row_bytes, row_count)) in
         planes.iter_mut().zip(&dimensions[..count])
     {
@@ -3840,11 +3841,12 @@ fn video_plane_layouts(
         };
         offset += row_stride * row_count;
         debug_assert!(active_row_bytes <= row_stride);
-        payload += active_row_bytes * row_count;
-        debug_assert!(payload <= offset);
     }
-    let storage = storage as usize;
-    Ok((planes, count, storage, payload))
+    // The complete storage extent and each partial sum fit MAX_VIDEO_BYTES.
+    // Active rows fit their strides, so payload products and sums fit too.
+    // Layout accessors and packed() can therefore derive either extent using
+    // ordinary usize arithmetic without overflow on any supported target.
+    Ok(planes)
 }
 
 /// Validated audio frame layout information.
@@ -5588,9 +5590,12 @@ mod tests {
                         );
                         assert_eq!(layout.is_ok(), expected <= MAX_VIDEO_BYTES as u128);
                         if let Ok(layout) = layout {
-                            assert_eq!(layout.plane_count, count);
-                            assert_eq!(layout.data_len_bytes as u128, expected);
-                            assert_eq!(layout.payload_len_bytes, active * height as usize * count);
+                            assert_eq!(layout.plane_count(), count);
+                            assert_eq!(layout.data_len_bytes() as u128, expected);
+                            assert_eq!(
+                                layout.payload_len_bytes(),
+                                active * height as usize * count
+                            );
                             for (i, plane) in layout.planes().iter().enumerate() {
                                 assert_eq!(plane.offset, i * stride * height as usize);
                                 assert_eq!(plane.row_stride, stride);
@@ -5643,7 +5648,7 @@ mod tests {
                             .unwrap();
                     let packed = layout.packed();
                     assert_eq!(format!("{packed:?}"), format!("{expected:?}"));
-                    assert_eq!(packed.data_len_bytes, layout.payload_len_bytes);
+                    assert_eq!(packed.data_len_bytes(), layout.payload_len_bytes());
                     packed_layouts += 1;
                 }
             }
@@ -5683,7 +5688,7 @@ mod tests {
                 let data = unsafe { layout.view_data(storage.as_ptr()) };
                 assert_eq!(
                     data.map(<[u8]>::len),
-                    contiguous.then_some(layout.payload_len_bytes),
+                    contiguous.then_some(layout.payload_len_bytes()),
                     "{format:?} height {height} padding {padding}"
                 );
                 for (index, plane) in planes.iter().enumerate() {
@@ -6315,8 +6320,11 @@ mod tests {
                         assert_eq!(reversed.join().unwrap(), serial);
                     });
                 }
-                assert_eq!(VideoParts::layout(&frame).data_len_bytes, offset);
-                assert_eq!(VideoParts::layout(&frame).payload_len_bytes, expected.len());
+                assert_eq!(VideoParts::layout(&frame).data_len_bytes(), offset);
+                assert_eq!(
+                    VideoParts::layout(&frame).payload_len_bytes(),
+                    expected.len()
+                );
                 let owned = frame.to_owned();
                 let raw_owned = unsafe { VideoFrame::from_raw(&raw) }.unwrap();
                 assert_eq!(owned.data(), expected);
@@ -6538,7 +6546,7 @@ mod tests {
                 ))
             }
             .unwrap();
-            assert_eq!(frame.data().is_some(), padded.plane_count == 1);
+            assert_eq!(frame.data().is_some(), padded.plane_count() == 1);
             assert!(
                 !frame.sends_in_place(),
                 "padded {format:?} capture must stage"
@@ -6547,7 +6555,7 @@ mod tests {
             for plane in frame.planes() {
                 assert_eq!(plane.data().unwrap(), vec![42; plane.active_row_bytes()]);
             }
-            assert_eq!(frame.to_owned().data(), vec![42; tight.payload_len_bytes]);
+            assert_eq!(frame.to_owned().data(), vec![42; tight.payload_len_bytes()]);
         }
         for format in [PixelFormat::Yv12, PixelFormat::I420, PixelFormat::Nv12] {
             let tight = ValidatedVideoLayout::new_uncompressed(format, 4, 2, None).unwrap();
@@ -6586,11 +6594,11 @@ mod tests {
             let (width, height) = (4, 2);
             let packed =
                 ValidatedVideoLayout::new_uncompressed(format, width, height, None).unwrap();
-            let stride = packed.line_stride_bytes + 8;
+            let stride = packed.line_stride_bytes() + 8;
             let padded =
                 ValidatedVideoLayout::new_uncompressed(format, width, height, Some(stride))
                     .unwrap();
-            let mut storage = Box::<[u8]>::new_uninit_slice(padded.data_len_bytes);
+            let mut storage = Box::<[u8]>::new_uninit_slice(padded.data_len_bytes());
             let mut active = Vec::new();
             let mut value = 7u8;
             for plane in padded.planes() {
@@ -6951,7 +6959,7 @@ mod tests {
             assert_eq!(sender.is_ok(), accepted, "BorrowedVideoFrame {label}");
 
             if let (Ok(len), Ok(layout)) = (info_len, layout) {
-                assert_eq!(layout.data_len_bytes, len, "{label}");
+                assert_eq!(layout.data_len_bytes(), len, "{label}");
             }
             if !accepted && height % 2 == 0 {
                 let msg = format.buffer_len(1920, height, Some(stride)).unwrap_err();
@@ -9122,7 +9130,7 @@ mod tests {
     fn test_video_cap_allows_8k_bgra_without_allocating() {
         let layout =
             ValidatedVideoLayout::new_uncompressed(PixelFormat::Bgra, 7680, 4320, None).unwrap();
-        assert_eq!(layout.data_len_bytes, 132_710_400);
+        assert_eq!(layout.data_len_bytes(), 132_710_400);
         assert!(matches!(
             ValidatedVideoLayout::new_uncompressed(PixelFormat::Bgra, 16_384, 8_640, None),
             Err(Error::InvalidFrame(_))
@@ -9164,9 +9172,9 @@ mod tests {
 
         let layout = result.unwrap();
         assert_eq!(layout.pixel_format, PixelFormat::Bgra);
-        assert_eq!(layout.data_len_bytes, expected_size);
+        assert_eq!(layout.data_len_bytes(), expected_size);
         assert_eq!(layout.sdk_line_stride(), stride);
-        assert_eq!(layout.line_stride_bytes, stride as usize);
+        assert_eq!(layout.line_stride_bytes(), stride as usize);
     }
 
     /// Test validate_video_layout accepts the first-plane strides the SDK
@@ -9205,9 +9213,9 @@ mod tests {
             let layout = validate_video_layout(&raw)
                 .unwrap_or_else(|e| panic!("{format:?} stride {stride} rejected: {e}"));
             assert_eq!(layout.pixel_format, format);
-            assert_eq!(layout.data_len_bytes, expected_size, "{format:?}");
+            assert_eq!(layout.data_len_bytes(), expected_size, "{format:?}");
             assert_eq!(layout.sdk_line_stride(), stride);
-            assert_eq!(layout.line_stride_bytes, stride as usize);
+            assert_eq!(layout.line_stride_bytes(), stride as usize);
         }
     }
 
@@ -9334,9 +9342,9 @@ mod tests {
             timestamp: 0,
         };
         let layout = validate_video_layout(&raw).unwrap();
-        assert_eq!(layout.data_len_bytes, data.len());
+        assert_eq!(layout.data_len_bytes(), data.len());
         assert_eq!(layout.sdk_line_stride(), 64);
-        assert_eq!(layout.line_stride_bytes, 64);
+        assert_eq!(layout.line_stride_bytes(), 64);
         let owned = unsafe { VideoFrame::from_raw(&raw) }.unwrap();
         assert_eq!(owned.data().len(), data.len());
     }
@@ -9962,7 +9970,7 @@ mod tests {
             "data() should return slice with cached length"
         );
         assert_eq!(
-            VideoParts::layout(&frame_ref).data_len_bytes,
+            VideoParts::layout(&frame_ref).data_len_bytes(),
             expected_size,
             "Cached data_len_bytes should match expected"
         );
@@ -10285,7 +10293,7 @@ mod tests {
                 metadata: expected_metadata,
                 timestamp: expected_timestamp,
             } = expected;
-            assert_eq!(data.len(), layout.data_len_bytes);
+            assert_eq!(data.len(), layout.data_len_bytes());
             let room = crate::pixels::send_room(layout, header.scan_type);
             assert_eq!(data.room_bytes(), vec![0; room]);
             assert_eq!(format!("{layout:?}"), format!("{expected_layout:?}"));
@@ -10584,3 +10592,7 @@ mod metadata_tests;
 #[cfg(ndi_test_descriptor_parts)]
 #[path = "../tests/ui/internal/descriptor_parts.rs"]
 mod descriptor_parts_fixture;
+
+#[cfg(test)]
+#[path = "frames/video_layout_tests.rs"]
+mod video_layout_tests;
