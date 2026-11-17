@@ -520,12 +520,10 @@ impl<T> FileOperation<T> {
 
     fn start(&mut self) {
         let stage = self.stage.get_mut().unwrap_or_else(PoisonError::into_inner);
-        if matches!(stage, Stage::Deferred(_)) {
-            let Stage::Deferred(start) = std::mem::replace(stage, Stage::Done) else {
-                unreachable!()
-            };
-            *stage = Stage::Live(start());
-        }
+        *stage = match std::mem::replace(stage, Stage::Done) {
+            Stage::Deferred(start) => Stage::Live(start()),
+            started => started,
+        };
     }
 
     #[cfg(test)]
