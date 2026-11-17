@@ -120,11 +120,3 @@ fn invalid_frame(cause: crate::FrameDefect) -> crate::Error {
 fn invalid_input(cause: crate::InputDefect) -> crate::Error {
     crate::Error::InvalidInput(cause)
 }
-
-/// `value` when it is in `1..=i32::MAX`, the range of the SDK's signed
-/// quantities: dimensions, sample rates, channel and sample counts.
-fn sdk_quantity(value: impl Into<i64>) -> Option<u32> {
-    u32::try_from(value.into())
-        .ok()
-        .filter(|value| (1..=i32::MAX.unsigned_abs()).contains(value))
-}

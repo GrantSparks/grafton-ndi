@@ -42,24 +42,15 @@ impl AudioReferenceLevel {
 struct AudioShape(ValidatedAudioLayout);
 
 impl AudioShape {
-    fn new(sample_rate: u32, num_channels: u32, num_samples: u32) -> Result<Self> {
-        // Share FLTP's checked stride and 64 MiB payload ceiling. This also
-        // bounds conversion destinations for 16-bit source data.
-        Ok(Self(ValidatedAudioLayout::new_uncompressed(
-            crate::AudioFormat::Fltp,
-            sample_rate,
-            num_channels,
-            num_samples,
-            None,
-        )?))
-    }
-
     /// The shape of `len` interleaved samples in `num_channels` channels.
     fn interleaved(sample_rate: u32, num_channels: u32, len: usize) -> Result<Self> {
         // Check channels through the same count rule as planar audio before
         // dividing. An empty source then reaches that rule as zero samples.
-        let (channels, _) = crate::frames::validate_positive_audio_counts(num_channels.into(), 1)?;
-        if !len.is_multiple_of(channels) {
+        let channels = crate::frames::validate_audio_count(
+            num_channels.into(),
+            crate::AudioCountKind::Channels,
+        )?;
+        if !len.is_multiple_of(channels.to_usize()) {
             return Err(Error::InvalidFrame(
                 crate::FrameDefect::InterleavedAudioLength {
                     actual: len,
@@ -67,7 +58,7 @@ impl AudioShape {
                 },
             ));
         }
-        let samples = len / channels;
+        let samples = len / channels.to_usize();
         let num_samples = u32::try_from(samples).map_err(|_| {
             // Any count beyond u32 also exceeds the FLTP payload ceiling.
             // Keep that size refusal distinct from a non-multiple length.
@@ -75,7 +66,18 @@ impl AudioShape {
                 (len as u64).saturating_mul(size_of::<f32>() as u64).into(),
             )
         })?;
-        Self::new(sample_rate, num_channels, num_samples)
+        // Keep the channel proof from the divisibility check. Only the new
+        // rate and sample count need checking before the shared extent rule.
+        Ok(Self(ValidatedAudioLayout::from_quantities(
+            crate::AudioFormat::Fltp,
+            crate::frames::validate_audio_sample_rate(sample_rate.into())?,
+            channels,
+            crate::frames::validate_audio_count(
+                num_samples.into(),
+                crate::AudioCountKind::Samples,
+            )?,
+            None,
+        )?))
     }
 
     /// The shape of a planar source whose layout was validated at construction

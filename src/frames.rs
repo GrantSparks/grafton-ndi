@@ -5,7 +5,6 @@ use std::{
     fmt,
     marker::PhantomData,
     mem::{size_of, ManuallyDrop},
-    num::NonZeroU32,
     os::raw::c_char,
     slice,
 };
@@ -19,6 +18,7 @@ use crate::{
         RecvMetadataGuard, SenderMetadataFree, VideoKind,
     },
     framesync::{AudioInputFormat, FrameSyncAudioRef, FrameSyncVideoRef},
+    media::SdkQuantity,
     pixels::Pixels,
     sys::{self, bindings::*},
     Error, FourCc, FrameRate, PictureAspectRatio, Rejected, Result, SdkTimestamp, Timecode,
@@ -3857,12 +3857,10 @@ fn video_plane_layouts(
 pub(crate) struct ValidatedAudioLayout {
     /// The validated audio format.
     format: AudioFormat,
-    /// The validated sample rate: positive and at most `i32::MAX`.
-    sample_rate: u32,
-    /// The validated channel count: positive.
-    no_channels: usize,
-    /// The validated samples per channel: positive.
-    no_samples: usize,
+    /// Quantities whose construction proves the SDK's signed range.
+    sample_rate: SdkQuantity,
+    no_channels: SdkQuantity,
+    no_samples: SdkQuantity,
     /// The validated channel stride in `f32` samples.
     channel_stride_samples: usize,
     /// The validated backing sample count. For strided planar audio this may be
@@ -3870,6 +3868,20 @@ pub(crate) struct ValidatedAudioLayout {
     /// padding up to the last channel's final sample.
     sample_count: usize,
 }
+
+// Keep the layout no larger than the previous representation on every target.
+const _: () = {
+    #[allow(dead_code)]
+    struct PreviousLayout {
+        format: AudioFormat,
+        sample_rate: u32,
+        no_channels: usize,
+        no_samples: usize,
+        channel_stride_samples: usize,
+        sample_count: usize,
+    }
+    assert!(size_of::<ValidatedAudioLayout>() <= size_of::<PreviousLayout>());
+};
 
 /// Initialized audio channel slices in channel order, without allocation.
 ///
@@ -3943,17 +3955,17 @@ impl ValidatedAudioLayout {
 
     /// The validated `sample_rate` value.
     pub(crate) const fn sample_rate(&self) -> u32 {
-        self.sample_rate
+        self.sample_rate.get()
     }
 
     /// The validated `no_channels` value.
     pub(crate) const fn no_channels(&self) -> usize {
-        self.no_channels
+        self.no_channels.to_usize()
     }
 
     /// The validated `no_samples` value.
     pub(crate) const fn no_samples(&self) -> usize {
-        self.no_samples
+        self.no_samples.to_usize()
     }
 
     /// The validated `channel_stride_samples` value.
@@ -3963,7 +3975,7 @@ impl ValidatedAudioLayout {
 
     /// Initialized samples only, excluding inter-channel padding.
     fn active_sample_count(&self) -> usize {
-        self.no_channels * self.no_samples
+        self.no_channels() * self.no_samples()
     }
 
     /// The validated `sample_count` value.
@@ -4039,11 +4051,11 @@ impl ValidatedAudioLayout {
     /// Replace the stride through the same rule used for delivered audio.
     #[cfg(feature = "advanced")]
     pub(crate) fn with_channel_stride_bytes(self, stride: usize) -> LayoutResult<Self> {
-        Self::checked(
+        Self::from_quantities(
             self.format,
-            self.sample_rate.into(),
-            self.no_channels as i64,
-            self.no_samples as i64,
+            self.sample_rate,
+            self.no_channels,
+            self.no_samples,
             Some(stride),
         )
     }
@@ -4057,10 +4069,24 @@ impl ValidatedAudioLayout {
     ) -> LayoutResult<Self> {
         let sample_rate = validate_audio_sample_rate(sample_rate)?;
         let (no_channels, no_samples) = validate_positive_audio_counts(no_channels, no_samples)?;
-        let minimum = no_samples as u64 * size_of::<f32>() as u64;
+        Self::from_quantities(format, sample_rate, no_channels, no_samples, channel_stride)
+    }
+
+    /// Check only the extent and stride of quantities already in the SDK range.
+    pub(crate) fn from_quantities(
+        format: AudioFormat,
+        sample_rate: SdkQuantity,
+        no_channels: SdkQuantity,
+        no_samples: SdkQuantity,
+        channel_stride: Option<usize>,
+    ) -> LayoutResult<Self> {
+        let minimum = u64::from(no_samples.get()) * size_of::<f32>() as u64;
         let stride = channel_stride.map_or(minimum, |stride| stride as u64);
-        let sample_count =
-            checked_audio_extent(no_channels, no_samples, stride / size_of::<f32>() as u64)?;
+        let sample_count = checked_audio_extent(
+            no_channels.to_usize(),
+            no_samples.to_usize(),
+            stride / size_of::<f32>() as u64,
+        )?;
         // The extent bounds the packed minimum even for a single channel.
         let minimum = minimum as usize;
         let stride = stride as usize;
@@ -4090,18 +4116,18 @@ impl ValidatedAudioLayout {
     /// The same frame with channels stored back to back, without padding.
     pub(crate) fn packed(self) -> Self {
         Self {
-            channel_stride_samples: self.no_samples,
-            sample_count: self.no_channels * self.no_samples,
+            channel_stride_samples: self.no_samples(),
+            sample_count: self.no_channels() * self.no_samples(),
             ..self
         }
     }
 
     pub(crate) fn num_channels(self) -> u32 {
-        self.no_channels as u32
+        self.no_channels.get()
     }
 
     pub(crate) fn num_samples(self) -> u32 {
-        self.no_samples as u32
+        self.no_samples.get()
     }
 
     pub(crate) fn channel_stride_bytes(self) -> usize {
@@ -4110,17 +4136,17 @@ impl ValidatedAudioLayout {
 
     /// The SDK's `sample_rate`.
     pub(crate) fn sdk_sample_rate(self) -> i32 {
-        self.sample_rate as i32
+        self.sample_rate.to_sdk()
     }
 
     /// The SDK's `no_channels`.
     pub(crate) fn sdk_num_channels(self) -> i32 {
-        self.no_channels as i32
+        self.no_channels.to_sdk()
     }
 
     /// The SDK's `no_samples`.
     pub(crate) fn sdk_num_samples(self) -> i32 {
-        self.no_samples as i32
+        self.no_samples.to_sdk()
     }
 
     /// The SDK's `channel_stride_in_bytes`.
@@ -4129,7 +4155,7 @@ impl ValidatedAudioLayout {
     }
 
     pub(crate) fn channel_range(self, channel: usize) -> Option<std::ops::Range<usize>> {
-        if channel >= self.no_channels {
+        if channel >= self.no_channels() {
             return None;
         }
 
@@ -4137,7 +4163,7 @@ impl ValidatedAudioLayout {
         // samples fits usize and sample_count; every earlier channel fits too.
         // packed() preserves that proof when removing inter-channel padding.
         let start = channel * self.channel_stride_samples;
-        let end = start + self.no_samples;
+        let end = start + self.no_samples();
         debug_assert!(end <= self.sample_count);
         Some(start..end)
     }
@@ -4153,7 +4179,7 @@ impl ValidatedAudioLayout {
         let range = self.channel_range(channel)?;
         // SAFETY: checked_audio_extent and packed() prove every channel's
         // range fits the initialized storage the caller keeps borrowed.
-        Some(unsafe { slice::from_raw_parts(data.add(range.start), self.no_samples) })
+        Some(unsafe { slice::from_raw_parts(data.add(range.start), self.no_samples()) })
     }
 
     /// Every channel's samples of the frame stored at `data`, in order,
@@ -4166,7 +4192,7 @@ impl ValidatedAudioLayout {
         AudioChannels {
             data,
             layout: self,
-            indices: 0..self.no_channels,
+            indices: 0..self.no_channels(),
             lifetime: PhantomData,
         }
     }
@@ -4180,7 +4206,7 @@ impl ValidatedAudioLayout {
     ///
     /// As for [`Self::channel`].
     unsafe fn view_samples<'a>(self, data: *const f32) -> Option<&'a [f32]> {
-        if self.no_channels > 1 && self.channel_stride_samples != self.no_samples {
+        if self.no_channels() > 1 && self.channel_stride_samples != self.no_samples() {
             return None;
         }
         // SAFETY: with one channel, or channels back to back, the
@@ -4207,8 +4233,8 @@ fn check_audio_data_len(layout: &ValidatedAudioLayout, len: usize) -> Result<()>
             detail: crate::CompactDiagnostic::new(crate::AudioLengthDefect {
                 actual: len,
                 expected: layout.sample_count,
-                channels: layout.no_channels as u32,
-                samples: layout.no_samples as u32,
+                channels: layout.no_channels.get(),
+                samples: layout.no_samples.get(),
             }),
         }));
     }
@@ -4217,32 +4243,29 @@ fn check_audio_data_len(layout: &ValidatedAudioLayout, len: usize) -> Result<()>
 
 /// The one sample-rate check for every audio path, for values from the API
 /// and from the SDK: `1..=i32::MAX` Hz.
-pub(crate) fn validate_audio_sample_rate(sample_rate: i64) -> LayoutResult<u32> {
-    u32::try_from(sample_rate)
-        .ok()
-        .filter(|rate| (1..=i32::MAX.unsigned_abs()).contains(rate))
-        .ok_or(crate::LayoutDefect::AudioRate(sample_rate.into()))
+pub(crate) fn validate_audio_sample_rate(sample_rate: i64) -> LayoutResult<SdkQuantity> {
+    SdkQuantity::new(sample_rate).ok_or(crate::LayoutDefect::AudioRate(sample_rate.into()))
 }
 
 /// The one audio count rule for channels and samples: `1..=i32::MAX`.
-pub(crate) fn validate_audio_count(value: i64, kind: crate::AudioCountKind) -> LayoutResult<u32> {
-    u32::try_from(value)
-        .ok()
-        .filter(|&count| (1..=i32::MAX.unsigned_abs()).contains(&count))
-        .ok_or(crate::LayoutDefect::AudioCount {
-            value: value.into(),
-            kind,
-        })
+pub(crate) fn validate_audio_count(
+    value: i64,
+    kind: crate::AudioCountKind,
+) -> LayoutResult<SdkQuantity> {
+    SdkQuantity::new(value).ok_or(crate::LayoutDefect::AudioCount {
+        value: value.into(),
+        kind,
+    })
 }
 
-/// Require channel and sample counts in the SDK's signed range and widen them.
+/// Retain the signed-range proof for channel and sample counts.
 pub(crate) fn validate_positive_audio_counts(
     no_channels: i64,
     no_samples: i64,
-) -> LayoutResult<(usize, usize)> {
+) -> LayoutResult<(SdkQuantity, SdkQuantity)> {
     Ok((
-        validate_audio_count(no_channels, crate::AudioCountKind::Channels)? as usize,
-        validate_audio_count(no_samples, crate::AudioCountKind::Samples)? as usize,
+        validate_audio_count(no_channels, crate::AudioCountKind::Channels)?,
+        validate_audio_count(no_samples, crate::AudioCountKind::Samples)?,
     ))
 }
 
@@ -4350,13 +4373,15 @@ pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<R
         return Err(Error::InvalidFrame(crate::FrameDefect::EmptyAudioHasData));
     }
 
-    if raw.sample_rate < 0 {
+    let sample_rate = SdkQuantity::new(raw.sample_rate.into());
+    if sample_rate.is_none() && raw.sample_rate != 0 {
         return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
             crate::LayoutDefect::AudioRate(raw.sample_rate.into()),
         )));
     }
 
-    if raw.no_channels < 0 {
+    let num_channels = SdkQuantity::new(raw.no_channels.into());
+    if num_channels.is_none() && raw.no_channels != 0 {
         return Err(Error::InvalidFrame(crate::FrameDefect::Layout(
             crate::LayoutDefect::AudioCount {
                 value: raw.no_channels.into(),
@@ -4377,10 +4402,6 @@ pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<R
         }));
     }
 
-    // Both were just checked nonnegative, so zero is the only value that
-    // does not convert.
-    let sample_rate = NonZeroU32::new(raw.sample_rate.unsigned_abs());
-    let num_channels = NonZeroU32::new(raw.no_channels.unsigned_abs());
     let format = match (sample_rate, num_channels) {
         // No source format is known yet. The SDK may leave the FourCC unset.
         (None, None) => {
@@ -5937,9 +5958,9 @@ mod tests {
                 crate::FrameDefect::Layout(crate::LayoutDefect::AudioRate(rate.into()))
             );
         }
-        assert_eq!(validate_audio_sample_rate(1).unwrap(), 1);
+        assert_eq!(validate_audio_sample_rate(1).unwrap().get(), 1);
         assert_eq!(
-            validate_audio_sample_rate(i32::MAX.into()).unwrap(),
+            validate_audio_sample_rate(i32::MAX.into()).unwrap().get(),
             i32::MAX.unsigned_abs()
         );
     }
@@ -9628,7 +9649,7 @@ mod tests {
         match validate_returned_audio(&raw) {
             Ok(ReturnedAudio::Samples(layout)) => {
                 assert_eq!(layout.format, AudioFormat::Fltp);
-                assert_eq!((layout.no_channels, layout.no_samples), (2, 4));
+                assert_eq!((layout.no_channels(), layout.no_samples()), (2, 4));
                 assert_eq!(layout.sample_count, 8);
             }
             other => panic!("expected samples, got {other:?}"),

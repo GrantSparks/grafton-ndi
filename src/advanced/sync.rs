@@ -6,14 +6,13 @@ use std::marker::PhantomData;
 #[cfg(any(test, ndi_has_advanced_av_sync, ndi_has_advanced_genlock))]
 use std::ptr;
 
-#[cfg(any(test, ndi_has_advanced_av_sync))]
-use super::sdk_quantity;
 use super::{invalid_input, AdvancedConfig, AvSyncAttached, ReceiverControls};
 use crate::{
     capture::{AvSyncAudioFree, Guard},
     frames::MAX_AUDIO_BYTES,
     frames::{ValidatedAudio, VideoPartsExt},
     marker::NotSync,
+    media::SdkQuantity,
     receiver::{
         attached::{sealed, Attached, Resource, Synchronizer},
         ReceiverCore,
@@ -46,9 +45,8 @@ use crate::{capture::AvSyncAudioInstance, frames::ReturnedAudio};
 /// has the source's own channels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AvSyncRequest {
-    // Each in 1..=i32::MAX when stated.
-    sample_rate: Option<u32>,
-    num_samples: Option<u32>,
+    sample_rate: Option<SdkQuantity>,
+    num_samples: Option<SdkQuantity>,
 }
 
 impl AvSyncRequest {
@@ -87,7 +85,8 @@ impl AvSyncRequest {
         };
         // A frame has at least one channel.
         if request.num_samples.is_some_and(|samples| {
-            (samples as usize)
+            samples
+                .to_usize()
                 .checked_mul(size_of::<f32>())
                 .is_none_or(|bytes| bytes > MAX_AUDIO_BYTES)
         }) {
@@ -98,12 +97,12 @@ impl AvSyncRequest {
 
     /// The sample rate in hertz the request was computed for, if stated.
     pub fn sample_rate(self) -> Option<u32> {
-        self.sample_rate
+        self.sample_rate.map(SdkQuantity::get)
     }
 
     /// The requested samples per channel, if any.
     pub fn num_samples(self) -> Option<u32> {
-        self.num_samples
+        self.num_samples.map(SdkQuantity::get)
     }
 
     /// The descriptor the SDK reads the request from and writes the audio to.
@@ -113,8 +112,7 @@ impl AvSyncRequest {
     /// descriptor must already name that format.
     #[cfg(any(test, ndi_has_advanced_av_sync))]
     fn raw(self) -> NDIlib_audio_frame_v3_t {
-        // Lossless: construction keeps both at or below i32::MAX.
-        let field = |value: Option<u32>| value.map_or(0, |value| value as i32);
+        let field = |value: Option<SdkQuantity>| value.map_or(0, SdkQuantity::to_sdk);
         // Keep the SDK's default channel field: it does not constrain the
         // source's channels, even when a rate is stated. The native regression
         // `avsync_states_rates_for_non_stereo_sources` pins this for mono and
@@ -701,12 +699,12 @@ fn outcome_with_call<'a>(
         Synchronized::NoMatchingSamples => AvSyncOutcomeRef::NoMatchingSamples,
         Synchronized::FormatChanged => {
             match (
-                sdk_quantity(audio.frame().sample_rate),
-                sdk_quantity(audio.frame().no_channels),
+                SdkQuantity::new(audio.frame().sample_rate.into()),
+                SdkQuantity::new(audio.frame().no_channels.into()),
             ) {
                 (Some(sample_rate), Some(num_channels)) => AvSyncOutcomeRef::FormatChanged {
-                    sample_rate,
-                    num_channels,
+                    sample_rate: sample_rate.get(),
+                    num_channels: num_channels.get(),
                 },
                 _ => {
                     return Err(Error::UnexpectedSdkResult(
@@ -1186,6 +1184,9 @@ impl std::fmt::Debug for AudioClock<'_> {
 /// contains no sample or metadata storage.
 #[derive(Clone, Copy)]
 pub struct AudioClockRequest {
+    sample_rate: SdkQuantity,
+    num_samples: SdkQuantity,
+    #[cfg_attr(not(any(test, ndi_has_advanced_genlock)), allow(dead_code))]
     timing: NDIlib_audio_frame_v3_t,
 }
 
@@ -1209,9 +1210,11 @@ impl AudioClockRequest {
             crate::frames::validate_audio_count(num_samples.into(), crate::AudioCountKind::Samples)
                 .map_err(|cause| invalid_input(crate::InputDefect::Layout(cause)))?;
         Ok(Self {
+            sample_rate,
+            num_samples,
             timing: NDIlib_audio_frame_v3_t {
-                sample_rate: sample_rate as i32,
-                no_samples: num_samples as i32,
+                sample_rate: sample_rate.to_sdk(),
+                no_samples: num_samples.to_sdk(),
                 ..descriptors::audio_frame()
             },
         })
@@ -1219,12 +1222,12 @@ impl AudioClockRequest {
 
     /// The requested sample rate in hertz.
     pub fn sample_rate(self) -> u32 {
-        self.timing.sample_rate as u32
+        self.sample_rate.get()
     }
 
     /// The requested samples per channel.
     pub fn num_samples(self) -> u32 {
-        self.timing.no_samples as u32
+        self.num_samples.get()
     }
 }
 

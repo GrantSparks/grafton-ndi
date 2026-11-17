@@ -73,7 +73,8 @@
 //! }
 //! ```
 
-use std::{fmt, num::NonZeroU32};
+use crate::media::SdkQuantity;
+use std::fmt;
 
 use crate::{
     capture::{FrameSyncAudioFree, FrameSyncVideoFree, Guard},
@@ -118,13 +119,13 @@ pub struct FrameSyncAudioRef<'fs> {
 /// is `Copy`, `Send` and `Sync`, and holds no SDK resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AudioInputFormat {
-    sample_rate: NonZeroU32,
-    num_channels: NonZeroU32,
+    sample_rate: SdkQuantity,
+    num_channels: SdkQuantity,
 }
 
 impl AudioInputFormat {
     /// A format the SDK reported, with values already checked positive.
-    pub(crate) const fn new(sample_rate: NonZeroU32, num_channels: NonZeroU32) -> Self {
+    pub(crate) const fn new(sample_rate: SdkQuantity, num_channels: SdkQuantity) -> Self {
         Self {
             sample_rate,
             num_channels,
@@ -278,7 +279,19 @@ impl FrameSyncAudioRequest {
     /// # }
     /// ```
     pub fn for_input(format: AudioInputFormat, num_samples: u32) -> Result<Self> {
-        Self::capture_at(format.sample_rate(), format.num_channels(), num_samples)
+        let num_samples =
+            crate::frames::validate_audio_count(num_samples.into(), crate::AudioCountKind::Samples)
+                .map_err(|cause| Error::InvalidInput(crate::InputDefect::Layout(cause)))?;
+        Ok(Self {
+            layout: ValidatedAudioLayout::from_quantities(
+                crate::AudioFormat::Fltp,
+                format.sample_rate,
+                format.num_channels,
+                num_samples,
+                None,
+            )
+            .map_err(|cause| Error::InvalidInput(crate::InputDefect::Layout(cause)))?,
+        })
     }
 }
 
@@ -1319,8 +1332,8 @@ mod tests {
             );
         }
         let format = AudioInputFormat::new(
-            NonZeroU32::new(48_000).unwrap(),
-            NonZeroU32::new(1).unwrap(),
+            SdkQuantity::new(48_000).unwrap(),
+            SdkQuantity::new(1).unwrap(),
         );
         for (samples, expected) in [
             (
@@ -1405,8 +1418,8 @@ mod tests {
         assert!(FrameSyncAudioRequest::capture_at(48_000, 1, 16_777_216).is_ok());
         assert!(FrameSyncAudioRequest::capture_at(48_000, 1, 16_777_217).is_err());
         let format = AudioInputFormat::new(
-            NonZeroU32::new(44_100).unwrap(),
-            NonZeroU32::new(6).unwrap(),
+            SdkQuantity::new(44_100).unwrap(),
+            SdkQuantity::new(6).unwrap(),
         );
         assert_eq!(
             FrameSyncAudioRequest::for_input(format, 480).unwrap(),
