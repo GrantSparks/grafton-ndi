@@ -150,13 +150,19 @@ pub(crate) trait Resolver {
     ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal>;
 }
 
-/// A table's exported symbol name, validated at compile time.
-pub(crate) const fn symbol_name(nul_terminated: &'static str) -> &'static CStr {
-    match CStr::from_bytes_with_nul(nul_terminated.as_bytes()) {
-        Ok(name) => name,
-        Err(_) => panic!("a native symbol name must end with its only NUL"),
-    }
+/// A table's exported symbol name, always validated at compile time.
+macro_rules! native_name {
+    ($name:ident) => {
+        const {
+            match ::std::ffi::CStr::from_bytes_with_nul(concat!(stringify!($name), "\0").as_bytes())
+            {
+                Ok(name) => name,
+                Err(_) => panic!("a native symbol name must end with its only NUL"),
+            }
+        }
+    };
 }
+pub(crate) use native_name;
 
 /// Define a table of native functions that is resolved as one unit.
 ///
@@ -200,7 +206,7 @@ macro_rules! native_table {
             /// Exported names, in declaration order.
             #[cfg(test)]
             pub(crate) const SYMBOLS: &'static [&'static ::std::ffi::CStr] = &[
-                $($crate::sys::table::symbol_name(concat!(stringify!($name), "\0")),)+
+                $($crate::sys::table::native_name!($name),)+
             ];
 
             /// Resolve every entry point, or name the first one `resolver` lacks.
@@ -210,7 +216,7 @@ macro_rules! native_table {
                 Ok(Ok(Self {
                     $($name: {
                         const NAME: &::std::ffi::CStr =
-                            $crate::sys::table::symbol_name(concat!(stringify!($name), "\0"));
+                            $crate::sys::table::native_name!($name);
                         match resolver.resolve(NAME)? {
                             // SAFETY: the resolver returned the address the selected SDK
                             // implementation exports under this name, and the target type
@@ -258,7 +264,7 @@ macro_rules! native_table {
                         // SAFETY: forwarded to the caller's obligations above.
                         value: unsafe { (self.0.$name)($($argument),*) },
                         function: $crate::sys::table::NativeFunction::new(
-                            $crate::sys::table::symbol_name(concat!(stringify!($name), "\0")),
+                            $crate::sys::table::native_name!($name),
                         ),
                     }
                 }

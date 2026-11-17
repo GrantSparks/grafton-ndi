@@ -85,7 +85,7 @@ macro_rules! advanced_tables {
 
                 impl $Table {
                     const SYMBOLS: &'static [&'static CStr] = &[
-                        $(super::table::symbol_name(concat!(stringify!($name), "\0"))),+
+                        $(super::table::native_name!($name)),+
                     ];
 
                     /// The first of the family's functions this build does
@@ -238,7 +238,7 @@ macro_rules! passthrough_presets {
                         super::advanced_bindings::$constant.to_ne_bytes(),
                     ))
                 } else {
-                    Err(super::table::symbol_name(concat!(stringify!($constant), "\0")))
+                    Err(super::table::native_name!($constant))
                 } },)+
             };
             // The headers declare each constant without its enumeration's
