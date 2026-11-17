@@ -246,14 +246,13 @@ unsafe impl VideoParts for P216Output<'_> {
 /// caller-owned initialized storage and do not allocate pixel buffers. Borrowed
 /// P216 inputs retain their original validated row and plane strides.
 pub struct VideoConverter {
-    _ndi: Ndi,
-    conversion: &'static sys::VideoConversion,
+    conversion: crate::runtime::Bound<sys::VideoConversion>,
 }
 
 impl std::fmt::Debug for VideoConverter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VideoConverter")
-            .field("runtime", self._ndi.info())
+            .field("runtime", self.conversion.ndi().info())
             .finish_non_exhaustive()
     }
 }
@@ -267,8 +266,7 @@ impl VideoConverter {
     /// provide both native V210/P216 conversion functions.
     pub fn new(ndi: &Ndi) -> Result<Self> {
         Ok(Self {
-            conversion: ndi.table()?,
-            _ndi: ndi.clone(),
+            conversion: ndi.bind()?,
         })
     }
 

@@ -244,12 +244,22 @@ enum Synchronized {
 pub(crate) struct AvSyncKind {
     #[cfg(ndi_has_advanced_av_sync)]
     handle: AvSyncInstance,
-    table: &'static AvSyncTable,
+    table: crate::runtime::Bound<AvSyncTable, std::sync::Arc<ReceiverCore>>,
     // Keep the public Send + !Sync contract even without native declarations.
     _not_sync: NotSync,
 }
 
 type AvResource = Resource<AvSyncKind>;
+
+// The bound table uses the receiver lease the resource already retained:
+// one handle, one table pointer and one receiver Arc, with no separate Ndi.
+#[cfg(ndi_has_advanced_av_sync)]
+const _: () = assert!(
+    std::mem::size_of::<AvResource>()
+        == std::mem::size_of::<AvSyncInstance>()
+            + std::mem::size_of::<&AvSyncTable>()
+            + std::mem::size_of::<std::sync::Arc<ReceiverCore>>()
+);
 
 #[cfg(ndi_has_advanced_av_sync)]
 #[derive(Clone, Copy)]
@@ -279,7 +289,7 @@ unsafe impl Synchronizer for AvSyncKind {
     type Mode = AvSyncAttached;
     type Capture<'a> = AvSyncCapture<'a>;
 
-    unsafe fn destroy(&mut self, _receiver: &ReceiverCore) {
+    unsafe fn destroy(&mut self) {
         native!(AvSync, self.table => {
             // SAFETY: Resource retains the creating receiver and runtime, and
             // invokes this destruction once for the uniquely owned handle.
@@ -287,6 +297,10 @@ unsafe impl Synchronizer for AvSyncKind {
             #[cfg(test)]
             crate::receiver::lifecycle_test_events::record("avsync");
         });
+    }
+
+    fn receiver(&self) -> &std::sync::Arc<ReceiverCore> {
+        self.table.owner()
     }
 
     fn capture(resource: &AvResource) -> AvSyncCapture<'_> {
@@ -377,7 +391,9 @@ impl AvSync {
     /// when the SDK creates no synchronizer.
     #[doc(alias = "NDIlib_avsync_create")]
     pub fn new(receiver: Receiver) -> std::result::Result<Self, Rejected<Receiver>> {
-        let table = match receiver.core._ndi.table::<AvSyncTable>() {
+        let table = match crate::runtime::Bound::<AvSyncTable, _>::with_owner(
+            std::sync::Arc::clone(&receiver.core),
+        ) {
             Ok(table) => table,
             Err(error) => return Err(Rejected::new(error, receiver)),
         };
@@ -611,7 +627,7 @@ impl<'a> AvSyncCapture<'a> {
             // buffers, which the borrow keeps allocated for the call, and
             // carrying the timestamp `AvSyncVideo::new` checked.
             let video = _video.map(|video| video.descriptor());
-            let (handle, table) = (self.resource.handle, self.resource.table);
+            let (handle, table) = (self.resource.handle, &self.resource.table);
             let mut audio = _request.raw();
             let status = {
                 // SAFETY: the synchronizer is live, and so is the receiver it
@@ -664,10 +680,10 @@ impl<'a> AvSyncCapture<'a> {
                     other => Synchronized::Unknown(other),
                 })
             };
-            let instance = AvSyncAudioInstance::Native { handle: handle.0, table };
+            let instance = AvSyncAudioInstance::Native { handle: handle.0, free: table.NDIlib_avsync_free_audio };
             // SAFETY: the synchronizer and runtime remain borrowed through
             // the result; its guard returns this descriptor exactly once.
-            let guard = unsafe { Guard::new(&self.resource.receiver._ndi, instance, audio) };
+            let guard = unsafe { Guard::new(self.resource.receiver().ndi(), instance, audio) };
             outcome_with_call(status, guard)
         })
     }
@@ -886,8 +902,7 @@ impl ClockSource {
 struct GenResource {
     #[cfg(ndi_has_advanced_genlock)]
     handle: GenlockInstance,
-    table: &'static GenlockTable,
-    _ndi: Ndi,
+    table: crate::runtime::Bound<GenlockTable>,
     source: RetainedSources,
     _config: Option<AdvancedConfig>,
 }
@@ -1054,7 +1069,7 @@ impl Genlock {
     /// [`Error::NativeOperationFailed`] when the SDK creates no genlock.
     #[doc(alias = "NDIlib_genlock_create")]
     pub fn new(ndi: &Ndi, options: &GenlockOptions) -> Result<Self> {
-        let table = ndi.table::<GenlockTable>()?;
+        let table = ndi.bind::<GenlockTable>()?;
         native!(Genlock, table, uses(options) => {
             let mut source = RetainedSources::default();
             let handle = source.replace(options.source.as_ref(), |source| {
@@ -1071,7 +1086,6 @@ impl Genlock {
                 resource: GenResource {
                     handle: GenlockInstance(handle),
                     table,
-                    _ndi: ndi.clone(),
                     source,
                     _config: options.config.clone(),
                 },
@@ -1153,7 +1167,7 @@ impl VideoClock<'_> {
     pub fn wait(&mut self, frame_rate: FrameRate, scan_type: ScanType) -> ClockSource {
         native!(Genlock, self.resource.table, uses(frame_rate, scan_type) => {
             let timing = video_timing(frame_rate, scan_type);
-            let GenResource { handle, table, .. } = *self.resource;
+            let GenResource { handle, table, .. } = self.resource;
             // SAFETY: the genlock outlives this clock, and only this clock waits
             // for video.
             ClockSource::from_active(unsafe {
@@ -1223,7 +1237,7 @@ impl AudioClock<'_> {
     pub fn wait(&mut self, request: AudioClockRequest) -> ClockSource {
         native!(Genlock, self.resource.table, uses(request) => {
             let timing = audio_timing(request);
-            let GenResource { handle, table, .. } = *self.resource;
+            let GenResource { handle, table, .. } = self.resource;
             // SAFETY: the genlock outlives this clock, and only this clock waits
             // for audio. The validated request supplies the stack descriptor's
             // timing, and its pointers are null.
@@ -1911,9 +1925,13 @@ mod tests {
                 AvSyncAudioInstance::Synthetic(released),
                 raw,
                 |instance, raw| {
-                    let AvSyncAudioInstance::Synthetic(released) = instance else {
+                    #[cfg(ndi_has_advanced_av_sync)]
+                    let AvSyncAudioInstance::Synthetic(released) = instance
+                    else {
                         unreachable!()
                     };
+                    #[cfg(not(ndi_has_advanced_av_sync))]
+                    let AvSyncAudioInstance::Synthetic(released) = instance;
                     if !raw.p_data.is_null() || !raw.p_metadata.is_null() {
                         (*released).set((*released).get() + 1);
                     }
@@ -1987,7 +2005,7 @@ mod tests {
             Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new("").unwrap())).unwrap();
         let sync = AvSync::new(receiver).unwrap();
         let resource = sync.inner.resource();
-        let (handle, table) = (resource.handle, resource.table);
+        let (handle, table) = (resource.handle, &resource.table);
         let mut raw = AvSyncRequest::automatic().raw();
         raw.timestamp = 12345;
         let status = unsafe {
@@ -2002,7 +2020,7 @@ mod tests {
                 &ndi,
                 AvSyncAudioInstance::Native {
                     handle: handle.0,
-                    table,
+                    free: table.NDIlib_avsync_free_audio,
                 },
                 raw,
             )

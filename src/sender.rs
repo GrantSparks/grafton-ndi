@@ -86,10 +86,17 @@ unsafe impl Sync for SendInstance {}
 /// A copy is a borrowed handle, valid while an owner of the native sender
 /// (`Shared` or `Exclusive`) keeps it alive.
 #[derive(Clone, Copy)]
-struct SendHandle<'a> {
+pub(crate) struct SendHandle<'a> {
     instance: SendInstance,
-    core: &'static sys::Core,
+    core: &'a sys::Core,
     _owner: PhantomData<&'a SenderResource>,
+}
+
+impl SendHandle<'_> {
+    #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
+    pub(crate) fn instance(self) -> NDIlib_send_instance_t {
+        self.instance.0
+    }
 }
 
 /// Sender-side bookkeeping that need not outlive the sender itself.
@@ -185,7 +192,7 @@ mod ownership {
         pub(super) failover: parking_lot::Mutex<RetainedSources>,
         #[cfg(feature = "advanced")]
         pub(super) _config: Option<crate::advanced::AdvancedConfig>,
-        pub(super) _ndi: Ndi,
+        pub(super) sdk: crate::runtime::Bound<sys::Core>,
     }
 
     // No application code runs under the failover lock. A replacement keeps
@@ -211,11 +218,11 @@ mod ownership {
     impl SenderResource {
         /// The runtime whose native instance this resource owns.
         pub(super) fn ndi(&self) -> &Ndi {
-            &self._ndi
+            self.sdk.ndi()
         }
 
-        pub(super) fn core(&self) -> &'static sys::Core {
-            &self.ndi().api().core
+        pub(super) fn core(&self) -> &sys::Core {
+            &self.sdk
         }
 
         pub(super) fn handle(&self) -> SendHandle<'_> {
@@ -452,7 +459,7 @@ pub(crate) mod in_flight {
     use super::Exclusive;
     use super::{async_flush_frame_ptr, PreparedVideo, SendHandle, SenderResource};
     #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
-    use crate::advanced::{ScatterSendable, ScatterVideoLoan};
+    use crate::advanced::ScatterVideoLoan;
     use crate::{frames::Sendable, sys::bindings::NDIlib_video_frame_v2_t, VideoFrame};
     use crate::{frames::VideoSource, pixels::Pixels, Result};
     use std::sync::{Arc, Mutex};
@@ -833,7 +840,7 @@ pub(crate) mod in_flight {
         /// frame's blocks, for `NDIlib_send_send_video_scatter_async`. No
         /// header says the SDK copies the list, so the frame owns it too.
         #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
-        Scatter(ScatterSendable<ScatterVideoLoan>),
+        Scatter(ScatterVideoLoan),
     }
 
     impl Lent {
@@ -881,7 +888,7 @@ pub(crate) mod in_flight {
                 Self::Scatter(proof) => {
                     // SAFETY: the same lifetime contract also covers the stable
                     // scatter list and the arrays and payload it names.
-                    unsafe { proof.submit(sender.instance.0, descriptor) };
+                    unsafe { proof.submit(sender, descriptor) };
                 }
             }
         }
@@ -1877,15 +1884,15 @@ impl<M: SenderMode> Sender<M> {
         options: &SenderOptions,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
-            &'static sys::Core,
+            &sys::Core,
             &NDIlib_send_create_t,
         ) -> sys::table::Called<NDIlib_send_instance_t>,
     ) -> Result<Self> {
         let name = CString::new(options.name.as_str())?;
         let groups = crate::finder::list_cstring(options.groups.as_deref(), "groups")?;
-        let core = &ndi.api().core;
+        let core = ndi.bind_core();
         let instance = create(
-            core,
+            &core,
             &NDIlib_send_create_t {
                 p_ndi_name: name.as_ptr(),
                 p_groups: groups.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
@@ -1910,7 +1917,7 @@ impl<M: SenderMode> Sender<M> {
                 failover: parking_lot::Mutex::new(RetainedSources::default()),
                 #[cfg(feature = "advanced")]
                 _config: config,
-                _ndi: ndi.clone(),
+                sdk: core,
             }),
             _mode: PhantomData,
         })
@@ -2221,7 +2228,7 @@ impl<M: SenderMode> Sender<M> {
 
     /// The core entry points of the runtime that created this sender.
     #[cfg(feature = "advanced")]
-    pub(crate) fn core(&self) -> &'static sys::Core {
+    pub(crate) fn core(&self) -> &sys::Core {
         self.resource().core()
     }
 
@@ -2306,7 +2313,7 @@ impl<M: SenderMode> Sender<M> {
                     self.resource().ndi(),
                     crate::capture::SenderMetadataInstance {
                         instance: self.resource().instance(),
-                        metadata,
+                        free: metadata.NDIlib_send_free_metadata,
                     },
                     raw,
                 )
@@ -2716,6 +2723,10 @@ mod tests {
     use super::*;
     use crate::RuntimeFeature;
 
+    mod shared_ownership {
+        include!("sender_shared_tests.rs");
+    }
+
     #[test]
     fn metadata_capture_lease_moves_threads_and_retains_the_wait_budget() {
         let gate = SenderMetadataGate::default();
@@ -2813,7 +2824,7 @@ mod tests {
             Guard::<SenderMetadataFree>::with_test_free(
                 SenderMetadataInstance {
                     instance: (&observation as *const Observation).cast_mut().cast(),
-                    metadata: table,
+                    free: table.NDIlib_send_free_metadata,
                 },
                 raw,
                 observe_free,

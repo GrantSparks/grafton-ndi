@@ -90,7 +90,7 @@ pub(crate) trait Configurable: Sized {
         options: &Self::Options,
         config: &AdvancedConfig,
         create: impl FnOnce(
-            &'static C,
+            &C,
             &Self::Settings,
             *const c_char,
         ) -> crate::sys::table::Called<Self::Instance>,
@@ -159,7 +159,7 @@ macro_rules! configurable {
                         ndi,
                         options,
                         config,
-                        |table: &'static $Table, _settings, _text| {
+                        |table: &$Table, _settings, _text| {
                             native!($Table, table => table.named().$create(_settings, _text))
                         },
                     )

@@ -199,7 +199,7 @@ impl QueuedVideoFrame {
     }
 
     #[cfg(test)]
-    fn authorize_for_test(self, scatter: Option<&'static ScatterSend>) -> QueuedStorage {
+    fn authorize_for_test(self, scatter: Option<&ScatterSend>) -> QueuedStorage {
         self.authorize_with(
             |frame| Ok(Sendable::for_test(frame)),
             |frame| ScatterSendable::for_test(frame, scatter),
@@ -209,7 +209,7 @@ impl QueuedVideoFrame {
 }
 
 /// Every variant owns the exact capability its payload needs. Packet storage
-/// additionally owns the scatter table and stable list when one is needed.
+/// additionally owns the scatter dispatch and stable list when one is needed.
 enum QueuedStorage {
     Pixels(Sendable<VideoFrame>),
     Packet(PendingVideo),
@@ -757,7 +757,7 @@ impl QueuedSender {
         native!(SendCompletion, table, uses(options, limits) => {
             let callback = CallbackState::new(*limits)?;
             let sender = Sender::open(ndi, options)?;
-            Ok(Self::install(sender, callback, table))
+            Ok(Self::install(sender, callback, table.NDIlib_send_set_video_async_completion))
         })
     }
 
@@ -785,6 +785,7 @@ impl QueuedSender {
             Err(error) => return Err(Rejected::new(error, sender)),
         };
         native!(SendCompletion, table, uses(limits) => {
+            let register = table.NDIlib_send_set_video_async_completion;
             let callback = match CallbackState::new(*limits) {
                 Ok(callback) => callback,
                 Err(error) => return Err(Rejected::new(error, sender)),
@@ -792,7 +793,7 @@ impl QueuedSender {
             // The conversion takes the native sender only when no registration
             // shares it, and retires the sender's asynchronous video pipeline.
             match sender.into_attached() {
-                Ok((sender, earlier)) => Ok((Self::install(sender, callback, table), earlier)),
+                Ok((sender, earlier)) => Ok((Self::install(sender, callback, register), earlier)),
                 Err(sender) => Err(Rejected::new(
                     Error::InvalidInput(crate::InputDefect::QueuedSenderRegistered),
                     sender,
@@ -810,7 +811,11 @@ impl QueuedSender {
     fn install(
         sender: Sender<QueueAttached>,
         callback: Box<CallbackState>,
-        table: &'static SendCompletion,
+        register: unsafe extern "C" fn(
+            NDIlib_send_instance_t,
+            *mut c_void,
+            Option<unsafe extern "C" fn(*mut c_void, *const NDIlib_video_frame_v2_t)>,
+        ),
     ) -> Self {
         let callback = AliasableBox::new(callback);
         let state = callback.as_ptr();
@@ -818,7 +823,7 @@ impl QueuedSender {
         // only reads it through a shared reference, and the returned value
         // keeps it until after the sender has been destroyed.
         unsafe {
-            table.NDIlib_send_set_video_async_completion(
+            register(
                 sender.native_instance(),
                 state.cast_mut().cast(),
                 Some(completion),

@@ -1255,13 +1255,13 @@ impl Exclusive<'_> {
     }
 
     pub(crate) fn ndi(&self) -> &Ndi {
-        &self.core._ndi
+        self.core.ndi()
     }
 }
 
 /// Owned allocator authority minted while taking exclusive receiver ownership.
 /// Only allocator registration stores it; it cannot be cloned or recovered as
-/// a receiver. Its mutable borrow keeps install/reset operations exclusive.
+/// a receiver. Registration alone borrows this authority, during its exclusive install/reset operations.
 #[cfg(feature = "advanced")]
 pub(crate) struct AllocatorOwner(
     #[cfg_attr(
@@ -1277,7 +1277,7 @@ pub(crate) struct AllocatorOwner(
 #[cfg(feature = "advanced")]
 impl AllocatorOwner {
     #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-    pub(crate) fn exclusive(&mut self) -> Exclusive<'_> {
+    pub(crate) fn exclusive(&self) -> Exclusive<'_> {
         Exclusive {
             core: &self.0,
             _exclusive: self.0.connection_guard.lock(),
@@ -1406,7 +1406,7 @@ unsafe impl Sync for RecvInstance {}
 
 pub(crate) struct ReceiverCore {
     instance: RecvInstance,
-    pub(crate) _ndi: Ndi,
+    pub(crate) sdk: crate::runtime::Bound<sys::Core>,
     /// Serializes local connection changes and shared controls. Captures never
     /// take this lock; their connection overlap is measured beside CaptureLock.
     connection_guard: Mutex<ConnectionPermit>,
@@ -1522,7 +1522,7 @@ impl<M: CreatableMode> Receiver<M> {
         options: &ReceiverOptions,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
-            &'static sys::Core,
+            &sys::Core,
             &NDIlib_recv_create_v3_t,
         ) -> sys::table::Called<NDIlib_recv_instance_t>,
     ) -> Result<Self> {
@@ -1533,11 +1533,12 @@ impl<M: CreatableMode> Receiver<M> {
         } = options.to_raw(ndi)?;
         // SAFETY: the core keeps every string these settings point to until
         // after native destruction, including the target and receiver name.
-        let instance = create(&ndi.api().core, &raw).created()?.as_ptr();
+        let sdk = ndi.bind_core();
+        let instance = create(&sdk, &raw).created()?.as_ptr();
         Ok(Self {
             core: Arc::new(ReceiverCore {
                 instance: RecvInstance(instance),
-                _ndi: ndi.clone(),
+                sdk,
                 connection_guard: Mutex::new(ConnectionPermit),
                 target: RwLock::new(RetainedSource::new(&options.source)),
                 pending: PendingEvents::default(),
@@ -1827,7 +1828,7 @@ impl<M: ReceiverMode> Receiver<M> {
         // The query comes with the function that releases what it returns.
         let (web_control, strings) = self
             .core
-            ._ndi
+            .ndi()
             .table::<(sys::ReceiverWebControl, sys::ReceiverStrings)>()?;
         let connection = self.core.lock_connection();
         let guard = RecvStringGuard {
@@ -2179,17 +2180,21 @@ impl<M: EventMode> Receiver<M> {
 }
 
 impl ReceiverCore {
+    pub(crate) fn ndi(&self) -> &Ndi {
+        self.sdk.ndi()
+    }
+
     /// The entry points of the runtime this receiver was created through.
-    pub(crate) fn sdk(&self) -> &'static sys::Core {
-        &self._ndi.api().core
+    pub(crate) fn sdk(&self) -> &sys::Core {
+        &self.sdk
     }
 
-    fn delay(&self) -> Result<&'static sys::ReceiveDelay> {
-        self._ndi.table()
+    fn delay(&self) -> Result<&sys::ReceiveDelay> {
+        self.ndi().table()
     }
 
-    fn connection_metadata(&self) -> Result<&'static sys::ReceiverConnectionMetadata> {
-        self._ndi.table()
+    fn connection_metadata(&self) -> Result<&sys::ReceiverConnectionMetadata> {
+        self.ndi().table()
     }
 
     /// Issue a permit tied to this receiver and its local connection lock.
@@ -2389,8 +2394,8 @@ impl ReceiverCore {
 
     pub(crate) fn source_name_tables(
         &self,
-    ) -> Result<&'static (sys::ReceiverSourceName, sys::ReceiverStrings)> {
-        self._ndi.table()
+    ) -> Result<&(sys::ReceiverSourceName, sys::ReceiverStrings)> {
+        self.ndi().table()
     }
 
     /// [`Self::wait_for_source_name_change_until`] through the given tables, so
@@ -2496,7 +2501,7 @@ impl<'rx> CaptureLock<'rx> {
     /// The runtime the receiver was created through, which frees the frames
     /// a capture under this lock delivers.
     pub(crate) fn runtime(&self) -> &'rx Ndi {
-        &self.core._ndi
+        self.core.ndi()
     }
 
     /// The receiver instance a capture under this lock is made on.
@@ -3976,7 +3981,7 @@ mod tests {
             return;
         };
         let mut receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        let mut allocator = receiver.allocator_owner();
+        let allocator = receiver.allocator_owner();
         for allocator_authority in [false, true] {
             let core = Arc::clone(&receiver.core);
             let expected = core.instance.0 as usize;

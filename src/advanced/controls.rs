@@ -360,7 +360,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// without an Advanced runtime.
     #[doc(alias = "NDIlib_recv_request_keyframe")]
     pub fn request_keyframe(&self) -> Result<()> {
-        let table = self.core._ndi.table::<KeyframeRequest>()?;
+        let table = self.core.ndi().table::<KeyframeRequest>()?;
         native!(KeyframeRequest, table => {
             let connection = self.core.lock_connection();
             // SAFETY: the live core and connection permit cover this call;

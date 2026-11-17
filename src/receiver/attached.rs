@@ -26,9 +26,13 @@ pub(crate) unsafe trait Synchronizer: sealed::Sealed + Sized + 'static {
     ///
     /// # Safety
     ///
-    /// The handle must be live, uniquely owned and created from `receiver`.
+    /// The handle must be live, uniquely owned and created from the retained receiver.
     /// It may be destroyed only once and no captured frame may remain live.
-    unsafe fn destroy(&mut self, receiver: &ReceiverCore);
+    unsafe fn destroy(&mut self);
+
+    /// The receiver retained by this native synchronizer until destruction.
+    fn receiver(&self) -> &Arc<ReceiverCore>;
+
     fn capture(resource: &Resource<Self>) -> Self::Capture<'_>;
 }
 
@@ -36,7 +40,12 @@ pub(crate) unsafe trait Synchronizer: sealed::Sealed + Sized + 'static {
 /// Construction is private to `Attached::adopt`.
 pub(crate) struct Resource<S: Synchronizer> {
     native: S,
-    pub(crate) receiver: Arc<ReceiverCore>,
+}
+
+impl<S: Synchronizer> Resource<S> {
+    pub(crate) fn receiver(&self) -> &Arc<ReceiverCore> {
+        self.native.receiver()
+    }
 }
 
 impl<S: Synchronizer> Deref for Resource<S> {
@@ -52,7 +61,7 @@ impl<S: Synchronizer> Drop for Resource<S> {
         // SAFETY: only adoption constructs this resource, pairing its unique
         // handle with this retained receiver. Views and frame guards borrow
         // the resource, so they have ended before its one destruction.
-        unsafe { self.native.destroy(&self.receiver) };
+        unsafe { self.native.destroy() };
     }
 }
 
@@ -102,10 +111,7 @@ impl<S: Synchronizer> Attached<S> {
             Err(error) => return Err(Rejected::new(error, receiver)),
         };
         Ok(Self {
-            resource: Resource {
-                native,
-                receiver: Arc::clone(&receiver.core),
-            },
+            resource: Resource { native },
             receiver: Receiver {
                 core: receiver.core,
                 _mode: std::marker::PhantomData,

@@ -10,8 +10,8 @@ use std::{
 use super::{
     out_param,
     types::{track_flags, FileText, NamePattern, ResolvedRecorderOptions},
-    EventText, FileApi, FileRecorderOptions, RecorderEvent, RecorderEventKind, RecorderStats,
-    RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec, StateConflict,
+    EventText, FileApi, FileBound, FileRecorderOptions, RecorderEvent, RecorderEventKind,
+    RecorderStats, RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec, StateConflict,
 };
 #[cfg(doc)]
 use super::{FileFamily, FileNaming};
@@ -985,7 +985,7 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 /// [`AsyncFileRecorder`](super::AsyncFileRecorder) offers the same operations
 /// as futures.
 pub struct FileRecorder {
-    recording: &'static sys::FileRecording,
+    recording: FileBound<sys::FileRecording>,
     handle: NonNull<NDIlib_file_recorder_instance_type>,
     /// The configured tracks, used when starting each new session.
     tracks: MediaTypes,
@@ -996,8 +996,6 @@ pub struct FileRecorder {
     ledger: Ledger,
     generation: u64,
     cleanup: CleanupBudget,
-    // Keeps the NDI runtime initialized.
-    _api: FileApi,
     // Neither the NDI File Format API documentation nor
     // Processing.NDI.Lib.File.Recorder.h says on which threads a recorder may
     // be created, used and destroyed, or whether calls on one recorder may
@@ -1011,8 +1009,7 @@ pub struct FileRecorder {
 /// Rust-only creation state: its validation and family check require no
 /// native object, so this value can move to an owner thread before creation.
 pub(super) struct PreparedRecorder {
-    api: FileApi,
-    recording: &'static sys::FileRecording,
+    recording: FileBound<sys::FileRecording>,
     options: CheckedRecorderOptions,
 }
 
@@ -1043,11 +1040,7 @@ impl CheckedRecorderOptions {
 
 impl PreparedRecorder {
     pub(super) fn create(self) -> Result<FileRecorder> {
-        let Self {
-            api,
-            recording,
-            options,
-        } = self;
+        let Self { recording, options } = self;
         let resolved = options.resolved;
         let settings = NDIlib_file_recorder_create_t {
             source_to_connect_to: raw_source(&options.source),
@@ -1074,7 +1067,6 @@ impl PreparedRecorder {
             naming: resolved.naming,
             ledger: Ledger::idle(),
             generation: 0,
-            _api: api,
             _thread: PhantomData,
         })
     }
@@ -1113,13 +1105,9 @@ impl FileRecorder {
     }
 
     pub(super) fn prepare(api: FileApi, options: &FileRecorderOptions) -> Result<PreparedRecorder> {
-        let recording = api.table::<sys::FileRecording>()?;
+        let recording = api.into_table::<sys::FileRecording>()?;
         let options = CheckedRecorderOptions::new(options)?;
-        Ok(PreparedRecorder {
-            api,
-            recording,
-            options,
-        })
+        Ok(PreparedRecorder { recording, options })
     }
 
     /// Where the recorder is in its session.
@@ -1585,7 +1573,13 @@ impl FileRecorder {
     #[doc(alias = "NDIlib_file_recorder_destroy")]
     #[doc(alias = "NDIlib_file_recorder_create")]
     pub fn reset(&mut self, options: &FileRecorderOptions) -> Result<RecordingReport> {
-        self.reset_with(|recorder| Self::new(&recorder._api, options))
+        self.reset_with(|recorder| {
+            PreparedRecorder {
+                recording: recorder.recording.clone(),
+                options: CheckedRecorderOptions::new(options)?,
+            }
+            .create()
+        })
     }
 
     pub(super) fn reset_checked(
@@ -1594,8 +1588,7 @@ impl FileRecorder {
     ) -> Result<RecordingReport> {
         self.reset_with(|recorder| {
             PreparedRecorder {
-                api: recorder._api.clone(),
-                recording: recorder.recording,
+                recording: recorder.recording.clone(),
                 options,
             }
             .create()

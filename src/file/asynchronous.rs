@@ -1902,7 +1902,7 @@ impl ProbeQueue {
     fn probe(&self, api: &FileApi, path: &Path) -> Live<FileInfo> {
         // Match synchronous probe precedence before starting a thread or
         // consuming a queue place, then retain the proved path text.
-        let playback = match api.table::<crate::sys::FilePlayback>() {
+        let playback = match api.bind_table::<crate::sys::FilePlayback>() {
             Ok(playback) => playback,
             Err(error) => return Live::failed(error),
         };
@@ -1910,14 +1910,10 @@ impl ProbeQueue {
             Ok(path) => path,
             Err(error) => return Live::failed(error),
         };
-        let api = api.clone();
         let (reply, future) = operation();
         let job: ProbeJob = Box::new(move || {
-            // The static table keeps the module mapped; this lease separately
-            // keeps NDI initialized while the probe is queued and running.
-            let _api = api;
             if !reply.cancelled() {
-                reply.complete(FilePlayer::probe_checked(playback, &path));
+                reply.complete(FilePlayer::probe_checked(&playback, &path));
             }
         });
         if let Err(error) = self.submit(job) {

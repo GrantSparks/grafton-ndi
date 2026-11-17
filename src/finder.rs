@@ -246,7 +246,7 @@ pub struct Finder {
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
-    _ndi: Ndi,
+    sdk: crate::runtime::Bound<sys::Core>,
 }
 
 impl fmt::Debug for Finder {
@@ -816,14 +816,15 @@ impl Finder {
         settings: &FinderOptions,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
-            &'static sys::Core,
+            &sys::Core,
             &NDIlib_find_create_t,
         ) -> sys::table::Called<NDIlib_find_instance_t>,
     ) -> Result<Self> {
         let groups = list_cstring(settings.groups.as_deref(), "groups")?;
         let extra_ips = list_cstring(settings.extra_ips.as_deref(), "extra_ips")?;
+        let sdk = ndi.bind_core();
         let instance = create(
-            &ndi.api().core,
+            &sdk,
             &NDIlib_find_create_t {
                 show_local_sources: settings.show_local_sources,
                 p_groups: groups.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
@@ -840,7 +841,7 @@ impl Finder {
             _extra_ips: extra_ips,
             #[cfg(feature = "advanced")]
             _config: config,
-            _ndi: ndi.clone(),
+            sdk,
         };
         // Some standard-library mutexes allocate their native backing on the
         // first lock. Initialize before exposure, while Finder already owns
@@ -918,7 +919,7 @@ impl Finder {
 
     pub(crate) fn current_sources_stoppable<S: Stop>(&self, stop: S) -> StopResult<Vec<Source>, S> {
         match self.lock_snapshots(stop) {
-            Ok(guard) => guard.snapshot(&self._ndi.api().core).map(Ok),
+            Ok(guard) => guard.snapshot(&*self.sdk).map(Ok),
             Err(stopped) => Ok(Err(stopped)),
         }
     }
@@ -926,7 +927,7 @@ impl Finder {
     /// The runtime this finder was created through.
     #[cfg(feature = "advanced")]
     pub(crate) fn runtime(&self) -> &Ndi {
-        &self._ndi
+        self.sdk.ndi()
     }
 
     /// Monitor this finder's source list with a cursor for one consumer.
@@ -952,9 +953,7 @@ impl Finder {
         // SAFETY: the finder instance is live for this borrow.
         self.changes
             .wait_since(generation, deadline, stop, |timeout_ms| unsafe {
-                self._ndi
-                    .api()
-                    .core
+                self.sdk
                     .NDIlib_find_wait_for_sources(self.instance.0, timeout_ms)
             })
     }
@@ -1017,7 +1016,7 @@ impl Finder {
         match self.lock_snapshots_until(deadline, stop) {
             Ok(Some(guard)) => guard
                 .snapshot(&SelectingSnapshot {
-                    core: &self._ndi.api().core,
+                    core: &self.sdk,
                     select,
                 })
                 .map(|sources| Ok(Some(sources))),
@@ -1256,7 +1255,7 @@ impl Finder {
 impl Drop for Finder {
     fn drop(&mut self) {
         // SAFETY: the instance belongs to this runtime and is destroyed once.
-        unsafe { self._ndi.api().core.NDIlib_find_destroy(self.instance.0) };
+        unsafe { self.sdk.NDIlib_find_destroy(self.instance.0) };
     }
 }
 

@@ -272,7 +272,7 @@ trait ServerApi: crate::sys::Table + Sync {
     /// through destruction, and `table` belongs to the same runtime.
     #[cfg(feature = "advanced")]
     unsafe fn create_configured(
-        table: &'static Self::Configured,
+        table: &Self::Configured,
         settings: *const Self::Settings,
         config: *const std::ffi::c_char,
     ) -> sys::table::Called<Self::Instance>;
@@ -317,7 +317,7 @@ macro_rules! server_api {
             }
             #[cfg(feature = "advanced")]
             unsafe fn create_configured(
-                table: &'static Self::Configured,
+                table: &Self::Configured,
                 _settings: *const Self::Settings,
                 _config: *const std::ffi::c_char,
             ) -> sys::table::Called<Self::Instance> {
@@ -401,11 +401,10 @@ unsafe impl<A: ServerApi> Retained<A> for () {}
 struct ServerObject<A: ServerApi, R: Retained<A> = ()> {
     instance: A::Instance,
     retained: R,
-    api: &'static A,
+    api: crate::runtime::Bound<A>,
     _url: Option<std::ffi::CString>,
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
-    _ndi: crate::Ndi,
 }
 
 impl<A: ServerApi, R: Retained<A>> ServerObject<A, R> {
@@ -419,7 +418,7 @@ impl<A: ServerApi, R: Retained<A>> ServerObject<A, R> {
                     ndi,
                     options,
                     config,
-                    |table: &'static A::Configured, settings, text| {
+                    |table: &A::Configured, settings, text| {
                         A::create_configured(table, settings, text)
                     },
                 )
@@ -447,17 +446,17 @@ impl<A: ServerApi, R: Retained<A>> ServerObject<A, R> {
         options: &A::Options,
         retained: R,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
-        create: impl FnOnce(&'static A, &A::Settings) -> sys::table::Called<A::Instance>,
+        create: impl FnOnce(&A, &A::Settings) -> sys::table::Called<A::Instance>,
     ) -> crate::Result<Self> {
         // Configured gates run first and include this table's own capability.
-        let api = ndi.table::<A>()?;
+        let api = ndi.bind::<A>()?;
         let endpoint = options.server()?;
         let settings = A::settings(
             endpoint
                 .as_ref()
                 .map_or(std::ptr::null(), |endpoint| endpoint.url.as_ptr()),
         );
-        let instance = create(api, &settings).into_value();
+        let instance = create(&api, &settings).into_value();
         if instance.is_null() {
             return Err(not_created(A::OBJECT, endpoint.as_ref()));
         }
@@ -468,7 +467,6 @@ impl<A: ServerApi, R: Retained<A>> ServerObject<A, R> {
             _url: endpoint.map(|endpoint| endpoint.url),
             #[cfg(feature = "advanced")]
             _config: config,
-            _ndi: ndi.clone(),
         })
     }
 }
@@ -513,9 +511,9 @@ impl<A: ServerApi, R: Retained<A>> Drop for ServerObject<A, R> {
         // registrations go through this owner's native instance and API.
         // Exclusive ownership excludes overlapping operations. The hook keeps
         // those registrations live until native destruction returns.
-        unsafe { self.retained.before_destroy(self.api, self.instance) };
+        unsafe { self.retained.before_destroy(&self.api, self.instance) };
         // SAFETY: this owner destroys its non-null instance exactly once. All
-        // retained state, creation strings, configuration and runtime are live
+        // retained state, creation strings and configuration are live
         // throughout destruction. Fields are dropped only after this returns,
         // so retained state never depends on field order for native teardown.
         unsafe { self.api.destroy(self.instance) };

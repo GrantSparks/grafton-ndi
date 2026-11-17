@@ -529,10 +529,10 @@ impl PixelFormat {
     /// planar 4:4:4 formats need [`RuntimeFeature::Planar444Video`].
     ///
     /// [`RuntimeFeature::Planar444Video`]: crate::RuntimeFeature::Planar444Video
-    pub(crate) fn require_sendable(
+    pub(crate) fn require_sendable<T>(
         self,
-        planar444: impl FnOnce() -> Result<&'static sys::Planar444Video>,
-    ) -> Result<Option<&'static sys::Planar444Video>> {
+        planar444: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
         if matches!(
             self.info().category(),
             FormatCategory::Planar444 | FormatCategory::Planar444Alpha
@@ -3294,7 +3294,7 @@ pub(crate) struct ValidatedVideoLayout {
 /// Geometry stays with its storage; no other frame can consume its proof.
 pub(crate) struct Sendable<F> {
     frame: F,
-    _planar444: Option<&'static sys::Planar444Video>,
+    _planar444: Option<sys::Planar444Video>,
 }
 
 impl<F> std::ops::Deref for Sendable<F> {
@@ -3309,7 +3309,7 @@ impl<F: VideoParts> Sendable<F> {
         match frame
             .layout()
             .pixel_format()
-            .require_sendable(|| ndi.table::<sys::Planar444Video>())
+            .require_sendable(|| ndi.table::<sys::Planar444Video>().copied())
         {
             Ok(planar444) => Ok(Self {
                 frame,
@@ -3357,7 +3357,11 @@ impl<F: VideoParts> Sendable<F> {
         let planar444 = frame
             .layout()
             .pixel_format()
-            .require_sendable(|| sys::with_test_evidence("6.4.0.2", sys::Planar444Video::check))
+            .require_sendable(|| {
+                sys::with_test_evidence("6.4.0.2", |evidence| {
+                    sys::Planar444Video::check(evidence).copied()
+                })
+            })
             .unwrap();
         Self {
             frame,
@@ -5823,7 +5827,7 @@ mod tests {
                 format,
                 PixelFormat::Na48 | PixelFormat::Nb48 | PixelFormat::Na4g | PixelFormat::Nb4g
             );
-            let result = format.require_sendable(|| ndi.table::<sys::Planar444Video>());
+            let result = format.require_sendable(|| ndi.table::<sys::Planar444Video>().copied());
             if planar_444 && !supported {
                 assert!(
                     matches!(

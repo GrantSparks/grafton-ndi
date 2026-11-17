@@ -262,15 +262,15 @@ impl CaptureStrategy for MetadataKind {
 #[derive(Debug)]
 pub(crate) struct SenderMetadataFree;
 
-/// The sender and authorized optional table that produced one metadata loan.
+/// The sender and matching release function that produced one metadata loan.
 #[derive(Clone, Copy)]
 pub(crate) struct SenderMetadataInstance {
     pub(crate) instance: NDIlib_send_instance_t,
-    pub(crate) metadata: &'static sys::SenderMetadata,
+    pub(crate) free: unsafe extern "C" fn(NDIlib_send_instance_t, *const NDIlib_metadata_frame_t),
 }
 
 // SAFETY: this strategy releases only the metadata descriptor returned by
-// NDIlib_send_capture through the same sender instance and authorized table.
+// NDIlib_send_capture through the same sender instance and authorized release function.
 // That family's text is readable through the first NUL or metadata cap,
 // independently of its reported count, so its scanner uses the sender rule.
 unsafe impl FrameFree for SenderMetadataFree {
@@ -287,9 +287,7 @@ unsafe impl FrameFree for SenderMetadataFree {
     }
 
     unsafe fn free(_core: &sys::Core, instance: Self::Instance, frame: &mut Self::RawFrame) {
-        instance
-            .metadata
-            .NDIlib_send_free_metadata(instance.instance, frame);
+        (instance.free)(instance.instance, frame);
     }
 }
 
@@ -355,7 +353,7 @@ unsafe impl FrameFree for FrameSyncAudioFree {
 #[derive(Debug)]
 pub(crate) struct AvSyncAudioFree;
 
-/// The native owner and already-authorized table of one AV-sync audio loan.
+/// The native owner and authorized release function of one AV-sync audio loan.
 #[cfg(feature = "advanced")]
 #[derive(Clone, Copy)]
 pub(crate) enum AvSyncAudioInstance {
@@ -369,14 +367,18 @@ pub(crate) enum AvSyncAudioInstance {
     Native {
         #[cfg(ndi_has_advanced_av_sync)]
         handle: crate::sys::advanced::AvSyncHandle,
-        table: &'static crate::sys::advanced::AvSync,
+        #[cfg(ndi_has_advanced_av_sync)]
+        free:
+            unsafe extern "C" fn(crate::sys::advanced::AvSyncHandle, *mut NDIlib_audio_frame_v3_t),
+        #[cfg(not(ndi_has_advanced_av_sync))]
+        unavailable: std::convert::Infallible,
     },
     #[cfg(test)]
     Synthetic(*const std::cell::Cell<usize>),
 }
 
-// SAFETY: each instance carries the synchronizer and the same table that
-// returned its descriptor. The owner borrow outlives matching native release,
+// SAFETY: each instance carries the synchronizer and the release entry point
+// of the same bound table that returned its descriptor. The owner borrow outlives matching native release,
 // retaining embedded metadata through its first NUL or the metadata cap.
 #[cfg(feature = "advanced")]
 unsafe impl FrameFree for AvSyncAudioFree {
@@ -393,13 +395,17 @@ unsafe impl FrameFree for AvSyncAudioFree {
             AvSyncAudioInstance::Native {
                 #[cfg(ndi_has_advanced_av_sync)]
                 handle,
-                table,
+                #[cfg(ndi_has_advanced_av_sync)]
+                free,
+                #[cfg(not(ndi_has_advanced_av_sync))]
+                unavailable,
             } => {
-                crate::sys::advanced::native!(AvSync, table => {
-                    if !_frame.p_data.is_null() || !_frame.p_metadata.is_null() {
-                        table.NDIlib_avsync_free_audio(handle, _frame);
-                    }
-                });
+                #[cfg(ndi_has_advanced_av_sync)]
+                if !_frame.p_data.is_null() || !_frame.p_metadata.is_null() {
+                    free(handle, _frame);
+                }
+                #[cfg(not(ndi_has_advanced_av_sync))]
+                match unavailable {}
             }
             #[cfg(test)]
             AvSyncAudioInstance::Synthetic(_) => {

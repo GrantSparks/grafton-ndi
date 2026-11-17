@@ -301,14 +301,57 @@ impl FileApiOptions {
 /// one, keeps the NDI runtime initialized.
 #[derive(Clone)]
 pub struct FileApi {
-    runtime: &'static sys::FileRuntime,
-    /// Keeps the NDI runtime initialized.
-    #[cfg(not(test))]
-    _ndi: Ndi,
-    /// In a unit-test build, the API of a library of test doubles has none:
-    /// it reaches no runtime. Every other API keeps one, as in other builds.
+    runtime: FileBound<sys::FileRuntime>,
+}
+
+/// A native File capability retains its initialized core runtime. Synthetic
+/// test capabilities explicitly reach no runtime and need no initialization.
+/// File owners keep the same field type in production and unit-test builds.
+enum FileBound<T: crate::runtime::BoundTable> {
+    Native(crate::runtime::Bound<T>),
     #[cfg(test)]
-    _ndi: Option<Ndi>,
+    Synthetic(&'static T),
+}
+
+impl<T: crate::runtime::BoundTable> Clone for FileBound<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Native(bound) => Self::Native(bound.clone()),
+            #[cfg(test)]
+            Self::Synthetic(table) => Self::Synthetic(table),
+        }
+    }
+}
+
+impl<T: crate::runtime::BoundTable> std::ops::Deref for FileBound<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Self::Native(bound) => bound,
+            #[cfg(test)]
+            Self::Synthetic(table) => table,
+        }
+    }
+}
+
+impl FileBound<sys::FileRuntime> {
+    /// Transfer the existing lease to the gated family before native creation.
+    fn into_table<T: sys::FileTable>(self) -> Result<FileBound<T>> {
+        match self {
+            Self::Native(bound) => bound.into_file_table().map(FileBound::Native),
+            #[cfg(test)]
+            Self::Synthetic(runtime) => runtime.table().map(FileBound::Synthetic),
+        }
+    }
+
+    fn bind_table<T: sys::FileTable>(&self) -> Result<FileBound<T>> {
+        match self {
+            Self::Native(bound) => bound.bind_file_table().map(FileBound::Native),
+            #[cfg(test)]
+            Self::Synthetic(runtime) => runtime.table().map(FileBound::Synthetic),
+        }
+    }
 }
 
 impl std::fmt::Debug for FileApi {
@@ -345,11 +388,7 @@ impl FileApi {
             options.library_path.as_deref(),
         )?;
         Ok(Self {
-            runtime,
-            #[cfg(not(test))]
-            _ndi: ndi.clone(),
-            #[cfg(test)]
-            _ndi: Some(ndi.clone()),
+            runtime: FileBound::Native(ndi.bind_file_runtime(runtime)),
         })
     }
 
@@ -395,8 +434,16 @@ impl FileApi {
     /// The table of a family, or the error for the first of its entry points
     /// the library does not export. A player, recorder or probe takes its
     /// table here, before it calls anything, so none runs without its family.
-    fn table<T: sys::FileTable>(&self) -> Result<&'static T> {
+    fn table<T: sys::FileTable>(&self) -> Result<&T> {
         self.runtime.table()
+    }
+
+    fn into_table<T: sys::FileTable>(self) -> Result<FileBound<T>> {
+        self.runtime.into_table()
+    }
+
+    fn bind_table<T: sys::FileTable>(&self) -> Result<FileBound<T>> {
+        self.runtime.bind_table()
     }
 }
 
@@ -410,8 +457,7 @@ impl FileApi {
     /// An API for a library of test doubles, which needs no runtime.
     fn with_runtime(runtime: &'static sys::FileRuntime) -> Self {
         Self {
-            runtime,
-            _ndi: None,
+            runtime: FileBound::Synthetic(runtime),
         }
     }
 }

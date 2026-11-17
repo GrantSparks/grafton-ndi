@@ -176,7 +176,7 @@ impl HeldInputs {
 /// [`release_all`](Self::release_all) to learn whether that succeeded.
 pub struct KvmSession<'a, M: ReceiverMode> {
     receiver: &'a Receiver<M>,
-    kvm: &'static Kvm,
+    kvm: &'a Kvm,
     held: HeldInputs,
 }
 
@@ -203,7 +203,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// time; use [`KvmSession::receiver`] to keep using it meanwhile.
     pub fn kvm(&mut self) -> Result<KvmSession<'_, M>> {
         Ok(KvmSession {
-            kvm: self.core._ndi.table()?,
+            kvm: self.core.ndi().table()?,
             receiver: &*self,
             held: HeldInputs::default(),
         })

@@ -456,20 +456,58 @@ pub struct ReclaimedVideo {
 }
 
 /// A scatter input together with the exact native capability that admits it.
-/// The table is uninhabited when this build lacks scatter declarations, so
+/// Its dispatch capability is uninhabited without scatter declarations, so
 /// successful construction also proves the native send methods are compiled.
-pub(crate) struct ScatterSendable<F> {
+pub(crate) struct ScatterSendable<F, T = ScatterDispatch> {
     frame: F,
-    table: &'static ScatterSend,
+    table: T,
+}
+
+/// Admission's dispatch capability. Native calls also require a live sender
+/// handle, so retaining a frame needs no separate runtime lease.
+pub(crate) struct ScatterDispatch {
+    #[cfg(ndi_has_advanced_scatter_send)]
+    send: unsafe extern "C" fn(
+        NDIlib_send_instance_t,
+        *const NDIlib_video_frame_v2_t,
+        *const FrameScatter,
+    ),
+    #[cfg(not(ndi_has_advanced_scatter_send))]
+    unavailable: ScatterSend,
+}
+
+#[cfg(ndi_has_advanced_scatter_send)]
+const _: () = assert!(size_of::<ScatterDispatch>() == size_of::<&ScatterSend>());
+
+impl ScatterDispatch {
+    #[cfg(ndi_has_advanced_scatter_send)]
+    fn of(table: &ScatterSend) -> Self {
+        Self {
+            send: table.NDIlib_send_send_video_scatter_async,
+        }
+    }
 }
 
 impl<F> ScatterSendable<F> {
     fn with_table(
         frame: F,
-        table: Result<&'static ScatterSend>,
+        table: Result<&ScatterSend>,
     ) -> std::result::Result<Self, (crate::Error, F)> {
         match table {
-            Ok(table) => Ok(Self { frame, table }),
+            Ok(table) => {
+                #[cfg(ndi_has_advanced_scatter_send)]
+                {
+                    Ok(Self {
+                        frame,
+                        table: ScatterDispatch::of(table),
+                    })
+                }
+                #[cfg(not(ndi_has_advanced_scatter_send))]
+                {
+                    let _ = frame;
+                    match *table {}
+                }
+            }
             Err(error) => Err((error, frame)),
         }
     }
@@ -489,7 +527,7 @@ impl<F> ScatterSendable<F> {
     #[cfg(test)]
     pub(super) fn for_test(
         frame: F,
-        table: Option<&'static ScatterSend>,
+        table: Option<&ScatterSend>,
     ) -> std::result::Result<Self, (crate::Error, F)> {
         let table = table.ok_or(crate::Error::UnsupportedCapability {
             capability: crate::Capability::Runtime(crate::RuntimeFeature::ScatterSend),
@@ -499,13 +537,16 @@ impl<F> ScatterSendable<F> {
     }
 }
 
-impl<'a, F> ScatterSendable<&'a mut F> {
-    fn borrowed(frame: &'a mut F, ndi: &Ndi) -> Result<Self> {
-        Self::checked(frame, ndi).map_err(|(error, _)| error)
+impl<'a, F> ScatterSendable<&'a mut F, &'a ScatterSend> {
+    fn borrowed(frame: &'a mut F, ndi: &'a Ndi) -> Result<Self> {
+        Ok(Self {
+            frame,
+            table: ndi.table::<ScatterSend>()?,
+        })
     }
 }
 
-impl ScatterSendable<&mut ScatterVideoFrame> {
+impl ScatterSendable<&mut ScatterVideoFrame, &ScatterSend> {
     fn send_video(self, sender: NDIlib_send_instance_t) {
         native!(ScatterSend, self.table, uses(self, sender) => {
             let descriptor = self.frame.descriptor();
@@ -517,7 +558,7 @@ impl ScatterSendable<&mut ScatterVideoFrame> {
     }
 }
 
-impl ScatterSendable<&mut ScatterAudioFrame> {
+impl ScatterSendable<&mut ScatterAudioFrame, &ScatterSend> {
     fn send_audio(self, sender: NDIlib_send_instance_t) {
         native!(ScatterSend, self.table, uses(self, sender) => {
             let descriptor = self.frame.descriptor();
@@ -535,18 +576,29 @@ impl ScatterSendable<&mut ScatterAudioFrame> {
 pub(crate) struct ScatterVideoLoan {
     descriptor: NDIlib_video_frame_v2_t,
     scatter: *const FrameScatter,
+    send: unsafe extern "C" fn(
+        NDIlib_send_instance_t,
+        *const NDIlib_video_frame_v2_t,
+        *const FrameScatter,
+    ),
 }
 
 impl ScatterSendable<ScatterVideoFrame> {
     fn lend(&mut self) -> Lent {
-        native!(ScatterSend, self.table, uses(self) => {
+        #[cfg(ndi_has_advanced_scatter_send)]
+        {
             let descriptor = self.frame.descriptor();
             let scatter = self.frame.storage.descriptor();
-            Lent::Scatter(ScatterSendable {
-                frame: ScatterVideoLoan { descriptor, scatter },
-                table: self.table,
+            Lent::Scatter(ScatterVideoLoan {
+                descriptor,
+                scatter,
+                send: self.table.send,
             })
-        })
+        }
+        #[cfg(not(ndi_has_advanced_scatter_send))]
+        {
+            match self.table.unavailable {}
+        }
     }
 
     #[cfg(ndi_has_advanced_scatter_send)]
@@ -562,13 +614,13 @@ impl ScatterSendable<ScatterVideoFrame> {
 }
 
 #[cfg(ndi_has_advanced_scatter_send)]
-impl ScatterSendable<ScatterVideoLoan> {
+impl ScatterVideoLoan {
     pub(crate) fn descriptor(&self) -> &NDIlib_video_frame_v2_t {
-        &self.frame.descriptor
+        &self.descriptor
     }
 
     pub(crate) fn descriptor_mut(&mut self) -> &mut NDIlib_video_frame_v2_t {
-        &mut self.frame.descriptor
+        &mut self.descriptor
     }
 
     /// # Safety
@@ -576,14 +628,12 @@ impl ScatterSendable<ScatterVideoLoan> {
     /// proof's pointees remain initialized and retained through native release.
     pub(crate) unsafe fn submit(
         &self,
-        sender: NDIlib_send_instance_t,
+        sender: crate::sender::SendHandle<'_>,
         descriptor: *const NDIlib_video_frame_v2_t,
     ) {
-        // SAFETY: caller supplies the complete native-loan lifetime contract.
-        unsafe {
-            self.table
-                .NDIlib_send_send_video_scatter_async(sender, descriptor, self.frame.scatter)
-        };
+        // SAFETY: the handle borrows the live native resource and its runtime;
+        // the caller supplies the complete native-loan lifetime contract.
+        unsafe { (self.send)(sender.instance(), descriptor, self.scatter) };
     }
 }
 
@@ -1551,14 +1601,14 @@ mod tests {
         let Lent::Scatter(lent) = pending.lend() else {
             panic!("a scatter frame is lent with its scatter list");
         };
-        let scatter = lent.frame.scatter;
+        let scatter = lent.scatter;
         // Moving the entry, as its stream's slot does, leaves the list where
         // the SDK was told it is, still naming the frame's arrays.
         let mut moved = Box::new(pending);
         let Lent::Scatter(lent) = moved.lend() else {
             panic!("a scatter frame is lent with its scatter list");
         };
-        assert_eq!(lent.frame.scatter, scatter);
+        assert_eq!(lent.scatter, scatter);
         native!(ScatterSend, table => {
             // SAFETY: the moved entry owns the list.
             let list = unsafe { &*scatter };

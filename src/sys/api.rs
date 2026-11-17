@@ -134,7 +134,7 @@ pub(crate) trait Table: Sized + 'static {
 // proofs use the same gate as tables, so descriptor builders cannot bypass it.
 macro_rules! version_gates {
     ($($gate:ident),+ $(,)?) => {$(
-        #[derive(Debug)]
+        #[derive(Clone, Copy, Debug)]
         pub(crate) struct $gate(());
         impl $gate {
             pub(crate) fn check(evidence: Evidence<'_>) -> Result<&'static Self> {
@@ -178,6 +178,21 @@ impl Resolved {
             #[cfg(feature = "advanced")]
             advanced: super::advanced::AdvancedApi::load(resolver)?,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_core(core: Core) -> Self {
+        let mut resolved = Self::load(&super::table::ExportsWhere(|name: &str| {
+            Core::SYMBOLS
+                .iter()
+                .any(|symbol| symbol.to_bytes() == name.as_bytes())
+                || Lifecycle::SYMBOLS
+                    .iter()
+                    .any(|symbol| symbol.to_bytes() == name.as_bytes())
+        }))
+        .unwrap();
+        resolved.api.core = core;
+        resolved
     }
 
     /// Required entry points, available before version and edition detection.

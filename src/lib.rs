@@ -172,3 +172,11 @@ mod test_support;
 #[cfg(ndi_test_receiver_proofs)]
 #[path = "../tests/ui/internal/receiver_proofs.rs"]
 mod receiver_proofs;
+
+#[cfg(any(
+    ndi_test_runtime_binding,
+    ndi_test_runtime_binding_control,
+    ndi_test_runtime_binding_privacy
+))]
+#[path = "../tests/ui/internal/runtime_binding.rs"]
+mod runtime_binding_contract;
