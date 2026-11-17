@@ -381,6 +381,236 @@ fn native_capture_and_connect_overlap_without_torn_frames() {
     loans.balanced(&ndi);
 }
 
+// Refusals caused by an absent source are part of the control contract.
+// PTZ and KVM report NativeOperationFailed when their message was not sent.
+fn control_result<T: std::fmt::Debug>(result: Result<T, Error>) {
+    assert!(
+        matches!(
+            result,
+            Ok(_) | Err(Error::NotConnected | Error::NativeOperationFailed { .. })
+        ),
+        "unexpected shared-control refusal: {result:?}"
+    );
+}
+
+fn shared_controls<M: ReceiverMode>(receiver: &Receiver<M>, kind: usize, round: u64) {
+    use grafton_ndi::Tally;
+    match kind % 3 {
+        0 => {
+            let ptz = receiver.ptz();
+            let _ = ptz.is_supported();
+            control_result(ptz.recall_preset(0, 0.5));
+            control_result(ptz.store_preset(0));
+            control_result(ptz.zoom(0.5));
+            control_result(ptz.zoom_speed(0.0));
+            control_result(ptz.pan_tilt(0.0, 0.0));
+            control_result(ptz.pan_tilt_speed(0.0, 0.0));
+            control_result(ptz.auto_focus());
+            control_result(ptz.focus(0.5));
+            control_result(ptz.focus_speed(0.0));
+            control_result(ptz.white_balance_auto());
+            control_result(ptz.white_balance_indoor());
+            control_result(ptz.white_balance_outdoor());
+            control_result(ptz.white_balance_oneshot());
+            control_result(ptz.white_balance_manual(0.5, 0.5));
+            control_result(ptz.exposure_auto());
+            control_result(ptz.exposure_manual(0.5));
+            control_result(ptz.exposure_manual_detailed(1.0, 0.5, 0.5));
+        }
+        1 => {
+            receiver.set_tally(Tally::new(
+                round.is_multiple_of(2),
+                !round.is_multiple_of(2),
+            ));
+            let metadata = MetadataFrame::new("<control-overlap/>").unwrap();
+            control_result(receiver.send_metadata(&metadata));
+            control_result(receiver.add_connection_metadata(&metadata));
+            control_result(receiver.clear_connection_metadata());
+            control_result(receiver.web_control_url());
+        }
+        _ => {
+            control_result(receiver.connection_stats());
+            let _ = receiver.is_connected();
+            // The capability was selected once by the owner before spawning.
+            // Older runtimes may lack the delay or keyframe families entirely.
+            for result in [
+                receiver.set_video_delay(Duration::from_millis(round % 2)),
+                receiver.set_audio_delay(Duration::from_millis(round % 2)),
+            ] {
+                if !matches!(result, Err(Error::UnsupportedCapability { .. })) {
+                    control_result(result);
+                }
+            }
+            for result in [receiver.video_delay(), receiver.audio_delay()] {
+                if !matches!(result, Err(Error::UnsupportedCapability { .. })) {
+                    control_result(result);
+                }
+            }
+            #[cfg(feature = "advanced")]
+            {
+                let result = receiver.request_keyframe();
+                if !matches!(result, Err(Error::UnsupportedCapability { .. })) {
+                    control_result(result);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_controls_capture_and_connect_complete_without_torn_frames() {
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let peers = Peers::new(&ndi);
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(peers.sources[0].clone())).unwrap();
+    let loans = Loans::default();
+    let controls = AtomicU64::new(0);
+    peers.run(|stopped| {
+        thread::scope(|scope| {
+            let _stop = Stop(stopped);
+            for kind in 0..3 {
+                let (receiver, controls) = (&receiver, &controls);
+                scope.spawn(move || {
+                    let mut round = 0;
+                    while !stopped.load(Ordering::Acquire) {
+                        timed("shared controls", Duration::ZERO, || {
+                            shared_controls(receiver, kind, round)
+                        });
+                        controls.fetch_add(1, Ordering::Relaxed);
+                        round += 1;
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                });
+            }
+            let workers = std::env::var("GRAFTON_NDI_OVERLAP_THREADS")
+                .map(|value| value.parse::<usize>().unwrap())
+                .unwrap_or(3);
+            for kind in 0..workers {
+                let (receiver, peers, loans) = (&receiver, &peers, &loans);
+                scope.spawn(move || {
+                    while !stopped.load(Ordering::Acquire) {
+                        match kind % 3 {
+                            0 => {
+                                if let Some(frame) =
+                                    captured(timed("control overlap video", SLICE, || {
+                                        receiver.capture_video_ref(SLICE)
+                                    }))
+                                {
+                                    loans.video(frame, peers);
+                                }
+                            }
+                            1 => {
+                                if let Some(frame) =
+                                    captured(timed("control overlap audio", SLICE, || {
+                                        receiver.capture_audio_ref(SLICE)
+                                    }))
+                                {
+                                    loans.audio(frame);
+                                }
+                            }
+                            _ => match captured(timed("control overlap mixed", SLICE, || {
+                                receiver.capture_any_ref(SLICE)
+                            })) {
+                                Some(ReceiverItemRef::Video(frame)) => loans.video(frame, peers),
+                                Some(ReceiverItemRef::Audio(frame)) => loans.audio(frame),
+                                _ => {}
+                            },
+                        }
+                    }
+                });
+            }
+            progress(&receiver);
+            loans.wait_for_media(&ndi);
+            storm(&receiver, &peers, stopped);
+        });
+    });
+    assert!(controls.load(Ordering::Relaxed) > 0);
+    loans.balanced(&ndi);
+    eprintln!(
+        "completed {} shared-control groups",
+        controls.load(Ordering::Relaxed)
+    );
+}
+
+#[cfg(feature = "advanced")]
+fn kvm_overlap(
+    receiver: &mut Receiver,
+    peers: &Peers,
+    ndi: &Ndi,
+    changes: impl FnOnce(&AtomicBool) + Send,
+) {
+    use grafton_ndi::advanced::{MouseButton, WheelAxis};
+    let loans = Loans::default();
+    peers.run(|stopped| {
+        progress(receiver);
+        let mut session = receiver.kvm().unwrap();
+        let view = session.receiver();
+        thread::scope(|scope| {
+            let _stop = Stop(stopped);
+            scope.spawn(|| changes(stopped));
+            scope.spawn(|| {
+                while !stopped.load(Ordering::Acquire) {
+                    match captured(timed("KVM overlap capture", SLICE, || {
+                        view.capture_any_ref(SLICE)
+                    })) {
+                        Some(ReceiverItemRef::Video(frame)) => loans.video(frame, peers),
+                        Some(ReceiverItemRef::Audio(frame)) => loans.audio(frame),
+                        _ => {}
+                    }
+                }
+            });
+            loans.wait_for_media(ndi);
+            let deadline = Instant::now() + duration();
+            let mut groups = 0;
+            while Instant::now() < deadline {
+                timed("KVM controls", Duration::ZERO, || {
+                    let _ = session.is_supported();
+                    for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+                        control_result(session.mouse_down(button));
+                        control_result(session.mouse_up(button));
+                    }
+                    for axis in [WheelAxis::Vertical, WheelAxis::Horizontal] {
+                        control_result(session.wheel(axis, 0.5));
+                    }
+                    control_result(session.move_pointer(0.5, 0.5));
+                    control_result(session.set_clipboard_text("overlap"));
+                    control_result(session.key_down(0xff0d));
+                    control_result(session.key_up(0xff0d));
+                    control_result(session.touch(&[[0.2, 0.3]]));
+                    control_result(session.finish_touch());
+                    control_result(session.release_all());
+                    view.set_tally(grafton_ndi::Tally::new(false, true));
+                    control_result(view.request_keyframe());
+                    control_result(view.connection_stats());
+                });
+                groups += 1;
+                thread::sleep(Duration::from_millis(2));
+            }
+            eprintln!("completed {groups} KVM control groups");
+        });
+    });
+    loans.balanced(ndi);
+}
+
+#[cfg(feature = "advanced")]
+#[test]
+fn kvm_controls_and_shared_capture_complete_without_torn_frames() {
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    if let Err(error) = ndi.require_feature(grafton_ndi::RuntimeFeature::Kvm) {
+        common::skip(common::Requirement::Advanced, &error.to_string());
+        return;
+    }
+    let _turn = sockets();
+    let peers = Peers::new(&ndi);
+    let mut receiver =
+        Receiver::new(&ndi, &ReceiverOptions::new(peers.sources[0].clone())).unwrap();
+    kvm_overlap(&mut receiver, &peers, &ndi, |_| {});
+}
+
 #[test]
 fn framesync_capture_and_connect_overlap_without_torn_frames() {
     let Some(ndi) = common::ndi() else {
@@ -602,10 +832,42 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
     // records an SDK unsubscribe/connect deadlock. Listener destruction happens
     // only after every capture/control worker below has joined.
     listener.subscribe(&id);
+    #[cfg(feature = "advanced")]
+    let mut receiver = receiver;
+    #[cfg(feature = "advanced")]
+    if ndi.require_feature(RuntimeFeature::Kvm).is_ok() {
+        kvm_overlap(&mut receiver, &peers, &ndi, |stopped| {
+            while !stopped.load(Ordering::Acquire) {
+                listener
+                    .request_connect(&id, peers.sources[1].name())
+                    .unwrap();
+                thread::sleep(Duration::from_millis(25));
+                listener.request_disconnect(&id).unwrap();
+                thread::sleep(Duration::from_millis(25));
+                listener
+                    .request_connect(&id, peers.sources[0].name())
+                    .unwrap();
+                thread::sleep(Duration::from_millis(250));
+            }
+        });
+    }
     let loans = Loans::default();
     peers.run(|stopped| {
         thread::scope(|scope| {
             let _stop = Stop(stopped);
+            for kind in 0..3 {
+                let receiver = &receiver;
+                scope.spawn(move || {
+                    let mut round = 0;
+                    while !stopped.load(Ordering::Acquire) {
+                        timed("remote shared controls", Duration::ZERO, || {
+                            shared_controls(receiver, kind, round)
+                        });
+                        round += 1;
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                });
+            }
             scope.spawn(|| {
                 while !stopped.load(Ordering::Acquire) {
                     match captured(timed("remote mixed capture", SLICE, || {

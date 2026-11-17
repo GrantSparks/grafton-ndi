@@ -362,7 +362,9 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn request_keyframe(&self) -> Result<()> {
         let table = self.core._ndi.table::<KeyframeRequest>()?;
         native!(KeyframeRequest, table => {
-            // SAFETY: the receiver instance is live for this borrow.
+            let _connection = self.core.lock_connection();
+            // SAFETY: the live core and connection permit cover this call;
+            // see the RecvInstance concurrency inventory.
             unsafe { table.NDIlib_recv_request_keyframe(self.core.instance.0) };
             Ok(())
         })
