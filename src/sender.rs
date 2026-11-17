@@ -1121,6 +1121,89 @@ pub(crate) mod in_flight {
             assert_eq!(observed.releases, 9);
         }
 
+        /// Read the borrowed frame and its tail through the native descriptor,
+        /// exercising the same synchronous dispatch kernel as Sender::send_video.
+        #[test]
+        fn synchronous_native_send_reads_the_whole_borrowed_buffer() {
+            use super::super::{BorrowedVideoFrame, SendInstance};
+            use crate::{
+                frames::ValidatedVideoLayout, pixels::send_room, sys::table::Resolver, LoadRefusal,
+                PixelFormat, ScanType,
+            };
+            use std::{
+                cell::Cell,
+                ffi::{c_void, CStr},
+                marker::PhantomData,
+                ptr::NonNull,
+                sync::LazyLock,
+            };
+
+            struct Observation {
+                len: usize,
+                calls: Cell<usize>,
+            }
+            unsafe extern "C" fn unused() {}
+            unsafe extern "C" fn read_video(
+                instance: crate::sys::bindings::NDIlib_send_instance_t,
+                frame: *const NDIlib_video_frame_v2_t,
+            ) {
+                // SAFETY: this synchronous call borrows the live observation
+                // and PreparedVideo retains its descriptor and all readable bytes.
+                let observed = unsafe { &*instance.cast::<Observation>() };
+                let frame = unsafe { &*frame };
+                let bytes = unsafe { std::slice::from_raw_parts(frame.p_data, observed.len) };
+                for (index, &byte) in bytes.iter().enumerate() {
+                    assert_eq!(byte, (index % 251) as u8);
+                }
+                observed.calls.set(observed.calls.get() + 1);
+            }
+            struct Synthetic;
+            impl Resolver for Synthetic {
+                fn resolve(
+                    &self,
+                    name: &'static CStr,
+                ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
+                    // Only synchronous video dispatch is exercised here.
+                    let address = if name == c"NDIlib_send_send_video_v2" {
+                        read_video as *mut c_void
+                    } else {
+                        unused as *mut c_void
+                    };
+                    Ok(NonNull::new(address))
+                }
+            }
+            static CORE: LazyLock<crate::sys::Core> =
+                LazyLock::new(|| crate::sys::Core::load(&Synthetic).unwrap().ok().unwrap());
+            for (height, scan) in [(4, ScanType::Progressive), (6, ScanType::Interlaced)] {
+                let layout =
+                    ValidatedVideoLayout::new_uncompressed(PixelFormat::Uyvy, 18, height, None)
+                        .unwrap();
+                let len = layout.data_len_bytes() + send_room(&layout, scan);
+                let buffer: Vec<u8> = (0..len).map(|index| (index % 251) as u8).collect();
+                let frame = BorrowedVideoFrame::builder(&buffer, 18, height, PixelFormat::Uyvy)
+                    .scan_type(scan)
+                    .allow_send_from_padding_and_tail(true)
+                    .build()
+                    .unwrap();
+                assert!(frame.sends_in_place());
+                let observed = Observation {
+                    len,
+                    calls: Cell::new(0),
+                };
+                let sender = SendHandle {
+                    instance: SendInstance(std::ptr::from_ref(&observed).cast_mut().cast()),
+                    core: &CORE,
+                    _owner: PhantomData,
+                };
+                let mut state = VideoState::default();
+                let mut pair = state.paired(sender);
+                let prepared = PreparedVideo::new(&frame, pair.staging);
+                assert_eq!(prepared.raw.p_data.cast_const(), buffer.as_ptr());
+                pair.stream.send(prepared);
+                assert_eq!(observed.calls.get(), 1);
+            }
+        }
+
         #[test]
         fn an_unproven_drop_leaks_the_native_loan() {
             use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1263,24 +1346,19 @@ impl fmt::Debug for RawVideo<'_> {
 pub struct BorrowedVideoFrame<'buf> {
     layout: ValidatedVideoLayout,
     header: VideoHeader,
-    /// Exactly the validated storage extent.
+    /// The whole initialized buffer, including any room after the frame.
     data: &'buf [u8],
-    /// The initialized bytes, borrowed for `'buf` as `data` is, between the
-    /// frame's last active byte and the end of the buffer `data` is a prefix
-    /// of: the last row's padding and whatever the buffer holds after the
-    /// frame.
-    tail_room: usize,
-    /// Caller opted in, or this is crate-owned storage with a zeroed tail.
-    allow_padding_and_tail: bool,
+    /// Readable bytes after the last active pixel, zero unless opted in.
+    room_after: usize,
     /// The metadata text, validated with its terminator.
     metadata: Option<MetadataText<'buf>>,
 }
 
 // SAFETY: Construction checks the initialized byte slice covers the validated
 // layout; its borrow also retains validated terminated metadata unchanged.
-// Its initialized report vouches for all storage padding and, only after the
-// caller opts in, the known room after the last pixel. Direct SDK reads are
-// decided by the common rule over that quantity.
+// pixels() derives from the whole borrowed buffer, so its provenance covers
+// the storage and, only after the caller opts in, the reported room after the
+// last pixel. Direct SDK reads are decided by the common rule over that room.
 unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
     #[inline]
     fn layout(&self) -> &ValidatedVideoLayout {
@@ -1307,11 +1385,7 @@ unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
 
     fn initialized(&self) -> crate::frames::Initialized {
         crate::frames::Initialized::Storage {
-            room_after: if self.allow_padding_and_tail {
-                self.tail_room
-            } else {
-                0
-            },
+            room_after: self.room_after,
         }
     }
 }
@@ -1442,11 +1516,10 @@ crate::frames::video_accessors! {
         /// [`PixelFormat::send_tail_room`] is nonzero. Opting in with
         /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`] allows
         /// direct sending if enough room follows the last pixel. The last row's
-        /// padding, the bytes of the
-        /// buffer after the frame, and bytes vouched for with
-        /// [`BorrowedVideoFrameBuilder::readable_after`] all count towards the
-        /// room after that opt-in. An interlaced or single-field frame of those
-        /// formats whose height is not a multiple of four needs two line strides more.
+        /// padding and the bytes of the builder's buffer after the frame count
+        /// towards the room after that opt-in. An interlaced or single-field
+        /// frame of those formats whose height is not a multiple of four needs
+        /// two line strides more.
         ///
         /// Where the SDK reads frames exactly, which is 64-bit ARM Linux, the
         /// room is zero and every frame sends in place.
@@ -1535,7 +1608,6 @@ impl<'buf> BorrowedVideoFrame<'buf> {
             scan_type: ScanType::Progressive,
             timecode: Timecode::SYNTHESIZE,
             metadata: None,
-            readable_after: 0,
             allow_padding_and_tail: false,
         }
     }
@@ -1545,7 +1617,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// part of it. [`Self::plane`] and [`Self::planes`] borrow the active
     /// rows alone.
     pub fn storage(&self) -> &[u8] {
-        self.data
+        &self.data[..self.layout.data_len_bytes()]
     }
 
     /// Return this frame with `timecode`.
@@ -1589,8 +1661,6 @@ pub struct BorrowedVideoFrameBuilder<'buf> {
     scan_type: ScanType,
     timecode: Timecode,
     metadata: Option<&'buf CStr>,
-    /// Readable bytes the caller vouches for after `data`.
-    readable_after: usize,
     allow_padding_and_tail: bool,
 }
 
@@ -1606,7 +1676,6 @@ impl std::fmt::Debug for BorrowedVideoFrameBuilder<'_> {
             .field("scan_type", &self.scan_type)
             .field("timecode", &self.timecode)
             .field("metadata", &self.metadata.map(CStr::to_string_lossy))
-            .field("readable_after", &self.readable_after)
             .field(
                 "allow_send_from_padding_and_tail",
                 &self.allow_padding_and_tail,
@@ -1673,8 +1742,8 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
     ///
     /// Defaults to `false`. Where UYVY/UYVA sending needs tail room, the
     /// default path packs active rows and zeroes the tail. Setting this to
-    /// `true` permits sending directly if the supplied buffer (plus any
-    /// [`Self::readable_after`] room) is large enough. The SDK may encode row
+    /// `true` permits sending directly if the supplied buffer is large enough
+    /// to include the required room after the frame. The SDK may encode row
     /// padding and trailing bytes into the picture: only opt in when their
     /// contents are suitable for transmission. All such bytes must be
     /// initialized and stable throughout the send. Insufficient room still
@@ -1682,55 +1751,6 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
     #[must_use]
     pub fn allow_send_from_padding_and_tail(mut self, allow: bool) -> Self {
         self.allow_padding_and_tail = allow;
-        self
-    }
-
-    /// Declare that `bytes` bytes of initialized memory follow the builder's
-    /// buffer.
-    ///
-    /// They count towards the [room](PixelFormat::send_tail_room) the SDK
-    /// needs after the frame, so that a buffer which ends with its frame and
-    /// cannot be made longer, such as one another library allocated with
-    /// padding, is [sent in place](BorrowedVideoFrame::sends_in_place)
-    /// instead of copied, only after explicitly opting in with
-    /// [`Self::allow_send_from_padding_and_tail`]. This declaration alone
-    /// does not change the default copying policy. The SDK may read those
-    /// bytes and compress them into the picture's last blocks. It writes nothing.
-    ///
-    /// A buffer the program allocates itself needs none of this: make it
-    /// longer, and the frame borrows the room with the pixels.
-    ///
-    /// # Safety
-    ///
-    /// The `bytes` bytes that follow the last byte of the buffer given to
-    /// [`BorrowedVideoFrame::builder`] must be readable memory for as long
-    /// as that buffer is borrowed, initialized, and within the same live
-    /// allocation as the buffer. Every byte the SDK may read, including row
-    /// padding and trailing room, must be initialized and remain stable
-    /// throughout the send; nothing may write it during that time.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let format = PixelFormat::Uyvy;
-    /// // A capture library's buffer: the frame, then its own padding.
-    /// let capture = vec![0u8; 720 * 480 * 2 + 64];
-    /// let pixels = &capture[..720 * 480 * 2];
-    ///
-    /// let builder = BorrowedVideoFrame::builder(pixels, 720, 480, format)
-    ///     .allow_send_from_padding_and_tail(true);
-    /// // SAFETY: `pixels` is followed by 64 more bytes of `capture`, which
-    /// // outlives the frame; every byte is initialized and remains stable.
-    /// let frame = unsafe { builder.readable_after(64) }.build()?;
-    /// assert!(frame.sends_in_place());
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[must_use]
-    pub unsafe fn readable_after(mut self, bytes: usize) -> Self {
-        self.readable_after = bytes;
         self
     }
 
@@ -1753,7 +1773,7 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
             self.height,
             self.line_stride,
         )?;
-        let Some(data) = self.data.get(..layout.data_len_bytes()) else {
+        if self.data.len() < layout.data_len_bytes() {
             return Err(Error::InvalidFrame(
                 crate::FrameDefect::VideoBufferTooSmall {
                     format: self.pixel_format,
@@ -1761,7 +1781,7 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
                     minimum: layout.data_len_bytes(),
                 },
             ));
-        };
+        }
         let metadata = self.metadata.map(MetadataText::from_cstr).transpose()?;
         Ok(BorrowedVideoFrame {
             layout,
@@ -1771,10 +1791,12 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
                 self.scan_type,
                 self.timecode,
             ),
-            data,
-            tail_room: (layout.trailing_padding() + (self.data.len() - data.len()))
-                .saturating_add(self.readable_after),
-            allow_padding_and_tail: self.allow_padding_and_tail,
+            data: self.data,
+            room_after: if self.allow_padding_and_tail {
+                layout.trailing_padding() + (self.data.len() - layout.data_len_bytes())
+            } else {
+                0
+            },
             metadata,
         })
     }
@@ -3397,9 +3419,9 @@ mod tests {
                     let mut staging = Pixels::default();
                     let mut expected = None;
                     for extra in [0, room] {
-                        for vouched in [0, room] {
+                        for offered in [0, room] {
                             for padding in [16, 235] {
-                                let mut buffer = vec![padding; len + extra + vouched];
+                                let mut buffer = vec![padding; len + extra + offered];
                                 let ranges: Vec<_> = {
                                     let frame = BorrowedVideoFrame::builder(&buffer, 18, 6, format)
                                         .line_stride_bytes(stride)
@@ -3422,18 +3444,10 @@ mod tests {
                                 for range in ranges {
                                     buffer[range].fill(128);
                                 }
-                                let builder = BorrowedVideoFrame::builder(
-                                    &buffer[..len + extra],
-                                    18,
-                                    6,
-                                    format,
-                                )
-                                .line_stride_bytes(stride)
-                                .scan_type(scan);
-                                // SAFETY: the same initialized allocation extends
-                                // `vouched` bytes past the slice and stays unchanged.
-                                let frame =
-                                    unsafe { builder.readable_after(vouched) }.build().unwrap();
+                                let builder = BorrowedVideoFrame::builder(&buffer, 18, 6, format)
+                                    .line_stride_bytes(stride)
+                                    .scan_type(scan);
+                                let frame = builder.build().unwrap();
                                 assert!(!frame.sends_in_place());
                                 let raw = PreparedVideo::new(&frame, &mut staging).raw;
                                 assert_eq!(
@@ -3465,25 +3479,20 @@ mod tests {
 
     /// The room the SDK reads after a UYVY or UYVA frame is whatever follows
     /// the last pixel in the caller's buffer: the last row's padding, the
-    /// bytes after the frame, and the bytes the caller vouches for. Other
+    /// bytes after the frame included in the builder's slice. Other
     /// formats need none, and an interlaced or single-field frame whose
     /// height is not a multiple of four needs two rows more.
     #[test]
     fn a_borrowed_frame_sends_in_place_when_room_follows_its_last_pixel() {
         let buffer = vec![0u8; 8192];
-        let in_place = |format, height, scan, stride: Option<usize>, len: usize, vouched| {
+        let in_place = |format, height, scan, stride: Option<usize>, len: usize| {
             let mut builder = BorrowedVideoFrame::builder(&buffer[..len], 18, height, format)
                 .scan_type(scan)
                 .allow_send_from_padding_and_tail(true);
             if let Some(stride) = stride {
                 builder = builder.line_stride_bytes(stride);
             }
-            // SAFETY: `buffer` extends at least `vouched` bytes past every
-            // length used here.
-            unsafe { builder.readable_after(vouched) }
-                .build()
-                .unwrap()
-                .sends_in_place()
+            builder.build().unwrap().sends_in_place()
         };
         let progressive = ScanType::Progressive;
         // No format but UYVY and UYVA is read past.
@@ -3492,10 +3501,7 @@ mod tests {
                 assert_eq!(format.send_tail_room(), 0, "{format:?}");
                 let len = format.buffer_len(18, 4, None).unwrap();
                 for scan in ScanType::ALL {
-                    assert!(
-                        in_place(format, 4, scan, None, len, 0),
-                        "{format:?} {scan:?}"
-                    );
+                    assert!(in_place(format, 4, scan, None, len), "{format:?} {scan:?}");
                 }
             }
         }
@@ -3505,54 +3511,77 @@ mod tests {
         if room == 0 {
             // The SDK reads frames exactly here: nothing needs room.
             for scan in ScanType::ALL {
-                assert!(in_place(uyvy, 6, scan, None, 216, 0), "{scan:?}");
-                assert!(in_place(uyva, 6, scan, None, 324, 0), "{scan:?}");
+                assert!(in_place(uyvy, 6, scan, None, 216), "{scan:?}");
+                assert!(in_place(uyva, 6, scan, None, 324), "{scan:?}");
             }
             return;
         }
         assert_eq!(room, 64);
         // Packed rows of 36 bytes, four rows: the frame is 144 bytes.
-        assert!(!in_place(uyvy, 4, progressive, None, 144, 0));
-        assert!(!in_place(uyvy, 4, progressive, None, 144 + 63, 0));
-        assert!(in_place(uyvy, 4, progressive, None, 144 + 64, 0));
+        assert!(!in_place(uyvy, 4, progressive, None, 144));
+        assert!(!in_place(uyvy, 4, progressive, None, 144 + 63));
+        assert!(in_place(uyvy, 4, progressive, None, 144 + 64));
         // Row padding counts: 64 bytes of it, or 60 and four more bytes.
-        assert!(in_place(uyvy, 4, progressive, Some(100), 400, 0));
-        assert!(!in_place(uyvy, 4, progressive, Some(96), 384, 0));
-        assert!(!in_place(uyvy, 4, progressive, Some(96), 384 + 3, 0));
-        assert!(in_place(uyvy, 4, progressive, Some(96), 384 + 4, 0));
-        // So do bytes the caller vouches for, alone or with the others.
-        assert!(!in_place(uyvy, 4, progressive, None, 144, 63));
-        assert!(in_place(uyvy, 4, progressive, None, 144, 64));
-        assert!(in_place(uyvy, 4, progressive, Some(96), 384 + 2, 2));
+        assert!(in_place(uyvy, 4, progressive, Some(100), 400));
+        assert!(!in_place(uyvy, 4, progressive, Some(96), 384));
+        assert!(!in_place(uyvy, 4, progressive, Some(96), 384 + 3));
+        assert!(in_place(uyvy, 4, progressive, Some(96), 384 + 4));
 
         // UYVA ends with its alpha plane, whose rows are half the stride.
-        assert!(!in_place(uyva, 4, progressive, None, 216, 0));
-        assert!(!in_place(uyva, 4, progressive, None, 216 + 63, 0));
-        assert!(in_place(uyva, 4, progressive, None, 216 + 64, 0));
-        assert!(in_place(uyva, 4, progressive, Some(164), 984, 0));
-        assert!(!in_place(uyva, 4, progressive, Some(160), 960, 0));
-        assert!(in_place(uyva, 4, progressive, Some(160), 960 + 2, 0));
+        assert!(!in_place(uyva, 4, progressive, None, 216));
+        assert!(!in_place(uyva, 4, progressive, None, 216 + 63));
+        assert!(in_place(uyva, 4, progressive, None, 216 + 64));
+        assert!(in_place(uyva, 4, progressive, Some(164), 984));
+        assert!(!in_place(uyva, 4, progressive, Some(160), 960));
+        assert!(in_place(uyva, 4, progressive, Some(160), 960 + 2));
         // Interlaced and single-field frames need the same room when their
         // height is a multiple of four, and two line strides more when not.
         for scan in [ScanType::Interlaced, ScanType::Field0, ScanType::Field1] {
-            assert!(!in_place(uyvy, 4, scan, None, 144 + 63, 0), "{scan:?}");
-            assert!(in_place(uyvy, 4, scan, None, 144 + 64, 0), "{scan:?}");
+            assert!(!in_place(uyvy, 4, scan, None, 144 + 63), "{scan:?}");
+            assert!(in_place(uyvy, 4, scan, None, 144 + 64), "{scan:?}");
             // Six rows of 36 bytes: 216 bytes, and 72 + 64 of room.
-            assert!(!in_place(uyvy, 6, scan, None, 216 + 64, 0), "{scan:?}");
-            assert!(!in_place(uyvy, 6, scan, None, 216 + 135, 0), "{scan:?}");
-            assert!(in_place(uyvy, 6, scan, None, 216 + 136, 0), "{scan:?}");
-            assert!(in_place(uyvy, 5, scan, None, 180 + 136, 0), "{scan:?}");
+            assert!(!in_place(uyvy, 6, scan, None, 216 + 64), "{scan:?}");
+            assert!(!in_place(uyvy, 6, scan, None, 216 + 135), "{scan:?}");
+            assert!(in_place(uyvy, 6, scan, None, 216 + 136), "{scan:?}");
+            assert!(in_place(uyvy, 5, scan, None, 180 + 136), "{scan:?}");
             // With a 100-byte stride the rows are 200 bytes, less the 64 of
             // padding that already follow the last pixel.
-            assert!(
-                !in_place(uyvy, 6, scan, Some(100), 600 + 199, 0),
-                "{scan:?}"
-            );
-            assert!(in_place(uyvy, 6, scan, Some(100), 600 + 200, 0), "{scan:?}");
-            assert!(in_place(uyva, 6, scan, None, 324 + 136, 0), "{scan:?}");
-            assert!(!in_place(uyva, 6, scan, None, 324 + 135, 0), "{scan:?}");
+            assert!(!in_place(uyvy, 6, scan, Some(100), 600 + 199), "{scan:?}");
+            assert!(in_place(uyvy, 6, scan, Some(100), 600 + 200), "{scan:?}");
+            assert!(in_place(uyva, 6, scan, None, 324 + 136), "{scan:?}");
+            assert!(!in_place(uyva, 6, scan, None, 324 + 135), "{scan:?}");
         }
-        assert!(in_place(uyvy, 6, progressive, None, 216 + 64, 0));
+        assert!(in_place(uyvy, 6, progressive, None, 216 + 64));
+    }
+
+    /// Miri must observe the SDK's complete read, including bytes outside the
+    /// frame storage that were included in the builder's original borrow.
+    #[test]
+    fn borrowed_video_descriptor_can_read_the_whole_buffer() {
+        for (height, scan) in [(4, ScanType::Progressive), (6, ScanType::Interlaced)] {
+            let layout =
+                ValidatedVideoLayout::new_uncompressed(PixelFormat::Uyvy, 18, height, None)
+                    .unwrap();
+            let data_len = layout.data_len_bytes();
+            let read_len = data_len + send_room(&layout, scan);
+            let buffer: Vec<u8> = (0..read_len).map(|index| (index % 251) as u8).collect();
+            let frame = BorrowedVideoFrame::builder(&buffer, 18, height, PixelFormat::Uyvy)
+                .scan_type(scan)
+                .allow_send_from_padding_and_tail(true)
+                .build()
+                .unwrap();
+            assert!(frame.sends_in_place());
+            assert_eq!(frame.storage(), &buffer[..data_len]);
+            assert_eq!(frame.data(), Some(&buffer[..data_len]));
+            let mut staging = Pixels::default();
+            let raw = PreparedVideo::new(&frame, &mut staging).raw;
+            assert_eq!(raw.p_data.cast_const(), buffer.as_ptr());
+            // SAFETY: the frame's whole buffer borrow covers the layout and
+            // reported send room. This models the native SDK's actual read.
+            let read = unsafe { std::slice::from_raw_parts(raw.p_data, read_len) };
+            assert_eq!(read, buffer);
+            assert!(staging.as_slice().is_empty());
+        }
     }
 
     /// Staging packs active pixels, preserves headers and metadata, reuses

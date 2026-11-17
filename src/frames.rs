@@ -399,9 +399,9 @@ impl PixelFormat {
     ///   [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`](crate::BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail).
     ///   [`BorrowedVideoFrame::sends_in_place`](crate::BorrowedVideoFrame::sends_in_place)
     ///   tells which.
-    /// - A buffer that cannot be made longer, but is known to be followed by
-    ///   initialized memory in the same allocation, can say so with
-    ///   [`BorrowedVideoFrameBuilder::readable_after`](crate::BorrowedVideoFrameBuilder::readable_after).
+    /// - Include any initialized trailing room in the slice passed to
+    ///   [`BorrowedVideoFrame::builder`](crate::BorrowedVideoFrame::builder),
+    ///   so the frame borrows those bytes along with its pixels.
     ///
     /// One kind of frame needs two rows more, twice the line stride: an
     /// interlaced or single-field UYVY or UYVA frame whose height is not a
@@ -677,7 +677,9 @@ impl VideoHeader {
 /// string for the borrow. An [`Initialized::Storage`] report guarantees every
 /// byte of the layout's storage, padding included, is initialized. Its
 /// `room_after` bytes after the last active pixel are also initialized and
-/// readable in that same allocation; final-row padding counts towards them.
+/// readable through the pointer `pixels()` returns: it must derive from a
+/// reference or allocation covering both storage and room. Final-row padding
+/// counts towards that room.
 /// Copying, views and descriptors are non-overridable helpers.
 pub(crate) unsafe trait VideoParts {
     /// The validated layout of the frame's pixels.
@@ -708,7 +710,8 @@ pub(crate) enum Initialized {
     /// Only the active rows are known initialized.
     ActiveRows,
     /// All layout storage is initialized, including padding, and `room_after`
-    /// initialized bytes follow the last active pixel in the same allocation.
+    /// initialized bytes follow the last active pixel and are readable through
+    /// `VideoParts::pixels()`, whose provenance covers the storage and room.
     /// The final row's padding is part of that room.
     Storage { room_after: usize },
 }
@@ -899,7 +902,8 @@ pub(crate) struct PackedVideo<'a> {
 }
 
 // SAFETY: only the copy kernel constructs this view, after filling its own
-// computed layout and zeroed tail. All other fields borrow the source frame.
+// computed layout and zeroed tail. Pixels::as_ptr derives from the owning Vec,
+// covering the complete allocation, tail included. Other fields borrow the source.
 unsafe impl VideoParts for PackedVideo<'_> {
     fn layout(&self) -> &ValidatedVideoLayout {
         &self.layout
@@ -1471,7 +1475,8 @@ pub struct VideoFrame {
 // SAFETY: Pixels owns and initializes the validated layout and scan-dependent
 // SDK tail. OwnedFrameMetadata owns bounded terminated text. Immutable borrows keep
 // both allocations unchanged. Its initialized report comes from Pixels'
-// tracked room, including every byte after its tightly packed active pixels.
+// tracked room; Pixels::as_ptr derives from the owning Vec and covers the whole
+// allocation, including every byte after its tightly packed active pixels.
 unsafe impl VideoParts for VideoFrame {
     #[inline]
     fn layout(&self) -> &ValidatedVideoLayout {
@@ -4869,7 +4874,8 @@ impl<'a> ValidatedAudio<&'a NDIlib_audio_frame_v3_t> {
 // SAFETY: video validates this descriptor's layout and metadata; its holder's
 // invariant guarantees initialized active pixels and live unchanged storage for
 // F's lifetime. Views borrow this holder. Default descriptors and direct-send
-// checks never extend the initialized active span into padding or tail room.
+// checks never extend the initialized active span into padding or tail room:
+// captures report Initialized::ActiveRows.
 unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_video_frame_v2_t>> VideoParts
     for ValidatedVideo<F>
 {

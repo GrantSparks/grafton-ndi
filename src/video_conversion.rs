@@ -217,7 +217,8 @@ impl<'a> P216Output<'a> {
 
 // SAFETY: construction copies the owned frame's validated layout and borrows
 // its exactly sized initialized storage exclusively. The borrow keeps it allocated and inaccessible until
-// the view is consumed; metadata is absent and the header is valid.
+// the view is consumed; metadata is absent and the header is valid. Its
+// Initialized::Storage report claims zero room beyond that storage.
 unsafe impl VideoParts for P216Output<'_> {
     fn layout(&self) -> &ValidatedVideoLayout {
         &self.layout

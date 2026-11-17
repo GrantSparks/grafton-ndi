@@ -171,6 +171,8 @@ impl Pixels {
 
     /// The first pixel. `len` bytes and then `tail` zero bytes
     /// are readable from it, until the storage is next changed or dropped.
+    /// Deriving from the Vec keeps provenance for the whole allocation,
+    /// including the initialized room beyond its logical length.
     pub(crate) fn as_ptr(&self) -> *const u8 {
         self.bytes.as_ptr()
     }

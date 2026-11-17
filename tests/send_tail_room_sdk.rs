@@ -535,22 +535,20 @@ fn bytes_after_a_buffer_reach_the_picture_only_as_room() {
     assert_eq!(exact(&dark, "dark after"), zero_room);
     assert_eq!(exact(&bright, "bright after"), zero_room);
 
-    // Vouched for, they are the room again, read where they lie.
-    let builder = BorrowedVideoFrame::builder(&bright[..len], width, height, format)
-        .allow_send_from_padding_and_tail(true);
-    // SAFETY: `after` more bytes of `bright` follow the slice, and nothing
-    // writes them.
-    let vouched = unsafe { builder.readable_after(after) }.build().unwrap();
-    assert!(vouched.sends_in_place());
-    assert_eq!(received(&ndi, "vouched", &vouched, format), bright_room);
+    // Extending the borrowed slice offers the trailing bytes as room.
+    let extended = BorrowedVideoFrame::builder(&bright[..len + after], width, height, format)
+        .allow_send_from_padding_and_tail(true)
+        .build()
+        .unwrap();
+    assert!(extended.sends_in_place());
+    assert_eq!(received(&ndi, "extended", &extended, format), bright_room);
 
-    // Declaring initialized room alone must not bypass default staging.
-    let builder = BorrowedVideoFrame::builder(&bright[..len], width, height, format);
-    // SAFETY: the same initialized allocation extends `after` bytes past
-    // the slice and remains stable throughout the send.
-    let default = unsafe { builder.readable_after(after) }.build().unwrap();
+    // Including initialized room alone must not bypass default staging.
+    let default = BorrowedVideoFrame::builder(&bright[..len + after], width, height, format)
+        .build()
+        .unwrap();
     assert_eq!(
-        received(&ndi, "default vouched", &default, format),
+        received(&ndi, "default extended", &default, format),
         zero_room
     );
     let default = BorrowedVideoFrame::builder(&bright, width, height, format)
@@ -583,7 +581,7 @@ fn default_yuv_sends_depend_only_on_active_pixels() {
         if format.send_tail_room() == 0 {
             continue;
         }
-        for (label, padding, height, scan, extra, vouched, last_only) in [
+        for (label, padding, height, scan, extra, frame_only, last_only) in [
             (
                 "earlier rows",
                 4,
@@ -613,7 +611,7 @@ fn default_yuv_sends_depend_only_on_active_pixels() {
                 false,
             ),
             (
-                "asserted room",
+                "room outside slice",
                 0,
                 32,
                 ScanType::Progressive,
@@ -660,15 +658,11 @@ fn default_yuv_sends_depend_only_on_active_pixels() {
             };
             let (dark, bright) = (make(16), make(235));
             let frame = |data: &[u8], name: &str| {
-                let slice = if vouched { &data[..len] } else { data };
+                let slice = if frame_only { &data[..len] } else { data };
                 let builder = BorrowedVideoFrame::builder(slice, width, height, format)
                     .line_stride_bytes(stride)
                     .scan_type(scan);
-                // SAFETY: `extra` initialized bytes follow the slice within
-                // the same allocation when vouched; all data stays stable.
-                let frame = unsafe { builder.readable_after(if vouched { extra } else { 0 }) }
-                    .build()
-                    .unwrap();
+                let frame = builder.build().unwrap();
                 assert!(!frame.sends_in_place());
                 received(&ndi, &format!("{format:?} {label} {name}"), &frame, format)
             };
