@@ -26,6 +26,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Fixed
 
+- Queued senders publish unknown-completion failures in the admission lock,
+  so a racing submission cannot enter after failure is detected.
+
 - Recorder file tracking stays bounded after native event loss and preserves
   unknown cleanup obligations even after all known files close. Drop and async
   close consume the remaining original cleanup budget; final reports stay fixed.
