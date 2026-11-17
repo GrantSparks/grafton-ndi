@@ -152,7 +152,7 @@
 //! anywhere. [`AsyncFilePlayer`] and [`AsyncFileRecorder`] keep each native
 //! object on a dedicated thread and expose futures that work with any executor.
 //! Those futures submit work on their first poll; [`FileOperation::submit`]
-//! explicitly submits immediately. Submitted stop, finish and close operations
+//! explicitly submits immediately. Submitted stop, finish, close and abandon operations
 //! survive cancellation of their futures. Dropping the last async handle can
 //! block; await its `close()` operation before dropping it on an executor.
 //!

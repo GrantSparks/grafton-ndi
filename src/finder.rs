@@ -445,6 +445,13 @@ impl SourceWatch<'_> {
     /// Copy the currently known sources and record the generation before
     /// copying, preserving any report that arrives during the snapshot.
     /// A failed snapshot leaves the cursor unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the snapshot errors of [`Finder::current_sources`]:
+    /// [`Error::UnexpectedSdkResult`] for a malformed top-level descriptor array,
+    /// [`Error::AllocationFailed`] when result or text storage cannot be reserved,
+    /// or [`Error::ResourceLimit`] when a snapshot exceeds its copy budgets.
     pub fn current_sources(&mut self) -> Result<Vec<Source>> {
         self.snapshot(Finder::current_sources, |_| true)
     }
@@ -783,6 +790,14 @@ impl Finder {
     ///
     /// A vector of currently known sources. May be empty if no sources are found.
     ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedSdkResult`] with
+    /// [`crate::SdkResultDefect::MalformedDiscoveryData`] for a malformed top-level
+    /// descriptor array, [`Error::AllocationFailed`] when result or text storage
+    /// cannot be reserved, or [`Error::ResourceLimit`] when a snapshot exceeds
+    /// its copy budgets. An isolated malformed descriptor is skipped.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -961,6 +976,9 @@ impl Finder {
     /// whole window exceed 16,384 entries or 16 MiB. The retained byte budget
     /// counts shared source strings once, plus the storage of both the result
     /// vector and the deduplication set, including container capacity.
+    /// Returns [`Error::UnexpectedSdkResult`] for a malformed top-level snapshot
+    /// array, or [`Error::AllocationFailed`] when result or text storage cannot
+    /// be reserved. An isolated malformed descriptor is skipped.
     ///
     /// # Examples
     ///

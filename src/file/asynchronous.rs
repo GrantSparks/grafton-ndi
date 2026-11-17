@@ -494,7 +494,7 @@ impl<T> FileOperation<T> {
     /// Submission never waits for the SDK. It checks queue admission and starts
     /// the operation's deadline now. Await the returned future to receive the
     /// result. Dropping it cancels an ordinary command that has not started;
-    /// submitted stop, finish and close requests continue even when dropped.
+    /// submitted stop, finish, close and abandon requests continue even when dropped.
     ///
     /// For example, `drop(recorder.request_stop().submit())` explicitly asks the
     /// recorder to stop without waiting for its result. Merely dropping
@@ -1992,6 +1992,11 @@ impl AsyncFilePlayer {
     /// only read, so they stay with the caller whatever the outcome.
     /// Options and the required File family are checked at submission, before
     /// an owner thread starts. Native creation runs on that thread.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`FilePlayer::new`], and [`Error::Io`] when the owner thread
+    /// cannot be started.
     #[doc(alias = "NDIlib_file_player_create")]
     pub fn create(api: &FileApi, options: &FilePlayerOptions) -> FileOperation<Self> {
         Worker::<PlayerOwner>::create(api, options, |worker| Self { worker })
@@ -2221,6 +2226,11 @@ impl AsyncFileRecorder {
     /// only read, so they stay with the caller whatever the outcome.
     /// Options and the required File family are checked at submission, before
     /// an owner thread starts. Native creation runs on that thread.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`FileRecorder::new`], and [`Error::Io`] when the owner thread
+    /// cannot be started.
     #[doc(alias = "NDIlib_file_recorder_create")]
     pub fn create(api: &FileApi, options: &FileRecorderOptions) -> FileOperation<Self> {
         Worker::<RecorderOwner>::create(api, options, |worker| Self { worker })

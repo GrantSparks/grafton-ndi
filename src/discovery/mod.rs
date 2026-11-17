@@ -122,8 +122,10 @@
 //! beyond its individual bound, or an entry with a malformed nested array,
 //! is omitted while the other entries are returned. Rejected string scans
 //! remain charged, so several malformed entries can still exhaust the budget.
-//! A malformed top-level array or allocation failure returns
-//! [`Error::UnexpectedSdkResult`](crate::Error::UnexpectedSdkResult). A rejected
+//! A malformed top-level array returns
+//! [`Error::UnexpectedSdkResult`](crate::Error::UnexpectedSdkResult); allocation
+//! failure returns [`Error::AllocationFailed`](crate::Error::AllocationFailed).
+//! A rejected
 //! event batch is freed and its events are lost.
 //!
 //! # Example

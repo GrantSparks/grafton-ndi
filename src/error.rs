@@ -242,10 +242,12 @@ pub enum Error {
     #[error("Not connected: the NDI SDK sent nothing")]
     NotConnected,
 
-    /// Text the SDK delivered is not UTF-8; the original [`std::str::Utf8Error`] retains its offsets.
+    /// Text is not UTF-8; the original [`std::str::Utf8Error`] retains its offsets.
     ///
     /// Reported for standalone received metadata frames and strings a receiver
-    /// returns, such as its source's web-control URL. Unreadable per-frame
+    /// returns, such as its source's web-control URL, and for application metadata
+    /// passed as a [`std::ffi::CStr`] to borrowed audio and video frame builders.
+    /// Unreadable per-frame
     /// video/audio metadata is withheld without discarding the media; inspect
     /// [`crate::FrameMetadataStatus`] instead. Text a peer advertises through a Discovery Server is
     /// decoded lossily instead.
@@ -337,7 +339,7 @@ pub enum Error {
     ///
     /// For example a negative connection count, a receive delay outside the
     /// range the SDK accepts, a string without a terminator within its limit,
-    /// a Discovery Server snapshot or event batch that is malformed, a
+    /// a finder or Discovery Server snapshot, or an event batch, that is malformed, a
     /// send-completion callback for a frame the SDK
     /// was not handed or had already returned, negative encoder guidance, an
     /// unknown AV sync status, an AV sync format change to a sample rate or
