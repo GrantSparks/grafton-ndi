@@ -231,7 +231,11 @@ mod tests {
         assert_eq!(sources.unwrap().len(), 1);
         assert_eq!(allocations, 5);
 
-        let seen = snapshot(&entries).unwrap().into_iter().collect();
+        let seen = snapshot(&entries)
+            .unwrap()
+            .into_iter()
+            .map(super::super::SeenSource)
+            .collect();
         let (sources, allocations) = crate::test_alloc::allocation_count(|| {
             selected_snapshot(&entries, |source| Ok(!source.seen_in(&seen)?))
         });
@@ -288,7 +292,11 @@ mod tests {
             let actual = selected_snapshot(&entries, |source| source.matches_query(query)).unwrap();
             assert_eq!(actual, expected, "{host}");
         }
-        let seen = copied.iter().cloned().collect();
+        let seen = copied
+            .iter()
+            .cloned()
+            .map(super::super::SeenSource)
+            .collect();
         assert!(
             selected_snapshot(&entries, |source| Ok(!source.seen_in(&seen)?))
                 .unwrap()

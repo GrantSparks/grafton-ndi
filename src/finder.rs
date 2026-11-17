@@ -667,7 +667,7 @@ impl BorrowedSource<'_> {
         self.with_key(|(name, address)| source_matches_query(name, address, query))
     }
 
-    fn seen_in(&self, seen: &HashSet<Source>) -> Result<bool> {
+    fn seen_in(&self, seen: &HashSet<SeenSource>) -> Result<bool> {
         self.with_key(|key| seen.contains(&key as &dyn SourceIdentity))
     }
 }
@@ -1335,12 +1335,12 @@ pub(crate) fn checked_host_lookup(
 
 fn accumulate_sources(
     discovered: &mut Vec<Source>,
-    seen: &mut HashSet<Source>,
+    seen: &mut HashSet<SeenSource>,
     retained_bytes: &mut usize,
     sources: Vec<Source>,
 ) -> Result<()> {
     for source in sources {
-        if seen.contains(&source) {
+        if seen.contains(&source as &dyn SourceIdentity) {
             continue;
         }
         if discovered.len() == budget::MAX_SOURCES {
@@ -1383,7 +1383,7 @@ fn accumulate_sources(
                 budget::MAX_BYTES,
             ));
         }
-        seen.insert(source.clone());
+        seen.insert(SeenSource(source.clone()));
         discovered.push(source);
         *retained_bytes = bytes;
     }
@@ -1771,11 +1771,19 @@ impl SourceAddress {
 /// assert_eq!(source.to_string(), "LAPTOP (Camera 1)@192.168.1.100:5960");
 /// assert!(Source::new("LAPTOP (Camera 1)").unwrap().address().is_none());
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Source {
     name: SourceText,
     address: Option<SourceAddress>,
 }
+
+/// Only discovery's private deduplication set needs borrowed textual keys.
+/// Keep its custom Borrow and hashing separate from the public source value.
+#[repr(transparent)]
+#[derive(Clone, PartialEq, Eq)]
+struct SeenSource(Source);
+
+const _: () = assert!(std::mem::size_of::<SeenSource>() == std::mem::size_of::<Source>());
 
 /// Owned and borrowed source keys use the same complete textual identity.
 /// Trait-object borrowing permits a HashSet lookup without allocating a Source.
@@ -1798,7 +1806,13 @@ impl SourceIdentity for (&str, Option<&str>) {
     }
 }
 
-impl Hash for Source {
+impl SourceIdentity for SeenSource {
+    fn key(&self) -> (&str, Option<&str>) {
+        self.0.key()
+    }
+}
+
+impl Hash for SeenSource {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.key().hash(state);
     }
@@ -1818,7 +1832,7 @@ impl PartialEq for dyn SourceIdentity + '_ {
 
 impl Eq for dyn SourceIdentity + '_ {}
 
-impl<'a> Borrow<dyn SourceIdentity + 'a> for Source {
+impl<'a> Borrow<dyn SourceIdentity + 'a> for SeenSource {
     fn borrow(&self) -> &(dyn SourceIdentity + 'a) {
         self
     }
@@ -2632,7 +2646,7 @@ mod tests {
         assert_eq!(retained, expected);
         assert!(Arc::ptr_eq(
             &discovered[0].name.0,
-            &seen.get(&source).unwrap().name.0
+            &seen.get(&source as &dyn SourceIdentity).unwrap().0.name.0
         ));
         accumulate_sources(&mut discovered, &mut seen, &mut retained, vec![source]).unwrap();
         assert_eq!(retained, expected, "duplicates add no storage");
