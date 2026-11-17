@@ -1,8 +1,10 @@
 //! Audio matched to video timestamps, and clocks locked to a reference source.
 
+#[cfg(test)]
+use std::cell::Cell;
+use std::marker::PhantomData;
 #[cfg(any(test, ndi_has_advanced_av_sync, ndi_has_advanced_genlock))]
 use std::ptr;
-use std::{cell::Cell, marker::PhantomData};
 
 #[cfg(any(test, ndi_has_advanced_av_sync))]
 use super::sdk_quantity;
@@ -11,6 +13,7 @@ use crate::{
     capture::{AvSyncAudioFree, Guard},
     frames::MAX_AUDIO_BYTES,
     frames::{ValidatedAudio, VideoPartsExt},
+    marker::NotSync,
     receiver::{
         attached::{sealed, Attached, Resource, Synchronizer},
         ReceiverCore,
@@ -359,13 +362,6 @@ pub struct AvSync {
     inner: Attached<AvSyncKind>,
 }
 
-/// A field that withholds [`Sync`] from the type that holds it, and nothing
-/// else: that type keeps [`Send`] and both unwind traits.
-struct NotSync(PhantomData<Cell<()>>);
-
-// It holds nothing, so a panic cannot leave it half-changed.
-impl std::panic::RefUnwindSafe for NotSync {}
-
 impl std::fmt::Debug for AvSync {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AvSync")
@@ -399,7 +395,7 @@ impl AvSync {
                     Ok(AvSyncKind {
                         handle: AvSyncInstance(handle),
                         table,
-                        _not_sync: NotSync(PhantomData),
+                        _not_sync: NotSync::default(),
                     })
                 })
             }.map(|inner| Self { inner })
@@ -1083,7 +1079,7 @@ impl Genlock {
                     source,
                     _config: options.config.clone(),
                 },
-                _not_sync: NotSync(PhantomData),
+                _not_sync: NotSync::default(),
             })
         })
     }
@@ -1131,11 +1127,11 @@ impl Genlock {
         (
             VideoClock {
                 resource: &self.resource,
-                _not_sync: NotSync(PhantomData),
+                _not_sync: NotSync::default(),
             },
             AudioClock {
                 resource: &self.resource,
-                _not_sync: NotSync(PhantomData),
+                _not_sync: NotSync::default(),
             },
         )
     }

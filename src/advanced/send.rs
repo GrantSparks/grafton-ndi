@@ -14,6 +14,7 @@ use super::{
     CompressedVideoFrame, VideoPacketFormat, MAX_PACKET_BYTES,
 };
 use crate::{
+    marker::NotSync,
     sender::in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans},
     sys::{
         advanced::{native, ScatterSend},
@@ -829,7 +830,7 @@ impl CompressedSender {
         (
             CompressedVideo {
                 pair,
-                _not_sync: std::marker::PhantomData,
+                _not_sync: NotSync::default(),
             },
             sender,
         )
@@ -913,7 +914,7 @@ impl CompressedSender {
 /// owner when the view is dropped; closing or dropping the owner drains them.
 pub struct CompressedVideo<'a> {
     pair: LoanPair<'a, CompressedAttached, &'a mut PendingStreams>,
-    _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
+    _not_sync: NotSync,
 }
 
 impl CompressedVideo<'_> {

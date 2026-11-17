@@ -24,6 +24,7 @@ use crate::{
         MetadataText, PixelFormat, ScanType, Sendable, ValidatedVideoLayout, VideoFrame,
         VideoHeader, VideoParts, VideoPartsExt, VideoSource,
     },
+    marker::NotSync,
     pixels::Pixels,
     receiver::Tally,
     source_retention::RetainedSources,
@@ -1187,7 +1188,7 @@ impl<M: SenderMode> fmt::Debug for Sender<M> {
 /// synchronizes them.
 pub struct RawVideo<'a> {
     sender: &'a Sender,
-    _not_sync: PhantomData<std::cell::Cell<()>>,
+    _not_sync: NotSync,
 }
 
 impl RawVideo<'_> {
@@ -1935,7 +1936,7 @@ impl Sender {
         (
             RawVideo {
                 sender,
-                _not_sync: PhantomData,
+                _not_sync: NotSync::default(),
             },
             sender,
         )

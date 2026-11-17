@@ -24,6 +24,7 @@ use super::{
 use crate::sys::advanced::ScatterSend;
 use crate::{
     frames::Sendable,
+    marker::NotSync,
     sender::in_flight::{Destroyed, Lend, Lending, Lent, LoanPair, Loans},
     sys::{
         advanced::{native, SendCompletion},
@@ -854,7 +855,7 @@ impl QueuedSender {
         let sender = pair.sender();
         let video = QueuedVideo {
             pair,
-            _not_sync: std::marker::PhantomData,
+            _not_sync: NotSync::default(),
         };
         (video, sender)
     }
@@ -966,7 +967,7 @@ impl QueuedSender {
 /// cannot outlive its owner. Dropping it leaves pending frames with the owner.
 pub struct QueuedVideo<'a> {
     pair: LoanPair<'a, QueueAttached, &'a AliasableBox<CallbackState>>,
-    _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
+    _not_sync: NotSync,
 }
 
 impl QueuedVideo<'_> {
