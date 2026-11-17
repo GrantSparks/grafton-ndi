@@ -1,6 +1,7 @@
 //! Input ownership at the native boundary, including failed release and drop.
 
 use super::*;
+use crate::sys::bindings::NDIlib_recv_instance_t;
 use std::cell::RefCell;
 #[cfg(ndi_has_advanced_kvm)]
 use std::ffi::CStr;
@@ -129,64 +130,54 @@ struct TestSender;
 
 #[cfg(not(ndi_has_advanced_kvm))]
 impl InputSender for TestSender {
-    fn key(&self, instance: NDIlib_recv_instance_t, value: i32, down: bool) -> Result<()> {
+    fn key(&self, connection: &Connection<'_>, value: i32, down: bool) -> Result<()> {
         let (accepted, operation) = if down {
             // SAFETY: these synthetic callbacks only record their arguments.
             (
-                unsafe { key(instance, value) },
+                unsafe { key(connection.instance(), value) },
                 c"NDIlib_recv_kvm_send_keyboard_press",
             )
         } else {
             (
-                unsafe { release(instance, value) },
+                unsafe { release(connection.instance(), value) },
                 c"NDIlib_recv_kvm_send_keyboard_release",
             )
         };
         crate::sys::table::for_test(accepted, operation).performed()
     }
 
-    fn mouse(
-        &self,
-        instance: NDIlib_recv_instance_t,
-        button: MouseButton,
-        down: bool,
-    ) -> Result<()> {
+    fn mouse(&self, connection: &Connection<'_>, button: MouseButton, down: bool) -> Result<()> {
         if down {
-            record(instance);
+            record(connection.instance());
             return Ok(());
         }
         let (accepted, operation) = match button {
             // SAFETY: these synthetic callbacks only record their arguments.
             MouseButton::Left => (
-                unsafe { left_release(instance) },
+                unsafe { left_release(connection.instance()) },
                 c"NDIlib_recv_kvm_send_left_mouse_release",
             ),
             MouseButton::Middle => (
-                unsafe { middle_release(instance) },
+                unsafe { middle_release(connection.instance()) },
                 c"NDIlib_recv_kvm_send_middle_mouse_release",
             ),
             MouseButton::Right => (
-                unsafe { right_release(instance) },
+                unsafe { right_release(connection.instance()) },
                 c"NDIlib_recv_kvm_send_right_mouse_release",
             ),
         };
         crate::sys::table::for_test(accepted, operation).performed()
     }
 
-    fn touch(
-        &self,
-        instance: NDIlib_recv_instance_t,
-        count: i32,
-        points: &[[f32; 2]],
-    ) -> Result<()> {
+    fn touch(&self, connection: &Connection<'_>, count: i32, points: &[[f32; 2]]) -> Result<()> {
         // SAFETY: HeldInputs lends this validated count of initialized pairs.
-        let accepted = unsafe { touch(instance, count, points.as_ptr().cast()) };
+        let accepted = unsafe { touch(connection.instance(), count, points.as_ptr().cast()) };
         crate::sys::table::for_test(accepted, c"NDIlib_recv_kvm_send_touch_positions").performed()
     }
 
-    fn finish_touch(&self, instance: NDIlib_recv_instance_t) -> Result<()> {
+    fn finish_touch(&self, connection: &Connection<'_>) -> Result<()> {
         // SAFETY: the synthetic callback only records its instance argument.
-        let accepted = unsafe { finish_touch(instance) };
+        let accepted = unsafe { finish_touch(connection.instance()) };
         crate::sys::table::for_test(accepted, c"NDIlib_recv_kvm_send_touch_finish").performed()
     }
 }
@@ -218,28 +209,36 @@ impl TestSession {
     }
 
     fn key_down(&mut self, keysym: u32) -> Result<()> {
-        self.held
-            .key(self.instance, sender(), key_symbol(keysym)?, true)
+        Connection::with_test_instance(self.instance, |connection| {
+            self.held
+                .key(connection, sender(), key_symbol(keysym)?, true)
+        })
     }
 
     fn mouse_down(&mut self, button: MouseButton) -> Result<()> {
-        self.held.mouse(self.instance, sender(), button, true)
+        Connection::with_test_instance(self.instance, |connection| {
+            self.held.mouse(connection, sender(), button, true)
+        })
     }
 
     fn touch(&mut self, points: &[[f32; 2]]) -> Result<()> {
-        self.held.touch(self.instance, sender(), points)
+        Connection::with_test_instance(self.instance, |connection| {
+            self.held.touch(connection, sender(), points)
+        })
     }
 
     fn release_all(&mut self) -> Result<()> {
-        self.held.release_all(self.instance, sender())
+        Connection::with_test_instance(self.instance, |connection| {
+            self.held.release_all(connection, sender())
+        })
     }
 }
 
 impl Drop for TestSession {
     fn drop(&mut self) {
-        // The native session retries these same held inputs before its
-        // receiver borrow ends; this session lends only synthetic storage.
-        self.held.release_on_drop(self.instance, sender());
+        Connection::with_test_instance(self.instance, |connection| {
+            self.held.release_on_drop(connection, sender());
+        });
     }
 }
 

@@ -30,7 +30,6 @@ use crate::sys::bindings::*;
 use crate::AudioFormat;
 use crate::{
     frames::{ValidatedAudioLayout, ValidatedVideoLayout},
-    receiver::ReceiverCore,
     runtime::ProcessLifetimeRuntime,
     sys::advanced::ReceiveAllocators,
     FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode, Rejected, Result,
@@ -1248,12 +1247,12 @@ impl AllocatorService {
     /// Take `receiver`, in any mode, with no allocator of its own set yet.
     fn allocation<M: ReceiverMode>(
         self,
-        receiver: Receiver<M>,
+        mut receiver: Receiver<M>,
     ) -> std::result::Result<AllocatedReceiver<M>, Rejected<Receiver<M>>> {
         match self.runtime.ndi().table::<ReceiveAllocators>() {
             Ok(table) => Ok(AllocatedReceiver {
                 registration: Registration {
-                    core: receiver.core.clone(),
+                    owner: receiver.allocator_owner(),
                     table,
                     #[cfg(ndi_has_advanced_receive_allocators)]
                     video_token: None,
@@ -1470,7 +1469,7 @@ struct Registration {
             reason = "the uninhabited table prevents registrations without declarations"
         )
     )]
-    core: Arc<ReceiverCore>,
+    owner: crate::receiver::AllocatorOwner,
     table: &'static ReceiveAllocators,
     #[cfg(ndi_has_advanced_receive_allocators)]
     video_token: Option<usize>,
@@ -1483,31 +1482,40 @@ impl Registration {
     /// and retire the generation it replaces.
     #[cfg(ndi_has_advanced_receive_allocators)]
     fn install(&mut self, stream: Stream, token: Option<usize>) {
-        let instance = self.core.instance.0;
+        let owner = &mut self.owner;
         let table = self.table;
         let slot = match stream {
             Stream::Video => &mut self.video_token,
             Stream::Audio => &mut self.audio_token,
         };
         let opaque = token.map_or(std::ptr::null_mut(), |token| token as *mut c_void);
-        // SAFETY: the registration owns the original receiver core, so that native
-        // instance stays live through installation and reset. The callbacks are functions of this
+        // SAFETY: the registration retains exclusive allocator authority and
+        // excludes membership changes through installation and reset. The callbacks are functions of this
         // program, which stays loaded, and the opaque value is a token they
         // look up, never a pointer they follow.
-        install_with(self.service.registry, slot, token, || unsafe {
-            match stream {
-                Stream::Video => table.NDIlib_recv_set_video_allocator(
-                    instance,
-                    opaque,
-                    token.map(|_| video_allocate as _),
-                    token.map(|_| video_free as _),
-                ),
-                Stream::Audio => table.NDIlib_recv_set_audio_allocator(
-                    instance,
-                    opaque,
-                    token.map(|_| audio_allocate as _),
-                    token.map(|_| audio_free as _),
-                ),
+        install_with(self.service.registry, slot, token, || {
+            // Hold the permission only around the native setter. Retirement
+            // below can run user policy destructors, which may unregister this
+            // same receiver from an advertiser and acquire its permit again.
+            let exclusive = owner.exclusive();
+            let instance = exclusive.instance();
+            // SAFETY: exclusive allocator authority and callback storage are
+            // retained through this setter, as described above.
+            unsafe {
+                match stream {
+                    Stream::Video => table.NDIlib_recv_set_video_allocator(
+                        instance,
+                        opaque,
+                        token.map(|_| video_allocate as _),
+                        token.map(|_| video_free as _),
+                    ),
+                    Stream::Audio => table.NDIlib_recv_set_audio_allocator(
+                        instance,
+                        opaque,
+                        token.map(|_| audio_allocate as _),
+                        token.map(|_| audio_free as _),
+                    ),
+                }
             }
         });
     }

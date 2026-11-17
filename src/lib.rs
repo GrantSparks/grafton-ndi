@@ -168,3 +168,7 @@ mod test_alloc;
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(ndi_test_receiver_proofs)]
+#[path = "../tests/ui/internal/receiver_proofs.rs"]
+mod receiver_proofs;

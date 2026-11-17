@@ -559,13 +559,14 @@ impl FrameSync {
         // SAFETY: this call creates a uniquely owned synchronizer from the
         // supplied live receiver, through that receiver's runtime.
         unsafe {
-            Attached::adopt(receiver, |core| {
+            Attached::adopt(receiver, |adoption| {
+                let core = adoption.core();
                 let instance = core
                     ._ndi
                     .api()
                     .core
                     .named()
-                    .NDIlib_framesync_create(core.instance.0)
+                    .NDIlib_framesync_create(adoption.instance())
                     .created()?
                     .as_ptr();
                 Ok(FrameSyncKind {
@@ -1061,7 +1062,7 @@ mod tests {
         let mut sync = FrameSync::new(receiver).unwrap();
         let original = (
             sync.inner.resource().instance,
-            sync.receiver().core.instance.0,
+            sync.receiver().core.lock_connection().instance(),
         );
         let (results, allocations) = crate::test_alloc::allocation_count(|| {
             let tier = sync.controls().set_stream_tier(crate::StreamTier::Preview);
@@ -1075,7 +1076,7 @@ mod tests {
         assert_eq!(
             (
                 sync.inner.resource().instance,
-                sync.receiver().core.instance.0
+                sync.receiver().core.lock_connection().instance()
             ),
             original
         );
@@ -1124,13 +1125,13 @@ mod tests {
                     &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
                 )
                 .unwrap();
-                let original = receiver.core.instance.0;
+                let original = receiver.core.lock_connection().instance();
                 drop(ndi);
                 for _ in 0..3 {
                     let fs = FrameSync::new(receiver).unwrap();
-                    assert_eq!(fs.receiver().core.instance.0, original);
+                    assert_eq!(fs.receiver().core.lock_connection().instance(), original);
                     receiver = fs.into_receiver();
-                    assert_eq!(receiver.core.instance.0, original);
+                    assert_eq!(receiver.core.lock_connection().instance(), original);
                     assert!(receiver.capture_video(std::time::Duration::ZERO).is_ok());
                 }
                 let fs = FrameSync::new(receiver).unwrap();

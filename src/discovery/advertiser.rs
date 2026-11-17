@@ -248,11 +248,13 @@ impl AdvertiserApi for sys::ReceiverAdvertising {
         member: &Self::Member,
         options: &Self::Advertisement,
     ) -> sys::table::Called<bool> {
-        // SAFETY: forwarded to the caller's live-owner and retained-name obligation.
+        let membership = member.resource.advertiser_membership();
+        // SAFETY: the membership proof excludes local receiver mutation; the
+        // retained owner and input-group name cover native lifetime obligations.
         unsafe {
             self.named().NDIlib_recv_advertiser_add_receiver(
                 instance.0,
-                member.resource.instance.0,
+                membership.instance(),
                 options.controlling,
                 options.monitoring,
                 member
@@ -267,10 +269,12 @@ impl AdvertiserApi for sys::ReceiverAdvertising {
         instance: Self::Instance,
         member: &Self::Member,
     ) -> sys::table::Called<bool> {
-        // SAFETY: forwarded to the caller's live-owner obligation.
+        let membership = member.resource.advertiser_membership();
+        // SAFETY: the membership proof and retained member authorize removal,
+        // including cleanup when the advertiser itself is dropped.
         unsafe {
             self.named()
-                .NDIlib_recv_advertiser_del_receiver(instance.0, member.resource.instance.0)
+                .NDIlib_recv_advertiser_del_receiver(instance.0, membership.instance())
         }
     }
 }

@@ -362,10 +362,10 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn request_keyframe(&self) -> Result<()> {
         let table = self.core._ndi.table::<KeyframeRequest>()?;
         native!(KeyframeRequest, table => {
-            let _connection = self.core.lock_connection();
+            let connection = self.core.lock_connection();
             // SAFETY: the live core and connection permit cover this call;
             // see the RecvInstance concurrency inventory.
-            unsafe { table.NDIlib_recv_request_keyframe(self.core.instance.0) };
+            unsafe { table.NDIlib_recv_request_keyframe(connection.instance()) };
             Ok(())
         })
     }
@@ -383,14 +383,15 @@ impl<M: ReceiverMode> Receiver<M> {
     /// without an Advanced runtime.
     #[doc(alias = "NDIlib_recv_set_bandwidth")]
     pub fn set_stream_tier(&mut self, tier: StreamTier) -> Result<SettingChange> {
-        let table = self.core._ndi.table::<ReceiverBandwidthControl>()?;
+        let exclusive = self.exclusive();
+        let table = exclusive.ndi().table::<ReceiverBandwidthControl>()?;
         native!(ReceiverBandwidthControl, table, uses(tier) => {
             let bandwidth = match tier {
                 StreamTier::Program => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
                 StreamTier::Preview => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
             };
-            // SAFETY: the receiver instance is live for this borrow.
-            let switched = unsafe { table.NDIlib_recv_set_bandwidth(self.core.instance.0, bandwidth) };
+            // SAFETY: exclusive receiver authority excludes advertiser changes.
+            let switched = unsafe { table.NDIlib_recv_set_bandwidth(exclusive.instance(), bandwidth) };
             Ok(SettingChange::from_sdk(switched))
         })
     }
@@ -409,12 +410,13 @@ impl<M: ReceiverMode> Receiver<M> {
     /// without an Advanced runtime.
     #[doc(alias = "NDIlib_recv_set_enabled_streams")]
     pub fn set_streams(&mut self, streams: MediaTypes) -> Result<SettingChange> {
-        let table = self.core._ndi.table::<ReceiverStreamControl>()?;
+        let exclusive = self.exclusive();
+        let table = exclusive.ndi().table::<ReceiverStreamControl>()?;
         native!(ReceiverStreamControl, table, uses(streams) => {
-            // SAFETY: the receiver instance is live for this borrow.
+            // SAFETY: exclusive receiver authority excludes advertiser changes.
             let changed = unsafe {
                 table.NDIlib_recv_set_enabled_streams(
-                    self.core.instance.0,
+                    exclusive.instance(),
                     streams.contains(MediaTypes::VIDEO),
                     streams.contains(MediaTypes::AUDIO),
                     streams.contains(MediaTypes::METADATA),

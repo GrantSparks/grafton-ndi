@@ -1280,3 +1280,155 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
     });
     loans.balanced(&ndi);
 }
+
+/// Membership add/remove owns an independent receiver reference. Churn its
+/// entire lifecycle while captures, connection requests and controls run.
+#[cfg(all(target_os = "linux", not(ndi_link_static)))]
+#[test]
+fn advertiser_membership_changes_overlap_capture_connect_and_controls() {
+    use grafton_ndi::{
+        discovery_server::{AdvertiserOptions, RecvAdvertisement, RecvAdvertiser},
+        RuntimeFeature,
+    };
+    let Some(ndi) = common::ndi() else { return };
+    if let Err(error) = ndi.require_feature(RuntimeFeature::ReceiverAdvertising) {
+        common::skip(common::Requirement::DiscoveryServer, &error.to_string());
+        return;
+    }
+    let Some(binary) = common::discovery_server::server_binary(&ndi) else {
+        common::skip(
+            common::Requirement::DiscoveryServer,
+            "no vendor Discovery Server",
+        );
+        return;
+    };
+    let _turn = sockets();
+    let server = common::discovery_server::Server::start(&binary);
+    let options = AdvertiserOptions::new().servers([server.endpoint()]);
+    let peers = Peers::new(&ndi);
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(peers.sources[0].clone())).unwrap();
+    let loans = Loans::default();
+    let memberships = AtomicU64::new(0);
+    peers.run(|stopped| {
+        thread::scope(|captures| {
+            let _stop = Stop(stopped);
+            let receiver = &receiver;
+            captures.spawn(|| {
+                while !stopped.load(Ordering::Acquire) {
+                    match captured(timed("membership capture", SLICE, || {
+                        receiver.capture_any_ref(SLICE)
+                    })) {
+                        Some(ReceiverItemRef::Video(frame)) => loans.video(frame, &peers),
+                        Some(ReceiverItemRef::Audio(frame)) => loans.audio(frame),
+                        Some(ReceiverItemRef::Metadata(frame)) => loans.check(frame, |_| {}),
+                        _ => {}
+                    }
+                }
+            });
+            progress(receiver);
+            loans.wait_for_media(&ndi);
+            let loading = AtomicBool::new(true);
+            thread::scope(|load| {
+                load.spawn(|| {
+                    while loading.load(Ordering::Acquire) {
+                        let mut advertiser = RecvAdvertiser::new(&ndi, &options).unwrap();
+                        let advertisement = RecvAdvertisement::new()
+                            .allow_controlling(true)
+                            .allow_monitoring(true);
+                        let registration = timed("membership add", Duration::ZERO, || {
+                            advertiser.register(receiver, &advertisement)
+                        })
+                        .unwrap();
+                        timed("membership remove", Duration::ZERO, || {
+                            advertiser.unregister(registration)
+                        })
+                        .unwrap();
+                        advertiser.register(receiver, &advertisement).unwrap();
+                        // Removes the second registration through advertiser Drop.
+                        timed("membership drop", Duration::ZERO, || drop(advertiser));
+                        memberships.fetch_add(1, Ordering::Relaxed);
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                });
+                for kind in 0..3 {
+                    let loading = &loading;
+                    load.spawn(move || {
+                        let mut round = 0;
+                        while loading.load(Ordering::Acquire) {
+                            timed("membership shared controls", Duration::ZERO, || {
+                                shared_controls(receiver, kind, round)
+                            });
+                            round += 1;
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                    });
+                }
+                load.spawn(|| {
+                    while loading.load(Ordering::Acquire) {
+                        for source in &peers.sources {
+                            timed("membership connect", Duration::ZERO, || {
+                                receiver.connect_to(source)
+                            });
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        receiver.disconnect();
+                        receiver.reconnect();
+                    }
+                });
+                thread::sleep(duration());
+                loading.store(false, Ordering::Release);
+            });
+            let before = receiver.connection_stats().unwrap().video_frames_received();
+            receiver.connect_to(&peers.sources[0]);
+            progress_after_in(receiver, before, "convergence after membership churn");
+        });
+    });
+    loans.balanced(&ndi);
+    assert!(memberships.load(Ordering::Relaxed) > 0);
+    eprintln!(
+        "completed {} advertiser lifecycle rounds on {:?}",
+        memberships.load(Ordering::Relaxed),
+        ndi.info()
+    );
+
+    // A prior registration can be removed on another thread during mutable
+    // stream controls and KVM. Its independent Arc defeats &mut-only exclusion.
+    #[cfg(feature = "advanced")]
+    {
+        let mut receiver = receiver;
+        let mut advertiser = RecvAdvertiser::new(&ndi, &options).unwrap();
+        advertiser
+            .register(&receiver, &RecvAdvertisement::new())
+            .unwrap();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                thread::sleep(Duration::from_millis(1));
+                drop(advertiser);
+            });
+            for _ in 0..16 {
+                if ndi
+                    .require_feature(RuntimeFeature::ReceiverStreamTier)
+                    .is_ok()
+                {
+                    control_result(receiver.set_stream_tier(grafton_ndi::StreamTier::Program));
+                }
+                if ndi
+                    .require_feature(RuntimeFeature::ReceiverStreamSelection)
+                    .is_ok()
+                {
+                    control_result(receiver.set_streams(grafton_ndi::MediaTypes::ALL));
+                }
+            }
+        });
+        if ndi.require_feature(RuntimeFeature::Kvm).is_ok() {
+            let mut advertiser = RecvAdvertiser::new(&ndi, &options).unwrap();
+            advertiser
+                .register(&receiver, &RecvAdvertisement::new())
+                .unwrap();
+            kvm_overlap(&mut receiver, &peers, &ndi, move |_| {
+                thread::sleep(Duration::from_millis(50));
+                drop(advertiser);
+            });
+        }
+    }
+}

@@ -3,6 +3,7 @@
 use std::{ops::Deref, sync::Arc};
 
 use super::{RawCapture, Receiver, ReceiverCore, SynchronizerMode};
+use crate::sys::bindings::NDIlib_recv_instance_t;
 use crate::{Rejected, Result};
 
 pub(crate) mod sealed {
@@ -55,6 +56,23 @@ impl<S: Synchronizer> Drop for Resource<S> {
     }
 }
 
+/// Borrow of the by-value receiver being adopted. Only `Attached::adopt`
+/// constructs it, after reserving that receiver's raw capture mode.
+pub(crate) struct Adoption<'a> {
+    core: &'a ReceiverCore,
+    _exclusive: parking_lot::MutexGuard<'a, super::ConnectionPermit>,
+}
+
+impl Adoption<'_> {
+    pub(crate) fn core(&self) -> &ReceiverCore {
+        self.core
+    }
+
+    pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
+        self.core.instance.0
+    }
+}
+
 /// The synchronizer and receiver can be paired only by adoption and recovered
 /// only together. No mutable receiver/resource fields escape this owner.
 pub(crate) struct Attached<S: Synchronizer> {
@@ -73,9 +91,13 @@ impl<S: Synchronizer> Attached<S> {
     /// native object. The receiver is returned unchanged on failure.
     pub(crate) unsafe fn adopt(
         receiver: Receiver,
-        create: impl FnOnce(&ReceiverCore) -> Result<S>,
+        create: impl FnOnce(Adoption<'_>) -> Result<S>,
     ) -> std::result::Result<Self, Rejected<Receiver>> {
-        let native = match create(&receiver.core) {
+        let adoption = Adoption {
+            core: &receiver.core,
+            _exclusive: receiver.core.connection_guard.lock(),
+        };
+        let native = match create(adoption) {
             Ok(native) => native,
             Err(error) => return Err(Rejected::new(error, receiver)),
         };

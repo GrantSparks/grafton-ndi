@@ -385,8 +385,8 @@ impl AvSync {
             // SAFETY: this creates a uniquely owned synchronizer from the
             // supplied receiver, using that receiver's runtime table.
             unsafe {
-                Attached::adopt(receiver, |core| {
-                    let handle = table.named().NDIlib_avsync_create(core.instance.0)
+                Attached::adopt(receiver, |adoption| {
+                    let handle = table.named().NDIlib_avsync_create(adoption.instance())
                         .created()?.as_ptr();
                     Ok(AvSyncKind {
                         handle: AvSyncInstance(handle),
