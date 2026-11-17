@@ -26,9 +26,9 @@ pub enum StateConflict {
     /// under complete tracking. Finish or poll it before starting another.
     #[error("finish the previous session before starting another")]
     PreviousSessionOpen,
-    /// File tracking is incomplete after native event loss, unreadable
-    /// lifecycle evidence or a tracking limit. Only a successful
-    /// [`FileRecorder::reset`](super::FileRecorder::reset) replaces the native
+    /// The session ended with incomplete file tracking after native event
+    /// loss, unreadable lifecycle evidence or a tracking limit. Only a
+    /// successful [`FileRecorder::reset`](super::FileRecorder::reset) replaces the native
     /// recorder and permits another session, even if every known file closes.
     #[error("file tracking is incomplete; reset the recorder before starting another session")]
     IncompleteFileTracking,

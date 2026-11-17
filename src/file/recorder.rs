@@ -2011,6 +2011,52 @@ mod tests {
     }
 
     #[test]
+    fn active_incomplete_tracking_keeps_the_session_refusal_until_it_ends() {
+        let mut ledger = session();
+        let _ = ledger.observe(Started, path("known.mkv"));
+        ledger.dropped(1);
+        for stopping in [false, true] {
+            if stopping {
+                assert!(ledger.stop_requested(true).is_some());
+            }
+            assert!(matches!(
+                ledger.admit_start(),
+                Err(crate::Error::InvalidState(
+                    StateConflict::PreviousSessionOpen
+                ))
+            ));
+        }
+        assert!(
+            ledger.drained(false).is_none(),
+            "the stop was already issued"
+        );
+        assert_eq!(ledger.state(), RecorderState::Indeterminate);
+        assert!(matches!(
+            ledger.admit_start(),
+            Err(crate::Error::InvalidState(
+                StateConflict::IncompleteFileTracking
+            ))
+        ));
+        let report = ledger.report();
+        let _ = ledger.observe(FileClosed, path("known.mkv"));
+        assert!(
+            ledger.cleanup_pending(),
+            "a known close cannot retire unknown files"
+        );
+        assert_eq!(
+            ledger.report(),
+            report,
+            "cleanup keeps the final report fixed"
+        );
+        assert!(matches!(
+            ledger.admit_start(),
+            Err(crate::Error::InvalidState(
+                StateConflict::IncompleteFileTracking
+            ))
+        ));
+    }
+
+    #[test]
     fn every_drain_uses_one_expiry_read_and_one_bounded_late_phase() {
         let at = Instant::now();
         let deadline =

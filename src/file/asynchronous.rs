@@ -2291,8 +2291,10 @@ impl AsyncFileRecorder {
     /// [`SessionTimecode`](super::SessionTimecode), validated before queuing.
     /// Events left by an earlier refused start are delivered through
     /// [`next_event`](Self::next_event) before the new session begins.
-    /// Incomplete file tracking returns [`StateConflict::IncompleteFileTracking`]
-    /// until [`reset`](Self::reset) succeeds, even if all known files closed.
+    /// A recording or stopping session returns [`StateConflict::PreviousSessionOpen`].
+    /// After it ends, incomplete file tracking returns
+    /// [`StateConflict::IncompleteFileTracking`] until [`reset`](Self::reset)
+    /// succeeds, even if all known files closed.
     #[doc(alias = "NDIlib_file_recorder_start")]
     #[doc(alias = "NDIlib_file_recorder_start_with_timecode")]
     pub fn start(
