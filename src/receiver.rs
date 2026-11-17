@@ -1349,9 +1349,10 @@ pub(crate) struct RecvInstance(NDIlib_recv_instance_t);
 // ptz_exposure_auto/manual/manual_v2                 |
 // request_keyframe                                  | Connection permit
 // set_bandwidth, set_enabled_streams                 | Exclusive (&mut Receiver)
+//                                                   | + connection permit
 // set_video_allocator, set_audio_allocator           | Owned allocator authority
 //                                                   | + connection permit
-// framesync_create, avsync_create                    | By-value adoption + permit
+// framesync_create, avsync_create (NDIlib_ prefix)    | By-value adoption + permit
 // destroy                                           | Last owning ReceiverCore
 // recv_advertiser_add_receiver,                      | Advertiser membership
 // recv_advertiser_del_receiver (NDIlib_ prefix)       | + connection permit
@@ -1359,7 +1360,7 @@ pub(crate) struct RecvInstance(NDIlib_recv_instance_t);
 // kvm_send_left/middle/right_mouse_click/release,    | (including held-input
 // kvm_send_vertical/horizontal_mouse_wheel,         | cleanup and Drop)
 // kvm_send_mouse_position/clipboard_contents,       |
-// kvm_send_touch_positions/finish                   |
+// kvm_send_touch_positions, kvm_send_touch_finish    |
 //
 // Native lock interposition and disassembly on Linux x86-64 Standard 6.1.1,
 // Standard/Advanced 6.3.2 and 6.4.0.2 provide the additional basis for controls

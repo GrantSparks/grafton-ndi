@@ -59,12 +59,12 @@ impl<S: Synchronizer> Drop for Resource<S> {
 /// Borrow of the by-value receiver being adopted. Only `Attached::adopt`
 /// constructs it, after reserving that receiver's raw capture mode.
 pub(crate) struct Adoption<'a> {
-    core: &'a ReceiverCore,
+    core: &'a Arc<ReceiverCore>,
     _exclusive: parking_lot::MutexGuard<'a, super::ConnectionPermit>,
 }
 
 impl Adoption<'_> {
-    pub(crate) fn core(&self) -> &ReceiverCore {
+    pub(crate) fn core(&self) -> &Arc<ReceiverCore> {
         self.core
     }
 
