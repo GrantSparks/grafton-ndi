@@ -1,6 +1,12 @@
 //! Library constructors run before validation; explicit selection avoids
 //! untrusted search candidates. All search directories here are test-owned.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "../src/sys/loader/file_policy.rs"]
 mod file_policy;
 
@@ -11,7 +17,7 @@ mod runtime_fixture;
 use fixture::FixtureDir;
 use grafton_ndi::{Ndi, RuntimeOptions};
 use runtime_fixture::FakeRuntime;
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf};
 
 #[test]
 fn relative_environment_directories_never_run_constructors() {
@@ -82,34 +88,25 @@ fn relative_environment_directories_never_run_constructors() {
         }
         let executable = root.join("executable/probe");
         fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
-        let output = Command::new(&executable)
-            .args([
-                "--exact",
-                "relative_environment_directories_never_run_constructors",
-                "--nocapture",
-            ])
-            .current_dir(root)
-            .env("GRAFTON_RELATIVE_TRUST_SCENARIO", scenario)
-            .env("GRAFTON_TRUST_ROOT", root)
-            .env("GRAFTON_REJECTED_CONSTRUCTOR_MARKER", root.join("marker"))
-            .env("NDI_RUNTIME_DIR_V6", "relative")
-            .env(
-                "LD_LIBRARY_PATH",
-                root.join(if scenario == "runtime" {
-                    "trusted"
-                } else {
-                    "loader"
-                }),
-            )
-            .env_remove("LD_PRELOAD")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{scenario}: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        TestChild::at(
+            &executable,
+            "relative_environment_directories_never_run_constructors",
+        )
+        .current_dir(root)
+        .env("GRAFTON_RELATIVE_TRUST_SCENARIO", scenario)
+        .env("GRAFTON_TRUST_ROOT", root)
+        .env("GRAFTON_REJECTED_CONSTRUCTOR_MARKER", root.join("marker"))
+        .env("NDI_RUNTIME_DIR_V6", "relative")
+        .env(
+            "LD_LIBRARY_PATH",
+            root.join(if scenario == "runtime" {
+                "trusted"
+            } else {
+                "loader"
+            }),
+        )
+        .env_remove("LD_PRELOAD")
+        .run();
     }
 }
 
@@ -202,32 +199,23 @@ fn explicit_paths_avoid_rejected_search_candidates() {
             rustc.arg(runtime_fixture::link_argument(trusted.as_os_str()));
             runtime_fixture::run(rustc, &output);
         }
-        let output = Command::new(&executable)
-            .args([
-                "--exact",
-                "explicit_paths_avoid_rejected_search_candidates",
-                "--nocapture",
-            ])
-            .env("GRAFTON_TRUST_SCENARIO", scenario)
-            .env("GRAFTON_TRUST_ROOT", root)
-            .env("GRAFTON_REJECTED_CONSTRUCTOR_MARKER", root.join("marker"))
-            .env(
-                "NDI_RUNTIME_DIR_V6",
-                root.join(if scenario.starts_with("file-") {
-                    "file-runtime"
-                } else {
-                    "trusted"
-                }),
-            )
-            .env_remove("LD_LIBRARY_PATH")
-            .env_remove("LD_PRELOAD")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{scenario}: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        TestChild::at(
+            &executable,
+            "explicit_paths_avoid_rejected_search_candidates",
+        )
+        .env("GRAFTON_TRUST_SCENARIO", scenario)
+        .env("GRAFTON_TRUST_ROOT", root)
+        .env("GRAFTON_REJECTED_CONSTRUCTOR_MARKER", root.join("marker"))
+        .env(
+            "NDI_RUNTIME_DIR_V6",
+            root.join(if scenario.starts_with("file-") {
+                "file-runtime"
+            } else {
+                "trusted"
+            }),
+        )
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .run();
     }
 }

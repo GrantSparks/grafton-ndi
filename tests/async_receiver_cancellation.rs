@@ -5,6 +5,12 @@
     any(feature = "tokio", feature = "smol")
 ))]
 
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -18,7 +24,6 @@ use grafton_ndi::{
 use std::{
     fs,
     future::Future,
-    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -328,24 +333,12 @@ fn abandoned_waits_release_the_receiver_without_spending_their_timeout() {
         ..Default::default()
     }
     .build(&library);
-    let result = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "abandoned_waits_release_the_receiver_without_spending_their_timeout",
-            "--nocapture",
-        ])
+    TestChild::new("abandoned_waits_release_the_receiver_without_spending_their_timeout")
         .env("GRAFTON_CANCEL_CHILD", library)
         .env("GRAFTON_FAKE_NDI_LOG", directory.path().join("cancel.log"))
         .env("GRAFTON_FAKE_CAPTURE_DELAY_MS", "80")
         .env("GRAFTON_FAKE_SOURCE_NAME_DELAY_MS", "80")
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+        .run();
 }
 
 async fn source_name_worker_retains_runtime<R: AsyncRuntime>(ndi: Ndi) {
@@ -421,12 +414,7 @@ fn a_source_name_worker_keeps_its_runtime_until_its_binding_drops() {
         "smol",
     ];
     for runtime in runtimes {
-        let result = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "a_source_name_worker_keeps_its_runtime_until_its_binding_drops",
-                "--nocapture",
-            ])
+        TestChild::new("a_source_name_worker_keeps_its_runtime_until_its_binding_drops")
             .env("GRAFTON_BINDING_CHILD", &library)
             .env("GRAFTON_BINDING_RUNTIME", runtime)
             .env(
@@ -437,13 +425,6 @@ fn a_source_name_worker_keeps_its_runtime_until_its_binding_drops() {
                 "GRAFTON_FAKE_SOURCE_NAME_RELEASE_FILE",
                 directory.path().join(format!("{runtime}.release")),
             )
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr)
-        );
+            .run();
     }
 }

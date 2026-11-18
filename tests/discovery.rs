@@ -5,6 +5,12 @@
 //! runtime once.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
@@ -20,7 +26,7 @@ use grafton_ndi::{
     Error, Ndi, Receiver, ReceiverOptions, ResourceKind, Sender, SenderOptions, Source,
 };
 use runtime_fixture::FakeRuntime;
-use std::{fs, path::PathBuf, process::Command, time::Duration};
+use std::{fs, path::PathBuf, time::Duration};
 
 /// The capabilities whose objects talk to a Discovery Server, with the names
 /// their errors carry.
@@ -113,22 +119,14 @@ fn discovery_server_objects() {
         }
         let library = runtime.build(&directory.join(variant.file));
         for scenario in variant.scenarios {
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "discovery_server_objects", "--nocapture"])
+            TestChild::new("discovery_server_objects")
                 .env("GRAFTON_DISCOVERY_CHILD", scenario)
                 .env("GRAFTON_DISCOVERY_LIBRARY", &library)
                 .env(
                     "GRAFTON_FAKE_NDI_LOG",
                     directory.join(format!("{scenario}.log")),
                 )
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{scenario}: {}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+                .run();
         }
     }
     fs::remove_dir_all(directory).unwrap();

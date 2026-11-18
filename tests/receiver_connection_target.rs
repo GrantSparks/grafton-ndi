@@ -1,13 +1,19 @@
 //! Connection targets and native requests stay in agreement, without an SDK.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
 use grafton_ndi::{Error, Ndi, Receiver, ReceiverOptions, RuntimeOptions, Source};
-use std::{fs, process::Command, sync::Barrier};
+use std::{fs, sync::Barrier};
 
 #[test]
 fn connection_target_tracks_native_requests() {
@@ -22,25 +28,13 @@ fn connection_target_tracks_native_requests() {
         ..Default::default()
     }
     .build(&library);
-    let result = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "connection_target_tracks_native_requests",
-            "--nocapture",
-        ])
+    TestChild::new("connection_target_tracks_native_requests")
         .env("GRAFTON_TARGET_CHILD", &library)
         .env(
             "GRAFTON_FAKE_NDI_LOG",
             directory.path().join("requests.log"),
         )
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+        .run();
 }
 
 #[test]
@@ -93,22 +87,10 @@ fn connection_target_snapshot_does_not_wait_for_a_native_connection_request() {
         ..Default::default()
     }
     .build(&library);
-    let result = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "connection_target_snapshot_does_not_wait_for_a_native_connection_request",
-            "--nocapture",
-        ])
+    TestChild::new("connection_target_snapshot_does_not_wait_for_a_native_connection_request")
         .env("GRAFTON_TARGET_BLOCKED_CHILD", &library)
         .env("GRAFTON_FAKE_CONNECT_GATE", directory.path())
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+        .run();
 }
 
 fn exercise_target() {

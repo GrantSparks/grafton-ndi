@@ -3,6 +3,12 @@
 //! library stays selected and loaded for the life of the process.
 #![cfg(all(target_os = "linux", not(ndi_link_static), feature = "file-io"))]
 
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -21,7 +27,6 @@ use runtime_fixture::FakeRuntime;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 /// The library names the loader searches for on this target. The vendor's
@@ -201,9 +206,8 @@ fn file_library_loader_contract() {
     let directory = FixtureDir::create("file-loader");
     let fixtures = Fixtures::build(directory.path());
     for scenario in SCENARIOS {
-        let mut command = Command::new(std::env::current_exe().unwrap());
+        let mut command = TestChild::new("file_library_loader_contract");
         command
-            .args(["--exact", "file_library_loader_contract", "--nocapture"])
             .env("GRAFTON_FILE_LOADER_CHILD", scenario.name)
             .env("GRAFTON_FILE_LOADER_FIXTURES", directory.path())
             .env_remove("NDI_RUNTIME_DIR_V6")
@@ -218,14 +222,7 @@ fn file_library_loader_contract() {
         if let Some(arrangement) = scenario.preloaded {
             command.env("LD_PRELOAD", fixtures.core(arrangement));
         }
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}: {}\n{}",
-            scenario.name,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        command.run();
     }
 }
 

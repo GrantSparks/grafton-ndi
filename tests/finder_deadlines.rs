@@ -1,5 +1,11 @@
 //! Lookup budgets include contention with a concurrent native snapshot/copy.
 #![cfg(target_os = "linux")]
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -11,7 +17,6 @@ use runtime_fixture::FakeRuntime;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -269,22 +274,10 @@ fn finder_lookup_snapshot_contention_spends_one_wait_budget() {
 }
 
 fn run_child(directory: &Path, library: &Path) {
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "finder_lookup_snapshot_contention_spends_one_wait_budget",
-            "--nocapture",
-        ])
+    TestChild::new("finder_lookup_snapshot_contention_spends_one_wait_budget")
         .env("GRAFTON_FAKE_FINDER_RUNTIME", library)
         .env("GRAFTON_FAKE_FINDER_CASE", "deadline")
         .env("GRAFTON_FAKE_FINDER_GATE", directory)
         .env("GRAFTON_FAKE_NDI_LOG", directory.join("calls.log"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .run();
 }

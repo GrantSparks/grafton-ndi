@@ -10,7 +10,8 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, prerequisites);
+common_helpers!(runtime, prerequisites, child);
+use common::TestChild;
 #[path = "support/fixture.rs"]
 mod fixture;
 use fixture::FixtureDir;
@@ -131,13 +132,9 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
             if kind == "symlink" {
                 fs::write(&victim, SENTINEL).unwrap();
             }
-            let mut command = Command::new(std::env::current_exe().unwrap());
+            let mut command =
+                TestChild::new("exact_name_races_preserve_files_and_report_native_failures");
             command
-                .args([
-                    "--exact",
-                    "exact_name_races_preserve_files_and_report_native_failures",
-                    "--nocapture",
-                ])
                 .env("LD_PRELOAD", &interposer)
                 .env("GRAFTON_FILE_RACE_OPERATION", operation)
                 .env("GRAFTON_FILE_RACE_TARGET", &target)
@@ -145,13 +142,7 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
             if kind != "regular" {
                 command.env("GRAFTON_FILE_RACE_SYMLINK", &victim);
             }
-            let output = command.output().unwrap();
-            assert!(
-                output.status.success(),
-                "{operation} {kind}: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            command.run();
             match kind {
                 "regular" => assert_eq!(fs::read(&target).unwrap(), SENTINEL),
                 "symlink" => {

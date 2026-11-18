@@ -2,6 +2,12 @@
 //! opening a library and rejecting it after its initializer has already run.
 #![cfg(all(any(windows, target_os = "macos"), not(ndi_link_static)))]
 
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -13,7 +19,6 @@ use runtime_fixture::FakeRuntime;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 fn canonical_fixture_path(path: &Path) -> PathBuf {
@@ -251,19 +256,15 @@ fn working_directory_libraries_never_run_constructors() {
         }
         let marker = root.join("marker");
         let _ = fs::remove_file(&marker);
-        let mut command = Command::new(
+        let mut command = TestChild::at(
             if scenario.starts_with("dyld-") && scenario != "dyld-absolute" {
                 &trusted_executable
             } else {
                 &executable
             },
+            "working_directory_libraries_never_run_constructors",
         );
         command
-            .args([
-                "--exact",
-                "working_directory_libraries_never_run_constructors",
-                "--nocapture",
-            ])
             .current_dir(&working)
             .env("GRAFTON_WORKING_DIRECTORY_SCENARIO", scenario)
             .env("GRAFTON_WORKING_DIRECTORY_ROOT", root)
@@ -300,12 +301,6 @@ fn working_directory_libraries_never_run_constructors() {
                 value,
             );
         }
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{scenario}:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        command.run();
     }
 }

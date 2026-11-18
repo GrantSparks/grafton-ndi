@@ -4,7 +4,8 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime);
+common_helpers!(runtime, child);
+use common::TestChild;
 #[path = "../src/sys/loader/file_policy.rs"]
 mod file_policy;
 
@@ -51,25 +52,13 @@ fn provisioned_identity_is_checked_in_the_process_that_loads_the_runtime() {
         ("6.4.0.2", wrong_edition, &runtime, false),
         ("6.4.0.2", edition, &other, false),
     ] {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "provisioned_identity_is_checked_in_the_process_that_loads_the_runtime",
-            ])
+        TestChild::new("provisioned_identity_is_checked_in_the_process_that_loads_the_runtime")
             .env("GRAFTON_IDENTITY_CHILD", "1")
             .env("NDI_RUNTIME_DIR_V6", directory.path())
             .env("GRAFTON_NDI_REQUIRE_RUNTIME", "1")
             .env("GRAFTON_NDI_EXPECTED_VERSION", version)
             .env("GRAFTON_NDI_EXPECTED_EDITION", edition)
             .env("GRAFTON_NDI_EXPECTED_RUNTIME", path)
-            .output()
-            .unwrap();
-        assert_eq!(
-            output.status.success(),
-            accepted,
-            "version={version}, edition={edition}, path={path:?}: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+            .run_expecting(accepted);
     }
 }

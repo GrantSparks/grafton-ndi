@@ -6035,17 +6035,11 @@ mod tests {
             std::env::temp_dir().join(format!("grafton-file-start-path-{}", std::process::id()));
         std::fs::create_dir_all(directory.join("submitted")).unwrap();
         std::fs::create_dir_all(directory.join("running")).unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "file::asynchronous::tests::a_relative_player_start_retains_the_directory_at_submission", "--nocapture"])
+        crate::test_support::TestChild::new("file::asynchronous::tests::a_relative_player_start_retains_the_directory_at_submission")
+
             .env(CHILD, &directory)
-            .output().unwrap();
+            .run();
         std::fs::remove_dir_all(directory).unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 
     #[test]

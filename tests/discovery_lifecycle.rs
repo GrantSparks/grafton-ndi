@@ -4,7 +4,8 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(policy, prerequisites);
+common_helpers!(policy, prerequisites, child);
+use common::TestChild;
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -207,20 +208,15 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
                 if refused && removal_refused {
                     continue;
                 }
-                let mut command = Command::new(std::env::current_exe().unwrap());
-                command
-                    .args([
-                        "--exact",
-                        "every_server_object_shares_plain_and_configured_creation_and_destruction",
-                        "--nocapture",
-                    ])
-                    .env("GRAFTON_LIFECYCLE_LIBRARY", &library)
-                    .env(
-                        "GRAFTON_FAKE_NDI_LOG",
-                        variant.join(format!(
-                            "configured-{configured}-removal-refused-{removal_refused}.log"
-                        )),
-                    );
+                let mut command = TestChild::new(
+                    "every_server_object_shares_plain_and_configured_creation_and_destruction",
+                );
+                command.env("GRAFTON_LIFECYCLE_LIBRARY", &library).env(
+                    "GRAFTON_FAKE_NDI_LOG",
+                    variant.join(format!(
+                        "configured-{configured}-removal-refused-{removal_refused}.log"
+                    )),
+                );
                 if configured {
                     command.env("GRAFTON_LIFECYCLE_CONFIGURED", "1");
                 }
@@ -232,13 +228,7 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
                         .env("GRAFTON_LIFECYCLE_REMOVE_REFUSED", "1")
                         .env("GRAFTON_FAKE_ADVERTISER_REMOVE", "refuse");
                 }
-                let output = command.output().unwrap();
-                assert!(
-                    output.status.success(),
-                    "{}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                command.run();
             }
         }
     }

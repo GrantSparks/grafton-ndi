@@ -5,6 +5,12 @@
     ndi_has_advanced_header,
     not(ndi_link_static)
 ))]
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -13,7 +19,7 @@ use grafton_ndi::{
     advanced::*, Error, Ndi, ReceiverEvent, ReceiverOptions, RuntimeOptions, SdkResultDefect,
     Source,
 };
-use std::{fs, process::Command, time::Duration};
+use std::{fs, time::Duration};
 
 #[test]
 fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
@@ -177,20 +183,8 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
         ..Default::default()
     }
     .build(&library);
-    let result = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "borrowed_packet_capture_retains_native_buffers_and_preserves_events",
-            "--nocapture",
-        ])
+    TestChild::new("borrowed_packet_capture_retains_native_buffers_and_preserves_events")
         .env("GRAFTON_PACKET_CAPTURE_CHILD", library)
         .env("GRAFTON_FAKE_NDI_LOG", dir.path().join("capture.log"))
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+        .run();
 }

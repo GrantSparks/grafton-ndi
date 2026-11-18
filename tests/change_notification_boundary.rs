@@ -6,7 +6,8 @@
 #[path = "common/mod.rs"]
 mod helpers;
 #[cfg(feature = "advanced")]
-common_helpers!(feature_policy);
+common_helpers!(feature_policy, child);
+use common::TestChild;
 
 #[path = "support/fixture.rs"]
 mod fixture;
@@ -22,7 +23,6 @@ use runtime_fixture::FakeRuntime;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::{mpsc, Barrier},
     thread,
     time::{Duration, Instant},
@@ -148,8 +148,7 @@ fn shared_native_change_reports() {
 }
 
 fn run_child(directory: &Path, library: &Path, case: &str) {
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "shared_native_change_reports", "--nocapture"])
+    TestChild::new("shared_native_change_reports")
         .env("GRAFTON_CHANGES_LIBRARY", library)
         .env("GRAFTON_CHANGES_CASE", case)
         .env("GRAFTON_FAKE_FINDER_CASE", "broadcast")
@@ -157,17 +156,7 @@ fn run_child(directory: &Path, library: &Path, case: &str) {
             "GRAFTON_FAKE_NDI_LOG",
             directory.join(format!("{case}.log")),
         )
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{case}: {}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    // A build without Advanced declarations still exercises Finder changes.
-    // Forward child skips directly: eprint! would let libtest hide them again.
-    let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &output.stderr);
+        .run();
 }
 
 // Exercise the real Rust Finder constructor even without an installed SDK,

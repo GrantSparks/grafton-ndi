@@ -10,7 +10,8 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, prerequisites, name, discovery_server);
+common_helpers!(runtime, prerequisites, name, discovery_server, child);
+use common::TestChild;
 #[path = "support/fixture.rs"]
 mod fixture;
 
@@ -26,7 +27,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::{Ipv4Addr, TcpListener},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -474,24 +475,12 @@ fn configured_servers_without_a_usable_endpoint_report_configuration_rejection()
         let directory = fixture.path().join(scenario);
         std::fs::create_dir(&directory).unwrap();
         std::fs::write(directory.join("ndi-config.v1.json"), configuration).unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "configured_servers_without_a_usable_endpoint_report_configuration_rejection",
-                "--nocapture",
-            ])
-            .env(SCENARIO, scenario)
-            .env("NDI_CONFIG_DIR", &directory)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{scenario}: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        TestChild::new(
+            "configured_servers_without_a_usable_endpoint_report_configuration_rejection",
+        )
+        .env(SCENARIO, scenario)
+        .env("NDI_CONFIG_DIR", &directory)
+        .run();
     }
 }
 
@@ -621,13 +610,9 @@ fn the_server_does_not_outlive_a_killed_test_process() {
     let Some((_ndi, binary)) = discovery_server() else {
         return;
     };
-    let mut holder = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "the_server_does_not_outlive_a_killed_test_process",
-            "--nocapture",
-        ])
+    let mut holder = TestChild::new("the_server_does_not_outlive_a_killed_test_process")
         .env(HOLDER, &binary)
+        .command()
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();

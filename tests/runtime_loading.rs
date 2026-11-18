@@ -2,6 +2,12 @@
 //! selection is intentionally irreversible, while failed selection is retryable.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
@@ -337,9 +343,8 @@ fn selected_runtime_loader_contract() {
         } else {
             &test_binary
         };
-        let mut command = Command::new(executable);
+        let mut command = TestChild::at(executable, "selected_runtime_loader_contract");
         command
-            .args(["--exact", "selected_runtime_loader_contract", "--nocapture"])
             .env("GRAFTON_LOADER_CHILD", scenario.name)
             .env("GRAFTON_LOADER_FIXTURES", &root)
             .env(
@@ -362,14 +367,7 @@ fn selected_runtime_loader_contract() {
         if let Some(directory) = scenario.loader_directory {
             command.env("LD_LIBRARY_PATH", root.join(directory));
         }
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}: {}\n{}",
-            scenario.name,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        command.run();
     }
     fs::remove_dir_all(root).unwrap();
 }

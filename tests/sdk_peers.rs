@@ -9,7 +9,8 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, identity, name, loopback);
+common_helpers!(runtime, identity, name, loopback, child);
+use common::TestChild;
 
 use grafton_ndi::{
     capabilities::SdkEdition, AudioFrame, FrameRate, MetadataFrame, Ndi, PixelFormat, Receiver,
@@ -18,7 +19,7 @@ use grafton_ndi::{
 };
 use std::{
     io::{BufRead, BufReader, Write},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
@@ -149,17 +150,13 @@ fn different_sdk_versions_exchange_video_audio_and_metadata() {
         version,
         "this test must exercise different runtime versions"
     );
-    let child = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "different_sdk_versions_exchange_video_audio_and_metadata",
-            "--nocapture",
-        ])
+    let child = TestChild::new("different_sdk_versions_exchange_video_audio_and_metadata")
         .env("GRAFTON_NDI_PEER_CHILD", "1")
         .env("GRAFTON_NDI_EXPECTED_RUNTIME", path)
         .env("GRAFTON_NDI_EXPECTED_VERSION", version)
         .env("GRAFTON_NDI_EXPECTED_EDITION", edition)
         .env("GRAFTON_NDI_REQUIRE_RUNTIME", "1")
+        .command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

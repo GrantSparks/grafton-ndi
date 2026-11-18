@@ -36,6 +36,11 @@ macro_rules! common_helpers {
     (@ identity) => {
         pub use identity::assert_expected_identity;
     };
+    (@ child) => {
+        #[path = "../../src/test_support/child.rs"]
+        mod child;
+        pub use child::TestChild;
+    };
     (@ name) => {
         #[path = "../../src/test_support/unique_name.rs"]
         mod unique_name;

@@ -1,5 +1,11 @@
 //! Finder bounds exercised through the public APIs and a valid mock SDK.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -7,7 +13,7 @@ mod runtime_fixture;
 use fixture::FixtureDir;
 use grafton_ndi::{Error, Finder, FinderOptions, Ndi, ResourceKind, RuntimeOptions};
 use runtime_fixture::FakeRuntime;
-use std::{path::PathBuf, process::Command, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 #[test]
 fn finder_enforces_snapshot_and_whole_window_limits() {
@@ -87,21 +93,9 @@ fn finder_enforces_snapshot_and_whole_window_limits() {
         "retained-count",
         "retained-bytes",
     ] {
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "finder_enforces_snapshot_and_whole_window_limits",
-                "--nocapture",
-            ])
+        TestChild::new("finder_enforces_snapshot_and_whole_window_limits")
             .env("GRAFTON_FAKE_FINDER_CASE", scenario)
             .env("GRAFTON_FAKE_FINDER_RUNTIME", &library)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{scenario}: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+            .run();
     }
 }

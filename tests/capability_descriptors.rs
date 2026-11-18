@@ -6,7 +6,8 @@
 #[path = "common/mod.rs"]
 mod helpers;
 #[cfg(feature = "advanced")]
-common_helpers!(policy, prerequisites);
+common_helpers!(policy, prerequisites, child);
+use common::TestChild;
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -22,7 +23,6 @@ use std::time::Duration;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 const PIXELS: [PixelFormat; 15] = [
@@ -122,28 +122,12 @@ fn caller_descriptors_apply_version_gates_before_native_operations() {
 }
 
 fn run_child(library: &Path, modern: bool, directory: &Path) {
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "caller_descriptors_apply_version_gates_before_native_operations",
-            "--nocapture",
-        ])
+    TestChild::new("caller_descriptors_apply_version_gates_before_native_operations")
         .env("GRAFTON_DESCRIPTOR_LIBRARY", library)
         .env("GRAFTON_DESCRIPTOR_MODERN", if modern { "1" } else { "0" })
         .env("GRAFTON_FAKE_NDI_LOG", directory.join("descriptors.log"))
         .env("GRAFTON_FAKE_CALLBACK_MODE", "immediate")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}: {}\n{}",
-        directory.display(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    }
+        .run();
 }
 
 fn sending(ndi: &Ndi, modern: bool) {

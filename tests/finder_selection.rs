@@ -1,5 +1,11 @@
 //! Configured, staggered selection and set-valued scoped caching at the native boundary.
 #![cfg(target_os = "linux")]
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -12,7 +18,6 @@ use grafton_ndi::{
 use runtime_fixture::FakeRuntime;
 use std::{
     path::PathBuf,
-    process::Command,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -89,24 +94,12 @@ fn owning_cache_retains_discovery_scope_and_runtime_across_server_workers() {
         ..Default::default()
     }
     .build(&library);
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "owning_cache_retains_discovery_scope_and_runtime_across_server_workers",
-            "--nocapture",
-        ])
+    TestChild::new("owning_cache_retains_discovery_scope_and_runtime_across_server_workers")
         .env("GRAFTON_OWNED_CACHE_CHILD", "1")
         .env("GRAFTON_FAKE_FINDER_CASE", "selection-forward")
         .env("GRAFTON_FAKE_FINDER_RUNTIME", &library)
         .env("GRAFTON_FAKE_NDI_LOG", directory.path().join("calls.log"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .run();
 }
 
 fn finder(ndi: &Ndi, group: &str) -> Finder {
@@ -265,21 +258,9 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
     }
     .build(&library);
     for scenario in ["selection-forward", "selection-reverse"] {
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "exact_selection_preserves_scope_and_complete_host_sets",
-                "--nocapture",
-            ])
+        TestChild::new("exact_selection_preserves_scope_and_complete_host_sets")
             .env("GRAFTON_FAKE_FINDER_CASE", scenario)
             .env("GRAFTON_FAKE_FINDER_RUNTIME", &library)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{scenario}: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+            .run();
     }
 }

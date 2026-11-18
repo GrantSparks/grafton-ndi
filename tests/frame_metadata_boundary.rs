@@ -1,6 +1,12 @@
 //! Malformed side text must not discard otherwise usable native media.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -10,7 +16,7 @@ use grafton_ndi::{
     AudioSource, FrameMetadataStatus, Ndi, Receiver, ReceiverItem, ReceiverItemRef,
     ReceiverOptions, RuntimeOptions, Source, VideoSource,
 };
-use std::{process::Command, time::Duration};
+use std::time::Duration;
 
 #[test]
 fn malformed_per_frame_metadata_preserves_typed_mixed_and_async_media() {
@@ -47,22 +53,10 @@ fn malformed_per_frame_metadata_preserves_typed_mixed_and_async_media() {
         ..Default::default()
     }
     .build(&library);
-    let result = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "malformed_per_frame_metadata_preserves_typed_mixed_and_async_media",
-            "--nocapture",
-        ])
+    TestChild::new("malformed_per_frame_metadata_preserves_typed_mixed_and_async_media")
         .env("GRAFTON_METADATA_BOUNDARY_CHILD", library)
         .env("GRAFTON_FAKE_NDI_LOG", directory.path().join("capture.log"))
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+        .run();
 }
 
 fn script(serial: usize, kind: &str) {

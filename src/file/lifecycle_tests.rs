@@ -1720,7 +1720,6 @@ fn unwritable_unix_recording_directories_never_reach_the_sdk() {
 fn an_effective_identity_without_write_access_is_refused() {
     use std::os::unix::fs::PermissionsExt;
     const CHILD_DIRECTORY: &str = "GRAFTON_NDI_PERMISSION_CHILD_DIRECTORY";
-    const IDENTITY_UNAVAILABLE: i32 = 77;
     if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
         // This isolated subprocess alone changes identity. The parent retains
         // ownership of the fixture and removes it after this process exits.
@@ -1734,8 +1733,11 @@ fn an_effective_identity_without_write_access_is_refused() {
             let error = std::io::Error::last_os_error();
             if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EINVAL)) {
                 // User namespaces may map root alone, or forbid changing
-                // identity. Let the parent report that limitation visibly.
-                std::process::exit(IDENTITY_UNAVAILABLE);
+                // identity. The child helper forwards this limitation visibly.
+                crate::test_support::unsupported(
+                    "this process cannot switch to an unprivileged effective identity",
+                );
+                return;
             }
             panic!("cannot set the subprocess's effective identity: {error}");
         }
@@ -1752,27 +1754,11 @@ fn an_effective_identity_without_write_access_is_refused() {
     let denied = directory.0.join("denied");
     std::fs::create_dir(&denied).unwrap();
     std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let result = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "file::lifecycle_tests::an_effective_identity_without_write_access_is_refused",
-            "--nocapture",
-        ])
-        .env(CHILD_DIRECTORY, &directory.0)
-        .output()
-        .unwrap();
-    if result.status.code() == Some(IDENTITY_UNAVAILABLE) {
-        crate::test_support::unsupported(
-            "this process cannot switch to an unprivileged effective identity",
-        );
-        return;
-    }
-    assert!(
-        result.status.success(),
-        "effective-identity child failed:\n{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr),
-    );
+    crate::test_support::TestChild::new(
+        "file::lifecycle_tests::an_effective_identity_without_write_access_is_refused",
+    )
+    .env(CHILD_DIRECTORY, &directory.0)
+    .run();
 }
 
 #[cfg(windows)]

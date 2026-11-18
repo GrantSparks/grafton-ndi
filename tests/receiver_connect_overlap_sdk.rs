@@ -9,10 +9,24 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-#[cfg(any(feature = "advanced", all(target_os = "linux", not(ndi_link_static))))]
+#[cfg(all(target_os = "linux", not(ndi_link_static)))]
+common_helpers!(
+    runtime,
+    prerequisites,
+    name,
+    loopback,
+    discovery_server,
+    child
+);
+#[cfg(all(
+    feature = "advanced",
+    not(all(target_os = "linux", not(ndi_link_static)))
+))]
 common_helpers!(runtime, prerequisites, name, loopback, discovery_server);
 #[cfg(not(any(feature = "advanced", all(target_os = "linux", not(ndi_link_static)))))]
 common_helpers!(runtime, name, loopback);
+#[cfg(all(target_os = "linux", not(ndi_link_static)))]
+use common::TestChild;
 
 #[cfg(all(target_os = "linux", not(ndi_link_static)))]
 #[path = "support/fixture.rs"]
@@ -1085,19 +1099,11 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
             r#"{"ndi":{"networks":{"ips":"127.0.0.1"}}}"#,
         )
         .unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "discovery_server_connects_overlap_capture_and_report_the_remote_target",
-                "--nocapture",
-            ])
+        TestChild::new("discovery_server_connects_overlap_capture_and_report_the_remote_target")
             .env("GRAFTON_NDI_OVERLAP_REMOTE_CHILD", "1")
             .env("NDI_CONFIG_DIR", fixture.path())
-            .output()
-            .unwrap();
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        eprint!("{}", String::from_utf8_lossy(&output.stdout));
-        assert!(output.status.success(), "remote overlap subprocess failed");
+            .run();
+
         return;
     }
     let Some(ndi) = common::ndi() else {
@@ -1444,10 +1450,7 @@ fn receiver_mutation_allows_membership_changes_from_active_allocator_policies() 
         discovery_server::{AdvertiserOptions, RecvAdvertisement, RecvAdvertiser},
         RuntimeFeature,
     };
-    use std::{
-        process::{Command, Stdio},
-        sync::{mpsc, Arc, OnceLock, Weak},
-    };
+    use std::sync::{mpsc, Arc, OnceLock, Weak};
     let Some(ndi) = common::ndi() else { return };
     for (feature, requirement) in [
         (
@@ -1473,39 +1476,13 @@ fn receiver_mutation_allows_membership_changes_from_active_allocator_policies() 
             ("reconnect", "add"),
             ("disconnect", "add"),
         ] {
-            let mut child = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "receiver_mutation_allows_membership_changes_from_active_allocator_policies",
-                    "--nocapture",
-                ])
-                .env("GRAFTON_NDI_ALLOCATOR_MEMBERSHIP_CHILD", "1")
-                .env("GRAFTON_NDI_MEMBERSHIP_ACTION", action)
-                .env("GRAFTON_NDI_NATIVE_OPERATION", operation)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(45);
-            while child.try_wait().unwrap().is_none() {
-                if Instant::now() >= deadline {
-                    child.kill().unwrap();
-                    let output = child.wait_with_output().unwrap();
-                    panic!(
-                        "{operation}/{action} did not complete:\n{}\n{}",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            let output = child.wait_with_output().unwrap();
-            assert!(
-                output.status.success(),
-                "{operation}/{action} subprocess failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            TestChild::new(
+                "receiver_mutation_allows_membership_changes_from_active_allocator_policies",
+            )
+            .env("GRAFTON_NDI_ALLOCATOR_MEMBERSHIP_CHILD", "1")
+            .env("GRAFTON_NDI_MEMBERSHIP_ACTION", action)
+            .env("GRAFTON_NDI_NATIVE_OPERATION", operation)
+            .run_with_timeout(Duration::from_secs(45));
         }
         return;
     }
@@ -1688,7 +1665,6 @@ fn allocator_code_uses_shared_controls_during_connection_changes() {
         RuntimeFeature, Tally,
     };
     use std::{
-        process::{Command, Stdio},
         ptr::NonNull,
         sync::{mpsc, Arc, OnceLock, Weak},
     };
@@ -1701,39 +1677,11 @@ fn allocator_code_uses_shared_controls_during_connection_changes() {
     if std::env::var_os("GRAFTON_NDI_ALLOCATOR_CONTROLS_CHILD").is_none() {
         for operation in ["connect_to", "disconnect", "reconnect"] {
             for callback in ["policy", "release"] {
-                let mut child = Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "allocator_code_uses_shared_controls_during_connection_changes",
-                        "--nocapture",
-                    ])
+                TestChild::new("allocator_code_uses_shared_controls_during_connection_changes")
                     .env("GRAFTON_NDI_ALLOCATOR_CONTROLS_CHILD", "1")
                     .env("GRAFTON_NDI_NATIVE_OPERATION", operation)
                     .env("GRAFTON_NDI_ALLOCATOR_CALLBACK", callback)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                let deadline = Instant::now() + Duration::from_secs(45);
-                while child.try_wait().unwrap().is_none() {
-                    if Instant::now() >= deadline {
-                        child.kill().unwrap();
-                        let output = child.wait_with_output().unwrap();
-                        panic!(
-                            "{operation}/{callback} did not complete:\n{}\n{}",
-                            String::from_utf8_lossy(&output.stdout),
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
-                let output = child.wait_with_output().unwrap();
-                assert!(
-                    output.status.success(),
-                    "{operation}/{callback} failed:\n{}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                    .run_with_timeout(Duration::from_secs(45));
                 eprintln!("{operation}/{callback} completed");
             }
         }

@@ -1,6 +1,12 @@
 //! Polling must retain the SDK's one-shot tally change for one waiter.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -14,7 +20,6 @@ use runtime_fixture::FakeRuntime;
 use std::{
     fs,
     path::PathBuf,
-    process::Command,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -183,20 +188,8 @@ fn polls_preserve_changes_and_never_enter_a_waiters_native_query() {
         ..Default::default()
     }
     .build(&library);
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "polls_preserve_changes_and_never_enter_a_waiters_native_query",
-            "--nocapture",
-        ])
+    TestChild::new("polls_preserve_changes_and_never_enter_a_waiters_native_query")
         .env("GRAFTON_TALLY_LIBRARY", &library)
         .env("GRAFTON_FAKE_NDI_LOG", directory.path().join("tally.log"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .run();
 }

@@ -4,7 +4,8 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(policy, prerequisites);
+common_helpers!(policy, prerequisites, child);
+use common::TestChild;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
@@ -20,9 +21,7 @@ use grafton_ndi::{
 use runtime_fixture::FakeRuntime;
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
@@ -150,10 +149,8 @@ fn native_resource_ownership() {
             "queue_sender_conversion",
         ]);
     }
-    let mut explained = false;
     for case in scenarios {
-        let result = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "native_resource_ownership", "--nocapture"])
+        TestChild::new("native_resource_ownership")
             .env("GRAFTON_OWNERSHIP_CHILD", case)
             .env(
                 "GRAFTON_OWNERSHIP_LIBRARY",
@@ -186,30 +183,7 @@ fn native_resource_ownership() {
                 "GRAFTON_FAKE_NDI_LOG",
                 directory.join(format!("{case}.log")),
             )
-            .output()
-            .unwrap();
-        let errors = String::from_utf8_lossy(&result.stderr);
-        assert!(
-            result.status.success(),
-            "{case}: {}\n{errors}",
-            String::from_utf8_lossy(&result.stdout),
-        );
-        // A scenario that could not run says so on its own standard error,
-        // which the harness shows only for a failure: pass the notice on, and
-        // the reason before the first one.
-        let (notices, reasons): (Vec<_>, Vec<_>) = errors
-            .lines()
-            .filter(|line| !line.is_empty())
-            .partition(|line| line.starts_with("skipped:"));
-        let mut stderr = std::io::stderr().lock();
-        for notice in notices {
-            if !std::mem::replace(&mut explained, true) {
-                for reason in &reasons {
-                    let _ = writeln!(stderr, "{reason}");
-                }
-            }
-            let _ = writeln!(stderr, "{notice} (scenario {case})");
-        }
+            .run();
     }
     fs::remove_dir_all(directory).unwrap();
 }

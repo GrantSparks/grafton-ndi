@@ -1,6 +1,12 @@
 //! Receiver control forwarding and held-input clocked capture without an SDK.
 #![cfg(all(feature = "advanced", target_os = "linux", not(ndi_link_static)))]
 
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -10,7 +16,7 @@ use grafton_ndi::{
     advanced::MouseButton, Error, FrameSync, FrameSyncAudioRequest, MediaTypes, Ndi, Receiver,
     ReceiverOptions, RuntimeFeature, RuntimeOptions, ScanType, SettingChange, Source, StreamTier,
 };
-use std::{fs, process::Command, time::Duration};
+use std::{fs, time::Duration};
 
 #[test]
 fn kvm_release_precedes_connection_changes_on_the_same_receiver() {
@@ -30,22 +36,10 @@ fn kvm_release_precedes_connection_changes_on_the_same_receiver() {
         ..Default::default()
     }
     .build(&library);
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "kvm_release_precedes_connection_changes_on_the_same_receiver",
-            "--nocapture",
-        ])
+    TestChild::new("kvm_release_precedes_connection_changes_on_the_same_receiver")
         .env("GRAFTON_KVM_CHILD", &library)
         .env("GRAFTON_FAKE_NDI_LOG", directory.path().join("kvm.log"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .run();
 }
 
 fn exercise_kvm(library: std::path::PathBuf) {
@@ -238,25 +232,13 @@ fn controls_keep_the_same_receiver_and_synchronizer() {
             fake.cfgs.push("fake_advanced");
         }
         fake.build(&library);
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "controls_keep_the_same_receiver_and_synchronizer",
-                "--nocapture",
-            ])
+        TestChild::new("controls_keep_the_same_receiver_and_synchronizer")
             .env("GRAFTON_CONTROLS_CHILD", &library)
             .env(
                 "GRAFTON_FAKE_NDI_LOG",
                 directory.path().join(format!("controls-{advanced}.log")),
             )
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+            .run();
     }
 }
 

@@ -1,6 +1,12 @@
 //! Native count breaches retain evidence and pending status invalidations.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -10,7 +16,7 @@ use grafton_ndi::{
     Error, FrameSync, Ndi, Receiver, ReceiverEvent, ReceiverItem, ReceiverOptions, RuntimeOptions,
     SdkResultDefect, Source,
 };
-use std::{process::Command, time::Duration};
+use std::time::Duration;
 
 fn refused<T: std::fmt::Debug>(result: Result<T, Error>, function: &str, expected: i64) {
     assert!(
@@ -145,20 +151,8 @@ fn negative_counts_are_errors_and_status_survives() {
         ..Default::default()
     }
     .build(&directory.path().join("libndi.so"));
-    let result = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "negative_counts_are_errors_and_status_survives",
-            "--nocapture",
-        ])
+    TestChild::new("negative_counts_are_errors_and_status_survives")
         .env("GRAFTON_NEGATIVE_COUNTS_CHILD", library)
         .env("GRAFTON_FAKE_NDI_LOG", directory.path().join("counts.log"))
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+        .run();
 }

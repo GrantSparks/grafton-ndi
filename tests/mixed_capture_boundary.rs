@@ -1,6 +1,12 @@
 //! Standard mixed-media capture, exercised against a scripted native boundary.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child);
+use common::TestChild;
+
 #[path = "support/fixture.rs"]
 mod fixture;
 #[path = "support/runtime_fixture.rs"]
@@ -12,7 +18,6 @@ use grafton_ndi::{
 };
 use std::{
     fs,
-    process::Command,
     time::{Duration, Instant},
 };
 
@@ -29,22 +34,10 @@ fn mixed_capture_dispatch_and_lifecycle() {
         ..Default::default()
     }
     .build(&library);
-    let result = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "mixed_capture_dispatch_and_lifecycle",
-            "--nocapture",
-        ])
+    TestChild::new("mixed_capture_dispatch_and_lifecycle")
         .env("GRAFTON_MIXED_CAPTURE_CHILD", library)
         .env("GRAFTON_FAKE_NDI_LOG", directory.path().join("capture.log"))
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+        .run();
 }
 
 fn script(serial: usize, items: &str) {

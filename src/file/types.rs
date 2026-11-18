@@ -2644,17 +2644,13 @@ mod tests {
         let directory = scratch("non-utf8-output");
         let non_utf8 = directory.join(std::ffi::OsString::from_vec(vec![0xff]));
         std::fs::create_dir(&non_utf8).unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "file::types::tests::non_utf8_output_paths_are_refused_without_panicking",
-            ])
-            .env(CHILD, "1")
-            .current_dir(non_utf8)
-            .output()
-            .unwrap();
+        let output = crate::test_support::TestChild::new(
+            "file::types::tests::non_utf8_output_paths_are_refused_without_panicking",
+        )
+        .env(CHILD, "1")
+        .current_dir(non_utf8)
+        .run();
         let _ = std::fs::remove_dir_all(directory);
-        assert!(output.status.success(), "{output:?}");
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 

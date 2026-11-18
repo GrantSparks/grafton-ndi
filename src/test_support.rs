@@ -8,6 +8,7 @@ use crate as api;
 
 #[cfg(feature = "advanced")]
 mod advanced_runtime;
+mod child;
 mod feature;
 #[cfg(feature = "file-io")]
 mod file_api;
@@ -20,6 +21,7 @@ mod unsupported;
 
 #[cfg(feature = "advanced")]
 pub use advanced_runtime::advanced_ndi;
+pub use child::TestChild;
 pub use feature::require_feature;
 #[cfg(feature = "file-io")]
 pub use file_api::file_api;
@@ -136,6 +138,32 @@ mod tests {
     }
 
     #[test]
+    fn child_skips_are_forwarded_to_the_diagnostic_writer() {
+        const CHILD: &str = "GRAFTON_CHILD_SKIP_FIXTURE";
+        const REASON: &str = "the skip fixture has no Discovery Server";
+        if std::env::var_os(CHILD).is_some() {
+            policy::skip(Requirement::DiscoveryServer, REASON);
+            return;
+        }
+
+        let output = TestChild::new(
+            "test_support::tests::child_skips_are_forwarded_to_the_diagnostic_writer",
+        )
+        .env(CHILD, "1")
+        .env_remove("GRAFTON_NDI_REQUIRE_RUNTIME")
+        .output(true);
+        let mut diagnostics = Vec::new();
+        child::forward_skips(&output, &mut diagnostics);
+        let diagnostics = String::from_utf8(diagnostics).unwrap();
+        let mut lines = diagnostics.lines();
+        assert_eq!(lines.next(), Some(REASON));
+        assert!(lines.next().unwrap().starts_with(
+            "skipped: test_support::tests::child_skips_are_forwarded_to_the_diagnostic_writer"
+        ));
+        assert_eq!(lines.next(), None);
+    }
+
+    #[test]
     fn decoder_promises_enforce_their_implied_requirements() {
         const CHILD: &str = "GRAFTON_DECODER_PROMISE_CHILD";
         if std::env::var_os(CHILD).is_some() {
@@ -168,22 +196,12 @@ mod tests {
             } else {
                 "h264-decoder,hevc-444-decoder"
             };
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "test_support::tests::decoder_promises_enforce_their_implied_requirements",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .env("GRAFTON_NDI_REQUIRE_RUNTIME", tokens)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{tokens}: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            TestChild::new(
+                "test_support::tests::decoder_promises_enforce_their_implied_requirements",
+            )
+            .env(CHILD, "1")
+            .env("GRAFTON_NDI_REQUIRE_RUNTIME", tokens)
+            .run();
         }
     }
 
@@ -219,20 +237,15 @@ mod tests {
             return;
         }
         for promise in [None, Some("advanced")] {
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command.args([
-                "--exact",
-                "test_support::tests::feature_refusals_distinguish_prerequisites_from_runtime_limits",
-                "--nocapture",
-            ]).env(CHILD, "1");
+            let mut command = TestChild::new("test_support::tests::feature_refusals_distinguish_prerequisites_from_runtime_limits");
+            command.env(CHILD, "1");
             if let Some(promise) = promise {
                 command.env("GRAFTON_NDI_REQUIRE_RUNTIME", promise);
             } else {
                 command.env_remove("GRAFTON_NDI_REQUIRE_RUNTIME");
             }
-            let output = command.output().unwrap();
+            let output = command.run();
             let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(output.status.success(), "{stderr}");
             assert!(
                 stderr.contains("skipped:") && stderr.contains("video-only receiver bandwidth"),
                 "{stderr}"
