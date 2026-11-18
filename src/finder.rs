@@ -268,20 +268,14 @@ pub(crate) unsafe trait FinderSnapshot: snapshot_sealed::Sealed {
     ) -> Result<Option<Self::Item>>;
 }
 
-/// The same native snapshot and copy budget, with allocation deferred until
-/// an internal selector accepts the borrowed, bounded source text.
-struct SelectingSnapshot<'a, F> {
-    core: &'a sys::Core,
-    select: F,
-}
+/// The standard source snapshot entry point.
+struct SourceSnapshot<'a>(&'a sys::Core);
 
-impl<F> snapshot_sealed::Sealed for SelectingSnapshot<'_, F> {}
+impl snapshot_sealed::Sealed for SourceSnapshot<'_> {}
 
-// SAFETY: this delegates fetch to Core and never lets borrowed text escape
-// copy; accepted entries become the same owned Sources as an ordinary snapshot.
-unsafe impl<F: Fn(&BorrowedSource<'_>) -> Result<bool>> FinderSnapshot
-    for SelectingSnapshot<'_, F>
-{
+// SAFETY: this delegates fetch to Core and copies accepted descriptors into
+// owned sources before the guard ends the native snapshot's lifetime.
+unsafe impl FinderSnapshot for SourceSnapshot<'_> {
     type Descriptor = NDIlib_source_t;
     type Item = Source;
 
@@ -291,7 +285,7 @@ unsafe impl<F: Fn(&BorrowedSource<'_>) -> Result<bool>> FinderSnapshot
         count: &mut u32,
     ) -> *const Self::Descriptor {
         // SAFETY: forwarded to the serialized live-instance obligation.
-        unsafe { self.core.NDIlib_find_get_current_sources(instance, count) }
+        unsafe { self.0.NDIlib_find_get_current_sources(instance, count) }
     }
 
     unsafe fn copy(
@@ -299,9 +293,8 @@ unsafe impl<F: Fn(&BorrowedSource<'_>) -> Result<bool>> FinderSnapshot
         source: &Self::Descriptor,
         budget: &mut SnapshotBudget,
     ) -> Result<Option<Source>> {
-        let (name, address) = source_pointers(source);
         // SAFETY: the snapshot guard keeps both native strings readable.
-        unsafe { decode_source(name, address, budget, &self.select) }
+        unsafe { copy_source(source, budget, |_| Ok(true)) }
     }
 }
 
@@ -367,15 +360,74 @@ impl SnapshotWait for Deadline {
 
 impl SnapshotGuard<'_> {
     fn snapshot<S: FinderSnapshot>(&self, snapshot: &S) -> Result<Vec<S::Item>> {
+        let mut copied = Vec::new();
+        self.scan(snapshot, |source, budget, remaining| {
+            // SAFETY: scan keeps this entry point's descriptors readable.
+            let item = unsafe { snapshot.copy(source, budget) }?;
+            budget::push_snapshot_item(&mut copied, item, remaining)
+        })?;
+        Ok(copied)
+    }
+
+    fn first_named(
+        &self,
+        snapshot: &impl FinderSnapshot<Descriptor = NDIlib_source_t, Item = Source>,
+        name: &str,
+    ) -> Result<Option<Source>> {
+        let mut first = None;
+        self.scan(snapshot, |entry, budget, _| {
+            // SAFETY: scan keeps the source descriptor and its strings live.
+            if let Some(source) = unsafe {
+                copy_source(entry, budget, |source| {
+                    Ok(first.is_none() && source.name.equals(name))
+                })
+            }? {
+                first = Some(source);
+            }
+            Ok(())
+        })?;
+        Ok(first)
+    }
+
+    fn discover(
+        &self,
+        snapshot: &impl FinderSnapshot<Descriptor = NDIlib_source_t, Item = Source>,
+        staged: &mut DiscoveryWindow,
+        query: Option<HostQuery<'_>>,
+    ) -> Result<()> {
+        let mut retained = Ok(());
+        self.scan(snapshot, |entry, budget, _| {
+            // SAFETY: scan keeps the source descriptor and its strings live.
+            if let Some(source) = unsafe {
+                copy_source(entry, budget, |source| {
+                    if retained.is_ok() {
+                        source.selected_by(query, Some(&staged.seen))
+                    } else {
+                        // Preserve the snapshot's error precedence even when
+                        // the discovery window has run out of space.
+                        Ok(false)
+                    }
+                })
+            }? {
+                retained = staged.push(source);
+            }
+            Ok(())
+        })?;
+        retained
+    }
+
+    fn scan<S: FinderSnapshot>(
+        &self,
+        snapshot: &S,
+        visit: impl FnMut(&S::Descriptor, &mut SnapshotBudget, usize) -> Result<()>,
+    ) -> Result<()> {
         let mut count = 0;
         // SAFETY: this private guard keeps its own finder's handle serialized
-        // until all copying completes. The sealed entry point supplies the
-        // array and string lifetimes required by the bounded copy kernel.
+        // until the scan completes. The sealed entry point supplies the array
+        // and string lifetimes required by the bounded scan kernel.
         unsafe {
             let descriptors = snapshot.fetch(self.instance.0, &mut count);
-            budget::copy_snapshot(descriptors, count, |source, budget| {
-                snapshot.copy(source, budget)
-            })
+            budget::scan_snapshot::<_, S::Item>(descriptors, count, visit)
         }
     }
 }
@@ -521,14 +573,18 @@ impl SourceWatch<'_> {
         Ok(self.wait_until(Deadline::after(timeout)?, NeverStop))
     }
 
-    fn current_sources_until<S: Stop>(
+    fn snapshot_until<S: Stop, T>(
         &mut self,
         deadline: Deadline,
         stop: S,
-        select: impl Fn(&BorrowedSource<'_>) -> Result<bool>,
-    ) -> StopResult<Option<Vec<Source>>, S> {
+        copy: impl FnOnce(SnapshotGuard<'_>) -> Result<T>,
+    ) -> StopResult<Option<T>, S> {
         self.snapshot(
-            |finder| finder.current_sources_until(deadline, stop, select),
+            |finder| match finder.lock_snapshots_until(deadline, stop) {
+                Ok(Some(guard)) => copy(guard).map(|sources| Ok(Some(sources))),
+                Ok(None) => Ok(Ok(None)),
+                Err(stopped) => Ok(Err(stopped)),
+            },
             |sources| matches!(sources, Ok(Some(_))),
         )
     }
@@ -700,6 +756,21 @@ fn source_pointers(source: &NDIlib_source_t) -> (*const c_char, *const c_char) {
     (source.p_ndi_name, address)
 }
 
+/// Copy one entry after checking the operation's selector. A skipped entry
+/// still consumes the same snapshot budget as a retained one.
+/// # Safety
+/// The snapshot must keep the descriptor's strings readable through their NUL
+/// terminator or through the applicable limit until this returns.
+unsafe fn copy_source(
+    source: &NDIlib_source_t,
+    budget: &mut SnapshotBudget,
+    select: impl FnOnce(&BorrowedSource<'_>) -> Result<bool>,
+) -> Result<Option<Source>> {
+    let (name, address) = source_pointers(source);
+    // SAFETY: forwarded to the caller's bounded string obligation.
+    unsafe { decode_source(name, address, budget, select) }
+}
+
 impl Finder {
     /// Creates a new source finder with the specified settings.
     ///
@@ -852,12 +923,7 @@ impl Finder {
 
     pub(crate) fn current_sources_stoppable<S: Stop>(&self, stop: S) -> StopResult<Vec<Source>, S> {
         match self.lock_snapshots(stop) {
-            Ok(guard) => guard
-                .snapshot(&SelectingSnapshot {
-                    core: &self.sdk,
-                    select: |_: &BorrowedSource<'_>| Ok(true),
-                })
-                .map(Ok),
+            Ok(guard) => guard.snapshot(&SourceSnapshot(&self.sdk)).map(Ok),
             Err(stopped) => Ok(Err(stopped)),
         }
     }
@@ -944,25 +1010,6 @@ impl Finder {
         Ok(sources)
     }
 
-    /// The lookup's next snapshot, or none when contention exhausts its budget.
-    fn current_sources_until<S: Stop>(
-        &self,
-        deadline: Deadline,
-        stop: S,
-        select: impl Fn(&BorrowedSource<'_>) -> Result<bool>,
-    ) -> StopResult<Option<Vec<Source>>, S> {
-        match self.lock_snapshots_until(deadline, stop) {
-            Ok(Some(guard)) => guard
-                .snapshot(&SelectingSnapshot {
-                    core: &self.sdk,
-                    select,
-                })
-                .map(|sources| Ok(Some(sources))),
-            Ok(None) => Ok(Ok(None)),
-            Err(stopped) => Ok(Err(stopped)),
-        }
-    }
-
     /// Poll discovery until `accept` selects a value or `timeout` elapses.
     ///
     /// After each source-list snapshot, `accept` may select a value, observe
@@ -975,30 +1022,27 @@ impl Finder {
     /// against that while still returning the instant `accept` is satisfied.
     ///
     /// Returns `Ok(Ok(None))` if the deadline passes without a selection.
-    fn poll_until_deadline<T, S: Stop, A>(
+    fn poll_until_deadline<T, S: Stop, R>(
         &self,
         deadline: Deadline,
         stop: S,
-        state: &mut A,
-        select: impl Fn(&A, &BorrowedSource<'_>) -> Result<bool>,
-        mut accept: impl FnMut(&mut A, Vec<Source>) -> StopResult<Option<T>, S>,
+        mut copy: impl FnMut(SnapshotGuard<'_>) -> Result<R>,
+        mut accept: impl FnMut(R) -> StopResult<Option<T>, S>,
     ) -> StopResult<Option<T>, S> {
         let mut watch = self.watch();
         loop {
             if let Err(stopped) = stop.check() {
                 return Ok(Err(stopped));
             }
-            let sources = match watch
-                .current_sources_until(deadline, stop, |source| select(state, source))?
-            {
+            let sources = match watch.snapshot_until(deadline, stop, &mut copy)? {
                 Ok(Some(sources)) => sources,
                 Ok(None) => return Ok(Ok(None)),
                 Err(stopped) => return Ok(Err(stopped)),
             };
-            match accept(state, sources)? {
+            match accept(sources)? {
                 Ok(Some(selected)) => return Ok(Ok(Some(selected))),
-                Err(stopped) => return Ok(Err(stopped)),
                 Ok(None) => {}
+                Err(stopped) => return Ok(Err(stopped)),
             }
             if deadline.is_expired() {
                 return Ok(Ok(None));
@@ -1054,9 +1098,8 @@ impl Finder {
         self.poll_until_deadline(
             deadline,
             stop,
-            &mut (),
-            |_, _| Ok(true),
-            |_, sources| Ok(select_owned_source(sources, stop, &mut select)),
+            |guard| guard.snapshot(&SourceSnapshot(&self.sdk)),
+            |sources| Ok(select_owned_source(sources, stop, &mut select)),
         )
     }
 
@@ -1065,8 +1108,8 @@ impl Finder {
     /// Names normally look like `"STUDIO (Camera 2)"`. Duplicate names at different
     /// addresses select the first match in the current snapshot; use
     /// [`Self::find_source`] with an address predicate to disambiguate them.
-    /// Timeout, concurrency and error behavior match that method. Only matching
-    /// descriptors are copied from each bounded snapshot.
+    /// Timeout, concurrency and error behavior match that method. Only the
+    /// first matching descriptor is copied from each bounded snapshot.
     ///
     /// # Errors
     ///
@@ -1090,9 +1133,8 @@ impl Finder {
         self.poll_until_deadline(
             deadline,
             stop,
-            &mut (),
-            |_, source| Ok(source.name.equals(name)),
-            |_, sources| Ok(Ok(sources.into_iter().next())),
+            |guard| guard.first_named(&SourceSnapshot(&self.sdk), name),
+            |source| Ok(Ok(source)),
         )
     }
 
@@ -1174,19 +1216,23 @@ impl Finder {
         stop: S,
         query: Option<HostQuery<'_>>,
     ) -> StopResult<Vec<Source>, S> {
-        // Preserve first-observed order and deduplicate by complete descriptor.
-        let mut state = (Vec::new(), HashSet::new(), 0);
+        let mut window = DiscoveryWindow::default();
         let outcome = self.poll_until_deadline(
             deadline,
             stop,
-            &mut state,
-            |(_, seen, _), source| source.selected_by(query, Some(seen)),
-            |(discovered, seen, retained_bytes), sources| {
-                accumulate_sources(discovered, seen, retained_bytes, sources)?;
-                Ok(Ok(None::<()>))
+            |guard| {
+                // The committed window becomes private staging for this
+                // attempt. An invalid snapshot drops the staged results.
+                let mut staged = std::mem::take(&mut window);
+                let result = guard.discover(&SourceSnapshot(&self.sdk), &mut staged, query);
+                drop(guard);
+                result?;
+                window = staged;
+                Ok(())
             },
+            |()| Ok(Ok(None::<()>)),
         )?;
-        Ok(outcome.map(|_| state.0))
+        Ok(outcome.map(|_| window.sources))
     }
 }
 
@@ -1291,17 +1337,19 @@ pub(crate) fn checked_host_lookup(
     Ok((host, Deadline::after(timeout)?))
 }
 
-fn accumulate_sources(
-    discovered: &mut Vec<Source>,
-    seen: &mut HashSet<SeenSource>,
-    retained_bytes: &mut usize,
+/// An ordered discovery window and its borrowed-lookup index. Their source
+/// values share the same text storage.
+#[derive(Default)]
+struct DiscoveryWindow {
     sources: Vec<Source>,
-) -> Result<()> {
-    for source in sources {
-        if seen.contains(&source as &dyn SourceIdentity) {
-            continue;
-        }
-        if discovered.len() == budget::MAX_SOURCES {
+    seen: HashSet<SeenSource>,
+    retained_bytes: usize,
+}
+
+impl DiscoveryWindow {
+    /// Retain a source after the snapshot selector has checked its identity.
+    fn push(&mut self, source: Source) -> Result<()> {
+        if self.sources.len() == budget::MAX_SOURCES {
             return Err(budget::limit(
                 ResourceKind::FinderDiscoverySources,
                 budget::MAX_SOURCES,
@@ -1312,13 +1360,14 @@ fn accumulate_sources(
                 .address
                 .as_ref()
                 .map_or(0, |address| address.0.storage_bytes());
-        let bytes = retained_bytes
+        let bytes = self
+            .retained_bytes
             .checked_add(text_bytes)
             .ok_or_else(|| budget::limit(ResourceKind::FinderDiscoveryBytes, budget::MAX_BYTES))?;
-        // Check before growing either container or copying strings. Round
+        // Check before growing either container. Round
         // up for vector growth, hash buckets and control bytes; the actual
         // capacities are checked as well before retaining the source.
-        let next_capacity = (discovered.len() + 1).max(4).next_power_of_two();
+        let next_capacity = (self.sources.len() + 1).max(4).next_power_of_two();
         let growth_bound = next_capacity * 4 * (std::mem::size_of::<Source>() + 1);
         if bytes + growth_bound > budget::MAX_BYTES {
             return Err(budget::limit(
@@ -1326,26 +1375,27 @@ fn accumulate_sources(
                 budget::MAX_BYTES,
             ));
         }
-        discovered
+        self.sources
             .try_reserve(1)
             .map_err(|_| budget::allocation_failed())?;
-        seen.try_reserve(1)
+        self.seen
+            .try_reserve(1)
             .map_err(|_| budget::allocation_failed())?;
         // HashSet capacity excludes unused buckets. Charging twice its
         // capacity covers bucket rounding and control bytes conservatively.
-        let containers = discovered.capacity() * std::mem::size_of::<Source>()
-            + seen.capacity() * 2 * (std::mem::size_of::<Source>() + 1);
+        let containers = self.sources.capacity() * std::mem::size_of::<Source>()
+            + self.seen.capacity() * 2 * (std::mem::size_of::<Source>() + 1);
         if bytes + containers > budget::MAX_BYTES {
             return Err(budget::limit(
                 ResourceKind::FinderDiscoveryBytes,
                 budget::MAX_BYTES,
             ));
         }
-        seen.insert(SeenSource(source.clone()));
-        discovered.push(source);
-        *retained_bytes = bytes;
+        self.seen.insert(SeenSource(source.clone()));
+        self.sources.push(source);
+        self.retained_bytes = bytes;
+        Ok(())
     }
-    Ok(())
 }
 
 struct Authority<'a> {
@@ -2620,28 +2670,30 @@ mod tests {
 
     #[test]
     fn discovery_window_charges_shared_source_strings_once() {
-        let source = Source::new("HOST (Camera)")
-            .unwrap()
-            .with_address(SourceAddress::new("192.0.2.7:5961").unwrap());
+        let entry = source_entry(c"HOST (Camera)".as_ptr(), c"192.0.2.7:5961".as_ptr());
+        let mutex = parking_lot::Mutex::new(FindInstance(ptr::null_mut()));
+        let guard = SnapshotGuard {
+            instance: mutex.lock(),
+        };
+        let mut window = DiscoveryWindow::default();
+        let snapshot = SliceSnapshot(&[entry, entry]);
+        guard.discover(&snapshot, &mut window, None).unwrap();
+        let source = &window.sources[0];
         let expected =
             source.name.storage_bytes() + source.address.as_ref().unwrap().0.storage_bytes();
-        let mut discovered = Vec::new();
-        let mut seen = HashSet::new();
-        let mut retained = 0;
-        accumulate_sources(
-            &mut discovered,
-            &mut seen,
-            &mut retained,
-            vec![source.clone()],
-        )
-        .unwrap();
-        assert_eq!(retained, expected);
+        assert_eq!(window.retained_bytes, expected);
         assert!(Arc::ptr_eq(
-            &discovered[0].name.0,
-            &seen.get(&source as &dyn SourceIdentity).unwrap().0.name.0
+            &source.name.0,
+            &window
+                .seen
+                .get(source as &dyn SourceIdentity)
+                .unwrap()
+                .0
+                .name
+                .0
         ));
-        accumulate_sources(&mut discovered, &mut seen, &mut retained, vec![source]).unwrap();
-        assert_eq!(retained, expected, "duplicates add no storage");
+        guard.discover(&snapshot, &mut window, None).unwrap();
+        assert_eq!(window.retained_bytes, expected, "duplicates add no storage");
     }
 
     #[test]
@@ -3612,6 +3664,15 @@ mod tests {
         assert!(parse_authority("").is_none());
     }
 
+    fn source_entry(name: *const c_char, address: *const c_char) -> NDIlib_source_t {
+        NDIlib_source_t {
+            p_ndi_name: name,
+            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                p_url_address: address,
+            },
+        }
+    }
+
     #[test]
     fn authority_parsing_uses_the_outer_endpoint() {
         for (endpoint, host, port, is_url) in [
@@ -3664,29 +3725,141 @@ mod tests {
 
     #[test]
     fn discovery_accumulates_distinct_name_and_address_text_in_order() {
-        let first = Source::new("Camera")
+        let lossy = source_entry(c"STUDIO (Camera \xff)".as_ptr(), c"192.0.2.1".as_ptr());
+        let same = source_entry(c"STUDIO (Camera �)".as_ptr(), c"192.0.2.1".as_ptr());
+        let changed = source_entry(c"STUDIO (Camera �)".as_ptr(), c"192.0.2.2".as_ptr());
+        let last = source_entry(c"STUDIO (Last)".as_ptr(), ptr::null());
+        let unrelated = source_entry(c"OTHER (Feed)".as_ptr(), ptr::null());
+        let unterminated = vec![b'x'; crate::sdk_copy::MAX_SDK_STRING_BYTES];
+        let malformed = source_entry(unterminated.as_ptr().cast(), ptr::null());
+        let mutex = parking_lot::Mutex::new(FindInstance(ptr::null_mut()));
+        let guard = SnapshotGuard {
+            instance: mutex.lock(),
+        };
+        let mut window = DiscoveryWindow::default();
+        let query = Some(HostQuery::checked("STUDIO").unwrap());
+        let initial = [malformed, lossy, same, unrelated, changed, changed];
+        let subsequent = [same, changed, last, lossy, last];
+        guard
+            .discover(&SliceSnapshot(&initial), &mut window, query)
+            .unwrap();
+        guard
+            .discover(&SliceSnapshot(&subsequent), &mut window, query)
+            .unwrap();
+        assert_eq!(
+            window
+                .sources
+                .iter()
+                .map(SourceIdentity::key)
+                .collect::<Vec<_>>(),
+            [
+                ("STUDIO (Camera �)", Some("192.0.2.1")),
+                ("STUDIO (Camera �)", Some("192.0.2.2")),
+                ("STUDIO (Last)", None),
+            ]
+        );
+        let first_named = guard
+            .first_named(&SliceSnapshot(&initial), "STUDIO (Camera �)")
             .unwrap()
-            .with_address(SourceAddress::new("192.0.2.1").unwrap());
-        let changed = first
-            .clone()
-            .with_address(SourceAddress::new("192.0.2.2").unwrap());
-        let same_address = first
-            .clone()
-            .with_address(SourceAddress::new("192.0.2.1").unwrap());
-        let mut seen = HashSet::new();
-        let mut discovered = Vec::new();
-        let mut bytes = 0;
-        accumulate_sources(&mut discovered, &mut seen, &mut bytes, vec![first.clone()]).unwrap();
-        accumulate_sources(&mut discovered, &mut seen, &mut bytes, Vec::new()).unwrap();
-        accumulate_sources(
-            &mut discovered,
-            &mut seen,
-            &mut bytes,
-            vec![first.clone(), changed.clone(), same_address.clone()],
-        )
-        .unwrap();
-        assert_eq!(same_address, first);
-        assert_eq!(discovered, vec![first, changed]);
+            .unwrap();
+        assert_eq!(first_named, window.sources[0]);
+    }
+
+    #[test]
+    fn duplicate_snapshots_allocate_like_a_single_selected_descriptor() {
+        let entry = source_entry(c"STUDIO (Camera)".as_ptr(), c"192.0.2.1".as_ptr());
+        let control = [entry];
+        let duplicates = vec![entry; budget::MAX_SOURCES];
+        let mutex = parking_lot::Mutex::new(FindInstance(ptr::null_mut()));
+        let guard = SnapshotGuard {
+            instance: mutex.lock(),
+        };
+        let name = "STUDIO (Camera)";
+        let query = HostQuery::checked("STUDIO").unwrap();
+        let first = |entries| guard.first_named(&SliceSnapshot(entries), name).unwrap();
+        let discover = |entries, query| {
+            let mut window = DiscoveryWindow::default();
+            guard
+                .discover(&SliceSnapshot(entries), &mut window, query)
+                .unwrap();
+            window.sources
+        };
+        for entries in [&control[..], &duplicates] {
+            let (missing, missing_allocations) = crate::test_alloc::allocation_count(|| {
+                guard
+                    .first_named(&SliceSnapshot(entries), "missing")
+                    .unwrap()
+            });
+            let (_, missing_peak) = crate::test_alloc::peak_bytes(|| {
+                guard
+                    .first_named(&SliceSnapshot(entries), "missing")
+                    .unwrap()
+            });
+            assert_eq!((missing, missing_allocations, missing_peak), (None, 0, 0));
+        }
+        let (first_control, first_allocations) =
+            crate::test_alloc::allocation_count(|| first(&control));
+        let (first_duplicate, duplicate_allocations) =
+            crate::test_alloc::allocation_count(|| first(&duplicates));
+        assert_eq!(first_duplicate, first_control);
+        assert!(first_duplicate.is_some());
+        assert_eq!(duplicate_allocations, first_allocations);
+        let (_, first_peak) = crate::test_alloc::peak_bytes(|| first(&control));
+        let (_, duplicate_peak) = crate::test_alloc::peak_bytes(|| first(&duplicates));
+        assert_eq!(duplicate_peak, first_peak);
+        for query in [None, Some(query)] {
+            let (expected, control_allocations) =
+                crate::test_alloc::allocation_count(|| discover(&control, query));
+            let (actual, allocations) =
+                crate::test_alloc::allocation_count(|| discover(&duplicates, query));
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), 1);
+            assert_eq!(allocations, control_allocations);
+            let (_, control_peak) = crate::test_alloc::peak_bytes(|| discover(&control, query));
+            let (_, duplicate_peak) =
+                crate::test_alloc::peak_bytes(|| discover(&duplicates, query));
+            assert_eq!(duplicate_peak, control_peak);
+        }
+    }
+
+    #[test]
+    fn snapshot_limit_after_a_match_takes_priority_over_discovery_limit() {
+        let named = source_entry(c"STUDIO (Camera)".as_ptr(), ptr::null());
+        let unterminated = vec![b'x'; crate::sdk_copy::MAX_SDK_STRING_BYTES];
+        let malformed = source_entry(unterminated.as_ptr().cast(), ptr::null());
+        let mut entries = vec![named];
+        entries.extend([malformed; 4]);
+        let entries = SliceSnapshot(&entries);
+        let mutex = parking_lot::Mutex::new(FindInstance(ptr::null_mut()));
+        let guard = SnapshotGuard {
+            instance: mutex.lock(),
+        };
+        let mut window = DiscoveryWindow {
+            retained_bytes: budget::MAX_BYTES,
+            ..Default::default()
+        };
+        assert!(matches!(
+            guard.discover(&SliceSnapshot(&[named]), &mut window, None),
+            Err(Error::ResourceLimit {
+                resource: ResourceKind::FinderDiscoveryBytes,
+                ..
+            })
+        ));
+        assert!(matches!(
+            guard.discover(&entries, &mut window, None),
+            Err(Error::ResourceLimit {
+                resource: ResourceKind::FinderSnapshotBytes,
+                ..
+            })
+        ));
+        assert!(matches!(
+            guard.first_named(&entries, "STUDIO (Camera)"),
+            Err(Error::ResourceLimit {
+                resource: ResourceKind::FinderSnapshotBytes,
+                ..
+            })
+        ));
+        assert!(window.sources.is_empty());
     }
 
     #[test]
@@ -4091,6 +4264,33 @@ mod tests {
         }
     }
 
+    struct SliceSnapshot<'a>(&'a [NDIlib_source_t]);
+    impl snapshot_sealed::Sealed for SliceSnapshot<'_> {}
+    // SAFETY: this fixture is created only below, where its array and all
+    // strings stay live until the guard completes the bounded copy.
+    unsafe impl FinderSnapshot for SliceSnapshot<'_> {
+        type Descriptor = NDIlib_source_t;
+        type Item = Source;
+
+        unsafe fn fetch(
+            &self,
+            _: NDIlib_find_instance_t,
+            count: &mut u32,
+        ) -> *const Self::Descriptor {
+            *count = self.0.len() as u32;
+            self.0.as_ptr()
+        }
+
+        unsafe fn copy(
+            &self,
+            source: &Self::Descriptor,
+            budget: &mut SnapshotBudget,
+        ) -> Result<Option<Source>> {
+            // SAFETY: all fixture strings remain live through this call.
+            unsafe { copy_source(source, budget, |_| Ok(true)) }
+        }
+    }
+
     #[test]
     fn a_snapshot_leaves_out_only_the_malformed_entries() {
         let Some(ndi) = crate::test_support::ndi() else {
@@ -4111,37 +4311,6 @@ mod tests {
             named(ptr::null()),
             named(c"Last".as_ptr()),
         ];
-        struct SliceSnapshot<'a>(&'a [NDIlib_source_t]);
-        impl snapshot_sealed::Sealed for SliceSnapshot<'_> {}
-        // SAFETY: this fixture is created only below, where its array and all
-        // strings stay live until the guard completes the bounded copy.
-        unsafe impl FinderSnapshot for SliceSnapshot<'_> {
-            type Descriptor = NDIlib_source_t;
-            type Item = Source;
-
-            unsafe fn fetch(
-                &self,
-                _: NDIlib_find_instance_t,
-                count: &mut u32,
-            ) -> *const Self::Descriptor {
-                *count = self.0.len() as u32;
-                self.0.as_ptr()
-            }
-
-            unsafe fn copy(
-                &self,
-                source: &Self::Descriptor,
-                budget: &mut SnapshotBudget,
-            ) -> Result<Option<Source>> {
-                // SAFETY: all fixture strings remain live through this call.
-                unsafe {
-                    {
-                        let (name, address) = source_pointers(source);
-                        decode_source(name, address, budget, |_| Ok(true))
-                    }
-                }
-            }
-        }
         let sources = finder.snapshot(&SliceSnapshot(&snapshot));
         let sources = sources.unwrap();
         let names: Vec<_> = sources.iter().map(Source::name).collect();
