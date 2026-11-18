@@ -546,7 +546,7 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
 }
 
 #[test]
-fn audio_timestamp_normalization_depends_on_the_capture_family() {
+fn timestamp_normalization_uses_audio_capture_family_marker() {
     fn check<S>(ticks: i64, expected: Option<SdkTimestamp>)
     where
         S: AudioTest,

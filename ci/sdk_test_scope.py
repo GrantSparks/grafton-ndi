@@ -201,7 +201,7 @@ FILTER_SELECTIONS = {
         'frames::tests::video_padding_encoders',
         'frames::metadata_tests::metadata_constructors',
         'frames::metadata_tests::owned_metadata_states',
-        'frames::metadata_tests::audio_timestamp',
+        'frames::metadata_tests::timestamp_normalization_uses_audio_capture_family_marker',
         'receiver::mixed_tests',
         'receiver::latest_report_tests::',
         'receiver::pending::tests::',
