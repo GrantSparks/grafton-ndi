@@ -60,6 +60,16 @@ thread_local! {
         )
     )]
     static FILE_THREAD: Cell<bool> = const { Cell::new(false) };
+
+    #[cfg(test)]
+    #[cfg_attr(
+        target_os = "android",
+        allow(
+            clippy::missing_const_for_thread_local,
+            reason = "Clippy 1.100 re-lints the Android OS-backed TLS expansion despite this const initializer"
+        )
+    )]
+    static CLOSE_CANCELLATION_CHECKS: Cell<usize> = const { Cell::new(0) };
 }
 
 fn mark_file_thread() {
@@ -1046,6 +1056,8 @@ enum CloseReply<C> {
 
 impl<C: Clone> CloseReply<C> {
     fn cancelled(&self) -> bool {
+        #[cfg(test)]
+        CLOSE_CANCELLATION_CHECKS.with(|checks| checks.set(checks.get() + 1));
         match self {
             Self::Close(reply) => reply.cancelled(),
             Self::Outcome(reply) => reply.cancelled(),
@@ -1070,6 +1082,31 @@ impl<C: Clone> CloseReply<C> {
 struct CloseQueue<C: CloseOutcome> {
     request: C::Request,
     replies: Vec<CloseReply<C>>,
+    prune_at: usize,
+}
+
+impl<C: CloseOutcome> CloseQueue<C> {
+    const MIN_PRUNE_INTERVAL: usize = 8;
+
+    fn new() -> Self {
+        Self {
+            request: C::initial_request(),
+            replies: Vec::new(),
+            prune_at: Self::MIN_PRUNE_INTERVAL,
+        }
+    }
+
+    fn push(&mut self, reply: CloseReply<C>) {
+        if self.replies.len() == self.prune_at {
+            self.replies.retain(|reply| !reply.cancelled());
+            // Allow at least one new registration per survivor before
+            // scanning again. The next scan visits at most twice as many
+            // replies as were registered since this one.
+            let remaining = self.replies.len();
+            self.prune_at = remaining + remaining.max(Self::MIN_PRUNE_INTERVAL);
+        }
+        self.replies.push(reply);
+    }
 }
 
 struct Control<C: CloseOutcome = ()> {
@@ -1136,10 +1173,7 @@ impl<C: CloseOutcome> Control<C> {
             claimed: AtomicBool::new(false),
             shutdown_at: OnceLock::new(),
             outcome: OnceLock::new(),
-            closing: Mutex::new(CloseQueue {
-                request: C::initial_request(),
-                replies: Vec::new(),
-            }),
+            closing: Mutex::new(CloseQueue::new()),
             closed: OnceLock::new(),
         }
     }
@@ -1196,8 +1230,7 @@ impl<C: CloseOutcome> Control<C> {
             drop(queue);
             reply.complete(closed);
         } else {
-            queue.replies.retain(|reply| !reply.cancelled());
-            queue.replies.push(reply);
+            queue.push(reply);
             update(&mut queue.request);
             // Publish admission, the close request and the first budget
             // together. The owner reads its request through this same lock.
@@ -1214,6 +1247,8 @@ impl<C: CloseOutcome> Control<C> {
     }
 
     /// A live close reports destruction instead of the last handle joining.
+    /// Read cancellation directly because a cancelled reply can remain queued
+    /// until another registration triggers pruning.
     fn needs_cleanup_join(&self) -> bool {
         let queue = lock(&self.closing);
         self.closed.get().is_none() && queue.replies.iter().all(CloseReply::cancelled)
@@ -4384,6 +4419,24 @@ mod tests {
     }
 
     #[test]
+    fn registering_live_closes_checks_cancellation_a_linear_number_of_times() {
+        for count in [256, 1024, 4096] {
+            let control = Arc::new(Control::new());
+            CLOSE_CANCELLATION_CHECKS.set(0);
+            let closes: Vec<_> = (0..count)
+                .map(|_| control.request_close(|| {}).submit())
+                .collect();
+            let checks = CLOSE_CANCELLATION_CHECKS.get();
+            assert!(
+                checks <= 2 * count,
+                "{count} registrations made {checks} cancellation checks"
+            );
+            assert_eq!(lock(&control.closing).replies.len(), count);
+            drop(closes);
+        }
+    }
+
+    #[test]
     fn closes_racing_an_owner_exit_are_never_lost() {
         for outcome in [OwnerExit::Closed, OwnerExit::Failed] {
             for _ in 0..32 {
@@ -5464,6 +5517,47 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_close_churn_keeps_the_queue_bounded_and_last_drop_joins() {
+        let (destroys, player) = mock_player();
+        let (blocked, release) = block_owner(&player.worker);
+        let control = Arc::clone(&player.worker.control);
+        let live_count = 100;
+        let closes: Vec<_> = (0..live_count).map(|_| player.close().submit()).collect();
+        let mut peak_replies = 0;
+        for _ in 0..4096 {
+            drop(player.close().submit());
+            peak_replies = peak_replies.max(lock(&control.closing).replies.len());
+        }
+        let joins_with_observers = control.needs_cleanup_join();
+        drop(closes);
+        // Last drop must see these cancellations without another registration.
+        let joins_without_observers = control.needs_cleanup_join();
+
+        let (started, starting) = mpsc::channel();
+        let (returned, returning) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            started.send(()).unwrap();
+            drop(player);
+            returned.send(()).unwrap();
+        });
+        let started = starting.recv_timeout(Duration::from_secs(1));
+        let early = returning.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        block_on(blocked).unwrap();
+        dropper.join().unwrap();
+
+        assert!(
+            peak_replies <= 2 * live_count,
+            "retained {peak_replies} replies"
+        );
+        assert!(!joins_with_observers);
+        assert!(joins_without_observers);
+        started.unwrap();
+        assert_eq!(early, Err(RecvTimeoutError::Timeout));
+        assert_eq!(destroys.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
     fn an_awaited_player_close_keeps_the_last_drop_nonblocking() {
         let (destroys, player) = mock_player();
         let (blocked, release) = block_owner(&player.worker);
@@ -5605,6 +5699,82 @@ mod tests {
         let report = block_on(abandoned).unwrap();
         assert_eq!(report.session(), 1);
         closed(block_on(finishing));
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        assert_eq!(recorder.worker.admission.state.load(Ordering::Acquire), 0);
+        assert_eq!(recorder.worker.finish.state.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn concurrent_close_and_abandon_observers_share_shutdown_with_queued_finish() {
+        struct DestructionWake {
+            device: Arc<mock::Recorder>,
+            observed: Sender<usize>,
+        }
+        impl Wake for DestructionWake {
+            fn wake(self: Arc<Self>) {
+                let _ = self
+                    .observed
+                    .send(self.device.destroys.load(Ordering::Acquire));
+            }
+        }
+
+        let (device, recorder) = mock_recorder_with_drop_wait(
+            Closing::Never,
+            AsyncFileOptions::new(),
+            Duration::from_secs(2),
+        );
+        let other = recorder.clone();
+        let (blocked, release) = block_owner(&recorder.worker);
+        let finishing = other.finish(Duration::from_secs(30)).submit();
+        let mut closes = vec![recorder.close().submit()];
+        let control = &recorder.worker.control;
+        let first_shutdown = control.shutdown_requested_at();
+        let mut abandons = [other.abandon().submit(), recorder.abandon().submit()];
+        for _ in 0..32 {
+            drop(recorder.abandon().submit());
+            drop(other.close().submit());
+            closes.push(other.close().submit());
+        }
+        let late_finish = recorder.finish(Duration::from_secs(30)).submit();
+        let shutdown = control.shutdown_requested_at();
+        let (observed, wakes) = mpsc::channel();
+        let waker = Waker::from(Arc::new(DestructionWake {
+            device: Arc::clone(&device),
+            observed,
+        }));
+        let mut context = Context::from_waker(&waker);
+        let mut pending = true;
+        for close in &mut closes {
+            pending &= Pin::new(close).poll(&mut context).is_pending();
+        }
+        for abandon in &mut abandons {
+            pending &= Pin::new(abandon).poll(&mut context).is_pending();
+        }
+        let finish_pending = !finishing.is_completed();
+        let late_finish_refused = late_finish.is_completed();
+        release.send(()).unwrap();
+        block_on(blocked).unwrap();
+
+        assert!(pending);
+        assert!(finish_pending);
+        assert!(late_finish_refused);
+        assert!(first_shutdown.is_some());
+        assert_eq!(first_shutdown, shutdown);
+        for _ in 0..closes.len() + abandons.len() {
+            assert_eq!(wakes.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        }
+        for close in closes {
+            block_on(close).unwrap();
+        }
+        let [first_abandon, second_abandon] = abandons;
+        let report = block_on(first_abandon).unwrap();
+        assert_eq!(block_on(second_abandon).unwrap(), report);
+        assert_eq!(report.session(), 1);
+        assert!(!report.closure_confirmed());
+        closed(block_on(finishing));
+        closed(block_on(late_finish));
+        assert_eq!(device.waits.load(Ordering::Acquire), 0);
         assert_eq!(device.stops.load(Ordering::Acquire), 1);
         assert_eq!(device.destroys.load(Ordering::Acquire), 1);
         assert_eq!(recorder.worker.admission.state.load(Ordering::Acquire), 0);
