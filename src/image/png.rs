@@ -12,8 +12,8 @@ use crate::{Error, Result};
 /// Encode `pixels` as a PNG of `channels` channels into `out`, with a `cICP`
 /// chunk when `cicp` gives one.
 ///
-/// An RGBA frame whose rows are the image's rows is read in place; anything
-/// else converts into one row of scratch, reused for every row.
+/// Contiguous RGBA rows at full size are read in place. Otherwise one row
+/// of scratch holds the converted pixels.
 pub(super) fn encode<P: Sample>(
     pixels: &mut Pixels<'_, P>,
     shape: ImageShape,
@@ -25,7 +25,8 @@ pub(super) fn encode<P: Sample>(
 ) -> Result<()> {
     // Complete wrapper storage preparation before the signature, IHDR or cICP.
     // Eligible RGBA rows borrow the source and need no conversion storage.
-    if pixels.rgba_rows().is_none() {
+    let direct = pixels.direct_rgba();
+    if direct.is_none() {
         super::resize_scratch(row, shape.row_bytes)?;
     }
     let mut encoder = ::png::Encoder::new(out, shape.width, shape.height);
@@ -59,8 +60,8 @@ pub(super) fn encode<P: Sample>(
     }
     {
         let mut stream = writer.stream_writer().map_err(png_error)?;
-        if let Some(plane) = pixels.rgba_rows() {
-            for row in plane.rows() {
+        if let Some(bytes) = direct {
+            for row in bytes.chunks_exact(shape.row_bytes) {
                 stream.write_all(row)?;
             }
         } else {

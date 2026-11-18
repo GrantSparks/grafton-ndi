@@ -1693,11 +1693,11 @@ fn codecs_admit_colors_only_when_they_can_write_the_required_tag() {
 fn every_image_format_has_its_documented_quality_bounds() {
     for (format, expected) in [
         (ImageFormat::Png, None),
-        (ImageFormat::Jpeg(85), Some(1..=100)),
+        (ImageFormat::Jpeg(85), Some((85, 1..=100))),
         (ImageFormat::WebpLossless, None),
-        (ImageFormat::WebpLossy(75), Some(0..=100)),
+        (ImageFormat::WebpLossy(75), Some((75, 0..=100))),
     ] {
-        assert_eq!(format.info().quality, expected);
+        assert_eq!(format.quality(), expected);
     }
 }
 
@@ -2083,51 +2083,69 @@ fn every_writer_encode_reports_final_flush_and_buffered_write_failures() {
 
 #[test]
 fn conflicting_options_are_refused_before_anything_is_written() {
+    use crate::{ImageCodecKind, ImageSettingKind, InputDefect};
+
     let frame = random_codes(PixelFormat::P216, 4, 2, 1).frame(None);
     let cases = [
-        (options(ImageFormat::Jpeg(0)), "quality"),
-        (options(ImageFormat::Jpeg(101)), "quality"),
-        (options(ImageFormat::Jpeg(255)), "quality"),
-        (options(ImageFormat::WebpLossy(101)), "WebP quality"),
-        (options(ImageFormat::WebpLossy(255)), "WebP quality"),
+        (
+            options(ImageFormat::Jpeg(0)),
+            Some((ImageSettingKind::Quality, 0, 1, 100)),
+        ),
+        (
+            options(ImageFormat::Jpeg(101)),
+            Some((ImageSettingKind::Quality, 101, 1, 100)),
+        ),
+        (
+            options(ImageFormat::Jpeg(255)),
+            Some((ImageSettingKind::Quality, 255, 1, 100)),
+        ),
+        (
+            options(ImageFormat::WebpLossy(101)),
+            Some((ImageSettingKind::Quality, 101, 0, 100)),
+        ),
+        (
+            options(ImageFormat::WebpLossy(255)),
+            Some((ImageSettingKind::Quality, 255, 0, 100)),
+        ),
         (
             options(ImageFormat::WebpLossy(75)).webp_effort(7),
-            "WebP effort",
+            Some((ImageSettingKind::Effort, 7, 0, 6)),
         ),
         (
             options(ImageFormat::WebpLossy(75)).webp_effort(255),
-            "WebP effort",
+            Some((ImageSettingKind::Effort, 255, 0, 6)),
         ),
         (
             options(ImageFormat::Jpeg(85)).depth(SampleDepth::Sixteen),
-            "SampleDepth::Sixteen",
+            None,
         ),
         (
             options(ImageFormat::WebpLossless).depth(SampleDepth::Sixteen),
-            "SampleDepth::Sixteen",
+            None,
         ),
         (
             options(ImageFormat::WebpLossy(75)).depth(SampleDepth::Sixteen),
-            "SampleDepth::Sixteen",
+            None,
         ),
     ];
-    for (options, needle) in cases {
+    for (options, bad_setting) in cases {
         let mut out = Recorder {
             written: 0,
             fail_after: None,
         };
         let message = invalid_input(frame.encode_image_to(&options, &mut out));
-        assert!(
-            match needle {
-                "quality" | "WebP quality" =>
-                    matches!(message, crate::InputDefect::ImageQuality { codec, .. } if codec == options.format.info().codec),
-                "WebP effort" => matches!(message, crate::InputDefect::WebpEffort { .. }),
-                "SampleDepth::Sixteen" =>
-                    matches!(message, crate::InputDefect::SixteenBitNeedsPng { codec } if codec == options.format.info().codec),
-                other => panic!("unexpected case {other}"),
+        let codec = options.format.info().codec;
+        let expected = match bad_setting {
+            Some((setting, value, minimum, maximum)) => InputDefect::ImageSetting {
+                codec,
+                setting,
+                value,
+                minimum,
+                maximum,
             },
-            "{message}"
-        );
+            None => InputDefect::SixteenBitNeedsPng { codec },
+        };
+        assert_eq!(message, expected);
         assert_eq!(out.written, 0, "{options:?}");
     }
     for quality in [0, 101] {
@@ -2137,7 +2155,7 @@ fn conflicting_options_are_refused_before_anything_is_written() {
                     crate::image_encoding::ImageFormat::Jpeg(quality)
                 ))
             ),
-            crate::InputDefect::ImageQuality { codec: crate::ImageCodecKind::Jpeg, quality: actual, .. } if actual == quality
+            InputDefect::ImageSetting { codec: ImageCodecKind::Jpeg, setting: ImageSettingKind::Quality, value, .. } if value == quality
         ));
         assert!(matches!(
             invalid_input(
@@ -2145,7 +2163,7 @@ fn conflicting_options_are_refused_before_anything_is_written() {
                     ImageFormat::Jpeg(quality)
                 ))
             ),
-            crate::InputDefect::ImageQuality { codec: crate::ImageCodecKind::Jpeg, quality: actual, .. } if actual == quality
+            InputDefect::ImageSetting { codec: ImageCodecKind::Jpeg, setting: ImageSettingKind::Quality, value, .. } if value == quality
         ));
     }
     // Quality is checked before the frame: even an HDR frame reports it.
@@ -2678,7 +2696,7 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                             let ((mut pixels, allocations), peak) =
                                 peak_bytes(|| allocation_count(|| plan.pixels::<u8>()));
                             check(allocations, peak);
-                            let borrowed = pixels.rgba_rows().is_some();
+                            let borrowed = pixels.direct_rgba().is_some();
                             assert_eq!(
                                 borrowed,
                                 format == PixelFormat::Rgba
@@ -2701,7 +2719,7 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                             let ((mut pixels, allocations), peak) =
                                 peak_bytes(|| allocation_count(|| plan.pixels::<u16>()));
                             check(allocations, peak);
-                            assert!(pixels.rgba_rows().is_none());
+                            assert!(pixels.direct_rgba().is_none());
                             let mut row = row_buffer::<u16>(reduced.0, channels);
                             assert_eq!(row.len(), row_len);
                             let (_, allocations) = allocation_count(|| {
@@ -3604,6 +3622,50 @@ fn reader_format_facts_match_the_frame_layout_for_every_format() {
 }
 
 #[test]
+fn direct_rows_require_contiguous_full_size_eight_bit_packed_rgb() {
+    use crate::frames::RgbOrder;
+
+    for format in PixelFormat::ALL {
+        let order = match format {
+            PixelFormat::Rgba | PixelFormat::Rgbx => Some(RgbOrder::Rgb),
+            PixelFormat::Bgra | PixelFormat::Bgrx => Some(RgbOrder::Bgr),
+            _ => None,
+        };
+        for padding in [0, 8] {
+            let (width, height) = (18, 10);
+            let stride = format.line_stride_bytes(width).unwrap() + padding;
+            let data = vec![42; format.buffer_len(width, height, Some(stride)).unwrap()];
+            let frame = BorrowedVideoFrame::builder(&data, width, height, format)
+                .line_stride_bytes(stride)
+                .build()
+                .unwrap();
+            let source = Source::new(&frame);
+            for downscale in Downscale::ALL {
+                for alpha in [AlphaMode::Keep, AlphaMode::Discard] {
+                    let options = options(ImageFormat::Png).downscale(downscale).alpha(alpha);
+                    let plan = Plan::new(&source, &options).unwrap();
+                    let pixels = plan.pixels::<u8>();
+                    let eligible = order.filter(|_| padding == 0 && downscale == Downscale::Off);
+                    assert_eq!(
+                        pixels.direct_rows(false),
+                        eligible.map(|order| (data.as_slice(), order)),
+                        "{format:?} {padding} {options:?}",
+                    );
+                    assert_eq!(
+                        pixels.direct_rows(true),
+                        eligible
+                            .filter(|_| alpha.keeps_alpha() && format.info().has_alpha())
+                            .map(|order| (data.as_slice(), order)),
+                        "{format:?} {padding} {options:?}",
+                    );
+                    assert!(plan.pixels::<u16>().direct_rows(false).is_none());
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn generic_video_sources_encode_and_workspaces_reuse_data_url_conversion() {
     fn encode<T: crate::VideoSource>(frame: &T, options: &ImageOptions) -> (Vec<u8>, String) {
         let image = frame.encode_image(options).unwrap();
@@ -3734,7 +3796,6 @@ fn every_image_format_states_its_capabilities_once() {
             ImageFormat::Png => (
                 crate::ImageCodecKind::Png,
                 "image/png",
-                None,
                 AlphaChannel::Optional,
                 true,
                 true,
@@ -3743,7 +3804,6 @@ fn every_image_format_states_its_capabilities_once() {
             ImageFormat::Jpeg(_) => (
                 crate::ImageCodecKind::Jpeg,
                 "image/jpeg",
-                Some(1..=100),
                 AlphaChannel::None,
                 false,
                 false,
@@ -3752,7 +3812,6 @@ fn every_image_format_states_its_capabilities_once() {
             ImageFormat::WebpLossless => (
                 crate::ImageCodecKind::Webp,
                 "image/webp",
-                None,
                 AlphaChannel::Optional,
                 false,
                 false,
@@ -3761,7 +3820,6 @@ fn every_image_format_states_its_capabilities_once() {
             ImageFormat::WebpLossy(_) => (
                 crate::ImageCodecKind::Webp,
                 "image/webp",
-                Some(0..=100),
                 AlphaChannel::AlwaysRgba,
                 false,
                 false,
@@ -3772,7 +3830,6 @@ fn every_image_format_states_its_capabilities_once() {
             (
                 info.codec,
                 info.media_type,
-                info.quality.clone(),
                 info.alpha,
                 info.sixteen_bit,
                 info.carries_color_tag,

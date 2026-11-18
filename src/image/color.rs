@@ -11,7 +11,7 @@
 //! G = (Y' − K<sub>R</sub>·R − K<sub>B</sub>·B) / (1 − K<sub>R</sub> − K<sub>B</sub>), each clamped to 0 to 1
 //! and rounded to the image's maximum code.
 
-use std::ops::{Add, Mul, Neg, Shl, Shr, Sub};
+use std::ops::{Add, Mul, Shl, Shr, Sub};
 
 use super::{options::YuvRange, read::BATCH};
 use crate::YuvMatrix;
@@ -141,7 +141,6 @@ pub(super) trait Fixed:
     + Add<Output = Self>
     + Sub<Output = Self>
     + Mul<Output = Self>
-    + Neg<Output = Self>
     + Shl<u32, Output = Self>
     + Shr<u32, Output = Self>
 {

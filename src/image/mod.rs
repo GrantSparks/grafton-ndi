@@ -40,10 +40,10 @@ use self::{
     options::AlphaChannel,
     read::{Reader, Sink},
 };
-use crate::frames::{PlaneRoles, VideoPartsExt};
+use crate::frames::{PlaneRoles, RgbOrder, VideoPartsExt};
 use crate::{
     color_info, frames::VideoParts, ColorInfo, ColorPrimaries, Error, PixelFormat, Result,
-    TransferFunction, VideoPlane, YuvMatrix,
+    TransferFunction, YuvMatrix,
 };
 
 /// The parts of a video frame an encode reads, borrowed from any frame type.
@@ -181,16 +181,8 @@ impl ImageWorkspace {
     fn encode_source(&mut self, source: Source<'_>, options: &ImageOptions) -> Result<Vec<u8>> {
         let plan = Plan::new(&source, options)?;
         // Preserve the backend's output buffer: no second lossy WebP copy.
-        if let Codec::WebpLossy {
-            quality,
-            effort,
-            sharp_yuv,
-            shape,
-        } = plan.codec
-        {
-            return plan.with_pixels::<u8, _>(&mut self.sums8, |pixels| {
-                webp::encode_lossy(pixels, shape, quality, effort, sharp_yuv, &mut self.image)
-            });
+        if let Codec::WebpLossy(settings) = plan.codec {
+            return plan.encode_lossy_webp(settings, self);
         }
         let shape = plan.shape();
         // A sudden reduction must not reserve a previous large image's output.
@@ -296,22 +288,9 @@ fn write_image(plan: Plan<'_>, out: &mut dyn Write, workspace: &mut ImageWorkspa
             .with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
                 webp::encode_lossless(pixels, shape, &mut out, &mut workspace.image)
             }),
-        Codec::WebpLossy {
-            quality,
-            effort,
-            sharp_yuv,
-            shape,
-        } => plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
-            let image = webp::encode_lossy(
-                pixels,
-                shape,
-                quality,
-                effort,
-                sharp_yuv,
-                &mut workspace.image,
-            )?;
-            out.write_all(&image).map_err(Error::Io)
-        }),
+        Codec::WebpLossy(settings) => plan
+            .encode_lossy_webp(settings, workspace)
+            .and_then(|image| out.write_all(&image).map_err(Error::Io)),
     };
     let result = result.and_then(|()| out.flush().map_err(Error::Io));
     match out.error {
@@ -558,12 +537,7 @@ enum Codec {
     /// Dimensions within WebP's limit.
     WebpLossless { shape: BufferedImageShape },
     /// Quality in 0 to 100, dimensions within lossy WebP's limit.
-    WebpLossy {
-        shape: BufferedImageShape,
-        quality: webp::WebpQuality,
-        effort: webp::WebpEffort,
-        sharp_yuv: bool,
-    },
+    WebpLossy(webp::LossySettings),
 }
 
 /// Codec settings that are validated before examining the source frame.
@@ -672,12 +646,12 @@ impl<'a> Plan<'a> {
                     channels,
                 )?,
             },
-            CodecSettings::WebpLossy(quality, effort) => Codec::WebpLossy {
+            CodecSettings::WebpLossy(quality, effort) => Codec::WebpLossy(webp::LossySettings {
                 shape: BufferedImageShape::new(webp::MAX_LOSSY_DIMENSION, width, height, channels)?,
                 quality,
                 effort,
                 sharp_yuv: options.webp_sharp_yuv,
-            },
+            }),
         };
         Ok(Self {
             source,
@@ -693,8 +667,19 @@ impl<'a> Plan<'a> {
         match self.codec {
             Codec::Png { shape, .. } => shape,
             Codec::Jpeg { dimensions, .. } => dimensions.shape(),
-            Codec::WebpLossless { shape } | Codec::WebpLossy { shape, .. } => shape.rows,
+            Codec::WebpLossless { shape } => shape.rows,
+            Codec::WebpLossy(settings) => settings.shape.rows,
         }
+    }
+
+    fn encode_lossy_webp(
+        &self,
+        settings: webp::LossySettings,
+        workspace: &mut ImageWorkspace,
+    ) -> Result<Vec<u8>> {
+        self.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
+            webp::encode_lossy(pixels, settings, &mut workspace.image)
+        })
     }
 
     #[cfg(test)]
@@ -791,13 +776,23 @@ impl<'a, P: Sample> Pixels<'a, P> {
         reduced(self.reader.height(), self.shift())
     }
 
-    /// The frame's own rows when they are exactly the image's: an 8-bit RGBA
-    /// image of an RGBA frame at full size.
-    fn rgba_rows(&self) -> Option<VideoPlane<'a>> {
-        match self.downscaler {
-            Some(_) => None,
-            None => self.reader.rgba_rows(),
+    /// The frame's active bytes when the codec can use full-size, contiguous
+    /// 8-bit RGB data in native channel order. Alpha must be kept when needed.
+    fn direct_rows(&self, need_alpha: bool) -> Option<(&'a [u8], RgbOrder)> {
+        if P::BYTES != 1 || self.downscaler.is_some() {
+            return None;
         }
+        let (plane, order, alpha) = self.reader.packed_rgb()?;
+        if need_alpha && !alpha {
+            return None;
+        }
+        Some((plane.data()?, order))
+    }
+
+    /// PNG and WebP can use in-place input only in RGBA channel order.
+    fn direct_rgba(&self) -> Option<&'a [u8]> {
+        let (bytes, order) = self.direct_rows(true)?;
+        (order == RgbOrder::Rgb).then_some(bytes)
     }
 
     /// Convert row `y` into `sink`.

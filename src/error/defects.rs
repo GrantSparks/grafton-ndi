@@ -47,6 +47,18 @@ pub enum ImageCodecKind {
     Webp,
 }
 
+/// A numerical codec setting checked by the image encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[non_exhaustive]
+pub enum ImageSettingKind {
+    /// JPEG or lossy WebP quality.
+    #[error("quality")]
+    Quality,
+    /// Lossy WebP encoding effort.
+    #[error("effort")]
+    Effort,
+}
+
 /// The rejected native Discovery Server address, retained only for diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Error)]
 #[error(
@@ -715,23 +727,19 @@ pub enum InputDefect {
         /// The limit.
         limit: usize,
     },
-    /// {codec} quality must be in {minimum}..={maximum}, got {quality}.
-    #[error("{codec} quality must be in {minimum}..={maximum}, got {quality}")]
-    ImageQuality {
+    /// A codec setting falls outside its supported range.
+    #[error("{codec} {setting} must be in {minimum}..={maximum}, got {value}")]
+    ImageSetting {
         /// The codec.
         codec: ImageCodecKind,
-        /// The quality.
-        quality: u8,
+        /// The setting.
+        setting: ImageSettingKind,
+        /// The requested value.
+        value: u8,
         /// The minimum.
         minimum: u8,
         /// The maximum.
         maximum: u8,
-    },
-    /// WebP effort must be in 0..=6, got {effort}.
-    #[error("WebP effort must be in 0..=6, got {effort}")]
-    WebpEffort {
-        /// The effort.
-        effort: u8,
     },
     /// {codec} images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png.
     #[error("{codec} images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png")]

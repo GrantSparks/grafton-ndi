@@ -1,7 +1,7 @@
 //! WebP from one buffer of the whole image: lossless through `image-webp`,
 //! lossy through the scalar Rust port of libwebp, `libwebpop`.
 
-use std::io::Write;
+use std::{io::Write, ops::RangeInclusive};
 
 use super::{BufferedImageShape, Channels, Pixels};
 use crate::{Error, Result};
@@ -23,6 +23,8 @@ const_assert!({
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct WebpQuality(u8);
 impl WebpQuality {
+    pub(super) const RANGE: RangeInclusive<u8> = 0..=100;
+
     pub(super) fn new(value: u8) -> Result<Self> {
         super::ImageFormat::WebpLossy(value).validate_quality()?;
         Ok(Self(value))
@@ -33,12 +35,15 @@ impl WebpQuality {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct WebpEffort(u8);
 impl WebpEffort {
+    pub(super) const RANGE: RangeInclusive<u8> = 0..=6;
+
     pub(super) fn new(value: u8) -> Result<Self> {
-        if value > 6 {
-            return Err(Error::InvalidInput(crate::InputDefect::WebpEffort {
-                effort: value,
-            }));
-        }
+        super::options::check_image_setting(
+            crate::ImageCodecKind::Webp,
+            crate::ImageSettingKind::Effort,
+            value,
+            Self::RANGE,
+        )?;
         Ok(Self(value))
     }
 }
@@ -71,19 +76,31 @@ pub(super) fn encode_lossless(
         })
 }
 
-/// Lossy color with exact alpha and optional SharpYUV conversion. `Plan` validated
-/// quality, effort and dimensions. The backend takes RGBA, including opaque alpha
-/// when discarded, and returns a complete image.
+/// The plan's checked lossy WebP settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LossySettings {
+    pub(super) shape: BufferedImageShape,
+    pub(super) quality: WebpQuality,
+    pub(super) effort: WebpEffort,
+    pub(super) sharp_yuv: bool,
+}
+
+/// Lossy color with exact alpha and optional SharpYUV conversion. The backend
+/// takes RGBA, including opaque alpha if the source has none or it was
+/// discarded, and returns a complete image.
 pub(super) fn encode_lossy(
     pixels: &mut Pixels<'_, u8>,
-    shape: BufferedImageShape,
-    quality: WebpQuality,
-    effort: WebpEffort,
-    sharp_yuv: bool,
+    settings: LossySettings,
     scratch: &mut Vec<u8>,
 ) -> Result<Vec<u8>> {
     use libwebpop::{OpConfig, OpImage, OpQuality};
 
+    let LossySettings {
+        shape,
+        quality,
+        effort,
+        sharp_yuv,
+    } = settings;
     let (width, height) = (shape.rows.width, shape.rows.height);
     let image = image_with(pixels, shape, scratch)?;
     let mut config = OpConfig::new(OpQuality::Lossy {
@@ -120,7 +137,7 @@ pub(super) fn image_with<'s, 'a: 's>(
     shape: BufferedImageShape,
     scratch: &'s mut Vec<u8>,
 ) -> Result<&'s [u8]> {
-    if let Some(data) = pixels.rgba_rows().and_then(|plane| plane.data()) {
+    if let Some(data) = pixels.direct_rgba() {
         return Ok(data);
     }
     super::resize_scratch(scratch, shape.image_bytes)?;
@@ -135,7 +152,7 @@ pub(super) fn image<'a>(
     pixels: &mut Pixels<'a, u8>,
     shape: BufferedImageShape,
 ) -> std::borrow::Cow<'a, [u8]> {
-    match pixels.rgba_rows().and_then(|plane| plane.data()) {
+    match pixels.direct_rgba() {
         Some(data) => std::borrow::Cow::Borrowed(data),
         None => {
             let mut scratch = Vec::new();

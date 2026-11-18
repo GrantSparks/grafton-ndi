@@ -229,8 +229,7 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("KvmWheel", InputDefect::KvmWheel { units: 2.5 }, "KVM wheel units 2.5 are not finite"),
         ("KvmTouchCount", InputDefect::KvmTouchCount { count: 3 }, "3 KVM touch points are more than the SDK can count"),
         ("QueueFrameTooLarge", InputDefect::QueueFrameTooLarge { bytes: 268435457, limit: 268435456 }, "frame retains 268435457 bytes of allocation capacity, exceeding the queue's 268435456 byte limit"),
-        ("ImageQuality", InputDefect::ImageQuality { codec: ImageCodecKind::Jpeg, quality: 101, minimum: 1, maximum: 100 }, "JPEG quality must be in 1..=100, got 101"),
-        ("WebpEffort", InputDefect::WebpEffort { effort: 7 }, "WebP effort must be in 0..=6, got 7"),
+        ("ImageSetting", InputDefect::ImageSetting { codec: ImageCodecKind::Jpeg, setting: ImageSettingKind::Quality, value: 101, minimum: 1, maximum: 100 }, "JPEG quality must be in 1..=100, got 101"),
         ("SixteenBitNeedsPng", InputDefect::SixteenBitNeedsPng { codec: ImageCodecKind::Jpeg }, "JPEG images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png"),
         ("ColorTagNeedsPng", InputDefect::ColorTagNeedsPng { codec: ImageCodecKind::Jpeg, primaries: Some(crate::ColorPrimaries::Bt2020), transfer: Some(TransferFunction::Pq) }, "JPEG cannot carry the required color tag for BT.2020 primaries and PQ transfer. Use ImageFormat::Png"),
         ("RecordingPathTooLong", InputDefect::RecordingPathTooLong { maximum_bytes: 4094, longest_bytes: 4095, index_digits_reserved: 17 }, "recording file path may reach 4095 UTF-8 bytes, exceeding the 4094-byte event path limit (17 digits reserved for index growth)"),
@@ -240,6 +239,17 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("SpeedHqCodec", InputDefect::SpeedHqCodec { codec: crate::advanced::VideoCodec::H264 }, "SpeedHQ quality guidance does not apply to H264"),
     ];
     check_cases("InputDefect", &cases);
+    assert_eq!(
+        InputDefect::ImageSetting {
+            codec: ImageCodecKind::Webp,
+            setting: ImageSettingKind::Effort,
+            value: 7,
+            minimum: 0,
+            maximum: 6,
+        }
+        .to_string(),
+        "WebP effort must be in 0..=6, got 7"
+    );
 }
 
 #[test]

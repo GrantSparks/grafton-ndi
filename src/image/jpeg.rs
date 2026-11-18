@@ -4,13 +4,14 @@
 use std::{
     cell::{Cell, RefCell},
     io::Write,
+    ops::RangeInclusive,
 };
 
 use super::{
     read::{Sink, BATCH},
     Channels, ImageShape, Pixels, SampleDepth,
 };
-use crate::{Error, Result};
+use crate::{frames::RgbOrder, Error, Result};
 
 /// JPEG's largest width or height.
 pub(super) const MAX_DIMENSION: usize = u16::MAX as usize;
@@ -19,6 +20,8 @@ pub(super) const MAX_DIMENSION: usize = u16::MAX as usize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct JpegQuality(u8);
 impl JpegQuality {
+    pub(super) const RANGE: RangeInclusive<u8> = 1..=100;
+
     pub(super) fn new(value: u8) -> Result<Self> {
         super::ImageFormat::Jpeg(value).validate_quality()?;
         Ok(Self(value))
@@ -73,19 +76,14 @@ pub(super) fn encode(
     // VideoPlane::data exposes only initialized contiguous active pixels;
     // padded native rows must stay on the row path. Both color types ignore
     // the fourth byte, including RGBX/BGRX's unspecified alpha.
-    if pixels.downscaler.is_none() {
-        if let Some((plane, rgb)) = pixels.reader.rgb_rows() {
-            if let Some(data) = plane.data() {
-                let color = if rgb {
-                    jpeg_encoder::ColorType::Rgba
-                } else {
-                    jpeg_encoder::ColorType::Bgra
-                };
-                return encoder(out, quality, density)
-                    .encode(data, width, height, color)
-                    .map_err(encoding_error);
-            }
-        }
+    if let Some((data, order)) = pixels.direct_rows(false) {
+        let color = match order {
+            RgbOrder::Rgb => jpeg_encoder::ColorType::Rgba,
+            RgbOrder::Bgr => jpeg_encoder::ColorType::Bgra,
+        };
+        return encoder(out, quality, density)
+            .encode(data, width, height, color)
+            .map_err(encoding_error);
     }
     encode_rows(pixels, quality, dimensions, density, cache, out)
 }
@@ -208,18 +206,23 @@ impl jpeg_encoder::ImageBuffer for Rows<'_, '_> {
 /// codec's own JFIF conversion and dropping alpha.
 struct Components<'b>(&'b mut [Vec<u8>; 4]);
 
+#[inline]
+fn ycbcr_batch(pixels: &[[u8; 4]]) -> [[u8; BATCH]; 3] {
+    // Convert into arrays first, so the conversion vectorizes.
+    let mut components = [[0; BATCH]; 3];
+    for (i, &[red, green, blue, _]) in pixels.iter().enumerate() {
+        let (y, cb, cr) = jpeg_encoder::rgb_to_ycbcr(red, green, blue);
+        components[0][i] = y;
+        components[1][i] = cb;
+        components[2][i] = cr;
+    }
+    components
+}
+
 impl Sink<u8> for Components<'_> {
     #[inline]
     fn put(&mut self, pixels: &[[u8; 4]]) {
-        // A batch converts into arrays first, so the conversion vectorizes
-        // and each component row grows once a batch.
-        let mut components = [[0; BATCH]; 3];
-        for (i, &[red, green, blue, _]) in pixels.iter().enumerate() {
-            let (y, cb, cr) = jpeg_encoder::rgb_to_ycbcr(red, green, blue);
-            components[0][i] = y;
-            components[1][i] = cb;
-            components[2][i] = cr;
-        }
+        let components = ycbcr_batch(pixels);
         for (buffer, values) in self.0.iter_mut().zip(&components) {
             buffer.extend_from_slice(&values[..pixels.len()]);
         }
@@ -233,13 +236,7 @@ struct CachedComponents<'r> {
 
 impl Sink<u8> for CachedComponents<'_> {
     fn put(&mut self, pixels: &[[u8; 4]]) {
-        let mut components = [[0; BATCH]; 3];
-        for (i, &[red, green, blue, _]) in pixels.iter().enumerate() {
-            let (y, cb, cr) = jpeg_encoder::rgb_to_ycbcr(red, green, blue);
-            components[0][i] = y;
-            components[1][i] = cb;
-            components[2][i] = cr;
-        }
+        let components = ycbcr_batch(pixels);
         for (row, values) in self.rows.iter_mut().zip(&components) {
             row[self.at..self.at + pixels.len()].copy_from_slice(&values[..pixels.len()]);
         }

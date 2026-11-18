@@ -179,7 +179,9 @@ for application planning.
 
 ## Errors
 
-Invalid quality, effort or depth settings return `InvalidInput`. JPEG and
+Invalid quality and effort settings return `InvalidInput` with
+`InputDefect::ImageSetting`. Incompatible sample depth also returns
+`InvalidInput`. JPEG and
 WebP also return `InvalidInput` with `InputDefect::ColorTagNeedsPng` for frames
 with BT.2020 primaries or with PQ or HLG under `HdrPolicy::CodeValues`.
 Malformed color descriptions, HDR refusal, excessive dimensions

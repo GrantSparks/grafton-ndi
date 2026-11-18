@@ -1,6 +1,9 @@
 //! What to encode and how: [`ImageOptions`] and the settings it holds.
 
-use crate::YuvMatrix;
+use std::ops::RangeInclusive;
+
+use super::{jpeg::JpegQuality, webp::WebpQuality};
+use crate::{Error, ImageCodecKind, ImageSettingKind, InputDefect, Result, YuvMatrix};
 
 /// The image format a video frame is encoded to.
 ///
@@ -52,7 +55,6 @@ pub enum ImageFormat {
 pub(super) struct ImageFormatInfo {
     pub(super) codec: crate::ImageCodecKind,
     pub(super) media_type: &'static str,
-    pub(super) quality: Option<std::ops::RangeInclusive<u8>>,
     pub(super) alpha: AlphaChannel,
     pub(super) sixteen_bit: bool,
     pub(super) carries_color_tag: bool,
@@ -72,7 +74,6 @@ impl ImageFormat {
             Self::Png => ImageFormatInfo {
                 codec: crate::ImageCodecKind::Png,
                 media_type: "image/png",
-                quality: None,
                 alpha: AlphaChannel::Optional,
                 sixteen_bit: true,
                 carries_color_tag: true,
@@ -81,7 +82,6 @@ impl ImageFormat {
             Self::Jpeg(_) => ImageFormatInfo {
                 codec: crate::ImageCodecKind::Jpeg,
                 media_type: "image/jpeg",
-                quality: Some(1..=100),
                 alpha: AlphaChannel::None,
                 sixteen_bit: false,
                 carries_color_tag: false,
@@ -90,7 +90,6 @@ impl ImageFormat {
             Self::WebpLossless => ImageFormatInfo {
                 codec: crate::ImageCodecKind::Webp,
                 media_type: "image/webp",
-                quality: None,
                 alpha: AlphaChannel::Optional,
                 sixteen_bit: false,
                 carries_color_tag: false,
@@ -99,7 +98,6 @@ impl ImageFormat {
             Self::WebpLossy(_) => ImageFormatInfo {
                 codec: crate::ImageCodecKind::Webp,
                 media_type: "image/webp",
-                quality: Some(0..=100),
                 alpha: AlphaChannel::AlwaysRgba,
                 sixteen_bit: false,
                 carries_color_tag: false,
@@ -108,24 +106,38 @@ impl ImageFormat {
         }
     }
 
-    pub(super) fn validate_quality(self) -> crate::Result<()> {
-        let info = self.info();
-        if let Self::Jpeg(quality) | Self::WebpLossy(quality) = self {
-            if let Some(bounds) = info.quality {
-                if !bounds.contains(&quality) {
-                    return Err(crate::Error::InvalidInput(
-                        crate::InputDefect::ImageQuality {
-                            codec: info.codec,
-                            quality,
-                            minimum: *bounds.start(),
-                            maximum: *bounds.end(),
-                        },
-                    ));
-                }
-            }
+    pub(super) fn quality(self) -> Option<(u8, RangeInclusive<u8>)> {
+        match self {
+            Self::Png | Self::WebpLossless => None,
+            Self::Jpeg(value) => Some((value, JpegQuality::RANGE)),
+            Self::WebpLossy(value) => Some((value, WebpQuality::RANGE)),
+        }
+    }
+
+    pub(super) fn validate_quality(self) -> Result<()> {
+        if let Some((value, bounds)) = self.quality() {
+            check_image_setting(self.info().codec, ImageSettingKind::Quality, value, bounds)?;
         }
         Ok(())
     }
+}
+
+pub(super) fn check_image_setting(
+    codec: ImageCodecKind,
+    setting: ImageSettingKind,
+    value: u8,
+    bounds: RangeInclusive<u8>,
+) -> Result<()> {
+    if !bounds.contains(&value) {
+        return Err(Error::InvalidInput(InputDefect::ImageSetting {
+            codec,
+            setting,
+            value,
+            minimum: *bounds.start(),
+            maximum: *bounds.end(),
+        }));
+    }
+    Ok(())
 }
 
 // One list supplies representative formats and an exhaustive coverage check,
@@ -269,7 +281,8 @@ image_format_variants!(
 /// # Memory
 ///
 /// PNG and JPEG convert one output row at a time, so conversion scratch
-/// does not grow with frame height. PNG borrows eligible RGBA rows or
+/// does not grow with frame height. PNG borrows contiguous full-size 8-bit
+/// RGBA rows or
 /// retains one row; JPEG converts into the codec's rows and retains its
 /// final component row to avoid converting padding requests again.
 /// WebP encodes from one buffer, so it holds the whole converted

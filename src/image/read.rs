@@ -62,8 +62,7 @@ enum Layout<'a, P: Sample> {
     /// BGRA, BGRX, RGBA and RGBX: four bytes a pixel.
     Rgb {
         plane: VideoPlane<'a>,
-        red: usize,
-        blue: usize,
+        order: RgbOrder,
         /// Whether the fourth byte is read as alpha.
         alpha: bool,
     },
@@ -138,18 +137,11 @@ impl<'a, P: Sample> Reader<'a, P> {
         let info = source.format.info();
         let kernel = || Kernel::new(matrix, range, info.sample_width().bits());
         let layout = match source.planes {
-            PlaneRoles::PackedRgb { pixels, order } => {
-                let (red, blue) = match order {
-                    RgbOrder::Rgb => (0, 2),
-                    RgbOrder::Bgr => (2, 0),
-                };
-                Layout::Rgb {
-                    plane: pixels,
-                    red,
-                    blue,
-                    alpha,
-                }
-            }
+            PlaneRoles::PackedRgb { pixels, order } => Layout::Rgb {
+                plane: pixels,
+                order,
+                alpha,
+            },
             PlaneRoles::Packed422 { pixels } => Layout::Packed422 {
                 plane: pixels,
                 alpha: None,
@@ -224,24 +216,14 @@ impl<'a, P: Sample> Reader<'a, P> {
         }
     }
 
-    /// The frame's own rows when they are exactly the image's 8-bit RGBA, so
-    /// that a codec can read them in place.
-    pub(super) fn rgba_rows(&self) -> Option<VideoPlane<'a>> {
+    /// The packed RGB input and its channel order and decided alpha policy.
+    pub(super) fn packed_rgb(&self) -> Option<(VideoPlane<'a>, RgbOrder, bool)> {
         match self.layout {
             Layout::Rgb {
                 plane,
-                red: 0,
-                alpha: true,
-                ..
-            } if P::BYTES == 1 => Some(plane),
-            _ => None,
-        }
-    }
-
-    /// Four-byte RGB rows in their native channel order, before alpha policy.
-    pub(super) fn rgb_rows(&self) -> Option<(VideoPlane<'a>, bool)> {
-        match self.layout {
-            Layout::Rgb { plane, red, .. } if P::BYTES == 1 => Some((plane, red == 0)),
+                order,
+                alpha,
+            } => Some((plane, order, alpha)),
             _ => None,
         }
     }
@@ -254,10 +236,13 @@ impl<'a, P: Sample> Reader<'a, P> {
         match &self.layout {
             &Layout::Rgb {
                 plane,
-                red,
-                blue,
+                order,
                 alpha,
             } => {
+                let (red, blue) = match order {
+                    RgbOrder::Rgb => (0, 2),
+                    RgbOrder::Bgr => (2, 0),
+                };
                 let row = row(plane, y);
                 // Two loops, so that neither tests for alpha at each pixel.
                 if alpha {
