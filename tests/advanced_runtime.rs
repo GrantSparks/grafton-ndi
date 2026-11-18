@@ -927,6 +927,70 @@ fn assert_same_packet(
     assert!(received.is_known_version() && received.trailing_bytes().is_empty());
 }
 
+/// Assert every byte in the sender's storage, except for the SDK-owned
+/// reserved field at offsets 24..32, kept its value after native access.
+fn assert_envelope_stamping_only(before: &[u8], after: &[u8]) {
+    assert_eq!(&before[..24], &after[..24]);
+    assert_eq!(&before[32..], &after[32..]);
+}
+
+#[test]
+fn compressed_sends_change_only_the_reserved_envelope_field() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("envelope-stamping")).unwrap();
+    let mut receiver = packet_receiver(
+        &ndi,
+        &sender.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
+    connect(&mut receiver, "envelope stamping", |timecode| {
+        sender.send_video(&mut keyframe(
+            VideoCodec::H264,
+            StreamTier::Program,
+            timecode,
+        ));
+    });
+
+    let mut video = keyframe(VideoCodec::H264, StreamTier::Program, FIRST_TIMECODE + 1);
+    let before = video.data().to_vec();
+    sender.send_video(&mut video);
+    await_video(&mut receiver, FIRST_TIMECODE + 1);
+    assert_envelope_stamping_only(&before, video.data());
+
+    video.set_timecode(Timecode::from_ticks(FIRST_TIMECODE + 2));
+    let before = video.data().to_vec();
+    assert!(sender.submit_video(video).is_none());
+    let Some(SubmittedVideo::Contiguous(video)) = sender.reclaim_video().program else {
+        panic!("the sender releases its submitted video frame");
+    };
+    await_video(&mut receiver, FIRST_TIMECODE + 2);
+    assert_envelope_stamping_only(&before, video.data());
+
+    let timecode = FIRST_TIMECODE + 3;
+    let bytes = audio_bytes(AudioCodec::Aac, 48_000, 2, timecode);
+    let mut audio = CompressedAudioFrame::new(
+        AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
+        bytes.clone(),
+    )
+    .unwrap();
+    audio.set_timecode(Timecode::from_ticks(timecode));
+    // Audio submissions are synchronous. Exercise the contiguous and
+    // scatter paths so both descriptor styles expose any native writes.
+    sender.sender().send_compressed_audio(&mut audio);
+    await_audio(&mut receiver, timecode);
+    assert_envelope_stamping_only(&bytes, audio.data());
+
+    let timecode = FIRST_TIMECODE + 4;
+    let mut audio = ScatterAudioFrame::new(audio.format(), split(&bytes, &[44])).unwrap();
+    audio.set_timecode(Timecode::from_ticks(timecode));
+    sender.sender().send_scatter_audio(&mut audio).unwrap();
+    await_audio(&mut receiver, timecode);
+    assert_envelope_stamping_only(&bytes, audio.into_contiguous_copy().data());
+}
+
 /// How a compressed frame is handed to the sender.
 #[derive(Clone, Copy, Debug)]
 enum Submission {

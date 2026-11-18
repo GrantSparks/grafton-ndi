@@ -1,5 +1,5 @@
 //! Packet storage and its checked extent, inseparable outside this module.
-use super::{invalid_frame, PacketLen};
+use super::{invalid_frame, EnvelopeExtents, PacketLen};
 use crate::{advanced::aliasable::AliasableVec, Result};
 
 /// Immutable packet bytes whose checked length belongs to this exact slice.
@@ -53,6 +53,7 @@ impl<'a> PacketSlice<'a> {
 pub(crate) struct PacketBytes {
     bytes: AliasableVec<u8>,
     len: PacketLen,
+    extents: Option<EnvelopeExtents>,
 }
 
 impl PacketBytes {
@@ -61,22 +62,33 @@ impl PacketBytes {
             Some(len) => Ok(Self {
                 bytes: AliasableVec::new(bytes),
                 len,
+                extents: None,
             }),
             None => Err(bytes),
         }
     }
 
-    pub(crate) fn copied(source: PacketSlice<'_>) -> Self {
+    pub(super) fn with_envelope(mut self, extents: Option<EnvelopeExtents>) -> Self {
+        self.extents = extents;
+        self
+    }
+
+    pub(super) fn extents(&self) -> Option<EnvelopeExtents> {
+        self.extents
+    }
+
+    pub(super) fn copied(source: PacketSlice<'_>, extents: Option<EnvelopeExtents>) -> Self {
         Self {
             bytes: AliasableVec::new(source.bytes.to_vec()),
             len: source.len,
+            extents,
         }
     }
 
-    pub(crate) fn refill(&mut self, source: PacketSlice<'_>) {
+    pub(super) fn refill(&mut self, source: PacketSlice<'_>, extents: Option<EnvelopeExtents>) {
         if self.bytes.capacity() < source.bytes.len() {
             // Complete the allocation before replacing the paired destination.
-            *self = Self::copied(source);
+            *self = Self::copied(source, extents);
             return;
         }
         // Capacity already covers the copy. No operation between taking and
@@ -87,9 +99,14 @@ impl PacketBytes {
         bytes.extend_from_slice(source.bytes);
         self.bytes = AliasableVec::new(bytes);
         self.len = source.len;
+        self.extents = extents;
     }
 
-    pub(crate) fn with_len(len: PacketLen, fill: impl FnOnce(&mut Vec<u8>)) -> Self {
+    pub(crate) fn with_len(
+        len: PacketLen,
+        extents: Option<EnvelopeExtents>,
+        fill: impl FnOnce(&mut Vec<u8>),
+    ) -> Self {
         let mut bytes = Vec::with_capacity(len.to_usize());
         fill(&mut bytes);
         // The fixed checked extent remains true even if an internal join
@@ -98,6 +115,7 @@ impl PacketBytes {
         Self {
             bytes: AliasableVec::new(bytes),
             len,
+            extents,
         }
     }
 
@@ -136,23 +154,23 @@ mod tests {
         assert!(PacketBytes::new(Vec::new()).is_err());
         let mut packet = PacketBytes::new(vec![3; 8]).unwrap();
         paired(&mut packet);
-        let mut copied = PacketBytes::copied(packet.view());
+        let mut copied = PacketBytes::copied(packet.view(), None);
         paired(&mut copied);
         let mut cloned = packet.clone();
         paired(&mut cloned);
         let len = PacketLen::new(8).unwrap();
         for written in [4, 8, 16] {
-            let mut joined = PacketBytes::with_len(len, |bytes| bytes.resize(written, 4));
+            let mut joined = PacketBytes::with_len(len, None, |bytes| bytes.resize(written, 4));
             paired(&mut joined);
             assert_eq!(joined.as_slice().len(), 8);
         }
         let pointer = packet.as_slice().as_ptr();
         let (_, allocations) =
-            allocation_count(|| packet.refill(PacketSlice::new(&[5; 4]).unwrap()));
+            allocation_count(|| packet.refill(PacketSlice::new(&[5; 4]).unwrap(), None));
         assert_eq!(allocations, 0);
         assert_eq!(packet.as_slice().as_ptr(), pointer);
         paired(&mut packet);
-        packet.refill(PacketSlice::new(&[6; 32]).unwrap());
+        packet.refill(PacketSlice::new(&[6; 32]).unwrap(), None);
         paired(&mut packet);
     }
 }

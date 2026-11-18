@@ -232,22 +232,46 @@ impl TryFrom<FourCc> for EnvelopeCodec {
     }
 }
 
-/// The fixed fields of an envelope header, read in native byte order.
+/// The extents established when an envelope is admitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct EnvelopeHeader {
+pub(crate) struct EnvelopeExtents {
     size: usize,
-    codec: FourCc,
-    pts: i64,
-    dts: i64,
-    reserved: u64,
-    flags: u32,
     data_len: usize,
     extra_len: usize,
 }
 
+impl EnvelopeExtents {
+    fn checked_end(self) -> Option<usize> {
+        self.size
+            .checked_add(self.data_len)?
+            .checked_add(self.extra_len)
+    }
+
+    fn check_extent(self, total: usize) -> Result<usize> {
+        let end = self
+            .checked_end()
+            .ok_or_else(|| invalid_frame(crate::FrameDefect::PacketLengthOverflow))?;
+        if end > total {
+            return Err(invalid_frame(crate::FrameDefect::PacketTruncated));
+        }
+        Ok(end)
+    }
+
+    fn extra_offset(self) -> usize {
+        self.size + self.data_len
+    }
+}
+
+/// The fields that decide whether an envelope is admissible.
+struct EnvelopeHeader {
+    extents: EnvelopeExtents,
+    codec: FourCc,
+    flags: u32,
+}
+
 impl EnvelopeHeader {
     /// Read the header at the start of `bytes`.
-    pub(crate) fn read(bytes: &[u8]) -> Result<Self> {
+    fn read(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < ENVELOPE_HEADER_BYTES {
             return Err(invalid_frame(crate::FrameDefect::PacketHeaderTruncated));
         }
@@ -255,39 +279,19 @@ impl EnvelopeHeader {
             .ok()
             .filter(|size| *size >= ENVELOPE_HEADER_BYTES)
             .ok_or_else(|| invalid_frame(crate::FrameDefect::PacketHeaderSize))?;
-        Ok(Self::read_fields(bytes, size))
-    }
-
-    /// Read the fixed fields after the caller has established the header's
-    /// readable extent and size.
-    fn read_fields(bytes: &[u8], size: usize) -> Self {
-        Self {
-            size,
+        Ok(Self {
+            extents: EnvelopeExtents {
+                size,
+                data_len: u32::from_ne_bytes(field(bytes, DATA_SIZE_OFFSET)) as usize,
+                extra_len: u32::from_ne_bytes(field(bytes, EXTRA_DATA_SIZE_OFFSET)) as usize,
+            },
             codec: FourCc::from_raw(u32::from_ne_bytes(field(bytes, CODEC_OFFSET))),
-            pts: i64::from_ne_bytes(field(bytes, PTS_OFFSET)),
-            dts: i64::from_ne_bytes(field(bytes, DTS_OFFSET)),
-            reserved: u64::from_ne_bytes(field(bytes, RESERVED_OFFSET)),
             flags: u32::from_ne_bytes(field(bytes, FLAGS_OFFSET)),
-            data_len: u32::from_ne_bytes(field(bytes, DATA_SIZE_OFFSET)) as usize,
-            extra_len: u32::from_ne_bytes(field(bytes, EXTRA_DATA_SIZE_OFFSET)) as usize,
-        }
+        })
     }
 
-    pub(crate) fn is_keyframe(&self) -> bool {
+    fn is_keyframe(&self) -> bool {
         self.flags & KEYFRAME != 0
-    }
-
-    /// Header, payload and codec configuration together, if that does not overflow.
-    pub(crate) fn total_len(&self) -> Option<usize> {
-        self.size
-            .checked_add(self.data_len)?
-            .checked_add(self.extra_len)
-    }
-
-    /// Where the codec configuration starts, counted from the header's first
-    /// byte.
-    pub(crate) fn extra_offset(&self) -> usize {
-        self.size + self.data_len
     }
 
     /// Check the codec, payload and declared lengths once for every container.
@@ -298,34 +302,34 @@ impl EnvelopeHeader {
     /// The reserved field takes no part. It belongs to the SDK, which
     /// overwrites it in every packet it sends, so a packet that has been sent
     /// or received carries whatever the SDK left there.
-    pub(crate) fn validate(&self, codec: EnvelopeCodec, total: usize, purpose: Use) -> Result<()> {
+    fn validate(
+        &self,
+        codec: EnvelopeCodec,
+        total: usize,
+        purpose: Use,
+    ) -> Result<EnvelopeExtents> {
         if purpose == Use::Send
-            && (self.size != ENVELOPE_HEADER_BYTES || self.flags & !KEYFRAME != 0)
+            && (self.extents.size != ENVELOPE_HEADER_BYTES || self.flags & !KEYFRAME != 0)
         {
             return Err(invalid_frame(crate::FrameDefect::PacketHeaderUnsupported));
         }
         if self.codec != FourCc::from(codec) {
             return Err(invalid_frame(crate::FrameDefect::PacketCodecMismatch));
         }
-        if self.data_len == 0 {
+        if self.extents.data_len == 0 {
             return Err(invalid_frame(crate::FrameDefect::EmptyCodecPayload));
         }
-        let declared = self
-            .total_len()
-            .ok_or_else(|| invalid_frame(crate::FrameDefect::PacketLengthOverflow))?;
-        if declared > total {
-            return Err(invalid_frame(crate::FrameDefect::PacketTruncated));
-        }
+        let declared = self.extents.check_extent(total)?;
         if purpose == Use::Send && declared < total {
             return Err(invalid_frame(crate::FrameDefect::PacketLengthsMismatch));
         }
-        Ok(())
+        Ok(self.extents)
     }
 
     /// Check the codec configuration of a video packet that is about to be
     /// sent: a decoder cannot start on a keyframe without its parameter sets.
     pub(crate) fn validate_video_configuration(&self) -> Result<()> {
-        if self.is_keyframe() && self.extra_len == 0 {
+        if self.is_keyframe() && self.extents.extra_len == 0 {
             return Err(invalid_frame(
                 crate::FrameDefect::KeyframeConfigurationMissing,
             ));
@@ -379,7 +383,7 @@ impl EnvelopeHeader {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PacketEnvelope<'a> {
     bytes: &'a [u8],
-    header: EnvelopeHeader,
+    extents: EnvelopeExtents,
 }
 
 impl std::fmt::Debug for PacketEnvelope<'_> {
@@ -401,15 +405,9 @@ impl std::fmt::Debug for PacketEnvelope<'_> {
 }
 
 impl<'a> PacketEnvelope<'a> {
-    /// View bytes whose containing packet validated the complete envelope.
-    /// Read on each call so the SDK's current reserved value is preserved.
-    fn from_validated(bytes: &'a [u8]) -> Self {
-        debug_assert!(bytes.len() >= ENVELOPE_HEADER_BYTES);
-        let size = i32::from_ne_bytes(field(bytes, VERSION_OFFSET)) as usize;
-        let header = EnvelopeHeader::read_fields(bytes, size);
-        debug_assert!(size >= ENVELOPE_HEADER_BYTES);
-        debug_assert!(header.total_len().is_some_and(|end| end <= bytes.len()));
-        Self { bytes, header }
+    /// View bytes with the extents their containing packet validated.
+    fn from_validated(bytes: &'a [u8], extents: EnvelopeExtents) -> Self {
+        Self { bytes, extents }
     }
 
     /// Parse `bytes` as one packet envelope.
@@ -427,14 +425,9 @@ impl<'a> PacketEnvelope<'a> {
                 crate::FrameDefect::PacketLength
             })
         })?;
-        let header = EnvelopeHeader::read(bytes)?;
-        let end = header
-            .total_len()
-            .ok_or_else(|| invalid_frame(crate::FrameDefect::PacketLengthOverflow))?;
-        if end > bytes.len() {
-            return Err(invalid_frame(crate::FrameDefect::PacketTruncated));
-        }
-        Ok(Self { bytes, header })
+        let extents = EnvelopeHeader::read(bytes)?.extents;
+        extents.check_extent(bytes.len())?;
+        Ok(Self::from_validated(bytes, extents))
     }
 
     /// Build a version-0 packet envelope around one codec payload.
@@ -516,34 +509,34 @@ impl<'a> PacketEnvelope<'a> {
 
     /// The codec, when the header names one this module knows.
     pub fn codec(self) -> Option<EnvelopeCodec> {
-        EnvelopeCodec::try_from(self.header.codec).ok()
+        EnvelopeCodec::try_from(self.fourcc()).ok()
     }
 
     /// The codec's FourCC exactly as the header carries it.
     pub fn fourcc(self) -> FourCc {
-        self.header.codec
+        FourCc::from_raw(u32::from_ne_bytes(field(self.bytes, CODEC_OFFSET)))
     }
 
     /// Presentation timestamp, in the stream's own units.
     pub fn presentation_time(self) -> i64 {
-        self.header.pts
+        i64::from_ne_bytes(field(self.bytes, PTS_OFFSET))
     }
 
     /// Decode timestamp, in the stream's own units.
     pub fn decode_time(self) -> i64 {
-        self.header.dts
+        i64::from_ne_bytes(field(self.bytes, DTS_OFFSET))
     }
 
     /// Whether the keyframe flag is set.
     pub fn is_keyframe(self) -> bool {
-        self.header.is_keyframe()
+        self.flags() & KEYFRAME != 0
     }
 
     /// The header's flags field, every bit as the packet carries it,
     /// including bits this module does not interpret.
     /// [`is_keyframe`](Self::is_keyframe) reads the one it does.
     pub fn flags(self) -> u32 {
-        self.header.flags
+        u32::from_ne_bytes(field(self.bytes, FLAGS_OFFSET))
     }
 
     /// The header's reserved field.
@@ -551,35 +544,35 @@ impl<'a> PacketEnvelope<'a> {
     /// The field belongs to the SDK, which overwrites it in every packet it
     /// sends. Its value says nothing about whether a packet can be sent.
     pub fn reserved(self) -> u64 {
-        self.header.reserved
+        u64::from_ne_bytes(field(self.bytes, RESERVED_OFFSET))
     }
 
     /// Header bytes beyond the version-0 fields. Empty for version 0.
     pub fn header_extension(self) -> &'a [u8] {
-        &self.bytes[ENVELOPE_HEADER_BYTES..self.header.size]
+        &self.bytes[ENVELOPE_HEADER_BYTES..self.extents.size]
     }
 
     /// The codec payload.
     pub fn data(self) -> &'a [u8] {
-        let start = self.header.size;
-        &self.bytes[start..start + self.header.data_len]
+        let start = self.extents.size;
+        &self.bytes[start..start + self.extents.data_len]
     }
 
     /// Codec configuration data (parameter sets, or the AAC configuration),
     /// which follows the payload. Empty when the packet carries none.
     pub fn extra_data(self) -> &'a [u8] {
-        let start = self.header.size + self.header.data_len;
-        &self.bytes[start..start + self.header.extra_len]
+        let start = self.extents.extra_offset();
+        &self.bytes[start..start + self.extents.extra_len]
     }
 
     /// Bytes after the lengths the header declares.
     pub fn trailing_bytes(self) -> &'a [u8] {
-        &self.bytes[self.header.size + self.header.data_len + self.header.extra_len..]
+        &self.bytes[self.extents.extra_offset() + self.extents.extra_len..]
     }
 
     /// Whether the header is exactly version 0, the version this module writes.
     pub fn is_known_version(self) -> bool {
-        self.header.size == ENVELOPE_HEADER_BYTES
+        self.extents.size == ENVELOPE_HEADER_BYTES
     }
 }
 
@@ -754,7 +747,11 @@ impl VideoPacketFormat {
     /// with `header`, is one this module can send and the SDK delivers; see
     /// [`VideoCodec`]. `header` holds [`header_bytes`](Self::header_bytes)
     /// bytes or more.
-    pub(crate) fn validate_for_send(self, header: &[u8], total: usize) -> Result<()> {
+    pub(crate) fn validate_for_send(
+        self,
+        header: &[u8],
+        total: usize,
+    ) -> Result<Option<EnvelopeExtents>> {
         let Some(codec) = self.codec.envelope_codec() else {
             if header
                 .first()
@@ -762,10 +759,10 @@ impl VideoPacketFormat {
             {
                 return Err(invalid_frame(crate::FrameDefect::SpeedHqQuality));
             }
-            return Ok(());
+            return Ok(None);
         };
         let header = EnvelopeHeader::read(header)?;
-        header.validate(codec, total, Use::Send)?;
+        let extents = header.validate(codec, total, Use::Send)?;
         header.validate_video_configuration()?;
         if self.tier == StreamTier::Preview
             && (self.width.get() > MAX_PREVIEW_DIMENSION
@@ -773,7 +770,7 @@ impl VideoPacketFormat {
         {
             return Err(invalid_frame(crate::FrameDefect::PreviewVideoDimensions));
         }
-        Ok(())
+        Ok(Some(extents))
     }
 
     /// A native frame descriptor with this format and no data, no timecode
@@ -993,28 +990,12 @@ macro_rules! packet_debug {
 }
 pub(crate) use packet_debug;
 
-macro_rules! video_envelope_accessor {
-    () => {
-        /// The validated H.264 or HEVC envelope, including alpha variants.
-        /// SpeedHQ packets have no envelope and return `None`.
+macro_rules! envelope_accessor {
+    ($($extents:tt)+) => {
+        /// The validated envelope for H.264, HEVC or AAC. Other codecs have no envelope.
         pub fn envelope(&self) -> Option<PacketEnvelope<'_>> {
-            self.format()
-                .codec()
-                .envelope_codec()
-                .map(|_| PacketEnvelope::from_validated(self.data()))
-        }
-    };
-}
-
-macro_rules! audio_envelope_accessor {
-    () => {
-        /// The validated AAC envelope. Opus packets have no envelope and
-        /// return `None`.
-        pub fn envelope(&self) -> Option<PacketEnvelope<'_>> {
-            match self.format().codec() {
-                AudioCodec::Aac => Some(PacketEnvelope::from_validated(self.data())),
-                AudioCodec::Opus => None,
-            }
+            self.$($extents)+
+                .map(|extents| PacketEnvelope::from_validated(self.data(), extents))
         }
     };
 }
@@ -1041,7 +1022,7 @@ packet_debug!(CompressedVideoFrame, "CompressedVideoFrame", frame, video, frame.
 
 impl CompressedVideoFrame {
     frame_extras_accessors!();
-    video_envelope_accessor!();
+    envelope_accessor!(payload.extents());
 
     /// Take ownership of one frame's bytes: a packet envelope for H.264 and
     /// HEVC (see [`PacketEnvelope::encode`]), a SpeedHQ frame otherwise. The
@@ -1065,12 +1046,13 @@ impl CompressedVideoFrame {
                 bytes,
             )
         })?;
-        if let Err(error) = validate_video_content(format, payload.view(), Use::Send) {
-            return Err(Rejected::new(error, payload.into_vec()));
-        }
+        let extents = match validate_video_content(format, payload.view(), Use::Send) {
+            Ok(extents) => extents,
+            Err(error) => return Err(Rejected::new(error, payload.into_vec())),
+        };
         Ok(Self {
             format,
-            payload,
+            payload: payload.with_envelope(extents),
             extras: FrameExtras::default(),
         })
     }
@@ -1138,7 +1120,7 @@ fn validate_video_content(
     format: VideoPacketFormat,
     packet: PacketSlice<'_>,
     purpose: Use,
-) -> Result<()> {
+) -> Result<Option<EnvelopeExtents>> {
     let bytes = packet.as_slice();
     let len = packet.len();
     if format.codec.envelope_codec().is_none() && bytes.len() < SPEEDHQ_HEADER_BYTES {
@@ -1147,8 +1129,10 @@ fn validate_video_content(
     match purpose {
         Use::Send => format.validate_for_send(bytes, len.to_usize()),
         Use::Receive => match format.codec.envelope_codec() {
-            Some(codec) => EnvelopeHeader::read(bytes)?.validate(codec, len.to_usize(), purpose),
-            None => Ok(()),
+            Some(codec) => EnvelopeHeader::read(bytes)?
+                .validate(codec, len.to_usize(), purpose)
+                .map(Some),
+            None => Ok(None),
         },
     }
 }
@@ -1343,14 +1327,15 @@ impl AudioCodec {
         header: &[u8],
         total: usize,
         bytes_at: impl FnOnce(usize) -> Option<[u8; 2]>,
-    ) -> Result<()> {
+    ) -> Result<Option<EnvelopeExtents>> {
         self.validate_delivery(parameters)?;
         match self {
-            Self::Opus => Ok(()),
+            Self::Opus => Ok(None),
             Self::Aac => {
                 let header = EnvelopeHeader::read(header)?;
-                header.validate(EnvelopeCodec::Aac, total, Use::Send)?;
-                header.validate_aac(bytes_at(header.extra_offset()), parameters)
+                let extents = header.validate(EnvelopeCodec::Aac, total, Use::Send)?;
+                header.validate_aac(bytes_at(extents.extra_offset()), parameters)?;
+                Ok(Some(extents))
             }
         }
     }
@@ -1427,7 +1412,7 @@ packet_debug!(CompressedAudioFrame, "CompressedAudioFrame", frame, audio, frame.
 
 impl CompressedAudioFrame {
     frame_extras_accessors!();
-    audio_envelope_accessor!();
+    envelope_accessor!(payload.extents());
 
     /// Take ownership of one audio frame's bytes: a packet envelope for AAC
     /// (see [`PacketEnvelope::encode`]), one bare packet for Opus.
@@ -1448,12 +1433,13 @@ impl CompressedAudioFrame {
                 bytes,
             )
         })?;
-        if let Err(error) = validate_audio_content_for_send(format, payload.view()) {
-            return Err(Rejected::new(error, payload.into_vec()));
-        }
+        let extents = match validate_audio_content_for_send(format, payload.view()) {
+            Ok(extents) => extents,
+            Err(error) => return Err(Rejected::new(error, payload.into_vec())),
+        };
         Ok(Self {
             format,
-            payload,
+            payload: payload.with_envelope(extents),
             extras: FrameExtras::default(),
         })
     }
@@ -1501,7 +1487,7 @@ fn validate_audio_for_send(format: AudioPacketFormat, bytes: &[u8]) -> Result<Pa
 fn validate_audio_content_for_send(
     format: AudioPacketFormat,
     packet: PacketSlice<'_>,
-) -> Result<()> {
+) -> Result<Option<EnvelopeExtents>> {
     let bytes = packet.as_slice();
     let len = packet.len();
     format
@@ -1511,13 +1497,16 @@ fn validate_audio_content_for_send(
         })
 }
 
-fn validate_received_audio(codec: AudioCodec, packet: PacketSlice<'_>) -> Result<()> {
-    let bytes = packet.as_slice();
-    let len = packet.len();
+fn validate_received_audio(
+    codec: AudioCodec,
+    packet: PacketSlice<'_>,
+) -> Result<Option<EnvelopeExtents>> {
     if codec == AudioCodec::Aac {
-        EnvelopeHeader::read(bytes)?.validate(EnvelopeCodec::Aac, len.to_usize(), Use::Receive)?;
+        return EnvelopeHeader::read(packet.as_slice())?
+            .validate(EnvelopeCodec::Aac, packet.len().to_usize(), Use::Receive)
+            .map(Some);
     }
-    Ok(())
+    Ok(None)
 }
 
 #[path = "packets/received.rs"]
@@ -2013,7 +2002,7 @@ mod tests {
     }
 
     /// The text of an invalid-frame error.
-    fn reason(result: Result<()>) -> crate::FrameDefect {
+    fn reason<T: std::fmt::Debug>(result: Result<T>) -> crate::FrameDefect {
         match result {
             Err(Error::InvalidFrame(reason)) => reason,
             other => panic!("expected an invalid frame, got {other:?}"),
@@ -2738,6 +2727,60 @@ mod tests {
         assert!(validate_video_packet(format, &bytes, Use::Send).is_err());
     }
 
+    #[test]
+    fn envelope_slices_keep_admitted_extents_after_native_header_writes() {
+        let overwrite = |data: *mut u8| {
+            // SAFETY: each caller passes the writable header from its own
+            // live frame's descriptor, with a complete version-0 header.
+            unsafe {
+                data.add(VERSION_OFFSET).cast::<i32>().write_unaligned(-1);
+                data.add(DATA_SIZE_OFFSET)
+                    .cast::<u32>()
+                    .write_unaligned(u32::MAX);
+                data.add(EXTRA_DATA_SIZE_OFFSET)
+                    .cast::<u32>()
+                    .write_unaligned(u32::MAX);
+                data.add(RESERVED_OFFSET).cast::<u64>().write_unaligned(42);
+            }
+        };
+        let assert_envelope = |view: PacketEnvelope<'_>, codec, config: &[u8]| {
+            assert_eq!(view.codec(), Some(codec));
+            assert!(view.is_known_version());
+            assert!(view.header_extension().is_empty());
+            assert_eq!(view.data(), &[1, 2]);
+            assert_eq!(view.extra_data(), config);
+            assert!(view.trailing_bytes().is_empty());
+            assert_eq!(view.reserved(), 42);
+        };
+
+        for (codec, envelope) in [
+            (VideoCodec::H264, EnvelopeCodec::H264),
+            (VideoCodec::Hevc, EnvelopeCodec::Hevc),
+        ] {
+            let format = VideoPacketFormat::new(codec, 1920, 1080).unwrap();
+            let bytes = PacketEnvelope::encode(envelope, 0, 0, true, &[1, 2], &[3]).unwrap();
+            let mut frame = CompressedVideoFrame::new(format, bytes).unwrap();
+            overwrite(frame.raw().p_data);
+            assert_envelope(frame.envelope().unwrap(), envelope, &[3]);
+            let received = ReceivedVideoPacket::from(frame);
+            assert_envelope(received.envelope().unwrap(), envelope, &[3]);
+        }
+
+        let mut frame = CompressedAudioFrame::new(
+            AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
+            aac_packet(48_000, 2, &[1, 2]),
+        )
+        .unwrap();
+        overwrite(frame.raw().p_data);
+        assert_envelope(frame.envelope().unwrap(), EnvelopeCodec::Aac, &[0x11, 0x90]);
+        let received = ReceivedAudioPacket::from(frame);
+        assert_envelope(
+            received.envelope().unwrap(),
+            EnvelopeCodec::Aac,
+            &[0x11, 0x90],
+        );
+    }
+
     /// The SDK stamps the reserved field of every envelope it sends, in the
     /// sender's buffer, and delivers packets with the field set. Neither a
     /// frame that has been sent nor one that was received may be refused for
@@ -2887,14 +2930,13 @@ mod tests {
         // and refused when sent: the SDK would drop it without a word.
         let mut packet = aac_packet(48_000, 2, &[1]);
         packet[FLAGS_OFFSET..FLAGS_OFFSET + 4].copy_from_slice(&0u32.to_ne_bytes());
+        let payload = PacketBytes::new(packet.clone()).unwrap();
+        let extents = validate_received_audio(AudioCodec::Aac, payload.view()).unwrap();
         let received = ReceivedAudioPacket {
             format: AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
-            payload: PacketBytes::new(packet.clone()).unwrap(),
+            payload: payload.with_envelope(extents),
             extras: FrameExtras::default(),
         };
-        assert!(
-            validate_received_audio(received.format().codec(), received.payload.view()).is_ok()
-        );
         assert!(matches!(
             reason(received.validate_for_send()),
             crate::FrameDefect::AacKeyframeMissing

@@ -4,7 +4,11 @@ use super::*;
 
 #[cfg(ndi_test_packet_payload)]
 fn construct(bytes: super::super::aliasable::AliasableVec<u8>, len: PacketLen) -> PacketBytes {
-    PacketBytes { bytes, len }
+    PacketBytes {
+        bytes,
+        len,
+        extents: None,
+    }
 }
 
 #[cfg(ndi_test_packet_payload_mutation)]

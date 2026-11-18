@@ -18,7 +18,7 @@ packet_debug!(ReceivedVideoPacket, "ReceivedVideoPacket", frame, video, frame.ti
 
 impl ReceivedVideoPacket {
     frame_extras_accessors!();
-    video_envelope_accessor!();
+    envelope_accessor!(payload.extents());
 
     /// The complete codec bytes, including retained envelope extensions.
     pub fn data(&self) -> &[u8] {
@@ -47,6 +47,10 @@ impl ReceivedVideoPacket {
     /// [`Error::InvalidFrame`] when the envelope or codec parameters are not
     /// supported for sending. The packet remains unchanged.
     pub fn validate_for_send(&self) -> Result<()> {
+        self.send_extents().map(drop)
+    }
+
+    fn send_extents(&self) -> Result<Option<EnvelopeExtents>> {
         validate_video_content(self.format, self.payload.view(), Use::Send)
     }
 }
@@ -55,9 +59,10 @@ impl TryFrom<ReceivedVideoPacket> for CompressedVideoFrame {
     type Error = Rejected<ReceivedVideoPacket>;
 
     fn try_from(packet: ReceivedVideoPacket) -> std::result::Result<Self, Self::Error> {
-        if let Err(error) = packet.validate_for_send() {
-            return Err(Rejected::new(error, packet));
-        }
+        let extents = match packet.send_extents() {
+            Ok(extents) => extents,
+            Err(error) => return Err(Rejected::new(error, packet)),
+        };
         let ReceivedVideoPacket {
             format,
             payload,
@@ -65,7 +70,7 @@ impl TryFrom<ReceivedVideoPacket> for CompressedVideoFrame {
         } = packet;
         Ok(Self {
             format,
-            payload,
+            payload: payload.with_envelope(extents),
             extras,
         })
     }
@@ -103,7 +108,7 @@ packet_debug!(ReceivedAudioPacket, "ReceivedAudioPacket", frame, audio, frame.ti
 
 impl ReceivedAudioPacket {
     frame_extras_accessors!();
-    audio_envelope_accessor!();
+    envelope_accessor!(payload.extents());
 
     /// The complete codec bytes, including retained envelope extensions.
     pub fn data(&self) -> &[u8] {
@@ -132,6 +137,10 @@ impl ReceivedAudioPacket {
     /// [`Error::InvalidFrame`] for unsupported delivery parameters or envelope
     /// details. The packet remains unchanged.
     pub fn validate_for_send(&self) -> Result<()> {
+        self.send_extents().map(drop)
+    }
+
+    fn send_extents(&self) -> Result<Option<EnvelopeExtents>> {
         validate_audio_content_for_send(self.format, self.payload.view())
     }
 }
@@ -140,9 +149,10 @@ impl TryFrom<ReceivedAudioPacket> for CompressedAudioFrame {
     type Error = Rejected<ReceivedAudioPacket>;
 
     fn try_from(packet: ReceivedAudioPacket) -> std::result::Result<Self, Self::Error> {
-        if let Err(error) = packet.validate_for_send() {
-            return Err(Rejected::new(error, packet));
-        }
+        let extents = match packet.send_extents() {
+            Ok(extents) => extents,
+            Err(error) => return Err(Rejected::new(error, packet)),
+        };
         let ReceivedAudioPacket {
             format,
             payload,
@@ -150,7 +160,7 @@ impl TryFrom<ReceivedAudioPacket> for CompressedAudioFrame {
         } = packet;
         Ok(Self {
             format,
-            payload,
+            payload: payload.with_envelope(extents),
             extras,
         })
     }

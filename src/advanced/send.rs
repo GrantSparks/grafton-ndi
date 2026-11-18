@@ -10,8 +10,8 @@ use super::{
     aliasable::AliasableVec,
     invalid_frame,
     packets::{
-        frame_extras_accessors, packet_debug, AudioPacketFormat, FrameExtras, PacketBytes,
-        PacketLen,
+        frame_extras_accessors, packet_debug, AudioPacketFormat, EnvelopeExtents, FrameExtras,
+        PacketBytes, PacketLen,
     },
     AdvancedConfig, CompressedAttached, CompressedAudioFrame, CompressedAudioSendMode,
     CompressedVideoFrame, VideoPacketFormat,
@@ -222,8 +222,8 @@ impl ScatterStorage {
             .collect()
     }
 
-    fn copy_contiguous(&self) -> PacketBytes {
-        PacketBytes::with_len(self.total, |bytes| {
+    fn copy_contiguous(&self, extents: Option<EnvelopeExtents>) -> PacketBytes {
+        PacketBytes::with_len(self.total, extents, |bytes| {
             for block in self.blocks() {
                 bytes.extend_from_slice(block);
             }
@@ -280,6 +280,7 @@ fn bytes_at<const N: usize>(blocks: &[Vec<u8>], offset: usize) -> Option<[u8; N]
 pub struct ScatterVideoFrame {
     format: VideoPacketFormat,
     storage: ScatterStorage,
+    extents: Option<EnvelopeExtents>,
     extras: FrameExtras,
 }
 
@@ -304,16 +305,17 @@ impl ScatterVideoFrame {
     ) -> std::result::Result<Self, Rejected<Vec<Vec<u8>>>> {
         let check = || {
             let sizes = ScatterStorage::check(&blocks)?;
-            format.validate_for_send(
+            let extents = format.validate_for_send(
                 first_block(&blocks, format.header_bytes())?,
                 sizes.total.to_usize(),
             )?;
-            Ok(sizes)
+            Ok((sizes, extents))
         };
         match check() {
-            Ok(sizes) => Ok(Self {
+            Ok((sizes, extents)) => Ok(Self {
                 format,
                 storage: ScatterStorage::new(blocks, sizes),
+                extents,
                 extras: FrameExtras::default(),
             }),
             Err(error) => Err(Rejected::new(error, blocks)),
@@ -353,7 +355,7 @@ impl ScatterVideoFrame {
     pub fn into_contiguous_copy(self) -> CompressedVideoFrame {
         CompressedVideoFrame {
             format: self.format,
-            payload: self.storage.copy_contiguous(),
+            payload: self.storage.copy_contiguous(self.extents),
             extras: self.extras,
         }
     }
@@ -374,6 +376,7 @@ impl ScatterVideoFrame {
 pub struct ScatterAudioFrame {
     format: AudioPacketFormat,
     storage: ScatterStorage,
+    extents: Option<EnvelopeExtents>,
     extras: FrameExtras,
 }
 
@@ -399,17 +402,19 @@ impl ScatterAudioFrame {
         let check = || {
             let sizes = ScatterStorage::check(&blocks)?;
             let header = first_block(&blocks, format.codec().header_bytes())?;
-            format
-                .codec()
-                .validate_for_send(format, header, sizes.total.to_usize(), |offset| {
-                    bytes_at(&blocks, offset)
-                })?;
-            Ok(sizes)
+            let extents = format.codec().validate_for_send(
+                format,
+                header,
+                sizes.total.to_usize(),
+                |offset| bytes_at(&blocks, offset),
+            )?;
+            Ok((sizes, extents))
         };
         match check() {
-            Ok(sizes) => Ok(Self {
+            Ok((sizes, extents)) => Ok(Self {
                 format,
                 storage: ScatterStorage::new(blocks, sizes),
+                extents,
                 extras: FrameExtras::default(),
             }),
             Err(error) => Err(Rejected::new(error, blocks)),
@@ -443,7 +448,7 @@ impl ScatterAudioFrame {
     pub fn into_contiguous_copy(self) -> CompressedAudioFrame {
         CompressedAudioFrame {
             format: self.format,
-            payload: self.storage.copy_contiguous(),
+            payload: self.storage.copy_contiguous(self.extents),
             extras: self.extras,
         }
     }
