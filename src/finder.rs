@@ -1417,13 +1417,13 @@ fn strip_url_scheme(address: &str) -> Option<&str> {
 
 // An outer None rejects the authority, while Some(None) accepts an empty port.
 fn parse_port(text: &str, allow_empty: bool) -> Option<Option<u16>> {
-    if text.is_empty() {
-        return allow_empty.then_some(None);
+    match text.as_bytes().first() {
+        None => allow_empty.then_some(None),
+        // The integer parser checks the remaining digits and the range. The
+        // first byte must be a digit to rule out its optional leading '+'.
+        Some(b'0'..=b'9') => text.parse().ok().map(Some),
+        _ => None,
     }
-    if !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    text.parse().ok().map(Some)
 }
 
 fn parse_authority(address: &str) -> Option<Authority<'_>> {
@@ -3764,6 +3764,8 @@ mod tests {
                     ("-5960", None, false),
                     (" 5960", None, false),
                     ("５９６０", None, false),
+                    ("59a0", None, false),
+                    ("5960+", None, false),
                     ("65536", None, false),
                     ("0", Some(0), true),
                     ("05960", Some(5960), true),
