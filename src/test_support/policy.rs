@@ -1,4 +1,7 @@
 //! The prerequisite policy shared by unit and integration tests.
+//!
+//! Report every reduction in native coverage through [`skip`] for a missing
+//! prerequisite or `unsupported` for a measured platform or runtime limit.
 
 use std::{io::Write, sync::Mutex};
 
@@ -15,6 +18,8 @@ pub enum Requirement {
     Advanced,
     /// The NDI File library. Listed as `file`.
     File,
+    /// A second pinned SDK runtime for cross-version transport. Listed as `peer`.
+    Peer,
     /// The vendor's Discovery Server program, installed with the SDK the
     /// selected runtime belongs to, and a runtime whose advertisers and
     /// listeners can use it. Listed as `discovery-server`.
@@ -50,10 +55,11 @@ pub enum Requirement {
 }
 
 impl Requirement {
-    const ALL: [Self; 6] = [
+    pub(super) const ALL: [Self; 7] = [
         Self::Runtime,
         Self::Advanced,
         Self::File,
+        Self::Peer,
         Self::DiscoveryServer,
         Self::H264Decoder,
         Self::Hevc444Decoder,
@@ -63,7 +69,7 @@ impl Requirement {
     pub(super) const fn implied(self) -> &'static [Self] {
         match self {
             Self::Runtime => &[],
-            Self::Advanced | Self::File | Self::DiscoveryServer => &[Self::Runtime],
+            Self::Advanced | Self::File | Self::Peer | Self::DiscoveryServer => &[Self::Runtime],
             Self::H264Decoder | Self::Hevc444Decoder => &[Self::Runtime, Self::Advanced],
         }
     }
@@ -74,6 +80,7 @@ impl Requirement {
             Self::Runtime => "1",
             Self::Advanced => "advanced",
             Self::File => "file",
+            Self::Peer => "peer",
             Self::DiscoveryServer => "discovery-server",
             Self::H264Decoder => "h264-decoder",
             Self::Hevc444Decoder => "hevc-444-decoder",
@@ -86,6 +93,7 @@ impl Requirement {
             Self::Runtime => "an NDI runtime",
             Self::Advanced => "the Advanced SDK",
             Self::File => "the NDI File library",
+            Self::Peer => "a second pinned SDK runtime for cross-version transport",
             Self::DiscoveryServer => "the SDK's Discovery Server",
             Self::H264Decoder => "an NDI|HX decoder for H.264",
             Self::Hevc444Decoder => "an NDI|HX decoder for HEVC 4:4:4",
@@ -112,7 +120,7 @@ impl Requirement {
                     .find(|requirement| requirement.token() == entry)
                     .unwrap_or_else(|| {
                         panic!(
-                            "{REQUIRE_RUNTIME} lists {entry:?}; expected 1, advanced, file, \
+                            "{REQUIRE_RUNTIME} lists {entry:?}; expected 1, advanced, file, peer, \
                              discovery-server, h264-decoder or hevc-444-decoder"
                         )
                     })

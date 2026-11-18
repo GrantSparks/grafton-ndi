@@ -66,6 +66,10 @@ fn missing_requirement(requirement: Requirement) -> Option<&'static str> {
         Requirement::Runtime => None,
         Requirement::Advanced => missing(cfg!(feature = "advanced"), "the `advanced` feature"),
         Requirement::File => missing(cfg!(feature = "file-io"), "the `file-io` feature"),
+        Requirement::Peer => missing(
+            cfg!(not(ndi_link_static)),
+            "a target that loads the runtime dynamically",
+        ),
         Requirement::DiscoveryServer => missing(
             cfg!(all(target_os = "linux", not(ndi_link_static))),
             "a Linux target that loads the runtime dynamically",
@@ -113,15 +117,6 @@ mod tests {
     use crate::{Capability, CapabilityRefusal, Error, RuntimeFeature, SdkVersion};
     use std::sync::LazyLock;
 
-    const REQUIREMENTS: [Requirement; 6] = [
-        Requirement::Runtime,
-        Requirement::Advanced,
-        Requirement::File,
-        Requirement::DiscoveryServer,
-        Requirement::H264Decoder,
-        Requirement::Hevc444Decoder,
-    ];
-
     #[test]
     fn requirement_implications_include_decoder_prerequisites_without_cycles() {
         fn visit(requirement: Requirement, path: &mut Vec<Requirement>) {
@@ -132,7 +127,7 @@ mod tests {
             }
             path.pop();
         }
-        for requirement in REQUIREMENTS {
+        for requirement in Requirement::ALL {
             visit(requirement, &mut Vec::new());
             if requirement != Requirement::Runtime {
                 assert!(requirement.implied().contains(&Requirement::Runtime));
@@ -196,6 +191,39 @@ mod tests {
             "skipped: test_support::tests::child_skips_are_forwarded_to_the_diagnostic_writer"
         ));
         assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn peer_promises_require_a_dynamic_build_and_a_second_runtime() {
+        const CHILD: &str = "GRAFTON_PEER_PROMISE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(Requirement::Peer.is_promised());
+            assert!(Requirement::Runtime.is_promised());
+            assert_eq!(
+                unverifiable_promises().is_empty(),
+                cfg!(not(ndi_link_static))
+            );
+            policy::skip(Requirement::Peer, "the peer fixture has no second runtime");
+            return;
+        }
+
+        let mut child = TestChild::new(
+            "test_support::tests::peer_promises_require_a_dynamic_build_and_a_second_runtime",
+        );
+        child
+            .env(CHILD, "1")
+            .env("GRAFTON_NDI_REQUIRE_RUNTIME", "peer");
+        let output = child.output(false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("promises peer but the peer fixture has no second runtime"),
+            "{stderr}"
+        );
+
+        child.env("GRAFTON_NDI_REQUIRE_RUNTIME", "peer,unknown");
+        let output = child.output(false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("lists \"unknown\""), "{stderr}");
     }
 
     #[test]

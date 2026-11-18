@@ -1,7 +1,8 @@
 //! Transport interoperability between two independently loaded SDK versions.
 //!
 //! Set GRAFTON_NDI_PEER_RUNTIME, GRAFTON_NDI_PEER_VERSION and
-//! GRAFTON_NDI_PEER_EDITION to require a peer from a second pinned SDK. The
+//! GRAFTON_NDI_PEER_EDITION to select a second pinned SDK. Set
+//! GRAFTON_NDI_REQUIRE_RUNTIME=peer to require the peer exchange. The
 //! child inherits the test runner's network confinement; both peers use only
 //! loopback. Each process retains exactly one native implementation.
 #![cfg(not(ndi_link_static))]
@@ -9,7 +10,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, identity, name, loopback, child);
+common_helpers!(runtime, identity, name, loopback, child, prerequisites);
 use common::TestChild;
 
 use grafton_ndi::{
@@ -136,9 +137,9 @@ fn different_sdk_versions_exchange_video_audio_and_metadata() {
         return;
     }
     let Some(path) = std::env::var_os("GRAFTON_NDI_PEER_RUNTIME") else {
-        let _ = writeln!(
-            std::io::stderr(),
-            "skipped: cross-SDK transport needs GRAFTON_NDI_PEER_RUNTIME"
+        common::skip(
+            common::Requirement::Peer,
+            "GRAFTON_NDI_PEER_RUNTIME is unset",
         );
         return;
     };
