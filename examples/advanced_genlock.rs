@@ -17,7 +17,7 @@ use std::{env, time::Duration};
 
 use grafton_ndi::{
     advanced::{AudioClockRequest, ClockSource, Genlock, GenlockOptions},
-    Error, FrameRate, Ndi, RuntimeOptions, ScanType, SdkEdition, Sender, SenderOptions, VideoFrame,
+    FrameRate, Ndi, RuntimeOptions, ScanType, SdkEdition, Sender, SenderOptions, VideoFrame,
 };
 
 #[path = "common/finder.rs"]
@@ -25,7 +25,7 @@ mod finder;
 
 use finder::finder_with_extra_ips;
 
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
 

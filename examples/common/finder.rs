@@ -1,8 +1,8 @@
 //! Finder construction shared by the discovery and receiver examples.
 
-use std::{io, net::IpAddr};
+use std::net::IpAddr;
 
-use grafton_ndi::{Finder, FinderOptions, Ndi, Result};
+use grafton_ndi::{Finder, FinderOptions, Ndi};
 
 /// Build a [`Finder`] that discovers local sources plus any extra IP addresses
 /// supplied on the command line.
@@ -10,14 +10,16 @@ use grafton_ndi::{Finder, FinderOptions, Ndi, Result};
 /// `extra_ips` are the positional, non-flag arguments each example collects
 /// from `std::env::args`, such as `192.168.0.110` or `10.0.0.8`.
 /// Local sources are always included so loopback senders are visible during testing.
-pub fn finder_with_extra_ips(ndi: &Ndi, extra_ips: &[&str]) -> Result<Finder> {
+pub fn finder_with_extra_ips(
+    ndi: &Ndi,
+    extra_ips: &[&str],
+) -> Result<Finder, Box<dyn std::error::Error>> {
     let mut options = FinderOptions::new();
 
     if !extra_ips.is_empty() {
         for ip in extra_ips {
-            ip.parse::<IpAddr>().map_err(|error| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("{ip:?}: {error}"))
-            })?;
+            ip.parse::<IpAddr>()
+                .map_err(|error| format!("invalid extra IP address {ip:?}: {error}"))?;
         }
         println!("Searching additional IP addresses:");
         for ip in extra_ips {
@@ -27,5 +29,5 @@ pub fn finder_with_extra_ips(ndi: &Ndi, extra_ips: &[&str]) -> Result<Finder> {
         println!();
     }
 
-    Finder::new(ndi, &options)
+    Ok(Finder::new(ndi, &options)?)
 }

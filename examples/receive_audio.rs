@@ -13,14 +13,14 @@
 
 use std::{env, time::Duration};
 
-use grafton_ndi::{Error, Ndi, Receiver, ReceiverBandwidth, ReceiverOptions};
+use grafton_ndi::{Ndi, Receiver, ReceiverBandwidth, ReceiverOptions};
 
 #[path = "common/finder.rs"]
 mod finder;
 
 use finder::finder_with_extra_ips;
 
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments for extra IPs
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();

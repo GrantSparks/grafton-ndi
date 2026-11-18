@@ -18,7 +18,7 @@
 //! - Ensure NDI sources are running on your network
 //! - Check firewall settings (NDI uses UDP port 5353 for discovery)
 
-use grafton_ndi::{Error, Ndi};
+use grafton_ndi::Ndi;
 
 use std::{
     env,
@@ -30,7 +30,7 @@ mod finder;
 
 use finder::finder_with_extra_ips;
 
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments for extra IPs
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
