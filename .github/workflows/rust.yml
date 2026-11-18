@@ -105,6 +105,8 @@ jobs:
         with:
           path: target/doc
       - name: Minimum supported Rust version
+        env:
+          RUSTFLAGS: -D warnings
         run: |
           rustup toolchain install 1.88.0 --profile minimal
           cargo +1.88.0 check --locked --workspace --all-targets --all-features
@@ -630,6 +632,7 @@ jobs:
       - name: Lint and document the Advanced implementation
         if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.role == 'primary' && contains(matrix.package, 'advanced') }}
         env:
+          RUSTFLAGS: -D warnings
           RUSTDOCFLAGS: -D warnings
         run: |
           rustup toolchain install 1.88.0 --profile minimal --target "$TARGET"

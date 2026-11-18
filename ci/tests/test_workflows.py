@@ -157,11 +157,14 @@ def source_consistency_violations(parsed, manifest, pins, setup):
     )
     found = []
     for name, steps, target, workspace in expected:
-        script = steps.get(name, {}).get('run', '').splitlines()
+        step = steps.get(name, {})
+        script = step.get('run', '').splitlines()
         commands = (f'rustup toolchain install {minimum} --profile minimal{target}',
                     f'cargo +{minimum} check --locked {workspace}--all-targets{target} --all-features')
         if any(command not in script for command in commands):
             found.append(f'rust.yml: {name} must install and check Cargo.toml rust-version {minimum}')
+        if step.get('env', {}).get('RUSTFLAGS') != '-D warnings':
+            found.append(f'rust.yml: {name} must deny warnings on Cargo.toml rust-version {minimum}')
     for workflow, body in parsed.items():
         for job, definition in body['jobs'].items():
             for step in definition.get('steps', []):
@@ -1241,6 +1244,14 @@ class Repository(unittest.TestCase):
             return source_consistency_violations(workflow, cargo, packages, platforms)
 
         self.assertEqual(violations_for(), [])
+        for job, step_name in (('lint', 'Minimum supported Rust version'),
+                               ('sdk', 'Lint and document the Advanced implementation')):
+            broken = copy.deepcopy(parsed)
+            step = next(step for step in broken['rust.yml']['jobs'][job]['steps']
+                        if step.get('name') == step_name)
+            del step['env']['RUSTFLAGS']
+            self.assertTrue(any(step_name in error and 'deny warnings' in error
+                                for error in violations_for(workflow=broken)))
         min_version = msrv_version(manifest)
         major, minor, _ = min_version.split('.')
         next_version = f'{major}.{int(minor) + 1}'
